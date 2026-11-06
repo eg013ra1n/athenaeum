@@ -46,6 +46,60 @@ export const STAGES: readonly Stage[] = [
  *  `calibrate`'s own state (see `rowState` below). */
 export type BoardStage = Stage | 'debayer';
 
+/** What row 1 of the board is. A frame set is calibrated by the run (`'calibrate'`); a project's frames are
+ *  calibrated by their publishers and an attested set's lights externally, so the run only prepares them
+ *  (`'prepare'`, spec §5.1 and §13) and the stage reads from the plan, never from config. */
+export type BoardMode = 'calibrate' | 'prepare';
+
+export function boardMode(plan: StackingPlan | null): BoardMode {
+  return plan != null && (plan.projectId != null || plan.readiness.attested) ? 'prepare' : 'calibrate';
+}
+
+const STAGE_LABEL: Record<BoardStage, string> = {
+  masters: 'Masters',
+  calibrate: 'Calibrate',
+  debayer: 'Debayer',
+  measure: 'Measure & select',
+  reference: 'Reference',
+  register: 'Register',
+  normalize: 'Local normalization',
+  integrate: 'Integrate',
+  drizzle: 'Drizzle',
+  output: 'Output',
+};
+
+/** A stage's name on the board, the inspector and the Re-run menu. The stage key stays `calibrate` in a project
+ *  (it is the backend's stage and the stored selection); only its name changes. */
+export function stageLabel(stage: BoardStage, mode: BoardMode): string {
+  return stage === 'calibrate' && mode === 'prepare' ? 'Prepare' : STAGE_LABEL[stage];
+}
+
+/** The Masters row and panel for a plan that needs no masters, or `null` when the run builds them as usual. */
+export function mastersNotNeeded(plan: StackingPlan | null | undefined): string | null {
+  if (plan == null) return null;
+  if (plan.projectId != null) return 'Not needed \u2014 project frames are calibrated by their publishers';
+  if (plan.readiness.attested) return 'Not needed \u2014 the lights are calibrated externally';
+  return null;
+}
+
+/** The Prepare row's one line: what the run does with the frames (`PlanPrepare`), zero terms left out, the frames
+ *  inside a zip last because the run only probes them after extracting. Frames no reader decodes are not a term:
+ *  they leave the plan, and the Prepare panel counts them. */
+function prepareSummary(plan: StackingPlan | null | undefined): string {
+  const prepare = plan?.prepare;
+  if (!prepare) return 'Nothing to prepare';
+  const terms = [
+    prepare.inPlace > 0 ? `${prepare.inPlace} in place` : null,
+    prepare.debayered > 0 ? `${prepare.debayered} debayered` : null,
+    prepare.converted > 0 ? `${prepare.converted} converted` : null,
+  ].filter((t): t is string => t !== null);
+  if (prepare.atRun > 0) {
+    const atRun = `${prepare.atRun} checked at run`;
+    return terms.length > 0 ? `${terms.join(' \u00b7 ')} + ${atRun}` : atRun;
+  }
+  return terms.length > 0 ? terms.join(' \u00b7 ') : 'Nothing to prepare';
+}
+
 /**
  * The subset of `STAGES` that actually get their own `StageTiming` entry in
  * `RunSummary.stages` (`run.rs`'s `rc.timings.push(…)` call sites) — used by
@@ -244,6 +298,10 @@ export function cleanupLabel(v: StackingConfig['output']['cleanup']): string {
  * `plan.mastersToBuild` instead. `plan` is optional and defaults to `null`
  * so every other stage's call site (and the inspector header, which may not
  * always have a plan handy) keeps working unchanged.
+ *
+ * `'calibrate'` reads the plan too, but only for a project or an attested set
+ * (wave 6c): that row is Prepare there, and its line is the plan's own
+ * `prepare` counts. A frame set keeps its config summary.
  */
 export function stageSummary(
   stage: BoardStage,
@@ -252,6 +310,8 @@ export function stageSummary(
 ): string {
   switch (stage) {
     case 'masters': {
+      const notNeeded = mastersNotNeeded(plan);
+      if (notNeeded !== null) return notNeeded;
       const items = plan?.mastersToBuild ?? [];
       const toBuild = items.filter((m) => m.kind === 'build').length;
       const toRebuild = items.filter((m) => m.kind === 'rebuild').length;
@@ -262,6 +322,7 @@ export function stageSummary(
       return parts.join(', ');
     }
     case 'calibrate': {
+      if (boardMode(plan ?? null) === 'prepare') return prepareSummary(plan);
       const parts = [
         config.calibration.flatNorm
           ? `flat-norm ${flatNormModeLabel(config.calibration.flatNormMode)}`
@@ -517,6 +578,11 @@ export function rowState(
   // normalization stays `ready` (labelled "global") when its toggle is off
   // — LN is the optional PART of the `normalize` stage, not the whole row.
   if (stage === 'drizzle' && !config.drizzle.enabled) return 'off';
+
+  // 0. A project and an attested set need no masters (wave 6c): the row is off
+  // in every run state, whatever a stale plan or a half-loaded run says, and a
+  // masters blocker never lands on it.
+  if (stage === 'masters' && mastersNotNeeded(plan) !== null) return 'off';
 
   // 0. Masters (stage 0.5, Plan 5b Task 8) is off when there is nothing to
   // build/rebuild AND no masters/masterFiles blocker either — most runs

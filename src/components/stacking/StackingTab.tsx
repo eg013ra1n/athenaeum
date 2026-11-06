@@ -21,7 +21,7 @@ import { StageInspector } from './StageInspector';
 import { FramesTable, type LightFrameRef } from './FramesTable';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 import { ResultsPanel } from './ResultsPanel';
-import { stableStringify, withoutPaths, type BoardStage } from './stageSummary';
+import { boardMode, stableStringify, stageLabel, withoutPaths, type BoardStage } from './stageSummary';
 import {
   readSelectedStage,
   writeSelectedStage,
@@ -54,19 +54,6 @@ interface PendingWrite {
 // keyed on them.
 const NO_LIGHT_FRAMES: LightFrameRef[] = [];
 const NO_FRAME_IDS: number[] = [];
-
-const STAGE_LABEL: Record<BoardStage, string> = {
-  masters: 'Masters',
-  calibrate: 'Calibrate',
-  debayer: 'Debayer',
-  measure: 'Measure & select',
-  reference: 'Reference',
-  register: 'Register',
-  normalize: 'Local normalization',
-  integrate: 'Integrate',
-  drizzle: 'Drizzle',
-  output: 'Output',
-};
 
 const PRESET_LABEL: Record<StackingPreset, string> = {
   default: 'Default',
@@ -754,14 +741,18 @@ export function StackingTab({ subject }: StackingTabProps) {
   // refuses a blocked plan, so an open menu would only offer failures.
   const rerunDisabled = running || starting || plan.blockers.length > 0;
   const measureCached = !plan.staleStages.includes('measure');
+  // Wave 6c: a project or an attested set shows Prepare where a frame set shows Calibrate; every name and
+  // sentence here follows the board.
+  const mode = boardMode(plan);
+  const firstStage = stageLabel('calibrate', mode);
   const runStartsAt =
     firstStale === undefined
       ? 'Every cached stage is reused — the run re-integrates from the cached registered frames'
       : firstStale === 'calibrate'
         ? measureCached
-          ? 'No calibrated or registered frames are cached — the run starts from Calibrate; the measurements are reused'
-          : 'Nothing is cached — the run starts from Calibrate'
-        : `Starts from ${STAGE_LABEL[firstStale]} — the stages before it are reused from cache`;
+          ? `No ${mode === 'prepare' ? 'prepared' : 'calibrated'} or registered frames are cached — the run starts from ${firstStage}; the measurements are reused`
+          : `Nothing is cached — the run starts from ${firstStage}`
+        : `Starts from ${stageLabel(firstStale, mode)} — the stages before it are reused from cache`;
   // Fix round 1, Minor #8: APPLYING a preset edits the config the same way
   // every inspector panel does, so it is disabled while a run is active for
   // the same reason those panels are (`StageInspector`'s own `disabled`
@@ -1035,7 +1026,7 @@ export function StackingTab({ subject }: StackingTabProps) {
                         ? 'Not cached — every run redoes this stage already'
                         : stage === 'integrate'
                           ? 'Reuse every cached stage and integrate again'
-                          : `Redo ${STAGE_LABEL[stage]} and everything after it; reuse the stages before`
+                          : `Redo ${stageLabel(stage, mode)} and everything after it; reuse the stages before`
                     }
                     className={`w-full text-left px-3 py-1.5 text-sm ${
                       stale
@@ -1044,7 +1035,7 @@ export function StackingTab({ subject }: StackingTabProps) {
                     }`}
                   >
                     <span className="flex items-center justify-between gap-2">
-                      <span>{STAGE_LABEL[stage]}</span>
+                      <span>{stageLabel(stage, mode)}</span>
                       {stale && <span className="text-xs">stale</span>}
                     </span>
                   </button>
@@ -1065,15 +1056,17 @@ export function StackingTab({ subject }: StackingTabProps) {
             <div key={`${b.code}-${i}`} className="flex items-center gap-2 text-sm text-error">
               <AlertTriangle size={14} className="shrink-0" />
               <span>{b.message}</span>
-              {(b.code === 'masters' || b.code === 'links' || b.code === 'masterFiles') && (
-                <button
-                  type="button"
-                  className="underline hover:no-underline text-content-secondary"
-                  onClick={handleCoverageClick}
-                >
-                  → Coverage
-                </button>
-              )}
+              {/* A project has no Calibration tab to go to: its frames come calibrated. */}
+              {subject.kind !== 'project' &&
+                (b.code === 'masters' || b.code === 'links' || b.code === 'masterFiles') && (
+                  <button
+                    type="button"
+                    className="underline hover:no-underline text-content-secondary"
+                    onClick={handleCoverageClick}
+                  >
+                    → Coverage
+                  </button>
+                )}
             </div>
           ))}
         </div>
@@ -1121,7 +1114,7 @@ export function StackingTab({ subject }: StackingTabProps) {
             className="lg:hidden w-full flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-surface-elevated text-sm font-medium text-content hover:text-content-secondary transition-colors"
           >
             {inspectorCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-            {STAGE_LABEL[selectedStage]}
+            {stageLabel(selectedStage, mode)}
           </button>
           <div className={`${inspectorCollapsed ? 'hidden' : 'block'} lg:block`}>
             <StageInspector

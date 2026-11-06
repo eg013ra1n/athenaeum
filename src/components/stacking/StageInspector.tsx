@@ -6,6 +6,7 @@
 
 import { MastersPanel } from './panels/MastersPanel';
 import { CalibratePanel } from './panels/CalibratePanel';
+import { PreparePanel } from './panels/PreparePanel';
 import { DebayerPanel } from './panels/DebayerPanel';
 import { MeasurePanel } from './panels/MeasurePanel';
 import { ReferencePanel } from './panels/ReferencePanel';
@@ -14,7 +15,7 @@ import { NormalizePanel } from './panels/NormalizePanel';
 import { IntegratePanel } from './panels/IntegratePanel';
 import { DrizzlePanel } from './panels/DrizzlePanel';
 import { OutputPanel } from './panels/OutputPanel';
-import type { BoardStage } from './stageSummary';
+import { boardMode, stageLabel, type BoardStage } from './stageSummary';
 import type { StackingConfig, StackingPlan } from '../../types/stacking';
 
 export interface StageInspectorProps {
@@ -44,17 +45,19 @@ export interface StageInspectorProps {
   mode?: 'perSet' | 'global';
 }
 
-const STAGE_TITLE: Record<BoardStage, string> = {
-  masters: '0 · Masters',
-  calibrate: '1 · Calibrate',
-  debayer: '2 · Debayer',
-  measure: '3 · Measure & select',
-  reference: '4 · Reference',
-  register: '5 · Register',
-  normalize: '6 · Local normalization',
-  integrate: '7 · Integrate',
-  drizzle: '8 · Drizzle',
-  output: '9 · Output',
+/** The number in front of a stage's title; the name comes from `stageLabel`, so the board, this title and the
+ *  Re-run menu never disagree. */
+const STAGE_NUMBER: Record<BoardStage, number> = {
+  masters: 0,
+  calibrate: 1,
+  debayer: 2,
+  measure: 3,
+  reference: 4,
+  register: 5,
+  normalize: 6,
+  integrate: 7,
+  drizzle: 8,
+  output: 9,
 };
 
 export function StageInspector({
@@ -68,14 +71,23 @@ export function StageInspector({
   remeasureDisabled,
   mode = 'perSet',
 }: StageInspectorProps) {
+  // Wave 6c: a project and an attested set show Prepare in place of Calibrate (same stage key, same slot).
+  const board = boardMode(plan);
+  const patchCalibration = (patch: Partial<StackingConfig['calibration']>) => {
+    onChange({ ...config, calibration: { ...config.calibration, ...patch } });
+  };
+
   return (
     <div className="bg-surface-elevated rounded-lg p-4 h-full">
-      <h4 className="text-sm font-medium text-content mb-3">{STAGE_TITLE[stage]}</h4>
+      <h4 className="text-sm font-medium text-content mb-3">{`${STAGE_NUMBER[stage]} · ${stageLabel(stage, board)}`}</h4>
       {stage === 'masters' && <MastersPanel plan={plan} />}
-      {stage === 'calibrate' && (
-        <CalibratePanel config={config} onChange={onChange} plan={plan} disabled={disabled} />
-      )}
-      {stage === 'debayer' && <DebayerPanel config={config} />}
+      {stage === 'calibrate' &&
+        (board === 'prepare' ? (
+          <PreparePanel config={config} plan={plan} disabled={disabled} onPatchCalibration={patchCalibration} />
+        ) : (
+          <CalibratePanel config={config} onChange={onChange} plan={plan} disabled={disabled} />
+        ))}
+      {stage === 'debayer' && <DebayerPanel config={config} plan={plan} />}
       {stage === 'measure' && (
         <MeasurePanel
           config={config}
