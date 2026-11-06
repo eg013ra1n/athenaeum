@@ -120,7 +120,7 @@ describe('StackingBlink', () => {
     });
     expect(notifyMock).toHaveBeenCalledWith({
       title: 'Some frames are not on this device',
-      detail: '1 of 3 frames are not on this device.',
+      detail: '2 of 3 frames are not on this device.',
       kind: 'stacking',
       tone: 'warning',
     });

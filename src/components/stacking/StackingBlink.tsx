@@ -113,13 +113,13 @@ export function StackingBlink({
         tone: 'warning',
       });
     (subject.kind === 'frameSet' ? loadSetEntries(rows) : loadProjectEntries(subject.projectId, rows))
-      .then(({ asked, resolved: found }) => {
+      .then(({ resolved: found }) => {
         if (cancelled) return;
-        // Rows with no uuid are skipped without a word; the count is of the frames that were asked for and did
-        // not come back. With nothing to open the notice still says so, and Blink closes.
-        const missing = asked - found.length;
+        // The count is of every row Blink will not open: a row that could not be asked for (no uuid, no frame id)
+        // counts with the frames that did not come back. With nothing to open the notice still says so, and Blink closes.
+        const missing = rows.length - found.length;
         if (found.length === 0) {
-          notAvailable(asked === 0 ? rows.length : missing);
+          notAvailable(missing);
           onClose();
           return;
         }
