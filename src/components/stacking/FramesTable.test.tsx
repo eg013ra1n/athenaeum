@@ -152,6 +152,24 @@ describe('FramesTable for a frame set', () => {
     expect(summary).toHaveClass('text-content-muted');
   });
 
+  it('groups_before_first_run', () => {
+    // No run yet: the plan names each group's members, so the rows sit under the plan's groups, in the plan's order,
+    // and nothing falls under `Not grouped yet`.
+    const lights = SET_LIGHTS.filter((f) => [...L_IDS, ...R_IDS].includes(f.frameId));
+    const groupOf = (id: number): [number, string] => [id, L_IDS.includes(id) ? 'L' : 'R'];
+    renderTable({
+      ...SET,
+      lightFrames: lights,
+      runDetail: null,
+      planGroups: [planGroup('L', 1.2), planGroup('R', 1.2)],
+      planGroupByFrameId: new Map(lights.map((f) => groupOf(f.frameId))),
+    });
+    expect(headers().map((h) => h.textContent?.slice(0, 1))).toEqual(['L', 'R']);
+    expect(screen.queryByText(/Not grouped yet/)).toBeNull();
+    expect(headerOf(/^L/)).toHaveTextContent('0 / 4 included');
+    expect(headerOf(/^R/)).toHaveTextContent('0 / 4 included');
+  });
+
   it('names the selected run in the header line, or says there is none', () => {
     const { rerender } = renderTable(SET);
     expect(screen.getByText('metrics from run #8 · 2026-11-05 22:14:03')).toBeInTheDocument();

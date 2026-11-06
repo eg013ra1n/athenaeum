@@ -340,7 +340,15 @@ export type PlanMaster = { setId: number, kind: MasterWork, imagetyp: string, fr
 
 export type PlanBlocker = { code: string, message: string, };
 
-export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, cameras: Array<string>, exposureS: number | null, exposureClass: string, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
+export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, cameras: Array<string>, exposureS: number | null, exposureClass: string, frameCount: number, 
+/**
+ * The frames this group holds, in group order, every member (a manually excluded one included, so
+ * `member_frame_ids.len() == frame_count`): the same grouping code that builds the group fills it, so the
+ * plan and the run never disagree about membership. The ids are in the run's namespace — a catalog frame
+ * id for a set, a project-frame handle for a project. The Frames table groups its rows by it before the
+ * first run (Frames block spec §7.1).
+ */
+memberFrameIds: Array<number>, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
 /**
  * Tier C Task 1: frames (of `frame_count`) whose `metrics` row AND
  * every one of its planes' `fits` rows are all fresh — a subset of

@@ -9,7 +9,7 @@ import type { ExposureMode, GroupingConfig, PlanGroup } from '../../types/stacki
 const group = (over: Partial<PlanGroup> = {}): PlanGroup =>
   ({
     key: 'mono__L__bin1__180s', instrume: null, colorMode: 'mono', filter: 'L', binning: 1, cameras: ['ASI2600MM'],
-    exposureS: 180, exposureClass: '180s', frameCount: 10, includedCount: 9, totalExposureS: 1620,
+    exposureS: 180, exposureClass: '180s', frameCount: 10, memberFrameIds: [], includedCount: 9, totalExposureS: 1620,
     calibratedCached: 0, metricsCached: 0, pixelScaleArcsec: null, scaleSource: null, scaleRatioToReference: null,
     ...over,
   }) as unknown as PlanGroup;

@@ -1814,7 +1814,7 @@ time on a 16 GB machine). The tab is enabled for every build since that run.
   percentage; the main pane scrolled horizontally after the provenance modal
   (frames table wider than the pane); a cancelled run's board showing every
   stage as "Skipped" (Calibrate had completed from cache, Measure was
-  interrupted); "—" in the frames table's Group column before any run.
+  interrupted).
 - **Dev-workflow note:** the Vite dev server cannot call a separately running
   web API (no CORS layer, no proxy) — for a same-origin dev run build the
   frontend with `NODE_ENV=development VITE_TARGET=web npx vite build --outDir <dir>`

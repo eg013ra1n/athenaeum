@@ -65,8 +65,6 @@ interface PendingWrite {
 const NO_LIGHT_FRAMES: LightFrameRef[] = [];
 const NO_FRAME_IDS: number[] = [];
 const NO_PROJECT_FRAMES: PlanProjectFrame[] = [];
-// Until the plan names each group's members (Task 9) no frame without a run row has a planned group.
-const NO_PLAN_GROUPS = new Map<number, string>();
 
 /** D7: the live feed's events for a project re-plan it at most this often. */
 const PLAN_FEED_REFRESH_MS = 1000;
@@ -253,6 +251,16 @@ export function StackingTab({ subject, onReferenceChanged }: StackingTabProps) {
   const excludedFrameIds = useMemo(
     () => (subject.kind === 'frameSet' ? excluded.map(Number) : NO_FRAME_IDS),
     [excluded, subject.kind],
+  );
+
+  // The plan's group of each frame it names (spec §7.1): the Frames table groups a row with no run row by it, so the
+  // table is grouped before the first run. Ids are in the run's namespace (a catalog id for a set, a handle for a
+  // project), the keys `RowContext.planGroupByFrameId` looks up.
+  const planGroupByFrameId = useMemo(
+    () => new Map<number, string>(
+      (plan?.groups ?? []).flatMap((g) => g.memberFrameIds.map((id): [number, string] => [id, g.key])),
+    ),
+    [plan?.groups],
   );
 
   const handleToggleFramesCollapsed = useCallback(() => {
@@ -1354,7 +1362,7 @@ export function StackingTab({ subject, onReferenceChanged }: StackingTabProps) {
         excludedKeys={excluded}
         referenceFrameUuid={pinnedReference}
         pinnedFrameId={pinnedFrameId}
-        planGroupByFrameId={NO_PLAN_GROUPS}
+        planGroupByFrameId={planGroupByFrameId}
         onSetExcluded={handleSetExcluded}
         onPin={handlePinReference}
         onBlink={handleBlink}

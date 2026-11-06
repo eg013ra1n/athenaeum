@@ -166,6 +166,12 @@ pub struct PlanGroup {
     // shows beside the seconds value.
     pub exposure_class: String,
     pub frame_count: usize,
+    /// The frames this group holds, in group order, every member (a manually excluded one included, so
+    /// `member_frame_ids.len() == frame_count`): the same grouping code that builds the group fills it, so the
+    /// plan and the run never disagree about membership. The ids are in the run's namespace — a catalog frame
+    /// id for a set, a project-frame handle for a project. The Frames table groups its rows by it before the
+    /// first run (Frames block spec §7.1).
+    pub member_frame_ids: Vec<i64>,
     pub included_count: usize,
     pub total_exposure_s: f64,
     pub calibrated_cached: usize,
@@ -3766,6 +3772,7 @@ pub fn build_plan(
             exposure_s: g.exposure_s,
             exposure_class: g.exposure_class.clone(),
             frame_count: g.frames.len(),
+            member_frame_ids: g.frames.iter().map(|f| f.frame_id).collect(),
             included_count,
             total_exposure_s: g.total_exposure_s,
             calibrated_cached,
@@ -4921,6 +4928,72 @@ mod tests {
             .scale_ratio_to_reference
             .expect("and so does the ratio");
         assert!((ratio - 1.55 / 0.78).abs() < 1e-9, "{ratio}");
+    }
+
+    /// Stacking Frames block, spec §7.1: each plan group names the frames it holds, in the run's
+    /// namespace (a catalog frame id for a set), so the Frames table can group before the first run.
+    /// Every member is named, a manually excluded one included: `member_frame_ids.len()` is
+    /// `frame_count`, never `included_count`. The groups are disjoint and together hold every light.
+    #[test]
+    fn plan_groups_name_their_members() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut l_ids = Vec::new();
+        for i in 0..3 {
+            let t = format!("2025-01-01T00:{:02}:00", i * 5);
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), &t));
+            l_ids.push(id);
+        }
+        let mut ha_ids = Vec::new();
+        for i in 0..2 {
+            let t = format!("2025-01-01T01:{:02}:00", i * 5);
+            let stem = format!("ha{i}");
+            let mut spec = light_spec(&stem, &t);
+            spec.filter = Some("Ha");
+            let (id, _path) = test_fixtures::add_light(&f, &spec);
+            ha_ids.push(id);
+        }
+        // One member is excluded for the next run: it stays a member of its group.
+        set_set_config(&f.conn, f.set_id, "{}", &[l_ids[1]]).unwrap();
+
+        let plan = set_plan_of(&f);
+        assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
+        let mut seen: Vec<i64> = Vec::new();
+        for g in &plan.groups {
+            assert_eq!(
+                g.member_frame_ids.len(),
+                g.frame_count,
+                "group {} names every frame it holds",
+                g.key
+            );
+            seen.extend(&g.member_frame_ids);
+        }
+        let big = plan.groups.iter().find(|g| g.frame_count == 3).unwrap();
+        assert_eq!(
+            big.included_count, 2,
+            "the exclusion lowers the included count only"
+        );
+        let mut big_members = big.member_frame_ids.clone();
+        big_members.sort_unstable();
+        assert_eq!(big_members, l_ids, "the excluded frame is still a member");
+        let small = plan.groups.iter().find(|g| g.frame_count == 2).unwrap();
+        let mut small_members = small.member_frame_ids.clone();
+        small_members.sort_unstable();
+        assert_eq!(small_members, ha_ids);
+
+        let mut union = seen.clone();
+        union.sort_unstable();
+        union.dedup();
+        assert_eq!(
+            union.len(),
+            seen.len(),
+            "no frame belongs to two groups: {seen:?}"
+        );
+        let mut lights: Vec<i64> = l_ids.iter().chain(&ha_ids).copied().collect();
+        lights.sort_unstable();
+        assert_eq!(
+            union, lights,
+            "the groups together hold the set's light frames"
+        );
     }
 
     /// M4b ruling R-T1-1, fix round 1: `Auto` reference mode (the default)
@@ -9613,6 +9686,22 @@ mod tests {
             .unwrap();
         assert!(!o1.has_wcs && o1.on_disk && o1.handle.is_some());
         assert_eq!(o1.color_mode, ColorMode::Osc);
+        // Spec §7.1: a project group names its members by project-frame handle, the plan rows' own `handle`.
+        let handles: std::collections::HashSet<i64> = plan
+            .project_frames
+            .iter()
+            .filter_map(|r| r.handle)
+            .collect();
+        for g in &plan.groups {
+            assert_eq!(g.member_frame_ids.len(), g.frame_count, "{}", g.key);
+            for id in &g.member_frame_ids {
+                assert!(
+                    handles.contains(id),
+                    "{id} is no plan row's handle ({})",
+                    g.key
+                );
+            }
+        }
         assert!(plan.masters_to_build.is_empty());
         assert_eq!(plan.readiness.total, 0);
     }

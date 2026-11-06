@@ -377,6 +377,53 @@ const completeEvent = (setId: number | null, projectId: string | null, runId = 3
   runId, setId, projectId, success: false, cancelled: false, error: 'boom', warnings: [], masters: [],
 });
 
+/** The plan's groups with the frames each holds (`PlanGroup.memberFrameIds`), in the plan's order. */
+const planGroupOf = (key: string, memberFrameIds: number[]) =>
+  ({ key, filter: key, exposureClass: '300s', colorMode: 'mono', binning: 1, memberFrameIds });
+
+/** Answers `get_stacking_plan` / `get_project_stacking_plan` with `groups`, and every run list with no run. */
+function planWithGroupsAndNoRun(groups: unknown[], projectFrames: unknown[] = []) {
+  vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
+    switch (command) {
+      case 'get_stacking_plan':
+        return Promise.resolve(plan({ setId: args?.setId, groups }));
+      case 'get_project_stacking_plan':
+        return Promise.resolve(plan({ setId: null, projectId: args?.projectId, groups, projectFrames }));
+      case 'get_stacking_runs':
+      case 'get_project_stacking_runs':
+        return Promise.resolve([]);
+      default:
+        return answer(command, args);
+    }
+  }) as never);
+}
+
+const groupHeaders = () => screen.getAllByTestId('frame-group-header').map((h) => h.textContent?.slice(0, 1));
+
+describe('StackingTab Frames table before the first run', () => {
+  it('groups_a_frame_set_by_the_plan_before_the_first_run', async () => {
+    planWithGroupsAndNoRun([planGroupOf('L', [102]), planGroupOf('R', [101])]);
+    await mount(frameSetTab(7));
+
+    expect(screen.getByText('no run yet')).toBeInTheDocument();
+    expect(groupHeaders()).toEqual(['L', 'R']);
+    expect(screen.queryByText(/Not grouped yet/)).toBeNull();
+    const rows = screen.getAllByTestId('frame-row').map((r) => r.textContent ?? '');
+    expect(rows[0]).toContain('b.fit');
+    expect(rows[1]).toContain('a.fit');
+  });
+
+  it('groups_a_project_by_the_plan_before_the_first_run', async () => {
+    // A project group names its members by project-frame handle; the third frame has none (not on this device).
+    planWithGroupsAndNoRun([planGroupOf('L', [1, 2])], PROJECT_FRAMES);
+    await mount(projectTab('p1'));
+
+    // Only the frame with no handle is left under `Not grouped yet`.
+    expect(groupHeaders()).toEqual(['L', 'N']);
+    expect(screen.getAllByText(/Not grouped yet/)).toHaveLength(1);
+  });
+});
+
 describe('StackingTab Frames table writes for a frame set', () => {
   const MANUAL = { ...CONFIG, reference: { mode: 'manual', twoPass: false } };
   const AUTO = { ...CONFIG, reference: { mode: 'auto', twoPass: false } };
