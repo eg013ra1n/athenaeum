@@ -439,9 +439,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     }
 
     renderLockRef.current = true;
+    // A decode that outlives an Aligned / Original flip belongs to the variant that left: the flip released the lock
+    // and blanked the canvas, so it neither paints, nor reports an error, nor touches the lock a newer decode holds.
+    const epoch = variantEpochRef.current;
     const img = new Image();
 
     img.onload = () => {
+      if (epoch !== variantEpochRef.current) return;
       try {
         currentImageRef.current = img;
         renderCanvas();
@@ -451,6 +455,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
 
     img.onerror = () => {
+      if (epoch !== variantEpochRef.current) return;
       setError("Failed to load/decode image");
       renderLockRef.current = false;
     };
@@ -634,6 +639,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const next = !alignedActiveRef.current;
     alignedActiveRef.current = next;
     variantEpochRef.current += 1;
+    renderLockRef.current = false; // a pending decode is stale now; the other variant's render must not wait for it
     loadedImagesRef.current.forEach((value) => {
       if (value.startsWith("blob:")) URL.revokeObjectURL(value);
     });
@@ -1215,7 +1221,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
             {cur?.badge && <Chip tone="warn">{cur.badge}</Chip>}
             <span className="truncate font-mono text-content">{cur?.file.filename}</span>
             {cur && contextLabel && <span className="truncate">{contextLabel(cur)}</span>}
-            {alignedActive && cur && alignedReasonOf(cur) !== null && (
+            {alignedMode && cur && alignedReasonOf(cur) !== null && (
               <span className="truncate">{`original — ${alignedReasonOf(cur)}`}</span>
             )}
             <span className="flex-1" />

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
@@ -11,12 +11,22 @@ import type { File as CatalogFile, Frame } from '../types/models';
 vi.mock('../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn(() => Promise.resolve(() => {})) } }));
 vi.mock('../utils/platform', () => ({ isTauri: true }));
 
+// What the canvas was asked to draw, first argument of every drawImage.
+const drawn: unknown[] = [];
+
 beforeAll(() => {
   URL.createObjectURL = vi.fn(() => 'blob:x');
   URL.revokeObjectURL = vi.fn();
-  // jsdom has no 2D context: a context whose every method is a no-op.
+  // jsdom has no 2D context: a context whose every method is a no-op, drawImage noting its image.
   HTMLCanvasElement.prototype.getContext = vi.fn(
-    () => new Proxy({}, { get: (_t, k) => (k === 'canvas' ? document.createElement('canvas') : () => {}), set: () => true }),
+    () => new Proxy({}, {
+      get: (_t, k) => {
+        if (k === 'canvas') return document.createElement('canvas');
+        if (k === 'drawImage') return (img: unknown) => { drawn.push(img); };
+        return () => {};
+      },
+      set: () => true,
+    }),
   ) as never;
 });
 
@@ -33,6 +43,7 @@ function entry(i: number, o: Partial<BlinkFrame> = {}): BlinkFrame {
 const invoked = (cmd: string) => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === cmd);
 
 beforeEach(() => {
+  drawn.length = 0;
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
     if (cmd === 'get_blink_threads_max') return 2;
@@ -443,6 +454,8 @@ describe('BlinkViewer — aligned frames of a stacking run', () => {
     expect(screen.queryByTitle(/aligned frames|original frames/)).toBeNull();
     expect(screen.getByTitle('Show star annotations (A)')).toBeEnabled();
     expect(invoked('get_stacking_aligned_image')).toHaveLength(0);
+    // With no switch to say it, the strip still says why this entry is an original (spec 6.7: an older run).
+    expect(screen.getByText('original — a later run replaced it')).toBeInTheDocument();
   });
 
   it('an entry without an aligned frame loads its original and says why in the strip', async () => {
@@ -461,5 +474,75 @@ describe('BlinkViewer — aligned frames of a stacking run', () => {
     // On the original the strip stays quiet: every entry is an original there.
     fireEvent.click(screen.getByTitle(SWITCH_TO_ORIGINAL));
     expect(screen.queryByText(/^original — /)).toBeNull();
+  });
+});
+
+describe('BlinkViewer — a decode in flight when the aligned switch flips', () => {
+  const aligned = (i: number): BlinkFrame => entry(i, { imageRef: undefined, source: 'raw', aligned: { runId: 8, frameId: i } });
+  // jsdom decodes nothing: every Image made waits in `decodes` until the test fires its load or error.
+  let decodes: HTMLImageElement[];
+  const srcs = () => decodes.map((d) => d.getAttribute('src'));
+
+  beforeEach(() => {
+    decodes = [];
+    vi.stubGlobal('Image', function FakeImage() {
+      const img = document.createElement('img');
+      Object.defineProperty(img, 'width', { value: 100 });
+      Object.defineProperty(img, 'height', { value: 100 });
+      decodes.push(img);
+      return img;
+    });
+    // The blob URL tells the variants apart: the aligned image is 3 bytes, the original 2.
+    vi.mocked(URL.createObjectURL).mockImplementation((b) => `blob:${(b as Blob).size}`);
+    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_blink_threads_max') return 2;
+      if (cmd === 'get_setting') return '';
+      if (cmd === 'get_stacking_aligned_image') return new Uint8Array(3);
+      if (cmd === 'read_fits_image_rustafits') return new Uint8Array(2);
+      return null;
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.mocked(URL.createObjectURL).mockImplementation(() => 'blob:x');
+  });
+
+  /** The aligned preview has landed and its decode is pending; the switch flips to Original. */
+  async function flipWhileTheAlignedDecodePends() {
+    renderBlink({ actions: [], frames: [aligned(1)] });
+    await waitFor(() => expect(srcs()).toEqual(['blob:3']));
+    fireEvent.click(screen.getByTitle('Show original frames'));
+    await waitFor(() => expect(invoked('read_fits_image_rustafits')).toHaveLength(1));
+  }
+  const fire = (img: HTMLImageElement, type: 'load' | 'error') => act(async () => { img.dispatchEvent(new Event(type)); });
+
+  it('stale_decode_load_is_not_painted', async () => {
+    await flipWhileTheAlignedDecodePends();
+    // The original's decode starts although the aligned one has not finished.
+    await waitFor(() => expect(srcs()).toEqual(['blob:3', 'blob:2']));
+    const [leaving, arriving] = decodes;
+
+    await fire(leaving, 'load');
+    expect(drawn).toEqual([]);
+
+    await fire(arriving, 'load');
+    expect(drawn.length).toBeGreaterThan(0);
+    expect(drawn.every((d) => d === arriving)).toBe(true);
+    expect(screen.queryByText(/Failed to load/)).toBeNull();
+  });
+
+  it('stale_decode_error_shows_no_banner', async () => {
+    await flipWhileTheAlignedDecodePends();
+    await waitFor(() => expect(srcs()).toEqual(['blob:3', 'blob:2']));
+    const [leaving, arriving] = decodes;
+
+    // Revoking the aborted blob makes the browser fail the pending decode.
+    await fire(leaving, 'error');
+    expect(screen.queryByText(/Failed to load/)).toBeNull();
+
+    await fire(arriving, 'load');
+    expect(drawn.length).toBeGreaterThan(0);
+    expect(drawn.every((d) => d === arriving)).toBe(true);
+    expect(screen.queryByText(/Failed to load/)).toBeNull();
   });
 });
