@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { useStackingRuns } from './useStackingRuns';
 import { api } from '../api';
@@ -41,6 +41,8 @@ describe('useStackingRuns', () => {
     notifyMock.mockClear();
     vi.mocked(api.invoke).mockReset();
   });
+
+  afterEach(() => vi.restoreAllMocks());
 
   it('keys a frame-set run by its set subject key', async () => {
     const { result, handlers } = await mount();
@@ -126,7 +128,6 @@ describe('useStackingRuns', () => {
     expect(result.current.lastOutcome.size).toBe(0);
     expect(notifyMock).not.toHaveBeenCalled();
     expect(err).toHaveBeenCalledTimes(4);
-    err.mockRestore();
   });
 
   it('starts a project run through start_project_stacking with its project id', async () => {
@@ -166,6 +167,13 @@ describe('useStackingRuns', () => {
     expect(err).toHaveBeenCalledWith('[useStackingRuns] start_project_stacking failed:', 'boom');
     expect(notifyMock).toHaveBeenCalledTimes(1);
     expect(notifyMock.mock.calls[0][0].title).toBe('Failed to start stacking');
-    err.mockRestore();
+
+    notifyMock.mockClear();
+    await act(async () => {
+      await expect(result.current.startRun(frameSet(7))).rejects.toBe('boom');
+    });
+    expect(err).toHaveBeenCalledWith('[useStackingRuns] start_stacking failed:', 'boom');
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(notifyMock.mock.calls[0][0].title).toBe('Failed to start stacking');
   });
 });
