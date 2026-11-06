@@ -21,7 +21,8 @@ import type {
 import { PipelineBoard } from './PipelineBoard';
 import { GroupsTable } from './GroupsTable';
 import { StageInspector } from './StageInspector';
-import { FramesTable, type LightFrameRef } from './FramesTable';
+import { FramesTable } from './FramesTable';
+import type { LightFrameRef } from './frameRows';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 import { EmptyState } from '../ui/EmptyState';
 import { ResultsPanel } from './ResultsPanel';

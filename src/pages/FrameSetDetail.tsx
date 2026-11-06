@@ -22,6 +22,7 @@ import { RestoreDialog } from '../components/archive/RestoreDialog';
 import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { StackingTab } from '../components/stacking/StackingTab';
+import type { LightFrameRef } from '../components/stacking/frameRows';
 import { revealItemInDir, openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
@@ -381,8 +382,10 @@ export default function FrameSetDetail() {
   // second copy of a frame the set already holds (`duplicateFrameIds`).
   const stackingLightFrames = useMemo(() => {
     if (!detail) return [];
-    const out: { frameId: number; filename: string }[] = [];
+    const out: LightFrameRef[] = [];
     for (const night of detail.nights) {
+      // The `YYYY-MM-DD` of the night (`start_time` is a date or a date-time).
+      const nightDate = night.imaging_night.start_time.slice(0, 10);
       for (const session of night.sessions) {
         for (const fw of session.frames) {
           if (
@@ -392,7 +395,12 @@ export default function FrameSetDetail() {
             !(fw.file.id != null && blackholedFileIds.has(fw.file.id)) &&
             !duplicateFrameIds.has(fw.frame.id)
           ) {
-            out.push({ frameId: fw.frame.id, filename: fw.file.filename });
+            out.push({
+              frameId: fw.frame.id,
+              filename: fw.file.filename,
+              night: nightDate,
+              exptimeSec: fw.frame.exptime,
+            });
           }
         }
       }

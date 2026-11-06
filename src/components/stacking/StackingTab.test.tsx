@@ -12,7 +12,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { advance, PAST_THE_DEBOUNCE_MS } from '../../test/fakeClock';
 import { StackingProvider } from '../../contexts/StackingContext';
 import { StackingTab } from './StackingTab';
-import type { LightFrameRef } from './FramesTable';
+import type { LightFrameRef } from './frameRows';
 import { api } from '../../api';
 import type { StackingConfig, StackingPlan } from '../../types/stacking';
 
@@ -77,8 +77,8 @@ const RUN = {
 };
 
 const FRAMES: LightFrameRef[] = [
-  { frameId: 101, filename: 'a.fit' },
-  { frameId: 102, filename: 'b.fit' },
+  { frameId: 101, filename: 'a.fit', night: null, exptimeSec: null },
+  { frameId: 102, filename: 'b.fit', night: null, exptimeSec: null },
 ];
 
 const PROJECT_CONFIG = {

@@ -109,7 +109,13 @@ afterEach(() => {
 
 const projectTab = <StackingTab subject={{ kind: 'project', projectId: 'p1', title: 'Project' }} />;
 const frameSetTab = (
-  <StackingTab subject={{ kind: 'frameSet', framesSetId: 7, lightFrames: [{ frameId: 101, filename: 'a.fit' }] }} />
+  <StackingTab
+    subject={{
+      kind: 'frameSet',
+      framesSetId: 7,
+      lightFrames: [{ frameId: 101, filename: 'a.fit', night: null, exptimeSec: null }],
+    }}
+  />
 );
 
 async function mount(tab: ReactElement, stage?: string) {
