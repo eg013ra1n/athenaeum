@@ -642,9 +642,9 @@ export function FramesTable({
                             }
                             title={
                               r.pinned
-                                ? // A pinned frame that is no longer usable says why, after the clear hint.
+                                ? // A pinned frame that is no longer usable says why, in brackets after the clear hint.
                                   !r.pinnable && r.pinNote
-                                  ? `The reference frame — click to clear. ${r.pinNote}`
+                                  ? `The reference frame — click to clear (${r.pinNote})`
                                   : 'The reference frame — click to clear'
                                 : (r.pinNote ?? 'Use as the reference frame')
                             }

@@ -165,6 +165,11 @@ describe('GridSchematic', () => {
     expect(screen.queryByText(/not drawn/)).toBeNull();
   });
 
+  it('says it in the singular for one frame', () => {
+    draw({ framesNotDrawn: 1 });
+    expect(screen.getByText('1 frame is not drawn: no WCS in the manifest')).toBeInTheDocument();
+  });
+
   it('tilts the N arrow by the rotation of the grid', () => {
     const { unmount } = draw();
     expect(screen.getByTestId('grid-north').getAttribute('data-angle')).toBe('0.0');
@@ -403,6 +408,12 @@ describe('GridCard', () => {
     expect(screen.getByTestId('grid-schematic')).toBeInTheDocument();
   });
 
+  it('counts the accepted frames inside in the singular for one', () => {
+    card(planGrid('proposed', { framesInside: 1 }));
+    expect(screen.getByText('1 accepted frame lies at least half inside')).toBeInTheDocument();
+    expect(screen.queryByText(/1 accepted frames/)).toBeNull();
+  });
+
   it('reads the same for an unset state that carries a proposal', () => {
     card(planGrid('unset'));
     expect(screen.getByRole('heading', { name: 'Canonical grid — not confirmed' })).toBeInTheDocument();
@@ -469,6 +480,19 @@ describe('GridCard', () => {
     expect((dialog.getByLabelText('Width (px)') as HTMLInputElement).value).toBe('4096');
   });
 
+  it('warns about the rewrite in an Edit… dialog once the grid behind it was confirmed by someone else', () => {
+    const view = render(withMembers(<GridCard projectId="p1" grid={planGrid('proposed')} onSaved={vi.fn()} />));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit…' }));
+    expect(screen.queryByText(/rewrite its registered frames/)).toBeNull();
+    // Another member confirmed a grid while the dialog was open; the editor still can edit.
+    view.rerender(withMembers(<GridCard projectId="p1" grid={planGrid('confirmed')} onSaved={vi.fn()} />));
+    expect(
+      within(screen.getByRole('dialog')).getByText(
+        "Changing the grid makes every processor's next run rewrite its registered frames. Star matching is kept.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it('draws the confirmed grid, not the proposal, in the card', () => {
     card(planGrid('confirmed'));
     expect(Number(screen.getByTestId('grid-rect').getAttribute('width'))).toBe(4096);
@@ -517,6 +541,33 @@ describe('GridCard', () => {
     expect(spy).toHaveBeenCalledWith('[GridCard] set_collab_project_grid failed:', err);
     expect(onSaved).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Use proposal' })).toBeEnabled();
+  });
+
+  it('clears the refusal of Use proposal after a successful save from Edit…', async () => {
+    const err = 'hub returned 400 Bad Request (put project grid): out of bounds';
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(api.invoke).mockRejectedValueOnce(err);
+    const { onSaved } = card(planGrid('proposed'));
+    fireEvent.click(screen.getByRole('button', { name: 'Use proposal' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(err);
+
+    vi.mocked(api.invoke).mockResolvedValue(undefined as never);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('clears the refusal of Use proposal when the shown grid becomes confirmed', async () => {
+    const err = 'hub returned 403 Forbidden (put project grid): no project.edit';
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(api.invoke).mockRejectedValue(err);
+    const view = render(withMembers(<GridCard projectId="p1" grid={planGrid('proposed')} onSaved={vi.fn()} />));
+    fireEvent.click(screen.getByRole('button', { name: 'Use proposal' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(err);
+    view.rerender(withMembers(<GridCard projectId="p1" grid={planGrid('confirmed')} onSaved={vi.fn()} />));
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   // Review Focus 4: a save the hub refused (403 or 400) or another member got in first. The dialog stays open with

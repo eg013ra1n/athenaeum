@@ -168,7 +168,9 @@ export function GridSchematic({ grid, target, footprints, framesNotDrawn }: Grid
         {drawing.north !== null && <NorthArrow angleDeg={drawing.north} />}
       </div>
       {framesNotDrawn > 0 && (
-        <p className="mt-1 text-[11px] text-content-faint">{framesNotDrawn} frames are not drawn: no WCS in the manifest</p>
+        <p className="mt-1 text-[11px] text-content-faint">
+          {framesNotDrawn === 1 ? '1 frame is' : `${framesNotDrawn} frames are`} not drawn: no WCS in the manifest
+        </p>
       )}
     </div>
   );

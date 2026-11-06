@@ -2,7 +2,7 @@
 // every processor's run shares. An editor (`canEdit`: `project.edit`) proposes, confirms and changes it here; every
 // other member reads it, or waits for the coordinator to confirm one.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../../api';
 import { Button } from '../ui/Button';
 import { Card } from '../ui/Card';
@@ -49,12 +49,19 @@ export function GridCard({ projectId, grid, onSaved }: GridCardProps) {
   // The grid the schematic draws: the confirmed one, else the proposal.
   const shown = confirmed ? current : proposal;
 
+  // A refusal of `Use proposal` is about the card as it was: a grid someone else confirmed makes it stale.
+  useEffect(() => {
+    if (confirmed) setProposalError(null);
+  }, [confirmed]);
+
   const save = async (g: CanonicalGrid) => {
     await api.invoke<CanonicalGrid>('set_collab_project_grid', { projectId, grid: g });
+    // Any save that went through, from the dialog too, settles the refusal the card was showing.
+    setProposalError(null);
     onSaved();
   };
 
-  const useProposal = async () => {
+  const applyProposal = async () => {
     if (proposal === null || busy) return;
     setBusy(true);
     setProposalError(null);
@@ -75,7 +82,12 @@ export function GridCard({ projectId, grid, onSaved }: GridCardProps) {
     facts.push(['Grid', gridValuesLine(current)]);
   } else if (proposal !== null) {
     facts.push(['Proposal', gridValuesLine(proposal)]);
-    if (canEdit) facts.push(['Frames', `${grid.framesInside} accepted frames lie at least half inside`]);
+    if (canEdit) facts.push([
+        'Frames',
+        grid.framesInside === 1
+          ? '1 accepted frame lies at least half inside'
+          : `${grid.framesInside} accepted frames lie at least half inside`,
+      ]);
   }
 
   return (
@@ -104,7 +116,7 @@ export function GridCard({ projectId, grid, onSaved }: GridCardProps) {
             ) : (
               <>
                 {proposal !== null && (
-                  <Button variant="primary" onClick={() => void useProposal()} disabled={busy}>
+                  <Button variant="primary" onClick={() => void applyProposal()} disabled={busy}>
                     Use proposal
                   </Button>
                 )}
@@ -123,7 +135,8 @@ export function GridCard({ projectId, grid, onSaved }: GridCardProps) {
       {dialog !== null && (
         <GridDialog
           initial={dialog.initial}
-          warnRewrite={dialog.warnRewrite}
+          // A dialog opened from `Edit…` warns too once the grid behind it has been confirmed by someone else.
+          warnRewrite={dialog.warnRewrite || confirmed}
           schematic={{ target: grid.target, footprints: grid.footprints, framesNotDrawn: grid.framesNotDrawn }}
           onSave={save}
           onClose={() => setDialog(null)}
