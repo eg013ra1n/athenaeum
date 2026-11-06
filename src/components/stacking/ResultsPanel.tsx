@@ -18,6 +18,7 @@ import type {
   WorkUsage,
 } from '../../types/stacking';
 import { readSelectedRunId, writeSelectedRunId } from './stackingPrefs';
+import { subjectKey } from './subject';
 import { ProvenanceModal } from './ProvenanceModal';
 import { formatBytes } from './formatBytes';
 import { snrGainLabel } from './snrGain';
@@ -379,7 +380,7 @@ function MasterCard({
 export interface ResultsPanelProps {
   setId: number;
   /** True while a run is active for this set (`StackingTab`'s own
-   *  `isRunning(setId) || plan?.activeRunId != null`, threaded through
+   *  `isRunning(key) || plan?.activeRunId != null`, threaded through
    *  rather than recomputed here so the two never disagree on what
    *  "running" means). Gates the cleanup button. */
   running: boolean;
@@ -407,7 +408,8 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
   const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false);
   const [cleaning, setCleaning] = useState(false);
 
-  const lastOutcomeRunId = lastOutcome.get(setId)?.runId;
+  const stackKey = subjectKey({ kind: 'frameSet', framesSetId: setId, lightFrames: [] });
+  const lastOutcomeRunId = lastOutcome.get(stackKey)?.runId;
 
   const runsSeqRef = useRef(0);
   const fetchRuns = useCallback(async () => {
@@ -419,7 +421,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       setRunsError(null);
       setSelectedRunId((prev) => {
         if (prev != null && list.some((r) => r.run.id === prev)) return prev;
-        const remembered = readSelectedRunId(setId);
+        const remembered = readSelectedRunId(stackKey);
         if (remembered != null && list.some((r) => r.run.id === remembered)) return remembered;
         return list.length > 0 ? list[0].run.id : null; // newest first
       });
@@ -427,7 +429,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       console.error('[ResultsPanel] get_stacking_runs failed:', err);
       if (seq === runsSeqRef.current) setRunsError(String(err));
     }
-  }, [setId]);
+  }, [setId, stackKey]);
 
   // Mount / set change, every completion of a run for this set, and any
   // catalog change a completed run (or something else) might have caused.
@@ -447,7 +449,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       setRunDetail(null);
       return;
     }
-    writeSelectedRunId(setId, selectedRunId);
+    writeSelectedRunId(stackKey, selectedRunId);
     let cancelled = false;
     const seq = ++detailSeqRef.current;
     (async () => {
@@ -461,7 +463,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       }
     })();
     return () => { cancelled = true; };
-  }, [selectedRunId, setId, lastOutcomeRunId]);
+  }, [selectedRunId, setId, stackKey, lastOutcomeRunId]);
 
   useEffect(() => {
     onSelectedRunDetailChange(runDetail);

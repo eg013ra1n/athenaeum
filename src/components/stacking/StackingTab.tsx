@@ -4,6 +4,7 @@ import { Play, Square, ChevronDown, ChevronRight, FolderOpen, AlertTriangle, Loa
 import { api } from '../../api';
 import { useStackingContext } from '../../contexts/StackingContext';
 import { useNotifications } from '../../contexts/NotificationContext';
+import { subjectKey, type StackSubject } from './subject';
 import type {
   NamedPreset,
   Stage,
@@ -124,9 +125,14 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   // the other directly.
   const [selectedRunDetail, setSelectedRunDetail] = useState<StackingRunDetail | null>(null);
 
-  const runProgress = progress.get(framesSetId);
-  const runOutcome = lastOutcome.get(framesSetId);
-  const running = isRunning(framesSetId) || plan?.activeRunId != null;
+  const subject = useMemo<StackSubject>(
+    () => ({ kind: 'frameSet', framesSetId, lightFrames }),
+    [framesSetId, lightFrames],
+  );
+  const stackKey = subjectKey(subject);
+  const runProgress = progress.get(stackKey);
+  const runOutcome = lastOutcome.get(stackKey);
+  const running = isRunning(stackKey) || plan?.activeRunId != null;
 
   // The board's per-row cancelled/failed derivation (A5) needs the SAME
   // run's finished-stage list `outcome` describes — `selectedRunDetail`
@@ -616,8 +622,8 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
 
   const handleRun = useCallback(() => {
     if (!plan || plan.blockers.length > 0 || running || starting) return;
-    void beginStarting(() => startRun(framesSetId, draftConfig ?? undefined));
-  }, [plan, running, starting, beginStarting, startRun, framesSetId, draftConfig]);
+    void beginStarting(() => startRun(subject, draftConfig ?? undefined));
+  }, [plan, running, starting, beginStarting, startRun, subject, draftConfig]);
 
   const handleCancel = useCallback(async () => {
     const runId = runProgress?.runId ?? plan?.activeRunId ?? null;
@@ -632,8 +638,8 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const handleRerunFrom = useCallback((stage: Stage) => {
     setRerunMenuOpen(false);
     if (running || starting) return;
-    void beginStarting(() => startRun(framesSetId, draftConfig ?? undefined, stage));
-  }, [running, starting, beginStarting, startRun, framesSetId, draftConfig]);
+    void beginStarting(() => startRun(subject, draftConfig ?? undefined, stage));
+  }, [running, starting, beginStarting, startRun, subject, draftConfig]);
 
   // Measure panel's own "Re-measure" button (spec: rerunFrom: 'measure').
   // Gates on the plan's blockers and on a live run, the same way the

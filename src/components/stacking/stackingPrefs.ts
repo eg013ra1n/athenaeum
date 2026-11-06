@@ -15,6 +15,7 @@
 // second, incompatible one alongside it.
 
 import type { BoardStage } from './stageSummary';
+import type { SubjectKey } from './subject';
 
 /** localStorage key for the last-selected inspector stage. */
 export const STACKING_SELECTED_STAGE_KEY = 'athenaeum.stacking.selectedStage';
@@ -103,15 +104,24 @@ export function writeInspectorCollapsed(collapsed: boolean): void {
 }
 
 /** localStorage key prefix for the Results panel's last-selected run — one
- *  entry per frame set (a run id from one set is meaningless for another,
- *  unlike the selected stage, which is one global preference). */
+ *  entry per subject (a run id from one frame set or project is meaningless
+ *  for another, unlike the selected stage, which is one global preference). */
 const STACKING_SELECTED_RUN_KEY_PREFIX = 'athenaeum.stacking.selectedRun.';
 
-/** Read the last-selected run id for `setId` (`null` when unset/corrupt —
- *  the Results panel then falls back to the newest run). */
-export function readSelectedRunId(setId: number): number | null {
+/** The storage key of a subject's selected run. A frame set keeps the
+ *  spelling it had before projects could be stacked (`<prefix><setId>`, the
+ *  number alone), so a remembered choice survives the upgrade; a project is
+ *  `<prefix>project:<projectId>`. */
+function selectedRunStorageKey(key: SubjectKey): string {
+  const suffix = key.startsWith('set:') ? key.slice('set:'.length) : key;
+  return `${STACKING_SELECTED_RUN_KEY_PREFIX}${suffix}`;
+}
+
+/** Read the last-selected run id for the subject `key` (`null` when
+ *  unset/corrupt — the Results panel then falls back to the newest run). */
+export function readSelectedRunId(key: SubjectKey): number | null {
   try {
-    const raw = localStorage.getItem(`${STACKING_SELECTED_RUN_KEY_PREFIX}${setId}`);
+    const raw = localStorage.getItem(selectedRunStorageKey(key));
     // Fix round 1, Minor #9: `Number('')` is `0`, not `NaN` — an empty
     // string must be rejected explicitly before it silently reads back as
     // a real (and almost certainly wrong) run id.
@@ -124,10 +134,10 @@ export function readSelectedRunId(setId: number): number | null {
   }
 }
 
-/** Persist the last-selected run id for `setId`. */
-export function writeSelectedRunId(setId: number, runId: number): void {
+/** Persist the last-selected run id for the subject `key`. */
+export function writeSelectedRunId(key: SubjectKey, runId: number): void {
   try {
-    localStorage.setItem(`${STACKING_SELECTED_RUN_KEY_PREFIX}${setId}`, String(runId));
+    localStorage.setItem(selectedRunStorageKey(key), String(runId));
   } catch (err) {
     console.warn('[stackingPrefs] write selected run failed:', err);
   }
