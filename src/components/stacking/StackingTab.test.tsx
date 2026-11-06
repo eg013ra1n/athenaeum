@@ -312,6 +312,8 @@ function projectWith(o: {
   mode?: 'auto' | 'manual';
   runFrames?: unknown[];
   activeRunId?: number | null;
+  /** `PlanGrid` of the plan (absent: the plan carries none). */
+  grid?: unknown;
 }) {
   vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
     switch (command) {
@@ -326,6 +328,7 @@ function projectWith(o: {
         return Promise.resolve(
           plan({
             setId: null, projectId: args?.projectId, projectFrames: PROJECT_FRAMES, activeRunId: o.activeRunId ?? null,
+            ...(o.grid === undefined ? {} : { grid: o.grid }),
           }),
         );
       case 'get_stacking_run':
@@ -586,6 +589,45 @@ describe('StackingTab for a project', () => {
       await mount(frameSetTab(7));
       expect(screen.queryByRole('button', { name: 'Publisher' })).toBeNull();
       expect(screen.queryByRole('columnheader', { name: 'Reference' })).toBeNull();
+    });
+  });
+
+  describe('the grid card', () => {
+    const GRID_PLAN = {
+      state: 'proposed', current: null, framesInside: 12, canEdit: true,
+      proposal: { scaleArcsec: 1.5, widthPx: 3200, heightPx: 2560, crval1: 83.82, crval2: -5.39, rotationDeg: 0 },
+      target: { raDeg: 83.82, decDeg: -5.39, radiusDeg: 1 }, footprints: [], framesNotDrawn: 0,
+    };
+
+    it('sits above the board for a project', async () => {
+      projectWith({ grid: GRID_PLAN });
+      await mount(projectTab('p1'));
+      const heading = screen.getByRole('heading', { name: 'Canonical grid \u2014 not confirmed' });
+      const board = screen.getByTestId('board');
+      expect(heading.compareDocumentPosition(board) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it('is absent when the plan carries no grid, and for a frame set', async () => {
+      projectWith({ grid: null });
+      const view = await mount(projectTab('p1'));
+      expect(screen.queryByText(/Canonical grid/)).toBeNull();
+      view.unmount();
+      await mount(frameSetTab(7));
+      expect(screen.queryByText(/Canonical grid/)).toBeNull();
+    });
+
+    it('Use proposal saves the proposal for this project, then re-plans', async () => {
+      projectWith({ grid: GRID_PLAN });
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const plansBefore = argsOf('get_project_stacking_plan').length;
+
+      fireEvent.click(screen.getByRole('button', { name: 'Use proposal' }));
+      await advance(0);
+      await advance(0);
+
+      expect(argsOf('set_collab_project_grid')).toEqual([{ projectId: 'p1', grid: GRID_PLAN.proposal }]);
+      expect(argsOf('get_project_stacking_plan')).toHaveLength(plansBefore + 1);
     });
   });
 });

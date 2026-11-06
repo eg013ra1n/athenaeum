@@ -22,6 +22,7 @@ import { StageInspector } from './StageInspector';
 import { FramesTable, type LightFrameRef } from './FramesTable';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 import { ResultsPanel } from './ResultsPanel';
+import { GridCard } from './GridCard';
 import { boardMode, stableStringify, stageLabel, withoutPaths, type BoardStage } from './stageSummary';
 import {
   readSelectedStage,
@@ -488,6 +489,12 @@ export function StackingTab({ subject }: StackingTabProps) {
       prev ? { ...prev, drizzle: { ...prev.drizzle, enabled: checked } } : prev,
     );
   }, [setUserConfig]);
+
+  // A grid the card saved: re-plan now (the grid blocker lifts, the Register row unblocks). The live feed's
+  // `collab-grid-changed` re-plans again later, harmlessly.
+  const handleGridSaved = useCallback(() => {
+    void refetchPlan(draftConfigRef.current ?? undefined);
+  }, [refetchPlan]);
 
   const handleSelectStage = useCallback((stage: BoardStage) => {
     setSelectedStage(stage);
@@ -1111,6 +1118,11 @@ export function StackingTab({ subject }: StackingTabProps) {
       {/* Board (62%) / Inspector (38%) */}
       <div className="flex flex-col lg:flex-row gap-4">
         <div className="lg:w-[62%] min-w-0 space-y-3">
+          {/* A project's canonical grid is the registration target of every run: it sits above the board whose
+              Register row it unblocks. A frame set has none. */}
+          {subject.kind === 'project' && plan.grid && (
+            <GridCard projectId={subject.projectId} grid={plan.grid} onSaved={handleGridSaved} />
+          )}
           <PipelineBoard
             plan={plan}
             config={draftConfig}

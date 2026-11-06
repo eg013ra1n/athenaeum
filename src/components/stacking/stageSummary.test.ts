@@ -152,3 +152,27 @@ describe('rowState masters for a project and an attested set', () => {
   it('is still blocked for a frame set with a masters blocker', () =>
     expect(rowState('masters', planOf({ blockers: blocked }), undefined, undefined, CONFIG)).toBe('blocked'));
 });
+
+describe('rowState register for a project whose grid is not confirmed', () => {
+  const gridBlocker = { code: 'grid', message: 'Confirm the project\'s grid in the Stacking tab' };
+
+  it('is blocked while the plan carries the grid blocker', () => {
+    expect(rowState('register', planOf({ projectId: 'p1', blockers: [gridBlocker] }), undefined, undefined, CONFIG)).toBe('blocked');
+  });
+
+  it('is ready once the blocker is gone', () => {
+    expect(rowState('register', planOf({ projectId: 'p1' }), undefined, undefined, CONFIG)).toBe('ready');
+  });
+
+  it('puts the grid blocker on no other row', () => {
+    const plan = planOf({ projectId: 'p1', blockers: [gridBlocker] });
+    for (const stage of ['calibrate', 'measure', 'reference', 'normalize', 'integrate', 'output'] as const) {
+      expect(rowState(stage, plan, undefined, undefined, CONFIG), stage).toBe('ready');
+    }
+  });
+
+  it('lets a live run outrank the blocker', () => {
+    const progress = { runId: 1, subjectKey: 'project:p1', stage: 'register', groupKey: null, current: 1, total: 2, percent: 50, bytesDone: 0, bytesTotal: 0, frameId: null, message: null, startedAt: 0 } as unknown as RunProgress;
+    expect(rowState('register', planOf({ projectId: 'p1', blockers: [gridBlocker] }), progress, undefined, CONFIG)).toBe('running');
+  });
+});

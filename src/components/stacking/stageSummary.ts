@@ -497,6 +497,8 @@ const BLOCKER_STAGE: Partial<Record<string, BoardStage>> = {
   masters: 'masters',
   masterFiles: 'masters',
   links: 'calibrate',
+  // Registration lands on the project's grid (spec §5.5), so Register reads blocked while the grid is unconfirmed.
+  grid: 'register',
   reference: 'reference',
   folders: 'output',
   space: 'output',
