@@ -2,7 +2,7 @@
 // no way to a Calibration tab a project does not have, and a reference pinned in the Frames table. The real inspector
 // and panels render here; the board (pinned in `PipelineBoard.test.tsx`) and the groups table are stubs.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { advance, PAST_THE_DEBOUNCE_MS } from '../../test/fakeClock';
@@ -126,6 +126,19 @@ async function mount(tab: ReactElement, stage?: string) {
 const argsOf = (command: string) =>
   vi.mocked(api.invoke).mock.calls.filter(([c]) => c === command).map(([, args]) => args);
 
+/** The collapsed-inspector buttons named `name`: the ones that carry `aria-expanded`, whatever else shares the name. */
+const inspectorButtons = (name: string) =>
+  screen.queryAllByRole('button', { name }).filter((b) => b.hasAttribute('aria-expanded'));
+
+/** Opens the Re-run menu and returns it: the element right after its trigger button. */
+function openRerunMenu(): HTMLElement {
+  const trigger = screen.getByRole('button', { name: /Re-run from/ });
+  fireEvent.click(trigger);
+  const menu = trigger.nextElementSibling;
+  if (!(menu instanceof HTMLElement)) throw new Error('the Re-run menu did not open');
+  return menu;
+}
+
 describe('StackingTab Coverage link', () => {
   it('is not rendered for a project, whose blockers still show', async () => {
     await mount(projectTab);
@@ -196,15 +209,58 @@ describe('StackingTab Prepare', () => {
     ]);
   });
 
-  it('names the first stage Prepare in the Re-run menu of a project, and Calibrate for a frame set', async () => {
+  it('labels the collapsed-inspector button Prepare for a project and Calibrate for a frame set', async () => {
     const view = await mount(projectTab);
-    fireEvent.click(screen.getByRole('button', { name: /Re-run from/ }));
-    expect(screen.getByRole('button', { name: 'Prepare' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Calibrate' })).toBeNull();
+    expect(inspectorButtons('Prepare')).toHaveLength(1);
+    expect(inspectorButtons('Calibrate')).toHaveLength(0);
     view.unmount();
 
     await mount(frameSetTab);
-    fireEvent.click(screen.getByRole('button', { name: /Re-run from/ }));
-    expect(screen.getByRole('button', { name: 'Calibrate' })).toBeInTheDocument();
+    expect(inspectorButtons('Calibrate')).toHaveLength(1);
+    expect(inspectorButtons('Prepare')).toHaveLength(0);
+  });
+});
+
+// The Re-run menu opens only for a plan with no blockers, so these plans carry none.
+describe('StackingTab Re-run menu', () => {
+  it('lists Prepare first for a project, no Calibrate, and says every cached stage is reused', async () => {
+    plans.project = plan({ projectId: 'p1', prepare: PREPARE, blockers: [] });
+    await mount(projectTab);
+    const menu = openRerunMenu();
+    expect(within(menu).getAllByRole('button')[0]).toHaveAccessibleName('Prepare');
+    expect(within(menu).getByRole('button', { name: 'Prepare' })).toHaveAttribute(
+      'title',
+      'Redo Prepare and everything after it; reuse the stages before',
+    );
+    expect(within(menu).queryByRole('button', { name: /Calibrate/ })).toBeNull();
+    expect(
+      within(menu).getByText('Every cached stage is reused — the run re-integrates from the cached registered frames'),
+    ).toBeInTheDocument();
+  });
+
+  it('words a project\'s run start with Prepare when no prepared frames are cached', async () => {
+    plans.project = plan({ projectId: 'p1', prepare: PREPARE, blockers: [], staleStages: ['calibrate'] });
+    await mount(projectTab);
+    const menu = openRerunMenu();
+    expect(within(menu).getAllByRole('button')[0]).toHaveAccessibleName(/^Prepare/);
+    expect(within(menu).queryByRole('button', { name: /Calibrate/ })).toBeNull();
+    expect(
+      within(menu).getByText(
+        'No prepared or registered frames are cached — the run starts from Prepare; the measurements are reused',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('lists Calibrate first for a frame set, no Prepare, and words its run start with Calibrate', async () => {
+    plans.frameSet = plan({ setId: 7, blockers: [], staleStages: ['calibrate'] });
+    await mount(frameSetTab);
+    const menu = openRerunMenu();
+    expect(within(menu).getAllByRole('button')[0]).toHaveAccessibleName(/^Calibrate/);
+    expect(within(menu).queryByRole('button', { name: /Prepare/ })).toBeNull();
+    expect(
+      within(menu).getByText(
+        'No calibrated or registered frames are cached — the run starts from Calibrate; the measurements are reused',
+      ),
+    ).toBeInTheDocument();
   });
 });

@@ -48,7 +48,7 @@ export function PreparePanel({ config, plan, disabled, onPatchCalibration }: Pre
           ]}
         />
       ) : (
-        <p className="text-xs text-content-muted">No plan loaded yet.</p>
+        <p className="text-xs text-content-muted">{plan == null ? 'No plan loaded yet.' : 'Counts unavailable'}</p>
       )}
 
       <div className="pt-3 border-t border-border/60 space-y-3">

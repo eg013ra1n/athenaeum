@@ -83,9 +83,18 @@ describe('PreparePanel', () => {
     ).toBeInTheDocument();
   });
 
-  it('says so when there is no plan or no counts yet, and keeps the option', () => {
+  it('says no plan is loaded when there is none, and keeps the option', () => {
     show({ plan: null });
     expect(screen.getByText('No plan loaded yet.')).toBeInTheDocument();
+    expect(screen.queryByText('Counts unavailable')).toBeNull();
+    expect(screen.queryByText('In place')).toBeNull();
+    expect(screen.getByRole('checkbox', { name: 'Debayer OSC lights (VNG)' })).toBeInTheDocument();
+  });
+
+  it('says the counts are unavailable when a plan is loaded without them, and keeps the option', () => {
+    show({ plan: planWith(null) });
+    expect(screen.getByText('Counts unavailable')).toHaveClass('text-content-muted');
+    expect(screen.queryByText('No plan loaded yet.')).toBeNull();
     expect(screen.queryByText('In place')).toBeNull();
     expect(screen.getByRole('checkbox', { name: 'Debayer OSC lights (VNG)' })).toBeInTheDocument();
   });
