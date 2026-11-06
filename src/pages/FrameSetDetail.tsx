@@ -23,6 +23,7 @@ import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { StackingTab } from '../components/stacking/StackingTab';
 import type { LightFrameRef } from '../components/stacking/frameRows';
+import { formatNightLabel } from '../components/stacking/frameView';
 import { revealItemInDir, openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
@@ -384,8 +385,8 @@ export default function FrameSetDetail() {
     if (!detail) return [];
     const out: LightFrameRef[] = [];
     for (const night of detail.nights) {
-      // The `YYYY-MM-DD` of the night (`start_time` is a date or a date-time).
-      const nightDate = night.imaging_night.start_time.slice(0, 10);
+      // The night, labelled as the Analysis tab labels it (both ends read in UTC).
+      const nightLabel = formatNightLabel(night.imaging_night.start_time, night.imaging_night.end_time);
       for (const session of night.sessions) {
         for (const fw of session.frames) {
           if (
@@ -398,7 +399,7 @@ export default function FrameSetDetail() {
             out.push({
               frameId: fw.frame.id,
               filename: fw.file.filename,
-              night: nightDate,
+              night: nightLabel,
               exptimeSec: fw.frame.exptime,
             });
           }

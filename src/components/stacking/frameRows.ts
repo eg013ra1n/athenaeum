@@ -16,8 +16,9 @@ import type {
 export interface LightFrameRef {
   frameId: number;
   filename: string;
-  /** The `YYYY-MM-DD` of the imaging night the frame belongs to
-   *  (`imaging_night.start_time`); `null` when the caller has no night. */
+  /** The imaging night the frame belongs to, labelled as the Analysis tab
+   *  labels it (`formatNightLabel`, e.g. `September 13–14, 2025`); `null` when
+   *  the caller has no night. */
   night: string | null;
   /** The frame's exposure in seconds (`frame.exptime`); `null` when unknown. */
   exptimeSec: number | null;
@@ -75,8 +76,9 @@ export interface FrameRow {
   /** The run group's key when the selected run has a row for the frame, else
    *  the plan's group (`RowContext.planGroupByFrameId`), else `null`. */
   groupKey: string | null;
-  /** Frame-set row: the `YYYY-MM-DD` of the frame's imaging night. `null`
-   *  for a project row and for a run row the set no longer lists. */
+  /** Frame-set row: the label of the frame's imaging night
+   *  (`LightFrameRef.night`). `null` for a project row and for a run row the
+   *  set no longer lists. */
   night: string | null;
   exptimeSec: number | null;
   weight: number | null;

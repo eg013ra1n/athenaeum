@@ -14,6 +14,7 @@ import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { stackedFrameSnr } from './analysis/stackedSnr';
+import { autoOutlierLimit } from './analysis/outlierLimit';
 import { rowVerdict } from './analysis/unusable';
 import { computeRejectedFrameIds } from './analysis/rejection';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
@@ -325,10 +326,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   }, [checkedKeys, allFrames, framesByKey, blackholedFileIds]);
 
   // Auto FWHM threshold in PIXELS. Pure data transform — no UI-state dependency.
-  // Rule: median + 3 × max(MAD, 0.1 × median) over the *displayed* frames, so
-  // the threshold tracks whatever cohort the user has filtered to. The MAD floor
-  // keeps very tight clusters from collapsing the threshold onto the median
-  // (which would reject ~half the frames).
+  // Rule (`autoOutlierLimit`, shared with the Stacking Frames table): median +
+  // 3 × max(MAD, 0.1 × median) over the *displayed* frames, so the threshold
+  // tracks whatever cohort the user has filtered to.
   const autoFwhmPx = useMemo((): number | null => {
     if (analysisData.size === 0) return null;
     const values: number[] = [];
@@ -336,14 +336,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
       const a = analysisData.get(f.frame_id);
       if (a) values.push(a.median_fwhm);
     }
-    if (values.length === 0) return null;
-    values.sort((a, b) => a - b);
-    const median = values[Math.floor(values.length / 2)];
-    const deviations = values.map(v => Math.abs(v - median));
-    deviations.sort((a, b) => a - b);
-    const mad = deviations[Math.floor(deviations.length / 2)];
-    const effectiveMad = Math.max(mad, median * 0.1);
-    return median + 3 * effectiveMad;
+    return autoOutlierLimit(values);
   }, [analysisData, displayedFrames]);
 
   // Format a pixel value into the threshold-bar string in whatever unit is
