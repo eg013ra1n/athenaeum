@@ -73,6 +73,10 @@ export default {
           'peer-hover': 'rgba(67, 76, 94, 0.30)',  // Exchange peer row hover (§12)
         },
         teal: { DEFAULT: '#8fbcbb' }, // nord7
+        blink: {
+          DEFAULT: '#0891b2', // cyan-600 - the Blink action button
+          hover: '#0e7490',   // cyan-700
+        },
       }
     },
   },

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef, type ReactNode } from 'react';
-import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair } from 'lucide-react';
+import { Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, Crosshair } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -20,6 +20,7 @@ import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-s
 import { ZipExtractionLine } from './zip/ZipExtractionLine';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
+import { BlinkToolButton, ToolDivider, ToolSelection, ToolSplit, ToolToggle } from './toolbar/LabeledToolbar';
 
 interface LightsAnalysisViewProps {
   hierarchy: CalibrationHierarchyViewData;
@@ -47,31 +48,8 @@ interface LightsAnalysisViewProps {
   setTools?: ReactNode;
 }
 
-/** One toolbar action: a 40×28 button with its label under it, the shape of every button in this toolbar. */
-export function ToolButton({ label, title, onClick, disabled, className = 'text-content-secondary', children }: {
-  label: string;
-  title: string;
-  onClick: () => void;
-  disabled?: boolean;
-  className?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-      <button
-        type="button"
-        onClick={onClick}
-        disabled={disabled}
-        aria-label={label}
-        title={title}
-        className={`min-w-10 h-7 px-2 inline-flex items-center justify-center gap-1 text-xs font-medium bg-surface-hover hover:bg-surface-elevated rounded-lg border border-border transition-colors disabled:opacity-30 disabled:cursor-default ${className}`}
-      >
-        {children}
-      </button>
-      <span className="text-[10px] text-content-muted leading-tight">{label}</span>
-    </div>
-  );
-}
+// The toolbar pieces live in the shared module; `ToolButton` stays importable from here.
+export { ToolButton } from './toolbar/LabeledToolbar';
 
 export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, projectStates, setTools }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
@@ -720,69 +698,38 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               </div>
             )}
 
-            <span className="text-border h-7 flex items-center">|</span>
+            <ToolDivider />
 
             {/* Units toggle */}
             {plateScale && (
-              <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-                <button
-                  onClick={toggleUnits}
-                  className={`w-10 h-7 text-xs font-medium rounded-lg border transition-colors ${
-                    useArcsec
-                      ? 'bg-accent/20 border-accent text-accent'
-                      : 'bg-surface-hover border-border text-content-secondary hover:text-content'
-                  }`}
-                  title="Toggle units between pixels and arcseconds"
-                >
-                  {useArcsec ? '"' : 'px'}
-                </button>
-                <span className="text-[10px] text-content-muted leading-tight">Units</span>
-              </div>
+              <ToolToggle
+                label="Units"
+                title="Toggle units between pixels and arcseconds"
+                on={useArcsec}
+                onClick={toggleUnits}
+              >
+                {useArcsec ? '"' : 'px'}
+              </ToolToggle>
             )}
 
             {/* Selection: clear + invert split button */}
-            <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-              <div className="flex h-7">
-                <button
-                  onClick={() => setSelectedFrameIds(new Set())}
-                  disabled={!hasSelection}
-                  className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-l-lg border border-r-0 border-border transition-colors disabled:opacity-30 disabled:cursor-default"
-                  title="Clear selection"
-                >
-                  {hasSelection ? selectedFrameIds.size : 0}
-                </button>
-                <button
-                  onClick={() => {
-                    const all = new Set(displayedFrames.map(f => f.frame_id));
-                    const inverted = new Set<number>();
-                    for (const id of all) {
-                      if (!selectedFrameIds.has(id)) inverted.add(id);
-                    }
-                    setSelectedFrameIds(inverted);
-                  }}
-                  className="w-7 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-r-lg border border-border transition-colors"
-                  title="Invert selection"
-                >
-                  <ArrowLeftRight size={10} />
-                </button>
-              </div>
-              <span className="text-[10px] text-content-muted leading-tight">Selection</span>
-            </div>
-            <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-              <button
-                onClick={handleBlink}
-                disabled={displayedFrames.length === 0}
-                className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition-colors disabled:opacity-30 disabled:cursor-default"
-                title={
-                  hasSelection
-                    ? `Blink ${selectedFrameIds.size} selected frame${selectedFrameIds.size === 1 ? '' : 's'}`
-                    : `Blink all ${displayedFrames.length} frame${displayedFrames.length === 1 ? '' : 's'}`
+            <ToolSelection
+              count={selectedFrameIds.size}
+              onClear={() => setSelectedFrameIds(new Set())}
+              onInvert={() => {
+                const all = new Set(displayedFrames.map(f => f.frame_id));
+                const inverted = new Set<number>();
+                for (const id of all) {
+                  if (!selectedFrameIds.has(id)) inverted.add(id);
                 }
-              >
-                <Play size={12} />
-              </button>
-              <span className="text-[10px] text-content-muted leading-tight">{hasSelection ? 'Blink' : 'Blink all'}</span>
-            </div>
+                setSelectedFrameIds(inverted);
+              }}
+            />
+            <BlinkToolButton
+              selectedCount={selectedFrameIds.size}
+              visibleCount={displayedFrames.length}
+              onClick={handleBlink}
+            />
             <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
               <button
                 onClick={handleBlackholeSelected}
@@ -812,7 +759,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               </button>
               <span className="text-[10px] text-content-muted leading-tight">Plate Solve</span>
             </div>
-            <span className="text-border h-7 flex items-center">|</span>
+            <ToolDivider />
 
             {/* Rejection thresholds — inline */}
             <RejectionThresholdBar
@@ -826,7 +773,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               onToggleReject={() => setRejectActive(prev => !prev)}
             />
 
-            <span className="text-border h-7 flex items-center">|</span>
+            <ToolDivider />
 
             {/* Export / Charts */}
             <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
@@ -840,37 +787,19 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               </button>
               <span className="text-[10px] text-content-muted leading-tight">CSV</span>
             </div>
-            <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-              <div className="flex h-7">
-                <button
-                  onClick={() => setFrameViewMode('table')}
-                  className={`w-10 h-7 inline-flex items-center justify-center text-xs font-medium rounded-l-lg border border-r-0 transition-colors ${
-                    frameViewMode === 'table'
-                      ? 'bg-accent/20 text-accent border-accent/40'
-                      : 'bg-surface-hover hover:bg-surface-elevated text-content-secondary border-border'
-                  }`}
-                  title="Table view"
-                >
-                  <TableIcon size={12} />
-                </button>
-                <button
-                  onClick={() => setFrameViewMode('chart')}
-                  className={`w-10 h-7 inline-flex items-center justify-center text-xs font-medium rounded-r-lg border transition-colors ${
-                    frameViewMode === 'chart'
-                      ? 'bg-accent/20 text-accent border-accent/40'
-                      : 'bg-surface-hover hover:bg-surface-elevated text-content-secondary border-border'
-                  }`}
-                  title="Chart view"
-                >
-                  <LineChart size={12} />
-                </button>
-              </div>
-              <span className="text-[10px] text-content-muted leading-tight">View</span>
-            </div>
+            <ToolSplit
+              label="View"
+              value={frameViewMode}
+              onChange={setFrameViewMode}
+              options={[
+                { value: 'table', title: 'Table view', content: <TableIcon size={12} /> },
+                { value: 'chart', title: 'Chart view', content: <LineChart size={12} /> },
+              ]}
+            />
 
             {setTools && (
               <>
-                <span className="text-border h-7 flex items-center">|</span>
+                <ToolDivider />
                 {setTools}
               </>
             )}
