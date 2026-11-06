@@ -11,6 +11,7 @@
 //! working against the other.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection};
 
@@ -18,6 +19,7 @@ use crate::collab::hub_client::FrameViewWire;
 use crate::db::schema::init_db;
 use crate::fits_writer::card::{format_card, Card, CardValue, BLOCK_SIZE, CARD_SIZE};
 use crate::fits_writer::{write_fits_f32, write_xisf_f32};
+use crate::services::ServiceContext;
 use crate::test_support::{add_noise, gaussian_field};
 
 /// One fixture's whole catalog: an in-memory `Connection` seeded with a
@@ -1485,3 +1487,141 @@ pub(crate) const EAST_PAIR_OFFSET_WIDTHS: f64 = 0.85;
 pub(crate) const EAST_PAIR_SPACING_ARCSEC: f64 = 40.0;
 /// The star-field seed of that geometry, shared for the same reason.
 pub(crate) const EAST_PAIR_STAR_SEED: u64 = 9;
+
+// ── End-to-end run helpers ───────────────────────────────────────────────
+//
+// Shared by `run.rs`'s tests and any test that drives a real run (`start_stacking`
+// on a seeded star-field set, then waits for it): the star field, the seeder, the
+// light spec at the star field's size, and the wait.
+
+/// The star-field fixtures' canvas — large enough that the detector's
+/// own auto-threshold blob radius (empirically several px at these
+/// amplitudes/sigma) never touches a neighbouring star's blob at
+/// [`BASE_STARS`]' spacing (a 64x48 canvas at this SAME layout, tried
+/// first, made adjacent stars' supra-threshold regions overlap and
+/// merge into one blob, collapsing detection to a single point).
+pub(crate) const STAR_FIELD_WIDTH: usize = 192;
+pub(crate) const STAR_FIELD_HEIGHT: usize = 144;
+
+/// Ten stars spread across the [`STAR_FIELD_WIDTH`]x[`STAR_FIELD_HEIGHT`]
+/// field, margin generous enough that every shift used below (max
+/// magnitude 3 px) keeps every star well inside the frame. The SAME
+/// list, shifted by a per-frame `(dx, dy)` integer offset, is what makes
+/// registration find real inlier matches (well above the required ≥ 8)
+/// across every star-field fixture below.
+pub(crate) const BASE_STARS: &[(f64, f64, f64)] = &[
+    (30.0, 24.0, 9000.0),
+    (66.0, 30.0, 7000.0),
+    (102.0, 27.0, 8500.0),
+    (138.0, 33.0, 6500.0),
+    (36.0, 60.0, 7500.0),
+    (78.0, 66.0, 9000.0),
+    (120.0, 63.0, 6000.0),
+    (150.0, 72.0, 8000.0),
+    (54.0, 102.0, 7000.0),
+    (114.0, 99.0, 8500.0),
+];
+
+pub(crate) fn shifted_stars(dx: f64, dy: f64) -> Vec<(f64, f64, f64)> {
+    BASE_STARS
+        .iter()
+        .map(|&(x, y, a)| (x + dx, y + dy, a))
+        .collect()
+}
+
+pub(crate) fn date_obs_at(i: usize) -> String {
+    format!("2025-01-01T00:{:02}:00", (i as u32) * 5)
+}
+
+/// Seed `shifts.len()` star-field lights (`f0`, `f1`, …), the SAME
+/// [`BASE_STARS`] field shifted by each entry of `shifts` (known integer
+/// offsets), with `noise_sigmas[i]` raw-ADU Gaussian noise added to
+/// frame `i` — plus `stacking.working_dir`/`output_dir` settings.
+/// Frames share `instrume`/`filter`/binning/size, so `group_frames`
+/// puts them all in ONE group. Does NOT link a master dark/flat —
+/// callers call [`add_master_dark_and_flat`] themselves,
+/// once, over every frame id they end up needing (including any extra
+/// frame added after this call, e.g. a low-weight or flat-field one).
+pub(crate) fn seed_star_group(
+    db_path: &Path,
+    set_name: &str,
+    shifts: &[(f64, f64)],
+    noise_sigmas: &[f32],
+) -> (Fixture, Vec<i64>, tempfile::TempDir, tempfile::TempDir) {
+    assert_eq!(shifts.len(), noise_sigmas.len());
+    let fixture_conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+    let fixture = frame_set_with_conn(fixture_conn, set_name);
+
+    let mut light_ids = Vec::new();
+    for (i, (&(dx, dy), &sigma)) in shifts.iter().zip(noise_sigmas.iter()).enumerate() {
+        let stars = shifted_stars(dx, dy);
+        let date_obs = date_obs_at(i);
+        let stem = format!("f{i}");
+        let spec = star_light_spec(&stem, &date_obs);
+        let (id, _path) =
+            add_light_with_field(&fixture, &spec, &stars, 600.0, sigma, 100 + i as u64);
+        light_ids.push(id);
+    }
+
+    let working = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    crate::db::set_setting(
+        &fixture.conn,
+        crate::settings::keys::STACKING_WORKING_DIR,
+        working.path().to_str().unwrap(),
+    )
+    .unwrap();
+    crate::db::set_setting(
+        &fixture.conn,
+        crate::settings::keys::STACKING_OUTPUT_DIR,
+        output.path().to_str().unwrap(),
+    )
+    .unwrap();
+
+    (fixture, light_ids, working, output)
+}
+
+/// As `run.rs`'s `light_spec`, but at the star-field fixtures' own canvas size
+/// ([`STAR_FIELD_WIDTH`]x[`STAR_FIELD_HEIGHT`], above) — every frame in one of those tests' groups,
+/// including an extra low-weight/flat-field frame added alongside the
+/// star frames, must share this same size to land in the same
+/// `group_frames` group.
+pub(crate) fn star_light_spec<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
+    LightSpec {
+        stem,
+        instrume: "cam",
+        filter: None,
+        binning: 1,
+        width: STAR_FIELD_WIDTH,
+        height: STAR_FIELD_HEIGHT,
+        exptime: 60.0,
+        date_obs,
+        bayerpat: None,
+        write_file: true,
+    }
+}
+
+/// Waits (30s cap, 20ms polls) for `run_id` to disappear from
+/// `ctx.active_stacks` — the thread's single exit path removes it last
+/// among the observable side effects these tests care about.
+pub(crate) fn wait_for_run(ctx: &ServiceContext, run_id: i64) {
+    wait_for_run_within(ctx, run_id, Duration::from_secs(30));
+}
+
+/// [`wait_for_run`] with the cap supplied — for the one test whose run
+/// is deliberately big (20 frames through the whole spline pipeline)
+/// and therefore does not fit the default cap when the rest of the
+/// suite is competing for the same cores.
+pub(crate) fn wait_for_run_within(ctx: &ServiceContext, run_id: i64, cap: Duration) {
+    let start = Instant::now();
+    loop {
+        if !ctx.active_stacks.lock().unwrap().contains_key(&run_id) {
+            return;
+        }
+        assert!(
+            start.elapsed() < cap,
+            "stacking run {run_id} did not finish within {cap:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

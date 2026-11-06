@@ -6,13 +6,13 @@
 //! extrapolated almost exactly even when they clip, so a clipped star would not move a Measure-time weight; the
 //! "stars only one sub has" stand in for the ones real subs clip, lose or refuse. The common set must ignore them.
 
-use super::tests::{date_obs_at, run_stages_for_test, seed_run_and_groups, SET_NAME};
+use super::tests::{run_stages_for_test, seed_run_and_groups, SET_NAME};
 use super::*;
 use crate::db::stacking::StackingRunFrameRow;
 use crate::events::NullEmitter;
 use crate::stacking::groups::{group_frames, set_slug};
 use crate::stacking::telemetry::capture_logs;
-use crate::stacking::test_fixtures::{self, LightSpec};
+use crate::stacking::test_fixtures::{self, date_obs_at, LightSpec};
 use crate::stacking::weights::FormulaWeights;
 
 const W: usize = 384;
