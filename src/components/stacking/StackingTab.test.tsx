@@ -34,7 +34,7 @@ vi.mock('./PipelineBoard', () => ({
     </div>
   ),
 }));
-vi.mock('./StageInspector', () => ({ StageInspector: () => null }));
+vi.mock('./StageInspector', () => ({ StageInspector: () => <div data-testid="inspector" /> }));
 // The Groups table is a stub that shows what the tab hands it and patches the grouping when asked.
 vi.mock('./GroupsTable', () => ({
   GroupsTable: (p: {
@@ -705,17 +705,23 @@ describe('StackingTab for a project', () => {
     });
   });
 
-  // Wave 6c Task 9: a project with nothing to stack on this device shows why, instead of a board of rows that
-  // cannot run. The toolbar, the blocker line, the grid card and the Frames table stay.
+  // Wave 6c Task 9: a project with nothing usable included on this device shows why, instead of a board of rows that
+  // cannot run. It replaces the board only: the toolbar, the blocker line, the grid card, the Groups card, the
+  // inspector and the Frames table keep their places.
   describe('the empty state', () => {
     const NO_FRAMES = { code: 'frames', message: 'No frame of this project is on this device yet' };
     const TOO_FEW = { code: 'frames', message: 'At least 3 included frames in one group' };
     /** The same three frames, none of them stackable here. */
     const ELSEWHERE = PROJECT_FRAMES.map((f) => ({ ...f, handle: null, onDisk: false, reason: 'not on this device' }));
+    /** On this device, but the reader refuses them. */
+    const UNSUPPORTED = PROJECT_FRAMES.map((f) => ({
+      ...f, handle: null, onDisk: true, reason: 'unsupported file: tile-compressed FITS',
+    }));
 
     it.each([
       ['the plan lists no frame at all', [] as unknown[]],
       ['no listed frame is on this device', ELSEWHERE],
+      ['every frame on this device is unsupported', UNSUPPORTED],
     ])('says no frame is usable here when %s', async (_case, projectFrames) => {
       projectWith({ blockers: [NO_FRAMES], projectFrames });
       await mount(projectTab('p1'));
@@ -723,11 +729,45 @@ describe('StackingTab for a project', () => {
       expect(screen.getByText('Nothing to stack on this device')).toHaveClass('text-content');
       expect(screen.getByText('No frame of this project is usable on this device.')).toBeInTheDocument();
       expect(screen.queryByText('Every usable frame is excluded.')).toBeNull();
-      // The board and the groups give way to it; the blocker line stays, and Run stays refused.
+      // The board gives way to it; the blocker line stays, and Run stays refused.
       expect(screen.queryByTestId('board')).toBeNull();
-      expect(screen.queryByTestId('groups')).toBeNull();
       expect(screen.getByText(NO_FRAMES.message)).toBeInTheDocument();
       expect(screen.getByRole('button', { name: /Run stacking/ })).toBeDisabled();
+    });
+
+    it('replaces the board only: the Groups card and the inspector keep their places', async () => {
+      projectWith({ blockers: [NO_FRAMES], projectFrames: ELSEWHERE });
+      await mount(projectTab('p1'));
+
+      expect(screen.getByText('Nothing to stack on this device')).toBeInTheDocument();
+      expect(screen.queryByTestId('board')).toBeNull();
+      expect(screen.getByRole('heading', { name: /^Groups \(/ })).toBeInTheDocument();
+      expect(screen.getByTestId('groups')).toBeInTheDocument();
+      expect(screen.getByTestId('inspector')).toBeInTheDocument();
+    });
+
+    it('is not shown while usable frames are included, however few: the board and the Groups card stay', async () => {
+      // Two usable, included frames: the `frames` blocker stands (no group of three), the reason is the red line.
+      projectWith({ blockers: [TOO_FEW] });
+      await mount(projectTab('p1'));
+
+      expect(screen.queryByText('Nothing to stack on this device')).toBeNull();
+      expect(screen.queryByText(/excluded\./)).toBeNull();
+      expect(screen.queryByText('No frame of this project is usable on this device.')).toBeNull();
+      expect(screen.getByText(TOO_FEW.message)).toBeInTheDocument();
+      expect(screen.getByTestId('board')).toBeInTheDocument();
+      expect(screen.getByTestId('groups')).toBeInTheDocument();
+      expect(screen.getByTestId('inspector')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Run stacking/ })).toBeDisabled();
+    });
+
+    it('is not shown while one usable frame is still included', async () => {
+      projectWith({ blockers: [TOO_FEW], excluded: ['u1'] });
+      await mount(projectTab('p1'));
+
+      expect(screen.queryByText('Nothing to stack on this device')).toBeNull();
+      expect(screen.getByTestId('board')).toBeInTheDocument();
+      expect(screen.getByTestId('groups')).toBeInTheDocument();
     });
 
     it('keeps the Frames table under it when the plan lists frames', async () => {
@@ -748,6 +788,7 @@ describe('StackingTab for a project', () => {
       expect(screen.getByText('Every usable frame is excluded.')).toBeInTheDocument();
       expect(screen.queryByText('No frame of this project is usable on this device.')).toBeNull();
       expect(screen.queryByTestId('board')).toBeNull();
+      expect(screen.getByTestId('groups')).toBeInTheDocument();
 
       const include = screen.getByRole('checkbox', { name: 'Include a.fits in the next run' });
       expect(include).not.toBeChecked();
@@ -828,15 +869,20 @@ describe('StackingTab for a project', () => {
     it('a collab-grid-changed for this project refetches the plan once, with the draft config', async () => {
       const feed = trackListeners();
       await mount(projectTab('p1'));
+      // One draft field is edited and its own re-plan has landed: the event's refetch must carry the edit, not the
+      // config the tab loaded with.
+      const edited = { ...CONFIG, drizzle: { enabled: true } };
+      fireEvent.click(screen.getByText('edit config'));
       await advance(PAST_THE_DEBOUNCE_MS);
       const before = plans();
+      expect(argsOf('get_project_stacking_plan')[before - 1]).toEqual({ projectId: 'p1', config: edited });
 
       feed.fire('collab-grid-changed', { projectId: 'p1' });
       await advance(900);
       expect(plans()).toBe(before); // coalescing: nothing yet, the timer is trailing
       await advance(200);
       expect(plans()).toBe(before + 1);
-      expect(argsOf('get_project_stacking_plan')[before]).toEqual({ projectId: 'p1', config: CONFIG });
+      expect(argsOf('get_project_stacking_plan')[before]).toEqual({ projectId: 'p1', config: edited });
 
       // The next one refetches again: the first did not leave the tab waiting for ever.
       feed.fire('collab-grid-changed', { projectId: 'p1' });

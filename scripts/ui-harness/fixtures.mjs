@@ -127,7 +127,7 @@ function stackingHandlers({ projectId, card, nameOf, acc }) {
     outline: sensorOutline(f.centre[0], f.centre[1], f.rot, ra0, dec0),
   }));
   const projectFrames = frames.map((f) => ({
-    handle: f.flag ? null : 100 + f.i, frameUuid: f.uuid, fileName: f.fileName, publisher: f.publisher, filterCanonical: f.filter,
+    handle: f.flag === 'offDevice' ? null : 100 + f.i, frameUuid: f.uuid, fileName: f.fileName, publisher: f.publisher, filterCanonical: f.filter,
     exptimeSec: f.exp, colorMode: f.colorMode, hasWcs: f.centre !== null, onDisk: f.flag !== 'offDevice',
     reason: f.flag === 'offDevice' ? 'not on this device' : f.flag === 'unsupported' ? 'unsupported file: tile-compressed FITS' : null,
   }));
@@ -135,7 +135,7 @@ function stackingHandlers({ projectId, card, nameOf, acc }) {
     const [colorMode, exp] = FILTER[filter];
     const members = usable.filter((f) => f.filter === filter);
     return {
-      key: `${colorMode}__${filter}__bin1__st${exp}`, instrume: null, colorMode, filter: filter === 'None' ? null : filter, binning: 1, cameras,
+      key: `${colorMode}__${filter}__st${exp}`, instrume: null, colorMode, filter, binning: 1, cameras,
       exposureS: exp, exposureClass: `st${exp}`, frameCount: members.length, includedCount: members.length,
       totalExposureS: members.length * exp, calibratedCached: 0, metricsCached: 0, fitsCached: 0, lnCached: 0,
       lnScalePx: null, lnScaleEstimated: false, lnWidth: null, lnHeight: null, anchorWidth: anchor[0], anchorHeight: anchor[1],

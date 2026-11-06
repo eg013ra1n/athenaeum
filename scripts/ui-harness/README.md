@@ -20,7 +20,7 @@ The harness serves commands over HTTP only (no events), so the run shows through
 The `stacking` scenario (`/projects/p-m31?tab=stacking`) shows the project's Stacking tab on a plan shaped from
 `src/types/stacking.ts`: an unconfirmed grid (a proposal the viewer may confirm) with the schematic of ten frame
 outlines from three publishers, two of them reaching past the proposal, and two more frames without a WCS; the Prepare
-board; three groups (`mono__L__bin1__st120`, `mono__Ha__bin1__st300`, `osc__None__bin1__st180`); and twelve frames in
+board; three groups (`mono__L__st120`, `mono__Ha__st300`, `osc__None__st180`: a project key has no binning); and twelve frames in
 the Frames table, one of them not on this device, one an unsupported file and two without a WCS. No run exists
 (`get_project_stacking_runs` answers `[]`), and the writes the tab can reach are echoed, never stored. The plan still
 carries its `grid` blocker, so Run stays refused until a grid is confirmed.

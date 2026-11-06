@@ -861,10 +861,18 @@ export function StackingTab({ subject }: StackingTabProps) {
   // The pin in effect: a uuid stored under Auto is kept for the next Manual but is not the reference.
   const pinnedReference =
     subject.kind === 'project' && draftConfig.reference.mode === 'manual' ? referenceFrameUuid : null;
-  // A project with nothing a run could stack here: the board of rows that cannot run gives way to the reason. A
-  // frame set keeps its board whatever its blockers say.
-  const nothingToStack = subject.kind === 'project' && plan.blockers.some((b) => b.code === 'frames');
-  const nothingUsable = !plan.projectFrames.some((f) => f.onDisk);
+  // A project with nothing a run could stack here: the board of rows that cannot run gives way to the reason. The
+  // `frames` blocker also stands while usable, included frames are too few for one group (the first frames of a
+  // project still replicating, groups of two), and then the board, the exposure grouping that can clear it and the
+  // blocker line are what the member needs: the empty state shows only when no frame is usable here or every usable
+  // one is excluded. A frame set keeps its board whatever its blockers say.
+  const usableFrameUuids = plan.projectFrames.filter((f) => f.onDisk && f.reason == null).map((f) => f.frameUuid);
+  const nothingUsable = usableFrameUuids.length === 0;
+  const everyUsableExcluded = !nothingUsable && usableFrameUuids.every((uuid) => excluded.includes(uuid));
+  const nothingToStack =
+    subject.kind === 'project' &&
+    plan.blockers.some((b) => b.code === 'frames') &&
+    (nothingUsable || everyUsableExcluded);
 
   return (
     // Plan 5b final fix wave, review finding B7 (supersedes click-through
@@ -1173,9 +1181,8 @@ export function StackingTab({ subject }: StackingTabProps) {
         </div>
       )}
 
-      {/* Board (62%) / Inspector (38%). A project with nothing to stack keeps the grid card and shows the reason
-          where the board was, in the same column; the inspector reads the stages of a run that cannot start, so it
-          is not shown. */}
+      {/* Board (62%) / Inspector (38%). A project with nothing to stack keeps the grid card, the Groups card and the
+          inspector in their places and shows the reason where the board was. */}
       <div className="flex flex-col lg:flex-row gap-4">
         <div className="lg:w-[62%] min-w-0 space-y-3">
           {/* A project's canonical grid is the registration target of every run: it sits above the board whose
@@ -1195,62 +1202,58 @@ export function StackingTab({ subject }: StackingTabProps) {
               </EmptyState>
             </div>
           ) : (
-            <>
-              <PipelineBoard
-                plan={plan}
-                config={draftConfig}
-                progress={runProgress}
-                outcome={runOutcome}
-                finishedStages={boardFinishedStages}
-                selectedStage={selectedStage}
-                onSelectStage={handleSelectStage}
-                onToggleDrizzle={handleToggleDrizzle}
-              />
-              <div className="bg-surface-elevated rounded-lg p-3">
-                <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>
-                <GroupsTable
-                  groups={plan.groups}
-                  grouping={draftConfig.grouping}
-                  disabled={running || starting}
-                  toleranceInCalibrationHash={mode === 'calibrate'}
-                  onPatchGrouping={handlePatchGrouping}
-                />
-              </div>
-            </>
+            <PipelineBoard
+              plan={plan}
+              config={draftConfig}
+              progress={runProgress}
+              outcome={runOutcome}
+              finishedStages={boardFinishedStages}
+              selectedStage={selectedStage}
+              onSelectStage={handleSelectStage}
+              onToggleDrizzle={handleToggleDrizzle}
+            />
           )}
+          <div className="bg-surface-elevated rounded-lg p-3">
+            <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>
+            <GroupsTable
+              groups={plan.groups}
+              grouping={draftConfig.grouping}
+              disabled={running || starting}
+              toleranceInCalibrationHash={mode === 'calibrate'}
+              onPatchGrouping={handlePatchGrouping}
+            />
+          </div>
         </div>
 
-        {!nothingToStack && (
-          <div className="lg:w-[38%] min-w-0 space-y-2">
-            {/* Below `lg` only: a summary button naming the selected stage,
-             *  toggling the panel below it — `lg` and up hides this button
-             *  entirely and the panel is always shown (Task 2/3's original
-             *  side-by-side shape, unchanged). One `StageInspector` mount
-             *  either way, so a panel with its own fetch on mount (Output's
-             *  `get_stacking_paths`) never runs twice. */}
-            <button
-              type="button"
-              onClick={handleToggleInspectorCollapsed}
-              aria-expanded={!inspectorCollapsed}
-              className="lg:hidden w-full flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-surface-elevated text-sm font-medium text-content hover:text-content-secondary transition-colors"
-            >
-              {inspectorCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-              {stageLabel(selectedStage, mode)}
-            </button>
-            <div className={`${inspectorCollapsed ? 'hidden' : 'block'} lg:block`}>
-              <StageInspector
-                stage={selectedStage}
-                config={draftConfig}
-                onChange={handleConfigChange}
-                plan={plan}
-                disabled={running || starting}
-                presetDefault={presets.default}
-                onRemeasure={handleRemeasure}
-                remeasureDisabled={remeasureDisabled}
-              />
-            </div>
+        <div className="lg:w-[38%] min-w-0 space-y-2">
+          {/* Below `lg` only: a summary button naming the selected stage,
+           *  toggling the panel below it — `lg` and up hides this button
+           *  entirely and the panel is always shown (Task 2/3's original
+           *  side-by-side shape, unchanged). One `StageInspector` mount
+           *  either way, so a panel with its own fetch on mount (Output's
+           *  `get_stacking_paths`) never runs twice. */}
+          <button
+            type="button"
+            onClick={handleToggleInspectorCollapsed}
+            aria-expanded={!inspectorCollapsed}
+            className="lg:hidden w-full flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-surface-elevated text-sm font-medium text-content hover:text-content-secondary transition-colors"
+          >
+            {inspectorCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            {stageLabel(selectedStage, mode)}
+          </button>
+          <div className={`${inspectorCollapsed ? 'hidden' : 'block'} lg:block`}>
+            <StageInspector
+              stage={selectedStage}
+              config={draftConfig}
+              onChange={handleConfigChange}
+              plan={plan}
+              disabled={running || starting}
+              presetDefault={presets.default}
+              onRemeasure={handleRemeasure}
+              remeasureDisabled={remeasureDisabled}
+            />
           </div>
-        )}
+        </div>
       </div>
 
       {/* Frames + Results — full width, below the board/inspector split
