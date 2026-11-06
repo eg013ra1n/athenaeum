@@ -1146,9 +1146,9 @@ export function StackingTab({ subject }: StackingTabProps) {
             <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>
             <GroupsTable
               groups={plan.groups}
-              grouping={draftConfig?.grouping ?? plan.config.grouping}
+              grouping={draftConfig.grouping}
               disabled={running || starting}
-              subjectKind={subject.kind}
+              toleranceInCalibrationHash={mode === 'calibrate'}
               onPatchGrouping={handlePatchGrouping}
             />
           </div>

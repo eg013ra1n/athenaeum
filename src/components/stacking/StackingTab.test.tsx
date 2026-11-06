@@ -40,10 +40,10 @@ vi.mock('./GroupsTable', () => ({
   GroupsTable: (p: {
     grouping: { exposureMode: string };
     disabled?: boolean;
-    subjectKind: string;
+    toleranceInCalibrationHash: boolean;
     onPatchGrouping: (patch: { exposureMode: string }) => void;
   }) => (
-    <div data-testid="groups" data-kind={p.subjectKind} data-mode={p.grouping.exposureMode} data-disabled={String(!!p.disabled)}>
+    <div data-testid="groups" data-hint={String(p.toleranceInCalibrationHash)} data-mode={p.grouping.exposureMode} data-disabled={String(!!p.disabled)}>
       <button type="button" onClick={() => p.onPatchGrouping({ exposureMode: 'stops' })}>group by stops</button>
     </div>
   ),
@@ -224,7 +224,8 @@ describe('StackingTab for a frame set', () => {
     await mount(frameSetTab(7));
     await advance(PAST_THE_DEBOUNCE_MS);
     const groups = screen.getByTestId('groups');
-    expect(groups).toHaveAttribute('data-kind', 'frameSet');
+    // An ordinary set is calibrated by the run: its tolerance is part of the calibration hash.
+    expect(groups).toHaveAttribute('data-hint', 'true');
     expect(groups).toHaveAttribute('data-mode', 'seconds');
     const plansBefore = argsOf('get_stacking_plan').length;
 
@@ -237,6 +238,27 @@ describe('StackingTab for a frame set', () => {
     const plans = argsOf('get_stacking_plan');
     expect(plans.length).toBeGreaterThan(plansBefore);
     expect(plans[plans.length - 1]).toEqual({ setId: 7, config: edited });
+  });
+
+  // An attested set's stage-1 hash is the Prepare hash, which holds no grouping: the re-calibration hint would be false.
+  it('the Groups table of an attested set is told the tolerance is not in the calibration hash', async () => {
+    vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
+      command === 'get_stacking_plan'
+        ? Promise.resolve(plan({
+            setId: args?.setId,
+            readiness: { rawSetsWithoutMaster: 0, rawSetIdsWithoutMaster: [], attested: true },
+          }))
+        : answer(command, args)) as never);
+    await mount(frameSetTab(7));
+    expect(screen.getByTestId('groups')).toHaveAttribute('data-hint', 'false');
+  });
+
+  it('the Groups table is disabled while a run is in flight', async () => {
+    await mount(frameSetTab(7));
+    expect(screen.getByTestId('groups')).toHaveAttribute('data-disabled', 'false');
+
+    act(() => handlers['stacking-progress'](progressEvent(7, null)));
+    expect(screen.getByTestId('groups')).toHaveAttribute('data-disabled', 'true');
   });
 
   it('opening a set writes nothing', async () => {
@@ -504,7 +526,7 @@ describe('StackingTab for a project', () => {
   it('the Groups table of a project patches the project\u2019s own config', async () => {
     await mount(projectTab('p1'));
     await advance(PAST_THE_DEBOUNCE_MS);
-    expect(screen.getByTestId('groups')).toHaveAttribute('data-kind', 'project');
+    expect(screen.getByTestId('groups')).toHaveAttribute('data-hint', 'false');
 
     fireEvent.click(screen.getByText('group by stops'));
     await advance(PAST_THE_DEBOUNCE_MS);

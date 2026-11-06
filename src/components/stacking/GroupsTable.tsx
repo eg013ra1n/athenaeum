@@ -1,6 +1,5 @@
 import { Seg } from '../ui';
 import { NumericField } from './NumericField';
-import type { StackSubject } from './subject';
 import type { ExposureMode, GroupingConfig, PlanGroup } from '../../types/stacking';
 
 function formatExposure(totalExposureS: number): string {
@@ -59,13 +58,13 @@ const EQUIVALENT_HINT =
 interface ExposureGroupingControlProps {
   grouping: GroupingConfig;
   disabled?: boolean;
-  subjectKind: StackSubject['kind'];
+  toleranceInCalibrationHash: boolean;
   onPatchGrouping: (patch: Partial<GroupingConfig>) => void;
 }
 
 /** How a group's exposure classes are formed (spec §8, D1): the mode and that mode's threshold. A change patches
  *  `grouping`; the tab re-plans as for any config edit. */
-function ExposureGroupingControl({ grouping, disabled, subjectKind, onPatchGrouping }: ExposureGroupingControlProps) {
+function ExposureGroupingControl({ grouping, disabled, toleranceInCalibrationHash, onPatchGrouping }: ExposureGroupingControlProps) {
   const { exposureMode: mode } = grouping;
   return (
     <div className="mb-2 space-y-1.5">
@@ -107,9 +106,9 @@ function ExposureGroupingControl({ grouping, disabled, subjectKind, onPatchGroup
           </div>
         )}
       </div>
-      {/* Only a frame set's tolerance enters its calibration hash (`calibration_subtree`); a project's Prepare hash
-          has no grouping in it. */}
-      {subjectKind === 'frameSet' && mode === 'seconds' && (
+      {/* The tolerance enters the stage-1 hash only where the run calibrates (`calibration_subtree`); a Prepare hash
+          (a project's, an attested set's) has no grouping in it. */}
+      {toleranceInCalibrationHash && mode === 'seconds' && (
         <p className="text-[11px] text-content-muted">{RECALIBRATE_HINT}</p>
       )}
       {mode === 'equivalent' && <p className="text-[11px] text-content-muted">{EQUIVALENT_HINT}</p>}
@@ -122,18 +121,19 @@ export interface GroupsTableProps {
   /** The draft config's grouping: what the control shows and patches. */
   grouping: GroupingConfig;
   disabled?: boolean;
-  /** Decides whether the tolerance hint applies: only a frame set's calibration hash carries it. */
-  subjectKind: StackSubject['kind'];
+  /** Whether the tolerance is part of the stage-1 hash, which decides if the re-calibration hint applies: true when
+   *  the board calibrates (an ordinary frame set), false when it only prepares (a project, an attested set). */
+  toleranceInCalibrationHash: boolean;
   onPatchGrouping: (patch: Partial<GroupingConfig>) => void;
 }
 
 /** The plan's frame groups (spec §11.1), under the control that decides how their exposure classes are formed. */
-export function GroupsTable({ groups, grouping, disabled, subjectKind, onPatchGrouping }: GroupsTableProps) {
+export function GroupsTable({ groups, grouping, disabled, toleranceInCalibrationHash, onPatchGrouping }: GroupsTableProps) {
   const control = (
     <ExposureGroupingControl
       grouping={grouping}
       disabled={disabled}
-      subjectKind={subjectKind}
+      toleranceInCalibrationHash={toleranceInCalibrationHash}
       onPatchGrouping={onPatchGrouping}
     />
   );

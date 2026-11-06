@@ -27,7 +27,7 @@ const show = (
     groups?: PlanGroup[];
     grouping?: GroupingConfig;
     disabled?: boolean;
-    subjectKind?: 'frameSet' | 'project';
+    toleranceInCalibrationHash?: boolean;
   } = {},
 ) => {
   const onPatchGrouping = vi.fn();
@@ -36,7 +36,7 @@ const show = (
       groups={over.groups ?? [group()]}
       grouping={over.grouping ?? grouping()}
       disabled={over.disabled}
-      subjectKind={over.subjectKind ?? 'frameSet'}
+      toleranceInCalibrationHash={over.toleranceInCalibrationHash ?? true}
       onPatchGrouping={onPatchGrouping}
     />,
   );
@@ -110,7 +110,7 @@ describe('GroupsTable exposure grouping control', () => {
         <GroupsTable
           groups={[group()]}
           grouping={grouping({ exposureMode: m })}
-          subjectKind="project"
+          toleranceInCalibrationHash={false}
           onPatchGrouping={vi.fn()}
         />,
       );
@@ -173,18 +173,18 @@ describe('GroupsTable exposure grouping control', () => {
   });
 
   describe('hints', () => {
-    it('says a frame set’s tolerance is part of the calibration hash, in seconds mode', () => {
-      show({ subjectKind: 'frameSet' });
+    it('says the tolerance is part of the calibration hash, in seconds mode, where the board calibrates', () => {
+      show({ toleranceInCalibrationHash: true });
       expect(screen.getByText(HINT_RECALIBRATE)).toBeInTheDocument();
     });
 
-    it('never says it for a project, whatever the mode', () => {
+    it('never says it where the board only prepares (a project, an attested set), whatever the mode', () => {
       for (const m of ['seconds', 'stops', 'equivalent', 'none'] as const) {
         const { unmount } = render(
           <GroupsTable
             groups={[group()]}
             grouping={grouping({ exposureMode: m })}
-            subjectKind="project"
+            toleranceInCalibrationHash={false}
             onPatchGrouping={vi.fn()}
           />,
         );
@@ -193,13 +193,13 @@ describe('GroupsTable exposure grouping control', () => {
       }
     });
 
-    it('does not say it for a frame set outside seconds mode, where the tolerance is not in use', () => {
+    it('does not say it outside seconds mode, where the tolerance is not in use', () => {
       for (const m of ['stops', 'equivalent', 'none'] as const) {
         const { unmount } = render(
           <GroupsTable
             groups={[group()]}
             grouping={grouping({ exposureMode: m })}
-            subjectKind="frameSet"
+            toleranceInCalibrationHash
             onPatchGrouping={vi.fn()}
           />,
         );
@@ -214,14 +214,14 @@ describe('GroupsTable exposure grouping control', () => {
           <GroupsTable
             groups={[group()]}
             grouping={grouping({ exposureMode: m })}
-            subjectKind="project"
+            toleranceInCalibrationHash={false}
             onPatchGrouping={vi.fn()}
           />,
         );
         expect(screen.queryByText(HINT_EQUIVALENT), m).toBeNull();
         unmount();
       }
-      show({ grouping: grouping({ exposureMode: 'equivalent' }), subjectKind: 'project' });
+      show({ grouping: grouping({ exposureMode: 'equivalent' }), toleranceInCalibrationHash: false });
       expect(screen.getByText(HINT_EQUIVALENT)).toBeInTheDocument();
     });
   });
