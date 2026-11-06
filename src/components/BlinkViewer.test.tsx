@@ -89,6 +89,18 @@ describe('BlinkViewer — project mode', () => {
     await waitFor(() => expect(run).toHaveBeenCalledWith([expect.objectContaining({ key: 'f2' })]));
   });
 
+  it('a single-target action is offered only while exactly one entry of the selection is eligible', async () => {
+    const run = vi.fn();
+    const pick: BlinkAction = { id: 'pick', label: () => 'Pick', eligible: () => true, tone: 'default', single: true, run };
+    renderBlink({ actions: [pick] });
+    fireEvent.keyDown(window, { key: 's' }); // one entry selected
+    fireEvent.click(await screen.findByRole('button', { name: 'Pick' }));
+    await waitFor(() => expect(run).toHaveBeenCalledWith([expect.objectContaining({ key: 'f1' })]));
+
+    fireEvent.keyDown(window, { key: 'a', ctrlKey: true }); // both selected: two eligible
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Pick' })).toBeNull());
+  });
+
   it('a running action disables the buttons until its run settles', async () => {
     let release: () => void = () => {};
     const run = vi.fn(() => new Promise<void>((r) => { release = r; }));

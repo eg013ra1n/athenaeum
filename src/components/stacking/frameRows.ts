@@ -257,11 +257,14 @@ export function buildFrameRows(
   });
 }
 
+/** The prefix of a project run row's key when the row carries no frame uuid. */
+export const HANDLE_KEY_PREFIX = 'h:';
+
 /** A project run row's key: its frame uuid, or `h:<handle>` when the run row
  *  carries none (its project-frame row is gone). `h:` cannot collide with a
  *  uuid, and such a row is never joined to a plan row. */
 function runRowKey(r: StackingRunFrameRow): string {
-  return r.frameUuid ?? `h:${r.frameId}`;
+  return r.frameUuid ?? `${HANDLE_KEY_PREFIX}${r.frameId}`;
 }
 
 /** The project Frames table's row source (spec §12): every frame of the

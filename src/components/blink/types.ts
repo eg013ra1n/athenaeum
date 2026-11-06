@@ -19,6 +19,9 @@ export interface BlinkAction {
   label: (n: number) => string;
   eligible: (f: BlinkFrame) => boolean;
   tone: 'default' | 'warn' | 'danger';
+  /** A single-target action (e.g. "Use as reference"): offered only while exactly one entry of the selection is
+   *  eligible, hidden for none and for several. */
+  single?: boolean;
   /** Gets the eligible entries of the selection only. */
   run: (frames: BlinkFrame[]) => Promise<void> | void;
 }

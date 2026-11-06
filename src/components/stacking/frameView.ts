@@ -108,6 +108,9 @@ export function planGroupTitle(planGroups: PlanGroup[], key: string): string {
   return parts.join(' · ');
 }
 
+/** The title of the bucket of rows with no group yet: the Group mode's last header and Blink's strip. */
+export const NOT_GROUPED_TITLE = 'Not grouped yet';
+
 /** Whether an outcome counts as part of the stack: the run's reference is integrated like any included frame. */
 function isIncluded(row: FrameRow): boolean {
   const kind = row.outcome?.kind;
@@ -291,7 +294,7 @@ function bucketLayout(
       const unknown = withoutNone.filter((k) => !rank.has(k));
       return {
         keys: noneLast([...known, ...unknown]),
-        title: (k) => (k === NO_GROUP_KEY ? 'Not grouped yet' : ctx.groupTitle(k)),
+        title: (k) => (k === NO_GROUP_KEY ? NOT_GROUPED_TITLE : ctx.groupTitle(k)),
       };
     }
     case 'night':

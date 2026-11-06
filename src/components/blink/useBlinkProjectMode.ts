@@ -49,14 +49,15 @@ export function useBlinkProjectMode(
   );
 
   // Project mode: each caller action offers the eligible entries of the
-  // selection, read from the live entries; one with none is hidden.
+  // selection, read from the live entries; one with none is hidden, and a
+  // single-target one (`single`) is hidden for several as well.
   const selectedViews = useMemo(
     () => [...selectedFrames].map((i) => fitsFrames[i]).filter(Boolean).map(view),
     [selectedFrames, fitsFrames, view],
   );
   const projectActions: NonNullable<ToolBarProps['projectActions']> | undefined = useMemo(() => actions?.flatMap((a) => {
     const eligible = selectedViews.filter(a.eligible);
-    if (eligible.length === 0) return [];
+    if (eligible.length === 0 || (a.single && eligible.length > 1)) return [];
     return [{
       id: a.id,
       label: a.label(eligible.length),

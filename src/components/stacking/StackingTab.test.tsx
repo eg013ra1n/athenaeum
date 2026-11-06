@@ -15,6 +15,7 @@ import { StackingTab } from './StackingTab';
 import type { LightFrameRef } from './frameRows';
 import { api } from '../../api';
 import type { StackingConfig, StackingPlan } from '../../types/stacking';
+import type { FrameSetReference } from '../../types/models';
 
 vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
 
@@ -45,6 +46,29 @@ vi.mock('./GroupsTable', () => ({
   }) => (
     <div data-testid="groups" data-hint={String(p.toleranceInCalibrationHash)} data-mode={p.grouping.exposureMode} data-disabled={String(!!p.disabled)}>
       <button type="button" onClick={() => p.onPatchGrouping({ exposureMode: 'stops' })}>group by stops</button>
+    </div>
+  ),
+}));
+
+// Blink is a stub that shows which entries and actions the tab handed it, and runs an action on every entry it fits
+// (its own tests are `StackingBlink.test.tsx`).
+vi.mock('../BlinkViewer', () => ({
+  default: (p: {
+    frames: { key?: string }[];
+    actions?: { id: string; eligible: (f: { key?: string }) => boolean; run: (fs: { key?: string }[]) => void }[];
+    frameSetId?: number;
+    onClose: () => void;
+  }) => (
+    <div
+      data-testid="blink"
+      data-keys={p.frames.map((f) => f.key).join(',')}
+      data-actions={(p.actions ?? []).map((a) => a.id).join(',')}
+      data-set={String(p.frameSetId ?? '')}
+    >
+      {(p.actions ?? []).map((a) => (
+        <button key={a.id} type="button" onClick={() => a.run(p.frames.filter(a.eligible))}>{`run ${a.id}`}</button>
+      ))}
+      <button type="button" onClick={p.onClose}>close blink</button>
     </div>
   ),
 }));
@@ -150,8 +174,14 @@ afterEach(() => {
 });
 
 /** One Stacking tab for a frame set. */
-const frameSetTab = (framesSetId: number) => (
-  <StackingTab subject={{ kind: 'frameSet', framesSetId, lightFrames: FRAMES }} />
+const frameSetTab = (
+  framesSetId: number,
+  extra: { lightFrames?: LightFrameRef[]; onReferenceChanged?: (ref: FrameSetReference | null) => void } = {},
+) => (
+  <StackingTab
+    subject={{ kind: 'frameSet', framesSetId, lightFrames: extra.lightFrames ?? FRAMES }}
+    onReferenceChanged={extra.onReferenceChanged}
+  />
 );
 
 /** One Stacking tab for a collaboration project. */
@@ -345,6 +375,312 @@ const progressEvent = (setId: number | null, projectId: string | null, runId = 3
 });
 const completeEvent = (setId: number | null, projectId: string | null, runId = 3) => ({
   runId, setId, projectId, success: false, cancelled: false, error: 'boom', warnings: [], masters: [],
+});
+
+describe('StackingTab Frames table writes for a frame set', () => {
+  const MANUAL = { ...CONFIG, reference: { mode: 'manual', twoPass: false } };
+  const AUTO = { ...CONFIG, reference: { mode: 'auto', twoPass: false } };
+  const THREE: LightFrameRef[] = [...FRAMES, { frameId: 103, filename: 'c.fit', night: null, exptimeSec: null }];
+
+  /** A frame set whose stored config is in `mode` and whose backend holds the reference frame `held`: the plan it
+   *  builds reports what is held (whatever the mode, so the tab's own reading of the mode is what is tested). */
+  function referenceBackend(mode: 'auto' | 'manual', held: number | null = null, fail: string[] = []) {
+    let stored = held;
+    vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
+      if (fail.includes(command)) return Promise.reject(new Error('disk full'));
+      switch (command) {
+        case 'get_stacking_config':
+          return Promise.resolve({
+            config: { ...CONFIG, reference: { mode, twoPass: false } }, excludedFrameIds: [], isDefault: false, updatedAt: null,
+          });
+        case 'set_frame_set_reference':
+          stored = args?.frameId as number;
+          return Promise.resolve(undefined);
+        case 'clear_frame_set_reference':
+          stored = null;
+          return Promise.resolve(undefined);
+        case 'get_stacking_plan': {
+          const planMode = (args?.config as StackingConfig | undefined)?.reference.mode ?? mode;
+          return Promise.resolve(plan({
+            setId: args?.setId,
+            reference: { mode: planMode, frameId: stored, filename: stored === null ? null : `${stored}.fit`, onDisk: true },
+          }));
+        }
+        default:
+          return answer(command, args);
+      }
+    }) as never);
+  }
+
+  const star = (file: string, pinned: boolean) =>
+    screen.getByRole('button', { name: pinned ? `Clear the reference frame ${file}` : `Use ${file} as the reference frame` });
+  const commandOrder = () => vi.mocked(api.invoke).mock.calls.map(([c]) => c);
+
+  it('bulk_exclude_writes_one_list', async () => {
+    await mount(frameSetTab(7, { lightFrames: THREE }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    const plansBefore = argsOf('get_stacking_plan').length;
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible frames' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude' }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('set_stacking_config')).toEqual([{ setId: 7, config: CONFIG, excludedFrameIds: [101, 102, 103] }]);
+    expect(argsOf('get_stacking_plan')).toHaveLength(plansBefore + 1);
+
+    // The three stay selected; Include takes them out again in one write.
+    fireEvent.click(screen.getByRole('button', { name: 'Include' }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(argsOf('set_stacking_config')).toHaveLength(2);
+    expect(argsOf('set_stacking_config')[1]).toEqual({ setId: 7, config: CONFIG, excludedFrameIds: [] });
+  });
+
+  it('set_star_sets_then_clears', async () => {
+    referenceBackend('auto');
+    await mount(frameSetTab(7));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    fireEvent.click(star('a.fit', false));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('set_frame_set_reference')).toEqual([{ framesSetId: 7, frameId: 101 }]);
+    expect(argsOf('set_stacking_config')).toEqual([{ setId: 7, config: MANUAL, excludedFrameIds: [] }]);
+    // The stored reference is written before the plan that reads it is built.
+    expect(commandOrder().lastIndexOf('get_stacking_plan')).toBeGreaterThan(commandOrder().indexOf('set_frame_set_reference'));
+    expect(argsOf('get_stacking_plan').slice(-1)[0]).toEqual({ setId: 7, config: MANUAL });
+    expect(star('a.fit', true)).toHaveAttribute('aria-pressed', 'true');
+    expect(argsOf('clear_frame_set_reference')).toEqual([]);
+
+    fireEvent.click(star('a.fit', true));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('clear_frame_set_reference')).toEqual([{ framesSetId: 7 }]);
+    expect(argsOf('set_stacking_config')).toHaveLength(2);
+    expect(argsOf('set_stacking_config')[1]).toEqual({ setId: 7, config: AUTO, excludedFrameIds: [] });
+    expect(argsOf('get_stacking_plan').slice(-1)[0]).toEqual({ setId: 7, config: AUTO });
+    expect(argsOf('set_frame_set_reference')).toHaveLength(1);
+    expect(star('a.fit', false)).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('set_star_tells_the_page', async () => {
+    referenceBackend('auto');
+    const onReferenceChanged = vi.fn();
+    await mount(frameSetTab(7, { onReferenceChanged }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    fireEvent.click(star('b.fit', false));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(onReferenceChanged).toHaveBeenCalledTimes(1);
+    expect(onReferenceChanged).toHaveBeenLastCalledWith({ framesSetId: 7, referenceFrameId: 102, setAt: expect.any(String) });
+
+    fireEvent.click(star('b.fit', true));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(onReferenceChanged).toHaveBeenCalledTimes(2);
+    expect(onReferenceChanged).toHaveBeenLastCalledWith(null);
+  });
+
+  it('moves the pin to another frame: the new one is stored, Manual stays', async () => {
+    referenceBackend('manual', 101);
+    await mount(frameSetTab(7));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(star('a.fit', true)).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(star('b.fit', false));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('set_frame_set_reference')).toEqual([{ framesSetId: 7, frameId: 102 }]);
+    expect(argsOf('clear_frame_set_reference')).toEqual([]);
+    expect(star('b.fit', true)).toHaveAttribute('aria-pressed', 'true');
+    expect(star('a.fit', false)).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('shows the star only in Manual mode, and a click on the stored frame under Auto pins it', async () => {
+    referenceBackend('auto', 101);
+    const onReferenceChanged = vi.fn();
+    await mount(frameSetTab(7, { onReferenceChanged }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(star('a.fit', false)).toHaveAttribute('aria-pressed', 'false');
+
+    fireEvent.click(star('a.fit', false));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('set_frame_set_reference')).toEqual([{ framesSetId: 7, frameId: 101 }]);
+    expect(argsOf('set_stacking_config')).toEqual([{ setId: 7, config: MANUAL, excludedFrameIds: [] }]);
+    expect(star('a.fit', true)).toHaveAttribute('aria-pressed', 'true');
+    expect(onReferenceChanged).toHaveBeenCalledWith(expect.objectContaining({ referenceFrameId: 101 }));
+  });
+
+  it('a failed set is logged and notified, and the mode and the star stay as they were', async () => {
+    referenceBackend('auto', null, ['set_frame_set_reference']);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onReferenceChanged = vi.fn();
+    await mount(frameSetTab(7, { onReferenceChanged }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    const plansBefore = argsOf('get_stacking_plan').length;
+
+    fireEvent.click(star('a.fit', false));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(logged).toHaveBeenCalledWith('[StackingTab] frame-set reference write failed:', expect.any(Error));
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(notifyMock).toHaveBeenCalledWith({
+      title: 'Could not set the reference frame', detail: expect.stringContaining('disk full'),
+      kind: 'stacking', tone: 'warning', hasErrors: true,
+    });
+    expect(argsOf('set_stacking_config')).toEqual([]);
+    expect(argsOf('get_stacking_plan')).toHaveLength(plansBefore);
+    expect(onReferenceChanged).not.toHaveBeenCalled();
+    expect(star('a.fit', false)).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('a failed clear keeps the pin and the Manual mode', async () => {
+    referenceBackend('manual', 101, ['clear_frame_set_reference']);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onReferenceChanged = vi.fn();
+    await mount(frameSetTab(7, { onReferenceChanged }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    fireEvent.click(star('a.fit', true));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(logged).toHaveBeenCalledWith('[StackingTab] frame-set reference write failed:', expect.any(Error));
+    expect(notifyMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Could not set the reference frame', hasErrors: true }));
+    expect(argsOf('set_stacking_config')).toEqual([]);
+    expect(onReferenceChanged).not.toHaveBeenCalled();
+    expect(star('a.fit', true)).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('a second click while the first star write is in flight is ignored', async () => {
+    referenceBackend('auto');
+    await mount(frameSetTab(7));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    fireEvent.click(star('a.fit', false));
+    fireEvent.click(star('b.fit', false)); // before the first write resolved
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('set_frame_set_reference')).toEqual([{ framesSetId: 7, frameId: 101 }]);
+  });
+
+  it('forgets the table’s search when another set takes the tab', async () => {
+    const view = await mount(frameSetTab(7));
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search' }), { target: { value: 'b.fit' } });
+    expect(screen.getByRole('searchbox', { name: 'Search' })).toHaveValue('b.fit');
+
+    view.rerender(tree(frameSetTab(8)));
+    for (let i = 0; i < 4; i++) await advance(0);
+
+    expect(screen.getByRole('searchbox', { name: 'Search' })).toHaveValue('');
+  });
+
+  describe('Blink over the selection', () => {
+    /** Adds the catalog read a set's Blink makes to whatever the backend already answers. */
+    function withCatalogFrames(override: Record<string, (args?: Record<string, unknown>) => unknown> = {}) {
+      const backend = vi.mocked(api.invoke).getMockImplementation() as (c: string, a?: Record<string, unknown>) => Promise<unknown>;
+      vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
+        if (command in override) return Promise.resolve(override[command]!(args));
+        if (command !== 'get_files_with_frames_by_ids') return backend(command, args);
+        return Promise.resolve((args?.frameIds as number[]).map((id) => ({
+          file: { id: id * 10, path: `/d/${id}.fit`, filename: `${id}.fit`, format: 'FITS' }, frame: { id, imagetyp: 'Light' },
+        })));
+      }) as never);
+    }
+
+    it('opens the chosen rows of a set by frame id, with the stacking actions, and closes', async () => {
+      withCatalogFrames();
+      await mount(frameSetTab(7));
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select b.fit' }));
+      fireEvent.click(screen.getByRole('button', { name: /^Blink/ }));
+      await advance(0);
+
+      expect(argsOf('get_files_with_frames_by_ids')).toEqual([{ frameIds: [102] }]);
+      const blink = screen.getByTestId('blink');
+      expect(blink).toHaveAttribute('data-keys', '102');
+      expect(blink).toHaveAttribute('data-actions', 'exclude,include,reference');
+      expect(blink).toHaveAttribute('data-set', '7');
+
+      fireEvent.click(screen.getByText('close blink'));
+      expect(screen.queryByTestId('blink')).toBeNull();
+    });
+
+    it('with nothing selected blinks every visible row, and a second open loads again', async () => {
+      withCatalogFrames();
+      await mount(frameSetTab(7));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Blink all 2 frames' }));
+      await advance(0);
+      expect(screen.getByTestId('blink')).toHaveAttribute('data-keys', '101,102');
+      fireEvent.click(screen.getByText('close blink'));
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select a.fit' }));
+      fireEvent.click(screen.getByRole('button', { name: /^Blink/ }));
+      await advance(0);
+      expect(argsOf('get_files_with_frames_by_ids')).toEqual([{ frameIds: [101, 102] }, { frameIds: [101] }]);
+      expect(screen.getByTestId('blink')).toHaveAttribute('data-keys', '101');
+    });
+
+    it('an exclusion and a star in Blink go through the tab\u2019s own writes', async () => {
+      referenceBackend('auto');
+      withCatalogFrames();
+      await mount(frameSetTab(7));
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Blink all 2 frames' }));
+      await advance(0);
+      fireEvent.click(screen.getByText('run exclude'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      expect(argsOf('set_stacking_config')).toEqual([{ setId: 7, config: AUTO, excludedFrameIds: [101, 102] }]);
+      fireEvent.click(screen.getByText('close blink'));
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select a.fit' }));
+      fireEvent.click(screen.getByRole('button', { name: /^Blink/ }));
+      await advance(0);
+      fireEvent.click(screen.getByText('run reference'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      expect(argsOf('set_frame_set_reference')).toEqual([{ framesSetId: 7, frameId: 101 }]);
+    });
+
+    it('offers no action while a run is active', async () => {
+      withCatalogFrames({ get_stacking_plan: (args) => plan({ setId: args?.setId, activeRunId: 9 }) });
+      await mount(frameSetTab(7));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Blink all 2 frames' }));
+      await advance(0);
+      expect(screen.getByTestId('blink')).toHaveAttribute('data-actions', '');
+    });
+
+    it('a project\u2019s Blink asks for its frames by uuid, and a frame set\u2019s call is not made', async () => {
+      projectWith({ mode: 'auto' });
+      const backend = vi.mocked(api.invoke).getMockImplementation() as (c: string, a?: Record<string, unknown>) => Promise<unknown>;
+      vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
+        command === 'get_collab_blink_frames'
+          ? Promise.resolve((args?.refs as { frameUuid: string }[]).map((r) => ({
+              key: r.frameUuid, source: 'replica', frameUuid: r.frameUuid, sourceFrameId: null, publisherName: null,
+              entry: { file: { id: null, path: `/c/${r.frameUuid}.fits`, filename: `${r.frameUuid}.fits`, format: 'FITS' }, frame: null },
+            })))
+          : backend(command, args)) as never);
+      await mount(projectTab('p1'));
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select a.fits' }));
+      fireEvent.click(screen.getByRole('button', { name: /^Blink/ }));
+      await advance(0);
+
+      expect(argsOf('get_collab_blink_frames')).toEqual([{ projectId: 'p1', refs: [{ frameId: null, frameUuid: 'u1' }] }]);
+      expect(argsOf('get_files_with_frames_by_ids')).toEqual([]);
+      expect(screen.getByTestId('blink')).toHaveAttribute('data-keys', 'u1');
+      expect(screen.getByTestId('blink')).toHaveAttribute('data-set', '');
+    });
+  });
+
+  it('a project star never touches the frame-set reference', async () => {
+    projectWith({ mode: 'auto' });
+    await mount(projectTab('p1'));
+    fireEvent.click(screen.getByRole('button', { name: 'Use b.fits as the reference frame' }));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(argsOf('set_frame_set_reference')).toEqual([]);
+    expect(argsOf('clear_frame_set_reference')).toEqual([]);
+  });
 });
 
 const SET_COMMANDS = [

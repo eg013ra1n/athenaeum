@@ -1105,7 +1105,11 @@ export default function FrameSetDetail() {
               // exist under the new id. `ExportTab` below is NOT similarly keyed
               // — verified, not matched here on purpose, since only `StackingTab`
               // materializes a per-set override row a stale write could corrupt.
-              <StackingTab key={id} subject={stackingSubject} />
+              <StackingTab
+                key={id}
+                subject={stackingSubject}
+                onReferenceChanged={(ref) => setReferenceFrameId(ref?.referenceFrameId ?? null)}
+              />
             ) : (
               <div className="text-center py-12 text-content-muted">
                 This set has no light frames yet.
