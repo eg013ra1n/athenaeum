@@ -479,6 +479,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::integrate::GroupStats,
             crate::stacking::drizzle::DrizzleStats,
             crate::api::stacking::MasterLightKind,
+            crate::api::stacking_aligned::AlignedState,
+            crate::api::stacking_aligned::AlignedFrameStatus,
         ]))),
     ]
 }

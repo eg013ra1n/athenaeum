@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
@@ -11,12 +11,22 @@ import type { File as CatalogFile, Frame } from '../types/models';
 vi.mock('../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn(() => Promise.resolve(() => {})) } }));
 vi.mock('../utils/platform', () => ({ isTauri: true }));
 
+// What the canvas was asked to draw, first argument of every drawImage.
+const drawn: unknown[] = [];
+
 beforeAll(() => {
   URL.createObjectURL = vi.fn(() => 'blob:x');
   URL.revokeObjectURL = vi.fn();
-  // jsdom has no 2D context: a context whose every method is a no-op.
+  // jsdom has no 2D context: a context whose every method is a no-op, drawImage noting its image.
   HTMLCanvasElement.prototype.getContext = vi.fn(
-    () => new Proxy({}, { get: (_t, k) => (k === 'canvas' ? document.createElement('canvas') : () => {}), set: () => true }),
+    () => new Proxy({}, {
+      get: (_t, k) => {
+        if (k === 'canvas') return document.createElement('canvas');
+        if (k === 'drawImage') return (img: unknown) => { drawn.push(img); };
+        return () => {};
+      },
+      set: () => true,
+    }),
   ) as never;
 });
 
@@ -33,11 +43,14 @@ function entry(i: number, o: Partial<BlinkFrame> = {}): BlinkFrame {
 const invoked = (cmd: string) => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === cmd);
 
 beforeEach(() => {
+  drawn.length = 0;
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
     if (cmd === 'get_blink_threads_max') return 2;
     if (cmd === 'get_setting') return '';
-    if (cmd === 'get_collab_frame_image' || cmd === 'read_fits_image_rustafits') return new Uint8Array([0xff, 0xd8]);
+    if (cmd === 'get_collab_frame_image' || cmd === 'read_fits_image_rustafits' || cmd === 'get_stacking_aligned_image') {
+      return new Uint8Array([0xff, 0xd8]);
+    }
     if (cmd === 'get_blackholed_file_ids') return [];
     return null;
   });
@@ -87,6 +100,18 @@ describe('BlinkViewer — project mode', () => {
     fireEvent.keyDown(window, { key: 'a', ctrlKey: true });
     fireEvent.click(await screen.findByRole('button', { name: "Don't publish (1)" }));
     await waitFor(() => expect(run).toHaveBeenCalledWith([expect.objectContaining({ key: 'f2' })]));
+  });
+
+  it('a single-target action is offered only while exactly one entry of the selection is eligible', async () => {
+    const run = vi.fn();
+    const pick: BlinkAction = { id: 'pick', label: () => 'Pick', eligible: () => true, tone: 'default', single: true, run };
+    renderBlink({ actions: [pick] });
+    fireEvent.keyDown(window, { key: 's' }); // one entry selected
+    fireEvent.click(await screen.findByRole('button', { name: 'Pick' }));
+    await waitFor(() => expect(run).toHaveBeenCalledWith([expect.objectContaining({ key: 'f1' })]));
+
+    fireEvent.keyDown(window, { key: 'a', ctrlKey: true }); // both selected: two eligible
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Pick' })).toBeNull());
   });
 
   it('a running action disables the buttons until its run settles', async () => {
@@ -322,5 +347,212 @@ describe('BlinkViewer — frame navigation keys', () => {
     expect(screen.getByTitle('Previous frame (↑)')).toBeEnabled();
     fireEvent.click(screen.getByTitle('Previous frame (↑)'));
     expect(counter()).toBe('2 / 3');
+  });
+});
+
+describe('BlinkViewer — aligned frames of a stacking run', () => {
+  // Stacking entries are raw catalog frames with the run's verdict on them.
+  const aligned = (i: number, a: BlinkFrame['aligned']): BlinkFrame => entry(i, { imageRef: undefined, source: 'raw', aligned: a });
+  const available = (i: number) => aligned(i, { runId: 8, frameId: i });
+  const SWITCH_TO_ORIGINAL = 'Show original frames';
+  const SWITCH_TO_ALIGNED = 'Show aligned frames (run #8)';
+
+  it('aligned_mode_loads_run_frame', async () => {
+    renderBlink({ actions: [], frames: [aligned(1, { runId: 8, frameId: 7 })] });
+    await waitFor(() => expect(invoked('get_stacking_aligned_image')).toHaveLength(1));
+    // The preview carries no resolution, like the collab frame image.
+    expect(invoked('get_stacking_aligned_image')[0][1]).toEqual({ runId: 8, frameId: 7 });
+    expect(invoked('read_fits_image_rustafits')).toHaveLength(0);
+
+    fireEvent.click(screen.getByTitle(/Switch to full resolution/));
+    await waitFor(() =>
+      expect(invoked('get_stacking_aligned_image').map(([, a]) => a)).toContainEqual({ runId: 8, frameId: 7, resolution: 'full' }),
+    );
+    expect(invoked('read_fits_image_rustafits')).toHaveLength(0);
+  });
+
+  it('the switch is a toggle button named by its title', async () => {
+    renderBlink({ actions: [], frames: [available(1)] });
+    const showingAligned = await screen.findByRole('button', { name: SWITCH_TO_ORIGINAL });
+    expect(showingAligned).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(showingAligned);
+
+    expect(screen.getByRole('button', { name: SWITCH_TO_ALIGNED })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('toggle_reloads_original', async () => {
+    renderBlink({ actions: [], frames: [available(1), available(2)] });
+    await waitFor(() => expect(invoked('get_stacking_aligned_image')).toHaveLength(2));
+    fireEvent.click(screen.getByTitle(/Switch to full resolution/));
+    await waitFor(() => expect(invoked('get_stacking_aligned_image')).toHaveLength(3));
+    vi.mocked(URL.revokeObjectURL).mockClear();
+
+    fireEvent.click(screen.getByTitle(SWITCH_TO_ORIGINAL));
+
+    // The cached previews and the full-resolution image of the other variant are released.
+    expect(vi.mocked(URL.revokeObjectURL).mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(screen.getByTitle(/Switch to full resolution/)).toBeInTheDocument();
+    // The current frame and the preload both go through the original path.
+    await waitFor(() => expect(invoked('read_fits_image_rustafits').map(([, a]) => a)).toEqual(
+      expect.arrayContaining([{ path: '/c/c_1.fits' }, { path: '/c/c_2.fits' }]),
+    ));
+    expect(invoked('get_stacking_aligned_image')).toHaveLength(3);
+    expect(screen.getByTitle(SWITCH_TO_ALIGNED)).toBeInTheDocument();
+
+    // And back: the aligned frames are asked for again.
+    fireEvent.click(screen.getByTitle(SWITCH_TO_ALIGNED));
+    await waitFor(() => expect(invoked('get_stacking_aligned_image').length).toBeGreaterThanOrEqual(5));
+  });
+
+  it('a load of the other variant that lands after the toggle is dropped', async () => {
+    const sized = (n: number) => new Uint8Array(n);
+    let landLate: () => void = () => {};
+    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_blink_threads_max') return 2;
+      if (cmd === 'get_setting') return '';
+      if (cmd === 'get_stacking_aligned_image') return new Promise((r) => { landLate = () => r(sized(3)); });
+      if (cmd === 'read_fits_image_rustafits') return sized(2);
+      return null;
+    });
+    const created = vi.mocked(URL.createObjectURL);
+    created.mockClear();
+    renderBlink({ actions: [], frames: [available(1)] });
+    await waitFor(() => expect(invoked('get_stacking_aligned_image')).toHaveLength(1));
+
+    fireEvent.click(screen.getByTitle(SWITCH_TO_ORIGINAL));
+    await waitFor(() => expect(invoked('read_fits_image_rustafits')).toHaveLength(1));
+    landLate();
+    await waitFor(() => expect(created).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    const sizes = created.mock.calls.map(([b]) => (b as Blob).size);
+    expect(sizes).toEqual([2]);
+  });
+
+  it('aligned_disables_annotations', async () => {
+    // A flat, so that the contour button is live on the original.
+    renderBlink({ actions: [], frames: [{ ...available(1), frame: { id: 101, imagetyp: 'FLAT' } as unknown as Frame }] });
+    await waitFor(() => expect(invoked('get_stacking_aligned_image')).toHaveLength(1));
+    const buttons = () => screen.getAllByTitle('Not available on aligned frames');
+    expect(buttons()).toHaveLength(2);
+    for (const b of buttons()) expect(b).toBeDisabled();
+
+    fireEvent.keyDown(window, { key: 'a' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(invoked('get_frame_star_metrics')).toHaveLength(0);
+
+    // The original shows them again, and the stars follow the key.
+    fireEvent.click(screen.getByTitle(SWITCH_TO_ORIGINAL));
+    expect(screen.queryByTitle('Not available on aligned frames')).toBeNull();
+    expect(screen.getByTitle('Show star annotations (A)')).toBeEnabled();
+    expect(screen.getByTitle(/Show flat contour plot/)).toBeEnabled();
+    fireEvent.keyDown(window, { key: 'a' });
+    await waitFor(() => expect(invoked('get_frame_star_metrics')).toHaveLength(1));
+  });
+
+  it('no_switch_without_aligned_entries', async () => {
+    const none = { actions: [], frames: [entry(1, { imageRef: undefined, source: 'raw' })] };
+    const { unmount } = renderBlink(none);
+    await waitFor(() => expect(invoked('read_fits_image_rustafits').length).toBeGreaterThan(0));
+    expect(screen.queryByTitle(/aligned frames|original frames/)).toBeNull();
+    expect(screen.getByTitle('Show star annotations (A)')).toBeEnabled();
+    unmount();
+
+    // Entries that only say why they are originals do not offer the switch either.
+    renderBlink({ actions: [], frames: [aligned(1, { runId: 8, reason: 'a later run replaced it' })] });
+    await waitFor(() => expect(invoked('read_fits_image_rustafits').length).toBeGreaterThan(1));
+    expect(screen.queryByTitle(/aligned frames|original frames/)).toBeNull();
+    expect(screen.getByTitle('Show star annotations (A)')).toBeEnabled();
+    expect(invoked('get_stacking_aligned_image')).toHaveLength(0);
+    // With no switch to say it, the strip still says why this entry is an original (spec 6.7: an older run).
+    expect(screen.getByText('original — a later run replaced it')).toBeInTheDocument();
+  });
+
+  it('an entry without an aligned frame loads its original and says why in the strip', async () => {
+    renderBlink({
+      actions: [],
+      frames: [
+        aligned(1, { runId: 8, reason: 'registration failed in run #8' }),
+        available(2),
+      ],
+    });
+    await waitFor(() => expect(invoked('get_stacking_aligned_image')).toHaveLength(1));
+    expect(invoked('get_stacking_aligned_image')[0][1]).toEqual({ runId: 8, frameId: 2 });
+    expect(invoked('read_fits_image_rustafits')[0][1]).toEqual({ path: '/c/c_1.fits' });
+    expect(screen.getByText('original — registration failed in run #8')).toBeInTheDocument();
+
+    // On the original the strip stays quiet: every entry is an original there.
+    fireEvent.click(screen.getByTitle(SWITCH_TO_ORIGINAL));
+    expect(screen.queryByText(/^original — /)).toBeNull();
+  });
+});
+
+describe('BlinkViewer — a decode in flight when the aligned switch flips', () => {
+  const aligned = (i: number): BlinkFrame => entry(i, { imageRef: undefined, source: 'raw', aligned: { runId: 8, frameId: i } });
+  // jsdom decodes nothing: every Image made waits in `decodes` until the test fires its load or error.
+  let decodes: HTMLImageElement[];
+  const srcs = () => decodes.map((d) => d.getAttribute('src'));
+
+  beforeEach(() => {
+    decodes = [];
+    vi.stubGlobal('Image', function FakeImage() {
+      const img = document.createElement('img');
+      Object.defineProperty(img, 'width', { value: 100 });
+      Object.defineProperty(img, 'height', { value: 100 });
+      decodes.push(img);
+      return img;
+    });
+    // The blob URL tells the variants apart: the aligned image is 3 bytes, the original 2.
+    vi.mocked(URL.createObjectURL).mockImplementation((b) => `blob:${(b as Blob).size}`);
+    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_blink_threads_max') return 2;
+      if (cmd === 'get_setting') return '';
+      if (cmd === 'get_stacking_aligned_image') return new Uint8Array(3);
+      if (cmd === 'read_fits_image_rustafits') return new Uint8Array(2);
+      return null;
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.mocked(URL.createObjectURL).mockImplementation(() => 'blob:x');
+  });
+
+  /** The aligned preview has landed and its decode is pending; the switch flips to Original. */
+  async function flipWhileTheAlignedDecodePends() {
+    renderBlink({ actions: [], frames: [aligned(1)] });
+    await waitFor(() => expect(srcs()).toEqual(['blob:3']));
+    fireEvent.click(screen.getByTitle('Show original frames'));
+    await waitFor(() => expect(invoked('read_fits_image_rustafits')).toHaveLength(1));
+  }
+  const fire = (img: HTMLImageElement, type: 'load' | 'error') => act(async () => { img.dispatchEvent(new Event(type)); });
+
+  it('stale_decode_load_is_not_painted', async () => {
+    await flipWhileTheAlignedDecodePends();
+    // The original's decode starts although the aligned one has not finished.
+    await waitFor(() => expect(srcs()).toEqual(['blob:3', 'blob:2']));
+    const [leaving, arriving] = decodes;
+
+    await fire(leaving, 'load');
+    expect(drawn).toEqual([]);
+
+    await fire(arriving, 'load');
+    expect(drawn.length).toBeGreaterThan(0);
+    expect(drawn.every((d) => d === arriving)).toBe(true);
+    expect(screen.queryByText(/Failed to load/)).toBeNull();
+  });
+
+  it('stale_decode_error_shows_no_banner', async () => {
+    await flipWhileTheAlignedDecodePends();
+    await waitFor(() => expect(srcs()).toEqual(['blob:3', 'blob:2']));
+    const [leaving, arriving] = decodes;
+
+    // Revoking the aborted blob makes the browser fail the pending decode.
+    await fire(leaving, 'error');
+    expect(screen.queryByText(/Failed to load/)).toBeNull();
+
+    await fire(arriving, 'load');
+    expect(drawn.length).toBeGreaterThan(0);
+    expect(drawn.every((d) => d === arriving)).toBe(true);
+    expect(screen.queryByText(/Failed to load/)).toBeNull();
   });
 });

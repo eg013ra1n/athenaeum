@@ -123,8 +123,9 @@ Output` — nine backend stages plus the display-only Debayer row;
 `stageSummary.ts` — a pure function shared with `StageInspector`, never reads
 run state) + `GroupsTable`; `StageInspector` + one config panel per stage
 (`panels/{Masters,Calibrate,Debayer,Measure,Reference,Register,Normalize,
-Integrate,Drizzle,Output}Panel.tsx`) for configuration; `FramesTable` (manual
-exclusion is the ONE frame-level write from the tab — everything else is
+Integrate,Drizzle,Output}Panel.tsx`) for configuration; `FramesTable` (the Frames
+block — "The Frames block" below; excluding frames from the next run and the
+reference star are the frame-level writes from the tab, everything else is
 read-only run output) and `ResultsPanel` + `ProvenanceModal`. **No
 `StackingQueueIndicator`**: the sidebar's existing `ComputeQueueIndicator`
 already lists every queue entry including a running stack, with cancel — a
@@ -444,8 +445,9 @@ back to the quad seed. The trigger decides only the ORDER — below the
 floor the hint is still built whenever both frames are solved, and serves
 as the quad seed's own fallback (R-T6-9, below); neither seed ever
 bypasses the star-based confirmation.
-The frames table (`FramesTable.tsx`) renders the
-`+wcs` suffix on a row's `regModel` as a small muted `WCS` chip (title
+The Frames block (`FramesTable.tsx`; "The Frames block" below) renders the
+`+wcs` suffix on a row's `regModel`, in its Model column (the Columns toggle
+shows it), as a small muted `WCS` chip (title
 "seeded from the plate solves") next to the plain model text, rather than
 as part of the string. In native mode a Manual reference pin IS the
 run-level `stacking_runs.reference_frame_id` (ruling R-T3-2); every other
@@ -680,7 +682,7 @@ whole — `tpsSmoothing` is in every set's registration hash whatever the
 purpose; the later default-VALUE change costs no second invalidation, and
 reaches only documents that OMIT the field. `model_name` yields
 `homography+tps`, with `+wcs` still LAST (`homography+tps+wcs`)
-because `FramesTable.tsx::splitRegModel` strips the trailing suffix for its
+because `FramesTableRows.tsx::splitRegModel` strips the trailing suffix for its
 `WCS` chip.
 
 **LN local scale and the barycentre pass** (rulings R-M4c-8/9):
@@ -1641,11 +1643,18 @@ unchanged.
   - A row with no manifest WCS is pinnable too, with the tooltip `No WCS in the manifest — plate-solved locally first`,
     because the reference rule (§5.4) admits a locally solved frame and `hasWcs` is the manifest's WCS only. An unusable
     row shows its reason and cannot be pinned; a pinned row that became unusable can still be cleared.
-- **The project Frames table, by uuid.** Rows come from `plan.projectFrames`, with a Publisher column. A run row joins
-  its plan row by `frameUuid` only. A summary frame carries the run's handle and no uuid, so it is joined through the
-  run row (its own `frameId`), never through the plan's current handle. A run row whose frame left the plan renders from
-  the run (the summary's file name, or `frame <handle>`) with no toggle and no pin. An unusable plan row keeps its include
-  checkbox: it stores a uuid, so an exclusion survives the file landing later.
+- **The project Frames table, by uuid.** It is the shared Frames block ("The Frames block", below) over a project's
+  rows. Rows come from `plan.projectFrames`, with a Publisher column. A run row joins its plan row by `frameUuid` only.
+  A summary frame carries the run's handle and no uuid, so it is joined through the run row (its own `frameId`), never
+  through the plan's current handle.
+  - A run row whose frame left the plan renders from the run (the summary's file name, or `frame <handle>`). It is not
+    `editable`: it has no star, Exclude and Include skip it, and it has no uuid, so Blink cannot open it (it counts in
+    Blink's "not on this device" notice).
+  - An unusable plan row stays `editable`: Exclude and Include act on it, because it stores a uuid and an exclusion
+    survives the file landing later. Its outcome chip reads `Not stackable here`, with the plan's reason under the file
+    name.
+  - Grouping offers Group, Publisher, Status and None (a project has no Night). The outlier limit is per group and
+    publisher, since each member shoots with their own rig. The status chips add `Not stackable here`.
 - **The exposure grouping control (D1).** In the Groups table header, for both subjects: `Exposure grouping`, Seconds /
   Stops / Equivalent t/N² / None, and the mode's threshold. `seconds` takes `Tolerance (s)` (`exposureToleranceSec`,
   min 0.01); `stops` and `equivalent` take `Width (stops)` (`stopsWidth`, min 0.1); `none` takes none. The `Exp` column
@@ -1694,6 +1703,156 @@ unchanged.
 - **Not in 6c.** The grid and the outlines over the sky-chart survey background (a follow-up, possibly with the portal's
   grid editor, wave 7), and the `equivalent` zero point (sub-wave 6.5). Owed checks, the owner decisions and the
   acceptance re-check on current `main`: `docs/superpowers/open-items.md`, "Collab wave 6c".
+
+**The Frames block (2026-11-06)** (spec `docs/superpowers/specs/2026-11-06-stacking-frames-block-design.md`, plan
+`docs/superpowers/plans/2026-11-06-stacking-frames-block-plan.md`). One component, `FramesTable.tsx`, for a frame set and
+for a project. It lets the user decide, per frame and per group, what goes into the next stack, and it shows what the
+selected run did with each frame. Nothing changes in what a run does, in how exclusions and the reference are stored, or
+in the reference rules. The command count is 331 (three added: `clear_frame_set_reference`, `get_stacking_aligned_frames`,
+`get_stacking_aligned_image`; `docs/architecture/commands.md`).
+
+- **Layout, top to bottom.**
+  - The header line: the collapse chevron, `Frames (N)` and the run the metrics come from, `metrics from run #8 · 2026-10-01
+    23:41:57` (the run selected in Results; `formatTimestamp`), or `no run yet`.
+  - The reference strip, the toolbar with one row of status chips, and the table.
+  - The table has a sticky header and scrolls inside the block (`max-h-[70vh]`).
+  - Files: `FramesTable.tsx` (state and layout), `FramesToolbar.tsx`, `FramesTableRows.tsx` (rows, group headers, the
+    Model cell), `FramesReferenceStrip.tsx`, `frameRows.ts` (the row model: `FrameRow`, `Outcome`), `frameView.ts` (pure:
+    filters, grouping, outliers, counts), `StackingBlink.tsx`.
+- **The reference strip.** Two lines, built from data the tab already holds, so the strip makes no request.
+  - Line 1: `Registration reference, run #8: <file> · <group> · weight 1.000 · auto` (or `manual`), plus `· two-pass moved it
+    from <file>` when the summary's `reference.switchedFrom` is set. In native mode it reads `per group`, and each group
+    header names its own reference. While a run is in flight and has no summary yet, the row marked `regStatus =
+    'reference'` stands in.
+  - Line 2: `Next run: auto, picked at run time`, or `Next run: <file> · manual` from `plan.reference`, with an error mark
+    when that file is not on this device.
+- **The reference star, both subjects.** The Reference column holds the Analysis `Star`. The star means "you chose this";
+  the `Reference` status chip means "the run used this". The star is filled only in Manual mode, and it is disabled while a
+  run is active.
+  - A frame set: the star calls `set_frame_set_reference` and sets `reference.mode = 'manual'` in the draft config.
+    Clicking the pinned star calls `clear_frame_set_reference { framesSetId }` (new, both hosts: it deletes the stored
+    row) and sets the mode back to `auto`. The Analysis tab reads the same stored row, so after a pin or an unpin both
+    tabs agree. One state still differs: Manual switched to Auto in the Reference panel keeps the stored frame, so
+    Analysis shows its star and Stacking does not; the strip then reads `Next run: auto`. A failed write is logged and
+    notified.
+  - A project: the D2 pin, unchanged (`handlePinReference`: the uuid and `reference.mode` in one config write).
+- **The toolbar** is built from the Analysis toolbar's own pieces, moved to `src/components/toolbar/LabeledToolbar.tsx`
+  (`ToolButton`, `ToolSplit`, `ToolToggle`, `ToolSelection`, `BlinkToolButton`, `ToolDivider`), so both tabs render the
+  same components. The Blink colour is the `blink` token in `tailwind.config.js` (the Analysis tab's old raw cyan, same
+  value in both themes).
+
+  | Group | Control | Behaviour |
+  | ---- | ---- | ---- |
+  | Selection | count (clears) + invert | invert works over the visible rows |
+  | Actions | Blink | `Blink` with a selection, `Blink all` without |
+  | | Exclude, Include | act on the eligible part of the selection (below) |
+  | View | Group by | Group, Night, Status, None for a set; Group, Publisher, Status, None for a project |
+  | | Units (`px` / `"`) | shown when at least one group has a pixel scale |
+  | | Outliers | shows outlier rows only |
+  | | Columns | shows the registration columns |
+  | Search | text field | file name; also the publisher for a project |
+
+- **Selection.** A checkbox column. A row click toggles one row, Shift+click selects or clears the range from the anchor in
+  the displayed order, as on the Analysis tab. A row that a filter, the grouping or a collapsed group hides leaves the
+  selection, so an action never touches a row the user cannot see.
+- **Exclude and Include.** Exclude's eligible rows are selected, `editable` and not in the exclusion list; Include's are
+  selected, `editable` and in it. A button is enabled when its eligible set is not empty, and it reads `Exclude (3 of 5)`
+  when that set is smaller than the selection. Both add or remove keys through `setUserExcluded`, the existing gated
+  persist path, and are disabled while a run is active. Blink is not.
+- **Columns.** The default columns are File, Publisher (project), Weight, FWHM, Ecc, Seeds, Status and Reference. The
+  Columns toggle adds Reg RMS, Inliers, Model (with the `WCS` chip) and Scale (the LN scale). Group by, Units and Columns
+  persist in local storage (`stackingPrefs.ts`, `readFramesView`); the filters, search, selection and collapsed groups do
+  not. There is no per-row Include checkbox: inclusion shows in the Status cell and the row tint.
+- **Two signals per row.** The run's outcome and the next run's exclusion are separate chips and never compete. The
+  outcome comes from structured fields only (`frameRows.ts`), never from parsing `exclusionReason`.
+
+  | Outcome chip | When | Text beside the chips |
+  | ---- | ---- | ---- |
+  | `Reference` (accent) | the run row's `regStatus = 'reference'` | `run #N · auto` or `· manual` |
+  | `Included` (success) | the run included the frame | none |
+  | `Reg failed` (error) | `regStatus = 'failed'` | `exclusionReason` without a leading `registration failed: ` |
+  | `Excluded` (warning) | not included for any other reason | `exclusionReason` |
+  | `Not stackable here` (warning, project) | no run row, and the plan gives a `reason` | the reason, under the file name |
+
+  A row with no run row and no plan reason has no outcome chip. The second chip, `Out of next run` (warning), shows on
+  every row in the exclusion list, whatever its outcome, the run's reference included. A `Reg failed` row is tinted
+  `bg-error/10`; an out-of-next-run row is tinted `bg-warning/10` (the error tint wins when both apply).
+- **Status chips** (one active at a time, each with its count): `All`, `Included` (the `Reference` and `Included`
+  outcomes), `Reg failed`, `Excluded by the run`, `Out of next run` (every row in the exclusion list, so the rows Include
+  acts on are always findable) and, for a project, `Not stackable here`. A row can match more than one chip.
+- **Grouping.**
+  - Group (default): a row's group is the selected run's group when the row has a run row, otherwise the plan's group
+    (`PlanGroup.memberFrameIds`, below), otherwise `Not grouped yet`. Groups come in the plan's order.
+  - Night (frame set): labelled as the Analysis tab labels it (`formatNightLabel`, the TS twin of `format_night_display`:
+    UTC dates, `September 13–14, 2025`, `October 18, 2025`, `October 31 – November 1, 2025`), in first-appearance order.
+    Two imaging nights with the same UTC label share a bucket (the Analysis tab keys nights by their start).
+  - Publisher (project): `PlanProjectFrame.publisher`.
+  - Status: the outcomes in the table's order, and `Not run yet` for a row with no outcome.
+  - None: a flat table. Outside Group mode a row's group is named in its file tooltip.
+  - A group header is clickable to collapse it. The group is never computed in the frontend: the grouping rules live in
+    core.
+- **Group headers.** In Group mode: the filter dot, the group's name, then `N / M included · <integration> · median FWHM
+  <x>` (the integration is the sum of the included frames' exposures). A group with no included frame reads in error text
+  with its outcome counts and its most frequent reason: `0 / 28 included — 25 registration failed (<top reason>) · 3
+  excluded`. The top reason is the most frequent full `exclusionReason` among the group's failed rows, with the leading
+  `registration failed: ` removed. In native mode a header adds `Reference: <file>`; any group whose summary has a
+  `normalizationReferenceFrameId` adds `LN ref: <file>`. Night, Publisher and Status headers read `M frames · N included`.
+- **Outliers.** The Analysis rule (`src/components/analysis/outlierLimit.ts`, shared): limit = median + 3 × max(MAD, 0.1 ×
+  median), over the group's included and reference rows, for FWHM and for Ecc each. The group is the stacking group for a
+  set, and the group and publisher for a project. A cell above its limit is tinted `bg-warning-muted`, whether or not the
+  Outliers filter is on. Known limit: a set's group that mixes focal lengths flags the longer one's frames (camera and
+  geometry are not group keys, and no per-frame pixel scale exists to correct for it).
+- **The plan names each group's members.** `PlanGroup.memberFrameIds` holds every frame of the group in group order,
+  a manually excluded one too (`memberFrameIds.len() == frameCount`). The ids are the run's: catalog frame ids for a set,
+  project-frame handles for a project (the ids `StackingRunFrameRow.frameId` carries). The grouping code that builds the
+  group fills the list, in the existing plan command, so the plan and the run never disagree about membership. The tab
+  turns it into a frame-id to group-key map, so the Frames block has its groups before the first run.
+- **Blink over the selection** (`StackingBlink.tsx`, the viewer's project mode, both subjects). It opens over the selected
+  rows, or every visible row when nothing is selected, in the table's order.
+  - Entries: a set's come from `get_files_with_frames_by_ids`, a project's from `get_collab_blink_frames` by uuid. The
+    notification `N of M frames are not on this device.` counts every row Blink cannot open, including a row that cannot be
+    asked for (a project run row with no uuid).
+  - Actions: `Exclude from next run (N)`, `Include (N)` and `Use as reference` (one pinnable entry that is not already
+    the pin). There is no Black Hole, no withhold and no file deletion. They write through the table's own handlers, so the
+    table shows the change when Blink closes. Each badge is the outcome chip's label, plus `· out of next run`; the context
+    label is the group and the outcome's reason. No action shows while a run is active.
+- **Aligned frames in Blink** (`core/api/stacking_aligned.rs`). Stage 5 writes one registered frame per frame to
+  `<working_dir>/<subject>/registered/<group_key>/r_<stem>[_d].fits` and records it in `stacking_artifacts` (kind
+  `registered`). That row has no run id: every later run of the group overwrites the file and the row. So a frame is
+  aligned only for its own run, and only while that run is the latest to hold its group. `get_stacking_aligned_frames {
+  runId, frameIds }` answers one state per frame. The ids are the run's (catalog frame ids for a set, project-frame
+  handles for a project). The checks run in this order, and the first that applies decides:
+
+  | State | When | Context strip over the original |
+  | ---- | ---- | ---- |
+  | `notRegistered` | the run holds no row for the frame | `original — not registered in run #N` |
+  | `registrationFailed` | the run row's `reg_status` is `failed` | `original — registration failed in run #N` |
+  | `replaced` | a later run of the subject holds the frame's group | `original — a later run replaced it` |
+  | `available` | `reg_status` is `aligned`, `aligned_flipped` or `reference`, and the artifact row names a file on disk | none: the aligned frame is shown |
+  | `missing` | the same `reg_status`, but the artifact row has no path or the file is gone | `original — not in the working folder any more` |
+  | `notRegistered` | any other `reg_status` (`skipped`: the run cut the frame before Register) | `original — not registered in run #N` |
+
+  - The registered statuses are one list, `stacking::plan::registered_status`, shared with the plan's freshness check. A
+    meridian-flipped frame (`aligned_flipped`) has its aligned frame too.
+  - A frame cut by the weight floor after Register keeps `reg_status = aligned` and stays `available`. A `skipped` frame is
+    `notRegistered` even when an earlier run left an artifact for it: that file is not this run's.
+  - The group row of a later run exists from that run's first moment, so a later run that got no further than planning
+    already marks the group `replaced`. This is the safe side: never offer pixels a later run may have replaced.
+  - The file is the artifact row's absolute `path`, never a path rebuilt from the subject's current name (a rename changes
+    the folder). `get_stacking_aligned_image { runId, frameId, resolution? }` errors unless the state is `available`, then
+    renders the file with the original preview's pipeline and stretch, on both hosts (NaN outside coverage renders
+    black). It is a per-frame call, so its span is `debug`.
+  - In Blink, an **Aligned / Original** switch is offered when at least one entry has an aligned frame. Aligned is the
+    default. An entry without one shows its original, and the context strip says why. The strip's reason also shows when
+    no entry has an aligned frame (then there is no switch). With no run selected there are no verdicts and Blink shows
+    originals. The star overlay and the flat contour are drawn on the original's pixel grid, so both are off in Aligned
+    mode. A failed verdict call opens Blink with originals and a warning notification (`Aligned frames are unavailable`). A
+    failed aligned decode is shown as an error, with no silent fall back to the original.
+- **Not in the block.** No Black Hole and no file deletion in the table or in Blink. No threshold bar that auto-rejects
+  frames (the Analysis tab's `RejectionThresholdBar`): outliers are highlighted and filterable, and excluding them stays
+  the user's click.
+- **Owed.** Four checks on real data, by a human: `docs/superpowers/open-items.md`, "Stacking Frames block". The changes
+  made during implementation that differ from the spec's letter: the spec's section 12.
 
 **LN model fixes (2026-10-04 … 2026-10-06)** (spec
 `docs/superpowers/specs/2026-10-04-ln-model-fixes-design.md`, plan
@@ -4913,7 +5072,7 @@ In-app light stacking — the frame set's own master light(s) from its matched c
 - **The run** (`stacking::run`): one `stacking-run-<id>` thread admitted through the shared `ComputeQueue` (the sidebar's `ComputeQueueIndicator` lists it — no separate widget), cooperative cancel via `ServiceContext::active_stacks`, `heal_interrupted_runs` from every API entry point, `stacking-progress` throttled 300 ms (`FanOutTicker` inside the fan-out stages), exactly one `stacking-complete` from the single exit path.
 - **Config precedence is WHOLE-CONFIG** (`resolve_config`): a stored per-set document IS the run's config, no field-level merge; new fields are `#[serde(default)]` without a version bump. Presets (Default / Fast preview / Maximum quality) are a single Rust source of truth; user presets are one `stacking.presets` settings row, entry-wise decoded, written under `BEGIN IMMEDIATE`.
 - **26 commands** in `api/stacking.rs`, mirrored on both hosts: plan/start/cancel, runs, config/defaults/presets, paths/work-usage/cleanup, `get_master_light_preview` (`maxPx` clamped to `[64, 2048]`), `list/save/delete_stacking_preset`, and the seven project twins (wave 6b-3). A project run stacks onto the coordinator's canonical grid: one composed map per frame, LN on the overlap, a coverage map and an optional crop (`docs/stacking/README.md`, The project path on the grid).
-- **Tab** (`src/components/stacking/`): `StackingTab` → `PipelineBoard`/`StageRow` (ten rows: nine stages + the display-only Debayer) + `GroupsTable`, `StageInspector` + one panel per stage, `FramesTable` (manual exclusion is the ONE frame-level write), `ResultsPanel`/`ProvenanceModal`. Settings → Stacking: global defaults + working/output folders (`<working_dir>/<set_slug>/{calibrated,measured,registered,ln,runs,rej,previews}/`) + a Compute section (`compute.memory_budget_mb`, the frame memory budget; 0 = auto = a quarter of the effective memory, clamped above it; R-OSP-13).
+- **Tab** (`src/components/stacking/`): `StackingTab` → `PipelineBoard`/`StageRow` (ten rows: nine stages + the display-only Debayer) + `GroupsTable`, `StageInspector` + one panel per stage, `FramesTable` (the Frames block: exclusion from the next run and the reference star are the frame-level writes), `ResultsPanel`/`ProvenanceModal`. Settings → Stacking: global defaults + working/output folders (`<working_dir>/<set_slug>/{calibrated,measured,registered,ln,runs,rej,previews}/`) + a Compute section (`compute.memory_budget_mb`, the frame memory budget; 0 = auto = a quarter of the effective memory, clamped above it; R-OSP-13).
 - **Method rules**: a numeric change is judged on the WHOLE group at master level (a full checkpoint), never on a few-frame probe; a speedup that misses a spec §8 tolerance row is reverted with its numbers; only interleaved before/after brackets are comparable on this Mac; `cargo check --no-default-features` does not compile `integration/`, and `cargo test --lib` hides example breakage (`--all-targets`). Per-core efficiency (SIMD / branchless, bit-identical, scalar oracle kept) comes before threads or GPU, and work units are compared with the ERP, not stage walls (R-OSP-14). Measured-out ideas are recorded in the reference and in doc comments — do not re-propose them. Acceptance harness and the synthetic star lab: the private `athenaeum-lab` repository (`harness/acceptance/`, `star-lab/`; reuse, never rebuild; `ATHENAEUM_REPO` names this checkout). Lab and measurement tools are committed there, never here; the Rust probes stay in `examples/`.
 
 Key files: `crates/athenaeum-core/src/stacking/{config,groups,paths,plan,run,provenance,measure,weights,psf_signal,structure,integrate,master_cards,rej,fits_artifact}.rs`, `stacking/register/`, `stacking/ln/`, `stacking/drizzle/`, `integration/` (engine, combiners, `student_t.rs`), `geometry/tps.rs`, `fits_writer/{wcs,xisf_writer}.rs`, `api/stacking.rs`, `db/stacking.rs`; probes `examples/{measure,register,integrate,ln,drizzle}_probe.rs`, `examples/weight_audit.rs`. Frontend: `src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.

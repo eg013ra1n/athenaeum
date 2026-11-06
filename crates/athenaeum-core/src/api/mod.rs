@@ -116,6 +116,10 @@ pub mod plate_solve;
 // already are — the module doesn't exist at all in a headless build.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod stacking;
+// The aligned (registered) frames of a stacking run, for Blink: availability per frame and
+// the file to render. Gated like `stacking`, whose artifacts it reads.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod stacking_aligned;
 // Plan 6b-3 Task 9: a collaboration project stacked end to end through the
 // fake hub (spec §15.2). In-crate because the fake hub is `#[cfg(test)]`.
 #[cfg(all(test, feature = "render", feature = "solver"))]

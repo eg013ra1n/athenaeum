@@ -10,6 +10,10 @@ export type BlinkFrame = FileWithFrame & {
   source?: BlinkSource;
   /** A short state label (e.g. `withheld`, `excluded`) shown on the row and in the context strip. */
   badge?: string;
+  /** A stacking run's verdict on this frame (spec §6.7). With a `frameId` the run's registered frame is shown while
+   *  the viewer is in Aligned mode, loaded through get_stacking_aligned_image. With a `reason` the entry always shows
+   *  its original, and the context strip says `original — <reason>`. Absent: no run is involved. */
+  aligned?: { runId: number; frameId: number } | { runId: number; reason: string };
 };
 
 /** A caller action offered on the selection in project mode, in place of the Black Hole. */
@@ -19,6 +23,9 @@ export interface BlinkAction {
   label: (n: number) => string;
   eligible: (f: BlinkFrame) => boolean;
   tone: 'default' | 'warn' | 'danger';
+  /** A single-target action (e.g. "Use as reference"): offered only while exactly one entry of the selection is
+   *  eligible, hidden for none and for several. */
+  single?: boolean;
   /** Gets the eligible entries of the selection only. */
   run: (frames: BlinkFrame[]) => Promise<void> | void;
 }
@@ -94,6 +101,10 @@ export interface ToolBarProps {
   canShowContour: boolean;
   contourActive: boolean;
   onShowContourPlot: () => void;
+
+  // Aligned / Original switch — present only when some entry has an aligned frame (spec §6.7). While `aligned` is on,
+  // the star annotations and the flat contour (both drawn on the original's pixel grid) are disabled.
+  imageVariant?: { aligned: boolean; runId: number; onToggle: () => void };
 
   // Close
   onClose: () => void;

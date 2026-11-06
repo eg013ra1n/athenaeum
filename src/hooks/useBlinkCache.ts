@@ -8,6 +8,9 @@ interface UseBlinkCacheArgs {
   maxConcurrent: number;
   loadedImages: Map<number, string>;
   loadImage: (index: number) => Promise<void>;
+  /** A change restarts the preload from scratch: the caller emptied `loadedImages` because what an index loads
+   *  changed (BlinkViewer's Aligned / Original switch). */
+  resetKey?: unknown;
 }
 
 interface UseBlinkCacheResult {
@@ -31,6 +34,7 @@ export function useBlinkCache({
   maxConcurrent,
   loadedImages,
   loadImage,
+  resetKey,
 }: UseBlinkCacheArgs): UseBlinkCacheResult {
   const [isCaching, setIsCaching] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ current: 0, total: 0 });
@@ -48,6 +52,8 @@ export function useBlinkCache({
 
   const dispatchedRef = useRef(new Set<number>());
   const inflightCountRef = useRef(0);
+  /** Bumped at every restart: a load dispatched before it no longer counts against the new pool. */
+  const poolRef = useRef(0);
   const cacheStartTimeRef = useRef(0);
   const unmountedRef = useRef(false);
 
@@ -81,7 +87,9 @@ export function useBlinkCache({
       dispatchedRef.current.add(idx);
       inflightCountRef.current++;
 
+      const pool = poolRef.current;
       loadImageRef.current(idx).finally(() => {
+        if (pool !== poolRef.current) return;
         inflightCountRef.current--;
         tryDispatch();
       });
@@ -108,6 +116,7 @@ export function useBlinkCache({
     if (!cacheModeReady || frames.length === 0) return;
 
     unmountedRef.current = false;
+    poolRef.current++;
     dispatchedRef.current = new Set();
     inflightCountRef.current = 0;
     cacheStartTimeRef.current = Date.now();
@@ -121,7 +130,7 @@ export function useBlinkCache({
       unmountedRef.current = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cacheModeReady, frames.length]);
+  }, [cacheModeReady, frames.length, resetKey]);
 
   useEffect(() => {
     tryDispatch();

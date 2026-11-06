@@ -14,6 +14,7 @@ use axum::{
 use serde::Deserialize;
 
 use athenaeum_core::api::stacking as api;
+use athenaeum_core::api::stacking_aligned::{self as aligned, AlignedFrameStatus};
 use athenaeum_core::stacking::config::StackingConfig;
 use athenaeum_core::stacking::paths::{CleanupWhat, WorkUsage};
 use athenaeum_core::stacking::plan::{StackingPlan, Stage};
@@ -126,6 +127,22 @@ pub struct GetStackingWorkUsageArgs {
 pub struct CleanupStackingWorkArgs {
     pub set_id: i64,
     pub what: CleanupWhat,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetStackingAlignedFramesArgs {
+    pub run_id: i64,
+    pub frame_ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetStackingAlignedImageArgs {
+    pub run_id: i64,
+    pub frame_id: i64,
+    #[serde(default)]
+    pub resolution: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -463,6 +480,48 @@ pub async fn cleanup_stacking_work(
     Ok(Json(result))
 }
 
+// ── Aligned frames for Blink (stacking Frames block, spec 2026-11-06 §6.7) ────
+
+/// POST /api/get_stacking_aligned_frames
+///
+/// For each frame of a stacking run, whether its aligned (registered) frame can be shown in Blink and, if
+/// not, why. DB reads plus one `stat` per frame, on a blocking thread.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_stacking_aligned_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetStackingAlignedFramesArgs>,
+) -> Result<Json<Vec<AlignedFrameStatus>>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        aligned::get_stacking_aligned_frames(&ctx, args.run_id, &args.frame_ids)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Aligned-frames task panicked: {}", e),
+        )
+    })?
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// POST /api/get_stacking_aligned_image
+///
+/// JPEG of one frame's aligned frame in a stacking run, through the shared cache, gate, semaphore and pool
+/// (`get_collab_frame_image` is the model). The file is the artifact row's own path, resolved in core; a
+/// frame whose state is not `available` answers 404. Fired per Blink frame, so `debug`.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_stacking_aligned_image(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetStackingAlignedImageArgs>,
+) -> Result<Response, (StatusCode, String)> {
+    let path = aligned::resolve_stacking_aligned_path(&state.ctx, args.run_id, args.frame_id)
+        .map_err(api_err)?;
+    crate::routes::images::render_path_jpeg(&state, path.to_string_lossy().into_owned(), args.resolution)
+        .await
+}
+
 // ── Project stacking (collab wave 6b-3, spec §9.1) ───────────────────────
 
 /// POST /api/get_project_stacking_plan
@@ -754,6 +813,51 @@ mod tests {
             value["fastPreview"]["output"]["cleanup"],
             "deleteIntermediates"
         );
+    }
+
+    /// The aligned-frames batch is registered: with no catalog behind `test_state(None)` it answers
+    /// from the handler (a 500 for the missing database), never the router's 404.
+    #[tokio::test]
+    async fn get_stacking_aligned_frames_route() {
+        let state = test_state(None);
+        let router = crate::routes::build_router(state, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/get_stacking_aligned_frames")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"runId":1,"frameIds":[1,2]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The aligned image is registered, and `resolution` is optional on the wire.
+    #[tokio::test]
+    async fn get_stacking_aligned_image_route() {
+        let state = test_state(None);
+        let router = crate::routes::build_router(state, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/get_stacking_aligned_image")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"runId":1,"frameId":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// `POST /api/get_stacking_defaults` with `{}` is settings-only (no DB

@@ -11,8 +11,12 @@ import {
   ScanEye,
   Info,
   Mountain,
+  Layers,
 } from "lucide-react";
 import type { ToolBarProps } from "./types";
+
+/** The title of the star and contour buttons while Aligned mode is on: both are drawn on the original's pixel grid. */
+const NOT_ON_ALIGNED = "Not available on aligned frames";
 
 const PROJECT_ACTION_TONE: Record<NonNullable<ToolBarProps['projectActions']>[number]['tone'], string> = {
   warn: 'bg-warning text-surface',
@@ -47,11 +51,18 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   canShowContour,
   contourActive,
   onShowContourPlot,
+  imageVariant,
   isCaching,
   cacheProgress,
   cacheStats,
   onClose,
 }) {
+  const alignedOn = imageVariant?.aligned === true;
+  const variantTitle = imageVariant
+    ? imageVariant.aligned
+      ? "Show original frames"
+      : `Show aligned frames (run #${imageVariant.runId})`
+    : undefined;
   return (
     <div className="flex items-center justify-between px-4 py-2 bg-surface border-b border-border">
       {/* Left: Playback controls */}
@@ -103,12 +114,13 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
         {/* Star annotation toggle */}
         <button
           onClick={onToggleAnnotations}
-          className={`p-2 rounded transition-colors ${
+          disabled={alignedOn}
+          className={`p-2 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
             showAnnotations
               ? "bg-accent text-surface"
               : "bg-surface-elevated text-content hover:bg-surface-hover"
           }`}
-          title={showAnnotations ? "Hide star annotations (A)" : "Show star annotations (A)"}
+          title={alignedOn ? NOT_ON_ALIGNED : showAnnotations ? "Hide star annotations (A)" : "Show star annotations (A)"}
         >
           <Star size={20} />
         </button>
@@ -137,22 +149,42 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
             preview. Settings live in Settings → General → Flat Contour Plot. */}
         <button
           onClick={onShowContourPlot}
-          disabled={!canShowContour}
+          disabled={!canShowContour || alignedOn}
           className={`p-2 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
             contourActive
               ? "bg-accent text-surface"
               : "bg-surface-elevated text-content hover:bg-surface-hover"
           }`}
           title={
-            canShowContour
-              ? contourActive
-                ? "Hide flat contour plot"
-                : "Show flat contour plot — gradient & vignetting analysis"
-              : "Flat contour plot (FLAT / MASTERFLAT only)"
+            alignedOn
+              ? NOT_ON_ALIGNED
+              : canShowContour
+                ? contourActive
+                  ? "Hide flat contour plot"
+                  : "Show flat contour plot — gradient & vignetting analysis"
+                : "Flat contour plot (FLAT / MASTERFLAT only)"
           }
         >
           <Mountain size={20} />
         </button>
+
+        {/* Aligned / Original — offered only over a stacking run's frames (spec §6.7). On: each entry shows the
+            frame as the run registered it; an entry the run has no aligned frame for still shows its original. */}
+        {imageVariant && (
+          <button
+            onClick={imageVariant.onToggle}
+            className={`p-2 rounded transition-colors ${
+              imageVariant.aligned
+                ? "bg-accent text-surface"
+                : "bg-surface-elevated text-content hover:bg-surface-hover"
+            }`}
+            title={variantTitle}
+            aria-label={variantTitle}
+            aria-pressed={imageVariant.aligned}
+          >
+            <Layers size={20} />
+          </button>
+        )}
       </div>
 
       {/* Center: Frame counter + selection count + caching progress */}

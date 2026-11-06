@@ -7,7 +7,8 @@ import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
-import { LightsAnalysisView, ToolButton } from '../components/LightsAnalysisView';
+import { LightsAnalysisView } from '../components/LightsAnalysisView';
+import { ToolButton } from '../components/toolbar/LabeledToolbar';
 import FrameSetProjectBlock from '../components/collab/FrameSetProjectBlock';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
@@ -21,6 +22,8 @@ import { RestoreDialog } from '../components/archive/RestoreDialog';
 import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { StackingTab } from '../components/stacking/StackingTab';
+import type { LightFrameRef } from '../components/stacking/frameRows';
+import { formatNightLabel } from '../components/stacking/frameView';
 import { revealItemInDir, openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
@@ -380,8 +383,10 @@ export default function FrameSetDetail() {
   // second copy of a frame the set already holds (`duplicateFrameIds`).
   const stackingLightFrames = useMemo(() => {
     if (!detail) return [];
-    const out: { frameId: number; filename: string }[] = [];
+    const out: LightFrameRef[] = [];
     for (const night of detail.nights) {
+      // The night, labelled as the Analysis tab labels it (both ends read in UTC).
+      const nightLabel = formatNightLabel(night.imaging_night.start_time, night.imaging_night.end_time);
       for (const session of night.sessions) {
         for (const fw of session.frames) {
           if (
@@ -391,7 +396,12 @@ export default function FrameSetDetail() {
             !(fw.file.id != null && blackholedFileIds.has(fw.file.id)) &&
             !duplicateFrameIds.has(fw.frame.id)
           ) {
-            out.push({ frameId: fw.frame.id, filename: fw.file.filename });
+            out.push({
+              frameId: fw.frame.id,
+              filename: fw.file.filename,
+              night: nightLabel,
+              exptimeSec: fw.frame.exptime,
+            });
           }
         }
       }
@@ -1095,7 +1105,11 @@ export default function FrameSetDetail() {
               // exist under the new id. `ExportTab` below is NOT similarly keyed
               // — verified, not matched here on purpose, since only `StackingTab`
               // materializes a per-set override row a stale write could corrupt.
-              <StackingTab key={id} subject={stackingSubject} />
+              <StackingTab
+                key={id}
+                subject={stackingSubject}
+                onReferenceChanged={(ref) => setReferenceFrameId(ref?.referenceFrameId ?? null)}
+              />
             ) : (
               <div className="text-center py-12 text-content-muted">
                 This set has no light frames yet.

@@ -268,10 +268,10 @@ show `M frames · N included`.
 
 ### 7.1 The plan names each group's members
 
-The plan returns, for each group, the frames it holds: frame ids for a set, frame uuids for a project. They are filled
-by the same grouping code that builds the groups, from the existing plan command, so the plan and the run never
-disagree about membership. The new field goes through `ts_export.rs`; no new command. This closes the open item about
-"—" in the Group column before any run.
+The plan returns, for each group, the frames it holds: frame ids for a set, project-frame handles for a project (the
+ids the run's frame rows carry). They are filled by the same grouping code that builds the groups, from the existing plan
+command, so the plan and the run never disagree about membership. The new field goes through `ts_export.rs`; no new
+command. This closes the open item about "—" in the Group column before any run.
 
 ### 7.2 Aligned frame images for Blink
 
@@ -320,3 +320,23 @@ row and row-builder modules); the table's maximum height; icons for Exclude, Inc
 group's collapse state and the toolbar toggles persist (per subject, in local storage, like the block's own collapse);
 how a row shows its group outside Group mode; where the shared toolbar module lives and the token's name (§6.2, §8);
 how "the subject's latest run that holds the group" is queried (§6.7).
+
+## 12. Changes during implementation
+
+Controller rulings made while the plan was built that changed this document's letter:
+
+- **Night labels (R6, R7).** A night is labelled as the Analysis tab labels it (`formatNightLabel`, the TS twin of
+  `format_night_display`: UTC dates, `September 13–14, 2025`), not by a bare date as §6.6 says. A plain `YYYY-MM-DD`
+  start keeps the Rust fallback spelling (`October 08, 2025`), so both tabs agree.
+- **Row tint (R9).** A row in the exclusion list takes `bg-warning/10` (§6.3's "muted warning tint"), not
+  `bg-warning-muted/40`, which rendered four times as strong as the `bg-error/10` tint beside it.
+- **Blink's notice (R11).** `N of M frames are not on this device.` counts every row Blink does not open, including a row
+  that cannot be asked for (a project run row with no uuid), not only the requested frames that did not come back.
+- **Registered statuses (R12).** An aligned frame needs the run row's `reg_status` to be `aligned`, `aligned_flipped` or
+  `reference` (`stacking::plan::registered_status`, shared with the plan's freshness check). §6.7's rule (the artifact row
+  and its file exist) alone would show another run's file for a frame this run skipped, since artifacts have no run id.
+- **A fourth reason, `notRegistered` (§6.7).** The batch call answers `available`, `registrationFailed`, `notRegistered`,
+  `missing` or `replaced`. `notRegistered` (the run holds no row for the frame, or cut it before Register) reads `not
+  registered in run #N` in the context strip, beside §6.7's three reasons.
+- **Include needs `editable` (§6.2).** Include's eligible rows are selected rows in the exclusion list that are also
+  `editable`, like Exclude's: a project run row whose frame left the plan is never eligible.

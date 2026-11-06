@@ -375,6 +375,15 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking Frames block — reference strip, selection, grouping, Blink (2026-11-06)
+
+Branch `stacking-frames-block` (spec `docs/superpowers/specs/2026-11-06-stacking-frames-block-design.md`, plan `docs/superpowers/plans/2026-11-06-stacking-frames-block-plan.md`). Reference: `docs/stacking/README.md` ("The Frames block"). Code-complete with every task reviewed. The first look at the table was a web build on a catalog copy (set 182, run #8), never the desktop window. Owed by a human, in the desktop app, on real data:
+
+- **The reference strip on a run whose two-pass pick moved the reference.** Open the Stacking tab of a set (or a project) whose selected run moved its reference (set 182, run #8 is one). Line 1 of the strip names both files: `Registration reference, run #N: <file> · <group> · weight … · auto · two-pass moved it from <file>`. Line 2 reads `Next run: auto, picked at run time`, or the pinned file with `manual`. Select another run in Results and line 1 follows it. A native-geometry run reads `per group`, and each group header names its own `Reference:`. Delete this line when it passes.
+- **The frame-set star seen across the Analysis and Stacking tabs.** Star a frame in the Stacking Frames table: the Reference panel reads Manual, the strip's line 2 names the file, and the Analysis tab shows the same frame's star filled. Click the filled star in Stacking: the stored reference is cleared, Analysis shows no star and the mode is Auto. Star a frame in Analysis, switch the Reference panel to Manual, and see Stacking's star on it. One known difference, not a failure: Manual switched to Auto in the Reference panel keeps the stored frame, so Analysis keeps its star and Stacking shows none. Delete this line when it passes.
+- **Aligned Blink on a frame-set run in the desktop app.** It needs a fresh run, because run #8's working folder is gone: a small run of set 182 (a few L and a few R frames) with its working folder under `~/.athenaeum-acc/` and a `REGISTRY.tsv` row (the disk rule). Select frames of the run and press Blink. Aligned is the default and the stars stand still across the L frames. The R frames show their original, with `original — registration failed in run #N` in the context strip. The switch flips to Original and back. The star and contour buttons are off in Aligned mode. Start a second run of the set, then blink the first run: every entry shows its original with `original — a later run replaced it`. Delete the working folder and its registry row afterwards. Delete this line when it passes.
+- **Blink on a project run with a member's frame missing on this device.** Use a project with some members' frames landed and some not (on the dev catalog the LDN1272 test project's own frames read `own_missing` until the catalog lands them: see that item under Collab wave 6c). Select rows that include a frame that is not on this device and a row whose frame left the project. Blink opens over the rest and the notice reads `N of M frames are not on this device.`, with N counting every row it did not open. `Exclude from next run`, `Include` and `Use as reference` work on the entries that opened, with no Black Hole, and the table shows the change after Blink closes. Delete this line when it passes.
+
 ### Collab wave 6c — the project's Stacking tab (2026-11-06)
 
 Branch `collab-v3-wave6c` (plan `docs/superpowers/plans/2026-11-05-collab-v3-wave6c-project-stacking-ui-plan.md`, rulings D1–D11). Reference: `docs/stacking/README.md` (The project's Stacking tab, wave 6c) and `docs/transfers/README.md` (Collab wave 6c — the grid card). Code-complete with every task reviewed; the frontend was checked in the UI harness (`HARNESS_SCENARIO=stacking`) and never in the real window. Owed by a human, on real data, not done by an agent:
@@ -1814,7 +1823,7 @@ time on a 16 GB machine). The tab is enabled for every build since that run.
   percentage; the main pane scrolled horizontally after the provenance modal
   (frames table wider than the pane); a cancelled run's board showing every
   stage as "Skipped" (Calibrate had completed from cache, Measure was
-  interrupted); "—" in the frames table's Group column before any run.
+  interrupted).
 - **Dev-workflow note:** the Vite dev server cannot call a separately running
   web API (no CORS layer, no proxy) — for a same-origin dev run build the
   frontend with `NODE_ENV=development VITE_TARGET=web npx vite build --outDir <dir>`

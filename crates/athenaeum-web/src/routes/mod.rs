@@ -253,6 +253,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Registration (persisted reference frame)
         .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
         .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))
+        .route("/api/clear_frame_set_reference", post(registration::clear_frame_set_reference))
 
         .route("/api/get_stacking_plan", post(stacking::get_stacking_plan))
         .route("/api/start_stacking", post(stacking::start_stacking))
@@ -272,6 +273,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_stacking_paths", post(stacking::set_stacking_paths))
         .route("/api/get_stacking_work_usage", post(stacking::get_stacking_work_usage))
         .route("/api/cleanup_stacking_work", post(stacking::cleanup_stacking_work))
+        .route("/api/get_stacking_aligned_frames", post(stacking::get_stacking_aligned_frames))
+        .route("/api/get_stacking_aligned_image", post(stacking::get_stacking_aligned_image))
         .route("/api/get_project_stacking_plan", post(stacking::get_project_stacking_plan))
         .route("/api/start_project_stacking", post(stacking::start_project_stacking))
         .route("/api/get_project_stacking_runs", post(stacking::get_project_stacking_runs))

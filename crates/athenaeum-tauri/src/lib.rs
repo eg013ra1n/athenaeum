@@ -469,6 +469,7 @@ pub fn run() {
             // Registration (persisted reference frame)
             commands::set_frame_set_reference,
             commands::get_frame_set_reference,
+            commands::clear_frame_set_reference,
             // Stacking (M1 Plan 5a)
             commands::get_stacking_plan,
             commands::start_stacking,
@@ -488,6 +489,8 @@ pub fn run() {
             commands::set_stacking_paths,
             commands::get_stacking_work_usage,
             commands::cleanup_stacking_work,
+            commands::get_stacking_aligned_frames,
+            commands::get_stacking_aligned_image,
             // Project stacking (collab wave 6b-3)
             commands::get_project_stacking_plan,
             commands::start_project_stacking,

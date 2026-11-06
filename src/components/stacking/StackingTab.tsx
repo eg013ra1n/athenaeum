@@ -6,7 +6,7 @@ import { useStackingContext } from '../../contexts/StackingContext';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { subjectKey, type StackSubject, type SubjectKey } from './subject';
 import { useStackingSubjectApi, type StackingSubjectApi, type SubjectConfig } from './useStackingSubjectApi';
-import type { CollabFramesChange, CollabGridChanged } from '../../types/models';
+import type { CollabFramesChange, CollabGridChanged, FrameSetReference } from '../../types/models';
 import type {
   GroupingConfig,
   NamedPreset,
@@ -21,7 +21,9 @@ import type {
 import { PipelineBoard } from './PipelineBoard';
 import { GroupsTable } from './GroupsTable';
 import { StageInspector } from './StageInspector';
-import { FramesTable, type LightFrameRef } from './FramesTable';
+import { FramesTable } from './FramesTable';
+import type { FrameRow, LightFrameRef } from './frameRows';
+import { StackingBlink } from './StackingBlink';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 import { EmptyState } from '../ui/EmptyState';
 import { ResultsPanel } from './ResultsPanel';
@@ -41,6 +43,9 @@ export interface StackingTabProps {
    *  collaboration project. Every command, the run state and the pending
    *  config write are keyed by `subjectKey(subject)`. */
   subject: StackSubject;
+  /** A frame set's reference star was set (with the new reference) or cleared (`null`): the page that also shows
+   *  the Analysis tab's star keeps it in step. Called after the write succeeded; a project has no such reference. */
+  onReferenceChanged?: (ref: FrameSetReference | null) => void;
 }
 
 /** What a write still waiting for its debounce (or its flush) is about: the
@@ -92,7 +97,7 @@ function formatGB(bytes: number): string {
  * root carries no `title` (fix round 1 item 6): on a page-sized `div` it pops
  * a native tooltip over the ENTIRE tab on any hover, not just the header.
  */
-export function StackingTab({ subject }: StackingTabProps) {
+export function StackingTab({ subject, onReferenceChanged }: StackingTabProps) {
   const navigate = useNavigate();
   const { notify } = useNotifications();
   const { progress, lastOutcome, startRun, cancelRun, isRunning } = useStackingContext();
@@ -147,6 +152,10 @@ export function StackingTab({ subject }: StackingTabProps) {
   // panel's currently-selected run without either component reaching into
   // the other directly.
   const [selectedRunDetail, setSelectedRunDetail] = useState<StackingRunDetail | null>(null);
+  // Blink over the Frames table's rows: the rows it was opened on, and an open counter that keys the viewer (it
+  // snapshots its entries when it mounts, so every open is a fresh mount).
+  const [blink, setBlink] = useState<{ open: number; rows: FrameRow[] } | null>(null);
+  const blinkOpensRef = useRef(0);
 
   const runProgress = progress.get(stackKey);
   const runOutcome = lastOutcome.get(stackKey);
@@ -214,8 +223,8 @@ export function StackingTab({ subject }: StackingTabProps) {
   /** The exclusion-list analogue of `setUserConfig` above — Ruling 7's
    *  frame-level write (the pin below is the other). The load effect calls
    *  `setExcluded` directly (bypassing this), so opening a subject never
-   *  marks the draft dirty on its own; only the Frames table's include
-   *  checkbox, through `handleToggleExcludeFrame` below, goes through here. */
+   *  marks the draft dirty on its own; only the Frames table's Exclude and
+   *  Include, through `handleSetExcluded` below, go through here. */
   const setUserExcluded = useCallback<typeof setExcluded>((value) => {
     dirtyRef.current = true;
     storedRowDirtyRef.current = true;
@@ -232,13 +241,26 @@ export function StackingTab({ subject }: StackingTabProps) {
 
   // The Frames table speaks exclusion keys: `String(frameId)` for a set, the
   // frame uuid for a project — the same strings `SubjectConfig.excluded`
-  // holds, so one toggle serves both.
-  const handleToggleExcludeFrame = useCallback((key: string) => {
-    setUserExcluded((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  // holds, so one write serves both. Exclude adds the keys the list lacks,
+  // Include removes them.
+  const handleSetExcluded = useCallback((keys: string[], exclude: boolean) => {
+    setUserExcluded((prev) =>
+      exclude ? [...prev, ...keys.filter((k) => !prev.includes(k))] : prev.filter((k) => !keys.includes(k)),
+    );
   }, [setUserExcluded]);
   const excludedFrameIds = useMemo(
     () => (subject.kind === 'frameSet' ? excluded.map(Number) : NO_FRAME_IDS),
     [excluded, subject.kind],
+  );
+
+  // The plan's group of each frame it names (spec §7.1): the Frames table groups a row with no run row by it, so the
+  // table is grouped before the first run. Ids are in the run's namespace (a catalog id for a set, a handle for a
+  // project), the keys `RowContext.planGroupByFrameId` looks up.
+  const planGroupByFrameId = useMemo(
+    () => new Map<number, string>(
+      (plan?.groups ?? []).flatMap((g) => g.memberFrameIds.map((id): [number, string] => [id, g.key])),
+    ),
+    [plan?.groups],
   );
 
   const handleToggleFramesCollapsed = useCallback(() => {
@@ -528,19 +550,78 @@ export function StackingTab({ subject }: StackingTabProps) {
     setUserConfig(next);
   }, [setUserConfig]);
 
+  // The frame-set pin in effect: a frame set's star shows only in Manual mode, like a project's. The plan's reference
+  // is the stored one, once the plan is built with the draft's mode; a plan still behind the draft (the 300 ms
+  // re-plan) reads as no pin.
+  const pinnedFrameId =
+    subject.kind === 'frameSet' && draftConfig?.reference.mode === 'manual' ? (plan?.reference.frameId ?? null) : null;
+
+  // A frame-set pin writes the stored reference first (the plan reads it from there), then flips the mode in the
+  // draft, whose re-plan builds against the new reference. One write at a time: a second click while the first is on
+  // its way would race it for the stored row.
+  const referenceWriteRef = useRef(false);
+  // Set in the effect body, not at the declaration, so StrictMode's mount-unmount-mount ends on `true`.
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  const pinFrameSetReference = useCallback(async (framesSetId: number, frameId: number, clearing: boolean) => {
+    if (referenceWriteRef.current) return;
+    referenceWriteRef.current = true;
+    const forKey = subjectKeyRef.current;
+    try {
+      if (clearing) await api.invoke<void>('clear_frame_set_reference', { framesSetId });
+      else await api.invoke<void>('set_frame_set_reference', { framesSetId, frameId });
+    } catch (err) {
+      console.error('[StackingTab] frame-set reference write failed:', err);
+      notify({
+        title: 'Could not set the reference frame',
+        detail: String(err),
+        kind: 'stacking',
+        tone: 'warning',
+        hasErrors: true,
+      });
+      return;
+    } finally {
+      referenceWriteRef.current = false;
+    }
+    // The tab may be gone, or show another subject, by now; the mode belongs to the subject the write was made for.
+    if (!mountedRef.current || forKey !== subjectKeyRef.current) return;
+    setUserConfig((prev) =>
+      prev ? { ...prev, reference: { ...prev.reference, mode: clearing ? 'auto' : 'manual' } } : prev,
+    );
+    onReferenceChanged?.(
+      clearing ? null : { framesSetId, referenceFrameId: frameId, setAt: new Date().toISOString() },
+    );
+  }, [notify, setUserConfig, onReferenceChanged]);
+
   // D2: a project's manual reference is a pin in its Frames table. Pinning a
   // frame sets `reference.mode = 'manual'` and the stored uuid in one render,
   // so one write carries both; pinning the pinned frame clears the uuid and
   // returns to Auto. A uuid still stored under Auto is not "the pinned frame":
-  // the click pins it.
-  const handlePinReference = useCallback((uuid: string) => {
-    if (subject.kind !== 'project') return;
-    const clearing = referenceFrameUuid === uuid && draftConfig?.reference.mode === 'manual';
-    setUserReference(clearing ? null : uuid);
+  // the click pins it. A frame set's pin writes its own stored reference
+  // (`pinFrameSetReference`) and takes the same mode.
+  const handlePinReference = useCallback((key: string) => {
+    if (subject.kind === 'frameSet') {
+      const frameId = Number(key);
+      void pinFrameSetReference(subject.framesSetId, frameId, pinnedFrameId === frameId);
+      return;
+    }
+    const clearing = referenceFrameUuid === key && draftConfig?.reference.mode === 'manual';
+    setUserReference(clearing ? null : key);
     setUserConfig((prev) =>
       prev ? { ...prev, reference: { ...prev.reference, mode: clearing ? 'auto' : 'manual' } } : prev,
     );
-  }, [subject.kind, referenceFrameUuid, draftConfig, setUserReference, setUserConfig]);
+  }, [subject, pinnedFrameId, pinFrameSetReference, referenceFrameUuid, draftConfig, setUserReference, setUserConfig]);
+
+  const handleBlink = useCallback((rows: FrameRow[]) => {
+    blinkOpensRef.current += 1;
+    setBlink({ open: blinkOpensRef.current, rows });
+  }, []);
+  const handleCloseBlink = useCallback(() => setBlink(null), []);
+  // Blink writes through this tab's own handlers: it never outlives the subject it was opened on.
+  useEffect(() => { setBlink(null); }, [stackKey]);
 
   const handleToggleDrizzle = useCallback((checked: boolean) => {
     setUserConfig((prev) =>
@@ -873,6 +954,9 @@ export function StackingTab({ subject }: StackingTabProps) {
   // The pin in effect: a uuid stored under Auto is kept for the next Manual but is not the reference.
   const pinnedReference =
     subject.kind === 'project' && draftConfig.reference.mode === 'manual' ? referenceFrameUuid : null;
+  // The row key of the pin in effect, either subject's (Blink does not offer the pinned frame again).
+  const pinnedKey =
+    subject.kind === 'frameSet' ? (pinnedFrameId === null ? null : String(pinnedFrameId)) : pinnedReference;
   // A project with nothing a run could stack here: the board of rows that cannot run gives way to the reason. The
   // `frames` blocker also stands while usable, included frames are too few for one group (the first frames of a
   // project still replicating, groups of two), and then the board, the exposure grouping that can clear it and the
@@ -1269,17 +1353,25 @@ export function StackingTab({ subject }: StackingTabProps) {
       </div>
 
       {/* Frames + Results — full width, below the board/inspector split
-       *  (the Frames table's nine columns need the room; the Results
-       *  panel's master cards read better at full width too). */}
+       *  (the Frames table's columns need the room; the Results
+       *  panel's master cards read better at full width too). The table
+       *  is keyed by the subject: its filters, search, selection and
+       *  collapsed groups are about the rows of one set or project. */}
       <FramesTable
+        key={stackKey}
         subjectKind={subject.kind}
         lightFrames={lightFrames}
         projectFrames={subject.kind === 'project' ? plan.projectFrames : NO_PROJECT_FRAMES}
         runDetail={selectedRunDetail}
+        planGroups={plan.groups}
+        planReference={plan.reference}
         excludedKeys={excluded}
         referenceFrameUuid={pinnedReference}
-        onToggleExclude={handleToggleExcludeFrame}
+        pinnedFrameId={pinnedFrameId}
+        planGroupByFrameId={planGroupByFrameId}
+        onSetExcluded={handleSetExcluded}
         onPin={handlePinReference}
+        onBlink={handleBlink}
         collapsed={framesCollapsed}
         onToggleCollapsed={handleToggleFramesCollapsed}
         disabled={running}
@@ -1290,6 +1382,22 @@ export function StackingTab({ subject }: StackingTabProps) {
         running={running}
         onSelectedRunDetailChange={setSelectedRunDetail}
       />
+
+      {blink && (
+        <StackingBlink
+          key={blink.open}
+          subject={subject}
+          rows={blink.rows}
+          planGroups={plan.groups}
+          runDetail={selectedRunDetail}
+          excludedKeys={excluded}
+          pinnedKey={pinnedKey}
+          disabled={running}
+          onSetExcluded={handleSetExcluded}
+          onPin={handlePinReference}
+          onClose={handleCloseBlink}
+        />
+      )}
     </div>
   );
 }

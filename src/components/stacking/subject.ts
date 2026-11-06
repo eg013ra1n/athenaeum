@@ -1,4 +1,4 @@
-import type { LightFrameRef } from './FramesTable';
+import type { LightFrameRef } from './frameRows';
 
 /** What a stacking run is about: one frame set (the Stacking tab of an
  *  object) or one collaboration project (the Stacking tab of a project).

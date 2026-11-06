@@ -47,6 +47,25 @@ function collabFrameImage(ref: NonNullable<BlinkFrame['imageRef']>, full: boolea
   });
 }
 
+/** A stacking run's registered frame: core resolves the file from the run's artifact row, both hosts (spec §6.7). */
+function alignedFrameImage(ref: { runId: number; frameId: number }, full: boolean) {
+  return api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>('get_stacking_aligned_image', {
+    runId: ref.runId,
+    frameId: ref.frameId,
+    ...(full ? { resolution: 'full' } : {}),
+  });
+}
+
+/** The run frame to show for an entry that has an aligned frame, else `null`. */
+function alignedFrameOf(f: BlinkFrame): { runId: number; frameId: number } | null {
+  return f.aligned !== undefined && 'frameId' in f.aligned ? f.aligned : null;
+}
+
+/** Why an entry of a stacking run shows its original although the run was asked for, else `null`. */
+function alignedReasonOf(f: BlinkFrame): string | null {
+  return f.aligned !== undefined && 'reason' in f.aligned ? f.aligned.reason : null;
+}
+
 /** Input types that take typed text: a key pressed in one never drives Blink.
  * A range, checkbox or button input (the toolbar's speed slider) does not
  * swallow Blink's keys, as before. */
@@ -117,8 +136,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const fullResBlobRef = useRef<string | null>(null);
   const showAnnotationsRef = useRef(showAnnotations);
   const annotationSettingsRef = useRef(annotationSettings);
-  showAnnotationsRef.current = showAnnotations;
   annotationSettingsRef.current = annotationSettings;
+  // Aligned / Original (spec §6.7): Aligned is the default over a stacking run's entries. A load reads the variant
+  // and the epoch when it starts; flipping the switch bumps the epoch, so a load of the leaving variant that lands
+  // afterwards is dropped instead of filling the new variant's cache.
+  const [alignedMode, setAlignedMode] = useState(true);
+  const alignedActiveRef = useRef(false);
+  const variantEpochRef = useRef(0);
 
   // Resizable sidebar (stored in pixels, clamped on render)
   const [sidebarWidth, setSidebarWidth] = useState(320);
@@ -222,10 +246,24 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
   const frameIds = useMemo(() => fitsFrames.map(f => f.frame?.id ?? 0), [fitsFrames]);
 
+  // The switch exists only when some entry has an aligned frame; its title names that entry's run.
+  const alignedRunId = useMemo(() => {
+    for (const f of fitsFrames) {
+      const a = alignedFrameOf(f);
+      if (a) return a.runId;
+    }
+    return null;
+  }, [fitsFrames]);
+  const alignedActive = alignedRunId !== null && alignedMode;
+  alignedActiveRef.current = alignedActive;
+  // The stars are drawn on the original's pixel grid: none in Aligned mode, where the choice waits for the original.
+  const starsOn = showAnnotations && !alignedActive;
+  showAnnotationsRef.current = starsOn;
+
   const { getMetrics: getStarMetrics } = useStarMetricsCache({
     frameIds,
     currentIndex,
-    enabled: showAnnotations,
+    enabled: starsOn,
   });
   const getStarMetricsRef = useRef(getStarMetrics);
   getStarMetricsRef.current = getStarMetrics;
@@ -270,10 +308,14 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const frame = fitsFrames[index];
     if (!frame) return;
 
+    const epoch = variantEpochRef.current;
+    const aligned = alignedActiveRef.current ? alignedFrameOf(frame) : null;
     setError(null);
 
     try {
-      const imageData = frame.imageRef
+      const imageData = aligned
+        ? await alignedFrameImage(aligned, false)
+        : frame.imageRef
         ? await collabFrameImage(frame.imageRef, false)
         : isTauri
           ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
@@ -283,6 +325,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               frameId: frame.file.id,
             });
 
+      // The switch flipped while this loaded: the image belongs to the variant that left.
+      if (epoch !== variantEpochRef.current) return;
       const binaryData = toJpegBytes(imageData);
 
       // Both modes now return JPEG — create blob URL
@@ -291,13 +335,16 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       setLoadedImages((prev) => new Map(prev).set(index, url));
     } catch (err) {
       console.error(`Failed to load image ${index}:`, err);
-      setError(`Failed to load image: ${err}`);
+      if (epoch === variantEpochRef.current) setError(`Failed to load image: ${err}`);
     } finally {
-      setLoadingIndices((prev) => {
-        const newSet = new Set(prev);
-        newSet.delete(index);
-        return newSet;
-      });
+      // After a flip the toggle emptied the set, and the index may already be loading again for the new variant.
+      if (epoch === variantEpochRef.current) {
+        setLoadingIndices((prev) => {
+          const newSet = new Set(prev);
+          newSet.delete(index);
+          return newSet;
+        });
+      }
     }
   }, [fitsFrames]);
 
@@ -308,6 +355,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     maxConcurrent,
     loadedImages,
     loadImage,
+    resetKey: alignedActive,
   });
 
   // Helper to update zoom display with debouncing
@@ -391,9 +439,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     }
 
     renderLockRef.current = true;
+    // A decode that outlives an Aligned / Original flip belongs to the variant that left: the flip released the lock
+    // and blanked the canvas, so it neither paints, nor reports an error, nor touches the lock a newer decode holds.
+    const epoch = variantEpochRef.current;
     const img = new Image();
 
     img.onload = () => {
+      if (epoch !== variantEpochRef.current) return;
       try {
         currentImageRef.current = img;
         renderCanvas();
@@ -403,6 +455,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
 
     img.onerror = () => {
+      if (epoch !== variantEpochRef.current) return;
       setError("Failed to load/decode image");
       renderLockRef.current = false;
     };
@@ -414,7 +467,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   useEffect(() => {
     if (!cacheModeReady) return;
     loadImage(currentIndex);
-  }, [currentIndex, loadImage, cacheModeReady]);
+  }, [currentIndex, loadImage, cacheModeReady, alignedActive]);
 
   // Cleanup blob URLs on unmount
   useEffect(() => {
@@ -434,6 +487,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // while contourMode is on, auto-disable it so the toolbar button reflects
   // the now-disabled state and the canvas falls back to the FITS preview.
   const canShowContour = (() => {
+    if (alignedActive) return false; // drawn on the original's pixel grid
     const t = currentFrame?.frame?.imagetyp?.toUpperCase().trim();
     return t === 'FLAT' || t === 'MASTERFLAT';
   })();
@@ -492,7 +546,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Re-render when annotation state changes (renderCanvas reads from refs, just needs a kick)
   useEffect(() => {
     renderCanvas();
-  }, [showAnnotations, getStarMetrics, annotationSettings, renderCanvas]);
+  }, [starsOn, getStarMetrics, annotationSettings, renderCanvas]);
 
   // Reset full-res mode when navigating to a different frame
   useEffect(() => {
@@ -575,7 +629,36 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
   // Toggle annotations
   const handleToggleAnnotations = useCallback(() => {
+    if (alignedActiveRef.current) return; // the button is disabled; the key does nothing either
     setShowAnnotations((prev) => !prev);
+  }, []);
+
+  // Flip Aligned / Original. Everything keyed by index belongs to the variant that leaves: the previews, the
+  // full-resolution image and the picture on the canvas are released, and the loads restart for the other variant.
+  const handleToggleAligned = useCallback(() => {
+    const next = !alignedActiveRef.current;
+    alignedActiveRef.current = next;
+    variantEpochRef.current += 1;
+    renderLockRef.current = false; // a pending decode is stale now; the other variant's render must not wait for it
+    loadedImagesRef.current.forEach((value) => {
+      if (value.startsWith("blob:")) URL.revokeObjectURL(value);
+    });
+    loadedImagesRef.current = new Map();
+    setLoadedImages(new Map());
+    setLoadingIndices(new Set());
+    if (fullResBlobRef.current) {
+      URL.revokeObjectURL(fullResBlobRef.current);
+      fullResBlobRef.current = null;
+    }
+    setFullResMode(false);
+    currentImageRef.current = null;
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (canvas && ctx) {
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    setAlignedMode(next);
   }, []);
 
   // Toggle full-resolution rendering for the current frame
@@ -596,9 +679,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const frame = fitsFrames[currentIndex];
     if (!frame || loadingFullRes) return;
 
+    const epoch = variantEpochRef.current;
+    const aligned = alignedActiveRef.current ? alignedFrameOf(frame) : null;
     setLoadingFullRes(true);
     try {
-      const imageData = frame.imageRef
+      const imageData = aligned
+        ? await alignedFrameImage(aligned, true)
+        : frame.imageRef
         ? await collabFrameImage(frame.imageRef, true)
         : isTauri
           ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
@@ -610,6 +697,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               resolution: "full",
             });
 
+      if (epoch !== variantEpochRef.current) return; // the switch flipped while this loaded
       const binaryData = toJpegBytes(imageData);
 
       // Revoke previous full-res blob if any
@@ -1106,7 +1194,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           onRestore={handleRestoreSelected}
           isBlackholing={isBlackholing}
           projectActions={projectMode ? projectActions : undefined}
-          showAnnotations={showAnnotations}
+          showAnnotations={starsOn}
           onToggleAnnotations={handleToggleAnnotations}
           fullResMode={fullResMode}
           loadingFullRes={loadingFullRes}
@@ -1119,6 +1207,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
             if (!canShowContour) return;
             setContourMode(prev => !prev);
           }}
+          imageVariant={alignedRunId === null ? undefined : { aligned: alignedActive, runId: alignedRunId, onToggle: handleToggleAligned }}
           isCaching={isCaching}
           cacheProgress={cacheProgress}
           cacheStats={cacheStats}
@@ -1132,6 +1221,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
             {cur?.badge && <Chip tone="warn">{cur.badge}</Chip>}
             <span className="truncate font-mono text-content">{cur?.file.filename}</span>
             {cur && contextLabel && <span className="truncate">{contextLabel(cur)}</span>}
+            {alignedMode && cur && alignedReasonOf(cur) !== null && (
+              <span className="truncate">{`original — ${alignedReasonOf(cur)}`}</span>
+            )}
             <span className="flex-1" />
             {viewOnly && <Chip tone="mute">View only</Chip>}
           </div>
@@ -1249,7 +1341,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           <FrameInfoPanel
             currentFrame={cur}
             metrics={
-              (showAnnotations ? getStarMetrics(currentIndex)?.metrics : null)
+              (starsOn ? getStarMetrics(currentIndex)?.metrics : null)
               ?? (currentFrame?.frame?.id ? analysisMap.get(currentFrame.frame.id) ?? null : null)
             }
           />

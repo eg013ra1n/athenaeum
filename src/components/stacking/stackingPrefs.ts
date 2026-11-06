@@ -14,6 +14,7 @@
 // keeps the real, already-committed convention rather than introducing a
 // second, incompatible one alongside it.
 
+import type { GroupMode } from './frameView';
 import type { BoardStage } from './stageSummary';
 import type { SubjectKey } from './subject';
 
@@ -75,6 +76,54 @@ export function writeFramesCollapsed(collapsed: boolean): void {
     localStorage.setItem(STACKING_FRAMES_COLLAPSED_KEY, String(collapsed));
   } catch (err) {
     console.warn('[stackingPrefs] write frames-collapsed failed:', err);
+  }
+}
+
+/** localStorage keys of the Frames table's view: its grouping, its FWHM units and whether the registration columns
+ *  show. One key each, like the rest of this file. */
+export const STACKING_FRAMES_GROUP_MODE_KEY = 'athenaeum.stacking.framesGroupMode';
+export const STACKING_FRAMES_ARCSEC_KEY = 'athenaeum.stacking.framesArcsec';
+export const STACKING_FRAMES_COLUMNS_KEY = 'athenaeum.stacking.framesColumns';
+
+const GROUP_MODES: readonly GroupMode[] = ['group', 'night', 'publisher', 'status', 'none'];
+
+/** The Frames table's view preferences. A mode the subject does not offer (Night for a project, Publisher for a
+ *  set) is the caller's to fall back from. */
+export interface FramesView {
+  groupMode: GroupMode;
+  arcsec: boolean;
+  columns: boolean;
+}
+
+const DEFAULT_FRAMES_VIEW: FramesView = { groupMode: 'group', arcsec: false, columns: false };
+
+/** Read the Frames table's view (default: by stacking group, px, no registration columns, field by field when
+ *  unset/corrupt). */
+export function readFramesView(): FramesView {
+  try {
+    const mode = localStorage.getItem(STACKING_FRAMES_GROUP_MODE_KEY);
+    return {
+      groupMode:
+        mode !== null && (GROUP_MODES as readonly string[]).includes(mode)
+          ? (mode as GroupMode)
+          : DEFAULT_FRAMES_VIEW.groupMode,
+      arcsec: localStorage.getItem(STACKING_FRAMES_ARCSEC_KEY) === 'true',
+      columns: localStorage.getItem(STACKING_FRAMES_COLUMNS_KEY) === 'true',
+    };
+  } catch (err) {
+    console.warn('[stackingPrefs] read frames view failed:', err);
+    return DEFAULT_FRAMES_VIEW;
+  }
+}
+
+/** Persist the Frames table's view. */
+export function writeFramesView(view: FramesView): void {
+  try {
+    localStorage.setItem(STACKING_FRAMES_GROUP_MODE_KEY, view.groupMode);
+    localStorage.setItem(STACKING_FRAMES_ARCSEC_KEY, String(view.arcsec));
+    localStorage.setItem(STACKING_FRAMES_COLUMNS_KEY, String(view.columns));
+  } catch (err) {
+    console.warn('[stackingPrefs] write frames view failed:', err);
   }
 }
 
