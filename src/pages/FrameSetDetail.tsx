@@ -1090,9 +1090,7 @@ export default function FrameSetDetail() {
               // materializes a per-set override row a stale write could corrupt.
               <StackingTab
                 key={id}
-                framesSetId={parseInt(id!)}
-                frameSetName={detail?.frames_set?.name ?? undefined}
-                lightFrames={stackingLightFrames}
+                subject={{ kind: 'frameSet', framesSetId: parseInt(id!), lightFrames: stackingLightFrames }}
               />
             ) : (
               <div className="text-center py-12 text-content-muted">

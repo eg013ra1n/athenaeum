@@ -18,7 +18,8 @@ import type {
   WorkUsage,
 } from '../../types/stacking';
 import { readSelectedRunId, writeSelectedRunId } from './stackingPrefs';
-import { subjectKey } from './subject';
+import { subjectKey, type StackSubject } from './subject';
+import { useStackingSubjectApi } from './useStackingSubjectApi';
 import { ProvenanceModal } from './ProvenanceModal';
 import { formatBytes } from './formatBytes';
 import { snrGainLabel } from './snrGain';
@@ -377,9 +378,25 @@ function MasterCard({
   );
 }
 
+/** The command names a failure line reports, per subject kind (the adapter in
+ *  `useStackingSubjectApi.ts` picks the command; these are only for the log). */
+const COMMAND_NAMES = {
+  frameSet: {
+    runs: 'get_stacking_runs',
+    usage: 'get_stacking_work_usage',
+    cleanup: 'cleanup_stacking_work',
+  },
+  project: {
+    runs: 'get_project_stacking_runs',
+    usage: 'get_project_stacking_work_usage',
+    cleanup: 'cleanup_project_stacking_work',
+  },
+} as const;
+
 export interface ResultsPanelProps {
-  setId: number;
-  /** True while a run is active for this set (`StackingTab`'s own
+  /** What the panel lists runs for: a frame set or a project. */
+  subject: StackSubject;
+  /** True while a run is active for this subject (`StackingTab`'s own
    *  `isRunning(key) || plan?.activeRunId != null`, threaded through
    *  rather than recomputed here so the two never disagree on what
    *  "running" means). Gates the cleanup button. */
@@ -394,9 +411,12 @@ export interface ResultsPanelProps {
  *  group, Provenance, and the working-folder usage/cleanup line. Owns its
  *  own runs/detail/usage fetching — the same self-contained-fetch pattern
  *  Task 3's `OutputPanel` used for `get_stacking_paths`. */
-export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: ResultsPanelProps) {
+export function ResultsPanel({ subject, running, onSelectedRunDetailChange }: ResultsPanelProps) {
   const { notify } = useNotifications();
   const { lastOutcome } = useStackingContext();
+  const subjectApi = useStackingSubjectApi(subject);
+  const commandNames = COMMAND_NAMES[subject.kind];
+  const noun = subject.kind === 'frameSet' ? 'set' : 'project';
 
   const [runs, setRuns] = useState<StackingRunSummary[] | null>(null);
   const [runsError, setRunsError] = useState<string | null>(null);
@@ -408,14 +428,14 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
   const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false);
   const [cleaning, setCleaning] = useState(false);
 
-  const stackKey = subjectKey({ kind: 'frameSet', framesSetId: setId, lightFrames: [] });
+  const stackKey = subjectKey(subject);
   const lastOutcomeRunId = lastOutcome.get(stackKey)?.runId;
 
   const runsSeqRef = useRef(0);
   const fetchRuns = useCallback(async () => {
     const seq = ++runsSeqRef.current;
     try {
-      const list = await api.invoke<StackingRunSummary[]>('get_stacking_runs', { setId, limit: 20 });
+      const list = await subjectApi.getRuns(20);
       if (seq !== runsSeqRef.current) return; // superseded by a later call
       setRuns(list);
       setRunsError(null);
@@ -426,12 +446,12 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
         return list.length > 0 ? list[0].run.id : null; // newest first
       });
     } catch (err) {
-      console.error('[ResultsPanel] get_stacking_runs failed:', err);
+      console.error(`[ResultsPanel] ${commandNames.runs} failed:`, err);
       if (seq === runsSeqRef.current) setRunsError(String(err));
     }
-  }, [setId, stackKey]);
+  }, [subjectApi, stackKey, commandNames]);
 
-  // Mount / set change, every completion of a run for this set, and any
+  // Mount / subject change, every completion of a run for this subject, and any
   // catalog change a completed run (or something else) might have caused.
   useEffect(() => { void fetchRuns(); }, [fetchRuns, lastOutcomeRunId]);
   useEffect(() => {
@@ -441,7 +461,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
   }, [fetchRuns]);
 
   // The selected run's detail — re-fetched on selection AND whenever this
-  // set gets a fresh outcome (the previously-selected run might be the one
+  // subject gets a fresh outcome (the previously-selected run might be the one
   // that just finished, its `summary` now populated for the first time).
   const detailSeqRef = useRef(0);
   useEffect(() => {
@@ -463,7 +483,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       }
     })();
     return () => { cancelled = true; };
-  }, [selectedRunId, setId, stackKey, lastOutcomeRunId]);
+  }, [selectedRunId, stackKey, lastOutcomeRunId]);
 
   useEffect(() => {
     onSelectedRunDetailChange(runDetail);
@@ -471,23 +491,23 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
 
   const fetchUsage = useCallback(async () => {
     try {
-      const u = await api.invoke<WorkUsage>('get_stacking_work_usage', { setId });
+      const u = await subjectApi.getWorkUsage();
       setUsage(u);
       setUsageError(null);
     } catch (err) {
-      console.error('[ResultsPanel] get_stacking_work_usage failed:', err);
+      console.error(`[ResultsPanel] ${commandNames.usage} failed:`, err);
       // Fix round 1, Minor #6: a fetch failure must not leave the line
       // reading "loading…" forever — that's indistinguishable from a slow
       // request still in flight.
       setUsageError(String(err));
     }
-  }, [setId]);
+  }, [subjectApi, commandNames]);
   useEffect(() => { void fetchUsage(); }, [fetchUsage, lastOutcomeRunId]);
 
   const handleCleanup = useCallback(async () => {
     setCleaning(true);
     try {
-      const freed = await api.invoke<number>('cleanup_stacking_work', { setId, what: 'intermediates' });
+      const freed = await subjectApi.cleanup('intermediates');
       notify({
         title: 'Stacking intermediates deleted',
         detail: `Freed ${formatBytes(freed)}`,
@@ -504,7 +524,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       window.dispatchEvent(new Event('library-updated'));
       await fetchUsage();
     } catch (err) {
-      console.error('[ResultsPanel] cleanup_stacking_work failed:', err);
+      console.error(`[ResultsPanel] ${commandNames.cleanup} failed:`, err);
       notify({
         title: 'Could not delete intermediates',
         detail: String(err),
@@ -516,10 +536,10 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       setCleaning(false);
       setConfirmCleanupOpen(false);
     }
-  }, [setId, notify, fetchUsage]);
+  }, [subjectApi, commandNames, notify, fetchUsage]);
 
   const selectedRun = runs?.find((r) => r.run.id === selectedRunId) ?? null;
-  // Brief's literal gate: disabled only while a run is active for this set
+  // Brief's literal gate: disabled only while a run is active for this subject
   // (the backend's own `Conflict` refusal is the same condition, checked
   // again server-side — see the catch below).
   const cleanupDisabled = running || cleaning;
@@ -636,7 +656,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
           type="button"
           onClick={() => setConfirmCleanupOpen(true)}
           disabled={cleanupDisabled}
-          title={running ? 'A run is active for this set' : undefined}
+          title={running ? `A run is active for this ${noun}` : undefined}
           className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border transition-colors ${
             cleanupDisabled
               ? 'border-border text-content-muted cursor-not-allowed'
@@ -655,7 +675,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       <ConfirmDialog
         isOpen={confirmCleanupOpen}
         title="Delete stacking intermediates?"
-        message="Removes this set's registered, calibrated and local-normalization working files — the reproducible stage output. Run manifests and master lights are kept. This cannot be undone."
+        message={`Removes this ${noun}'s registered, calibrated and local-normalization working files — the reproducible stage output. Run manifests and master lights are kept. This cannot be undone.`}
         confirmText={cleaning ? 'Deleting…' : 'Delete intermediates'}
         confirmDanger
         onConfirm={() => { if (!cleaning) void handleCleanup(); }}

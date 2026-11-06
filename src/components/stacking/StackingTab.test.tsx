@@ -24,8 +24,12 @@ vi.mock('../../contexts/NotificationContext', () => ({
 }));
 
 vi.mock('./PipelineBoard', () => ({
-  PipelineBoard: (p: { progress?: { runId: number }; onToggleDrizzle: (checked: boolean) => void }) => (
-    <div data-testid="board" data-run={p.progress?.runId ?? ''}>
+  PipelineBoard: (p: {
+    progress?: { runId: number };
+    outcome?: { runId: number };
+    onToggleDrizzle: (checked: boolean) => void;
+  }) => (
+    <div data-testid="board" data-run={p.progress?.runId ?? ''} data-outcome={p.outcome?.runId ?? ''}>
       <button type="button" onClick={() => p.onToggleDrizzle(true)}>edit config</button>
     </div>
   ),
@@ -63,8 +67,12 @@ const FRAMES: LightFrameRef[] = [
   { frameId: 102, filename: 'b.fit' },
 ];
 
+const PROJECT_CONFIG = {
+  config: CONFIG, excludedFrameUuids: ['u-ex'], referenceFrameUuid: 'u-ref', isDefault: false, updatedAt: null,
+};
+
 /** What the backend answers, by command name. A command nobody listed resolves to `undefined`. */
-function answer(command: string): Promise<unknown> {
+function answer(command: string, args: Record<string, unknown> = {}): Promise<unknown> {
   switch (command) {
     case 'get_stacking_config':
       return Promise.resolve({ config: CONFIG, excludedFrameIds: [], isDefault: true, updatedAt: null });
@@ -73,7 +81,7 @@ function answer(command: string): Promise<unknown> {
     case 'list_stacking_presets':
       return Promise.resolve([]);
     case 'get_stacking_plan':
-      return Promise.resolve(plan());
+      return Promise.resolve(plan({ setId: args.setId, workingDir: `/work-${args.setId}` }));
     case 'get_stacking_runs':
       return Promise.resolve([RUN]);
     case 'get_stacking_run':
@@ -86,6 +94,20 @@ function answer(command: string): Promise<unknown> {
       return Promise.resolve({ runId: 11 });
     case 'cleanup_stacking_work':
       return Promise.resolve(1234);
+    case 'get_project_stacking_config':
+      return Promise.resolve(PROJECT_CONFIG);
+    case 'get_project_stacking_plan':
+      return Promise.resolve(plan({ setId: null, projectId: args.projectId, workingDir: `/work-${args.projectId}` }));
+    case 'get_project_stacking_runs':
+      return Promise.resolve([RUN]);
+    case 'get_project_stacking_work_usage':
+      return Promise.resolve(USAGE);
+    case 'set_project_stacking_config':
+      return Promise.resolve({ ...PROJECT_CONFIG, config: args.config, excludedFrameUuids: args.excludedFrameUuids });
+    case 'start_project_stacking':
+      return Promise.resolve({ runId: 12 });
+    case 'cleanup_project_stacking_work':
+      return Promise.resolve(99);
     default:
       return Promise.resolve(undefined);
   }
@@ -95,7 +117,8 @@ const handlers: Record<string, (payload: unknown) => void> = {};
 
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => answer(command)) as never);
+  vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
+    answer(command, args)) as never);
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation(((event: string, cb: (payload: unknown) => void) => {
     handlers[event] = cb;
@@ -112,7 +135,14 @@ afterEach(() => {
 });
 
 /** One Stacking tab for a frame set. */
-const frameSetTab = (framesSetId: number) => <StackingTab framesSetId={framesSetId} lightFrames={FRAMES} />;
+const frameSetTab = (framesSetId: number) => (
+  <StackingTab subject={{ kind: 'frameSet', framesSetId, lightFrames: FRAMES }} />
+);
+
+/** One Stacking tab for a collaboration project. */
+const projectTab = (projectId: string) => (
+  <StackingTab subject={{ kind: 'project', projectId, title: 'Project' }} />
+);
 
 const tree = (tab: ReactElement) => (
   <MemoryRouter>
@@ -162,10 +192,10 @@ describe('StackingTab for a frame set', () => {
   });
 
   it('a config edit writes the whole document with the exclusions it loaded with', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) =>
+    vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
       command === 'get_stacking_config'
         ? Promise.resolve({ config: CONFIG, excludedFrameIds: [101], isDefault: false, updatedAt: null })
-        : answer(command)) as never);
+        : answer(command, args)) as never);
     await mount(frameSetTab(7));
 
     fireEvent.click(screen.getByText('edit config'));
@@ -239,5 +269,169 @@ describe('StackingTab for a frame set', () => {
     act(() => handlers['stacking-progress'](event(7, null)));
     expect(screen.getByRole('button', { name: /Cancel/ })).toBeInTheDocument();
     expect(screen.getByTestId('board').dataset.run).toBe('3');
+  });
+});
+
+/** A progress / completion event of the backend, for the set or the project it names. */
+const progressEvent = (setId: number | null, projectId: string | null, runId = 3) => ({
+  runId, setId, projectId, stage: 'measure', groupKey: null, current: 1, total: 2, percent: 50,
+  bytesDone: 0, bytesTotal: 0, frameId: null, message: null,
+});
+const completeEvent = (setId: number | null, projectId: string | null, runId = 3) => ({
+  runId, setId, projectId, success: false, cancelled: false, error: 'boom', warnings: [], masters: [],
+});
+
+const SET_COMMANDS = [
+  'get_stacking_config', 'get_stacking_plan', 'get_stacking_runs', 'get_stacking_work_usage',
+  'set_stacking_config', 'start_stacking', 'cleanup_stacking_work', 'estimate_zip_extraction',
+];
+
+describe('StackingTab for a project', () => {
+  it('a project subject reads and writes through the project commands', async () => {
+    await mount(projectTab('p1'));
+
+    expect(argsOf('get_project_stacking_config')).toEqual([{ projectId: 'p1' }]);
+    expect(argsOf('get_project_stacking_plan')[0]).toEqual({ projectId: 'p1', config: CONFIG });
+    expect(argsOf('get_project_stacking_runs')).toEqual([{ projectId: 'p1', limit: 20 }]);
+    expect(argsOf('get_project_stacking_work_usage')).toEqual([{ projectId: 'p1' }]);
+    // The remembered run of a project is stored under its own key, apart from every set's.
+    expect(argsOf('get_stacking_run')).toEqual([{ runId: 5 }]);
+    expect(localStorage.getItem('athenaeum.stacking.selectedRun.project:p1')).toBe('5');
+
+    // A config edit is written whole, with the exclusions and the pinned reference the project was loaded with.
+    const edited = { ...CONFIG, drizzle: { enabled: true } };
+    fireEvent.click(screen.getByText('edit config'));
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(argsOf('set_project_stacking_config')).toEqual([
+      { projectId: 'p1', config: edited, excludedFrameUuids: ['u-ex'], referenceFrameUuid: 'u-ref' },
+    ]);
+
+    fireEvent.click(screen.getByRole('button', { name: /Run stacking/ }));
+    await advance(0);
+    expect(argsOf('start_project_stacking')).toEqual([{ projectId: 'p1', config: edited, rerunFrom: undefined }]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete intermediates' }));
+    expect(screen.getByText(/^Removes this project's registered/)).toBeInTheDocument();
+    const buttons = screen.getAllByRole('button', { name: 'Delete intermediates' });
+    await act(async () => { fireEvent.click(buttons[buttons.length - 1]); });
+    await advance(0);
+    expect(argsOf('cleanup_project_stacking_work')).toEqual([{ projectId: 'p1', what: 'intermediates' }]);
+
+    // No frame-set command was sent, and no zip estimate (a project has no light-frame list to ask about).
+    for (const command of SET_COMMANDS) expect(argsOf(command), command).toEqual([]);
+  });
+
+  it('progress of another subject is not shown', async () => {
+    await mount(projectTab('p1'));
+    expect(screen.getByRole('button', { name: /Run stacking/ })).toBeEnabled();
+
+    act(() => handlers['stacking-progress'](progressEvent(null, 'p2')));
+    act(() => handlers['stacking-progress'](progressEvent(7, null, 4)));
+    act(() => handlers['stacking-complete'](completeEvent(null, 'p2')));
+    act(() => handlers['stacking-complete'](completeEvent(7, null, 4)));
+    expect(screen.queryByRole('button', { name: /Cancel/ })).toBeNull();
+    expect(screen.getByRole('button', { name: /Run stacking/ })).toBeEnabled();
+    expect(screen.getByTestId('board').dataset.run).toBe('');
+    expect(screen.getByTestId('board').dataset.outcome).toBe('');
+
+    // The same events for the project on screen do show (the check above is not vacuous).
+    act(() => handlers['stacking-progress'](progressEvent(null, 'p1', 5)));
+    expect(screen.getByRole('button', { name: /Cancel/ })).toBeInTheDocument();
+    expect(screen.getByTestId('board').dataset.run).toBe('5');
+    act(() => handlers['stacking-complete'](completeEvent(null, 'p1', 5)));
+    expect(screen.getByTestId('board').dataset.outcome).toBe('5');
+  });
+
+  it('a frame set tab shows no progress of a project', async () => {
+    await mount(frameSetTab(7));
+
+    act(() => handlers['stacking-progress'](progressEvent(null, 'p1')));
+    expect(screen.queryByRole('button', { name: /Cancel/ })).toBeNull();
+    expect(screen.getByTestId('board').dataset.run).toBe('');
+  });
+
+  it('a pending write goes to the subject it was made for', async () => {
+    const view = await mount(projectTab('p1'));
+    fireEvent.click(screen.getByText('edit config'));
+    await advance(100); // inside the debounce
+
+    view.rerender(tree(frameSetTab(8)));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('set_project_stacking_config')).toEqual([
+      {
+        projectId: 'p1', config: { ...CONFIG, drizzle: { enabled: true } },
+        excludedFrameUuids: ['u-ex'], referenceFrameUuid: 'u-ref',
+      },
+    ]);
+    expect(argsOf('set_stacking_config')).toEqual([]);
+    // The set that took the tab over loaded as itself and was not written.
+    expect(argsOf('get_stacking_config')).toEqual([{ setId: 8 }]);
+  });
+
+  it('a pending write of a set is not sent to the project that takes the tab over', async () => {
+    const view = await mount(frameSetTab(7));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include a.fit in the next run' }));
+    await advance(100);
+
+    view.rerender(tree(projectTab('p1')));
+    await advance(PAST_THE_DEBOUNCE_MS);
+
+    expect(argsOf('set_stacking_config')).toEqual([{ setId: 7, config: CONFIG, excludedFrameIds: [101] }]);
+    expect(argsOf('set_project_stacking_config')).toEqual([]);
+  });
+
+  it('a slow write of the old subject does not stop the new subject\u2019s plan from landing', async () => {
+    let releaseWrite = () => {};
+    let releasePlan = () => {};
+    vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
+      if (command === 'set_stacking_config') {
+        return new Promise((resolve) => { releaseWrite = () => resolve(undefined); });
+      }
+      if (command === 'get_project_stacking_plan') {
+        return new Promise((resolve) => {
+          releasePlan = () => resolve(plan({ setId: null, projectId: 'p1', workingDir: '/work-p1' }));
+        });
+      }
+      return answer(command, args);
+    }) as never);
+    const view = await mount(frameSetTab(7));
+    await advance(PAST_THE_DEBOUNCE_MS); // the 300 ms plan refresh the first draft schedules
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include a.fit in the next run' }));
+    await advance(100);
+
+    view.rerender(tree(projectTab('p1')));
+    await advance(0);
+    await advance(0);
+    const plansForSet = argsOf('get_stacking_plan').length;
+    // The set's exclusion write finishes while the project's own plan is still on its way: it must not re-plan
+    // the set (that would supersede the project's plan fetch and leave the tab without a plan).
+    releaseWrite();
+    await advance(0);
+    releasePlan();
+    await advance(0);
+    await advance(0);
+
+    expect(screen.getByText('/work-p1')).toBeInTheDocument();
+    expect(argsOf('get_stacking_plan')).toHaveLength(plansForSet);
+  });
+
+  it('a project run row cannot be toggled as a frame id', async () => {
+    vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
+      command === 'get_stacking_run'
+        ? Promise.resolve({
+            run: RUN.run, groups: [], summary: null,
+            frames: [{
+              id: 1, runId: 5, groupId: 1, frameId: 41, included: true, exclusionReason: null, weight: 1,
+              regStatus: null, regModel: null, regRmsPx: null, regInliers: null, frameUuid: 'u41',
+            }],
+          })
+        : answer(command, args)) as never);
+    await mount(projectTab('p1'));
+
+    // The table still speaks the set's numeric frame ids: its checkbox is inert for a project.
+    expect(screen.getByRole('checkbox', { name: 'Include frame 41 in the next run' })).toBeDisabled();
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(argsOf('set_project_stacking_config')).toEqual([]);
   });
 });

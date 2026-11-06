@@ -26,6 +26,9 @@ export type SubjectConfig = {
 export interface StackingSubjectApi {
   getPlan(config?: StackingConfig): Promise<StackingPlan>;
   getConfig(): Promise<SubjectConfig>;
+  /** Stores the document and resolves with what is stored. For a frame set the command returns nothing, so the
+   *  result is the submitted document (`isDefault` false) and its `updatedAt` is the submitted one, not the new
+   *  timestamp; for a project it is the backend's stored document, `updatedAt` included. */
   setConfig(c: SubjectConfig): Promise<SubjectConfig>;
   getRuns(limit: number): Promise<StackingRunSummary[]>;
   getWorkUsage(): Promise<WorkUsage>;
