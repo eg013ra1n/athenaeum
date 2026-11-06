@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use athenaeum_core::api::stacking as api;
+use athenaeum_core::api::stacking_aligned::{self as aligned, AlignedFrameStatus};
 use athenaeum_core::api::PathPolicy;
 use athenaeum_core::stacking::config::StackingConfig;
 use athenaeum_core::stacking::paths::{CleanupWhat, WorkUsage};
@@ -244,6 +245,48 @@ pub async fn cleanup_stacking_work(
         .await
         .map_err(|e| format!("Cleanup task panicked: {e}"))?
         .map_err(|e| e.to_string())
+}
+
+// ── Aligned frames for Blink (stacking Frames block, spec 2026-11-06 §6.7) ────
+
+/// For each frame of a stacking run (ids in the run's namespace), whether its aligned (registered) frame can
+/// be shown in Blink and, if not, why. One call per Blink open. DB reads plus one `stat` per frame, on a
+/// blocking thread so a slow working-folder disk stays off the async executor.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_stacking_aligned_frames(
+    state: State<'_, AppState>,
+    run_id: i64,
+    frame_ids: Vec<i64>,
+) -> Result<Vec<AlignedFrameStatus>, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || aligned::get_stacking_aligned_frames(&ctx, run_id, &frame_ids))
+        .await
+        .map_err(|e| format!("Aligned-frames task panicked: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// JPEG bytes of one frame's aligned frame in a stacking run, through the same pipeline, cache and
+/// semaphore as every other preview (`get_collab_frame_image` is the model). The file is the artifact row's
+/// own path, resolved in core; the command errors unless the frame's state is `available`. Returned as a raw
+/// IPC response so the bytes are not serialized as a JSON number array. Fired per Blink frame, so `debug`.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_stacking_aligned_image(
+    state: State<'_, AppState>,
+    run_id: i64,
+    frame_id: i64,
+    resolution: Option<String>,
+) -> Result<tauri::ipc::Response, String> {
+    let path = aligned::resolve_stacking_aligned_path(&state.ctx, run_id, frame_id)
+        .map_err(|e| e.to_string())?;
+    crate::commands_rustafits::read_fits_image_bytes(
+        path.to_string_lossy().into_owned(),
+        resolution,
+        state,
+    )
+    .await
+    .map(tauri::ipc::Response::new)
 }
 
 // ── Project stacking (collab wave 6b-3, spec §9.1) ───────────────────────

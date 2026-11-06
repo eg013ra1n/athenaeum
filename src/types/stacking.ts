@@ -808,3 +808,7 @@ readMs: number, depositMs: number, bytesRead: number, };
 
 export type MasterLightKind = "master" | "drizzle" | "weightMap" | "coverage" | "drizzleCoverage";
 
+export type AlignedState = "available" | "registrationFailed" | "notRegistered" | "missing" | "replaced";
+
+export type AlignedFrameStatus = { frameId: number, state: AlignedState, };
+
