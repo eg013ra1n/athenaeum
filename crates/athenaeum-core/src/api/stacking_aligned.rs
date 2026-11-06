@@ -279,6 +279,11 @@ mod tests {
     const NOISY: [f32; 5] = [4.0, 4.0, 4.0, 4.0, 12.0];
     const CUT_FLOOR: f64 = 0.3;
 
+    /// One real run at a time: the core lib test binary peaks at 4092 of the 4096 threads `kern.num_taskthreads`
+    /// allows a process, and these nine tests add about 30 threads each at peak, which made unrelated tests fail with
+    /// thread-spawn EAGAIN in 2 of 5 full runs.
+    static RUN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A frame set of star-field lights with their master dark and flat linked, and the context that drives real runs
     /// on it.
     struct Seeded {
@@ -289,11 +294,14 @@ mod tests {
         ids: Vec<i64>,
         _working: tempfile::TempDir,
         _output: tempfile::TempDir,
+        /// Held for the whole test (last field, so it is released after everything else is dropped).
+        _gate: std::sync::MutexGuard<'static, ()>,
     }
 
     /// `noise.len()` star frames shifted by [`FOUR_SHIFTS`] (cycled), and `starless` flat-field frames after them: a
     /// constant background and noise, no stars, so registration cannot match them.
     fn seeded(noise: &[f32], starless: usize) -> Seeded {
+        let gate = RUN_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
@@ -329,6 +337,7 @@ mod tests {
             ids,
             _working: working,
             _output: output,
+            _gate: gate,
         }
     }
 
