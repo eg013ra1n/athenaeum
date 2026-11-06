@@ -1,5 +1,6 @@
-// Blink over the Frames table's rows (spec §6.7): the originals of a frame set or a project, in the viewer's project
-// mode. Its actions write through the table's own writers (Exclude, Include, the reference star) — never the Black
+// Blink over the Frames table's rows (spec §6.7): a frame set's or a project's frames, in the viewer's project mode.
+// Over a run each entry also carries the run's verdict on its aligned frame (the viewer's Aligned / Original switch).
+// Its actions write through the table's own writers (Exclude, Include, the reference star) — never the Black
 // Hole, never a file deletion. Mount one per open (keyed by an open counter): the viewer snapshots its entries when
 // it opens, so it is rendered only after the entries resolved, and the badges and eligibility follow the live
 // exclusion list by entry key.
@@ -10,7 +11,7 @@ import BlinkViewer from '../BlinkViewer';
 import type { BlinkAction, BlinkFrame } from '../blink/types';
 import { useNotifications } from '../../contexts/NotificationContext';
 import type { CollabBlinkEntry, FileWithFrame } from '../../types/models';
-import type { PlanGroup, StackingRunDetail } from '../../types/stacking';
+import type { AlignedFrameStatus, AlignedState, PlanGroup, StackingRunDetail } from '../../types/stacking';
 import { HANDLE_KEY_PREFIX, type FrameRow } from './frameRows';
 import { NOT_GROUPED_TITLE, planGroupTitle } from './frameView';
 import type { StackSubject } from './subject';
@@ -90,6 +91,31 @@ async function loadProjectEntries(projectId: string, rows: FrameRow[]): Promise<
   return { asked: askable.length, resolved };
 }
 
+/** What the context strip says when an entry shows its original although the run was asked for its aligned frame. */
+const ALIGNED_REASON: Record<Exclude<AlignedState, 'available'>, (runId: number) => string> = {
+  registrationFailed: (runId) => `registration failed in run #${runId}`,
+  notRegistered: (runId) => `not registered in run #${runId}`,
+  missing: () => 'not in the working folder any more',
+  replaced: () => 'a later run replaced it',
+};
+
+type AlignedVerdicts = Map<number, NonNullable<BlinkFrame['aligned']>>;
+
+/** The run's verdict on each row's frame, by the row's run frame id: one batch call. A row with no run frame id
+ *  cannot be asked for and has no verdict. */
+async function loadAlignedVerdicts(runId: number, rows: FrameRow[]): Promise<AlignedVerdicts> {
+  const verdicts: AlignedVerdicts = new Map();
+  const frameIds = rows.flatMap((r) => (r.frameId === null ? [] : [r.frameId]));
+  if (frameIds.length === 0) return verdicts;
+  const got = await api.invoke<AlignedFrameStatus[]>('get_stacking_aligned_frames', { runId, frameIds });
+  for (const { frameId, state } of got) {
+    verdicts.set(frameId, state === 'available' ? { runId, frameId } : { runId, reason: ALIGNED_REASON[state](runId) });
+  }
+  const unanswered = frameIds.filter((id) => !verdicts.has(id));
+  if (unanswered.length > 0) console.error('[StackingBlink] no aligned state answered for frames', unanswered);
+  return verdicts;
+}
+
 /** An entry's badge: the table's status chip label, then `· out of next run` when the frame is in the list. */
 function badgeOf(row: FrameRow, listed: boolean): string | undefined {
   const label = row.outcome?.label;
@@ -98,7 +124,7 @@ function badgeOf(row: FrameRow, listed: boolean): string | undefined {
 }
 
 export function StackingBlink({
-  subject, rows, planGroups, excludedKeys, pinnedKey, disabled, onSetExcluded, onPin, onClose,
+  subject, rows, planGroups, runDetail, excludedKeys, pinnedKey, disabled, onSetExcluded, onPin, onClose,
 }: StackingBlinkProps): JSX.Element | null {
   const { notify } = useNotifications();
   const [resolved, setResolved] = useState<Resolved[] | null>(null);
@@ -112,19 +138,46 @@ export function StackingBlink({
         kind: 'stacking',
         tone: 'warning',
       });
-    (subject.kind === 'frameSet' ? loadSetEntries(rows) : loadProjectEntries(subject.projectId, rows))
-      .then(({ resolved: found }) => {
+    const entries = subject.kind === 'frameSet' ? loadSetEntries(rows) : loadProjectEntries(subject.projectId, rows);
+    // The verdicts are read beside the entries, once. A failed read opens Blink with originals: its notice waits
+    // until Blink opens, so a Blink that closes for want of frames says only that.
+    const verdicts: Promise<{ byFrame: AlignedVerdicts; failure: string | null }> =
+      runDetail === null
+        ? Promise.resolve({ byFrame: new Map(), failure: null })
+        : loadAlignedVerdicts(runDetail.run.id, rows).then(
+            (byFrame) => ({ byFrame, failure: null }),
+            (err: unknown) => {
+              console.error('[StackingBlink] aligned frames unavailable:', err);
+              return { byFrame: new Map(), failure: err instanceof Error ? err.message : String(err) };
+            },
+          );
+    Promise.all([entries, verdicts])
+      .then(([{ resolved: loaded }, { byFrame, failure }]) => {
         if (cancelled) return;
         // The count is of every row Blink will not open: a row that could not be asked for (no uuid, no frame id)
         // counts with the frames that did not come back. With nothing to open the notice still says so, and Blink closes.
-        const missing = rows.length - found.length;
-        if (found.length === 0) {
+        const missing = rows.length - loaded.length;
+        if (loaded.length === 0) {
           notAvailable(missing);
           onClose();
           return;
         }
         if (missing > 0) notAvailable(missing);
-        setResolved(found);
+        if (failure !== null) {
+          notify({
+            title: 'Aligned frames are unavailable',
+            detail: `Blink opens with the original frames. ${failure}`,
+            kind: 'stacking',
+            tone: 'warning',
+            hasErrors: true,
+          });
+        }
+        setResolved(
+          loaded.map(({ row, entry }) => {
+            const aligned = row.frameId === null ? undefined : byFrame.get(row.frameId);
+            return aligned === undefined ? { row, entry } : { row, entry: { ...entry, aligned } };
+          }),
+        );
       })
       .catch((err) => {
         if (cancelled) return;

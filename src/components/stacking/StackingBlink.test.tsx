@@ -7,7 +7,7 @@ import { useState } from 'react';
 import { api } from '../../api';
 import type { BlinkViewerProps } from '../blink/types';
 import type { CollabBlinkEntry, FileWithFrame } from '../../types/models';
-import type { PlanGroup } from '../../types/stacking';
+import type { AlignedFrameStatus, PlanGroup, StackingRunDetail } from '../../types/stacking';
 import type { FrameRow } from './frameRows';
 import { StackingBlink } from './StackingBlink';
 import type { StackSubject } from './subject';
@@ -312,5 +312,94 @@ describe('StackingBlink', () => {
       'L · 300s · mono',
       'Not grouped yet',
     ]);
+  });
+
+  describe('over a run', () => {
+    const RUN = { run: { id: 8 }, groups: [], frames: [], summary: null } as unknown as StackingRunDetail;
+
+    /** The frame set's frames and the run's verdict on them (or a failure of that one call). */
+    function setRunBackend(order: number[], aligned: AlignedFrameStatus[] | Error) {
+      vi.mocked(api.invoke).mockImplementation((async (cmd: string, args?: { frameIds?: number[] }) => {
+        if (cmd === 'get_stacking_aligned_frames') {
+          if (aligned instanceof Error) throw aligned;
+          return aligned;
+        }
+        if (cmd !== 'get_files_with_frames_by_ids') throw new Error(`unexpected ${cmd}`);
+        const asked = new Set(args?.frameIds ?? []);
+        return order.filter((id) => asked.has(id)).map(fileFrame);
+      }) as never);
+    }
+    const alignedCalls = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_stacking_aligned_frames');
+
+    it('maps_aligned_states_to_reasons', async () => {
+      setRunBackend([1, 2, 3, 4, 5], [
+        { frameId: 1, state: 'available' },
+        { frameId: 2, state: 'registrationFailed' },
+        { frameId: 3, state: 'notRegistered' },
+        { frameId: 4, state: 'missing' },
+        { frameId: 5, state: 'replaced' },
+      ]);
+      render(<StackingBlink {...props({ runDetail: RUN, rows: ['1', '2', '3', '4', '5'].map((k) => row(k)) })} />);
+      await opened();
+
+      // One call, at open, with each row's run frame id.
+      expect(alignedCalls()).toEqual([['get_stacking_aligned_frames', { runId: 8, frameIds: [1, 2, 3, 4, 5] }]]);
+      expect(blink!.frames.map((f) => f.aligned)).toEqual([
+        { runId: 8, frameId: 1 },
+        { runId: 8, reason: 'registration failed in run #8' },
+        { runId: 8, reason: 'not registered in run #8' },
+        { runId: 8, reason: 'not in the working folder any more' },
+        { runId: 8, reason: 'a later run replaced it' },
+      ]);
+      expect(notifyMock).not.toHaveBeenCalled();
+    });
+
+    it('a project row is asked for by its run frame id, not its uuid', async () => {
+      vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
+        if (cmd === 'get_stacking_aligned_frames') return [{ frameId: 31, state: 'available' }];
+        if (cmd === 'get_collab_blink_frames') return [collabEntry('u1', 'raw')];
+        throw new Error(`unexpected ${cmd}`);
+      }) as never);
+      render(<StackingBlink {...props({ subject: PROJECT, runDetail: RUN, rows: [row('u1', { frameId: 31 })] })} />);
+      await opened();
+
+      expect(alignedCalls()).toEqual([['get_stacking_aligned_frames', { runId: 8, frameIds: [31] }]]);
+      expect(blink!.frames[0]!.aligned).toEqual({ runId: 8, frameId: 31 });
+    });
+
+    it('no run: no aligned call, and the entries carry no verdict', async () => {
+      setBackend([1, 2]);
+      render(<StackingBlink {...props()} />);
+      await opened();
+
+      expect(alignedCalls()).toHaveLength(0);
+      expect(blink!.frames.every((f) => f.aligned === undefined)).toBe(true);
+    });
+
+    it('aligned_call_failure_opens_originals', async () => {
+      setRunBackend([1, 2], new Error('stat failed'));
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+      render(<StackingBlink {...props({ runDetail: RUN })} />);
+      await opened();
+
+      expect(logged).toHaveBeenCalledWith('[StackingBlink] aligned frames unavailable:', expect.any(Error));
+      expect(notifyMock).toHaveBeenCalledWith(expect.objectContaining({
+        title: 'Aligned frames are unavailable', kind: 'stacking', tone: 'warning', hasErrors: true,
+      }));
+      expect(blink!.frames.map((f) => f.key)).toEqual(['1', '2']);
+      expect(blink!.frames.every((f) => f.aligned === undefined)).toBe(true);
+      logged.mockRestore();
+    });
+
+    it('a frame the run does not answer for opens as an original, and is logged', async () => {
+      setRunBackend([1, 2], [{ frameId: 1, state: 'available' }]);
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+      render(<StackingBlink {...props({ runDetail: RUN })} />);
+      await opened();
+
+      expect(blink!.frames.map((f) => f.aligned)).toEqual([{ runId: 8, frameId: 1 }, undefined]);
+      expect(logged).toHaveBeenCalledWith('[StackingBlink] no aligned state answered for frames', [2]);
+      logged.mockRestore();
+    });
   });
 });
