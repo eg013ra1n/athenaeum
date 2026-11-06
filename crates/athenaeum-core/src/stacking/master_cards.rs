@@ -432,22 +432,27 @@ fn blank(s: Option<&str>) -> Option<&str> {
 }
 
 /// What a master's name says about its exposure (plan 6c D9): one value —
-/// the group's own label, or `None` for the group of frames with no
-/// `EXPTIME` — or, for a group whose included frames carry more than one
-/// exposure, the range they span. [`exposure_label`] decides which.
+/// or `None` for the group of frames with no `EXPTIME` — or, for a group
+/// whose included frames carry more than one exposure, the range they span.
+/// [`exposure_label`] decides which.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExposureLabel {
     Single(Option<f64>),
     Range { min: f64, max: f64 },
 }
 
-/// The [`ExposureLabel`] of a group's master (plan 6c D9). `included` holds
-/// the exposure of every frame the master integrated. A `Range` only when
-/// `mode` lets one class hold several exposures (`stops`, `equivalent`,
-/// `none`) and `included` carries two that print differently — a frame with
-/// no, or a non-finite, exposure never counts. Otherwise the group's own
-/// label, `Single(group_exposure_s)`: in `seconds` mode that is the
-/// cluster's label, so a frame set's names in the default mode do not change.
+/// The [`ExposureLabel`] of a group's master (plan 6c D9: the name is over
+/// the frames the master integrated). `included` holds the exposure of every
+/// frame it integrated. In `seconds` mode the group's own label,
+/// `Single(group_exposure_s)` — the cluster's label, so a frame set's names
+/// in the default mode do not change. Outside it (`stops`, `equivalent`,
+/// `none`, where one class can hold several exposures) the label follows
+/// the included frames that carry a known, finite exposure: two that print
+/// differently are a `Range`; all printing the same are
+/// `Single(Some(that exposure))` — the included frames' exposure, not the
+/// class's shortest member, which an excluded frame may have set; none at
+/// all, `Single(group_exposure_s)`. A class of one exposure with nothing
+/// dropped keeps the name it always had.
 pub fn exposure_label(
     mode: ExposureMode,
     group_exposure_s: Option<f64>,
@@ -461,14 +466,17 @@ pub fn exposure_label(
         .flatten()
         .filter(|e| e.is_finite())
         .collect();
+    if known.is_empty() {
+        return ExposureLabel::Single(group_exposure_s);
+    }
     let min = known.iter().copied().fold(f64::INFINITY, f64::min);
     let max = known.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     // Compared as printed: two exposures `fmt_num` writes the same are one
     // exposure, never a `120-120s`.
-    if !known.is_empty() && fmt_num(min) != fmt_num(max) {
+    if fmt_num(min) != fmt_num(max) {
         ExposureLabel::Range { min, max }
     } else {
-        ExposureLabel::Single(group_exposure_s)
+        ExposureLabel::Single(Some(min))
     }
 }
 
@@ -1553,10 +1561,12 @@ mod tests {
         );
     }
 
-    /// Plan 6c D9: the label is a range only when the mode lets one class
-    /// hold several exposures (`stops`, `equivalent`, `none`) AND the
-    /// included frames really carry more than one of them; `seconds` mode
-    /// keeps the cluster's own label, so a frame set's names do not change.
+    /// Plan 6c D9: the name is over the included frames. `seconds` mode keeps
+    /// the cluster's own label, so a frame set's names do not change; outside
+    /// it the label is a range when the included frames carry more than one
+    /// exposure, their one exposure when they carry one (an excluded frame's
+    /// shorter exposure does not name the master), and the group's label only
+    /// when none of them has a known exposure.
     #[test]
     fn the_exposure_label_is_a_range_only_for_a_mixed_group_outside_seconds_mode() {
         use crate::stacking::config::ExposureMode;
@@ -1577,10 +1587,11 @@ mod tests {
                 },
                 "{mode:?}"
             );
-            // One exposure among the included frames: the cluster's label.
+            // One exposure among the included frames: that exposure, not the
+            // class's shortest member.
             assert_eq!(
                 label(mode, Some(120.0), &[Some(180.0), Some(180.0)]),
-                ExposureLabel::Single(Some(120.0)),
+                ExposureLabel::Single(Some(180.0)),
                 "{mode:?}"
             );
         }

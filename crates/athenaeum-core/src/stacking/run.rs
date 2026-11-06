@@ -33205,10 +33205,29 @@ mod tests {
         RunContext,
         crate::collab::grid::CanonicalGrid,
     ) {
+        run_sky_project_excluding(tmp, canonical, exposures, &[], tweak)
+    }
+
+    /// [`run_sky_project_exposures`] with the frames at the indices in
+    /// `excluded` on the project's manual exclusion list: stored as the plan
+    /// reads them, and on the run as the plan hands them over (`rc.excluded`).
+    fn run_sky_project_excluding(
+        tmp: &Path,
+        canonical: &str,
+        exposures: &[f64],
+        excluded: &[usize],
+        tweak: impl FnOnce(&mut StackingConfig),
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        RunContext,
+        crate::collab::grid::CanonicalGrid,
+    ) {
         let db_path = tmp.join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let conn = project_conn(&db_path);
         let grid = seed_sky_project_exposures(&conn, &tmp.join("collab"), exposures);
+        let excluded_uuids: Vec<String> = excluded.iter().map(|i| format!("l{i}")).collect();
         conn.execute(
             "UPDATE project_frames_local SET filter_canonical = ?1 WHERE project_id = 'p1'",
             [canonical],
@@ -33220,11 +33239,25 @@ mod tests {
             &conn,
             "p1",
             &serde_json::to_string(&cfg).unwrap(),
-            &[],
+            &excluded_uuids,
             None,
         )
         .unwrap();
+        let handles: Vec<i64> =
+            crate::stacking::project_source::project_frame_source(&conn, "p1", &cfg)
+                .unwrap()
+                .frames
+                .iter()
+                .filter(|f| excluded_uuids.contains(&f.frame_uuid))
+                .filter_map(|f| f.handle)
+                .collect();
+        assert_eq!(
+            handles.len(),
+            excluded_uuids.len(),
+            "every excluded frame has a handle"
+        );
         let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.join("work"), &tmp.join("out"));
+        rc.excluded = handles;
         rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
         run_pipeline(&mut rc).unwrap();
         (ctx, conn, rc, grid)
@@ -33853,6 +33886,43 @@ mod tests {
             written_master_name(&conn, rc.run_id),
             "p1_Lum_mono_120-180s_4x.fits"
         );
+    }
+
+    /// Plan 6c D9, r2: the name is over the frames the master integrated, not
+    /// over the class. A `stops` class of 60 s x 2 and 120 s x 3 is `60s` by
+    /// its shortest member; with both 60 s frames excluded the master holds
+    /// three 120 s frames and says `120s`, and with one excluded it holds a
+    /// 60 s and three 120 s frames and says the range.
+    #[test]
+    fn stops_master_name_follows_the_included_frames() {
+        use crate::stacking::config::ExposureMode;
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let exposures = [60.0, 60.0, 120.0, 120.0, 120.0];
+        for (excluded, expected) in [
+            (&[0usize, 1][..], "p1_Lum_mono_120s_3x.fits"),
+            (&[0usize][..], "p1_Lum_mono_60-120s_4x.fits"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_ctx, conn, rc, _grid) =
+                run_sky_project_excluding(tmp.path(), "Lum", &exposures, excluded, |cfg| {
+                    cfg.grouping.exposure_mode = ExposureMode::Stops
+                });
+            assert_eq!(
+                rc.plan_groups.len(),
+                1,
+                "{excluded:?}: one group over both exposures"
+            );
+            assert_eq!(
+                rc.plan_groups[0].exposure_s,
+                Some(60.0),
+                "{excluded:?}: the class's label is its shortest member, excluded or not"
+            );
+            assert_eq!(
+                written_master_name(&conn, rc.run_id),
+                expected,
+                "{excluded:?}"
+            );
+        }
     }
 
     /// Plan 6c D9: a `seconds` group keeps the cluster's own label, whatever
