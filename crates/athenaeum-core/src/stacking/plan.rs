@@ -1661,11 +1661,15 @@ pub(crate) fn registration_row_is_fresh(
     expected_hash: &str,
 ) -> bool {
     row.reference_frame_id == reference_frame_id
-        && matches!(
-            row.status.as_str(),
-            "aligned" | "aligned_flipped" | "reference"
-        )
+        && registered_status(&row.status)
         && row.config_hash.as_deref() == Some(expected_hash)
+}
+
+/// Whether a registration `status` (`registration_results.status`, copied to a run frame's `reg_status`) means the
+/// frame was registered: `aligned`, `aligned_flipped` (registered across a meridian flip) or `reference`. The one list
+/// the reuse predicate above and the aligned-frame API (`api::stacking_aligned`) share; `failed` and `skipped` are not.
+pub(crate) fn registered_status(status: &str) -> bool {
+    matches!(status, "aligned" | "aligned_flipped" | "reference")
 }
 
 /// Why a stage is stale, when the reason is the last run's OWN cleanup

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{db, ApiError};
 use crate::db::stacking::{find_artifact, get_run, StackSubject, StackingRunRow};
 use crate::services::ServiceContext;
+use crate::stacking::plan::registered_status;
 
 /// Whether a run's aligned frame can be shown for one frame, and why not when it cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -151,9 +152,9 @@ fn file_exists(path: &Path, run_id: i64, frame_id: i64) -> bool {
 /// 1. the run holds no row for the frame: `NotRegistered`;
 /// 2. its `reg_status` is `failed`: `RegistrationFailed`;
 /// 3. a later run of the subject holds the frame's group: `Replaced`;
-/// 4. the run registered it (`aligned`, or `reference`) and its `registered` artifact row names a file on disk:
-///    `Available` - whether or not the frame is still in the stack, since a frame the weight floor cut after Register
-///    keeps its aligned file and is worth blinking; no file: `Missing`;
+/// 4. the run registered it (`aligned`, `aligned_flipped` or `reference`: [`registered_status`]) and its `registered`
+///    artifact row names a file on disk: `Available` - whether or not the frame is still in the stack, since a frame
+///    the weight floor cut after Register keeps its aligned file and is worth blinking; no file: `Missing`;
 /// 5. anything else (`skipped`: cut before Register): `NotRegistered`. Such a frame may still have an artifact row, from
 ///    an earlier run that registered it; that file is not this run's.
 fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Resolved>, ApiError> {
@@ -190,7 +191,7 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
             out.push(Resolved::without_file(frame_id, AlignedState::Replaced));
             continue;
         }
-        if !matches!(reg_status, Some("aligned" | "reference")) {
+        if !reg_status.is_some_and(registered_status) {
             out.push(Resolved::without_file(
                 frame_id,
                 AlignedState::NotRegistered,
@@ -636,8 +637,13 @@ mod tests {
         let db_handle = db(&ctx).unwrap();
         let conn = db_handle.conn();
         crate::db::stacking::insert_test_project(&conn, "p1");
-        let handles = project_frame_handles(&conn, "p1", &["u-a", "u-b", "u-c"]).unwrap();
-        let (a, b, c) = (handles["u-a"], handles["u-b"], handles["u-c"]);
+        let handles = project_frame_handles(&conn, "p1", &["u-a", "u-b", "u-c", "u-d"]).unwrap();
+        let (a, b, c, d) = (
+            handles["u-a"],
+            handles["u-b"],
+            handles["u-c"],
+            handles["u-d"],
+        );
         let subject = StackSubject::Project("p1".to_string());
         let key = "mono__NoFilter__bin1__60s";
         let new_run = || NewRun {
@@ -661,11 +667,16 @@ mod tests {
             height: None,
             exposure: None,
             exposure_class: None,
-            frame_count: 3,
-            included_count: 3,
+            frame_count: 4,
+            included_count: 4,
         };
         let group_id = insert_group(&conn, &new_group(run_id)).unwrap();
-        for (handle, reg_status) in [(a, "aligned"), (b, "aligned"), (c, "skipped")] {
+        for (handle, reg_status) in [
+            (a, "aligned"),
+            (b, "aligned"),
+            (c, "skipped"),
+            (d, "aligned_flipped"),
+        ] {
             upsert_frame_row(
                 &conn,
                 &subject,
@@ -689,38 +700,47 @@ mod tests {
             )
             .unwrap();
         }
-        // Frame `a` has its aligned file; `b` was registered but has no artifact row; `c` was never registered.
+        // Frame `a` has its aligned file; `b` was registered but has no artifact row; `c` was never registered; `d` was
+        // registered across a meridian flip (`aligned_flipped`) and has its aligned file too.
         let file = tmp.path().join("r_a.fits");
-        std::fs::write(&file, b"SIMPLE").unwrap();
-        upsert_artifact(
-            &conn,
-            &NewArtifact {
-                subject: &subject,
-                frame_id: Some(a),
-                group_key: key,
-                kind: "registered",
-                path: file.to_str(),
-                config_hash: "h",
-                size: Some(6),
-                modified_at: None,
-                payload_json: None,
-            },
-        )
-        .unwrap();
+        let flipped_file = tmp.path().join("r_d.fits");
+        for (frame, path) in [(a, &file), (d, &flipped_file)] {
+            std::fs::write(path, b"SIMPLE").unwrap();
+            upsert_artifact(
+                &conn,
+                &NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(frame),
+                    group_key: key,
+                    kind: "registered",
+                    path: path.to_str(),
+                    config_hash: "h",
+                    size: Some(6),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
         drop(conn);
 
-        let got = get_stacking_aligned_frames(&ctx, run_id, &[a, b, c]).unwrap();
+        let got = get_stacking_aligned_frames(&ctx, run_id, &[a, b, c, d]).unwrap();
         assert_eq!(
             got.iter().map(|r| r.state).collect::<Vec<_>>(),
             vec![
                 AlignedState::Available,
                 AlignedState::Missing,
-                AlignedState::NotRegistered
+                AlignedState::NotRegistered,
+                AlignedState::Available
             ]
         );
         assert_eq!(
             resolve_stacking_aligned_path(&ctx, run_id, a).unwrap(),
             file
+        );
+        assert_eq!(
+            resolve_stacking_aligned_path(&ctx, run_id, d).unwrap(),
+            flipped_file
         );
 
         // A later run of the project that holds the group replaces the earlier run's frames.
