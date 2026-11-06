@@ -317,6 +317,8 @@ describe('FramesTable for a project', () => {
     const { onPin } = renderTable({ referenceFrameUuid: 'u2' });
     const pinned = within(rowOf('b.fits')).getByRole('button', { name: 'Clear the reference frame b.fits' });
     expect(pinned).toBeEnabled();
+    // The tooltip keeps the clear hint and adds why the frame can no longer be used.
+    expect(pinned).toHaveAttribute('title', 'The reference frame — click to clear. not on this device');
     fireEvent.click(pinned);
     expect(onPin).toHaveBeenCalledWith('u2');
   });

@@ -273,8 +273,7 @@ export function buildFrameRows(
 
 /** A project run row's key: its frame uuid, or `h:<handle>` when the run row
  *  carries none (its project-frame row is gone). `h:` cannot collide with a
- *  uuid, and such a row is never joined to a plan row — not by the handle
- *  either, which a later plan may have given to another frame. */
+ *  uuid, and such a row is never joined to a plan row. */
 function runRowKey(r: StackingRunFrameRow): string {
   return r.frameUuid ?? `h:${r.frameId}`;
 }
@@ -284,11 +283,9 @@ function runRowKey(r: StackingRunFrameRow): string {
  *  selected run's own rows for frames the plan no longer lists.
  *
  *  Rows are keyed by frame uuid, never by handle: a run row joins its plan
- *  row on `StackingRunFrameRow.frameUuid` and its summary frame on the run
- *  row's own `frameId` (the run's handle namespace; a `SummaryFrame` carries
- *  the handle and no uuid). The plan's `handle` is not used for the join: it
- *  is the CURRENT handle of the frame and can differ from the one the run
- *  stored.
+ *  row on `StackingRunFrameRow.frameUuid` (the documented join key) and its
+ *  summary frame on the run row's own `frameId` (the run's handle namespace;
+ *  a `SummaryFrame` carries the handle and no uuid).
  *
  *  A run row whose uuid has no plan row (the frame was excluded by the
  *  coordinator, remapped, or is no longer on disk) keeps the uuid as its key
@@ -645,7 +642,10 @@ export function FramesTable({
                             }
                             title={
                               r.pinned
-                                ? 'The reference frame — click to clear'
+                                ? // A pinned frame that is no longer usable says why, after the clear hint.
+                                  !r.pinnable && r.pinNote
+                                  ? `The reference frame — click to clear. ${r.pinNote}`
+                                  : 'The reference frame — click to clear'
                                 : (r.pinNote ?? 'Use as the reference frame')
                             }
                             className={`p-1 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
