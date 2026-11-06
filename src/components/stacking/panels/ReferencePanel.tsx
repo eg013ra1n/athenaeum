@@ -92,9 +92,7 @@ export function ReferencePanel({ config, onChange, plan, disabled }: ReferencePa
             <p className="text-xs text-content-muted">No reference frame chosen yet.</p>
           )}
           {plan?.projectId != null ? (
-            <p className="text-xs text-content-muted">
-              Pin a frame in the Frames table below. Only frames with a WCS can be the reference.
-            </p>
+            <p className="text-xs text-content-muted">Pin a frame in the Frames table below.</p>
           ) : (
             <button
               type="button"

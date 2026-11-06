@@ -155,9 +155,8 @@ describe('StackingTab Coverage link', () => {
 describe('StackingTab reference for a manual choice', () => {
   it('sends a project to its Frames table, with no Choose in Analysis button', async () => {
     await mount(projectTab, 'reference');
-    expect(
-      screen.getByText('Pin a frame in the Frames table below. Only frames with a WCS can be the reference.'),
-    ).toBeInTheDocument();
+    expect(screen.getByText('Pin a frame in the Frames table below.')).toBeInTheDocument();
+    expect(screen.queryByText(/Only frames with a WCS/)).toBeNull();
     expect(screen.queryByRole('button', { name: 'Choose in Analysis' })).toBeNull();
   });
 

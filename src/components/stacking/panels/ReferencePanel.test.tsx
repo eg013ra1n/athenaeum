@@ -21,12 +21,13 @@ const show = (mode: ReferenceMode, plan: StackingPlan | null) =>
     </MemoryRouter>,
   );
 
-const PIN_LINE = 'Pin a frame in the Frames table below. Only frames with a WCS can be the reference.';
+const PIN_LINE = 'Pin a frame in the Frames table below.';
 
 describe('ReferencePanel manual mode', () => {
   it('sends a project to its Frames table, not to Analysis', () => {
     show('manual', planOf({ projectId: 'p1' }));
     expect(screen.getByText(PIN_LINE)).toBeInTheDocument();
+    expect(screen.queryByText(/Only frames with a WCS/)).toBeNull();
     expect(screen.queryByText('Choose in Analysis')).toBeNull();
     expect(screen.getByText('ref.fits')).toBeInTheDocument();
   });
