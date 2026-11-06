@@ -138,6 +138,20 @@ describe('FramesTable for a frame set', () => {
     expect(lost).toHaveClass('text-error');
   });
 
+  it('pre_run_group_header_is_muted', () => {
+    // Before any run nothing was lost: the header counts what is not yet included, in muted text, never the error form.
+    renderTable({
+      ...SET,
+      lightFrames: SET_LIGHTS.filter((f) => L_IDS.slice(0, 2).includes(f.frameId)),
+      runDetail: null,
+      planGroupByFrameId: new Map([[7, 'L'], [8, 'L']]),
+    });
+    expect(headers()).toHaveLength(1);
+    const summary = within(headerOf(/^L/)).getByText('0 / 2 included');
+    expect(summary).not.toHaveClass('text-error');
+    expect(summary).toHaveClass('text-content-muted');
+  });
+
   it('names the selected run in the header line, or says there is none', () => {
     const { rerender } = renderTable(SET);
     expect(screen.getByText('metrics from run #8 · 2026-11-05 22:14:03')).toBeInTheDocument();
@@ -222,7 +236,7 @@ describe('FramesTable for a frame set', () => {
   it('a status chip filters the rows and tints them by outcome and exclusion', () => {
     renderTable({ ...SET, excludedKeys: ['8'] });
     expect(rowOf('R_0021.fits')).toHaveClass('bg-error/10');
-    expect(rowOf('L_0008.fits')).toHaveClass('bg-warning-muted/40');
+    expect(rowOf('L_0008.fits')).toHaveClass('bg-warning/10');
     expect(within(rowOf('R_0021.fits')).getByText('0 quad matches')).toHaveAttribute('title', '0 quad matches');
     fireEvent.click(screen.getByRole('button', { name: 'Reg failed 4' }));
     expect(fileColumn()).toEqual(['R_0021', 'R_0022', 'R_0023', 'R_0024']);

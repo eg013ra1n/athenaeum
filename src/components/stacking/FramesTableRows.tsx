@@ -164,7 +164,7 @@ export function FrameTableRow({
   row, columns, selected, outlier, fwhmScale, groupContext, disabled, onSelect, onPin,
 }: FrameTableRowProps) {
   // The run's registration failure is the stronger signal; the exclusion chip still shows beside it.
-  const tint = row.outcome?.kind === 'regFailed' ? 'bg-error/10' : row.outOfNextRun ? 'bg-warning-muted/40' : '';
+  const tint = row.outcome?.kind === 'regFailed' ? 'bg-error/10' : row.outOfNextRun ? 'bg-warning/10' : '';
   const cell = (c: FrameColumn) => {
     switch (c.id) {
       case 'file':
