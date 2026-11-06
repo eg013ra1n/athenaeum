@@ -471,6 +471,12 @@ export function StackingTab({ subject }: StackingTabProps) {
             detail: String(err),
           });
         }
+        // A project's draft re-plan stood down for this write (`storedRowDirtyRef`, above), and the post-write
+        // refetch runs on success only: a failed write would leave the plan behind the draft. Re-plan with the
+        // latest draft, for the subject the tab still shows. Frame sets never stood down; they are unchanged.
+        if (shouldRefetchPlan && payload.kind === 'project' && payload.key === subjectKeyRef.current) {
+          void refetchPlan(draftConfigRef.current ?? undefined);
+        }
       });
   }, [notify, refetchPlan]);
 

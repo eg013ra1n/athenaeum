@@ -633,6 +633,30 @@ describe('StackingTab for a project', () => {
       expect(argsOf('get_project_stacking_plan').slice(plansBefore)).toEqual([{ projectId: 'p1', config: MANUAL }]);
     });
 
+    it('a failed project write still re-plans with the draft', async () => {
+      projectWith({ mode: 'auto' });
+      const backend = vi.mocked(api.invoke).getMockImplementation() as (c: string, a?: Record<string, unknown>) => Promise<unknown>;
+      vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) =>
+        command === 'set_project_stacking_config' ? Promise.reject(new Error('disk full')) : backend(command, args)) as never);
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await mount(projectTab('p1'));
+      await advance(PAST_THE_DEBOUNCE_MS);
+      const plansBefore = argsOf('get_project_stacking_plan').length;
+
+      fireEvent.click(screen.getByRole('button', { name: 'Use b.fits as the reference frame' }));
+      // The draft re-plan stands down while the write is pending, as in the successful pin.
+      await advance(400);
+      expect(argsOf('get_project_stacking_plan')).toHaveLength(plansBefore);
+      await advance(PAST_THE_DEBOUNCE_MS);
+
+      // The write failed: it was logged and notified once, and the plan is still built from the draft.
+      expect(argsOf('set_project_stacking_config')).toHaveLength(1);
+      expect(logged).toHaveBeenCalledWith('[StackingTab] set_project_stacking_config failed:', expect.any(Error));
+      expect(notifyMock).toHaveBeenCalledTimes(1);
+      expect(notifyMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Stacking settings not saved' }));
+      expect(argsOf('get_project_stacking_plan').slice(plansBefore)).toEqual([{ projectId: 'p1', config: MANUAL }]);
+    });
+
     it('pinning the pinned frame clears the stored pin and returns to Auto', async () => {
       projectWith({ reference: 'u1' });
       await mount(projectTab('p1'));
