@@ -1402,7 +1402,8 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - With no candidate, the stage fails with "no frame of this project could be
     plate-solved; the grid needs one".
 - **The canonical grid** is described in `docs/transfers/README.md` (wave 6b-2).
-  **Orientation:** the grid is sky-standard (north up, east left, det(CD) < 0).
+  **Orientation:** the grid is sky-standard (east left of north, det(CD) < 0), turned
+  by its rotation, which a proposal takes from the frames' long side (2026-11-07).
   Every solve in the owner's catalog has det(CD) > 0, so a master on the grid is
   the mirror image of a raw frame, which is correct on the sky. 6b-3 must not
   copy the reference's `ROWORDER` onto a grid master.

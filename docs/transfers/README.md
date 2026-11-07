@@ -308,7 +308,8 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
   - `set_collab_project_grid` emits the event itself after a successful save (on every successful save; a re-plan is idempotent). The saving device gets it from the command, and every other device from the feed: the saving device's own cache write makes its feed refresh a no-op.
   - A grid move picked up first by the hosts' `refresh_projects` command or the device-replace refresh emits no event; the cards carry `canonicalGrid`. The 6c Stacking tab re-plans on the event only and does not read the card, so such a move shows at its next refetch.
 - **Proposal** (`collab::grid_geometry::propose_grid`). It is deterministic for a manifest version.
-  - Scale: the median `pixelScaleArcsec` of the accepted frames, rounded to 0.01″. Centre: the project target. Rotation: 0.
+  - Scale: the median `pixelScaleArcsec` of the accepted frames, rounded to 0.01″. Centre: the project target.
+  - Rotation (2026-11-07, owner ask: the frames' long side stays horizontal on the master and in Aligned Blink; it was always 0, so frames shot near 90° stood upright): the accepted WCS frames' long axis, so their long side lies along the grid's x axis. Each frame gives the axis of its long side (its x axis when square), measured through its WCS on the proposal's TAN; the rotation is the axial mean of those axes (doubled angles, summed in sorted order), kept within (−90°, 90°] so north stays as near the top as the frames allow, and rounded to 0.01°. 0 with no WCS frame, or when the axes cancel.
   - Size: the bounding box, in the proposed TAN, of the WCS frames' footprints (SIP applied), clipped to the target circle, rounded up to a multiple of 64 and clamped to [64, 65536]. With no WCS frame, a square of 2 × the target radius.
   - `framesInside` counts the frames at least half inside (a 16 × 16 sample).
   - With no accepted frame carrying a scale there is no proposal, and none either when the median scale rounds outside the hub's (0, 100].
@@ -319,7 +320,7 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
 
   Plan 6b-3 adds the seven project-stacking commands (→ 306).
 - **Fake hub:** `PUT /projects/{id}/grid`, `canonicalGrid` on the project page, and a settable target.
-- **Orientation:** the grid is sky-standard (north up, east left, det CD < 0). See the stacking reference for what that means for masters.
+- **Orientation:** the grid is sky-standard (east left of north, det CD < 0), turned by `rotationDeg`; a proposal turns it with the frames' long side (above). See the stacking reference for what that means for masters.
 
 ## Collab wave 6b-3 — project stacking (2026-10-03)
 

@@ -115,8 +115,9 @@ pub(crate) fn boundary_points(w: f64, h: f64) -> Vec<(f64, f64)> {
 /// - Scale: the median `pixelScaleArcsec` (even count: the mean of the two
 ///   middle ones), rounded to 0.01 arcsec. `None` when no frame has a scale,
 ///   or the rounded scale is outside the hub's `(0, 100]`.
-/// - Centre: the target. Rotation: 0.
-/// - Size: the bounding box, in the proposed TAN, of the WCS frames'
+/// - Centre: the target. Rotation: the WCS frames' long axis
+///   ([`frames_rotation`]), so the frames lie wide on the grid.
+/// - Size: the bounding box, in the proposed (turned) TAN, of the WCS frames'
 ///   footprints, symmetric about the target and clipped to the target circle's
 ///   TAN radius, rounded up to a multiple of 64 and clamped to `[64, 65536]`.
 ///   With no WCS frame, a square of twice the radius.
@@ -139,16 +140,22 @@ pub fn propose_grid(inputs: &[GridInput], target: &GridTarget) -> Option<Canonic
     let r_px = target.radius_deg.to_radians().tan().to_degrees() * 3600.0 / scale;
     // A 1x1 grid puts the reference pixel at (0, 0): grid pixels are offsets
     // from the target.
-    let tan = grid_wcs(&CanonicalGrid {
-        scale_arcsec: scale,
-        width_px: 1,
-        height_px: 1,
-        crval1: target.ra_deg,
-        crval2: target.dec_deg,
-        rotation_deg: 0.0,
-    });
+    let offsets = |rotation_deg: f64| {
+        grid_wcs(&CanonicalGrid {
+            scale_arcsec: scale,
+            width_px: 1,
+            height_px: 1,
+            crval1: target.ra_deg,
+            crval2: target.dec_deg,
+            rotation_deg,
+        })
+    };
+    let footprints: Vec<&FrameFootprint> =
+        inputs.iter().filter_map(|i| i.footprint.as_ref()).collect();
+    let rotation = frames_rotation(&footprints, &offsets(0.0));
+    let tan = offsets(rotation);
     let (mut hx, mut hy, mut any) = (0.0f64, 0.0f64, false);
-    for fp in inputs.iter().filter_map(|i| i.footprint.as_ref()) {
+    for fp in footprints {
         for (x, y) in boundary_points(fp.width, fp.height) {
             let (ra, dec) = fp.wcs.pixel_to_sky(x, y);
             let (gx, gy) = tan.sky_to_pixel(ra, dec);
@@ -172,10 +179,51 @@ pub fn propose_grid(inputs: &[GridInput], target: &GridTarget) -> Option<Canonic
             height_px: size(hy),
             crval1: target.ra_deg,
             crval2: target.dec_deg,
-            rotation_deg: 0.0,
+            rotation_deg: rotation,
         }
         .normalized(),
     )
+}
+
+/// The proposal's rotation (owner ask, 2026-11-07: a frame's long side stays horizontal on the master and in
+/// Aligned Blink). Each frame gives the axis from its centre along its long side (its x axis when square), mapped
+/// through its WCS onto `tan0`, the proposal's TAN at rotation 0. A grid turned by `theta` turns every pixel
+/// vector by `+theta`, so an axis at `phi` lies horizontal at `theta = -phi` (mod 180 degrees). The axes are
+/// averaged as doubled angles (axes at 80 and 100 degrees share 90, not 0), summed in sorted order so the result
+/// does not depend on frame order, kept within (-90, 90] (north as near the top as the frames allow) and rounded
+/// to 0.01 degree. 0 with no WCS frame, or when the axes cancel.
+fn frames_rotation(footprints: &[&FrameFootprint], tan0: &WcsSolution) -> f64 {
+    let mut doubled: Vec<f64> = footprints
+        .iter()
+        .filter_map(|fp| {
+            let (cx, cy) = ((fp.width - 1.0) / 2.0, (fp.height - 1.0) / 2.0);
+            let (ex, ey) = if fp.width >= fp.height {
+                (fp.width - 0.5, cy)
+            } else {
+                (cx, fp.height - 0.5)
+            };
+            let on_grid = |x: f64, y: f64| {
+                let (ra, dec) = fp.wcs.pixel_to_sky(x, y);
+                tan0.sky_to_pixel(ra, dec)
+            };
+            let ((x0, y0), (x1, y1)) = (on_grid(cx, cy), on_grid(ex, ey));
+            let phi = (y1 - y0).atan2(x1 - x0);
+            phi.is_finite().then_some(-2.0 * phi)
+        })
+        .collect();
+    doubled.sort_by(f64::total_cmp);
+    let (c, s) = doubled
+        .iter()
+        .fold((0.0f64, 0.0f64), |(c, s), a| (c + a.cos(), s + a.sin()));
+    if c.hypot(s) <= 1e-9 * doubled.len() as f64 {
+        return 0.0;
+    }
+    let theta = ((0.5 * s.atan2(c).to_degrees()) * 100.0).round() / 100.0;
+    if theta <= -90.0 {
+        theta + 180.0
+    } else {
+        theta
+    }
 }
 
 /// The fraction of a frame inside the grid: a 16 x 16 lattice of the frame's
@@ -252,6 +300,16 @@ mod tests {
         }
     }
 
+    /// [`meta`] turned on the sky: the frame's +x axis points `angle` degrees from east towards north, still in
+    /// the frames' own parity (det CD > 0).
+    fn turned(ra: f64, dec: f64, w: i64, h: i64, angle: f64) -> ProjectFrameMeta {
+        let s = 2.0 / 3600.0;
+        let (sin, cos) = angle.to_radians().sin_cos();
+        let mut m = meta(ra, dec, w, h, Some(2.0));
+        m.wcs.as_mut().unwrap().cd = [s * cos, -s * sin, s * sin, s * cos];
+        m
+    }
+
     fn scale_only(scale: f64) -> ProjectFrameMeta {
         ProjectFrameMeta {
             exptime_sec: 300.0,
@@ -307,17 +365,73 @@ mod tests {
         );
     }
 
+    /// A frame whose long side runs north-south: the grid turns with it, so the long side lies along the grid's
+    /// x axis and the grid is wide, not tall (200 px → 256, 80 px → 128).
+    #[test]
+    fn the_grid_turns_so_the_frames_long_side_is_horizontal() {
+        let inputs = vec![grid_input_of(&turned(10.5, 41.25, 200, 80, 90.0))];
+        let g = propose_grid(&inputs, &TARGET).unwrap();
+        assert_eq!(g.rotation_deg, 90.0);
+        assert_eq!((g.width_px, g.height_px), (256, 128));
+    }
+
+    /// The rotation is the frames' long axis, kept within (-90, 90] so north stays as near the top as the frames
+    /// allow, rounded to 0.01 degree. A portrait frame's long side is its y axis.
+    #[test]
+    fn the_rotation_follows_the_long_axis_nearest_north_up() {
+        for (w, h, angle, expected) in [
+            (200, 80, 0.0, 0.0),
+            (200, 80, 30.0, 30.0),
+            (200, 80, 120.0, -60.0),
+            (200, 80, -100.0, 80.0),
+            (200, 80, 180.0, 0.0),
+            (80, 200, 0.0, 90.0),
+            (200, 80, 12.3456, 12.35),
+        ] {
+            let inputs = vec![grid_input_of(&turned(10.5, 41.25, w, h, angle))];
+            let g = propose_grid(&inputs, &TARGET).unwrap();
+            assert_eq!(g.rotation_deg, expected, "{w}x{h} at {angle}");
+        }
+    }
+
+    /// Axes, not directions: frames at 80 and 100 degrees share the 90-degree axis (a plain mean of -80 and 80
+    /// would say 0), and frames at 10 and 170 degrees share 0.
+    #[test]
+    fn the_rotation_is_the_axial_mean_of_the_frames() {
+        let pair = |a: f64, b: f64| {
+            let inputs = vec![
+                grid_input_of(&turned(10.5, 41.25, 200, 80, a)),
+                grid_input_of(&turned(10.5, 41.25, 200, 80, b)),
+            ];
+            propose_grid(&inputs, &TARGET).unwrap().rotation_deg
+        };
+        assert_eq!(pair(80.0, 100.0), 90.0);
+        assert_eq!(pair(10.0, 170.0), 0.0);
+        assert_eq!(pair(20.0, 40.0), 30.0);
+    }
+
     #[test]
     fn the_proposal_does_not_depend_on_frame_order() {
         let a = meta(10.5, 41.25, 100, 80, Some(2.0));
         let b = meta(10.52, 41.25, 100, 80, Some(2.1));
         let c = scale_only(1.9);
+        let d = turned(10.51, 41.25, 100, 80, 33.3);
         let forward = propose_grid(
-            &[grid_input_of(&a), grid_input_of(&b), grid_input_of(&c)],
+            &[
+                grid_input_of(&a),
+                grid_input_of(&b),
+                grid_input_of(&c),
+                grid_input_of(&d),
+            ],
             &TARGET,
         );
         let reverse = propose_grid(
-            &[grid_input_of(&c), grid_input_of(&b), grid_input_of(&a)],
+            &[
+                grid_input_of(&d),
+                grid_input_of(&c),
+                grid_input_of(&b),
+                grid_input_of(&a),
+            ],
             &TARGET,
         );
         assert_eq!(forward, reverse);

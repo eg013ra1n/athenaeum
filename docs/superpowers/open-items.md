@@ -2557,3 +2557,10 @@ Sky Chart phase 3 (NSNS surveys and the tile cache limit, PR #22, 2026-11-05), i
 - **The sky tiles kept while browsing have a size limit, 10 GB by default for all surveys together.** Past it, the tiles unused longest are deleted; an offline pack's tiles are kept. Settings →
   General → Sky background shows the space the surveys take, with Clear all, and each survey's servers and offline-pack share. (`skychart.hips_cache_limit_gb`, `hips::cache`.)
 - **About → Acknowledgements credits the sky surveys:** HiPS, DSS colored, the Northern Sky Narrowband Survey and its GAVO mirror.
+
+The project grid's rotation (2026-11-07, owner-asked for v0.7.1), in plain words for the translation:
+
+- **A project's grid keeps your frames' long side horizontal.** A new grid proposal turns with the members' frames instead of always
+  putting north up, so the project master and the aligned frames in Blink lie the way the frames were shot, and the grid wastes less
+  empty sky. A grid already confirmed stays as it is; the coordinator can turn it with Change…. (`propose_grid`'s rotation, the axial
+  mean of the frames' long axes.)

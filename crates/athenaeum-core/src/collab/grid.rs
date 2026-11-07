@@ -3,8 +3,9 @@
 //! `projects.canonical_grid` is the source of truth; this is its typed,
 //! normalized form. Ungated: the cache (`db::collab`) and the feed read it.
 //!
-//! Orientation: sky-standard, north up, east left, `det(CD) < 0`
-//! (`collab::grid_geometry::grid_wcs`). Every solve in the owner's catalog has
+//! Orientation: sky-standard, east left of north, `det(CD) < 0`, turned by
+//! `rotation_deg` (`collab::grid_geometry::grid_wcs`; a proposal turns it with
+//! the frames' long side). Every solve in the owner's catalog has
 //! `det(CD) > 0`, so a grid master is the mirror image of a raw frame,
 //! which is correct on the sky; no `ROWORDER` of a source frame describes it.
 
