@@ -83,6 +83,9 @@ This update arrives inside the app: click **Download and install** when it is of
   only what you selected.
 - **The plate-solve batch progress** no longer runs a frame ahead, and in the web version it no longer closes at
   once.
+- **DWARF 3 frames show their sensor temperature.** Cameras that record it as `DET-TEMP` instead of `CCD-TEMP`
+  used to leave the temperature empty. Frames scanned from now on get it; frames already in your catalog keep an
+  empty temperature.
 
 ## Good to know after updating
 
