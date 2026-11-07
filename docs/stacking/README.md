@@ -1619,6 +1619,12 @@ unchanged.
     viewer's own outlines share the accent colour with the rectangle, which is drawn thicker (an owner glance, open-items).
     With no grid at all it draws the target circle and the outlines on a tangent plane at the target. In the dialog it is
     redrawn from the draft as the numbers change.
+  - **The registration reference (owner, 2026-11-07).** One outline is drawn in gold (`warning`), thicker, lightly
+    filled and last, so it reads apart from the rectangle and every member colour; a line under the schematic names it
+    and its source. `gridReference` picks it: the next run's manual pin when there is one, else the reference of the run
+    selected in Results, read as the reference strip reads it (the summary's `reference`, else the in-flight row marked
+    `reference`), joined to its footprint by the run row's `frameUuid`. A reference with no footprint is named with
+    "not drawn".
 - **Prepare panel and board mode (D3, D5).** `boardMode(plan)` is `prepare` when the plan is a project's or its
   `readiness.attested` is true, `calibrate` otherwise. Every board change below reads the plan, never the config.
   - **Plan counts.** `StackingPlan.prepare` is `Some(PlanPrepare)` for a project and for an attested set, `None` for
@@ -1719,13 +1725,21 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
   - Files: `FramesTable.tsx` (state and layout), `FramesToolbar.tsx`, `FramesTableRows.tsx` (rows, group headers, the
     Model cell), `FramesReferenceStrip.tsx`, `frameRows.ts` (the row model: `FrameRow`, `Outcome`), `frameView.ts` (pure:
     filters, grouping, outliers, counts), `StackingBlink.tsx`.
-- **The reference strip.** Two lines, built from data the tab already holds, so the strip makes no request.
-  - Line 1: `Registration reference, run #8: <file> · <group> · weight 1.000 · auto` (or `manual`), plus `· two-pass moved it
-    from <file>` when the summary's `reference.switchedFrom` is set. In native mode it reads `per group`, and each group
-    header names its own reference. While a run is in flight and has no summary yet, the row marked `regStatus =
-    'reference'` stands in.
-  - Line 2: `Next run: auto, picked at run time`, or `Next run: <file> · manual` from `plan.reference`, with an error mark
-    when that file is not on this device.
+- **The reference strip.** Two labelled rows in a two-column definition list (label left, value right), built from data
+  the tab already holds, so the strip makes no request. Reworked 2026-11-07 on the owner's ask: the old single
+  `·`-joined line was unreadable and, at full width, widened the card.
+  - `Run #8 aligned onto` (with the star; the tooltip says it is the registration reference), the value line by line:
+    the file; a sentence that says where the reference sits, `This frame is in group <group>, weight 1.000, chosen
+    automatically` (or `pinned by hand`; commas, since the group's own title keeps its `·`; `This frame has weight …`
+    when the group is unknown); and, when the summary's
+    `reference.switchedFrom` is set, `The second pass moved it here from <file>, which sat further from the median
+    framing`. A missing name reads `not picked yet` (a run in flight) or `not recorded` (an ended run). In native mode the
+    value is `each group's own frame, named in its header`. While a run is in flight and has no summary yet, the row
+    marked `regStatus = 'reference'` stands in.
+  - `Next run aligns onto`: `a frame it picks automatically when it starts`, or `<file> · pinned by hand` from
+    `plan.reference`, or `a frame pinned by hand, but none is chosen`, with an error mark when there is no frame or its
+    file is not on this device.
+  - The Frames card is `w-fit max-w-full` like its table box, so its background ends at its widest part.
 - **The reference star, both subjects.** The Reference column holds the Analysis `Star`. The star means "you chose this";
   the `Reference` status chip means "the run used this". The star is filled only in Manual mode, and it is disabled while a
   run is active.
@@ -1759,10 +1773,16 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
   selected, `editable` and in it. A button is enabled when its eligible set is not empty, and it reads `Exclude (3 of 5)`
   when that set is smaller than the selection. Both add or remove keys through `setUserExcluded`, the existing gated
   persist path, and are disabled while a run is active. Blink is not.
-- **Columns.** The default columns are File, Publisher (project), Weight, FWHM, Ecc, Seeds, Status and Reference. The
-  Columns toggle adds Reg RMS, Inliers, Model (with the `WCS` chip) and Scale (the LN scale). Group by, Units and Columns
-  persist in local storage (`stackingPrefs.ts`, `readFramesView`); the filters, search, selection and collapsed groups do
-  not. There is no per-row Include checkbox: inclusion shows in the Status cell and the row tint.
+- **Columns.** The default columns are File, Publisher (project), FL, Weight, FWHM, Ecc, Seeds, Status and Reference.
+  FL is the focal length the frame declares, in mm: a set light's `frames.focallen` (FOCALLEN), a project frame's
+  manifest value (`ProjectFrameMeta.focal_len` → `PlanProjectFrame.focal_len_mm`); never derived from a plate solve. The Columns toggle adds
+  Reg RMS, Inliers, Model (with the `WCS` chip) and Scale (the LN scale). Group by, Units and Columns persist in local
+  storage (`stackingPrefs.ts`, `readFramesView`); the filters, search, selection and collapsed groups do not. There is
+  no per-row Include checkbox: inclusion shows in the Status cell and the row tint.
+- **Width (2026-11-07).** The table is as wide as its columns (`w-fit max-w-full` box, no `w-full`): on a wide window
+  the spare room stays to its right instead of opening gaps between the columns. Cells never wrap; the File column
+  stops at 24rem and Publisher at 10rem, with an ellipsis and the whole value in the tooltip. A narrower window scrolls
+  the table sideways.
 - **Two signals per row.** The run's outcome and the next run's exclusion are separate chips and never compete. The
   outcome comes from structured fields only (`frameRows.ts`), never from parsing `exclusionReason`.
 
@@ -1848,6 +1868,14 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     originals. The star overlay and the flat contour are drawn on the original's pixel grid, so both are off in Aligned
     mode. A failed verdict call opens Blink with originals and a warning notification (`Aligned frames are unavailable`). A
     failed aligned decode is shown as an error, with no silent fall back to the original.
+  - **Stars on a project's frames (fix, 2026-11-07).** A project entry is asked for by uuid and carries no catalog frame
+    id, so the overlay used to load nothing for any project frame, silently. Every project entry now carries a
+    `starsRef` (`{ projectId, frame }`), and Blink loads an entry's stars by its catalog frame id when it has one, else
+    through `get_collab_frame_star_metrics { projectId, frame }` (both hosts, `debug` span). That command resolves the
+    file Blink shows (`resolve_collab_frame_path`, as `get_collab_frame_image` does) and runs the Analysis tab's
+    analysis on it with the Analysis config; nothing is stored, since there is no catalog frame to store it on, and
+    Blink keeps the answer while it is open. An entry with neither source is logged once and draws no star. The project
+    page's Blink uses the same ref for its replicas.
 - **Not in the block.** No Black Hole and no file deletion in the table or in Blink. No threshold bar that auto-rejects
   frames (the Analysis tab's `RejectionThresholdBar`): outliers are highlighted and filterable, and excluding them stays
   the user's click.

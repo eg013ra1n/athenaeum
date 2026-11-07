@@ -26,7 +26,7 @@ const fileOf = (id: number) => `${id < 20 ? 'L' : id < 30 ? 'R' : 'B'}_${String(
 
 /** B's lights come first, so the plan's order (not the set's) is what orders the groups. */
 const SET_LIGHTS: LightFrameRef[] = [...B_IDS, ...L_IDS, ...R_IDS].map((frameId) => ({
-  frameId, filename: fileOf(frameId), night: null, exptimeSec: 300,
+  frameId, filename: fileOf(frameId), night: null, exptimeSec: 300, focalLenMm: null,
 }));
 
 const QUAD_FAIL = 'registration failed: 0 quad matches';
@@ -306,6 +306,27 @@ describe('FramesTable for a frame set', () => {
     renderTable({ ...SET, lightFrames: [], runDetail: null });
     expect(screen.getByText('No light frames in this set.')).toBeInTheDocument();
   });
+
+  it("shows each light's focal length in the FL column and sorts by it, unknown last", () => {
+    const focal: Record<number, number> = { 7: 1000, 8: 382.6, 31: 530 };
+    renderTable({ ...SET, lightFrames: SET_LIGHTS.map((f) => ({ ...f, focalLenMm: focal[f.frameId] ?? null })) });
+    const fl = within(screen.getByRole('columnheader', { name: 'FL' }));
+    expect(screen.getByRole('columnheader', { name: 'FL' })).toHaveAttribute('title', expect.stringContaining('FOCALLEN'));
+    expect(within(rowOf('L_0007.fits')).getByText('1000 mm')).toBeInTheDocument();
+    expect(within(rowOf('L_0008.fits')).getByText('383 mm')).toBeInTheDocument();
+    fireEvent.click(within(toolbar()).getByRole('button', { name: 'None' }));
+    fireEvent.click(fl.getByRole('button'));
+    expect(fileColumn().slice(0, 4)).toEqual(['L_0008', 'B_0031', 'L_0007', 'B_0032']);
+  });
+
+  it('sizes the table to its columns instead of stretching it across the card', () => {
+    renderTable(SET);
+    expect(table().className).not.toContain('w-full');
+    expect(table().parentElement?.className).toContain('w-fit');
+    expect(table().parentElement?.className).toContain('max-w-full');
+    // The card hugs the table too, so its background ends where the table does.
+    expect(table().closest('.bg-surface-elevated')?.className).toContain('w-fit');
+  });
 });
 
 // ── The project ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -322,6 +343,12 @@ describe('FramesTable for a project', () => {
     expect(within(toolbar()).getByRole('button', { name: 'Publisher' })).toBeInTheDocument();
     expect(within(toolbar()).queryByRole('button', { name: 'Night' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Not stackable here 3' })).toBeInTheDocument();
+  });
+
+  it("shows a project frame's manifest focal length in the FL column", () => {
+    renderTable({ projectFrames: PLAN_FRAMES.map((f, i) => ({ ...f, focalLenMm: i === 0 ? 2800 : null })) });
+    expect(within(rowOf('a.fits')).getByText('2800 mm')).toBeInTheDocument();
+    expect(within(rowOf('b.fits')).getAllByText('—').length).toBeGreaterThan(0);
   });
 
   it('sorts by the publisher', () => {

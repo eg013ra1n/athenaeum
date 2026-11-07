@@ -333,6 +333,8 @@ pub struct PlanProjectFrame {
     pub filter_canonical: String,
     pub exptime_sec: f64,
     pub color_mode: ColorMode,
+    // The manifest's focal length in mm (the source frame's FOCALLEN); `None` when it has none.
+    pub focal_len_mm: Option<f64>,
     // The manifest carries a WCS (else the run plate-solves the frame).
     pub has_wcs: bool,
     // Stackable on this device.
@@ -2839,6 +2841,7 @@ fn project_inputs(
             filter_canonical: f.filter_canonical.clone(),
             exptime_sec: f.exptime_sec,
             color_mode: f.color_mode,
+            focal_len_mm: f.meta.as_ref().and_then(|m| m.focal_len),
             has_wcs: f.meta.as_ref().is_some_and(|m| m.wcs.is_some()),
             // The record's flag (landed on this device per the catalog), not a disk check: a landed file
             // gone since reads `true` here and names itself in `reason`.

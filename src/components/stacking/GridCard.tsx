@@ -9,7 +9,7 @@ import { Card } from '../ui/Card';
 import { KV } from '../ui/KV';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { GridDialog, errorText } from './GridDialog';
-import { GridSchematic } from './GridSchematic';
+import { GridSchematic, type GridReference } from './GridSchematic';
 import { gridValuesLine } from './gridProjection';
 import type { CanonicalGrid } from '../../types/models';
 import type { PlanGrid, PlanGridTarget } from '../../types/stacking';
@@ -17,6 +17,8 @@ import type { PlanGrid, PlanGridTarget } from '../../types/stacking';
 export interface GridCardProps {
   projectId: string;
   grid: PlanGrid;
+  /** The registration reference the schematic marks (`gridReference`); `null` or absent for none. */
+  reference?: GridReference | null;
   /** The grid was saved: the tab re-plans (the feed's `collab-grid-changed` re-plans again, harmlessly). */
   onSaved: () => void;
 }
@@ -38,7 +40,7 @@ function gridFromTarget(target: PlanGridTarget): CanonicalGrid {
   };
 }
 
-export function GridCard({ projectId, grid, onSaved }: GridCardProps) {
+export function GridCard({ projectId, grid, reference = null, onSaved }: GridCardProps) {
   const { notify } = useNotifications();
   const [dialog, setDialog] = useState<OpenDialog | null>(null);
   const [busy, setBusy] = useState(false);
@@ -99,7 +101,13 @@ export function GridCard({ projectId, grid, onSaved }: GridCardProps) {
         {!confirmed && canEdit && proposal === null && <p className="text-[12px] text-content-muted">No proposal yet.</p>}
         {facts.length > 0 && <KV items={facts} />}
 
-        <GridSchematic grid={shown} target={grid.target} footprints={grid.footprints} framesNotDrawn={grid.framesNotDrawn} />
+        <GridSchematic
+          grid={shown}
+          target={grid.target}
+          footprints={grid.footprints}
+          framesNotDrawn={grid.framesNotDrawn}
+          reference={reference}
+        />
 
         {proposalError !== null && (
           <p role="alert" className="text-xs text-error">
@@ -137,7 +145,7 @@ export function GridCard({ projectId, grid, onSaved }: GridCardProps) {
           initial={dialog.initial}
           // A dialog opened from `Edit…` warns too once the grid behind it has been confirmed by someone else.
           warnRewrite={dialog.warnRewrite || confirmed}
-          schematic={{ target: grid.target, footprints: grid.footprints, framesNotDrawn: grid.framesNotDrawn }}
+          schematic={{ target: grid.target, footprints: grid.footprints, framesNotDrawn: grid.framesNotDrawn, reference }}
           onSave={save}
           onClose={() => setDialog(null)}
         />

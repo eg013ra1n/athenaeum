@@ -401,6 +401,7 @@ export default function FrameSetDetail() {
               filename: fw.file.filename,
               night: nightLabel,
               exptimeSec: fw.frame.exptime,
+              focalLenMm: fw.frame.focallen,
             });
           }
         }

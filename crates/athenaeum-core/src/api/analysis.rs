@@ -595,6 +595,51 @@ pub async fn get_frame_star_metrics(
     })
 }
 
+/// Star metrics for a project frame in Blink: the file Blink shows for it
+/// (`collab_blink::resolve_collab_frame_path`, the same rule as
+/// `get_collab_frame_image`), analysed on demand with the Analysis tab's
+/// config. A project frame — a published copy or a member's replica — is no
+/// catalog frame, so nothing is stored: `frame_id` and `file_id` of the
+/// answer are 0, and Blink keeps the answer for as long as it is open.
+pub async fn get_collab_frame_star_metrics(
+    ctx: &ServiceContext,
+    project_id: &str,
+    frame: &crate::api::collab_blink::CollabFrameRef,
+) -> Result<StarMetricsResponse, ApiError> {
+    let (path, _) = crate::api::collab_blink::resolve_collab_frame_path(ctx, project_id, frame)?;
+    let path = path.to_string_lossy().into_owned();
+    let (analysis_config, config_hash) = {
+        let db_handle = db(ctx)?;
+        let conn = db_handle.conn();
+        let analysis_config = config::load_config(&conn);
+        let config_hash = analysis_config.config_hash();
+        (analysis_config, config_hash)
+    };
+    // An attested own frame resolves to its raw original, which may sit inside a zip.
+    let (local, pin) =
+        tokio::task::block_in_place(|| crate::zip_store::materialize::materialize_one(ctx, &path)).map_err(|e| {
+            tracing::warn!(project_id, path = %path, error = %e, "project frame is not readable for star metrics");
+            ApiError::Internal(format!("{}: {}", path, e))
+        })?;
+    let pool = Arc::clone(&ctx.image_pool);
+    let local = local.to_string_lossy().into_owned();
+    let analysed = tokio::task::spawn_blocking(move || {
+        let _pin = pin;
+        analyzer::analyze_frame(&local, &analysis_config, Some(&pool), &config_hash)
+    })
+    .await;
+    let (analysis, stars, flip_vertical) = analysed
+        .map_err(|e| ApiError::Internal(format!("Analysis panicked: {}", e)))?
+        .map_err(|e| ApiError::Internal(format!("Analysis failed: {}", e)))?;
+    Ok(StarMetricsResponse {
+        image_width: analysis.width,
+        image_height: analysis.height,
+        metrics: analysis,
+        stars,
+        flip_vertical,
+    })
+}
+
 // ========== Flat Contour Plot ==========
 //
 // Port of the ERP's flat-contour-plot script v1.3.1. Reads a flat (or master flat) at

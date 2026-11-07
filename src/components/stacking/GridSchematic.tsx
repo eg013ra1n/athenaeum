@@ -4,10 +4,49 @@
 // dialog (the draft as it is edited).
 
 import { useMemo } from 'react';
+import { Star } from 'lucide-react';
 import { useMemberColor } from '../collab/project/MemberColorsContext';
 import type { CanonicalGrid } from '../../types/models';
-import type { PlanGridFootprint, PlanGridTarget } from '../../types/stacking';
+import type {
+  PlanGridFootprint,
+  PlanGridTarget,
+  PlanProjectFrame,
+  StackingRunDetail,
+} from '../../types/stacking';
 import { northArrowAngleDeg, skyToGridPixel, toSchematic } from './gridProjection';
+
+/** The registration reference the schematic marks: the frame every other one is star-matched to before its map onto
+ *  the grid. */
+export interface GridReference {
+  frameUuid: string;
+  filename: string;
+  /** Which reference it is, for the key under the schematic: `next run, manual` or `run #<id>`. */
+  source: string;
+}
+
+/** The reference to mark: the next run's manual pin when there is one (it is what the next run registers onto),
+ *  else the reference of the run selected in Results, read as the reference strip reads it; `null` when neither names
+ *  a frame. */
+export function gridReference(
+  pinnedUuid: string | null,
+  runDetail: StackingRunDetail | null,
+  projectFrames: PlanProjectFrame[],
+): GridReference | null {
+  const nameOf = (uuid: string) => projectFrames.find((f) => f.frameUuid === uuid)?.fileName ?? uuid;
+  if (pinnedUuid !== null) return { frameUuid: pinnedUuid, filename: nameOf(pinnedUuid), source: 'next run, manual' };
+  if (runDetail === null) return null;
+  const reference = runDetail.summary?.reference ?? null;
+  // A finished run names its reference in the summary; a run still in flight only has the row marked `reference`.
+  const row =
+    reference === null
+      ? runDetail.frames.find((f) => f.regStatus === 'reference')
+      : reference.frameId === null
+        ? undefined
+        : runDetail.frames.find((f) => f.frameId === reference.frameId);
+  const uuid = row?.frameUuid ?? null;
+  if (uuid === null) return null;
+  return { frameUuid: uuid, filename: reference?.filename ?? nameOf(uuid), source: `run #${runDetail.run.id}` };
+}
 
 export interface GridSchematicProps {
   /** The grid to draw; `null` for a project with none yet: the target circle and the outlines only, on a tangent
@@ -17,6 +56,9 @@ export interface GridSchematicProps {
   footprints: PlanGridFootprint[];
   /** Accepted frames the plan could not outline (no usable WCS in the manifest, whichever of its four causes). */
   framesNotDrawn: number;
+  /** The registration reference, outlined in its own colour on top of the others and named under the schematic;
+   *  `null` or absent for none. */
+  reference?: GridReference | null;
 }
 
 /** The tallest the schematic grows; its width is the card's. */
@@ -60,8 +102,9 @@ function planeAtTarget(target: PlanGridTarget): CanonicalGrid {
 
 const pointsAttr = (pts: { x: number; y: number }[]) => pts.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
 
-export function GridSchematic({ grid, target, footprints, framesNotDrawn }: GridSchematicProps) {
+export function GridSchematic({ grid, target, footprints, framesNotDrawn, reference = null }: GridSchematicProps) {
   const colorOf = useMemberColor();
+  const referenceUuid = reference?.frameUuid ?? null;
 
   const drawing = useMemo(() => {
     const plane = grid ?? planeAtTarget(target);
@@ -107,6 +150,8 @@ export function GridSchematic({ grid, target, footprints, framesNotDrawn }: Grid
   }, [grid, target, footprints]);
 
   const { view } = drawing;
+  // Drawn last, so no member outline crosses over it.
+  const referencePolygon = drawing.polygons.find((p) => p.footprint.frameUuid === referenceUuid) ?? null;
   return (
     <div>
       <div className="relative">
@@ -147,6 +192,7 @@ export function GridSchematic({ grid, target, footprints, framesNotDrawn }: Grid
             />
           )}
           {drawing.polygons.map(({ footprint, points }) => {
+            if (footprint.frameUuid === referenceUuid) return null;
             const colour = colorOf(footprint.publisherAccountId);
             return (
               <polygon
@@ -164,9 +210,32 @@ export function GridSchematic({ grid, target, footprints, framesNotDrawn }: Grid
               />
             );
           })}
+          {referencePolygon && (
+            // Gold, thicker and lightly filled: it reads apart from the frost-blue grid rectangle and from every
+            // member colour, the gold one included.
+            <polygon
+              data-testid="grid-reference"
+              data-frame-uuid={referencePolygon.footprint.frameUuid}
+              points={referencePolygon.points}
+              strokeWidth={2.5}
+              strokeLinejoin="round"
+              fillOpacity={0.14}
+              vectorEffect="non-scaling-stroke"
+              className="stroke-warning fill-warning"
+            />
+          )}
         </svg>
         {drawing.north !== null && <NorthArrow angleDeg={drawing.north} />}
       </div>
+      {reference !== null && (
+        <p className="mt-1 flex items-center gap-1 text-[11px] text-content-faint min-w-0">
+          <Star size={11} className="shrink-0 fill-warning text-warning" aria-hidden="true" />
+          <span className="truncate" title={reference.filename}>
+            Reference ({reference.source}): <span className="font-mono">{reference.filename}</span>
+            {referencePolygon === null && ' — not drawn: no usable WCS in the manifest'}
+          </span>
+        </p>
+      )}
       {framesNotDrawn > 0 && (
         <p className="mt-1 text-[11px] text-content-faint">
           {framesNotDrawn === 1 ? '1 frame is' : `${framesNotDrawn} frames are`} not drawn: no usable WCS in the manifest

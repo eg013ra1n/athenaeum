@@ -22,6 +22,8 @@ export interface LightFrameRef {
   night: string | null;
   /** The frame's exposure in seconds (`frame.exptime`); `null` when unknown. */
   exptimeSec: number | null;
+  /** The frame's focal length in mm (`frame.focallen`, the header's FOCALLEN); `null` when unknown. */
+  focalLenMm: number | null;
 }
 
 /** The run-scoped slice the builders need — `groups`/`frames` and the run's
@@ -81,6 +83,9 @@ export interface FrameRow {
    *  set no longer lists. */
   night: string | null;
   exptimeSec: number | null;
+  /** The focal length in mm the frame declares: the set frame's FOCALLEN, the
+   *  project frame's manifest value. `null` when it declares none. */
+  focalLenMm: number | null;
   weight: number | null;
   fwhmPx: number | null;
   eccentricity: number | null;
@@ -133,6 +138,7 @@ export type SortKey =
   | 'groupKey'
   | 'night'
   | 'exptimeSec'
+  | 'focalLenMm'
   | 'weight'
   | 'fwhmPx'
   | 'eccentricity'
@@ -245,6 +251,7 @@ export function buildFrameRows(
         : (ctx.planGroupByFrameId.get(frameId) ?? null),
       night: lightRef?.night ?? null,
       exptimeSec: lightRef?.exptimeSec ?? null,
+      focalLenMm: lightRef?.focalLenMm ?? null,
       ...runMetrics(runRow, s),
       outcome: runRow && detail ? runOutcome(runRow, detail.run) : null,
       outOfNextRun: excludedSet.has(frameId),
@@ -327,6 +334,7 @@ export function buildProjectFrameRows(
           : null,
       night: null,
       exptimeSec: p.exptimeSec,
+      focalLenMm: p.focalLenMm,
       ...runMetrics(runRow, s),
       outcome,
       outOfNextRun: excluded.has(p.frameUuid),
@@ -350,6 +358,7 @@ export function buildProjectFrameRows(
         groupKey: groupKeyById.get(runRow.groupId) ?? null,
         night: null,
         exptimeSec: null,
+        focalLenMm: null,
         ...runMetrics(runRow, s),
         outcome: detail ? runOutcome(runRow, detail.run) : null,
         outOfNextRun: excluded.has(key),

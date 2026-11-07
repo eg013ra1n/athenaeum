@@ -15,7 +15,7 @@ export interface GridDialogProps {
   initial: CanonicalGrid;
   /** The grid is already confirmed: changing it makes every processor's next run rewrite its registered frames. */
   warnRewrite: boolean;
-  schematic: Pick<GridSchematicProps, 'target' | 'footprints' | 'framesNotDrawn'>;
+  schematic: Pick<GridSchematicProps, 'target' | 'footprints' | 'framesNotDrawn' | 'reference'>;
   /** Saves the grid; a rejection keeps the dialog open with its message. */
   onSave: (grid: CanonicalGrid) => Promise<void>;
   onClose: () => void;

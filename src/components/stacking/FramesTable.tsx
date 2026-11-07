@@ -232,7 +232,8 @@ export function FramesTable({
   const colSpan = columns.length + 1;
 
   return (
-    <div className="bg-surface-elevated rounded-lg p-3 space-y-2">
+    // The card hugs its widest part (the table, as a rule) instead of spanning the page.
+    <div className="w-fit max-w-full bg-surface-elevated rounded-lg p-3 space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
         <button
           type="button"
@@ -295,8 +296,10 @@ export function FramesTable({
                 counts={counts}
                 onStatus={setStatus}
               />
-              <div className="max-h-[70vh] overflow-y-auto overflow-x-auto border border-border rounded-lg">
-                <table className="w-full text-xs">
+              {/* The table is as wide as its columns, never stretched to the card: on a wide window the spare room
+                  stays to its right instead of opening gaps between the columns. */}
+              <div className="w-fit max-w-full max-h-[70vh] overflow-y-auto overflow-x-auto border border-border rounded-lg">
+                <table className="text-xs">
                   <thead className="sticky top-0 z-10 bg-surface-elevated">
                     <tr className="text-content-muted text-left border-b border-border">
                       <th className="w-8 py-1.5 px-2 text-center">
@@ -314,7 +317,7 @@ export function FramesTable({
                       {columns.map((c) => (
                         <th
                           key={c.id}
-                          className="py-1.5 px-2 font-medium"
+                          className="py-1.5 px-3 font-medium whitespace-nowrap"
                           title={c.title}
                           aria-sort={sortKey !== c.sortKey ? 'none' : sortDir === 'asc' ? 'ascending' : 'descending'}
                         >

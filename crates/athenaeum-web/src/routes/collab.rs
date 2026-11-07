@@ -1095,6 +1095,26 @@ pub async fn get_collab_frame_image(
     crate::routes::images::render_path_jpeg(&state, path.to_string_lossy().into_owned(), args.resolution).await
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameStarMetricsArgs {
+    project_id: String,
+    frame: athenaeum_core::api::collab_blink::CollabFrameRef,
+}
+
+/// Blink's star overlay for one project frame: the file Blink shows for it,
+/// analysed on demand (a project frame has no catalog frame to store it on).
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_collab_frame_star_metrics(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameStarMetricsArgs>,
+) -> Result<Json<athenaeum_core::models::StarMetricsResponse>, (axum::http::StatusCode, String)> {
+    athenaeum_core::api::analysis::get_collab_frame_star_metrics(&state.ctx, &args.project_id, &args.frame)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
 #[cfg(test)]
 mod remap_args_tests {
     use super::*;

@@ -12,7 +12,7 @@ import type { RunFrameData } from './frameRows';
 export const CANNOT_OPEN = 'cannot be opened (offline, moved or renamed)';
 
 export const pf = (over: Partial<PlanProjectFrame> = {}): PlanProjectFrame => ({
-  handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice', filterCanonical: 'L', exptimeSec: 300,
+  handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice', filterCanonical: 'L', exptimeSec: 300, focalLenMm: null,
   colorMode: 'mono', hasWcs: true, onDisk: true, reason: null, ...over,
 });
 

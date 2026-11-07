@@ -63,7 +63,7 @@ const PROJECT: StackSubject = { kind: 'project', projectId: 'p1', title: 'Projec
 
 const row = (key: string, over: Partial<FrameRow> = {}): FrameRow => ({
   key, frameId: Number(key) || null, filename: `${key}.fit`, publisher: null, groupKey: 'L-mono', night: null,
-  exptimeSec: 300, weight: null, fwhmPx: null, eccentricity: null, stars: null, regRmsPx: null, lnScale: null,
+  exptimeSec: 300, focalLenMm: null, weight: null, fwhmPx: null, eccentricity: null, stars: null, regRmsPx: null, lnScale: null,
   regInliers: null, regModel: null,
   outcome: { kind: 'included', label: 'Included', tone: 'success', reason: null },
   outOfNextRun: false, editable: true, unavailable: null, pinnable: true, pinned: false, pinNote: null,
@@ -136,6 +136,17 @@ describe('StackingBlink', () => {
     expect(blink!.frames[0]!.imageRef).toEqual({ projectId: 'p1', frame: { frameId: null, frameUuid: 'u1' } });
     expect(blink!.frames[1]!.imageRef).toBeUndefined();
     expect(blink!.frameSetId).toBeUndefined();
+  });
+
+  it('every project entry, a raw one too, carries the ref its stars load by', async () => {
+    vi.mocked(api.invoke).mockResolvedValueOnce([collabEntry('u1', 'replica'), collabEntry('u2', 'raw')] as never);
+    render(<StackingBlink {...props({ subject: PROJECT, rows: [row('u1'), row('u2')] })} />);
+    await opened();
+
+    expect(blink!.frames.map((f) => f.starsRef)).toEqual([
+      { projectId: 'p1', frame: { frameId: null, frameUuid: 'u1' } },
+      { projectId: 'p1', frame: { frameId: null, frameUuid: 'u2' } },
+    ]);
   });
 
   it('nothing on this device closes Blink after the notice, and opens nothing', async () => {

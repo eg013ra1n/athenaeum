@@ -552,6 +552,7 @@ pub fn run() {
             commands::get_collab_exchange,
             commands::get_collab_blink_frames,
             commands::get_collab_frame_image,
+            commands::get_collab_frame_star_metrics,
             commands::get_collab_publish_run,
             commands::cancel_collab_publish,
             commands::get_collab_filter_buckets,

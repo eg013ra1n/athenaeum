@@ -21,6 +21,8 @@ The `stacking` scenario (`/projects/p-m31?tab=stacking`) shows the project's Sta
 `src/types/stacking.ts`: an unconfirmed grid (a proposal the viewer may confirm) with the schematic of ten frame
 outlines from three publishers, two of them reaching past the proposal, and two more frames without a WCS; the Prepare
 board; three groups (`mono__L__st120`, `mono__Ha__st300`, `osc__None__st180`: a project key has no binning); and twelve frames in
-the Frames table, one of them not on this device, one an unsupported file and two without a WCS. No run exists
-(`get_project_stacking_runs` answers `[]`), and the writes the tab can reach are echoed, never stored. The plan still
+the Frames table, one of them not on this device, one an unsupported file and two without a WCS, with their focal
+lengths (FL). One finished run, #9, exists (`get_project_stacking_runs`, `get_stacking_run`): it wrote no master, and
+its reference was moved by the second pass, so the reference strip shows every line and the schematic outlines that
+frame in gold. The writes the tab can reach are echoed, never stored. The plan still
 carries its `grid` blocker, so Run stays refused until a grid is confirmed.

@@ -113,7 +113,7 @@ const frameSetTab = (
     subject={{
       kind: 'frameSet',
       framesSetId: 7,
-      lightFrames: [{ frameId: 101, filename: 'a.fit', night: null, exptimeSec: null }],
+      lightFrames: [{ frameId: 101, filename: 'a.fit', night: null, exptimeSec: null, focalLenMm: null }],
     }}
   />
 );

@@ -7,6 +7,9 @@ export type BlinkFrame = FileWithFrame & {
   key?: string;
   /** Set for calibrated and replica entries: both image loads go through get_collab_frame_image. */
   imageRef?: { projectId: string; frame: CollabFrameRef };
+  /** Set for every project entry: one with no catalog frame id loads its star overlay through
+   *  get_collab_frame_star_metrics, which analyses the file Blink shows for it. */
+  starsRef?: { projectId: string; frame: CollabFrameRef };
   source?: BlinkSource;
   /** A short state label (e.g. `withheld`, `excluded`) shown on the row and in the context strip. */
   badge?: string;

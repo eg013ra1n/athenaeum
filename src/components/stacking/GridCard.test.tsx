@@ -6,11 +6,19 @@ import type { ReactElement } from 'react';
 import { api } from '../../api';
 import { GridCard } from './GridCard';
 import { GridDialog, validateGrid } from './GridDialog';
-import { GridSchematic } from './GridSchematic';
+import { GridSchematic, gridReference } from './GridSchematic';
+import { pf } from './testFixtures';
 import { MemberColorsProvider } from '../collab/project/MemberColorsContext';
 import { memberColor } from '../collab/project/memberColors';
 import type { CanonicalGrid } from '../../types/models';
-import type { GridState, PlanGrid, PlanGridFootprint, PlanGridTarget } from '../../types/stacking';
+import type {
+  GridState,
+  PlanGrid,
+  PlanGridFootprint,
+  PlanGridTarget,
+  RunSummary,
+  StackingRunDetail,
+} from '../../types/stacking';
 
 vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
 
@@ -184,6 +192,65 @@ describe('GridSchematic', () => {
     expect(screen.queryByTestId('grid-rect')).toBeNull();
     expect(screen.getByTestId('grid-target')).toBeInTheDocument();
     expect(outlines()).toHaveLength(3);
+  });
+
+  it('marks the reference in gold, on top of the member outlines, and names it under the schematic', () => {
+    draw({ reference: { frameUuid: 'f2', filename: 'b.fits', source: 'run #9' } });
+    expect(outlines().map((o) => o.getAttribute('data-frame-uuid'))).toEqual(['f1', 'f3']);
+    const ref = screen.getByTestId('grid-reference');
+    expect(ref.getAttribute('data-frame-uuid')).toBe('f2');
+    expect(ref.getAttribute('class')).toContain('stroke-warning');
+    // The last shape drawn: nothing crosses over it.
+    expect(screen.getByTestId('grid-schematic').lastElementChild).toBe(ref);
+    expect(screen.getByText(/Reference \(run #9\)/)).toHaveTextContent('Reference (run #9): b.fits');
+  });
+
+  it('names a reference it cannot draw and says why', () => {
+    draw({ reference: { frameUuid: 'gone', filename: 'z.fits', source: 'next run, manual' } });
+    expect(screen.queryByTestId('grid-reference')).toBeNull();
+    expect(outlines()).toHaveLength(3);
+    expect(screen.getByText(/Reference \(next run, manual\)/)).toHaveTextContent(
+      'Reference (next run, manual): z.fits — not drawn: no usable WCS in the manifest',
+    );
+  });
+
+  it('marks nothing and names nothing without a reference', () => {
+    draw({ reference: null });
+    expect(screen.queryByTestId('grid-reference')).toBeNull();
+    expect(screen.queryByText(/Reference/)).toBeNull();
+  });
+});
+
+describe('gridReference', () => {
+  const frames = [pf({ handle: 7, frameUuid: 'u7', fileName: 'seven.fits' }), pf({ handle: 8, frameUuid: 'u8', fileName: 'eight.fits' })];
+  const runRow = (frameId: number, frameUuid: string | null, regStatus: string | null) =>
+    ({ frameId, frameUuid, regStatus }) as StackingRunDetail['frames'][number];
+  const detail = (frameRows: StackingRunDetail['frames'], reference: RunSummary['reference'] | null) =>
+    ({
+      run: { id: 9 },
+      frames: frameRows,
+      summary: reference === null ? null : { reference },
+    }) as unknown as StackingRunDetail;
+
+  it("prefers the next run's manual pin to the selected run's reference", () => {
+    const d = detail([runRow(8, 'u8', 'reference')], null);
+    expect(gridReference('u7', d, frames)).toEqual({ frameUuid: 'u7', filename: 'seven.fits', source: 'next run, manual' });
+  });
+
+  it("takes a finished run's reference from its summary", () => {
+    const reference = { frameId: 8, filename: 'eight-from-summary.fits' } as RunSummary['reference'];
+    const d = detail([runRow(7, 'u7', 'registered'), runRow(8, 'u8', 'registered')], reference);
+    expect(gridReference(null, d, frames)).toEqual({ frameUuid: 'u8', filename: 'eight-from-summary.fits', source: 'run #9' });
+  });
+
+  it('takes a run in flight from the row marked reference', () => {
+    const d = detail([runRow(7, 'u7', 'registered'), runRow(8, 'u8', 'reference')], null);
+    expect(gridReference(null, d, frames)).toEqual({ frameUuid: 'u8', filename: 'eight.fits', source: 'run #9' });
+  });
+
+  it('is null with no pin and no run, or a run row without a uuid', () => {
+    expect(gridReference(null, null, frames)).toBeNull();
+    expect(gridReference(null, detail([runRow(8, null, 'reference')], null), frames)).toBeNull();
   });
 });
 

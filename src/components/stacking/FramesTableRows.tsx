@@ -11,7 +11,7 @@ import type { FrameGroupView, GroupHeaderInfo, GroupMode, OutlierFlags } from '.
 export type TableSortKey = SortKey | 'reference';
 
 type ColumnId =
-  | 'file' | 'publisher' | 'weight' | 'fwhm' | 'ecc' | 'seeds'
+  | 'file' | 'publisher' | 'focalLen' | 'weight' | 'fwhm' | 'ecc' | 'seeds'
   | 'regRms' | 'inliers' | 'model' | 'scale' | 'status' | 'reference';
 
 export interface FrameColumn {
@@ -24,6 +24,9 @@ export interface FrameColumn {
 
 const FILE: FrameColumn = { id: 'file', label: 'File', sortKey: 'filename' };
 const PUBLISHER: FrameColumn = { id: 'publisher', label: 'Publisher', sortKey: 'publisher' };
+const FOCAL_LEN: FrameColumn = {
+  id: 'focalLen', label: 'FL', sortKey: 'focalLenMm', numeric: true, title: 'Focal length the frame declares (FOCALLEN), mm',
+};
 const METRICS: FrameColumn[] = [
   { id: 'weight', label: 'Weight', sortKey: 'weight', numeric: true },
   { id: 'fwhm', label: 'FWHM', sortKey: 'fwhmPx', numeric: true },
@@ -44,7 +47,9 @@ const TAIL: FrameColumn[] = [
 
 /** The table's columns after the selection checkbox: Publisher for a project, the registration columns on demand. */
 export function frameColumns(isProject: boolean, registration: boolean): FrameColumn[] {
-  return [FILE, ...(isProject ? [PUBLISHER] : []), ...METRICS, ...(registration ? REGISTRATION : []), ...TAIL];
+  return [
+    FILE, ...(isProject ? [PUBLISHER] : []), FOCAL_LEN, ...METRICS, ...(registration ? REGISTRATION : []), ...TAIL,
+  ];
 }
 
 /** `sortRows`, plus the Reference column: the pinned row first (last when descending), the rest in their order. */
@@ -65,7 +70,10 @@ const CHIP = 'inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold';
 /** Same muted-chip tokens `ProvenanceModal.tsx` uses for its own "off" state. */
 const WCS_CHIP = 'bg-surface-hover text-content-muted';
 const OUTLIER_CELL = 'bg-warning-muted text-warning';
-const TD = 'py-1.5 px-2';
+/** Cells never wrap: the table is as wide as its content (`FramesTable`), so a column is as wide as its widest value. */
+const TD = 'py-1.5 px-3 whitespace-nowrap';
+/** The widest the File column grows; a longer name ends in an ellipsis and shows whole in the tooltip. */
+const FILE_MAX = 'max-w-[24rem]';
 
 function fmtNum(n: number | null, digits: number, suffix = ''): string {
   return n == null ? '—' : `${n.toFixed(digits)}${suffix}`;
@@ -169,15 +177,16 @@ export function FrameTableRow({
     switch (c.id) {
       case 'file':
         return (
+          // A table cell ignores `max-width`; the caps sit on the blocks inside it.
           <td
             key={c.id}
             data-col="file"
-            className={`${TD} text-content font-mono truncate max-w-[220px]`}
+            className={`${TD} text-content font-mono`}
             title={groupContext === null ? row.filename : `${row.filename} · ${groupContext}`}
           >
-            {row.filename}
+            <div className={`truncate ${FILE_MAX}`}>{row.filename}</div>
             {row.unavailable && (
-              <div className="text-[10px] text-warning truncate" title={row.unavailable}>
+              <div className={`text-[10px] text-warning truncate ${FILE_MAX}`} title={row.unavailable}>
                 {row.unavailable}
               </div>
             )}
@@ -185,10 +194,12 @@ export function FrameTableRow({
         );
       case 'publisher':
         return (
-          <td key={c.id} className={`${TD} text-content-secondary truncate max-w-[140px]`} title={row.publisher ?? undefined}>
-            {row.publisher ?? '—'}
+          <td key={c.id} className={`${TD} text-content-secondary`} title={row.publisher ?? undefined}>
+            <div className="truncate max-w-[10rem]">{row.publisher ?? '—'}</div>
           </td>
         );
+      case 'focalLen':
+        return <td key={c.id} className={`${TD} text-content-secondary tabular-nums`}>{fmtNum(row.focalLenMm, 0, ' mm')}</td>;
       case 'weight':
         return <td key={c.id} className={`${TD} text-content-secondary tabular-nums`}>{fmtNum(row.weight, 3)}</td>;
       case 'fwhm':

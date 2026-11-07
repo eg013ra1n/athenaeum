@@ -41,7 +41,7 @@ const byKey = (rows: FrameRow[], key: string) => {
 };
 
 const light = (frameId: number, filename: string, over: Partial<LightFrameRef> = {}): LightFrameRef => ({
-  frameId, filename, night: null, exptimeSec: null, ...over,
+  frameId, filename, night: null, exptimeSec: null, focalLenMm: null, ...over,
 });
 
 describe('buildProjectFrameRows', () => {
@@ -143,7 +143,7 @@ describe('buildProjectFrameRows', () => {
     const gone = byKey(rows, 'gone');
     expect(gone).toMatchObject({
       filename: 'from-summary.fits', publisher: null, groupKey: 'L-mono', editable: false, pinnable: false,
-      pinned: false, unavailable: null, fwhmPx: 2.5, night: null, exptimeSec: null,
+      pinned: false, unavailable: null, fwhmPx: 2.5, night: null, exptimeSec: null, focalLenMm: null,
     });
     // It never takes a plan row's uuid, nor lends its numbers to one.
     expect(rows.filter((r) => r.key !== 'gone').every((r) => r.fwhmPx === null)).toBe(true);

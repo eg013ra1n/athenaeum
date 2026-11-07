@@ -749,3 +749,17 @@ pub async fn get_collab_frame_image(
     .await
     .map(tauri::ipc::Response::new)
 }
+
+/// Blink's star overlay for one project frame: the file Blink shows for it,
+/// analysed on demand (a project frame has no catalog frame to store it on).
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_collab_frame_star_metrics(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame: athenaeum_core::api::collab_blink::CollabFrameRef,
+) -> Result<athenaeum_core::models::StarMetricsResponse, String> {
+    athenaeum_core::api::analysis::get_collab_frame_star_metrics(&state.ctx, &project_id, &frame)
+        .await
+        .map_err(|e| e.to_string())
+}

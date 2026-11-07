@@ -681,6 +681,45 @@ mod tests {
         assert_eq!(p, std::path::PathBuf::from(landed));
     }
 
+    /// Blink's stars for a project frame (no catalog frame behind it): the file Blink shows, analysed on demand.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replicas_stars_are_measured_on_demand_and_nothing_is_stored() {
+        let rig = crate::api::collab_live::test_support::landed_rig(1).await;
+        let (pid, uuid, landed) = rig.frames[0].clone();
+        // A calibrated replica is float, 0..1.
+        let (data, w, h) = crate::test_support::fixture_field(7, 1.0, 0.002);
+        crate::fits_writer::write_fits_f32(std::path::Path::new(&landed), w, h, 1, &data, &[]).unwrap();
+        let r = CollabFrameRef {
+            frame_id: None,
+            frame_uuid: Some(uuid),
+        };
+        let m = crate::api::analysis::get_collab_frame_star_metrics(&rig.ctx, &pid, &r)
+            .await
+            .expect("the replica is analysed on demand");
+        assert_eq!((m.image_width as usize, m.image_height as usize), (w, h));
+        assert!(!m.stars.is_empty(), "the replica's stars were measured");
+        let stored: i64 = crate::api::db(&rig.ctx)
+            .unwrap()
+            .conn()
+            .query_row("SELECT count(*) FROM frame_analysis", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, 0, "a project frame is no catalog frame: nothing is stored");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stars_of_a_frame_the_project_does_not_hold_are_not_found() {
+        let rig = crate::api::collab_live::test_support::landed_rig(1).await;
+        let (pid, _, _) = rig.frames[0].clone();
+        let r = CollabFrameRef {
+            frame_id: None,
+            frame_uuid: Some("no-such-uuid".into()),
+        };
+        let err = crate::api::analysis::get_collab_frame_star_metrics(&rig.ctx, &pid, &r)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+    }
+
     #[tokio::test]
     async fn a_replica_entry_carries_manifest_metadata_and_a_synthetic_file() {
         let rig = crate::api::collab_live::test_support::landed_rig(1).await;

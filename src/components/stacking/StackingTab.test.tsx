@@ -102,8 +102,8 @@ const RUN = {
 };
 
 const FRAMES: LightFrameRef[] = [
-  { frameId: 101, filename: 'a.fit', night: null, exptimeSec: null },
-  { frameId: 102, filename: 'b.fit', night: null, exptimeSec: null },
+  { frameId: 101, filename: 'a.fit', night: null, exptimeSec: null, focalLenMm: null },
+  { frameId: 102, filename: 'b.fit', night: null, exptimeSec: null, focalLenMm: null },
 ];
 
 const PROJECT_CONFIG = {
@@ -427,7 +427,7 @@ describe('StackingTab Frames table before the first run', () => {
 describe('StackingTab Frames table writes for a frame set', () => {
   const MANUAL = { ...CONFIG, reference: { mode: 'manual', twoPass: false } };
   const AUTO = { ...CONFIG, reference: { mode: 'auto', twoPass: false } };
-  const THREE: LightFrameRef[] = [...FRAMES, { frameId: 103, filename: 'c.fit', night: null, exptimeSec: null }];
+  const THREE: LightFrameRef[] = [...FRAMES, { frameId: 103, filename: 'c.fit', night: null, exptimeSec: null, focalLenMm: null }];
 
   /** A frame set whose stored config is in `mode` and whose backend holds the reference frame `held`: the plan it
    *  builds reports what is held (whatever the mode, so the tab's own reading of the mode is what is tested). */
@@ -760,15 +760,15 @@ const SET_COMMANDS = [
 /** A project's plan rows: usable with a WCS, usable without one, and not on this device. */
 const PROJECT_FRAMES = [
   {
-    handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice', filterCanonical: 'L', exptimeSec: 300,
+    handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice', filterCanonical: 'L', exptimeSec: 300, focalLenMm: null,
     colorMode: 'mono', hasWcs: true, onDisk: true, reason: null,
   },
   {
-    handle: 2, frameUuid: 'u2', fileName: 'b.fits', publisher: 'Bob', filterCanonical: 'L', exptimeSec: 300,
+    handle: 2, frameUuid: 'u2', fileName: 'b.fits', publisher: 'Bob', filterCanonical: 'L', exptimeSec: 300, focalLenMm: null,
     colorMode: 'mono', hasWcs: false, onDisk: true, reason: null,
   },
   {
-    handle: null, frameUuid: 'u3', fileName: 'c.fits', publisher: 'Bob', filterCanonical: 'L', exptimeSec: 300,
+    handle: null, frameUuid: 'u3', fileName: 'c.fits', publisher: 'Bob', filterCanonical: 'L', exptimeSec: 300, focalLenMm: null,
     colorMode: 'mono', hasWcs: true, onDisk: false, reason: 'not on this device',
   },
 ];

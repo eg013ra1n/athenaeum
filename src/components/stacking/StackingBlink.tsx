@@ -79,11 +79,14 @@ async function loadProjectEntries(projectId: string, rows: FrameRow[]): Promise<
   const resolved = askable.flatMap((row) => {
     const e = byKey.get(row.key);
     if (!e) return [];
+    const ref = { frameId: null, frameUuid: row.key };
     const entry: BlinkFrame = {
       ...e.entry,
       key: e.key,
       source: e.source,
-      imageRef: e.source === 'raw' ? undefined : { projectId, frame: { frameId: null, frameUuid: row.key } },
+      imageRef: e.source === 'raw' ? undefined : { projectId, frame: ref },
+      // An entry asked for by uuid has no catalog frame id: its stars load by this ref, whatever its source.
+      starsRef: { projectId, frame: ref },
     };
     return [{ row, entry }];
   });

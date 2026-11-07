@@ -1,6 +1,7 @@
-// The two-line reference strip above the Frames table (spec §6.5). Line 1 names the frame the selected run registered
-// onto; line 2 names the reference the next run will use. Both come from data the caller already holds, so the strip
-// needs no request of its own.
+// The reference strip above the Frames table (spec §6.5), two labelled rows: the frame the selected run aligned every
+// other frame onto, with its group, weight, how it was chosen and a second-pass move each on a line of their own; then
+// the frame the next run will align onto. Both come from data the caller already holds, so the strip needs no request
+// of its own.
 import { useMemo, type ReactNode } from 'react';
 import { Star, XCircle } from 'lucide-react';
 import type { PlanReference, StackingRunDetail } from '../../types/stacking';
@@ -36,17 +37,46 @@ function isNativeGeometry(summaryGeometry: string | null, configJson: string): b
   }
 }
 
-const FileName = ({ name }: { name: string }) => <span className="font-mono">{name}</span>;
+const FileName = ({ name }: { name: string }) => <span className="font-mono text-content">{name}</span>;
 
-/** The parts of line 1 after the run id, in order; `null` for a run with no reference to name. */
-function runLineParts(
+/** How a reference was chosen, in words: the run's and the plan's `auto` / `manual`. */
+const howChosen = (mode: string) => (mode === 'manual' ? 'pinned by hand' : 'chosen automatically');
+
+/** A value inside a sentence of the strip, set apart from the words around it. */
+const Value = ({ children }: { children: ReactNode }) => <span className="text-content">{children}</span>;
+
+/** What the selected run aligned onto, split into the strip's lines. */
+interface RunReference {
+  /** The frame, or why none is named. */
+  frame: ReactNode;
+  /** The second line, a sentence about the frame: the group it is in, its weight, how it was chosen. */
+  about: ReactNode;
+  /** The frame the second pass moved the reference away from; `null` when it did not move it. */
+  movedFrom: string | null;
+}
+
+/** "This frame is in group <g>, weight <w>, chosen automatically", with whichever of the group and the weight are
+ *  known; a reference with no frame named gets only how it is chosen. The group's own title keeps its `·`, so the
+ *  sentence separates its facts with commas. */
+function aboutTheFrame(named: boolean, group: string | null, weight: number | null, how: string): ReactNode {
+  if (!named) return how;
+  const w = weight === null ? null : <Value>{weight.toFixed(3)}</Value>;
+  if (group !== null) {
+    return (
+      <>
+        This frame is in group <Value>{group}</Value>
+        {w !== null && <>, weight {w}</>}, {how}
+      </>
+    );
+  }
+  return w === null ? `This frame was ${how}` : <>This frame has weight {w}, {how}</>;
+}
+
+function runReference(
   runDetail: StackingRunDetail,
-  nativeGeometry: boolean,
   groupLabel: (groupKey: string) => string,
   filenameOf: (runFrameId: number) => string | null,
-): ReactNode[] {
-  if (nativeGeometry) return ['per group'];
-
+): RunReference {
   const { summary, groups, frames, run } = runDetail;
   const reference = summary?.reference ?? null;
   // A finished run names its reference in the summary; a run still in flight only has the row marked `reference`.
@@ -63,23 +93,37 @@ function runLineParts(
 
   // No reference named: a run still going has not picked one yet; a run that has ended never will.
   const notNamed = reference === null && !TERMINAL_STATUSES.includes(run.status) ? 'not picked yet' : 'not recorded';
-  const parts: ReactNode[] = [fileName === null ? notNamed : <FileName key="file" name={fileName} />];
-  if (groupKey !== undefined) parts.push(groupLabel(groupKey));
-  if (reference?.weight != null) parts.push(`weight ${reference.weight.toFixed(3)}`);
-  parts.push(reference?.mode ?? run.referenceMode);
-  if (reference?.switchedFrom != null) {
-    const previous = filenameOf(reference.switchedFrom);
-    parts.push(
-      <span key="switched">
-        two-pass moved it from {previous === null ? `#${reference.switchedFrom}` : <FileName name={previous} />}
-      </span>,
-    );
-  }
-  return parts;
+  const switchedFrom = reference?.switchedFrom ?? null;
+  return {
+    frame: fileName === null ? notNamed : <FileName name={fileName} />,
+    about: aboutTheFrame(
+      fileName !== null,
+      groupKey === undefined ? null : groupLabel(groupKey),
+      reference?.weight ?? null,
+      howChosen(reference?.mode ?? run.referenceMode),
+    ),
+    movedFrom: switchedFrom === null ? null : (filenameOf(switchedFrom) ?? `#${switchedFrom}`),
+  };
 }
 
-const joined = (parts: ReactNode[]): ReactNode[] =>
-  parts.flatMap((part, i) => (i === 0 ? [part] : [SEP, part]));
+/** One labelled row of the strip; `display: contents` keeps the label and the value in the strip's two columns. */
+function Row({ testId, label, title, icon, children }: {
+  testId: string;
+  label: string;
+  title: string;
+  icon: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div data-testid={testId} className="contents">
+      <dt className="self-start flex items-center gap-1.5 text-content-muted whitespace-nowrap" title={title}>
+        <span className="w-3 shrink-0" aria-hidden="true">{icon}</span>
+        {label}
+      </dt>
+      <dd className="m-0 min-w-0 space-y-0.5 break-words text-content-muted">{children}</dd>
+    </div>
+  );
+}
 
 export function FramesReferenceStrip({ runDetail, planReference, groupLabel, filenameOf }: FramesReferenceStripProps) {
   const summaryGeometry = runDetail?.summary?.config.registration.geometry ?? null;
@@ -101,37 +145,60 @@ export function FramesReferenceStrip({ runDetail, planReference, groupLabel, fil
       ? OFF_DISK_TITLE
       : null;
 
+  const run = runDetail === null || nativeGeometry ? null : runReference(runDetail, groupLabel, filenameOf);
+
   return (
-    <div className="bg-surface-hover/40 rounded-lg px-3 py-2 text-xs space-y-1">
+    <dl className="bg-surface-hover/40 rounded-lg px-3 py-2 text-xs m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5">
       {runDetail !== null && (
-        <div data-testid="reference-line-run" className="flex items-center gap-1.5 text-content">
-          <Star size={12} className="shrink-0 text-accent" aria-hidden="true" />
-          <span className="min-w-0 break-words">
-            Registration reference, run #{runDetail.run.id}:{' '}
-            {joined(runLineParts(runDetail, nativeGeometry, groupLabel, filenameOf))}
-          </span>
-        </div>
-      )}
-      <div data-testid="reference-line-next" className="flex items-center gap-1.5 text-content-muted">
-        {runDetail !== null && <span className="w-3 shrink-0" aria-hidden="true" />}
-        <span className="min-w-0 break-words">
-          {nextWithoutFrame ? (
-            'Next run: manual, no frame chosen'
-          ) : nextFile === null ? (
-            'Next run: auto, picked at run time'
+        <Row
+          testId="reference-line-run"
+          label={`Run #${runDetail.run.id} aligned onto`}
+          title={`The registration reference: every frame of run #${runDetail.run.id} was aligned onto it`}
+          icon={<Star size={12} className="text-accent" />}
+        >
+          {run === null ? (
+            <div className="text-content">each group&rsquo;s own frame, named in its header</div>
           ) : (
             <>
-              Next run: <FileName name={nextFile} />
-              {SEP}manual
+              <div>{run.frame}</div>
+              <div>{run.about}</div>
+              {run.movedFrom !== null && (
+                <div>
+                  The second pass moved it here from <FileName name={run.movedFrom} />, which sat further from the
+                  median framing
+                </div>
+              )}
             </>
           )}
-        </span>
-        {markLabel !== null && (
-          <span title={markLabel} role="img" aria-label={markLabel} className="shrink-0 text-error">
-            <XCircle size={12} aria-hidden="true" />
+        </Row>
+      )}
+      <Row
+        testId="reference-line-next"
+        label="Next run aligns onto"
+        title="The frame the next run will align every frame onto"
+        icon={null}
+      >
+        <div className="flex items-center gap-1.5">
+          <span className="min-w-0">
+            {nextWithoutFrame ? (
+              'a frame pinned by hand, but none is chosen'
+            ) : nextFile === null ? (
+              'a frame it picks automatically when it starts'
+            ) : (
+              <>
+                <FileName name={nextFile} />
+                {SEP}
+                {howChosen('manual')}
+              </>
+            )}
           </span>
-        )}
-      </div>
-    </div>
+          {markLabel !== null && (
+            <span title={markLabel} role="img" aria-label={markLabel} className="shrink-0 text-error">
+              <XCircle size={12} aria-hidden="true" />
+            </span>
+          )}
+        </div>
+      </Row>
+    </dl>
   );
 }

@@ -28,6 +28,7 @@ import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 import { EmptyState } from '../ui/EmptyState';
 import { ResultsPanel } from './ResultsPanel';
 import { GridCard } from './GridCard';
+import { gridReference } from './GridSchematic';
 import { boardMode, stableStringify, stageLabel, withoutPaths, type BoardStage } from './stageSummary';
 import {
   readSelectedStage,
@@ -1284,7 +1285,12 @@ export function StackingTab({ subject, onReferenceChanged }: StackingTabProps) {
           {/* A project's canonical grid is the registration target of every run: it sits above the board whose
               Register row it unblocks. A frame set has none. */}
           {subject.kind === 'project' && plan.grid && (
-            <GridCard projectId={subject.projectId} grid={plan.grid} onSaved={handleGridSaved} />
+            <GridCard
+              projectId={subject.projectId}
+              grid={plan.grid}
+              reference={gridReference(pinnedReference, selectedRunDetail, plan.projectFrames)}
+              onSaved={handleGridSaved}
+            />
           )}
           {nothingToStack ? (
             <div className="bg-surface-elevated rounded-lg px-4 py-2">

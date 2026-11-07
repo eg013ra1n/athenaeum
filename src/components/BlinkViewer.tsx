@@ -13,7 +13,7 @@ import { DEFAULT_ANNOTATION_SETTINGS } from "../types/helpers";
 import { ToolBar, FrameList, FrameInfoPanel } from "./blink";
 import { fetchAndComposeFlatContour, loadFlatContourOpts } from "./blink/flatContour";
 import { useBlinkCache } from "../hooks/useBlinkCache";
-import { useStarMetricsCache } from "../hooks/useStarMetricsCache";
+import { useStarMetricsCache, type StarSource } from "../hooks/useStarMetricsCache";
 import { drawStarOverlay } from "./blink/StarOverlay";
 import { Chip } from "./ui";
 import { isTopOverlay, popOverlay, pushOverlay } from "./ui/overlayStack";
@@ -244,7 +244,11 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const currentFrame = fitsFrames[currentIndex];
   const cur = currentFrame ? view(currentFrame) : undefined;
 
-  const frameIds = useMemo(() => fitsFrames.map(f => f.frame?.id ?? 0), [fitsFrames]);
+  // A catalog frame's stars come by its id; a project frame (no catalog id) brings its own ref.
+  const starSources = useMemo<StarSource[]>(
+    () => fitsFrames.map(f => (f.frame?.id ? { frameId: f.frame.id } : (f.starsRef ?? null))),
+    [fitsFrames],
+  );
 
   // The switch exists only when some entry has an aligned frame; its title names that entry's run.
   const alignedRunId = useMemo(() => {
@@ -261,7 +265,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   showAnnotationsRef.current = starsOn;
 
   const { getMetrics: getStarMetrics } = useStarMetricsCache({
-    frameIds,
+    sources: starSources,
     currentIndex,
     enabled: starsOn,
   });

@@ -128,7 +128,9 @@ function stackingHandlers({ projectId, card, nameOf, acc }) {
   }));
   const projectFrames = frames.map((f) => ({
     handle: f.flag === 'offDevice' ? null : 100 + f.i, frameUuid: f.uuid, fileName: f.fileName, publisher: f.publisher, filterCanonical: f.filter,
-    exptimeSec: f.exp, colorMode: f.colorMode, hasWcs: f.centre !== null, onDisk: f.flag !== 'offDevice',
+    // Two rigs: a 530 mm refractor on the mono camera, a 400 mm one on the OSC; the frames without a WCS declare none.
+    exptimeSec: f.exp, colorMode: f.colorMode, focalLenMm: f.centre === null ? null : f.colorMode === 'osc' ? 400 : 530,
+    hasWcs: f.centre !== null, onDisk: f.flag !== 'offDevice',
     reason: f.flag === 'offDevice' ? 'not on this device' : f.flag === 'unsupported' ? 'unsupported file: tile-compressed FITS' : null,
   }));
   const group = (filter, cameras, anchor, scale, source) => {
@@ -136,7 +138,8 @@ function stackingHandlers({ projectId, card, nameOf, acc }) {
     const members = usable.filter((f) => f.filter === filter);
     return {
       key: `${colorMode}__${filter}__st${exp}`, instrume: null, colorMode, filter, binning: 1, cameras,
-      exposureS: exp, exposureClass: `st${exp}`, frameCount: members.length, includedCount: members.length,
+      exposureS: exp, exposureClass: `st${exp}`, frameCount: members.length, memberFrameIds: members.map((f) => 100 + f.i),
+      includedCount: members.length,
       totalExposureS: members.length * exp, calibratedCached: 0, metricsCached: 0, fitsCached: 0, lnCached: 0,
       lnScalePx: null, lnScaleEstimated: false, lnWidth: null, lnHeight: null, anchorWidth: anchor[0], anchorHeight: anchor[1],
       pixelScaleArcsec: scale, scaleRatioToReference: null, scaleSource: source,
@@ -169,11 +172,37 @@ function stackingHandlers({ projectId, card, nameOf, acc }) {
     projectFrames, prepare: { inPlace: 9, debayered: 0, converted: 1, unsupported: 1, atRun: 0 },
   };
   const projectConfig = { config: seed, excludedFrameUuids: [], referenceFrameUuid: null, isDefault: true, updatedAt: null };
+  // One finished run, #9, for the reference strip and the gold outline: its auto pick was row 0 (the best weight), and
+  // the second pass moved it to row 1. Its groups and frames are the usable ten; it wrote no master.
+  const runId = 9;
+  const runGroups = groups.map((g, i) => ({
+    id: i + 1, runId, groupKey: g.key, instrume: null, colorMode: g.colorMode, filter: g.filter, binning: 1,
+    width: g.anchorWidth, height: g.anchorHeight, exposure: g.exposureS, frameCount: g.frameCount, includedCount: g.includedCount,
+  }));
+  const runFrames = usable.map((f, i) => ({
+    id: i + 1, runId, groupId: runGroups.find((g) => g.groupKey === groups.find((pg) => pg.filter === f.filter).key).id,
+    frameId: 100 + f.i, included: true, exclusionReason: null, weight: 0.9, weightChannelsJson: null, metricsJson: null,
+    regStatus: f.i === 1 ? 'reference' : 'ok', regModel: 'homography', regRmsPx: 0.21, regInliers: 400, regInlierRatio: 0.9,
+    regFlipped: false, rejectedFraction: 0.02, frameUuid: f.uuid,
+  }));
+  const runRow = {
+    id: runId, framesSetId: null, projectId, status: 'done', startedAt: '2026-11-06T09:03:59', finishedAt: '2026-11-06T09:41:12',
+    configJson: JSON.stringify(seed), configHash: 'harness-stacking', referenceFrameId: 101, referenceMode: 'auto',
+    workingDir: '/Volumes/Astro/Stacking/work', outputDir: '/Volumes/Astro/Stacking/out', summaryJson: null, error: null,
+  };
+  const runDetail = {
+    run: runRow, groups: runGroups, frames: runFrames,
+    summary: {
+      config: seed, grid: proposal, groups: [], stages: [],
+      reference: { frameId: 101, filename: frames[1].fileName, mode: 'auto', weight: 0.932, switchedFrom: 100 },
+    },
+  };
   const path = (dir) => ({ configured: null, effective: dir, default: dir, restartRequired: false });
   return {
     get_project_stacking_plan: () => plan,
     get_project_stacking_config: () => projectConfig,
-    get_project_stacking_runs: () => [],
+    get_project_stacking_runs: () => [{ run: runRow, groupCount: runGroups.length, masterPaths: [] }],
+    get_stacking_run: () => runDetail,
     get_project_stacking_work_usage: () => ({
       calibratedBytes: 0, registeredBytes: 0, lnBytes: 0, fitsBytes: 0, measuredBytes: 0, runsBytes: 0, rejBytes: 0, previewsBytes: 0, totalBytes: 0,
     }),

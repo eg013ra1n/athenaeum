@@ -38,6 +38,7 @@ function row(
     groupKey: null,
     night: null,
     exptimeSec: null,
+    focalLenMm: null,
     weight: null,
     fwhmPx: null,
     eccentricity: null,

@@ -87,6 +87,8 @@ export default function ProjectBlink({ projectId, table, vms, lookup, canModerat
       key: e.key,
       source: e.source,
       imageRef: e.source === 'raw' ? undefined : { projectId, frame: ref },
+      // Used only by an entry with no catalog frame id (a replica, asked for by uuid).
+      starsRef: { projectId, frame: ref },
       badge: vm ? blinkBadge(vm) : undefined,
     };
   }), [rows, lookup, projectId]);

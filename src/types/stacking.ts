@@ -412,7 +412,7 @@ export type PlanGrid = { state: GridState, current: CanonicalGrid | null, propos
 
 export type PlanPrepare = { inPlace: number, debayered: number, converted: number, unsupported: number, atRun: number, };
 
-export type PlanProjectFrame = { handle: number | null, frameUuid: string, fileName: string, publisher: string, filterCanonical: string, exptimeSec: number, colorMode: ColorMode, hasWcs: boolean, onDisk: boolean, reason: string | null, };
+export type PlanProjectFrame = { handle: number | null, frameUuid: string, fileName: string, publisher: string, filterCanonical: string, exptimeSec: number, colorMode: ColorMode, focalLenMm: number | null, hasWcs: boolean, onDisk: boolean, reason: string | null, };
 
 export type StackingPlan = { setId: number | null, projectId: string | null, setName: string, config: StackingConfig, configHash: string, groups: Array<PlanGroup>, blockers: Array<PlanBlocker>, warnings: Array<string>, readiness: ExportReadiness, 
 /**
