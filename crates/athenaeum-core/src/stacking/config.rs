@@ -1037,8 +1037,17 @@ fn measurement_subtree_with_measure_version(
     cfg: &StackingConfig,
     measure_version: u32,
 ) -> serde_json::Value {
+    // Spec 2026-11-08 §5.4: the weights are computed in every run from the stored measurements (`run.rs`
+    // `stage_measure_with`, `compute_weights`) and no fit reads `weightMode`, `formula` or `keyword`, so they are
+    // written as the shipped defaults: changing the weighting must not re-measure. A set with default weights keeps
+    // its hash byte for byte.
+    let defaults = MeasurementConfig::default();
+    let mut measurement = cfg.measurement.clone();
+    measurement.weight_mode = defaults.weight_mode;
+    measurement.formula = defaults.formula;
+    measurement.keyword = defaults.keyword;
     serde_json::json!({
-        "measurement": cfg.measurement,
+        "measurement": measurement,
         "normalization": { "scaleEstimator": cfg.normalization.scale_estimator },
         "measureVersion": measure_version,
     })
@@ -1394,6 +1403,38 @@ mod tests {
             stage_hash(&calibration_subtree(&cfg), &[], &[]),
             stage_hash(&calibration_subtree(&other), &[], &[]),
         );
+    }
+
+    /// Spec 2026-11-08 §5.4: the weights are computed every run from stored
+    /// measurements and no fit reads the weight fields, so changing them
+    /// must not re-measure; a field a fit does read still moves the hash.
+    #[test]
+    fn measurement_hash_ignores_the_weight_settings() {
+        let default = StackingConfig::default();
+        let h = |c: &StackingConfig| stage_hash(&measurement_subtree(c), &[], &[]);
+        let base = h(&default);
+
+        let mut noise = default.clone();
+        noise.measurement.weight_mode = WeightMode::Noise;
+        assert_eq!(h(&noise), base, "weightMode Noise must not move it");
+
+        let mut formula = default.clone();
+        formula.measurement.weight_mode = WeightMode::Formula;
+        formula.measurement.formula.fwhm = 40.0;
+        assert_eq!(h(&formula), base, "weightMode Formula and formula.fwhm must not move it");
+
+        let mut keyword = default.clone();
+        keyword.measurement.weight_mode = WeightMode::Keyword;
+        keyword.measurement.keyword = "WEIGHT".to_string();
+        assert_eq!(h(&keyword), base, "weightMode Keyword and its keyword must not move it");
+
+        let mut max_stars = default.clone();
+        max_stars.measurement.max_stars += 1;
+        assert_ne!(h(&max_stars), base, "maxStars still moves it");
+
+        let mut seed = default.clone();
+        seed.measurement.seed_threshold += 1.0;
+        assert_ne!(h(&seed), base, "seedThreshold still moves it");
     }
 
     /// Spec 2026-11-08 §5.2: the grouping tolerance decides which frames share
