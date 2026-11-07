@@ -132,7 +132,7 @@ pub struct GroupingConfig {
     /// [`resolve_config`] — never trusted raw from a stored document.
     pub exposure_tolerance_sec: f64,
     // How exposure classes are formed (spec 2026-10-02 §8). Enters no stage
-    // hash: `calibration_subtree` writes only `exposureToleranceSec`.
+    // hash: `calibration_subtree` writes a constant tolerance.
     pub exposure_mode: ExposureMode,
     // The class width of `stops` / `equivalent`, in stops. Clamped to
     // `MIN_STOPS_WIDTH` by `resolve_config`.
@@ -971,9 +971,16 @@ pub fn prepare_subtree(cfg: &StackingConfig) -> serde_json::Value {
     })
 }
 
+/// The `grouping.exposureToleranceSec` value [`calibration_subtree`] writes, whatever the config says (spec
+/// 2026-11-08 §5.2). It holds the hash shape — a set at the shipped default tolerance keeps a byte-identical hash —
+/// and says nothing about the run: the tolerance decides which frames share a group, never what a calibrated frame
+/// contains.
+pub const CALIBRATION_HASH_GROUPING_TOLERANCE_SEC: f64 = 2.0;
+
 /// Stage 1 (calibration) config subtree (spec §9.3): the frame's
-/// calibration options plus the grouping rule that decided which frames
-/// share a group.
+/// calibration options plus the grouping key's shape, written as the
+/// constant [`CALIBRATION_HASH_GROUPING_TOLERANCE_SEC`] (not the config's
+/// tolerance).
 pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     // `calibration.format` (the XISF plan, 2026-09-18, ruling R6) is the
     // container an EXPORT or a SEND writes; the run forces FITS for its own
@@ -994,7 +1001,7 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     // `stage_hashes_are_pinned_to_golden_literals`.
     serde_json::json!({
         "calibration": calibration,
-        "grouping": { "exposureToleranceSec": cfg.grouping.exposure_tolerance_sec },
+        "grouping": { "exposureToleranceSec": CALIBRATION_HASH_GROUPING_TOLERANCE_SEC },
     })
 }
 
@@ -1387,6 +1394,21 @@ mod tests {
             stage_hash(&calibration_subtree(&cfg), &[], &[]),
             stage_hash(&calibration_subtree(&other), &[], &[]),
         );
+    }
+
+    /// Spec 2026-11-08 §5.2: the grouping tolerance decides which frames share
+    /// a group, never what a calibrated frame contains; a set at another
+    /// tolerance or exposure mode keeps its calibration hash.
+    #[test]
+    fn calibration_hash_ignores_the_grouping_tolerance() {
+        let default = StackingConfig::default();
+        let mut wide = default.clone();
+        wide.grouping.exposure_tolerance_sec = 200.0;
+        let mut stops = default.clone();
+        stops.grouping.exposure_mode = ExposureMode::Stops;
+        let h = |c: &StackingConfig| stage_hash(&calibration_subtree(c), &["m"], &[]);
+        assert_eq!(h(&default), h(&wide), "a wider tolerance must not move it");
+        assert_eq!(h(&default), h(&stops), "the exposure mode must not move it");
     }
 
     /// Ruling R-M4c-8's own "the `.athln` config hash folds `localScale`

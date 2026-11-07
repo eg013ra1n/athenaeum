@@ -8998,13 +8998,14 @@ mod tests {
         // 2026-11-02 Plan D D2c r1 (review M1 of D2b): FITS_ARTIFACT_VERSION 3 folded into meas (the measurement subtree, beside MEASURE_VERSION) - meas, reg and ln move on every line (was meas=326ee3f03ffce101 on the default line); calib is UNCHANGED, and ln_ref and ln_cal too (this golden feeds them no measurement hash).
         // 2026-11-02 Plan D DF-a (main merged into plan-d): both sides moved the normalization hashes, so the merged ln_ref, ln and ln_cal are re-recorded on default, maximumQuality and custom (MEASURE_VERSION 8 AND the `local` rejection default move ln_ref, ln and ln_cal; FITS_ARTIFACT_VERSION 3 moves meas, reg and ln only, as the D2c r1 line above says); calib, meas and reg are Plan D's (pcores moves none of them), and the fastPreview line is Plan D's (it pins `scaleZeroOffset`, so only Plan D moved it).
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1 joins the registration subtree): reg and ln move on every line, the fastPreview line included (was default reg=efe8758fbdc4bbbd ln=532bfea1cac2d7b4; fastPreview reg=a038dcae26c2392a ln=4110659e2116091d; maximumQuality reg=bc4925cc6681db3a ln=b88fd0bd410fb46c; custom reg=916582f203cecefc ln=88cef42f95ee4e58); calib, meas, ln_ref and ln_cal are UNCHANGED (ln_ref's call passes the literals "r1,r2" / "m1,m2" and ln_cal folds ln_ref, so neither reads reg).
+        // 2026-11-08 frame-level cache Task 1 (spec §5.2): the calibration hash writes a constant grouping tolerance (2.0), so the `custom` line (tolerance 5.0) moves calib, meas, reg and ln (was calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=be7daf8c36663781 ln=d182aadf14a27b04); every other line and ln_ref, ln_cal are UNCHANGED.
         assert_eq!(
             got,
             vec![
                 "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=511225ffae14780f ln_ref=782cf447acae6ace ln=eda6a3f8d83f669c ln_cal=23f55e28c19f3459",
                 "fastPreview: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=f7e86b4f84ea0e62 ln_ref=500204de9b22c23d ln=3212a35f2a771db1 ln_cal=1ed2edc9d7ff5dcb",
                 "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=cb8b5afc0aaeb3b4 ln_ref=364ed4c8ffba6878 ln=ec1a338d219d6364 ln_cal=86f453747dcafe8b",
-                "custom: calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=be7daf8c36663781 ln_ref=364ed4c8ffba6878 ln=d182aadf14a27b04 ln_cal=86f453747dcafe8b",
+                "custom: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=c93dfd9d2706c88a ln_ref=364ed4c8ffba6878 ln=0a21b864ed61cc65 ln_cal=86f453747dcafe8b",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
