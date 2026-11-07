@@ -167,6 +167,7 @@ function stackingHandlers({ projectId, card, nameOf, acc }) {
     staleStages: ['calibrate', 'measure', 'register'], activeRunId: null,
     grid: {
       state: 'proposed', current: null, proposal, framesInside: footprints.length, canEdit: true,
+      proposalRotation: { source: 'bestWeighted', fileName: frames[0].fileName },
       target: { raDeg: ra0, decDeg: dec0, radiusDeg: targetRadiusDeg }, footprints, framesNotDrawn: frames.length - footprints.length,
     },
     projectFrames, prepare: { inPlace: 9, debayered: 0, converted: 1, unsupported: 1, atRun: 0 },
