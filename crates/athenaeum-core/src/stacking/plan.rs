@@ -43,7 +43,7 @@ use crate::stacking::groups::{
 use crate::stacking::ln::SeedsCalibration;
 use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::origin::{origin_of, FrameOrigin, FrameOrigins};
-use crate::stacking::paths::{self, EstimateInputs};
+use crate::stacking::paths::{self, artifact_group_key, EstimateInputs};
 use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
@@ -1316,7 +1316,7 @@ pub(crate) fn store_registration(
                 &NewArtifact {
                     subject,
                     frame_id: Some(record.frame_id),
-                    group_key: "",
+                    group_key: artifact_group_key(REGISTRATION_ARTIFACT_KIND, ""),
                     kind: REGISTRATION_ARTIFACT_KIND,
                     path: None,
                     config_hash: record.config_hash.as_deref().unwrap_or_default(),
@@ -3639,8 +3639,14 @@ pub fn build_plan(
                 included_count += 1;
             }
 
-            let calib_artifact =
-                find_artifact(conn, subject, &g.key, "calibrated", Some(f.frame_id))?;
+            // Frame-level rows sit under the empty key (spec §5.1), so a regroup finds them.
+            let calib_artifact = find_artifact(
+                conn,
+                subject,
+                artifact_group_key("calibrated", &g.key),
+                "calibrated",
+                Some(f.frame_id),
+            )?;
             let metrics_artifact =
                 find_artifact(conn, subject, &g.key, "metrics", Some(f.frame_id))?;
 
@@ -3665,8 +3671,13 @@ pub fn build_plan(
             // the calibrated half already passed, so a group without Bayer
             // drizzle costs no extra query at all.
             let calib_fresh = if calib_fresh && group_wants_mosaic {
-                let mosaic_artifact =
-                    find_artifact(conn, subject, &g.key, "calibrated_mosaic", Some(f.frame_id))?;
+                let mosaic_artifact = find_artifact(
+                    conn,
+                    subject,
+                    artifact_group_key("calibrated_mosaic", &g.key),
+                    "calibrated_mosaic",
+                    Some(f.frame_id),
+                )?;
                 match (&mosaic_artifact, &current_calib_hash) {
                     (Some(row), Some(hash)) => is_fresh(row, hash),
                     _ => false,
@@ -6761,7 +6772,6 @@ mod tests {
         let cfg = StackingConfig::default();
         let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
         assert_eq!(groups.len(), 1);
-        let group_key = groups[0].key.clone();
         let frame = groups[0].frames[0].clone();
 
         let mut divisors = DivisorCache::new();
@@ -6773,7 +6783,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
-                group_key: &group_key,
+                group_key: "",
                 kind: "calibrated",
                 path: None,
                 config_hash: &hash,
@@ -6808,7 +6818,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
-                group_key: &group_key,
+                group_key: "",
                 kind: "calibrated",
                 path: Some(path.to_str().unwrap()),
                 config_hash: &hash,
@@ -6833,6 +6843,68 @@ mod tests {
             plan2.stale_stages
         );
         assert_eq!(plan2.groups[0].calibrated_cached, 0);
+    }
+
+    /// Frame-level cache spec §5.1: the plan gate reads `calibrated` rows under the empty key, so a regroup does not
+    /// make Calibrate stale.
+    #[test]
+    fn plan_gate_reads_calibrated_rows_under_the_empty_key() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let mut cfg_seconds = StackingConfig::default();
+        cfg_seconds.grouping.exposure_mode = crate::stacking::config::ExposureMode::Seconds;
+        let mut cfg_all = StackingConfig::default();
+        cfg_all.grouping.exposure_mode = crate::stacking::config::ExposureMode::NoSplit;
+        let groups_seconds = group_frames(&f.conn, f.set_id, &cfg_seconds.grouping).unwrap();
+        let groups_all = group_frames(&f.conn, f.set_id, &cfg_all.grouping).unwrap();
+        assert_ne!(groups_seconds[0].key, groups_all[0].key);
+
+        let mut divisors = DivisorCache::new();
+        for gf in &groups_seconds[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg_seconds, gf, &mut divisors).unwrap();
+            let cal_path = f.dir.path().join(format!("calibrated_{}.fits", gf.frame_id));
+            std::fs::write(&cal_path, [0u8]).unwrap();
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &StackSubject::FrameSet(f.set_id),
+                    frame_id: Some(gf.frame_id),
+                    group_key: artifact_group_key("calibrated", &groups_seconds[0].key),
+                    kind: "calibrated",
+                    path: Some(cal_path.to_str().unwrap()),
+                    config_hash: &hash,
+                    size: Some(1),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        for cfg in [cfg_seconds, cfg_all] {
+            let plan = build_plan(
+                &f.conn,
+                &settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(f.set_id),
+                Some(cfg),
+            )
+            .unwrap();
+            assert!(
+                !plan.stale_stages.contains(&Stage::Calibrate),
+                "{:?}",
+                plan.stale_stages
+            );
+            assert_eq!(plan.groups[0].calibrated_cached, plan.groups[0].frame_count);
+        }
     }
 
     /// Seed a `stacking_runs` row (a stand-in for "a previous run already
@@ -7144,7 +7216,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "calibrated",
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
@@ -7652,7 +7724,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "calibrated",
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
@@ -7922,7 +7994,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "calibrated",
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,

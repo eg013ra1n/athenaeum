@@ -159,6 +159,35 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
     out
 }
 
+/// The artifact kinds that belong to a FRAME, not to a group (frame-level cache spec §5.1): their rows carry
+/// `group_key = ""`, so a regroup (another tolerance, another split, a merge) finds them again. `fits.<plane>` kinds
+/// are frame-level too ([`is_frame_level_kind`]). Prepare writes `calibrated` / `calibrated_mosaic` as well; there is
+/// no `prepared` kind.
+pub const FRAME_LEVEL_KINDS: &[&str] = &[
+    "calibrated",
+    "calibrated_mosaic",
+    "measured",
+    "metrics",
+    "registered",
+    "registration",
+    "solve",
+];
+
+/// Whether `kind` is frame-level: one of [`FRAME_LEVEL_KINDS`] or a `fits.<plane>` kind.
+pub fn is_frame_level_kind(kind: &str) -> bool {
+    FRAME_LEVEL_KINDS.contains(&kind) || kind.starts_with("fits.")
+}
+
+/// The `group_key` a `stacking_artifacts` row of `kind` is stored and looked up under: `""` for a frame-level kind,
+/// the group's key otherwise. The one rule every `find_artifact` / `upsert_artifact` call site goes through.
+pub fn artifact_group_key<'a>(kind: &str, group_key: &'a str) -> &'a str {
+    if is_frame_level_kind(kind) {
+        ""
+    } else {
+        group_key
+    }
+}
+
 impl WorkingLayout {
     pub fn new(working_dir: &Path, set_slug: &str) -> Self {
         WorkingLayout {
@@ -220,10 +249,11 @@ impl WorkingLayout {
         self.root.join("runs")
     }
 
-    /// `root/calibrated/<group_key>` — stage-1 calibrated frames for one
-    /// integration group.
-    pub fn calibrated_dir(&self, group_key: &str) -> PathBuf {
-        self.calibrated_root().join(group_key)
+    /// `root/calibrated` — stage-1 calibrated frames. Flat (frame-level cache spec §5.1): a calibrated file belongs
+    /// to its frame, never to a group, so there is no group sub-folder. Rows written before that change keep their
+    /// stored `path` under `calibrated/<group_key>/`; readers open the row's path.
+    pub fn calibrated_dir(&self) -> PathBuf {
+        self.calibrated_root()
     }
 
     /// `root/prepared` — Prepare's converted and debayered copies (plan
@@ -233,9 +263,9 @@ impl WorkingLayout {
         self.root.join("prepared")
     }
 
-    /// `root/prepared/<group_key>`.
-    pub fn prepared_dir(&self, group_key: &str) -> PathBuf {
-        self.prepared_root().join(group_key)
+    /// `root/prepared` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn prepared_dir(&self) -> PathBuf {
+        self.prepared_root()
     }
 
     /// `root/registered/<group_key>` — stage-5 registered frames for one
@@ -1210,6 +1240,22 @@ pub fn subject_output_dir(output_root: &Path, subject: &StackSubject, label: &st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_level_kinds_use_the_empty_group_key() {
+        assert_eq!(artifact_group_key("calibrated", "osc__x__bin1__180s"), "");
+        assert_eq!(artifact_group_key("calibrated_mosaic", "k"), "");
+        assert_eq!(artifact_group_key("solve", "k"), "");
+        assert_eq!(artifact_group_key("registration", "k"), "");
+        assert_eq!(artifact_group_key("fits.2", "k"), "");
+        assert_eq!(artifact_group_key("ln", "k"), "k");
+        assert_eq!(artifact_group_key("ln_reference", "k"), "k");
+        assert_eq!(artifact_group_key("two_pass", "k"), "k");
+        for kind in FRAME_LEVEL_KINDS {
+            assert!(is_frame_level_kind(kind), "{kind}");
+        }
+        assert!(!is_frame_level_kind("ln"));
+    }
+
     use super::*;
 
     use crate::db::schema::init_db;
@@ -1256,8 +1302,8 @@ mod tests {
         let layout = WorkingLayout::new(Path::new("/work"), "LDN_1272");
         assert_eq!(layout.root, PathBuf::from("/work/LDN_1272"));
         assert_eq!(
-            layout.calibrated_dir("cam__mono__Ha__bin1__100x100"),
-            PathBuf::from("/work/LDN_1272/calibrated/cam__mono__Ha__bin1__100x100")
+            layout.calibrated_dir(),
+            PathBuf::from("/work/LDN_1272/calibrated")
         );
         assert_eq!(
             layout.registered_dir("g"),
@@ -1989,11 +2035,11 @@ mod tests {
             tmp.path().join("set").join("prepared")
         );
         assert_eq!(
-            layout.prepared_dir("g"),
-            tmp.path().join("set").join("prepared").join("g")
+            layout.prepared_dir(),
+            tmp.path().join("set").join("prepared")
         );
-        write_bytes(&layout.calibrated_dir("g").join("c_a.fits"), 100);
-        write_bytes(&layout.prepared_dir("g").join("p_b.fits"), 50);
+        write_bytes(&layout.calibrated_dir().join("c_a.fits"), 100);
+        write_bytes(&layout.prepared_dir().join("p_b.fits"), 50);
         let usage = work_usage(&layout);
         assert_eq!(usage.calibrated_bytes, 150);
         assert_eq!(usage.total_bytes, 150);
@@ -2037,7 +2083,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = WorkingLayout::new(tmp.path(), "set");
 
-        let calibrated_file = layout.calibrated_dir("g").join("f1.fits");
+        let calibrated_file = layout.calibrated_dir().join("f1.fits");
         write_bytes(&calibrated_file, 100);
         let registered_file = layout.registered_dir("g").join("f1.fits");
         write_bytes(&registered_file, 200);
@@ -2123,7 +2169,7 @@ mod tests {
         .unwrap();
         assert_eq!(freed, 300);
         assert!(!layout.registered_dir("g").exists());
-        assert!(!layout.calibrated_dir("g").exists());
+        assert!(!layout.calibrated_dir().exists());
         assert!(
             layout.root.exists(),
             "the layout's own root is never removed"
@@ -2173,7 +2219,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = WorkingLayout::new(tmp.path(), "set");
 
-        let group_dir = layout.calibrated_dir("g");
+        let group_dir = layout.calibrated_dir();
         let real_dir = group_dir.join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
         write_bytes(&real_dir.join("f.fits"), 1024);
@@ -2197,7 +2243,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(freed, 1024);
-        assert!(!layout.calibrated_dir("g").exists());
+        assert!(!layout.calibrated_dir().exists());
     }
 
     /// M3 Task 2, brief test (j): `rej/` bytes are counted by `work_usage`

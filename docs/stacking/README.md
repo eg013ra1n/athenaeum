@@ -1248,8 +1248,7 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   entry has its reason. The per-frame dispatch points the run calls live in
   `stacking::origin`, which the test does not scan: `stored_solve`,
   `cfa_geometry`, `landed_unchanged`, `needs_prepare`, `prepare_input`,
-  `prepare_stem_needs_frame_id`, `solve_plan`, `wcs_tier` and
-  `local_solve_outcome`. A third subject or origin touches exactly these and the
+  `solve_plan`, `wcs_tier` and `local_solve_outcome`. A third subject or origin touches exactly these and the
   named funnels.
 - **The identity check.** `origin::landed_unchanged` compares a landed file with
   its row's `size:mtime` (2 s tolerance). It runs at Prepare, Solve, Measure,
@@ -1311,11 +1310,10 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - **Debayered:** a CFA mosaic, when `debayerOsc` is on, goes through the
     generator's own VNG (`debayer_plane`) into `p_<stem>_d.fits`. The
     pre-debayer mosaic is the `calibrated_mosaic` for Bayer drizzle.
-  - **Names:** a project frame keeps the replica's stem (`p_c_<uuid>.fits`); an
-    attested light's prepared name carries its catalog id
-    (`p_<stem>_f<frame_id>.fits`, decided by `origin::prepare_stem_needs_frame_id`),
-    because two files of one set may share a stem. A prepared output equal to
-    its source is refused (error log, frame excluded).
+  - **Names:** every prepared name is `p_<stem>_f<frame_id>.fits` (`run::frame_file_stem`,
+    the one frame-only stem of every frame-level file; a project frame's id is its handle),
+    because two files of one set may share a stem. `prepared/` is flat. A prepared output
+    equal to its source is refused (error log, frame excluded).
   - **Excluded:** a tile-compressed FITS, an extension image, a distributed
     XISF or a file that cannot be opened, as "unsupported file: …" (the
     decoder's reason reads "not a 1- or 3-plane 8/16/32-bit or float primary

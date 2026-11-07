@@ -98,7 +98,7 @@ use crate::stacking::pass1_artifact::{
 };
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{
-    cleanup_work, subject_layout, CleanupWhat, WorkingLayout, LN_REFERENCE_SATURATION_FILE,
+    artifact_group_key, cleanup_work, subject_layout, CleanupWhat, WorkingLayout, LN_REFERENCE_SATURATION_FILE,
 };
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
@@ -1776,7 +1776,10 @@ enum CalibrateResolved {
 /// read).
 struct CalibrateJob {
     frame_id: i64,
-    group_key: String,
+    /// The frame's `calibrated` / `calibrated_mosaic` rows as the resolve step found them (under the frame-level key),
+    /// so the commit can remove a file the rewrite replaced ([`replace_frame_level_file`]).
+    old_calibrated: Option<crate::db::stacking::StackingArtifactRow>,
+    old_mosaic: Option<crate::db::stacking::StackingArtifactRow>,
     hash: String,
     spec: GenerationSpec,
     out: PathBuf,
@@ -1939,46 +1942,70 @@ fn commit_calibrate_group(
     Ok(())
 }
 
-/// The collision-safe calibrated-file STEM for one frame of a group (fix
-/// round 1, Critical): the plain, extension-free source stem
-/// (`Path::file_stem` of `frame.filename`) when it is unique within the
-/// group; `<stem>_f<frame_id>` for EVERY frame that shares that stem with
-/// another member of the group (all of them, not just the later ones) —
-/// deterministic and order-independent, since it depends only on group
-/// membership, never on iteration order.
+/// The file STEM of every frame-level file of one frame (calibrated, prepared, registered, measured spill, fits,
+/// LN sidecar): `<source file stem>_f<frame_id>`, always. A function of the frame alone (frame-level cache spec
+/// §5.1), so a regroup or a merge never renames a frame's file. The `_f<id>` suffix keeps two frames that share a
+/// source basename (a capture program restarting its file counter on another night is routine) from clobbering one
+/// file, and `frame_id` is unique inside one subject (a catalog id, or a project handle).
 ///
-/// Why this exists: `layout.calibrated_dir(key).join(spec.output_filename(&frame.filename))`
-/// used to collide whenever two frames of one group shared a source
-/// basename (a capture program restarting its file counter on a different
-/// night is routine) — the second write silently clobbered the first, both
-/// artifact rows pointed at one file of identical size, and `is_fresh` then
-/// kept the FIRST frame's now-wrong row "fresh" forever, so a later stage
-/// used the second frame's pixels twice and lost the first one silently.
-///
-/// Callers append the generator's own `_d` debayer marker via
-/// `GenerationSpec::output_filename` — never insert it here, so the marker
-/// always stays LAST in the filename (`c_<stem>_f<id>_d.fits`, never
-/// `c_<stem>_d_f<id>.fits`). Task 7's registered-frame writer (both register
-/// fan-out closures, and [`registered_file_name`]) calls this SAME function
-/// for its own `r_<stem>[_d].fits` naming, so the two stay consistent by
+/// Callers append the generator's own `_d` debayer marker via `GenerationSpec::output_filename` — never insert it
+/// here, so the marker always stays LAST in the filename (`c_<stem>_d.fits`, never `c_<stem>_d_f<id>.fits`).
+/// [`registered_file_name`] takes this stem for its own `r_<stem>[_d].fits` naming, so the two stay consistent by
 /// construction rather than by one parsing the other's output.
-pub(crate) fn calibrated_file_stem(group: &IntegrationGroup, frame: &GroupFrame) -> String {
-    fn stem_of(f: &GroupFrame) -> &str {
-        Path::new(&f.filename)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&f.filename)
+///
+/// Rows written before this rule keep their stored `path`, which may carry the old collision-only stem; a reader
+/// opens the row's path and never recomputes it from this function.
+pub(crate) fn frame_file_stem(frame: &GroupFrame) -> String {
+    let plain = Path::new(&frame.filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&frame.filename);
+    format!("{plain}_f{}", frame.frame_id)
+}
+
+/// After a frame-level file was written and its row upserted: removes the file the row used to point to, when that
+/// path differs from `new_path` (a frame re-written under a new stem or folder), lies under `layout.root` (a Prepare
+/// row may point at a landed file used in place, which is never ours to remove), and no row of ANY subject still
+/// points to it. A failed removal is a `warn!` (`path`, `error`), never an error: the file is only disk.
+fn replace_frame_level_file(
+    conn: &rusqlite::Connection,
+    layout: &WorkingLayout,
+    old: Option<&crate::db::stacking::StackingArtifactRow>,
+    new_path: &Path,
+) {
+    let Some(old_path) = old.and_then(|row| row.path.as_deref()) else {
+        return;
+    };
+    let old_path = Path::new(old_path);
+    if old_path == new_path || !old_path.starts_with(&layout.root) {
+        return;
     }
-    let this_stem = stem_of(frame);
-    let collisions = group
-        .frames
-        .iter()
-        .filter(|f| stem_of(f) == this_stem)
-        .count();
-    if collisions > 1 {
-        format!("{this_stem}_f{}", frame.frame_id)
-    } else {
-        this_stem.to_string()
+    let old_str = old_path.to_string_lossy();
+    let still_referenced: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM stacking_artifacts WHERE path = ?1",
+        [old_str.as_ref()],
+        |r| r.get(0),
+    );
+    match still_referenced {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                path = %old_path.display(),
+                error = %e,
+                "could not check whether an old frame-level file is still referenced; keeping it"
+            );
+            return;
+        }
+    }
+    match std::fs::remove_file(old_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %old_path.display(),
+            error = %e,
+            "an old frame-level file could not be removed"
+        ),
     }
 }
 
@@ -2022,29 +2049,31 @@ fn resolve_calibrate_job(
     // mosaic, produced by the SAME generation as the debayered artifact.
     let want_mosaic = wants_cfa_mosaic(cfg, group);
 
-    if rc.rerun_from != Some(Stage::Calibrate) {
-        let (existing, mosaic_row) = {
-            let conn = db(&rc.ctx)?.conn();
-            let existing = crate::db::stacking::find_artifact(
+    // The frame's rows sit under the frame-level key (spec §5.1), so a regroup finds them again. They are read even
+    // under `rerun_from = Calibrate` (no reuse then): the commit removes the file a rewrite replaces.
+    let (existing, mosaic_row) = {
+        let conn = db(&rc.ctx)?.conn();
+        let existing = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key("calibrated", group_key),
+            "calibrated",
+            Some(frame.frame_id),
+        )?;
+        let mosaic_row = if want_mosaic {
+            crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                group_key,
-                "calibrated",
+                artifact_group_key("calibrated_mosaic", group_key),
+                "calibrated_mosaic",
                 Some(frame.frame_id),
-            )?;
-            let mosaic_row = if want_mosaic {
-                crate::db::stacking::find_artifact(
-                    &conn,
-                    &rc.subject,
-                    group_key,
-                    "calibrated_mosaic",
-                    Some(frame.frame_id),
-                )?
-            } else {
-                None
-            };
-            (existing, mosaic_row)
+            )?
+        } else {
+            None
         };
+        (existing, mosaic_row)
+    };
+    if rc.rerun_from != Some(Stage::Calibrate) {
         if let Some(row) = &existing {
             // The mosaic rides the calibrated artifact's OWN hash (it is the
             // same generation), so `drizzle.bayer` deliberately stays out of
@@ -2173,10 +2202,10 @@ fn resolve_calibrate_job(
         }
     };
 
-    let stem = calibrated_file_stem(group, frame);
+    let stem = frame_file_stem(frame);
     let out = rc
         .layout
-        .calibrated_dir(group_key)
+        .calibrated_dir()
         .join(spec.output_filename(&format!("{stem}.fits")));
     // M4d Task 1: the mosaic is the same stem under the MONO spelling
     // (`c_<stem>.fits`) — through the one shared naming rule, never a second
@@ -2186,7 +2215,7 @@ fn resolve_calibrate_job(
     // debayering — whose own output already IS this name).
     let mosaic_out = want_mosaic.then(|| {
         rc.layout
-            .calibrated_dir(group_key)
+            .calibrated_dir()
             .join(crate::export::calibrated_output_filename(
                 &format!("{stem}.fits"),
                 false,
@@ -2197,7 +2226,8 @@ fn resolve_calibrate_job(
 
     Ok(CalibrateResolved::Job(Box::new(CalibrateJob {
         frame_id: frame.frame_id,
-        group_key: group_key.to_string(),
+        old_calibrated: existing,
+        old_mosaic: mosaic_row,
         hash,
         spec,
         out,
@@ -2448,7 +2478,7 @@ fn commit_calibrated(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(job.frame_id),
-                group_key: &job.group_key,
+                group_key: artifact_group_key("calibrated", ""),
                 kind: "calibrated",
                 path: job.out.to_str(),
                 config_hash: &job.hash,
@@ -2463,7 +2493,7 @@ fn commit_calibrated(
                 &NewArtifact {
                     subject: &rc.subject,
                     frame_id: Some(job.frame_id),
-                    group_key: &job.group_key,
+                    group_key: artifact_group_key("calibrated_mosaic", ""),
                     kind: "calibrated_mosaic",
                     path: path.to_str(),
                     config_hash: &job.hash,
@@ -2475,6 +2505,11 @@ fn commit_calibrated(
         }
         tx.commit()
             .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
+        // The rows now point at the new files; the files they used to point at go once nothing references them.
+        replace_frame_level_file(&conn, &rc.layout, job.old_calibrated.as_ref(), &job.out);
+        if let Some((path, _)) = &mosaic_identity {
+            replace_frame_level_file(&conn, &rc.layout, job.old_mosaic.as_ref(), path);
+        }
     }
 
     Ok(size as u64)
@@ -2502,6 +2537,10 @@ enum PrepareResolved {
 struct PrepareRunJob {
     frame_id: i64,
     group_key: String,
+    /// The frame's `calibrated` / `calibrated_mosaic` rows as the resolve step found them, so the commit can remove a
+    /// file the rewrite replaced ([`replace_frame_level_file`]).
+    old_calibrated: Option<crate::db::stacking::StackingArtifactRow>,
+    old_mosaic: Option<crate::db::stacking::StackingArtifactRow>,
     hash: String,
     /// Bayer drizzle wants this frame's pre-debayer mosaic kept.
     keep_mosaic: bool,
@@ -2653,26 +2692,31 @@ fn resolve_prepare_job(
             }
         );
 
-    if rc.rerun_from != Some(Stage::Calibrate) {
+    // The frame's rows sit under the frame-level key (spec §5.1). Read even under `rerun_from = Calibrate` (no reuse
+    // then): the commit removes the file a rewrite replaces.
+    let (existing, mosaic_row) = {
         let conn = db(&rc.ctx)?.conn();
         let existing = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            &group.key,
+            artifact_group_key("calibrated", &group.key),
             "calibrated",
             Some(frame.frame_id),
         )?;
-        let mosaic_fresh = !keep_mosaic
-            || crate::db::stacking::find_artifact(
-                &conn,
-                &rc.subject,
-                &group.key,
-                "calibrated_mosaic",
-                Some(frame.frame_id),
-            )?
-            .is_some_and(|row| is_fresh(&row, &hash));
-        if let Some(row) = existing {
-            if is_fresh(&row, &hash) && mosaic_fresh {
+        let mosaic_row = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key("calibrated_mosaic", &group.key),
+            "calibrated_mosaic",
+            Some(frame.frame_id),
+        )?;
+        (existing, mosaic_row)
+    };
+    if rc.rerun_from != Some(Stage::Calibrate) {
+        let mosaic_fresh =
+            !keep_mosaic || mosaic_row.as_ref().is_some_and(|row| is_fresh(row, &hash));
+        if let Some(row) = &existing {
+            if is_fresh(row, &hash) && mosaic_fresh {
                 return Ok(PrepareResolved::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
                 });
@@ -2680,21 +2724,9 @@ fn resolve_prepare_job(
         }
     }
 
-    // An attested light's name is not unique by itself, so its stem always
-    // carries the frame id; a project's `c_<uuid>` stems are unique.
-    let stem = if crate::stacking::origin::prepare_stem_needs_frame_id(origin_of(
-        &rc.origins,
-        frame.frame_id,
-    )?) {
-        let plain = Path::new(&frame.filename)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&frame.filename);
-        format!("{plain}_f{}", frame.frame_id)
-    } else {
-        calibrated_file_stem(group, frame)
-    };
-    let dir = rc.layout.prepared_dir(&group.key);
+    // One stem rule for every frame-level file (spec §5.1): the frame's own, `<stem>_f<id>`.
+    let stem = frame_file_stem(frame);
+    let dir = rc.layout.prepared_dir();
     let converted_out = dir.join(format!("p_{stem}.fits"));
     let debayered_out = dir.join(format!("p_{stem}_d.fits"));
     // A zip frame that needs real work (not Reused above) is extracted only now.
@@ -2736,6 +2768,8 @@ fn resolve_prepare_job(
     Ok(PrepareResolved::Job(Box::new(PrepareRunJob {
         frame_id: frame.frame_id,
         group_key: group.key.clone(),
+        old_calibrated: existing,
+        old_mosaic: mosaic_row,
         hash,
         keep_mosaic,
         frame_uuid: input.frame_uuid,
@@ -2821,7 +2855,7 @@ fn commit_prepared(
         &NewArtifact {
             subject: &rc.subject,
             frame_id: Some(job.frame_id),
-            group_key: &job.group_key,
+            group_key: artifact_group_key("calibrated", &job.group_key),
             kind: "calibrated",
             path: files.calibrated.to_str(),
             config_hash: &job.hash,
@@ -2836,7 +2870,7 @@ fn commit_prepared(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(job.frame_id),
-                group_key: &job.group_key,
+                group_key: artifact_group_key("calibrated_mosaic", &job.group_key),
                 kind: "calibrated_mosaic",
                 path: path.to_str(),
                 config_hash: &job.hash,
@@ -2848,6 +2882,12 @@ fn commit_prepared(
     }
     tx.commit()
         .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
+    // The rows now point at the new files; the files they used to point at go once nothing references them. A
+    // landed file Prepare used in place is outside the working tree, so it is never touched.
+    replace_frame_level_file(&conn, &rc.layout, job.old_calibrated.as_ref(), &files.calibrated);
+    if let Some((path, _)) = &mosaic {
+        replace_frame_level_file(&conn, &rc.layout, job.old_mosaic.as_ref(), path);
+    }
     Ok(size as u64)
 }
 
@@ -3415,7 +3455,7 @@ fn stage_calibrate_with(rc: &mut RunContext, force_merge: Option<bool>) -> Resul
             if group_idx > 0 {
                 stash.push(take_list_stash(rc, warn_mark, excl_mark));
             }
-            std::fs::create_dir_all(rc.layout.calibrated_dir(&group.key))
+            std::fs::create_dir_all(rc.layout.calibrated_dir())
                 .map_err(|e| RunError::Other(format!("failed to create calibrated dir: {e}")))?;
 
             // Owner decision 2026-09-10 (same rule `stage_measure` uses): a
@@ -4900,15 +4940,21 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
         let hash = solve_hash(&plan.blake3, &identity);
         let conn = db(&rc.ctx)?.conn();
         let cached =
-            crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(frame_id))?
-                .is_some_and(|row| crate::stacking::solve::cached_outcome_holds(&row, &hash));
+            crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                artifact_group_key("solve", &key),
+                "solve",
+                Some(frame_id),
+            )?
+            .is_some_and(|row| crate::stacking::solve::cached_outcome_holds(&row, &hash));
         if cached {
             continue;
         }
         let calibrated = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            &key,
+            artifact_group_key("calibrated", &key),
             "calibrated",
             Some(frame_id),
         )?
@@ -5411,7 +5457,7 @@ fn measure_group_prepare(
             crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                &group.key,
+                artifact_group_key("calibrated", &group.key),
                 "calibrated",
                 Some(frame.frame_id),
             )?
@@ -6223,7 +6269,7 @@ fn measure_two_pass_prepare(
             let conn = db(&rc.ctx)?.conn();
             rc.memo.calibration_hash_checked(&conn, cfg, &frame)?
         };
-        let stem = calibrated_file_stem(group, &frame);
+        let stem = frame_file_stem(&frame);
         let mut member = MeasureMember {
             idx,
             frame,
@@ -6783,7 +6829,7 @@ fn persist_measurement(
     // plane, keyed on the SAME `expected_hash` — the two
     // are a product of the same computation and share
     // its staleness (see `plan.rs`'s per-frame loop).
-    let stem = calibrated_file_stem(group, frame);
+    let stem = frame_file_stem(frame);
     for (plane, plane_fits) in fits.iter().enumerate() {
         let fits_path = rc.layout.fits_path(&group.key, &stem, plane);
         // Final fix wave (ruling C-30, the whole-branch
@@ -7448,8 +7494,7 @@ struct RegisterItem {
     frame_id: i64,
     /// Perf tier A Task 6a fix round 1: kept whole (not just `frame_id`) —
     /// the worker's own registered-artifact write needs it for
-    /// `calibrated_file_stem` (which checks stem collisions against every
-    /// OTHER member of the group).
+    /// `frame_file_stem`.
     frame: GroupFrame,
     path: PathBuf,
     is_reference: bool,
@@ -8293,7 +8338,6 @@ fn register_group_pass(
         let out_dir_ref = &out_dir;
         let reference_name_ref = &reference_name;
         let grid_hash_ref = compose.as_ref().map(|(g, _)| g.hash.as_str());
-        let group_ref = group;
         let cancel_ref: &AtomicBool = &rc.cancel;
         let rewrite_ticker = FanOutTicker::new(
             rc,
@@ -8312,7 +8356,7 @@ fn register_group_pass(
             cancel_ref,
             move |item: ArtifactRewriteItem| -> Result<(i64, String, Result<PathBuf, String>), String> {
                 let frame_id = item.frame_id;
-                let stem = calibrated_file_stem(group_ref, &item.frame);
+                let stem = frame_file_stem(&item.frame);
                 let out = out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
                 let written = write_one_registered_frame(
                     &item.calibrated,
@@ -8567,7 +8611,7 @@ fn register_group_pass(
                                 (map, hash)
                             }
                         };
-                        let stem = calibrated_file_stem(group, &item.frame);
+                        let stem = frame_file_stem(&item.frame);
                         let out_path =
                             out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
                         let (written, write_error) = match write_one_registered_frame(
@@ -9753,8 +9797,8 @@ fn registered_artifact_is_fresh(
     .is_some_and(|row| is_fresh(&row, hash)))
 }
 
-/// `r_<stem>[_d].fits` for the SAME collision-safe `stem`
-/// [`calibrated_file_stem`] gave the calibrated file (fix round 1: the two
+/// `r_<stem>[_d].fits` for the SAME frame-only `stem`
+/// [`frame_file_stem`] gave the calibrated file (fix round 1: the two
 /// naming schemes must agree by construction). `debayered` is the caller's
 /// own known fact (`MeasuredFrame::planes == 3`) — NOT inferred by
 /// checking whether the calibrated file's own on-disk name ends in `_d`
@@ -12720,7 +12764,7 @@ fn process_group_output(
                     let path = crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        &group.key,
+                        artifact_group_key("calibrated_mosaic", &group.key),
                         "calibrated_mosaic",
                         Some(frame_id),
                     )?
@@ -13912,7 +13956,7 @@ fn run_group_normalization(
         Vec::with_capacity(members.len());
     for m in members.iter() {
         let stem = match group_frames_by_id.get(&m.frame_id).copied() {
-            Some(gf) => calibrated_file_stem(group, gf),
+            Some(gf) => frame_file_stem(gf),
             None => Path::new(&m.filename)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -16841,7 +16885,8 @@ mod tests {
         assert!(opts.hot_pixel_correction);
         let job = |id: i64, dark: &Path| CalibrateJob {
             frame_id: id,
-            group_key: "g".into(),
+            old_calibrated: None,
+            old_mosaic: None,
             hash: String::new(),
             spec: GenerationSpec {
                 inputs: crate::calibration_library::light_cal::LightCalInputs {
@@ -16983,7 +17028,6 @@ mod tests {
         let cfg = StackingConfig::default();
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-        let group_key = plan_groups[0].key.clone();
 
         // Fix round 1: `admission_with_shared` (like `admission`) treats an
         // unknown RAM total as an exhausted budget — admission 1 always,
@@ -17016,7 +17060,7 @@ mod tests {
         );
         stage_calibrate(&mut rc_seq).unwrap();
 
-        let seq_dir = layout_seq.calibrated_dir(&group_key);
+        let seq_dir = layout_seq.calibrated_dir();
         let mut seq_files: Vec<PathBuf> = std::fs::read_dir(&seq_dir)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -17072,7 +17116,7 @@ mod tests {
         rc_par.rerun_from = Some(Stage::Calibrate);
         stage_calibrate(&mut rc_par).unwrap();
 
-        let par_dir = layout_par.calibrated_dir(&group_key);
+        let par_dir = layout_par.calibrated_dir();
         let mut par_files: Vec<PathBuf> = std::fs::read_dir(&par_dir)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -17143,7 +17187,6 @@ mod tests {
             let layout = WorkingLayout::new(working_dir, &set_slug(SET_NAME));
             let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
             assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-            let key = plan_groups[0].key.clone();
             let mut rc = test_context(
                 ctx.clone(),
                 Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
@@ -17158,7 +17201,7 @@ mod tests {
             );
             stage_calibrate(&mut rc).unwrap();
             assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
-            let dir = layout.calibrated_dir(&key);
+            let dir = layout.calibrated_dir();
             let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
@@ -17244,13 +17287,12 @@ mod tests {
 
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-        let group_key = plan_groups[0].key.clone();
 
         // First pass: 3 calibrated files, 3 artifact rows.
         let mut rc1 = build(1, plan_groups.clone());
         stage_calibrate(&mut rc1).unwrap();
 
-        let calibrated_dir = layout.calibrated_dir(&group_key);
+        let calibrated_dir = layout.calibrated_dir();
         let files_on_disk = std::fs::read_dir(&calibrated_dir).unwrap().count();
         assert_eq!(files_on_disk, 3);
 
@@ -17343,6 +17385,272 @@ mod tests {
         }
     }
 
+    /// The sum of `items` over the `fan-out finished` lines of `stage` and `pass` in a
+    /// `crate::stacking::telemetry::capture_logs` text; 0 when there is none (a stage whose work was all cached
+    /// opens no fan-out).
+    pub(super) fn fan_out_items(logs: &str, stage: &str, pass: &str) -> usize {
+        logs.lines()
+            .filter(|l| {
+                l.contains("fan-out finished")
+                    && l.contains(&format!("stage=\"{stage}\""))
+                    && l.contains(&format!("pass=\"{pass}\""))
+            })
+            .map(|l| {
+                let rest = l.split("items=").nth(1).expect("items field");
+                rest.split_whitespace().next().unwrap().parse::<usize>().unwrap()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn frame_file_stem_ignores_group_membership() {
+        let frame = |id: i64, filename: &str| GroupFrame {
+            frame_id: id,
+            file_id: id,
+            filename: filename.to_string(),
+            path: format!("/data/{filename}"),
+            size: 1,
+            modified_at: String::new(),
+            exposure_s: Some(60.0),
+            date_obs: None,
+            width: 8,
+            height: 8,
+            pixel_scale_arcsec: None,
+            scale_source: None,
+        };
+        // Two frames sharing a source basename: each stem carries its own id, whoever else is in the group.
+        assert_eq!(frame_file_stem(&frame(7, "Light_0001.fits")), "Light_0001_f7");
+        assert_eq!(frame_file_stem(&frame(9, "Light_0001.fits")), "Light_0001_f9");
+        // A lone frame gets the suffix too: the stem does not change when a merge brings a namesake in.
+        assert_eq!(frame_file_stem(&frame(3, "Light_0001.fits")), "Light_0001_f3");
+        assert_eq!(frame_file_stem(&frame(4, "no_extension")), "no_extension_f4");
+    }
+
+    /// Frame-level cache spec §5.1: a regroup (here "one group per exposure" -> "no split") finds the calibrated
+    /// rows again; nothing is recalibrated and no file is rewritten.
+    #[test]
+    fn calibrated_artifact_is_reused_across_a_regroup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _light_ids, working, output) = seed_ready(&db_path, SET_NAME);
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        let mut cfg_seconds = StackingConfig::default();
+        cfg_seconds.grouping.exposure_mode = crate::stacking::config::ExposureMode::Seconds;
+        let mut cfg_all = StackingConfig::default();
+        cfg_all.grouping.exposure_mode = crate::stacking::config::ExposureMode::NoSplit;
+        let groups_of = |cfg: &StackingConfig| {
+            group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap()
+        };
+        let (groups_seconds, groups_all) = (groups_of(&cfg_seconds), groups_of(&cfg_all));
+        assert_ne!(
+            groups_seconds[0].key, groups_all[0].key,
+            "the two groupings must name the group differently"
+        );
+        let build = |run_id: i64, cfg: &StackingConfig, groups: Vec<IntegrationGroup>| {
+            test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                groups,
+                layout.clone(),
+                output.path().to_path_buf(),
+                HashMap::new(),
+            )
+        };
+        let rows = || {
+            crate::db::stacking::list_artifacts(
+                &fixture.conn,
+                &StackSubject::FrameSet(fixture.set_id),
+                Some("calibrated"),
+            )
+            .unwrap()
+        };
+
+        let mut rc1 = build(1, &cfg_seconds, groups_seconds);
+        let (res, text1) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc1));
+        res.unwrap();
+        assert_eq!(fan_out_items(&text1, "calibrate", "calibrate"), 3, "{text1}");
+        let first = rows();
+        assert_eq!(first.len(), 3);
+        assert!(first.iter().all(|r| r.group_key.is_empty()), "{first:?}");
+        let mtimes = |rows: &[crate::db::stacking::StackingArtifactRow]| -> Vec<std::time::SystemTime> {
+            rows.iter()
+                .map(|r| std::fs::metadata(r.path.as_ref().unwrap()).unwrap().modified().unwrap())
+                .collect()
+        };
+        let first_mtimes = mtimes(&first);
+
+        let mut rc2 = build(2, &cfg_all, groups_all);
+        let (res, text2) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc2));
+        res.unwrap();
+        assert_eq!(
+            fan_out_items(&text2, "calibrate", "calibrate"),
+            0,
+            "a regroup recalibrated: {text2}"
+        );
+        let second = rows();
+        assert_eq!(second.len(), 3, "a regroup added rows");
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!((a.id, &a.created_at, &a.path), (b.id, &b.created_at, &b.path));
+            assert_eq!(b.group_key, "");
+        }
+        assert_eq!(mtimes(&second), first_mtimes, "a regroup rewrote a calibrated file");
+    }
+
+    /// Frame-level cache spec §5.1/§5.7 (review focus 3): a frame re-written under a new stem or folder takes its
+    /// old file with it, unless another row still points to it.
+    #[test]
+    fn rewriting_a_frame_removes_its_old_file_once_unreferenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, output) = seed_ready(&db_path, SET_NAME);
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let cfg = StackingConfig::default();
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let build = |run_id: i64| {
+            test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                HashMap::new(),
+            )
+        };
+        let mut rc1 = build(1);
+        stage_calibrate(&mut rc1).unwrap();
+
+        // Rows as an older version left them: the file in `calibrated/<group_key>/` under the old stem.
+        let old_dir = layout.calibrated_dir().join(&plan_groups[0].key);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut old_paths = Vec::new();
+        for &id in &light_ids[..2] {
+            let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", "calibrated", Some(id))
+                .unwrap()
+                .unwrap();
+            let old = old_dir.join(format!("c_old_{id}.fits"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            old_paths.push(old);
+        }
+        // Another row (of another kind) still points to the second frame's old file.
+        upsert_artifact(
+            &fixture.conn,
+            &NewArtifact {
+                subject: &subject,
+                frame_id: Some(light_ids[1]),
+                group_key: "",
+                kind: "solve",
+                path: old_paths[1].to_str(),
+                config_hash: "h",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        let mut rc2 = build(2);
+        rc2.rerun_from = Some(Stage::Calibrate);
+        stage_calibrate(&mut rc2).unwrap();
+
+        for (n, &id) in light_ids[..2].iter().enumerate() {
+            let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", "calibrated", Some(id))
+                .unwrap()
+                .unwrap();
+            let new = PathBuf::from(row.path.unwrap());
+            assert_eq!(new.parent().unwrap(), layout.calibrated_dir(), "{new:?}");
+            let name = new.file_name().unwrap().to_str().unwrap().to_string();
+            assert!(name.ends_with(&format!("_f{id}.fits")), "{name}");
+            assert!(new.exists());
+            assert_eq!(
+                old_paths[n].exists(),
+                n == 1,
+                "frame {id}: the old file {} be gone",
+                if n == 0 { "must" } else { "must not" }
+            );
+        }
+    }
+
+    /// Frame-level cache spec §5.1 (review focus 4): a collab project frame (`StackSubject::Project`) takes the
+    /// same frame-level key and the frame-only stem.
+    #[test]
+    fn a_project_frame_uses_the_frame_level_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for (u, file) in [
+            ("m1", test_fixtures::ProjectFile::Mono32),
+            ("x1", test_fixtures::ProjectFile::Xisf32),
+        ] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = file;
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        let rows = crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("calibrated")).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            assert_eq!(row.group_key, "", "{row:?}");
+            assert!(matches!(row.subject, StackSubject::Project(_)), "{row:?}");
+            let handle = row.frame_id.expect("a project frame handle");
+            let found = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(handle))
+                .unwrap();
+            assert_eq!(found.map(|r| r.id), Some(row.id));
+        }
+        // The converted file is named by the frame alone: `p_<stem>_f<handle>.fits`, in the flat folder.
+        let converted = rows
+            .iter()
+            .map(|r| PathBuf::from(r.path.as_ref().unwrap()))
+            .find(|p| p.starts_with(rc.layout.prepared_dir()))
+            .expect("the XISF frame is converted under prepared/");
+        let handle = rows
+            .iter()
+            .find(|r| PathBuf::from(r.path.as_ref().unwrap()) == converted)
+            .unwrap()
+            .frame_id
+            .unwrap();
+        assert_eq!(converted.parent().unwrap(), rc.layout.prepared_dir());
+        assert!(
+            converted
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("_f{handle}.fits")),
+            "{converted:?}"
+        );
+    }
+
     /// Fix round 1, Critical: two frames of one group sharing a source
     /// basename (a capture counter restarted on another night) must not
     /// collide on one calibrated output — every colliding frame gets
@@ -17415,7 +17723,6 @@ mod tests {
 
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-        let group_key = plan_groups[0].key.clone();
 
         let mut rc = test_context(
             ctx.clone(),
@@ -17464,12 +17771,14 @@ mod tests {
             path_b.contains(&format!("_f{dup_b}")),
             "colliding frame {dup_b} must carry the disambiguating suffix: {path_b}"
         );
+        // Spec §5.1: the stem is a function of the frame alone, so a frame with a unique name carries its id too
+        // (a merge that brings a namesake in must not rename it).
         assert!(
-            !path_uniq.contains("_f"),
-            "a frame with a unique source name keeps the plain name: {path_uniq}"
+            path_uniq.contains(&format!("_f{uniq}")),
+            "a frame with a unique source name carries its own id as well: {path_uniq}"
         );
 
-        let calibrated_dir = layout.calibrated_dir(&group_key);
+        let calibrated_dir = layout.calibrated_dir();
         let files_on_disk = std::fs::read_dir(&calibrated_dir).unwrap().count();
         assert_eq!(
             files_on_disk, 3,
@@ -18156,7 +18465,7 @@ mod tests {
             crate::db::stacking::find_artifact(
                 &fixture.conn,
                 &subject,
-                &group_key,
+                "",
                 "calibrated",
                 Some(frame_id),
             )
@@ -18404,7 +18713,7 @@ mod tests {
             let row = crate::db::stacking::find_artifact(
                 &self.fixture.conn,
                 &self.subject,
-                &self.group_key,
+                "",
                 "calibrated",
                 Some(frame_id),
             )
@@ -18461,7 +18770,7 @@ mod tests {
     #[test]
     fn measure_pass1_residency_is_the_admitted_workers() {
         let rig = Pass1Rig::new();
-        let calibrated_dir = rig.layout.calibrated_dir(&rig.group_key);
+        let calibrated_dir = rig.layout.calibrated_dir();
         rig.run("run 1", None);
         assert_eq!(
             crate::stacking::measure::pass1_peak(&calibrated_dir),
@@ -18638,7 +18947,7 @@ mod tests {
         assert_eq!(out.excluded, 0);
         assert_eq!(out.logged.len(), 8, "pass 1 ran twice per member");
         assert_eq!(
-            crate::stacking::measure::pass1_peak(&rig.layout.calibrated_dir(&rig.group_key)),
+            crate::stacking::measure::pass1_peak(&rig.layout.calibrated_dir()),
             1
         );
     }
@@ -18808,7 +19117,7 @@ mod tests {
             let calibrated = crate::db::stacking::find_artifact(
                 &fixture.conn,
                 &subject,
-                &plan_groups[0].key,
+                "",
                 "calibrated",
                 Some(frame_id),
             )
@@ -22056,7 +22365,7 @@ mod tests {
                 .collect();
             let mut files = Vec::new();
             for g in &plan_groups {
-                let dir = layout.calibrated_dir(&g.key);
+                let dir = layout.calibrated_dir();
                 let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
                     .unwrap()
                     .map(|e| e.unwrap().path())
@@ -23694,7 +24003,7 @@ mod tests {
         assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
 
         for i in 0..4 {
-            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}"));
+            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}_f{}", light_ids[i]));
             assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
         }
 
@@ -23849,7 +24158,7 @@ mod tests {
             .find(|f| f.frame_id == light_ids[0])
             .expect("f0 must be a group member")
             .clone();
-        let stem = calibrated_file_stem(&plan_groups[0], &target_frame);
+        let stem = frame_file_stem(&target_frame);
 
         let (run_id, group_ids) = seed_run_and_groups(
             &fixture.conn,
@@ -24478,7 +24787,7 @@ mod tests {
             assert!(f.ln_scale.is_some(), "{f:?}");
         }
         for i in 0..4 {
-            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}"));
+            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}_f{}", light_ids[i]));
             assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
         }
 
@@ -24822,10 +25131,9 @@ mod tests {
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         let group_key = plan_groups[0].key.clone();
 
-        // f1's stem is plain "f1" (no basename collisions in this fixture —
-        // `calibrated_file_stem` only appends `_f<id>` when two frames
-        // share a source name).
-        let blocked_sidecar = layout.ln_sidecar_path(&group_key, "f1");
+        // f1's stem is `f1_f<frame id>` (`frame_file_stem`).
+        let blocked_sidecar =
+            layout.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
         std::fs::create_dir_all(&blocked_sidecar).unwrap();
 
         let (run_id, group_ids) = seed_run_and_groups(
@@ -25134,7 +25442,7 @@ mod tests {
         // artifact row's stored size/hash are untouched, so the second
         // run's `is_fresh` check still calls this a cache hit.
         let touched_frame_id = light_ids[1];
-        let sidecar = layout.ln_sidecar_path(&group_key, "f1");
+        let sidecar = layout.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
         let mut bytes = std::fs::read(&sidecar).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
@@ -25558,9 +25866,10 @@ mod tests {
             group_frames(&fixture.conn, fixture.set_id, &cfg_rejection_only.grouping).unwrap();
         let group_key = plan_groups_a[0].key.clone();
 
-        // f1's stem is plain "f1" — same deterministic write-failure trick
+        // f1's stem is `f1_f<frame id>` — same deterministic write-failure trick
         // as the OUTPUT-normalization exclusion test above.
-        let blocked_sidecar = layout_a.ln_sidecar_path(&group_key, "f1");
+        let blocked_sidecar =
+            layout_a.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
         std::fs::create_dir_all(&blocked_sidecar).unwrap();
 
         let (run_id_a, group_ids_a) = seed_run_and_groups(
@@ -29971,7 +30280,7 @@ mod tests {
         cfg.paths.working_dir = Some(working.path().to_string_lossy().into_owned());
         crate::api::stacking::set_stacking_config(&ctx, fixture.set_id, cfg, Vec::new()).unwrap();
 
-        let set_group = WorkingLayout::new(working.path(), &set_slug(SET_NAME)).calibrated_dir("g");
+        let set_group = WorkingLayout::new(working.path(), &set_slug(SET_NAME)).calibrated_dir();
         std::fs::create_dir_all(&set_group).unwrap();
         std::fs::write(set_group.join("x.bin"), vec![0u8; 1024]).unwrap();
         let project_group = working
@@ -30180,7 +30489,7 @@ mod tests {
                     &NewArtifact {
                         subject: &rc.subject,
                         frame_id: Some(f.frame_id),
-                        group_key: &g.key,
+                        group_key: artifact_group_key("calibrated", &g.key),
                         kind: "calibrated",
                         path: Some(&f.path),
                         config_hash: &hash,
@@ -30324,7 +30633,7 @@ mod tests {
             "{:?}",
             rc.runtime_exclusions
         );
-        let key = "osc__L__300s";
+        let key = "";
         for f in rc.plan_groups[0].frames.clone() {
             let row = |kind: &str| {
                 crate::db::stacking::find_artifact(&conn, &rc.subject, key, kind, Some(f.frame_id))
@@ -30341,7 +30650,9 @@ mod tests {
             let calibrated = PathBuf::from(row("calibrated"));
             assert_eq!(
                 calibrated,
-                rc.layout.prepared_dir(key).join(format!("p_{stem}_d.fits"))
+                rc.layout
+                    .prepared_dir()
+                    .join(format!("p_{stem}_f{}_d.fits", f.frame_id))
             );
             assert_eq!(row("calibrated_mosaic"), f.path, "the landed mosaic itself");
             let h = FitsHeader::from_path(&calibrated).unwrap();
@@ -30369,7 +30680,7 @@ mod tests {
             let a = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                "cfa__L__300s",
+                "",
                 "calibrated",
                 Some(f.frame_id),
             )
@@ -30423,19 +30734,22 @@ mod tests {
             "{:?}",
             rc.runtime_exclusions
         );
-        let calibrated_of = |uuid: &str| -> PathBuf {
-            let f = rc.plan_groups[0]
+        let handle_of = |uuid: &str| -> i64 {
+            rc.plan_groups[0]
                 .frames
                 .iter()
                 .find(|f| f.path == landed_of[uuid].to_str().unwrap())
-                .unwrap();
+                .unwrap()
+                .frame_id
+        };
+        let calibrated_of = |uuid: &str| -> PathBuf {
             PathBuf::from(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    key,
+                    "",
                     "calibrated",
-                    Some(f.frame_id),
+                    Some(handle_of(uuid)),
                 )
                 .unwrap()
                 .and_then(|a| a.path)
@@ -30447,7 +30761,9 @@ mod tests {
             let p = calibrated_of(uuid);
             assert_eq!(
                 p,
-                rc.layout.prepared_dir(key).join(format!("p_c_{uuid}.fits"))
+                rc.layout
+                    .prepared_dir()
+                    .join(format!("p_c_{uuid}_f{}.fits", handle_of(uuid)))
             );
             let h = FitsHeader::from_path(&p).unwrap();
             assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("converted"));
@@ -30614,7 +30930,7 @@ mod tests {
         assert!(crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            "mono__L__300s",
+            "",
             "calibrated",
             Some(b)
         )
@@ -30675,7 +30991,7 @@ mod tests {
             let a = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                "mono__L__300s",
+                "",
                 "calibrated",
                 Some(f.frame_id),
             )

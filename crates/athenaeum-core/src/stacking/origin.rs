@@ -57,17 +57,6 @@ pub(crate) fn needs_prepare(origin: &FrameOrigin) -> bool {
     }
 }
 
-/// Whether a frame's Prepare output stem must carry its frame id: an
-/// attested catalog light's file name is not unique by itself (`X.fits`
-/// debayered and `X_d.fits` converted would both be `p_X_d.fits`), while a
-/// project frame's `c_<uuid>` stem is.
-pub(crate) fn prepare_stem_needs_frame_id(origin: &FrameOrigin) -> bool {
-    match origin {
-        FrameOrigin::Catalog { .. } => true,
-        FrameOrigin::Project { .. } => false,
-    }
-}
-
 /// What Prepare reads for one frame, and the uuid its log line carries.
 pub(crate) struct PrepareInput {
     pub(crate) path: PathBuf,
@@ -407,7 +396,13 @@ pub(crate) fn wcs_outlook(
     };
     let subject = crate::db::stacking::StackSubject::Project(project_id.clone());
     let Some(row) =
-        crate::db::stacking::find_artifact(conn, &subject, "", "solve", Some(frame_id))?
+        crate::db::stacking::find_artifact(
+            conn,
+            &subject,
+            crate::stacking::paths::artifact_group_key("solve", ""),
+            "solve",
+            Some(frame_id),
+        )?
     else {
         return Ok(WcsOutlook::ToSolve);
     };
