@@ -1,74 +1,110 @@
-*Athenaeum v0.7.0: shoot one target together with friends, stack faster, and see at a glance which frames to throw away.*
+*Athenaeum v0.7.1: stack a collaboration project in the app, keep your archives as ZIP files, and see your frames aligned in Blink.*
 
-This update arrives inside the app: click **Download and install** when it is offered. If you take part in
-a collaboration project, update soon — older versions show **Update required** on every project.
+This update arrives inside the app: click **Download and install** when it is offered.
 
 ## What's New
 
-### Collaboration projects, rebuilt
+### Stack a collaboration project
 
-- **Share frames as soon as they are ready.** Calibrate your night, look through it in Blink, and publish
-  the frames you want to share. Everyone else in the project receives them within seconds.
-- **See the whole project on one page:** how much you have contributed, how close each filter is to the
-  project's goal, who is online, and what is being exchanged right now.
-- **Choose how hands-off you want to be.** Publish by hand (the default), let the app calibrate for you, or
-  make it fully automatic.
-- **Different filter names are no longer a problem.** If your filter is called "Ha" and the project's is
-  "H-alpha", map it once and the app remembers. Frames without a filter name can be shared too.
-- **Already calibrated somewhere else?** Mark the frame set **Calibrated externally** and share it as it is.
-- **For coordinators:** approve or reject frames in batches, set a frame aside and bring it back, and fix a
-  member's filter names yourself.
-- **Export the whole project** for stacking, sorted into one folder per filter.
+- **Every project has a Stacking tab.** Stack all members' frames together on your own computer. The tab shows
+  which frames are on this device, what the app will prepare before stacking, and where every member's frames lie
+  on the sky.
+- **One shared grid, so everyone's masters line up.** The coordinator confirms the grid every member stacks onto.
+  The proposed grid turns with your reference frame, so the master lies the way your frames were shot, and the
+  card shows how far it is turned from north.
+- **A coverage map after each stack** shows where the project is deep and where it is thin.
+- **Mix exposure lengths your way.** Group frames by exact exposure, within a stop, by equivalent exposure, or
+  stack them all together.
 
-### Stacking
+### Choose the frames that go into a stack
 
-- **Noticeably faster** — up to a quarter less time for the same result.
-- **Local normalization sets its own scale** to fit your image — one setting less to guess.
-- **Frame sets calibrated elsewhere** stack without asking for darks or flats.
-- **A heads-up when a light has a flat but no dark or bias**, before you stack.
+- **A Frames table on the Stacking tab.** Group frames by stacking group, night, member or status, filter them,
+  spot the outliers and exclude several frames at once.
+- **Pick the reference frame with a star**, the same star as in Frame Analysis, and see which frame each run
+  aligned to.
+- **Blink your selection, aligned or original.** Select frames and press Blink: aligned frames stand still, so
+  clouds, trails and satellites jump out at once. Switch to the originals any time. An aligned frame that stands
+  taller than wide is turned so its long side is horizontal.
 
-### Choosing your best frames
+### Sharper, more reliable stacks
 
-- **A plain verdict for every frame:** *Trailed*, *Defocused* or *No stars*. Tick **Unusable** in Frame
-  Analysis and reject them all at once.
-- **Star measurements you can trust everywhere.** Frame Analysis, Blink and stacking now measure stars the
-  same way, so their numbers agree.
+- **Sharper stars where the sharpest frames used to miss.** A few very sharp frames — most often when a set is
+  aligned to a reference frame from another camera — could land a few pixels off and soften the stars in the
+  stack. They now line up exactly. Frames that already aligned well are aligned exactly as before.
+- **A frame that can't be aligned reliably no longer blurs your stack.** If a frame's alignment rests on only a
+  small patch of stars, Athenaeum tries again from the frame's plate solution when it has one; if that does not
+  hold either, the frame is left out of the stack.
+- **Your best frames keep their star cores.** Rejection now matches frames by their stars' brightness, so the
+  cores of your sharpest frames are no longer clipped. Your saved stacking settings switch to this once.
+- **Weights follow how clear and how sharp a frame is.** Each frame's weight is measured on the stars every
+  frame of the group shows, so a soft frame no longer gains weight from its blur, and clear, steady frames count
+  most.
 
-### Plate solving
+### Your ZIP archives are part of the catalog
 
-- **Much faster solves without coordinates.** Download the quad index packs in **Settings → Plate Solving**
-  once, and frames with no position in their header solve in a second or two.
+- **Frames inside a ZIP file show up like any others.** A `.zip` in a scanned folder is read without unpacking:
+  its frames appear in Objects with a **zip** chip, and they open in Blink, plate solve, stack, build masters and
+  export just like frames on disk. Extracted copies are kept in a cache you can limit and clear in
+  **Settings → General → Archive**.
+- **Unpack from zip** puts a frame set back on disk for good, and **Unarchive** extracts only what is missing.
+- **Look inside a ZIP in the file browser**, with each file's header in the metadata pane. A whole ZIP can be
+  renamed, moved or sent to the Black Hole.
+- **An unplugged drive never deletes anything:** its ZIP frames show as missing until the drive is back.
 
-### Calibration
+### A real sky under the Sky Chart
 
-- **Fewer wrong matches.** Darks and flats of a different frame size are never linked to your lights.
-- **Fix links faster:** select several groups on the Calibration Coverage tab and re-assign or unlink them
-  together.
-- **Find the right master quickly** with the new Size column and Gain, Bin and Size filters.
-- **Masters can be saved as XISF** as well as FITS.
+- **See the sky behind your targets.** DSS colour and six narrowband surveys of the northern sky — the Northern
+  Sky Narrowband Survey by Stefan Ziegenbalg (RGB, Hα, [OIII], [SII] and two blends) — are drawn under the chart
+  as you browse and kept on your disk.
+- **Take it offline.** Download the whole sky ahead of time, with finer detail around your imaging locations and
+  the Messier objects. You see an estimate first, and you can cancel and resume later.
+- **Keeps drawing when a server is busy:** tiles come from every verified copy of a survey.
+- **A size limit for the sky tiles,** 10 GB by default. **Settings → Sky Chart** shows how much space they take
+  and clears them.
 
-### Settings
+## Changes
 
-- **Simpler and searchable.** Every change saves by itself — there is no Save button — and a search box
-  finds any setting.
-
-## Good to know after updating
-
-- **Click Re-Analyze on your frame sets once** to measure them the new way; until then a set shows its old
-  numbers. The first stack of each set also takes a little longer once. Nothing is calibrated twice.
-- **Numbers shift slightly.** Star sizes on colour cameras read smaller and star counts higher than before,
-  so take a quick look at your rejection limits.
-- **Collaboration projects start in manual mode.** Nothing is published until you choose to.
+- **The Sky Chart keeps its view** across pages, window resizes and restarts, and no longer slows down in a long
+  session.
+- **Black Hole: one delete button.** Select what you want gone and press **Send to Void**.
+- **Object page:** Duplicates, Unpack and Move to Archive sit at the end of the Lights toolbar, and one refresh
+  button beside the coordinates recomputes nights, sessions, centre and rotation.
+- **Plate-solve batches** count the frames finished and name the file being solved.
+- **Windows: link-mode export works without Developer Mode.** Where Windows refuses a link, the app makes a hard
+  link, or a copy where that is impossible, and the completion card counts each.
+- **About → Acknowledgements** credits the sky surveys.
 
 ## Bug Fixes
 
-- **Frames you moved to the Black Hole are now left out** of stacks, exports and frame sets sent to another
-  device. Before, some of them could still end up in the result — if you stacked or exported a set after
-  rejecting frames, run it again.
-- The stacking results show a realistic SNR gain; it used to read far too high.
-- The Export tab counts imaging nights correctly, and its folder preview no longer reshuffles.
-- Frame set cards show the right total exposure.
-- Colour cameras: hot pixels no longer make some frames count less than they should in the stack.
-- Some 16-bit FITS files and colour frames with an unusual Bayer layout now open with the right brightness
-  and colours.
-- A stack no longer fails to save its aligned frames when the reference frame has a very long file name.
+- **A frame stored twice is counted and stacked once.** Two copies of the same raw frame used to count twice in
+  Objects and weigh twice in a stack; the second copy now reads "duplicate — not used".
+- **Frame-set boxes on the Sky Chart point the right way.** They were mirrored, up to 27° off on some sets.
+- **Emptying the Black Hole with a filter on** could also delete the entries the filter hid. Send to Void deletes
+  only what you selected.
+- **The plate-solve batch progress** no longer runs a frame ahead, and in the web version it no longer closes at
+  once.
+
+## Good to know after updating
+
+- **The first stack after the update takes longer.** Each frame set re-measures its stars and re-aligns its
+  frames once; calibration is kept. Later stacks run at normal speed.
+- **Star numbers in a stack run read lower than before.** Compare frames within one run, not with older runs.
+  Runs stacked by earlier versions show "SNR gain —" until you stack them again.
+
+## Coming in 0.7.2
+
+- **Ask an AI assistant to work with your catalog.** Athenaeum will connect to AI assistants that support MCP,
+  such as Claude. Ask in plain words — "find my duplicate frames and plan what to send to the Black Hole", "fill
+  in the missing metadata" — then review the plan and apply it. Off until you turn it on.
+- **Frame and group weights from star photometry, measured against Gaia.** Athenaeum will compare the brightness
+  of each frame's stars with their Gaia catalog magnitudes, so it knows how much light the frame really collected.
+  A frame shot through haze or low in the sky gets the weight it deserves, and frames from different cameras,
+  telescopes and nights in a project are compared fairly by their equivalent exposure.
+
+## Coming in 0.7.3
+
+- **Mosaics.** A mosaic target becomes one object in your library, panels and all, and collaboration projects can
+  cover a mosaic, not just a single field.
+- **Athenaeum's stacking engine as an open library.** The stacking, registration and local normalization that
+  Athenaeum uses — already proven on real data — move into rustafits, our open-source image library, so anyone can
+  build them into their own tools and projects, vibe-coded ones included.
