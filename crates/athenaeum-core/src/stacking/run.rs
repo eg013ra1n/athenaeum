@@ -7988,6 +7988,9 @@ fn register_group_pass(
     // registrations whose artifact needs (re)writing — see the `reused`
     // branch below.
     let mut needs_artifact_rewrite: Vec<ArtifactRewriteItem> = Vec::new();
+    // Frame-level cache spec §5.5: the measurement hash is folded only for a frame whose registration reads
+    // `fits.0`; the gate derives the same flag (`plan::compute_register_stale`).
+    let prepare_path = crate::stacking::plan::subject_prepares(&rc.subject, &rc.origins);
     for (idx, frame, path, is_reference) in snapshot {
         let frame_hash = {
             let conn = db(&rc.ctx)?.conn();
@@ -7997,7 +8000,13 @@ fn register_group_pass(
         // `compute_register_stale` folds in — must match, or the gate and
         // the run disagree about whether a stored registration row is
         // fresh.
-        let frame_measurement_hash = group_measurement_hash(rc, &cfg, &group.key, &frame_hash);
+        let frame_measurement_hash = crate::stacking::plan::registration_measurement_fold(
+            &cfg,
+            group,
+            prepare_path,
+            &frame_hash,
+            rc.measured_groups.get(&group.key).and_then(|g| g.beta),
+        );
         let expected_hash = registration_hash_for(
             &cfg,
             reference_frame_id,

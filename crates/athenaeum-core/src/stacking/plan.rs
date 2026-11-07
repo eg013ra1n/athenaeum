@@ -790,13 +790,13 @@ fn gate_measure_betas(
 /// `measurement_hash_for(cfg, frame_calibrated_hash)` value, empty-string
 /// skipped as "not recorded" rather than folded in as some other frame's.
 ///
-/// The invalidation is uniform across BOTH mono and OSC frames, even though
-/// only mono frames ever actually read the `fits` artifact (OSC keeps the
-/// luminance detection, ruling C-6): a per-plane-count hash (folding the
-/// measurement hash in for mono only) would split this rule into two cases
-/// every caller has to get right for the SAME field, in exchange for
-/// sparing an OSC frame's `registration_results` row an invalidation it
-/// never needed — a far smaller cost than a second hash-construction path.
+/// The fold follows what the frame's registration READS (frame-level cache
+/// spec §5.5, reversing ruling C-18's "uniform across mono and OSC"): a
+/// frame whose registration reads Measure's `fits.0` (a 1-plane calibrated
+/// frame, [`register_reads_measure_fits`]) folds its measurement hash; a
+/// debayered OSC frame keeps its luminance detection, which reads only
+/// `cfg.registration` (already in `registration_subtree`), so its caller
+/// passes `""` and the group's beta no longer re-registers it.
 pub(crate) fn registration_hash_for(
     cfg: &StackingConfig,
     reference_frame_id: i64,
@@ -1160,6 +1160,45 @@ pub(crate) fn stage_one_planes(
         ColorMode::Osc if cfg.calibration.debayer_osc => 3,
         ColorMode::Osc if prepare_path && group.key.starts_with("osc__") => 3,
         ColorMode::Osc => 1,
+    }
+}
+
+/// Whether a run of this subject PREPARES its lights instead of calibrating them: a project, or a frame set whose
+/// lights are attested. The gate's `project.is_some() || readiness.attested`, derived from the subject and the frame
+/// origins so the run (which holds no readiness) reaches the same answer.
+pub(crate) fn subject_prepares(subject: &StackSubject, origins: &FrameOrigins) -> bool {
+    matches!(subject, StackSubject::Project(_))
+        || origins
+            .values()
+            .any(|o| matches!(o, FrameOrigin::Catalog { attested: true, .. }))
+}
+
+/// Whether a frame's registration reads Measure's `fits.0` artifact (frame-level cache spec §5.5): the group's
+/// stage-1 frames are one plane (`stage_one_planes == 1`: mono, or an OSC frame set calibrated with `debayerOsc`
+/// off, whose mosaic reads `fits.0`, `run.rs::resolve_register_fits`). Only then does the registration hash fold the
+/// measurement hash. NOT `run.rs::expected_stage_one_planes`, which always assumes the Prepare path.
+pub(crate) fn register_reads_measure_fits(
+    cfg: &StackingConfig,
+    group: &IntegrationGroup,
+    prepare_path: bool,
+) -> bool {
+    stage_one_planes(cfg, group, prepare_path) == 1
+}
+
+/// The `frame_measurement_hash` a caller hands [`registration_hash_for`]: the frame's [`measurement_hash_for`] at the
+/// group beta when its registration reads Measure's `fits.0` ([`register_reads_measure_fits`]), `""` (folded as
+/// nothing) otherwise. The one place the run and the gate decide it.
+pub(crate) fn registration_measurement_fold(
+    cfg: &StackingConfig,
+    group: &IntegrationGroup,
+    prepare_path: bool,
+    frame_calibrated_hash: &str,
+    group_beta: Option<f64>,
+) -> String {
+    if register_reads_measure_fits(cfg, group, prepare_path) {
+        measurement_hash_for(cfg, frame_calibrated_hash, group_beta)
+    } else {
+        String::new()
     }
 }
 
@@ -1788,6 +1827,7 @@ fn compute_register_stale(
     let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
         return Ok(true);
     };
+    let prepare_path = subject_prepares(subject, origins);
 
     let manual_reference = match reference.mode {
         ReferenceMode::Manual => {
@@ -1900,8 +1940,10 @@ fn compute_register_stale(
         // Ruling C-18: the same measurement hash `stacking::run` folds in
         // when it builds this frame's registration row — at the group β
         // `build_plan` resolved for the Measure check (Task 11b).
-        let frame_measurement_hash = measurement_hash_for(
+        let frame_measurement_hash = registration_measurement_fold(
             cfg,
+            group,
+            prepare_path,
             &frame_calib_hash,
             measure_betas.get(&group.key).copied(),
         );
@@ -11071,6 +11113,84 @@ mod tests {
         assert_eq!(second.project_frames.len(), first.project_frames.len());
         assert_eq!(second.config_hash, first.config_hash);
         writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A registration hash of one frame at a group beta, built the way both callers build it.
+    fn registration_hash_at_beta(
+        cfg: &StackingConfig,
+        group: &IntegrationGroup,
+        prepare_path: bool,
+        beta: f64,
+    ) -> String {
+        registration_hash_for(
+            cfg,
+            7,
+            "ref-calib",
+            "frame-calib",
+            &registration_measurement_fold(cfg, group, prepare_path, "frame-calib", Some(beta)),
+        )
+    }
+
+    fn registration_test_group(key: &str, color_mode: ColorMode) -> IntegrationGroup {
+        IntegrationGroup {
+            key: key.into(),
+            instrume: None,
+            color_mode,
+            filter: None,
+            binning: 1,
+            cameras: Vec::new(),
+            exposure_s: Some(300.0),
+            exposure_class: "st300".into(),
+            frames: Vec::new(),
+            total_exposure_s: 0.0,
+            pixel_scale_arcsec: None,
+        }
+    }
+
+    /// Frame-level cache spec §5.5: a debayered OSC frame's registration reads only `cfg.registration`, so the
+    /// group beta (a Measure product) no longer moves its registration hash.
+    #[test]
+    fn osc_registration_hash_ignores_the_group_beta() {
+        let cfg = StackingConfig::default();
+        assert!(cfg.calibration.debayer_osc);
+        let group = registration_test_group("osc__None__bin1__300s", ColorMode::Osc);
+        assert!(!register_reads_measure_fits(&cfg, &group, false));
+        assert_eq!(
+            registration_hash_at_beta(&cfg, &group, false, 1.5),
+            registration_hash_at_beta(&cfg, &group, false, 2.5)
+        );
+    }
+
+    /// A mono frame's registration reads `fits.0`, so the group beta keeps moving its hash (ruling C-6 / C-18).
+    #[test]
+    fn mono_registration_hash_follows_the_group_beta() {
+        let cfg = StackingConfig::default();
+        let group = registration_test_group("mono__L__bin1__300s", ColorMode::Mono);
+        assert!(register_reads_measure_fits(&cfg, &group, false));
+        assert_ne!(
+            registration_hash_at_beta(&cfg, &group, false, 1.5),
+            registration_hash_at_beta(&cfg, &group, false, 2.5)
+        );
+    }
+
+    /// A frame set's OSC group calibrated with `debayerOsc` off is a 1-plane mosaic that DOES read `fits.0`: its
+    /// hash follows the beta (and `expected_stage_one_planes`, which assumes Prepare, would have said otherwise).
+    #[test]
+    fn osc_without_debayer_registration_hash_follows_the_group_beta() {
+        let mut cfg = StackingConfig::default();
+        cfg.calibration.debayer_osc = false;
+        let group = registration_test_group("osc__None__bin1__300s", ColorMode::Osc);
+        assert!(register_reads_measure_fits(&cfg, &group, false));
+        assert_ne!(
+            registration_hash_at_beta(&cfg, &group, false, 1.5),
+            registration_hash_at_beta(&cfg, &group, false, 2.5)
+        );
+        // On the Prepare path the same `osc__` group is three planes and reads nothing.
+        assert!(!register_reads_measure_fits(&cfg, &group, true));
+        assert_eq!(
+            registration_hash_at_beta(&cfg, &group, true, 1.5),
+            registration_hash_at_beta(&cfg, &group, true, 2.5)
+        );
     }
 
     /// Plan 6b-3 D15 (the 6b-2 leftover): one rule for stage 1 and LN — an
