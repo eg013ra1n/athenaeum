@@ -335,6 +335,25 @@ contain forward slashes.
 - `FilterMappingDialog › focuses the first select once the sheet has loaded`
   (vitest) failed once in a whole run under load (2026-11-05, plan 6c Task 7)
   and passed alone; see "Collab wave 6c" below.
+- **A collab storage race on GitHub Linux, recurring: investigate, do not
+  re-run.** The v0.7.1 release commit d0023965 failed its Linux job twice
+  (2026-11-07, run 42377328811), each time on another collab test, both about
+  reading a file through the iroh store right after it was written or moved:
+  `api::collab_live::landing::tests::a_failed_direct_export_is_retried_through_a_temp_file`
+  ("unreadable through the store and copy repair is disabled", attempt 1;
+  passed 5 of 5 alone on the dev Mac) and
+  `api::collab_live::storage_task::tests::a_moved_file_is_readopted_by_hash_without_a_deletion`
+  ("left: Wanted, right: Held", attempt 2). Its sibling
+  `a_folder_renamed_unseen_in_degraded_mode_is_readopted_not_deleted` failed
+  the same way on 2026-11-04. The ticks are virtual time, so this is a race
+  between the readoption sweep and the store's path union, not a wall-clock
+  bound. None of `storage_task`, `landing`, `sharing/iroh`, `collab/storage`
+  or the iroh version changed since v0.7.0, so v0.7.0 carries it too. v0.7.1
+  was released on the owner's word with the tag gate reading the Windows job
+  only (`GATE_REQUIRED_CHECKS`, a push option on the tag). Start with the
+  readoption path: what the sweep reads from the store before the store has
+  taken the new path. Delete this entry when the race is fixed and a full
+  Linux run passes.
 
 ## Standing decisions — do not re-flag these
 
@@ -2475,94 +2494,5 @@ Known gap: republishing an `own_missing` frame that regenerates identical bytes 
 
 ## Release notes owed at the next tag
 
-Everything listed here up to v0.7.0 was paid in the v0.7.0 notes (2026-10-26). A cycle that
+Everything listed here up to v0.7.1 was paid in the v0.7.1 notes (2026-11-07). A cycle that
 lands adds its user-facing lines here, in engineering wording; the next release translates them for users.
-
-The cycles after the tag did not add theirs; the lines below were written on 2026-10-31 from `v0.7.0..0b89e4c4`.
-
-- **ZIP archives are part of the catalog.** A `.zip` on a scan root is scanned from its directory and entry headers only; its frames are ordinary
-  catalog rows ("zip" / "N of M in zip" chips in Objects), and preview, plate solve, Analysis, Blink, duplicate verify, stacking, master builds and
-  every export read them through an extraction cache (Settings → General → Archive: limit, status, Clear cache). Link-mode export copies zip frames.
-  Move and ZIP zips only the frames on disk; **Unpack from zip** writes a set's frames to disk for good; Unarchive extracts only the missing entries.
-  A zip opens read-only in the file browser, with each entry's header in the metadata pane; a whole zip can be renamed, moved, sent to the Black Hole
-  and voided, a single entry cannot. An unmounted share makes zip frames missing, never deleted.
-- **A frame held twice is counted and used once.** Two disk copies of one raw frame, or a disk copy and a zip entry, were two members of their set
-  (double counts in Objects, double weight in a stack, both copies in export and readiness). One copy is used now, disk before zip, and the other
-  reads "duplicate — not used".
-- **Black Hole: one delete button.** Empty Black Hole is gone (with a source filter on, it confirmed the filtered count and voided the hidden entries
-  too): select, then Send to Void. Send to Void rescans the folders it deleted from, so a voided unpacked copy returns its frame to the zip at once.
-- **Windows: link-mode export without Developer Mode.** Where Windows refuses a symbolic link (os error 1314) the export makes a hard link, and a
-  copy where a hard link is impossible (another volume, FAT/exFAT, a share); the completion card and the notification count each and point at
-  Developer Mode. Before, every disk frame ended as a "Failed to copy" warning.
-- **Sky Chart: a sky survey under the chart.** DSS colored tiles are fetched on demand and kept locally (Settings → General → Sky background; online
-  fetching can be turned off).
-- **Sky Chart offline pack.** The whole sky down to a chosen order (default 4) plus finer detail to order 6 around imaging locations, Messier
-  objects and, optionally, NGC/IC brighter than 10ᵐ, downloaded ahead for use without a network: an estimate before start, cancel and resume after a
-  restart, and a "Download for offline…" link in the chart's credit strip.
-- **The Sky Chart keeps its view** across page changes, window resizes and restarts, and no longer slows down over a long session (it was rebuilt on
-  every visit). Links frame the same area at any window width.
-- **Frame-set footprints are drawn right.** A set's center, rotation and box size come from its lights plate-solved by Athenaeum when it has any
-  (Black Hole lights left out, a circular mean for rotation, the box size from the solve), and the box turns the right way (it was mirrored: 27° off
-  on an M 31 set). The Sky Chart places sets by the new rule at once; the stored center and rotation on the object page and the Objects cards update
-  on the next metadata write or with the refresh button beside the coordinates.
-- **Object page:** Duplicates, Unpack and Move to Archive sit at the end of the Lights toolbar; the refresh beside the coordinates re-derives nights
-  and sessions and recomputes center and rotation, replacing the Recalculate nights button; the Duplicates page opens unfiltered.
-- **Plate-solve batch progress** counts frames finished out of the total and names the file being solved, instead of creeping on a timer and
-  running a frame ahead; a refused frame carries its file name into the failed list. In the web build the batch no longer closes at once and the
-  progress shows.
-
-Plan D (the stacking weight, 2026-11-02), in plain words for the translation; the exact versions are in the brackets:
-
-- **A frame's stacking weight follows how clear and how sharp the frame is, not its clipped stars.** The weight is now measured on the stars every frame of the group shows unclipped, so a soft frame no longer wins
-  weight from blur, and good-seeing frames on a clear sky count most. (The frame-common star set; `docs/stacking/README.md` R-OSP-18.)
-- **The per-frame star SNR in a stack run reads fewer stars, so its numbers are smaller than before.** Compare frames within one run, not with numbers from older runs.
-- **The SNR gain on the stack result was re-measured on the same shared stars.** Runs stored by earlier versions show "SNR gain —" until they are run again; a colour set shows the gain of each of its three
-  planes. (`SNR_GAIN_VERSION` 2.)
-- **The first stack after the update takes longer: every frame set re-measures its stars once.** Calibration is not redone, and the Analysis tab's star numbers refresh when a frame is re-analysed.
-  (`MEASURE_VERSION` 8, the Analysis rows too; the per-frame star files are version 3; a stackwork built at the unreleased 002cc8ea counts fresh.)
-- **Colour cameras: the brightness of stars on the red plane is read more accurately** (more of its bright stars are kept in the sample that sets the correction). (`c` on OSC, PD-9.)
-- **Two stars too close to separate are no longer measured as one wide star when stacking** (the Blend refusal, 0.7-1.2 % of the fits). (PD-10.)
-
-The robust quad seed (registration, 2026-11-03), in plain words for the translation:
-
-- **Very sharp frames registered onto a reference from another camera no longer land a few pixels off.** (`robust_quad_seed`, RQ-1.)
-- **A frame whose registration rests on a small patch of stars is now refused, or registered from its plate solve when it has one, instead of being stacked slightly misaligned.** (The coverage gate, RQ-10.)
-- **The first stack after the update re-registers every set once.** (`ALIGN_VERSION` 1; once for both this and Plan D's re-measure when they ship in one release.)
-
-Ready user wording for the robust quad seed (owner-approved 2026-11-03); its third line replaces Plan D's "first stack takes longer" line
-when both ship in one release:
-
-```
-### Stacking: frame alignment
-
-- **Sharper stars where the sharpest frames used to miss.** A few very sharp frames — most often when a set
-  is aligned to a reference frame from another camera — could land a few pixels off and soften the stars in
-  the stack. They now line up exactly. Frames that already aligned well are aligned exactly as before.
-- **A frame that can't be aligned reliably no longer blurs your stack.** If a frame's alignment rests on only
-  a small patch of stars, Athenaeum tries again from the frame's plate solution when it has one; if that does
-  not hold either, the frame is left out of the stack.
-- **The first stack after the update takes longer.** Each frame set re-measures its stars and re-aligns its
-  frames once; calibration is kept. Later stacks run at normal speed.
-```
-
-Sky Chart phase 3 (NSNS surveys and the tile cache limit, PR #22, 2026-11-05), in plain words for the translation; the exact names are in the brackets:
-
-- **Six narrowband sky surveys under the Sky Chart.** The Northern Sky Narrowband Survey by Stefan Ziegenbalg (RGB, [OIII]/Hα/[SII], Hα + continuum, Hα, [OIII] and [SII]) beside DSS colored,
-  for the northern ≈ 65 % of the sky (north of Dec −16°, black beyond it). Credited on the chart, in Settings and on the About page; free use only (CC BY-NC-SA 4.0). (The six NSNS DR0.2 8-bit
-  presets, `non_commercial`.)
-- **Survey tiles come from every verified copy of a survey, spread over the servers, so the chart keeps drawing when one server is down or busy.** (`hips::mirrors`, `hips::balance`; copies found
-  from the HiPS lists and the VO registry, kept in `hips/mirrors.json`.)
-- **An offline pack of a narrowband survey downloads only the detail the survey has, and its estimate counts only the sky it covers.** (Depth capped at the survey's deepest order, 5 for
-  `nsns-rgb8`; the estimate scaled by `moc_sky_fraction`.)
-- **The sky tiles kept while browsing have a size limit, 10 GB by default for all surveys together.** Past it, the tiles unused longest are deleted; an offline pack's tiles are kept. Settings →
-  General → Sky background shows the space the surveys take, with Clear all, and each survey's servers and offline-pack share. (`skychart.hips_cache_limit_gb`, `hips::cache`.)
-- **About → Acknowledgements credits the sky surveys:** HiPS, DSS colored, the Northern Sky Narrowband Survey and its GAVO mirror.
-
-The project grid's rotation and the turned Blink frame (2026-11-07, owner-asked for v0.7.1), in plain words for the translation:
-
-- **A project's grid lies the way your frames were shot.** A new grid proposal turns with the long side of the frame you pinned as
-  the reference, or of the best frame when none is pinned, instead of always putting north up; the card says which frame it follows,
-  and its rotation shows how far the grid is turned from north. A grid already confirmed stays as it is; the coordinator can turn it
-  with Change…. (`propose_grid`'s rotation, `ProposalRotation`.)
-- **Blink shows an aligned frame with its long side horizontal.** An aligned frame on a grid that stands taller than wide is turned
-  a quarter in Blink; the files and the master are unchanged. (`blink/imageFit.ts`.)
