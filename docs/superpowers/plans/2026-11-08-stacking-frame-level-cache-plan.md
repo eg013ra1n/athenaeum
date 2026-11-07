@@ -13,7 +13,7 @@ hashes stop folding fields that do not change their result (the grouping toleran
 registration stops folding the measurement hash; pass 1 survives a byte-identical recalibration and "Delete
 intermediates"; the two-pass dry pass caches its decision. One migration re-keys existing rows without moving files.
 
-**Tech Stack:** Rust (`athenaeum-core`), SQLite (`rusqlite`), no frontend change, no new command.
+**Tech Stack:** Rust (`athenaeum-core`), SQLite (`rusqlite`); one frontend removal (Task 13); no new command.
 
 **Spec:** `docs/superpowers/specs/2026-11-08-stacking-frame-level-cache-design.md` (items 1–8 = spec §5.1–§5.8).
 
@@ -369,6 +369,26 @@ gets "superseded by 2026-11-08 frame-level cache"; `docs/superpowers/open-items.
   Integrate. Folders and catalog copies under `~/.athenaeum-acc/` with a `REGISTRY.tsv` row; delete them once the
   result is recorded. A smoke that cannot run goes to `open-items.md`.
 - [ ] **Step 4:** docs as listed; commit `docs(stacking): the frame-level cache`.
+
+### Task 13: Remove the stale tolerance hint (frontend, `frontend-dev`)
+
+Added after the Task 1/3 review (I1). `src/components/stacking/GroupsTable.tsx:53-54` shows "The tolerance is part of
+the calibration hash: changing it re-calibrates this set's lights on the next run." for every calibrating set in
+`seconds` mode (`StackingTab.tsx` ~:1324). After Tasks 1 and 2 it is false, and it discourages the regroup this job
+makes cheap.
+
+**Files:** `src/components/stacking/GroupsTable.tsx`, `GroupsTable.test.tsx` (:21, :30-39, :113, :177-217),
+`StackingTab.tsx` (the `toleranceInCalibrationHash` prop), `StackingTab.test.tsx` (:44-47);
+`docs/stacking/README.md` (:1164-1166, :1672-1676).
+
+- [ ] Remove `RECALIBRATE_HINT`, the `toleranceInCalibrationHash` prop end to end, and the tests that pin the hint;
+  no replacement text. `npm run test -- GroupsTable StackingTab` and `npx tsc --noEmit` pass.
+- [ ] Rewrite the two README passages: the tolerance is no longer part of the calibration hash (spec §5.2).
+- [ ] Commit `fix(stacking-ui): the grouping tolerance no longer warns about recalibrating`.
+
+Known residual (I1 review, M1), recorded in spec §5.4 and `docs/superpowers/open-items.md` by Task 12: after a
+weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by weight and
+re-registers; the run's result is correct, the gate under-reports.
 
 ---
 
