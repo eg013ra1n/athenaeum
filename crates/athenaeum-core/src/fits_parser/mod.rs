@@ -464,7 +464,13 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
     let offset = header.get_f64("OFFSET");
     let xbinning = header.get_i32("XBINNING");
     let ybinning = header.get_i32("YBINNING");
-    let ccd_temp = header.get_f64("CCD-TEMP");
+    // Sensor temperature: `CCD-TEMP`, else `DET-TEMP` (smart telescopes such as
+    // the DWARF 3 write only the latter). An unparseable `CCD-TEMP` reads as
+    // absent. Kept in lock-step with the XISF path below and with
+    // `stored_header::snapshot_from_keys`.
+    let ccd_temp = header
+        .get_f64("CCD-TEMP")
+        .or_else(|| header.get_f64("DET-TEMP"));
     let set_temp = header.get_f64("SET-TEMP");
     let focallen = header.get_f64("FOCALLEN");
     let swcreate = header.get_str("SWCREATE");
@@ -775,8 +781,10 @@ fn parse_xisf_xml(content: &[u8], file_id: i64, path: &Path) -> Result<Frame> {
         .and_then(|s| s.parse::<i32>().ok())
         .or_else(|| xisf_properties.get("Instrument:Camera:YBinning")
             .and_then(|s| s.parse::<i32>().ok()));
+    // Same `CCD-TEMP` → `DET-TEMP` order as the FITS path.
     let ccd_temp = fits_keywords.get("CCD-TEMP")
-        .and_then(|s| s.parse::<f64>().ok());
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| fits_keywords.get("DET-TEMP").and_then(|s| s.parse::<f64>().ok()));
     let set_temp = fits_keywords.get("SET-TEMP")
         .and_then(|s| s.parse::<f64>().ok());
     let focallen = fits_keywords.get("FOCALLEN")
@@ -1400,6 +1408,85 @@ mod tests {
 
         let frame = parse_xisf(&path, 1).unwrap();
         assert_eq!(frame.bayerpat, None);
+    }
+
+    /// Sensor temperature: `CCD-TEMP` is the standard keyword, `DET-TEMP` the
+    /// one some smart telescopes write instead (DWARF 3, issue #21). The
+    /// scanner must land either in `frames.ccd_temp`, `CCD-TEMP` first.
+    fn fits_frame_with_cards(cards: &[&str]) -> Frame {
+        let header = header_with_cards(cards);
+        build_frame_from_header(&header, 1, std::path::Path::new("/tmp/test.fits")).unwrap()
+    }
+
+    #[test]
+    fn det_temp_alone_fills_ccd_temp() {
+        let frame = fits_frame_with_cards(&["DET-TEMP=                 -5.5 / sensor temperature"]);
+        assert_eq!(frame.ccd_temp, Some(-5.5));
+    }
+
+    #[test]
+    fn ccd_temp_outranks_det_temp() {
+        let frame = fits_frame_with_cards(&[
+            "CCD-TEMP=                -10.0 / CCD temperature",
+            "DET-TEMP=                 -5.5 / sensor temperature",
+        ]);
+        assert_eq!(frame.ccd_temp, Some(-10.0));
+    }
+
+    /// A `CCD-TEMP` that is present but not a number carries no temperature,
+    /// so the valid `DET-TEMP` is used rather than leaving the field empty.
+    #[test]
+    fn unparseable_ccd_temp_defers_to_det_temp() {
+        let frame = fits_frame_with_cards(&[
+            "CCD-TEMP= 'n/a     '           / not a number",
+            "DET-TEMP=                 -5.5 / sensor temperature",
+        ]);
+        assert_eq!(frame.ccd_temp, Some(-5.5));
+    }
+
+    #[test]
+    fn no_temperature_keyword_leaves_ccd_temp_unset() {
+        let frame = fits_frame_with_cards(&["EXPTIME =                120.0 / exposure"]);
+        assert_eq!(frame.ccd_temp, None);
+    }
+
+    /// `DET-TEMP` is the measured sensor temperature, not the cooling
+    /// set-point: it must not leak into `set_temp`.
+    #[test]
+    fn det_temp_does_not_set_set_temp() {
+        let frame = fits_frame_with_cards(&["DET-TEMP=                 -5.5 / sensor temperature"]);
+        assert_eq!(frame.set_temp, None);
+    }
+
+    fn xisf_frame_with_keywords(keywords: &[(&str, &str)]) -> Frame {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("temp.xisf");
+        write_xisf_with_keywords(&path, keywords);
+        parse_xisf(&path, 1).unwrap()
+    }
+
+    #[test]
+    fn xisf_det_temp_alone_fills_ccd_temp() {
+        let frame = xisf_frame_with_keywords(&[("DET-TEMP", "-5.5")]);
+        assert_eq!(frame.ccd_temp, Some(-5.5));
+    }
+
+    #[test]
+    fn xisf_ccd_temp_outranks_det_temp() {
+        let frame = xisf_frame_with_keywords(&[("CCD-TEMP", "-10.0"), ("DET-TEMP", "-5.5")]);
+        assert_eq!(frame.ccd_temp, Some(-10.0));
+    }
+
+    #[test]
+    fn xisf_unparseable_ccd_temp_defers_to_det_temp() {
+        let frame = xisf_frame_with_keywords(&[("CCD-TEMP", "'n/a'"), ("DET-TEMP", "-5.5")]);
+        assert_eq!(frame.ccd_temp, Some(-5.5));
+    }
+
+    #[test]
+    fn xisf_no_temperature_keyword_leaves_ccd_temp_unset() {
+        let frame = xisf_frame_with_keywords(&[("OBJECT", "'M33'")]);
+        assert_eq!(frame.ccd_temp, None);
     }
 }
 
