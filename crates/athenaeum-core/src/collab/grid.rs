@@ -22,6 +22,27 @@ pub struct CanonicalGrid {
     pub rotation_deg: f64,
 }
 
+/// Where a grid proposal's rotation comes from (owner ruling 2026-11-07): the long side of the frame pinned as
+/// the registration reference on this device, else of the accepted frame with the highest weight, else the
+/// frames' mean axis; north up when no frame has a WCS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum RotationSource {
+    Reference,
+    BestWeighted,
+    FramesMean,
+    NorthUp,
+}
+
+/// A grid proposal's rotation: where it comes from and the frame it follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalRotation {
+    pub source: RotationSource,
+    /// The file name of the frame whose long side the grid follows: `Some` for `reference` and `bestWeighted`.
+    pub file_name: Option<String>,
+}
+
 /// The hub's refusal text for a grid outside its bounds (athenaeum-hub
 /// `put_grid`), verbatim, so a local refusal reads as the hub's would.
 pub const GRID_INVALID_MSG: &str = "grid needs scaleArcsec in (0,100], widthPx/heightPx in [64,65536], crval1 in [0,360), crval2 in [-90,90], finite rotationDeg";

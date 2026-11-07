@@ -1127,7 +1127,7 @@ describe('StackingTab for a project', () => {
 
   describe('the grid card', () => {
     const GRID_PLAN = {
-      state: 'proposed', current: null, framesInside: 12, canEdit: true,
+      state: 'proposed', current: null, proposalRotation: null, framesInside: 12, canEdit: true,
       proposal: { scaleArcsec: 1.5, widthPx: 3200, heightPx: 2560, crval1: 83.82, crval2: -5.39, rotationDeg: 0 },
       target: { raDeg: 83.82, decDeg: -5.39, radiusDeg: 1 }, footprints: [], framesNotDrawn: 0,
     };
@@ -1261,7 +1261,7 @@ describe('StackingTab for a project', () => {
       projectWith({
         blockers: [NO_FRAMES], projectFrames: ELSEWHERE,
         grid: {
-          state: 'proposed', current: null, framesInside: 12, canEdit: true,
+          state: 'proposed', current: null, proposalRotation: null, framesInside: 12, canEdit: true,
           proposal: { scaleArcsec: 1.5, widthPx: 3200, heightPx: 2560, crval1: 83.82, crval2: -5.39, rotationDeg: 0 },
           target: { raDeg: 83.82, decDeg: -5.39, radiusDeg: 1 }, footprints: [], framesNotDrawn: 0,
         },

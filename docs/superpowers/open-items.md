@@ -2558,9 +2558,11 @@ Sky Chart phase 3 (NSNS surveys and the tile cache limit, PR #22, 2026-11-05), i
   General → Sky background shows the space the surveys take, with Clear all, and each survey's servers and offline-pack share. (`skychart.hips_cache_limit_gb`, `hips::cache`.)
 - **About → Acknowledgements credits the sky surveys:** HiPS, DSS colored, the Northern Sky Narrowband Survey and its GAVO mirror.
 
-The project grid's rotation (2026-11-07, owner-asked for v0.7.1), in plain words for the translation:
+The project grid's rotation and the turned Blink frame (2026-11-07, owner-asked for v0.7.1), in plain words for the translation:
 
-- **A project's grid keeps your frames' long side horizontal.** A new grid proposal turns with the members' frames instead of always
-  putting north up, so the project master and the aligned frames in Blink lie the way the frames were shot, and the grid wastes less
-  empty sky. A grid already confirmed stays as it is; the coordinator can turn it with Change…. (`propose_grid`'s rotation, the axial
-  mean of the frames' long axes.)
+- **A project's grid lies the way your frames were shot.** A new grid proposal turns with the long side of the frame you pinned as
+  the reference, or of the best frame when none is pinned, instead of always putting north up; the card says which frame it follows,
+  and its rotation shows how far the grid is turned from north. A grid already confirmed stays as it is; the coordinator can turn it
+  with Change…. (`propose_grid`'s rotation, `ProposalRotation`.)
+- **Blink shows an aligned frame with its long side horizontal.** An aligned frame on a grid that stands taller than wide is turned
+  a quarter in Blink; the files and the master are unchanged. (`blink/imageFit.ts`.)

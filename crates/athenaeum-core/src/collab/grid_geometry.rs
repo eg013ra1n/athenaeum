@@ -7,7 +7,7 @@
 use solvemyastro::wcs::WcsSolution;
 
 use crate::collab::frame_meta::ProjectFrameMeta;
-use crate::collab::grid::CanonicalGrid;
+use crate::collab::grid::{CanonicalGrid, ProposalRotation, RotationSource};
 
 pub struct GridTarget {
     pub ra_deg: f64,
@@ -39,12 +39,18 @@ impl FrameFootprint {
 
 /// One accepted frame as the proposal sees it.
 pub struct GridInput {
+    /// The frame's manifest uuid and file name, so the rotation can name the frame it follows. Empty from
+    /// [`grid_input_of`], which reads the metadata only; a proposal's caller fills them in.
+    pub frame_uuid: String,
+    pub file_name: String,
     pub pixel_scale_arcsec: Option<f64>,
+    /// `meta.snrWeight` when finite and positive.
+    pub weight: Option<f64>,
     pub footprint: Option<FrameFootprint>,
 }
 
-/// `meta`'s scale, and its footprint when it carries a WCS (SIP included)
-/// and its pixel size.
+/// `meta`'s scale and weight, and its footprint when it carries a WCS (SIP
+/// included) and its pixel size.
 pub fn grid_input_of(meta: &ProjectFrameMeta) -> GridInput {
     let footprint = match (&meta.wcs, meta.naxis1, meta.naxis2) {
         (Some(wcs), Some(w), Some(h)) if w > 0 && h > 0 => wcs
@@ -58,9 +64,12 @@ pub fn grid_input_of(meta: &ProjectFrameMeta) -> GridInput {
         _ => None,
     };
     GridInput {
+        frame_uuid: String::new(),
+        file_name: String::new(),
         pixel_scale_arcsec: meta
             .pixel_scale_arcsec
             .filter(|s| s.is_finite() && *s > 0.0),
+        weight: meta.snr_weight.filter(|w| w.is_finite() && *w > 0.0),
         footprint,
     }
 }
@@ -115,13 +124,18 @@ pub(crate) fn boundary_points(w: f64, h: f64) -> Vec<(f64, f64)> {
 /// - Scale: the median `pixelScaleArcsec` (even count: the mean of the two
 ///   middle ones), rounded to 0.01 arcsec. `None` when no frame has a scale,
 ///   or the rounded scale is outside the hub's `(0, 100]`.
-/// - Centre: the target. Rotation: the WCS frames' long axis
-///   ([`frames_rotation`]), so the frames lie wide on the grid.
+/// - Centre: the target. Rotation: the long side of one frame, so it lies
+///   wide on the grid ([`proposal_rotation`]: the frame pinned as the
+///   reference, else the best-weighted one, else the frames' mean axis).
 /// - Size: the bounding box, in the proposed (turned) TAN, of the WCS frames'
 ///   footprints, symmetric about the target and clipped to the target circle's
 ///   TAN radius, rounded up to a multiple of 64 and clamped to `[64, 65536]`.
 ///   With no WCS frame, a square of twice the radius.
-pub fn propose_grid(inputs: &[GridInput], target: &GridTarget) -> Option<CanonicalGrid> {
+pub fn propose_grid(
+    inputs: &[GridInput],
+    target: &GridTarget,
+    reference_uuid: Option<&str>,
+) -> Option<Proposal> {
     let mut scales: Vec<f64> = inputs.iter().filter_map(|i| i.pixel_scale_arcsec).collect();
     if scales.is_empty() {
         return None;
@@ -150,12 +164,10 @@ pub fn propose_grid(inputs: &[GridInput], target: &GridTarget) -> Option<Canonic
             rotation_deg,
         })
     };
-    let footprints: Vec<&FrameFootprint> =
-        inputs.iter().filter_map(|i| i.footprint.as_ref()).collect();
-    let rotation = frames_rotation(&footprints, &offsets(0.0));
+    let (rotation, source) = proposal_rotation(inputs, reference_uuid, &offsets(0.0));
     let tan = offsets(rotation);
     let (mut hx, mut hy, mut any) = (0.0f64, 0.0f64, false);
-    for fp in footprints {
+    for fp in inputs.iter().filter_map(|i| i.footprint.as_ref()) {
         for (x, y) in boundary_points(fp.width, fp.height) {
             let (ra, dec) = fp.wcs.pixel_to_sky(x, y);
             let (gx, gy) = tan.sky_to_pixel(ra, dec);
@@ -172,8 +184,8 @@ pub fn propose_grid(inputs: &[GridInput], target: &GridTarget) -> Option<Canonic
         (r_px, r_px)
     };
     let size = |half: f64| (((2.0 * half) / 64.0).ceil() as i64 * 64).clamp(64, 65536);
-    Some(
-        CanonicalGrid {
+    Some(Proposal {
+        grid: CanonicalGrid {
             scale_arcsec: scale,
             width_px: size(hx),
             height_px: size(hy),
@@ -182,16 +194,71 @@ pub fn propose_grid(inputs: &[GridInput], target: &GridTarget) -> Option<Canonic
             rotation_deg: rotation,
         }
         .normalized(),
+        rotation: source,
+    })
+}
+
+/// A proposal: the grid and where its rotation comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proposal {
+    pub grid: CanonicalGrid,
+    pub rotation: ProposalRotation,
+}
+
+/// The proposal's rotation and its source (owner ruling 2026-11-07). The grid turns with the long side of one
+/// frame with a footprint: the one `reference_uuid` names (the reference pinned on this device), else the one
+/// with the highest weight (ties: the lowest uuid). With no pinned frame and no weight, the frames' mean axis;
+/// with no footprint at all, north up.
+fn proposal_rotation(
+    inputs: &[GridInput],
+    reference_uuid: Option<&str>,
+    tan0: &WcsSolution,
+) -> (f64, ProposalRotation) {
+    let with_footprint = || inputs.iter().filter(|i| i.footprint.is_some());
+    let following = |input: &GridInput, source: RotationSource| {
+        let fp = input.footprint.as_ref().expect("filtered on a footprint");
+        (
+            frames_rotation(&[fp], tan0),
+            ProposalRotation {
+                source,
+                file_name: Some(input.file_name.clone()),
+            },
+        )
+    };
+    if let Some(reference) =
+        reference_uuid.and_then(|uuid| with_footprint().find(|i| i.frame_uuid == uuid))
+    {
+        return following(reference, RotationSource::Reference);
+    }
+    let best = with_footprint()
+        .filter_map(|i| i.weight.map(|w| (w, i)))
+        .max_by(|(a, x), (b, y)| a.total_cmp(b).then_with(|| y.frame_uuid.cmp(&x.frame_uuid)));
+    if let Some((_, best)) = best {
+        return following(best, RotationSource::BestWeighted);
+    }
+    let footprints: Vec<&FrameFootprint> = with_footprint()
+        .filter_map(|i| i.footprint.as_ref())
+        .collect();
+    let source = if footprints.is_empty() {
+        RotationSource::NorthUp
+    } else {
+        RotationSource::FramesMean
+    };
+    (
+        frames_rotation(&footprints, tan0),
+        ProposalRotation {
+            source,
+            file_name: None,
+        },
     )
 }
 
-/// The proposal's rotation (owner ask, 2026-11-07: a frame's long side stays horizontal on the master and in
-/// Aligned Blink). Each frame gives the axis from its centre along its long side (its x axis when square), mapped
-/// through its WCS onto `tan0`, the proposal's TAN at rotation 0. A grid turned by `theta` turns every pixel
-/// vector by `+theta`, so an axis at `phi` lies horizontal at `theta = -phi` (mod 180 degrees). The axes are
-/// averaged as doubled angles (axes at 80 and 100 degrees share 90, not 0), summed in sorted order so the result
-/// does not depend on frame order, kept within (-90, 90] (north as near the top as the frames allow) and rounded
-/// to 0.01 degree. 0 with no WCS frame, or when the axes cancel.
+/// The rotation that lays `footprints`' long side horizontal. Each frame gives the axis from its centre along its
+/// long side (its x axis when square), mapped through its WCS onto `tan0`, the proposal's TAN at rotation 0. A
+/// grid turned by `theta` turns every pixel vector by `+theta`, so an axis at `phi` lies horizontal at
+/// `theta = -phi` (mod 180 degrees). Several axes are averaged as doubled angles (axes at 80 and 100 degrees share
+/// 90, not 0), summed in sorted order so the result does not depend on frame order. Kept within (-90, 90] (north
+/// as near the top as the frames allow) and rounded to 0.01 degree; 0 with no frame, or when the axes cancel.
 fn frames_rotation(footprints: &[&FrameFootprint], tan0: &WcsSolution) -> f64 {
     let mut doubled: Vec<f64> = footprints
         .iter()
@@ -273,6 +340,21 @@ mod tests {
     use super::*;
     use crate::collab::frame_meta::{ManifestWcs, ProjectFrameMeta};
 
+    /// The proposal's grid with no reference pinned.
+    fn proposed(inputs: &[GridInput], target: &GridTarget) -> Option<CanonicalGrid> {
+        propose_grid(inputs, target, None).map(|p| p.grid)
+    }
+
+    /// [`grid_input_of`] named and weighted as a proposal's caller fills it in.
+    fn named(m: &ProjectFrameMeta, uuid: &str, weight: Option<f64>) -> GridInput {
+        GridInput {
+            frame_uuid: uuid.to_string(),
+            file_name: format!("{uuid}.fits"),
+            weight,
+            ..grid_input_of(m)
+        }
+    }
+
     const TARGET: GridTarget = GridTarget {
         ra_deg: 10.5,
         dec_deg: 41.25,
@@ -324,24 +406,24 @@ mod tests {
             .iter()
             .map(|s| grid_input_of(&scale_only(*s)))
             .collect();
-        assert_eq!(propose_grid(&inputs, &TARGET).unwrap().scale_arcsec, 1.88);
+        assert_eq!(proposed(&inputs, &TARGET).unwrap().scale_arcsec, 1.88);
         let even: Vec<GridInput> = [1.0, 2.0]
             .iter()
             .map(|s| grid_input_of(&scale_only(*s)))
             .collect();
-        assert_eq!(propose_grid(&even, &TARGET).unwrap().scale_arcsec, 1.5);
+        assert_eq!(proposed(&even, &TARGET).unwrap().scale_arcsec, 1.5);
         let none = vec![grid_input_of(&ProjectFrameMeta {
             exptime_sec: 1.0,
             ..ProjectFrameMeta::default()
         })];
-        assert_eq!(propose_grid(&none, &TARGET), None);
+        assert_eq!(proposed(&none, &TARGET), None);
     }
 
     /// No frame with a WCS: a square of twice the target circle's TAN radius,
     /// rounded up to 64 — 1° at 2″/px is 1800.18 px, so 3600.4 → 3648.
     #[test]
     fn without_a_wcs_the_grid_is_the_target_square() {
-        let g = propose_grid(&[grid_input_of(&scale_only(2.0))], &TARGET).unwrap();
+        let g = proposed(&[grid_input_of(&scale_only(2.0))], &TARGET).unwrap();
         assert_eq!((g.width_px, g.height_px), (3648, 3648));
         assert_eq!((g.crval1, g.crval2, g.rotation_deg), (10.5, 41.25, 0.0));
     }
@@ -351,13 +433,13 @@ mod tests {
     #[test]
     fn the_size_is_the_footprint_box_clipped_to_the_target_circle() {
         let inputs = vec![grid_input_of(&meta(10.5, 41.25, 100, 80, Some(2.0)))];
-        let g = propose_grid(&inputs, &TARGET).unwrap();
+        let g = proposed(&inputs, &TARGET).unwrap();
         assert_eq!((g.width_px, g.height_px), (128, 128));
         let tiny = GridTarget {
             radius_deg: 0.01,
             ..TARGET
         };
-        let g = propose_grid(&inputs, &tiny).unwrap();
+        let g = proposed(&inputs, &tiny).unwrap();
         assert_eq!(
             (g.width_px, g.height_px),
             (64, 64),
@@ -370,7 +452,7 @@ mod tests {
     #[test]
     fn the_grid_turns_so_the_frames_long_side_is_horizontal() {
         let inputs = vec![grid_input_of(&turned(10.5, 41.25, 200, 80, 90.0))];
-        let g = propose_grid(&inputs, &TARGET).unwrap();
+        let g = proposed(&inputs, &TARGET).unwrap();
         assert_eq!(g.rotation_deg, 90.0);
         assert_eq!((g.width_px, g.height_px), (256, 128));
     }
@@ -389,7 +471,7 @@ mod tests {
             (200, 80, 12.3456, 12.35),
         ] {
             let inputs = vec![grid_input_of(&turned(10.5, 41.25, w, h, angle))];
-            let g = propose_grid(&inputs, &TARGET).unwrap();
+            let g = proposed(&inputs, &TARGET).unwrap();
             assert_eq!(g.rotation_deg, expected, "{w}x{h} at {angle}");
         }
     }
@@ -403,11 +485,88 @@ mod tests {
                 grid_input_of(&turned(10.5, 41.25, 200, 80, a)),
                 grid_input_of(&turned(10.5, 41.25, 200, 80, b)),
             ];
-            propose_grid(&inputs, &TARGET).unwrap().rotation_deg
+            proposed(&inputs, &TARGET).unwrap().rotation_deg
         };
         assert_eq!(pair(80.0, 100.0), 90.0);
         assert_eq!(pair(10.0, 170.0), 0.0);
         assert_eq!(pair(20.0, 40.0), 30.0);
+    }
+
+    /// Owner ruling 2026-11-07: the grid follows the pinned reference frame's long side, else the best-weighted
+    /// frame's, and says which frame it follows.
+    #[test]
+    fn the_rotation_follows_the_reference_else_the_best_weighted_frame() {
+        let inputs = vec![
+            named(&turned(10.5, 41.25, 200, 80, 30.0), "a", Some(5.0)),
+            named(&turned(10.5, 41.25, 200, 80, 60.0), "b", Some(10.0)),
+            named(&scale_only(2.0), "c", Some(99.0)),
+        ];
+        let pinned = propose_grid(&inputs, &TARGET, Some("a")).unwrap();
+        assert_eq!(pinned.grid.rotation_deg, 30.0);
+        assert_eq!(
+            pinned.rotation,
+            ProposalRotation {
+                source: RotationSource::Reference,
+                file_name: Some("a.fits".into())
+            }
+        );
+        let best = propose_grid(&inputs, &TARGET, None).unwrap();
+        assert_eq!(best.grid.rotation_deg, 60.0, "c weighs most but has no WCS");
+        assert_eq!(
+            best.rotation,
+            ProposalRotation {
+                source: RotationSource::BestWeighted,
+                file_name: Some("b.fits".into())
+            }
+        );
+        let unsolved_pin = propose_grid(&inputs, &TARGET, Some("c")).unwrap();
+        assert_eq!(unsolved_pin.rotation.source, RotationSource::BestWeighted);
+        let unknown_pin = propose_grid(&inputs, &TARGET, Some("gone")).unwrap();
+        assert_eq!(unknown_pin.grid.rotation_deg, 60.0);
+    }
+
+    /// Equal weights pick the lowest uuid, so the proposal does not depend on frame order.
+    #[test]
+    fn a_weight_tie_picks_the_lowest_uuid() {
+        let a = named(&turned(10.5, 41.25, 200, 80, 20.0), "a", Some(7.0));
+        let b = named(&turned(10.5, 41.25, 200, 80, 40.0), "b", Some(7.0));
+        let p = propose_grid(&[b, a], &TARGET, None).unwrap();
+        assert_eq!(p.grid.rotation_deg, 20.0);
+        assert_eq!(p.rotation.file_name.as_deref(), Some("a.fits"));
+    }
+
+    /// No weight anywhere: the frames' mean axis, naming no frame; no WCS frame: north up.
+    #[test]
+    fn without_weights_the_mean_and_without_a_wcs_north_up() {
+        let unweighted = vec![
+            named(&turned(10.5, 41.25, 200, 80, 20.0), "a", None),
+            named(&turned(10.5, 41.25, 200, 80, 40.0), "b", None),
+        ];
+        let p = propose_grid(&unweighted, &TARGET, None).unwrap();
+        assert_eq!(p.grid.rotation_deg, 30.0);
+        assert_eq!(
+            p.rotation,
+            ProposalRotation {
+                source: RotationSource::FramesMean,
+                file_name: None
+            }
+        );
+        let p = propose_grid(&[named(&scale_only(2.0), "c", Some(3.0))], &TARGET, None).unwrap();
+        assert_eq!(p.grid.rotation_deg, 0.0);
+        assert_eq!(p.rotation.source, RotationSource::NorthUp);
+    }
+
+    /// `meta.snrWeight` reaches the input only when finite and positive.
+    #[test]
+    fn the_weight_is_the_manifests_snr_weight() {
+        let weighted = |w: Option<f64>| ProjectFrameMeta {
+            snr_weight: w,
+            ..scale_only(2.0)
+        };
+        assert_eq!(grid_input_of(&weighted(Some(170.6))).weight, Some(170.6));
+        for bad in [Some(0.0), Some(-1.0), Some(f64::NAN), None] {
+            assert_eq!(grid_input_of(&weighted(bad)).weight, None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -416,7 +575,7 @@ mod tests {
         let b = meta(10.52, 41.25, 100, 80, Some(2.1));
         let c = scale_only(1.9);
         let d = turned(10.51, 41.25, 100, 80, 33.3);
-        let forward = propose_grid(
+        let forward = proposed(
             &[
                 grid_input_of(&a),
                 grid_input_of(&b),
@@ -425,7 +584,7 @@ mod tests {
             ],
             &TARGET,
         );
-        let reverse = propose_grid(
+        let reverse = proposed(
             &[
                 grid_input_of(&d),
                 grid_input_of(&c),
@@ -492,9 +651,9 @@ mod tests {
     #[test]
     fn a_rounded_scale_outside_the_hubs_range_proposes_nothing() {
         let inputs = vec![grid_input_of(&scale_only(0.004))];
-        assert_eq!(propose_grid(&inputs, &TARGET), None);
+        assert_eq!(proposed(&inputs, &TARGET), None);
         let huge = vec![grid_input_of(&scale_only(100.006))];
-        assert_eq!(propose_grid(&huge, &TARGET), None);
+        assert_eq!(proposed(&huge, &TARGET), None);
     }
 
     /// A frame shifted north by half its height covers exactly 8 of 16 rows,

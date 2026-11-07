@@ -833,6 +833,7 @@ pub(crate) mod tests {
             aperture: None,
             instrume: Some("cam".into()),
             wcs: None,
+            snr_weight: None,
         };
         let r = SolveRequest::for_frame(7, Path::new("/w/p.fits"), &meta, Some((83.8, -5.4)));
         assert_eq!(r.handle, 7);

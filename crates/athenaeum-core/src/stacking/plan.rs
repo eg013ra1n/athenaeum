@@ -287,6 +287,9 @@ pub struct PlanGrid {
     pub state: GridState,
     pub current: Option<crate::collab::grid::CanonicalGrid>,
     pub proposal: Option<crate::collab::grid::CanonicalGrid>,
+    // Where the proposal's rotation comes from and the frame it follows; `None` exactly when there is no
+    // proposal.
+    pub proposal_rotation: Option<crate::collab::grid::ProposalRotation>,
     // Stackable frames with a WCS at least half inside the grid in use
     // (the confirmed one, else the proposal).
     pub frames_inside: usize,
@@ -2636,15 +2639,25 @@ fn project_inputs(
     let all_inputs: Vec<GridInput> = source
         .frames
         .iter()
-        .filter_map(|f| f.meta.as_ref())
-        .map(grid_input_of)
+        .filter_map(|f| {
+            f.meta.as_ref().map(|m| GridInput {
+                frame_uuid: f.frame_uuid.clone(),
+                file_name: f.file_name.clone(),
+                ..grid_input_of(m)
+            })
+        })
         .collect();
     let target = GridTarget {
         ra_deg: project.target_ra_deg,
         dec_deg: project.target_dec_deg,
         radius_deg: project.target_radius_deg,
     };
-    let proposal = propose_grid(&all_inputs, &target);
+    // The reference pinned on this device turns the proposal (owner ruling 2026-11-07).
+    let pinned = crate::db::stacking::get_project_config(conn, project_id)?
+        .and_then(|c| c.reference_frame_uuid);
+    let proposed = propose_grid(&all_inputs, &target, pinned.as_deref());
+    let proposal = proposed.as_ref().map(|p| p.grid);
+    let proposal_rotation = proposed.map(|p| p.rotation);
     let (footprints, frames_not_drawn) = grid_footprints(&source.frames);
     let state = match (&current, &proposal) {
         (Some(_), _) => GridState::Confirmed,
@@ -2879,6 +2892,7 @@ fn project_inputs(
                 state,
                 current,
                 proposal,
+                proposal_rotation,
                 frames_inside,
                 can_edit,
                 target: PlanGridTarget {

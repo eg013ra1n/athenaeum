@@ -2,7 +2,7 @@
 // `collab::grid_geometry::grid_wcs` + `WcsSolution::sky_to_pixel` (no SIP: the grid has none), 0-based pixels, and
 // is pinned to Task 1b's golden file to 1e-6 px. Nothing here decides what a run does: the Rust side owns that.
 
-import type { CanonicalGrid } from '../../types/models';
+import type { CanonicalGrid, ProposalRotation } from '../../types/models';
 
 /** A position in the grid's 0-based pixel frame (the frame is BOTTOM-UP: y grows toward north at rotation 0). */
 export interface GridPixel {
@@ -97,6 +97,20 @@ export function fixed(n: number, digits: number): string {
 export function fieldOfView(grid: CanonicalGrid): string {
   const deg = (px: number) => trimmed((px * grid.scaleArcsec) / 3600, 2);
   return `${deg(grid.widthPx)}° × ${deg(grid.heightPx)}°`;
+}
+
+/** Where a proposal's rotation comes from (owner ruling 2026-11-07): the frame whose long side the grid follows. */
+export function proposalRotationLine(rotation: ProposalRotation): string {
+  switch (rotation.source) {
+    case 'reference':
+      return `Follows the reference frame ${rotation.fileName ?? ''}`.trimEnd();
+    case 'bestWeighted':
+      return `Follows the best-weighted frame ${rotation.fileName ?? ''}`.trimEnd();
+    case 'framesMean':
+      return "Follows the frames' average orientation";
+    case 'northUp':
+      return 'North up: no frame has a plate solution';
+  }
 }
 
 /** The grid's values on one line: scale, size and field of view, centre, rotation. The scale reads 2 decimals and the

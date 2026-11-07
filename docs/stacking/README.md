@@ -1403,7 +1403,8 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     plate-solved; the grid needs one".
 - **The canonical grid** is described in `docs/transfers/README.md` (wave 6b-2).
   **Orientation:** the grid is sky-standard (east left of north, det(CD) < 0), turned
-  by its rotation, which a proposal takes from the frames' long side (2026-11-07).
+  by its rotation, which a proposal takes from the long side of the pinned reference
+  or the best-weighted frame (2026-11-07; the rule is in the transfers reference).
   Every solve in the owner's catalog has det(CD) > 0, so a master on the grid is
   the mirror image of a raw frame, which is correct on the sky. 6b-3 must not
   copy the reference's `ROWORDER` onto a grid master.
@@ -1869,6 +1870,11 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     originals. The star overlay and the flat contour are drawn on the original's pixel grid, so both are off in Aligned
     mode. A failed verdict call opens Blink with originals and a warning notification (`Aligned frames are unavailable`). A
     failed aligned decode is shown as an error, with no silent fall back to the original.
+  - **A tall aligned frame lies wide (owner, 2026-11-07).** In Aligned mode an image taller than wide (a project grid
+    standing upright, e.g. frames shot with their long side north-south on a north-up grid) is drawn turned a quarter
+    clockwise, so its long side is horizontal. Display only: the file, the master and the grid are unchanged, the turn
+    is the same for every frame of one grid so the stars stay still, the mirror of a grid frame is kept, and Original
+    mode never turns. `src/components/blink/imageFit.ts`.
   - **Stars on a project's frames (fix, 2026-11-07).** A project entry is asked for by uuid and carries no catalog frame
     id, so the overlay used to load nothing for any project frame, silently. Every project entry now carries a
     `starsRef` (`{ projectId, frame }`), and Blink loads an entry's stars by its catalog frame id when it has one, else

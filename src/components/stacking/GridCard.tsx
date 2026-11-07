@@ -10,7 +10,7 @@ import { KV } from '../ui/KV';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { GridDialog, errorText } from './GridDialog';
 import { GridSchematic, type GridReference } from './GridSchematic';
-import { gridValuesLine } from './gridProjection';
+import { gridValuesLine, proposalRotationLine } from './gridProjection';
 import type { CanonicalGrid } from '../../types/models';
 import type { PlanGrid, PlanGridTarget } from '../../types/stacking';
 
@@ -84,6 +84,7 @@ export function GridCard({ projectId, grid, reference = null, onSaved }: GridCar
     facts.push(['Grid', gridValuesLine(current)]);
   } else if (proposal !== null) {
     facts.push(['Proposal', gridValuesLine(proposal)]);
+    if (grid.proposalRotation !== null) facts.push(['Rotation', proposalRotationLine(grid.proposalRotation)]);
     if (canEdit) facts.push([
         'Frames',
         grid.framesInside === 1

@@ -224,6 +224,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::db::collab::PublishMode,
             crate::api::collab::ProjectCard,
             crate::collab::grid::CanonicalGrid,
+            crate::collab::grid::RotationSource,
+            crate::collab::grid::ProposalRotation,
             crate::api::collab_grid::GridProposal,
             crate::api::collab_grid::CollabGridChanged,
             crate::api::collab::ProjectDetail,
@@ -396,7 +398,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::rustafits_processor::AnnotationSettings,
         ]))),
         ("stacking.ts", js_safe_ints(format!(
-            "{HEADER}import type {{ CanonicalGrid, ExportReadiness, FlatNormMode, LightCalParams, PathSetting }} from './models';\n\n{}",
+            "{HEADER}import type {{ CanonicalGrid, ExportReadiness, FlatNormMode, LightCalParams, PathSetting, ProposalRotation }} from './models';\n\n{}",
             decls![
             crate::resample::Interpolation,
             crate::stacking::prefilter::SeedPrefilter,

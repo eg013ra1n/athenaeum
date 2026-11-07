@@ -1824,7 +1824,15 @@ publishingHere: boolean, };
 
 export type CanonicalGrid = { scaleArcsec: number, widthPx: number, heightPx: number, crval1: number, crval2: number, rotationDeg: number, };
 
-export type GridProposal = { current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, };
+export type RotationSource = "reference" | "bestWeighted" | "framesMean" | "northUp";
+
+export type ProposalRotation = { source: RotationSource, 
+/**
+ * The file name of the frame whose long side the grid follows: `Some` for `reference` and `bestWeighted`.
+ */
+fileName: string | null, };
+
+export type GridProposal = { current: CanonicalGrid | null, proposal: CanonicalGrid | null, proposalRotation: ProposalRotation | null, framesInside: number, canEdit: boolean, };
 
 export type CollabGridChanged = { projectId: string, };
 

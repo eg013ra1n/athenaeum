@@ -56,7 +56,8 @@ const FOOTPRINTS: PlanGridFootprint[] = [
 ];
 
 const planGrid = (state: GridState, over: Partial<PlanGrid> = {}): PlanGrid => ({
-  state, current: state === 'confirmed' ? GRID : null, proposal: PROPOSAL, framesInside: 12, canEdit: true,
+  state, current: state === 'confirmed' ? GRID : null, proposal: PROPOSAL,
+  proposalRotation: { source: 'bestWeighted', fileName: 'L_0042.fits' }, framesInside: 12, canEdit: true,
   target: TARGET, footprints: FOOTPRINTS, framesNotDrawn: 0, ...over,
 });
 
@@ -473,6 +474,25 @@ describe('GridCard', () => {
     expect(screen.getByRole('button', { name: 'Edit…' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: 'Change…' })).toBeNull();
     expect(screen.getByTestId('grid-schematic')).toBeInTheDocument();
+  });
+
+  it('says which frame the proposal turns with', () => {
+    const line = (proposalRotation: PlanGrid['proposalRotation']) => {
+      const { unmount } = card(planGrid('proposed', { proposalRotation }));
+      const text = screen.getByText('Rotation').nextSibling?.textContent ?? null;
+      unmount();
+      return text;
+    };
+    expect(line({ source: 'reference', fileName: 'L_0007.fits' })).toBe('Follows the reference frame L_0007.fits');
+    expect(line({ source: 'bestWeighted', fileName: 'L_0042.fits' })).toBe('Follows the best-weighted frame L_0042.fits');
+    expect(line({ source: 'framesMean', fileName: null })).toBe("Follows the frames' average orientation");
+    expect(line({ source: 'northUp', fileName: null })).toBe('North up: no frame has a plate solution');
+  });
+
+  it('names no rotation source for a confirmed grid', () => {
+    card(planGrid('confirmed'));
+    expect(screen.queryByText('Rotation')).toBeNull();
+    expect(screen.queryByText(/Follows the/)).toBeNull();
   });
 
   it('counts the accepted frames inside in the singular for one', () => {

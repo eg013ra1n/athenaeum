@@ -1,7 +1,7 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
-import type { CanonicalGrid, ExportReadiness, FlatNormMode, LightCalParams, PathSetting } from './models';
+import type { CanonicalGrid, ExportReadiness, FlatNormMode, LightCalParams, PathSetting, ProposalRotation } from './models';
 
 export type Interpolation = "nearest" | "bilinear" | "bicubicSpline" | "bicubicBSpline" | "lanczos3" | "lanczos4" | "mitchellNetravali";
 
@@ -408,7 +408,7 @@ export type PlanGridTarget = { raDeg: number, decDeg: number, radiusDeg: number,
 
 export type PlanGridFootprint = { frameUuid: string, publisherAccountId: string, publisher: string, filterCanonical: string, outline: Array<[number, number]>, };
 
-export type PlanGrid = { state: GridState, current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, target: PlanGridTarget, footprints: Array<PlanGridFootprint>, framesNotDrawn: number, };
+export type PlanGrid = { state: GridState, current: CanonicalGrid | null, proposal: CanonicalGrid | null, proposalRotation: ProposalRotation | null, framesInside: number, canEdit: boolean, target: PlanGridTarget, footprints: Array<PlanGridFootprint>, framesNotDrawn: number, };
 
 export type PlanPrepare = { inPlace: number, debayered: number, converted: number, unsupported: number, atRun: number, };
 

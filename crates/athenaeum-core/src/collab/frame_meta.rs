@@ -192,6 +192,9 @@ pub struct ProjectFrameMeta {
     pub aperture: Option<f64>,
     pub instrume: Option<String>,
     pub wcs: Option<ManifestWcs>,
+    /// The publisher's Analysis weight of the frame (`meta.snrWeight`); the grid proposal turns with the
+    /// best-weighted frame when no reference is pinned.
+    pub snr_weight: Option<f64>,
 }
 
 /// `meta.wcs` as [`build_frame_meta`] writes it: TAN (no CTYPE), `crpix`
@@ -241,6 +244,7 @@ struct MetaWire {
     aperture: Option<f64>,
     instrume: Option<String>,
     wcs: Option<ManifestWcs>,
+    snr_weight: Option<f64>,
 }
 
 /// Parse one manifest row (plan 6b-2 C4). A missing exposure or a malformed
@@ -261,6 +265,7 @@ pub fn parse_project_frame_meta(manifest_json: &str) -> Result<ProjectFrameMeta>
         aperture: meta.aperture,
         instrume: meta.instrume,
         wcs: meta.wcs,
+        snr_weight: meta.snr_weight,
     })
 }
 

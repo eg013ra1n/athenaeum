@@ -20,6 +20,7 @@ import { isTopOverlay, popOverlay, pushOverlay } from "./ui/overlayStack";
 import { useBlinkProjectMode } from "./blink/useBlinkProjectMode";
 
 import type { BlinkFrame, BlinkViewerProps, SortField, SortDirection } from "./blink/types";
+import { drawFitted, imageFit } from "./blink/imageFit";
 
 /** Normalize a JPEG payload from either backend.
  *
@@ -382,28 +383,15 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx || (ctx as any).isContextLost?.()) return;
 
-    const imgWidth = img.width;
-    const imgHeight = img.height;
-    if (!imgWidth || !imgHeight) return;
-
-    const canvasAspect = canvas.width / canvas.height;
-    const imageAspect = imgWidth / imgHeight;
-    if (!isFinite(canvasAspect) || !isFinite(imageAspect)) return;
-
-    // Fit-to-view base dimensions (zoom 1.0)
-    let baseWidth: number, baseHeight: number;
-    if (imageAspect > canvasAspect) {
-      baseWidth = canvas.width;
-      baseHeight = canvas.width / imageAspect;
-    } else {
-      baseHeight = canvas.height;
-      baseWidth = canvas.height * imageAspect;
-    }
-    imageSizeRef.current = { width: baseWidth, height: baseHeight };
+    // Fit-to-view base dimensions (zoom 1.0). An aligned frame taller than wide (a project grid standing upright)
+    // is drawn turned a quarter, its long side horizontal.
+    const fit = imageFit(canvas.width, canvas.height, img.width, img.height, alignedActiveRef.current);
+    if (!fit) return;
+    imageSizeRef.current = { width: fit.width, height: fit.height };
 
     const zoom = zoomRef.current;
-    const renderWidth = baseWidth * zoom;
-    const renderHeight = baseHeight * zoom;
+    const renderWidth = fit.width * zoom;
+    const renderHeight = fit.height * zoom;
     const centerX = canvas.width / 2 + panRef.current.x;
     const centerY = canvas.height / 2 + panRef.current.y;
     const offsetX = centerX - renderWidth / 2;
@@ -412,7 +400,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     // Draw base image
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
+    drawFitted(ctx, img, fit, centerX, centerY, zoom);
+    // The stars are drawn on the original's pixel grid, never on a turned frame.
+    if (fit.turned) return;
 
     // Draw star overlay if annotations are enabled (read from refs for stability)
     if (!showAnnotationsRef.current) return;

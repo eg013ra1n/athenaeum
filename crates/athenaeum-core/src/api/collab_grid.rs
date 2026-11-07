@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use crate::account::AccountClientError;
 use crate::api::collab::{client_err, has_cap, internal};
 use crate::api::{db, ApiError};
-use crate::collab::grid::CanonicalGrid;
+use crate::collab::grid::{CanonicalGrid, ProposalRotation};
 use crate::collab::grid_geometry::{
     count_inside, grid_input_of, propose_grid, GridInput, GridTarget,
 };
@@ -28,7 +28,8 @@ pub struct CollabGridChanged {
 }
 
 /// What `get_collab_grid_proposal` answers (spec §9.1): the confirmed
-/// grid, the proposal from the whole manifest, how many accepted frames with
+/// grid, the proposal from the whole manifest and where its rotation comes
+/// from, how many accepted frames with
 /// a WCS lie at least half inside the proposal, and whether this account may
 /// save a grid. `proposal` is `None` when no accepted frame carries a pixel
 /// scale, and also when the median scale rounds outside the hub's `(0, 100]`
@@ -38,6 +39,7 @@ pub struct CollabGridChanged {
 pub struct GridProposal {
     pub current: Option<CanonicalGrid>,
     pub proposal: Option<CanonicalGrid>,
+    pub proposal_rotation: Option<ProposalRotation>,
     pub frames_inside: usize,
     pub can_edit: bool,
 }
@@ -60,8 +62,9 @@ pub fn stored_grid(conn: &Connection, project_id: &str) -> Result<Option<Canonic
 
 /// The proposal's inputs: every published, accepted frame of the manifest
 /// mirror (spec §6.2 — the whole manifest, so every device proposes the same
-/// grid for one manifest version), in `frame_uuid` order. A row whose
-/// manifest does not parse is logged and left out.
+/// grid for one manifest version and one pinned reference), in `frame_uuid`
+/// order, each named by its uuid and file name. A row whose manifest does not
+/// parse is logged and left out.
 pub fn grid_inputs_of_project(
     conn: &Connection,
     project_id: &str,
@@ -73,7 +76,11 @@ pub fn grid_inputs_of_project(
         .filter(|r| crate::db::collab_frames::part_of_project(r))
     {
         match crate::collab::frame_meta::parse_project_frame_meta(&row.manifest_json) {
-            Ok(meta) => out.push(grid_input_of(&meta)),
+            Ok(meta) => out.push(GridInput {
+                frame_uuid: row.frame_uuid.clone(),
+                file_name: row.file_name.clone(),
+                ..grid_input_of(&meta)
+            }),
             Err(e) => {
                 tracing::warn!(project_id, frame_uuid = %row.frame_uuid, error = %format!("{e:#}"), "project frame metadata unreadable; left out of the grid proposal")
             }
@@ -102,7 +109,13 @@ pub fn get_collab_grid_proposal(
         dec_deg: project.target_dec_deg,
         radius_deg: project.target_radius_deg,
     };
-    let proposal = propose_grid(&inputs, &target);
+    // The reference pinned on this device turns the proposal (owner ruling 2026-11-07).
+    let pinned = crate::db::stacking::get_project_config(&conn, project_id)
+        .map_err(internal)?
+        .and_then(|c| c.reference_frame_uuid);
+    let proposed = propose_grid(&inputs, &target, pinned.as_deref());
+    let proposal = proposed.as_ref().map(|p| p.grid);
+    let proposal_rotation = proposed.map(|p| p.rotation);
     let frames_inside = proposal
         .as_ref()
         .map(|g| count_inside(&inputs, g))
@@ -116,6 +129,7 @@ pub fn get_collab_grid_proposal(
     Ok(GridProposal {
         current,
         proposal,
+        proposal_rotation,
         frames_inside,
         can_edit,
     })

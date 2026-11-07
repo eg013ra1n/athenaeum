@@ -1921,7 +1921,7 @@ describe('ProjectDetail Stacking tab (wave 6c)', () => {
     frameUuid, publisherAccountId, publisher: publisherAccountId, filterCanonical: 'L', outline: square(ra, -5.4),
   });
   const grid: PlanGrid = {
-    state: 'proposed', current: null, framesInside: 2, canEdit: false,
+    state: 'proposed', current: null, proposalRotation: null, framesInside: 2, canEdit: false,
     proposal: { scaleArcsec: 1.5, widthPx: 3200, heightPx: 2560, crval1: 83.8, crval2: -5.4, rotationDeg: 0 },
     target: { raDeg: 83.8, decDeg: -5.4, radiusDeg: 1.5 },
     footprints: [footprint('f-known', 'acc-a', 83.7), footprint('f-stranger', 'acc-gone', 83.9)],
