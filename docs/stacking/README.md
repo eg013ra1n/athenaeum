@@ -3758,8 +3758,10 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
         `warn!` and pass 1 re-runs, never a mis-decode.
       - R11c-3 key: `pass1_hash_for(cfg, calib)` = the measurement subtree + the calib hash + `measure_pass1:v<N>`,
         independent of the group β, so a β move re-runs pass 2 only; `Moffat4` / `Fixed` write nothing.
-      - R11c-4 identity: the stamp is the read guard's size + mtime at pass 1's first plane read; a mismatch re-runs
-        pass 1 (never an exclusion).
+      - R11c-4 identity: the stamp is the read guard's size + mtime at pass 1's first plane read; a LENGTH mismatch
+        re-runs pass 1 (never an exclusion). Since the frame-level cache (spec §5.3) the mtime is stored but not compared:
+        validity follows the calibration hash in the row's key, because a recalibration reproduces the planes to the bit
+        (`recalibration_reproduces_the_planes_bit_for_bit`), so "Delete intermediates" plus a rerun keeps the first pass.
       - R11c-5 flow: validate on the controller, pass 1 fanned out and written inside the worker (records dropped
         there), the group β, then pass 2 from the artifact or, with none, pass 1 in the worker (the upgrade ripple).
         A write failure is a `warn!`, no row, pass 1 again in pass 2's worker: nothing is ever held.

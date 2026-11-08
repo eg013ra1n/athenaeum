@@ -19773,10 +19773,11 @@ mod tests {
         );
     }
 
-    /// Plan A Task 11c (R11c-4): a calibrated file whose mtime moved since the artifact was written makes THAT
-    /// frame's first pass stale; it re-runs, the others do not, nothing is excluded.
+    /// Plan A Task 11c (R11c-4), amended by the frame-level cache (spec §5.3): a calibrated file whose mtime moved
+    /// since the artifact was written is recalibrated by the calibrate stage (its row records the old mtime), and the
+    /// first pass survives: validity follows the calibration hash, not the mtime. Nothing is excluded.
     #[test]
-    fn measure_pass1_artifact_of_a_changed_source_reruns_pass_one() {
+    fn measure_pass1_artifact_survives_a_touched_source() {
         let rig = Pass1Rig::new();
         rig.run("run 1", None);
         let ids = rig.sorted_ids();
@@ -19790,8 +19791,162 @@ mod tests {
         drop(file);
         rig.delete_rows(&["fits.0"]);
         let second = rig.run("run 2", None);
-        assert_eq!(second.logged, vec![touched], "only the touched file re-ran pass 1");
+        assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
         assert_eq!(second.excluded, 0);
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Plan A Task 11c (R11c-4), amended (spec §5.3): a calibrated file of another SIZE than the one pass 1 read, whose
+    /// row says so too (the calibrate stage reuses it), makes THAT frame's first pass stale; it re-runs, the others do
+    /// not, nothing is excluded.
+    #[test]
+    fn measure_pass1_artifact_of_a_source_of_another_size_reruns_pass_one() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let ids = rig.sorted_ids();
+        let resized = rig.calibrated_path(ids[2]);
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&resized).unwrap();
+            file.write_all(&[0u8; 2880]).unwrap();
+        }
+        let row = crate::db::stacking::find_artifact(
+            &rig.fixture.conn,
+            &rig.subject,
+            "",
+            "calibrated",
+            Some(ids[2]),
+        )
+        .unwrap()
+        .unwrap();
+        let (size, modified_at) = file_identity(&resized).unwrap();
+        upsert_artifact(
+            &rig.fixture.conn,
+            &NewArtifact {
+                subject: &rig.subject,
+                frame_id: Some(ids[2]),
+                group_key: "",
+                kind: "calibrated",
+                path: row.path.as_deref(),
+                config_hash: &row.config_hash,
+                size: Some(size),
+                modified_at: Some(&modified_at),
+                payload_json: row.payload_json.as_deref(),
+            },
+        )
+        .unwrap();
+        rig.delete_rows(&["fits.0"]);
+        let second = rig.run("run 2", None);
+        assert_eq!(second.logged, vec![resized], "only the resized file re-ran pass 1");
+        assert_eq!(second.excluded, 0);
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Every plane of every calibrated frame of the rig, as bit patterns, by frame id.
+    fn calibrated_plane_bits(rig: &Pass1Rig) -> Vec<(i64, Vec<Vec<u32>>)> {
+        rig.sorted_ids()
+            .into_iter()
+            .map(|id| {
+                let reader = PlaneReader::open(&rig.calibrated_path(id)).unwrap();
+                let planes = (0..reader.channels())
+                    .map(|p| {
+                        reader
+                            .read_plane(p)
+                            .unwrap()
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect()
+                    })
+                    .collect();
+                (id, planes)
+            })
+            .collect()
+    }
+
+    /// Frame-level cache spec §5.3 / §8 Q1 (Task 8, step 1): the precondition of keeping a first pass across a
+    /// recalibration. A frame calibrated, its file and row deleted and calibrated again in a NEW run context has the
+    /// same planes to the bit. Without this pin the mtime stamp must stay.
+    #[test]
+    fn recalibration_reproduces_the_planes_bit_for_bit() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let before = calibrated_plane_bits(&rig);
+        assert_eq!(before.len(), 4);
+        let calibrated_files: Vec<PathBuf> =
+            before.iter().map(|(id, _)| rig.calibrated_path(*id)).collect();
+        rig.delete_rows(&["calibrated"]);
+        for file in &calibrated_files {
+            std::fs::remove_file(file).unwrap();
+        }
+        rig.run("run 2", None);
+        for file in &calibrated_files {
+            assert!(file.is_file(), "run 2 recalibrated {}", file.display());
+        }
+        let after = calibrated_plane_bits(&rig);
+        assert_eq!(before, after, "a recalibration changed a pixel");
+    }
+
+    /// Frame-level cache spec §5.3 (Task 8): "Delete intermediates" removes `calibrated/` and keeps `measured/`. The
+    /// next run recalibrates every frame (a new file, a new mtime, the same bytes) and, because it needs pass 2 again
+    /// (here: the `metrics` and `fits.0` rows of the measurement are gone), reads the stored first pass: the calibration
+    /// hash in the artifact's key is its validity, not the calibrated file's mtime. No `rerun_from`: that would force
+    /// Measure fresh.
+    #[test]
+    fn pass1_survives_a_byte_identical_recalibration() {
+        let rig = Pass1Rig::new();
+        let (first, logs1) = crate::stacking::telemetry::capture_logs(|| rig.run("run 1", None));
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 4, "{logs1}");
+        let calibrated_before: Vec<PathBuf> = rig
+            .sorted_ids()
+            .into_iter()
+            .map(|id| rig.calibrated_path(id))
+            .collect();
+        let measured_before: Vec<(i64, String, std::time::SystemTime)> = rig
+            .rows("measured")
+            .into_iter()
+            .map(|(id, row)| {
+                let path = row.path.unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (id, path, modified)
+            })
+            .collect();
+        assert_eq!(measured_before.len(), 4);
+
+        cleanup_work(
+            &rig.fixture.conn,
+            &rig.subject,
+            &rig.layout,
+            crate::stacking::paths::CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert!(calibrated_before.iter().all(|p| !p.exists()), "calibrated/ went");
+        assert!(
+            measured_before.iter().all(|(_, p, _)| Path::new(p).is_file()),
+            "measured/ stayed"
+        );
+        rig.delete_rows(&["metrics", "fits.0"]);
+
+        let (second, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        assert!(
+            calibrated_before.iter().all(|p| p.is_file()),
+            "run 2 recalibrated every frame"
+        );
+        assert_eq!(fan_out_items(&logs2, "measure", "pass1"), 0, "pass 1 re-ran: {logs2}");
+        assert_eq!(fan_out_items(&logs2, "measure", "pass2"), 4, "{logs2}");
+        assert!(second.logged.is_empty(), "{:?}", second.logged);
+        assert_eq!(second.excluded, 0);
+        assert_eq!(
+            second.beta.map(f64::to_bits),
+            first.beta.map(f64::to_bits),
+            "the group beta from the stored first passes is the one the pixels gave"
+        );
+        for (id, path, modified) in &measured_before {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                *modified,
+                "frame {id}: the first-pass file was rewritten"
+            );
+        }
         assert_eq!(rig.rows("metrics").len(), 4);
     }
 

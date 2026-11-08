@@ -43,7 +43,10 @@ pub(crate) const PREFIX_LEN: usize = 4 + 2 + 4 + 4 + 8;
 const MAX_HEAD_LEN: usize = 1 << 20;
 
 /// The calibrated file's identity at pass 1's first plane read (the read guard's identity, stored): its size and its
-/// modification time as signed nanoseconds since the Unix epoch (`None` where the filesystem has none).
+/// modification time as signed nanoseconds since the Unix epoch (`None` where the filesystem has none). Validity
+/// follows the calibration hash in the artifact's key (frame-level cache spec §5.3); on a read only `len` is compared,
+/// so a recalibration that reproduces the pixels (a new file, a new mtime) keeps the first pass. `modified_ns` stays
+/// in the head (no format change) for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceStamp {
     pub len: u64,
@@ -611,11 +614,12 @@ mod tests {
         ));
     }
 
-    /// R11c-4: the stamp is the calibrated file's size and mtime at pass 1's first read; a file touched since reads
-    /// `Stale` with both stamps — from the whole read and from the controller's head check — and an untouched one
+    /// R11c-4, amended by the frame-level cache (spec §5.3): the stamp is the calibrated file's size and mtime at pass
+    /// 1's first read, and only the size is compared. A file of another size reads `Stale` with both stamps — from the
+    /// whole read and from the controller's head check — a file whose mtime moved reads fine, and an untouched one
     /// reads fine.
     #[test]
-    fn a_changed_source_reads_stale() {
+    fn a_source_of_another_size_reads_stale() {
         let dir = tempfile::tempdir().unwrap();
         let opts = MeasureOptions::default();
         let path = frames(dir.path()).remove(0);
@@ -626,19 +630,35 @@ mod tests {
         check_pass1_head(&head, &path).unwrap();
         read_pass1(&artifact, &path, &opts).unwrap();
 
+        let stored = pass1.source().unwrap();
+
+        // A moved mtime alone is not a change (a recalibration writes a new file with the same bytes).
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
             .unwrap();
         drop(file);
-        let stored = pass1.source().unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before,
+            "the touch moved the mtime"
+        );
+        check_pass1_head(&head, &path).unwrap();
+        read_pass1(&artifact, &path, &opts).unwrap();
+
+        // Another size is.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&[0u8; 8]).unwrap();
+        }
         match read_pass1(&artifact, &path, &opts) {
             Err(Pass1ArtifactError::Stale {
                 stored: s,
                 now: Some(n),
             }) => {
                 assert_eq!(s, Some(stored));
-                assert_eq!(n.len, stored.len);
-                assert_ne!(n.modified_ns, stored.modified_ns);
+                assert_eq!(n.len, stored.len + 8);
             }
             other => panic!("expected Stale, got {:?}", other.map(|_| ())),
         }

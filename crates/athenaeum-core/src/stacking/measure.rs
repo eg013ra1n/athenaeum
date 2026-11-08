@@ -1921,7 +1921,8 @@ impl FramePass1 {
         self.planes.beta_own()
     }
 
-    /// The calibrated file's identity at this first pass's first plane read (Plan A Task 11c, R11c-4).
+    /// The calibrated file's identity at this first pass's first plane read (Plan A Task 11c, R11c-4). Only its length is
+    /// compared when the artifact is read back ([`check_stamp_len`]).
     pub(crate) fn source(&self) -> Option<SourceStamp> {
         self.identity.map(stamp_of)
     }
@@ -1960,7 +1961,8 @@ impl FramePass1 {
 
     /// A stored first pass read back (Task 11c, R11c-1 / R11c-4): the heads rebuilt from `opts`, the plane index, the
     /// plane count and the stored gain through the ONE [`module_options`] builder, the read guard seeded with the
-    /// identity of `calibrated` NOW, which must equal the stored stamp ([`Pass1ArtifactError::Stale`] otherwise).
+    /// identity of `calibrated` NOW, whose length must equal the stored stamp's ([`Pass1ArtifactError::Stale`]
+    /// otherwise; the mtime is not compared, see [`check_stamp_len`]).
     pub(crate) fn from_record(
         head: Pass1Head,
         body: Pass1Body,
@@ -1977,12 +1979,7 @@ impl FramePass1 {
             )));
         }
         let now = FileIdentity::of(calibrated)?;
-        if head.source != Some(stamp_of(now)) {
-            return Err(Pass1ArtifactError::Stale {
-                stored: head.source,
-                now: Some(stamp_of(now)),
-            });
-        }
+        check_stamp_len(head.source, now)?;
         let detector = resolve_detector(SeedOverride::Fast, opts);
         let colour = n == 3;
         let mut heads = Vec::with_capacity(n);
@@ -2093,19 +2090,13 @@ impl Pass1Body {
 }
 
 /// Whether a stored head describes `calibrated` as it is now (the controller's check in step (0), Plan A Task 11c,
-/// R11c-5): the stamp equals the file's identity now ([`Pass1ArtifactError::Stale`] otherwise) and the geometry and
-/// the plane count are the file's own (a header probe, no pixel read).
+/// R11c-5): the stamp's length equals the file's now ([`Pass1ArtifactError::Stale`] otherwise; [`check_stamp_len`]) and
+/// the geometry and the plane count are the file's own (a header probe, no pixel read).
 pub(crate) fn check_pass1_head(
     head: &Pass1Head,
     calibrated: &Path,
 ) -> Result<(), Pass1ArtifactError> {
-    let now = stamp_of(FileIdentity::of(calibrated)?);
-    if head.source != Some(now) {
-        return Err(Pass1ArtifactError::Stale {
-            stored: head.source,
-            now: Some(now),
-        });
-    }
+    check_stamp_len(head.source, FileIdentity::of(calibrated)?)?;
     let reader = PlaneReader::open(calibrated).map_err(|e| {
         Pass1ArtifactError::Io(std::io::Error::other(format!("the calibrated file: {e}")))
     })?;
@@ -2121,6 +2112,22 @@ pub(crate) fn check_pass1_head(
         )));
     }
     Ok(())
+}
+
+/// The one validity check of a stored stamp against `calibrated` now (frame-level cache spec §5.3): the LENGTH must
+/// equal the stored one ([`Pass1ArtifactError::Stale`] otherwise). The modification time stays in the stamp (no format
+/// change) but is not compared: a first pass is valid for as long as the calibration hash in its artifact's key is,
+/// and a recalibration with the same hash reproduces the pixels to the bit (pinned by
+/// `recalibration_reproduces_the_planes_bit_for_bit`) while writing a file with a new mtime. A stamp without a
+/// recorded source never matches.
+fn check_stamp_len(stored: Option<SourceStamp>, now: FileIdentity) -> Result<(), Pass1ArtifactError> {
+    match stored {
+        Some(s) if s.len == now.len => Ok(()),
+        _ => Err(Pass1ArtifactError::Stale {
+            stored,
+            now: Some(stamp_of(now)),
+        }),
+    }
 }
 
 /// A read guard identity as the stored stamp: the size and the modification time as signed nanoseconds since the Unix
