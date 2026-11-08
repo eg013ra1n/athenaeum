@@ -2107,9 +2107,10 @@ fn compute_register_stale(
 /// How many of the latest runs [`latest_run_with_frame_rows`] looks through.
 const REGISTER_GATE_RUN_WINDOW: usize = 20;
 
-/// The latest run of `subject` that has `stacking_run_frames` rows, with them (ruling R9). A run that failed or was
-/// cancelled before the end of Register has none; the gate then judges the run before it. `None` when no recent run
-/// has any, which reads Register stale.
+/// The latest run of `subject` that has an INCLUDED `stacking_run_frames` row, with its rows (rulings R9, R14 (d)). A
+/// run that failed or was cancelled before the end of Register has none; one that ended inside Register after
+/// excluding frames can have only excluded rows, which say nothing about what was registered. The gate then judges
+/// the run before it. `None` when no recent run has any, which reads Register stale.
 fn latest_run_with_frame_rows(
     conn: &Connection,
     subject: &StackSubject,
@@ -2122,7 +2123,7 @@ fn latest_run_with_frame_rows(
 > {
     for run in list_runs(conn, subject, REGISTER_GATE_RUN_WINDOW)? {
         let frames = list_frame_rows(conn, run.id)?;
-        if !frames.is_empty() {
+        if frames.iter().any(|f| f.included) {
             return Ok(Some((run, frames)));
         }
     }

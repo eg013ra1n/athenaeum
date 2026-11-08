@@ -19258,6 +19258,81 @@ mod tests {
         assert!(rig.register_stale(&cfg), "the gate read the cancelled run's empty frame list as fresh");
     }
 
+    /// Ruling R14 (e), the fresh side of R9: run A registers under a config, then run B on the SAME config is
+    /// cancelled inside Register and writes no frame rows. The gate looks back past B to A's rows, which are fresh,
+    /// and reads Register fresh.
+    #[test]
+    fn a_run_cancelled_inside_register_leaves_an_older_fresh_run_fresh() {
+        use crate::stacking::config::ExposureMode;
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+        assert!(!rig.register_stale(&cfg), "run A's own rows read fresh");
+
+        let (rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        assert!(
+            crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_b.run_id).unwrap().is_empty(),
+            "premise: the cancelled run wrote no frame rows"
+        );
+        assert!(
+            !rig.register_stale(&cfg),
+            "the gate stopped at the cancelled run instead of looking back to run A"
+        );
+    }
+
+    /// Ruling R14 (d): a run that ended inside Register can hold frame rows that are all excluded (a changed landed
+    /// file takes members out before the stage's rows are complete). Those rows say nothing about what was
+    /// registered, so the gate skips such a run like an empty one and judges the run before it. Run A, then run B on
+    /// another manual reference cancelled inside Register with one excluded row: the gate under B's config reads run
+    /// A's rows, which name the other reference, and Register is stale (the excluded-only rows alone would judge no
+    /// frame and read fresh).
+    #[test]
+    fn a_run_with_only_excluded_rows_is_skipped_by_the_register_gate() {
+        use crate::stacking::config::ExposureMode;
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        let group_id = *rc_b.group_ids.values().next().unwrap();
+        crate::db::stacking::upsert_frame_row(
+            &rig.fixture.conn,
+            &StackSubject::FrameSet(rig.fixture.set_id),
+            &crate::db::stacking::NewFrameRow {
+                run_id: rc_b.run_id,
+                group_id,
+                frame_id: rig.light_ids[2],
+                included: false,
+                exclusion_reason: Some("changed during the run"),
+                weight: None,
+                weight_channels_json: None,
+                metrics_json: None,
+                reg_status: None,
+                reg_model: None,
+                reg_rms_px: None,
+                reg_inliers: None,
+                reg_inlier_ratio: None,
+                reg_flipped: None,
+                rejected_fraction: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_b.run_id)
+                .unwrap()
+                .iter()
+                .all(|r| !r.included),
+            "premise: the newest run has a row, and it is not included"
+        );
+        assert!(rig.register_stale(&cfg), "the gate judged a run with no included row");
+    }
+
     /// Ruling R4 (c) (Task 5): the `.rej` stem is the frame's own stem. Two frames of one merged group whose
     /// registered rows point at `registered/<keyA>/r_Light_0001.fits` and `registered/<keyB>/r_Light_0001.fits` (one
     /// file name from two old group folders) get two distinct `.rej` files: the stems of their stored paths are equal
@@ -22381,6 +22456,15 @@ mod tests {
             rc
         }
 
+        /// Every member's stored registration transform (`registration_results`), by frame id.
+        fn transforms(&self) -> HashMap<i64, Option<String>> {
+            get_registration_for_frame_set(&self.fixture.conn, self.fixture.set_id)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.frame_id, r.transform_json))
+                .collect()
+        }
+
         /// The group's `two_pass` row, if any.
         fn decision_row(&self, rc: &RunContext) -> Option<crate::db::stacking::StackingArtifactRow> {
             let key = &rc.plan_groups[0].key;
@@ -22416,12 +22500,38 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(row.payload_json.as_deref().unwrap()).unwrap();
         assert_eq!(payload, serde_json::json!({ "switchTo": chosen }));
 
+        // Ruling R14 (e): the stars a hit builds for the switched reference are the ones the dry pass built. One
+        // member that is neither the old nor the new reference loses its registration row, so run 2 registers it
+        // again against the hit's reference stars: its transform must be run 1's bit for bit.
+        let transforms1 = rig.transforms();
+        let probe = *rig
+            .light_ids
+            .iter()
+            .find(|&&id| id != chosen && id != rig.light_ids[0])
+            .unwrap();
+        assert!(transforms1[&probe].is_some(), "premise: run 1 stored the probe's transform");
+        assert_eq!(
+            rig.fixture
+                .conn
+                .execute(
+                    "DELETE FROM registration_results WHERE frames_set_id = ?1 AND frame_id = ?2",
+                    rusqlite::params![rig.fixture.set_id, probe],
+                )
+                .unwrap(),
+            1
+        );
+
         let (rc2, logs2) =
             crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
         assert_eq!(
             fan_out_items(&logs2, "register", "align"),
-            0,
-            "run 2 opened a registration fan-out (the dry pass ran again?): {logs2}"
+            1,
+            "run 2 registers the probe only: no dry pass, every other member reused: {logs2}"
+        );
+        let transforms2 = rig.transforms();
+        assert_eq!(
+            transforms2[&probe], transforms1[&probe],
+            "the probe's transform moved: the stars built on a hit differ from the dry pass's"
         );
         assert!(logs2.contains("two-pass decision reused"), "{logs2}");
         assert_eq!(rc2.reference_frame_id, Some(chosen));
