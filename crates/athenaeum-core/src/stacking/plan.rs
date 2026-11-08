@@ -806,8 +806,8 @@ fn gate_measure_betas(
 ///
 /// `reference_measurement_hash` (ruling R3 (a)): any frame whose reference lives in ANOTHER group (the native-geometry
 /// fallback included) is registered against star lists built from the REFERENCE's `fits.0` when the reference is one
-/// plane, Measure output
-/// the frame's own `measure:` term does not cover (it holds the frame's group's config and beta). The caller passes
+/// plane, which is Measure output the frame's own `measure:` term does not cover (it holds the frame's group's config
+/// and beta). The caller passes
 /// [`reference_measurement_fold`], folded here as `ref_measure:<h>`; `""` (nothing folded) when the reference is in
 /// the frame's own group, so a single-group set keeps its hashes.
 pub(crate) fn registration_hash_for(

@@ -1986,8 +1986,8 @@ fn rejection_map_stems(group: &IntegrationGroup, included_ids: &[i64]) -> Vec<St
 /// of ANY subject still points to it. A failed removal is a `warn!` (`path`, `error`), never an error: the file is
 /// only disk.
 ///
-/// `owned_root` is the root the WRITING kind owns (`calibrated_root()`, `prepared_root()`; ruling R4), passed by the
-/// caller, never `layout.root` in general: a frame set's working folder may overlap a scan root, and an attested
+/// `owned_root` is the root the WRITING kind owns (`calibrated_root()`, `prepared_root()`, `measured_root()`,
+/// `fits_root()`, `registered_root()`; ruling R4), passed by the caller, never `layout.root` in general: a frame set's working folder may overlap a scan root, and an attested
 /// frame used in place has a row pointing at the user's own landed file, which is never ours to remove.
 fn replace_frame_level_file(
     conn: &rusqlite::Connection,
@@ -6145,8 +6145,13 @@ struct MeasureMember {
     cached: Option<(FrameMeasurement, String)>,
     /// The frame's own β per plane (pass 1, read or reused).
     own: Option<Vec<f64>>,
-    /// Where the first-pass artifact lives (or will).
+    /// Where the first-pass artifact is READ from: the fresh row's own path (spec §5.7: a row written before the
+    /// frame-level key keeps its old folder), else [`Self::layout_spill`].
     spill: PathBuf,
+    /// Where a first-pass artifact is WRITTEN: the current layout's path for this frame (flat, frame-only stem).
+    /// A refused or stale artifact is rewritten here, never at the old row path, so the write's
+    /// [`replace_frame_level_file`] retires a legacy `measured/<old_key>/` file (ruling R6 M1).
+    layout_spill: PathBuf,
     /// The artifact's key ([`pass1_hash_for`]).
     pass1_key: String,
     source: Pass1Source,
@@ -6298,6 +6303,7 @@ fn measure_two_pass_prepare(
             frame,
             path,
             spill: rc.layout.measured_path(&stem),
+            layout_spill: rc.layout.measured_path(&stem),
             pass1_key: pass1_hash_for(cfg, &calib_hash),
             calib_hash,
             cached: None,
@@ -6362,6 +6368,9 @@ fn measure_two_pass_prepare(
                     ) {
                         member.source = Pass1Source::Artifact;
                         member.own = Some(head.beta_own);
+                    } else {
+                        // Refused or stale: pass 1 re-runs and writes the current layout's path.
+                        member.spill = member.layout_spill.clone();
                     }
                 } else {
                     member.spill_pending = true;
@@ -6398,7 +6407,7 @@ fn pass1_jobs(state: &TwoPassState) -> Vec<(i64, PathBuf, PathBuf)> {
             (
                 state.members[i].frame.frame_id,
                 state.members[i].path.clone(),
-                state.members[i].spill.clone(),
+                state.members[i].layout_spill.clone(),
             )
         })
         .collect()
@@ -6483,7 +6492,7 @@ fn upsert_pass1_rows(
             upsert_pass1_row(
                 rc,
                 &state.members[i].frame,
-                &state.members[i].spill,
+                &state.members[i].layout_spill,
                 &state.members[i].pass1_key,
             )?;
         }
@@ -6648,6 +6657,9 @@ fn measure_two_pass_rest(
             .is_some()
             {
                 members[i].source = Pass1Source::Artifact;
+            } else {
+                // Refused or stale: pass 1 re-runs here and writes the current layout's path.
+                members[i].spill = members[i].layout_spill.clone();
             }
         }
     }
@@ -6667,15 +6679,16 @@ fn measure_two_pass_rest(
             "pass2",
         );
     }
-    // Per job: the frame, its calibrated file, its artifact, where its first pass comes from, and whether its first
-    // half was already ticked by phase 1.
-    let jobs: Vec<(i64, PathBuf, PathBuf, Pass1Source, bool)> = need_pass2
+    // Per job: the frame, its calibrated file, the artifact it reads, the layout path a re-run first pass writes,
+    // where its first pass comes from, and whether its first half was already ticked by phase 1.
+    let jobs: Vec<(i64, PathBuf, PathBuf, PathBuf, Pass1Source, bool)> = need_pass2
         .iter()
         .map(|&i| {
             (
                 members[i].frame.frame_id,
                 members[i].path.clone(),
                 members[i].spill.clone(),
+                members[i].layout_spill.clone(),
                 members[i].source,
                 need_pass1.contains(&i),
             )
@@ -6700,7 +6713,7 @@ fn measure_two_pass_rest(
         &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
         FanOutLabel::new(rc, Stage::Measure, Some(&group.key), "pass2"),
         cancel_ref,
-        move |(frame_id, path, spill, source, first_half_ticked)| {
+        move |(frame_id, path, spill, layout_spill, source, first_half_ticked)| {
             // The first pass: the artifact (the checksum, the stamp), else pass 1 here — which also writes the
             // artifact — for a member owed it or whose artifact is refused now.
             let from_artifact = match source {
@@ -6720,7 +6733,7 @@ fn measure_two_pass_rest(
             };
             let first = match from_artifact {
                 Some(p) => Ok((p, false)),
-                None => run_pass1_and_spill(frame_id, &path, &spill, opts, pool_ref, cancel_ref),
+                None => run_pass1_and_spill(frame_id, &path, &layout_spill, opts, pool_ref, cancel_ref),
             };
             // One β per plane of THIS read (a group of one's planes included): every plane at the group β.
             let out = first
@@ -6745,7 +6758,7 @@ fn measure_two_pass_rest(
             upsert_pass1_row(
                 rc,
                 &members[i].frame,
-                &members[i].spill,
+                &members[i].layout_spill,
                 &members[i].pass1_key,
             )?;
         }
@@ -19347,6 +19360,124 @@ mod tests {
         assert!(in_layout_root.is_empty(), "nothing was written to the layout path: {in_layout_root:?}");
     }
 
+    /// Moves each frame's `kind` file into `<root>/old_group_key/legacy_<id><suffix>` and points its row there: what the
+    /// migration (spec §5.7) leaves. Returns the new path by frame id.
+    fn move_rows_to_legacy_folder(
+        rig: &Pass1Rig,
+        kind: &str,
+        root: &Path,
+        suffix: &str,
+    ) -> HashMap<i64, PathBuf> {
+        let old_dir = root.join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut moved = HashMap::new();
+        for (frame_id, row) in rig.rows(kind) {
+            let old = old_dir.join(format!("legacy_{frame_id}{suffix}"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            moved.insert(frame_id, old);
+        }
+        moved
+    }
+
+    /// The layout's pass-1 path for one frame of the rig's group.
+    fn layout_spill_of(rig: &Pass1Rig, frame_id: i64) -> PathBuf {
+        let frame = rig.plan_groups[0]
+            .frames
+            .iter()
+            .find(|f| f.frame_id == frame_id)
+            .expect("a frame of the group");
+        rig.layout.measured_path(&frame_file_stem(frame))
+    }
+
+    /// Ruling R6 M1 (Task 7): a REFUSED first-pass artifact is rewritten at the layout path, not the old row path, so
+    /// `replace_frame_level_file` retires the legacy `measured/<old_key>/` file. Three refusal arms: a head refused
+    /// with the member's own beta on its `metrics` row (validated when pass 2 needs it), a head refused on the
+    /// controller at prepare time (no `metrics` row), and a body refused by the worker's whole-file checksum; the
+    /// fourth member's legacy file is valid and stays where it is.
+    #[test]
+    fn a_refused_spill_is_rewritten_at_the_layout_path() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let ids = rig.sorted_ids();
+        assert_eq!(ids.len(), 4);
+        let moved = move_rows_to_legacy_folder(&rig, "measured", &rig.measured_root(), ".athm");
+        let flip = |path: &Path, at: usize| {
+            let mut bytes = std::fs::read(path).unwrap();
+            let at = if at == usize::MAX { bytes.len() / 2 } else { at };
+            bytes[at] ^= 0x5a;
+            std::fs::write(path, &bytes).unwrap();
+        };
+        let head = crate::stacking::pass1_artifact::PREFIX_LEN;
+        flip(&moved[&ids[0]], head); // pending arm: metrics row present, head refused
+        flip(&moved[&ids[1]], usize::MAX); // worker arm: head fine, whole-file checksum refused
+        flip(&moved[&ids[3]], head); // prepare arm: metrics row gone, head refused
+        rig.fixture
+            .conn
+            .execute(
+                "DELETE FROM stacking_artifacts WHERE kind = 'metrics' AND frame_id = ?1",
+                [ids[3]],
+            )
+            .unwrap();
+        // Pass 2 is owed for all four: their `fits.0` rows are gone.
+        rig.delete_rows(&["fits.0"]);
+
+        let second = rig.run("run 2", None);
+        let mut rerun = second.logged.clone();
+        rerun.sort();
+        let mut expected: Vec<PathBuf> = [ids[0], ids[1], ids[3]]
+            .iter()
+            .map(|&id| rig.calibrated_path(id))
+            .collect();
+        expected.sort();
+        assert_eq!(rerun, expected, "exactly the three refused artifacts re-ran pass 1");
+        assert_eq!(second.excluded, 0);
+
+        let rows = rig.rows("measured");
+        assert_eq!(rows.len(), 4);
+        for &id in &[ids[0], ids[1], ids[3]] {
+            let path = PathBuf::from(rows[&id].path.clone().unwrap());
+            assert_eq!(path, layout_spill_of(&rig, id), "frame {id}: rewritten at the layout path");
+            assert!(path.is_file(), "frame {id}");
+            assert!(!moved[&id].exists(), "frame {id}: the legacy file is retired");
+        }
+        let kept = PathBuf::from(rows[&ids[2]].path.clone().unwrap());
+        assert_eq!(kept, moved[&ids[2]], "a valid legacy artifact keeps its row path");
+        assert!(kept.is_file());
+    }
+
+    /// Ruling R6 M2 (Task 7): stale `fits.0` and `measured` rows pointing into `fits/<old_key>/` and
+    /// `measured/<old_key>/`, `rerun_from = Measure`: the old files are gone and the new ones sit at
+    /// `<stem>_f<id>` in the flat folders.
+    #[test]
+    fn a_forced_measure_replaces_files_in_old_group_folders() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let old_measured = move_rows_to_legacy_folder(&rig, "measured", &rig.measured_root(), ".athm");
+        let old_fits = move_rows_to_legacy_folder(&rig, "fits.0", &rig.layout.fits_root(), ".p0.athf");
+        assert_eq!((old_measured.len(), old_fits.len()), (4, 4));
+
+        rig.run("run 2", Some(Stage::Measure));
+        for group_frame in &rig.plan_groups[0].frames {
+            let id = group_frame.frame_id;
+            let stem = frame_file_stem(group_frame);
+            assert!(!old_measured[&id].exists(), "frame {id}: the old pass-1 file is gone");
+            assert!(!old_fits[&id].exists(), "frame {id}: the old fits file is gone");
+            let measured = rig.rows("measured")[&id].path.clone().unwrap();
+            assert_eq!(PathBuf::from(&measured), rig.layout.measured_path(&stem));
+            assert!(Path::new(&measured).is_file());
+            let fits = rig.rows("fits.0")[&id].path.clone().unwrap();
+            assert_eq!(PathBuf::from(&fits), rig.layout.fits_path(&stem, 0));
+            assert!(Path::new(&fits).is_file());
+        }
+    }
+
     /// Plan A Task 11c, bar 3: a first pass is alive only while its worker holds it, so the peak over a fresh run
     /// and over a group-β-move run is the admitted workers (one here), never the group (four).
     #[test]
@@ -22330,9 +22461,10 @@ mod tests {
         let rc2 = run_pass(cfg.clone());
         assert_eq!(osc_cached(&rc2), vec![true; 4], "the same config reuses");
 
-        // R5 M2, the round trip: the gate reads what the run wrote. After the repeat pass Register is not stale under
-        // `cfg`, and it is stale under `moved` BEFORE the run that moves (the OSC rows were registered against the
-        // reference's stars at the old config).
+        // R5 M2, the round trip on this fixture: after the repeat pass the gate reads Register not stale under `cfg`,
+        // and stale under `moved` before the run that moves, because the OSC rows' registration hash folds the
+        // mono reference's measurement hash (ruling R3 (a)). It pins that the gate and the run agree on this one
+        // reference move, not the gate's staleness in general.
         let register_stale = |cfg: &StackingConfig| -> bool {
             crate::stacking::plan::build_plan(
                 &fixture.conn,
