@@ -6154,6 +6154,12 @@ struct Pass2Failed {
     message: String,
     written: bool,
 }
+/// Whether `calibrated` is a file Athenaeum writes and replaces itself: under the layout's `calibrated/` or `prepared/`
+/// root. A first pass keeps its stamp's modification time out of the comparison for those only (R12 (a)); a path
+/// spelled differently from the roots compares as not owned, the safe side.
+fn owns_calibrated_file(layout: &WorkingLayout, calibrated: &Path) -> bool {
+    calibrated.starts_with(layout.calibrated_root()) || calibrated.starts_with(layout.prepared_root())
+}
 /// One frame of the group on its way through the two passes.
 struct MeasureMember {
     idx: usize,
@@ -6174,14 +6180,24 @@ struct MeasureMember {
     /// The artifact's key ([`pass1_hash_for`]).
     pass1_key: String,
     source: Pass1Source,
+    /// The calibrated file is not one Athenaeum writes (not under the layout's `calibrated/` or `prepared/`: an attested
+    /// light or a project replica used in place), so its modification time is part of the first pass's stamp (R12 (a)).
+    strict_mtime: bool,
     /// A fresh artifact row exists but its head is not validated yet: the member's own β came from its `metrics`
     /// row, so the artifact is only validated once the member is known to need pass 2 (R11c-5 (3)).
     spill_pending: bool,
 }
 /// The artifact's head validated against the calibrated file now: usable, or `None` after the log line that says
 /// why (stale before use `debug!`, any other refusal `warn!`).
-fn validate_pass1_spill(run_id: i64, frame_id: i64, spill: &Path, path: &Path) -> Option<Pass1Head> {
-    let usable = read_pass1_head(spill).and_then(|head| check_pass1_head(&head, path).map(|()| head));
+fn validate_pass1_spill(
+    run_id: i64,
+    frame_id: i64,
+    spill: &Path,
+    path: &Path,
+    strict_mtime: bool,
+) -> Option<Pass1Head> {
+    let usable = read_pass1_head(spill)
+        .and_then(|head| check_pass1_head(&head, path, strict_mtime).map(|()| head));
     match usable {
         Ok(head) => Some(head),
         // Found stale before use: the calibrated file is not the one the artifact was read from.
@@ -6320,6 +6336,7 @@ fn measure_two_pass_prepare(
         let mut member = MeasureMember {
             idx,
             frame,
+            strict_mtime: !owns_calibrated_file(&rc.layout, &path),
             path,
             spill: rc.layout.measured_path(&stem),
             layout_spill: rc.layout.measured_path(&stem),
@@ -6384,6 +6401,7 @@ fn measure_two_pass_prepare(
                         member.frame.frame_id,
                         &member.spill,
                         &member.path,
+                        member.strict_mtime,
                     ) {
                         member.source = Pass1Source::Artifact;
                         member.own = Some(head.beta_own);
@@ -6672,6 +6690,7 @@ fn measure_two_pass_rest(
                 members[i].frame.frame_id,
                 &members[i].spill,
                 &members[i].path,
+                members[i].strict_mtime,
             )
             .is_some()
             {
@@ -6700,7 +6719,7 @@ fn measure_two_pass_rest(
     }
     // Per job: the frame, its calibrated file, the artifact it reads, the layout path a re-run first pass writes,
     // where its first pass comes from, and whether its first half was already ticked by phase 1.
-    let jobs: Vec<(i64, PathBuf, PathBuf, PathBuf, Pass1Source, bool)> = need_pass2
+    let jobs: Vec<(i64, PathBuf, PathBuf, PathBuf, Pass1Source, bool, bool)> = need_pass2
         .iter()
         .map(|&i| {
             (
@@ -6710,6 +6729,7 @@ fn measure_two_pass_rest(
                 members[i].layout_spill.clone(),
                 members[i].source,
                 need_pass1.contains(&i),
+                members[i].strict_mtime,
             )
         })
         .collect();
@@ -6732,11 +6752,11 @@ fn measure_two_pass_rest(
         &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
         FanOutLabel::new(rc, Stage::Measure, Some(&group.key), "pass2"),
         cancel_ref,
-        move |(frame_id, path, spill, layout_spill, source, first_half_ticked)| {
+        move |(frame_id, path, spill, layout_spill, source, first_half_ticked, strict_mtime)| {
             // The first pass: the artifact (the checksum, the stamp), else pass 1 here — which also writes the
             // artifact — for a member owed it or whose artifact is refused now.
             let from_artifact = match source {
-                Pass1Source::Artifact => match read_pass1(&spill, &path, opts) {
+                Pass1Source::Artifact => match read_pass1(&spill, &path, opts, strict_mtime) {
                     Ok(p) => Some(p),
                     Err(e) => {
                         tracing::warn!(
@@ -19244,6 +19264,8 @@ mod tests {
         plan_groups: Vec<IntegrationGroup>,
         group_key: String,
         subject: StackSubject,
+        /// The run's frame origins when the set is attested (`test_context` assumes a plain catalog origin).
+        origins: Option<FrameOrigins>,
     }
 
     /// What one Measure stage did.
@@ -19284,7 +19306,28 @@ mod tests {
                 plan_groups,
                 group_key,
                 subject,
+                origins: None,
             }
+        }
+
+        /// An attested set (externally calibrated, ruling R12 (a)): the four lights are three-plane float FITS used IN
+        /// PLACE, so each `calibrated` row points at the user's own file, outside `calibrated/` and `prepared/`.
+        fn attested() -> Pass1Rig {
+            let mut rig = Pass1Rig::new();
+            let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+            make_lights_three_plane(&rig.fixture, &shifts, &[0, 1, 2, 3]);
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                    [rig.fixture.set_id],
+                )
+                .unwrap();
+            let (groups, origins) = frame_source(&rig.fixture.conn, &rig.subject, &rig.cfg).unwrap();
+            rig.group_key = groups[0].key.clone();
+            rig.plan_groups = groups;
+            rig.origins = Some(origins);
+            rig
         }
 
         fn run(&self, label: &str, rerun_from: Option<Stage>) -> Pass1Out {
@@ -19299,7 +19342,8 @@ mod tests {
             rerun_from: Option<Stage>,
             cancel_after: Option<usize>,
         ) -> Result<Pass1Out, RunError> {
-            let before = pass1_logged_under(self.working.path()).len();
+            let log_root = self.log_root();
+            let before = pass1_logged_under(&log_root).len();
             let (run_id, group_ids) = seed_run_and_groups(
                 &self.fixture.conn,
                 self.fixture.set_id,
@@ -19320,6 +19364,9 @@ mod tests {
                 group_ids,
             );
             rc.rerun_from = rerun_from;
+            if let Some(origins) = &self.origins {
+                rc.origins = origins.clone();
+            }
             if let Some(n) = cancel_after {
                 crate::stacking::measure::PASS1_CANCEL_AFTER
                     .lock()
@@ -19334,9 +19381,19 @@ mod tests {
             result?;
             Ok(Pass1Out {
                 beta: crate::db::stacking::list_groups(&self.fixture.conn, run_id).unwrap()[0].beta,
-                logged: pass1_logged_under(self.working.path())[before..].to_vec(),
+                logged: pass1_logged_under(&log_root)[before..].to_vec(),
                 excluded: rc.runtime_exclusions.len(),
             })
+        }
+
+        /// The folder whose first passes this rig counts: the working folder, or (an attested set, whose lights are
+        /// measured in place) the folder of the fixture's own lights.
+        fn log_root(&self) -> PathBuf {
+            if self.origins.is_some() {
+                self.fixture.dir.path().to_path_buf()
+            } else {
+                self.working.path().to_path_buf()
+            }
         }
 
         fn rows(&self, kind: &str) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
@@ -19810,6 +19867,53 @@ mod tests {
         rig.delete_rows(&["fits.0"]);
         let second = rig.run("run 2", None);
         assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
+        assert_eq!(second.excluded, 0);
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Ruling R12 (a): a file Athenaeum never rewrites (an attested light used in place) keeps its modification time in
+    /// the first pass's stamp. A same-size pixel edit by someone else (a new mtime, the catalog row refreshed as a
+    /// rescan does) makes THAT frame's first pass stale; it re-runs, the others do not, nothing is excluded. Without
+    /// the mtime the edit would be silently reused (the length is the same).
+    #[test]
+    fn measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one() {
+        let rig = Pass1Rig::attested();
+        let first = rig.run("run 1", None);
+        assert_eq!(first.logged.len(), 4);
+        let ids = rig.sorted_ids();
+        assert_eq!(ids.len(), 4);
+        for id in &ids {
+            let p = rig.calibrated_path(*id);
+            assert!(
+                !p.starts_with(rig.layout.calibrated_root()) && !p.starts_with(rig.layout.prepared_root()),
+                "{p:?} is used in place"
+            );
+        }
+        let edited = rig.calibrated_path(ids[2]);
+        let before = std::fs::metadata(&edited).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            // One pixel inside the data unit, same size: 1.0f32 big endian.
+            let mut file = std::fs::OpenOptions::new().write(true).open(&edited).unwrap();
+            file.seek(SeekFrom::Start(before.len() / 2)).unwrap();
+            file.write_all(&1.0f32.to_be_bytes()).unwrap();
+            file.set_modified(before.modified().unwrap() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let after = std::fs::metadata(&edited).unwrap();
+        assert_eq!(after.len(), before.len(), "a same-size edit");
+        assert_ne!(after.modified().unwrap(), before.modified().unwrap());
+        let (size, modified_at) = file_identity(&edited).unwrap();
+        rig.fixture
+            .conn
+            .execute(
+                "UPDATE files SET size = ?1, modified_at = ?2 WHERE path = ?3",
+                rusqlite::params![size, modified_at, edited.to_str().unwrap()],
+            )
+            .unwrap();
+        rig.delete_rows(&["metrics", "fits.0"]);
+        let second = rig.run("run 2", None);
+        assert_eq!(second.logged, vec![edited], "only the edited file re-ran pass 1");
         assert_eq!(second.excluded, 0);
         assert_eq!(rig.rows("metrics").len(), 4);
     }

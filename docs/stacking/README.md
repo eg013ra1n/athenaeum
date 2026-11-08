@@ -3762,6 +3762,10 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
         re-runs pass 1 (never an exclusion). Since the frame-level cache (spec §5.3) the mtime is stored but not compared:
         validity follows the calibration hash in the row's key, because a recalibration reproduces the planes to the bit
         (`recalibration_reproduces_the_planes_bit_for_bit`), so "Delete intermediates" plus a rerun keeps the first pass.
+        Ruling R12 (a): that holds only for a file Athenaeum writes (under the layout's `calibrated/` or `prepared/`); a
+        calibrated file anywhere else (an attested light or a project replica used in place) is never rewritten by us, so
+        a moved mtime there means someone edited it and the mtime IS compared (`strict_mtime`; a path spelled differently
+        from the two roots falls back to strict). Pin: `measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one`.
       - R11c-5 flow: validate on the controller, pass 1 fanned out and written inside the worker (records dropped
         there), the group β, then pass 2 from the artifact or, with none, pass 1 in the worker (the upgrade ripple).
         A write failure is a `warn!`, no row, pass 1 again in pass 2's worker: nothing is ever held.
