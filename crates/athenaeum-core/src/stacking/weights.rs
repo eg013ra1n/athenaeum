@@ -548,6 +548,11 @@ pub(crate) struct TwoPassCandidate {
 /// shallow one sits closer to the set's median pointing.
 pub(crate) const TWO_PASS_CANDIDATES: usize = 10;
 
+/// The version of the two-pass pick, folded into the cached decision's key (frame-level cache spec §5.6, ruling R14):
+/// bump it whenever [`two_pass_pick_among`], its candidate set or its tie-breaks change, so a decision recorded under
+/// the old rule is not reused under the new one.
+pub(crate) const TWO_PASS_PICK_VERSION: u32 = 1;
+
 /// How much corner displacement (px) the switch has to BUY before it
 /// happens (ruling R-M4a-5). Below this the current reference stays: every
 /// frame in a normal set sits within a few px of the median transform, and

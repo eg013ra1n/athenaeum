@@ -131,7 +131,7 @@ use crate::stacking::weights::{
     best_by_weight, compute_weights, defers_weight_gate, reference_coverage, select_frames,
     select_frames_deferring_weight_gate, sky_penalized_order, two_pass_deviation_px,
     two_pass_pick, two_pass_pick_among, weight_gate, FrameWeight, TwoPassCandidate, WeightInput,
-    WeightMode, MIN_REFERENCE_COVERAGE, TWO_PASS_CANDIDATES, TWO_PASS_MIN_GAIN_PX,
+    WeightMode, MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX, TWO_PASS_PICK_VERSION,
 };
 
 /// Every `fits` artifact path whose write DEGRADED (final fix wave, ruling
@@ -9137,16 +9137,53 @@ struct TwoPassPayload {
     switch_to: Option<i64>,
 }
 
+/// What the pick draws its finalists from (ruling R14 (a)): the whole weight ranking, not only the top
+/// `TWO_PASS_CANDIDATES` of it, because a member entering or leaving the top ranks through a weight edit or a
+/// floor edit changes the pick's input.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TwoPassRanking {
+    /// Every included member the pick can draw from with a finite weight, ids in rank order (weight descending, the
+    /// lower index first on a tie).
+    ranked: Vec<i64>,
+    /// The ids among them whose weight is not finite (the pick drops them), ascending.
+    non_finite: Vec<i64>,
+    /// The included members under the Measure-time floor that the PSF modes defer, ascending; the candidate reference
+    /// is left out (it stays a candidate whatever its flag).
+    floored: Vec<i64>,
+}
+
 /// The key of a two-pass decision: everything the dry pass and the pick read. The registration subtree (the dry
-/// pass registers with it), the candidate reference and its calibration hash, the ranked ids the pick scores (rank
-/// order), a project's WCS-allowed ids, and every included member's registration hash against the candidate (which
+/// pass registers with it), [`TWO_PASS_PICK_VERSION`], the candidate reference and its calibration hash, the
+/// [`TwoPassRanking`] (the full ranking, the members whose weight is not finite, the members under the Measure-time
+/// floor), a project's WCS-allowed ids, and every included member's registration hash against the candidate (which
 /// carries the member's calibration and, where registration reads Measure's fits, its measurement). Registration is
 /// deterministic (RQ-1), so equal inputs give the equal decision.
 pub(crate) fn two_pass_key(
     cfg: &StackingConfig,
     candidate_id: i64,
     candidate_calib_hash: &str,
-    ranked_ids: &[i64],
+    ranking: &TwoPassRanking,
+    allowed_ids: Option<&[i64]>,
+    member_hashes: &[(i64, String)],
+) -> String {
+    two_pass_key_with_version(
+        cfg,
+        TWO_PASS_PICK_VERSION,
+        candidate_id,
+        candidate_calib_hash,
+        ranking,
+        allowed_ids,
+        member_hashes,
+    )
+}
+
+/// [`two_pass_key`] with the pick version supplied, so a test can prove the key follows it.
+fn two_pass_key_with_version(
+    cfg: &StackingConfig,
+    pick_version: u32,
+    candidate_id: i64,
+    candidate_calib_hash: &str,
+    ranking: &TwoPassRanking,
     allowed_ids: Option<&[i64]>,
     member_hashes: &[(i64, String)],
 ) -> String {
@@ -9157,9 +9194,12 @@ pub(crate) fn two_pass_key(
             .join(",")
     };
     let mut upstream: Vec<String> = vec![
+        format!("pick:{pick_version}"),
         format!("ref:{candidate_id}"),
         candidate_calib_hash.to_string(),
-        format!("ranked:{}", join(ranked_ids)),
+        format!("ranked:{}", join(&ranking.ranked)),
+        format!("unweighed:{}", join(&ranking.non_finite)),
+        format!("floored:{}", join(&ranking.floored)),
     ];
     if let Some(allowed) = allowed_ids {
         upstream.push(format!("allowed:{}", join(allowed)));
@@ -9182,32 +9222,46 @@ struct TwoPassLookup {
     cached: Option<Option<i64>>,
 }
 
-/// The ids the pick scores, in rank order: the group's included frames with a calibrated file that are not under the
-/// Measure-time floor (the current reference stays whatever its flag, as in [`two_pass_candidates`]), restricted to
-/// `allowed` on a project, ordered by weight with the lower index first on a tie, the top
-/// [`TWO_PASS_CANDIDATES`] (`weights::two_pass_pick_among`).
-fn two_pass_ranked_ids(
+/// The [`TwoPassRanking`] of a group's entries: the included frames with a calibrated file, the current reference
+/// whatever its flag and every other one only when it is not under the Measure-time floor (as in
+/// [`two_pass_candidates`]), restricted to `allowed` on a project. The finite-weight ones are ordered by weight with
+/// the lower index first on a tie, as `weights::two_pass_pick_among` orders them, and NOT cut to the top N.
+fn two_pass_ranking(
     entries: &[MeasuredFrame],
     reference_frame_id: i64,
     allowed: Option<&HashSet<i64>>,
-) -> Vec<i64> {
-    let mut ranked: Vec<(usize, f64, i64)> = entries
+) -> TwoPassRanking {
+    let mut floored: Vec<i64> = entries
         .iter()
-        .enumerate()
-        .filter(|(_, e)| e.included && e.calibrated.is_some())
-        .filter(|(_, e)| e.frame.frame_id == reference_frame_id || !e.measure_floored)
-        .filter(|(_, e)| {
-            e.frame.frame_id == reference_frame_id
-                || allowed.is_none_or(|a| a.contains(&e.frame.frame_id))
-        })
-        .map(|(i, e)| {
-            let weight = e.weight.as_ref().map_or(0.0, |w| w.normalized_mean);
-            (i, weight, e.frame.frame_id)
-        })
+        .filter(|e| e.included && e.calibrated.is_some())
+        .filter(|e| e.measure_floored && e.frame.frame_id != reference_frame_id)
+        .map(|e| e.frame.frame_id)
         .collect();
+    floored.sort_unstable();
+    let mut ranked: Vec<(usize, f64, i64)> = Vec::new();
+    let mut non_finite: Vec<i64> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        if !(e.included && e.calibrated.is_some()) {
+            continue;
+        }
+        let id = e.frame.frame_id;
+        if id != reference_frame_id && (e.measure_floored || allowed.is_some_and(|a| !a.contains(&id))) {
+            continue;
+        }
+        let weight = e.weight.as_ref().map_or(0.0, |w| w.normalized_mean);
+        if weight.is_finite() {
+            ranked.push((i, weight, id));
+        } else {
+            non_finite.push(id);
+        }
+    }
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.truncate(TWO_PASS_CANDIDATES);
-    ranked.into_iter().map(|(_, _, id)| id).collect()
+    non_finite.sort_unstable();
+    TwoPassRanking {
+        ranked: ranked.into_iter().map(|(_, _, id)| id).collect(),
+        non_finite,
+        floored,
+    }
 }
 
 /// The two-pass key of `group` against the candidate reference, and the stored decision when its `two_pass` row is
@@ -9261,16 +9315,16 @@ fn two_pass_lookup(
         ids.sort_unstable();
         ids
     });
-    let ranked_ids = rc
+    let ranking = rc
         .measured
         .get(&group.key)
-        .map(|v| two_pass_ranked_ids(v, reference_frame_id, allowed.as_ref()))
+        .map(|v| two_pass_ranking(v, reference_frame_id, allowed.as_ref()))
         .unwrap_or_default();
     let key = two_pass_key(
         &rc.config,
         reference_frame_id,
         reference_hash,
-        &ranked_ids,
+        &ranking,
         allowed_ids.as_deref(),
         &member_hashes,
     );
@@ -9326,6 +9380,24 @@ fn two_pass_lookup(
         Some(payload.switch_to)
     });
     Ok(TwoPassLookup { key, cached })
+}
+
+/// [`two_pass_lookup`] after the Register boundary of the landed-file identity check (ruling R14 (b)): a member whose
+/// landed file changed is excluded FIRST, so a hit and a miss see the same members and a cached decision cannot name a
+/// member this run is about to drop. `exclude_changed_members` is idempotent, so the persisting pass repeats it for
+/// nothing. `None` when fewer than 3 included members remain: no decision to look up, and the pass is skipped.
+fn two_pass_lookup_after_identity_check(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    force_fresh: bool,
+) -> Result<Option<TwoPassLookup>, RunError> {
+    exclude_changed_members(rc, group)?;
+    if included_count_of(rc, &group.key) < 3 {
+        return Ok(None);
+    }
+    two_pass_lookup(rc, group, reference_frame_id, reference_hash, force_fresh).map(Some)
 }
 
 /// Record the dry pass's decision under the key [`two_pass_lookup`] computed before it ran. A failed write is logged
@@ -9400,7 +9472,11 @@ fn two_pass_refine(
 ) -> Result<Option<TwoPassSwitch>, RunError> {
     // Frame-level cache spec §5.6: the decision of an earlier run on the same inputs. A hit skips the dry pass; the
     // switch is built through `adopt_two_pass_pick`'s fresh-detection fallback (`rc.dry_pass_stars` is empty).
-    let lookup = two_pass_lookup(rc, group, reference_frame_id, reference_hash, force_fresh)?;
+    let Some(lookup) =
+        two_pass_lookup_after_identity_check(rc, group, reference_frame_id, reference_hash, force_fresh)?
+    else {
+        return Ok(None);
+    };
     if let Some(cached) = lookup.cached {
         tracing::info!(
             run_id = rc.run_id,
@@ -9805,11 +9881,9 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
     // co-registered path counts them.
     let mut total = 0usize;
     for g in &groups {
-        let included = included_count_of(rc, &g.key);
-        if included < 3 {
+        if included_count_of(rc, &g.key) < 3 {
             continue;
         }
-        total += included;
         let (group_reference, group_reference_hash) = {
             let geometry = rc.geometry_of(&g.key);
             (geometry.reference_frame_id, geometry.hash.clone())
@@ -9817,17 +9891,25 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
         if group_two_pass_wanted(&cfg, group_reference, manual_reference_frame_id)
             && group_can_switch(rc, &g.key, group_reference)
         {
-            // A cached decision removes this group's dry pass from the total.
-            let lookup = two_pass_lookup(
+            // A cached decision removes this group's dry pass from the total. The lookup runs after the identity
+            // check, as `two_pass_refine` does (ruling R14 (b)), so the count is of the members that will register.
+            let Some(lookup) = two_pass_lookup_after_identity_check(
                 rc,
                 g,
                 group_reference,
                 &group_reference_hash,
                 force_fresh,
-            )?;
+            )?
+            else {
+                continue;
+            };
+            let included = included_count_of(rc, &g.key);
+            total += included;
             if lookup.cached.is_none() {
                 total += included;
             }
+        } else {
+            total += included_count_of(rc, &g.key);
         }
     }
     let mut progress = (0usize, total);
@@ -10096,14 +10178,6 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         solve_of(&mut solves, &conn, &origins, reference_frame_id);
     }
 
-    let mut viable_total = 0usize;
-    for g in &groups {
-        let included = included_count_of(rc, &g.key);
-        if included >= 3 {
-            viable_total += included;
-        }
-    }
-
     // The dry pass's own group (ruling R-M4a-5): Auto mode, two-pass on,
     // and the reference's group viable — a group the persisting loop would
     // skip anyway gives nothing to take a median over.
@@ -10121,17 +10195,24 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
             None
         };
     // A cached two-pass decision removes the dry pass from the total (frame-level cache spec §5.6).
+    // The lookup runs after the identity check, as `two_pass_refine` does (ruling R14 (b)), so the totals count the
+    // members that will register.
     let dry_total = match dry_group.as_ref() {
         Some(g) => {
-            let lookup = two_pass_lookup(rc, g, reference_frame_id, &reference_hash, force_fresh)?;
-            if lookup.cached.is_some() {
-                0
-            } else {
-                included_count_of(rc, &g.key)
+            match two_pass_lookup_after_identity_check(rc, g, reference_frame_id, &reference_hash, force_fresh)? {
+                Some(lookup) if lookup.cached.is_none() => included_count_of(rc, &g.key),
+                _ => 0,
             }
         }
         None => 0,
     };
+    let mut viable_total = 0usize;
+    for g in &groups {
+        let included = included_count_of(rc, &g.key);
+        if included >= 3 {
+            viable_total += included;
+        }
+    }
 
     let mut progress = (0usize, viable_total + dry_total);
     rc.progress(
@@ -22270,7 +22351,11 @@ mod tests {
 
         /// One run through Register, `emitter` receiving its progress.
         fn run(&self, emitter: Arc<dyn ProgressEmitter>) -> RunContext {
-            let cfg = StackingConfig::default();
+            self.run_cfg(StackingConfig::default(), emitter)
+        }
+
+        /// One run through Register under `cfg`.
+        fn run_cfg(&self, cfg: StackingConfig, emitter: Arc<dyn ProgressEmitter>) -> RunContext {
             let plan_groups = group_frames(&self.fixture.conn, self.fixture.set_id, &cfg.grouping).unwrap();
             assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
             let (run_id, group_ids) = seed_run_and_groups(
@@ -22382,6 +22467,142 @@ mod tests {
         );
         let key2 = rig.decision_row(&rc2).unwrap().config_hash;
         assert_ne!(key1, key2, "the key ignored a changed member");
+    }
+
+    /// A `selection.minWeightFraction` that floors three of [`two_pass_fields`]' six members at Measure time (their
+    /// weights are about 0.296, 0.296, 0.304 against 0.39, 0.40 and 1.0), with a margin of 0.036 either side.
+    const FLOOR_FLOORING_THREE_MEMBERS: f64 = 0.34;
+
+    /// Ruling R14 (a): a `selection.minWeightFraction` edit changes no hash the members carry, but it moves which
+    /// members the Measure-time floor takes out of the pick (PSF modes defer the gate). The floored set is a term of
+    /// the key, so the edit is a miss.
+    #[test]
+    fn two_pass_cache_misses_when_a_floor_edit_floors_a_member() {
+        let rig = TwoPassRig::new();
+        let rc1 = rig.run(Arc::new(NullEmitter));
+        let key1 = rig.decision_row(&rc1).unwrap().config_hash;
+        let group = rc1.plan_groups[0].key.clone();
+        assert!(
+            !rc1.measured[&group].iter().any(|e| e.measure_floored),
+            "premise: the default floor takes nobody out"
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.selection.min_weight_fraction = FLOOR_FLOORING_THREE_MEMBERS;
+        let (rc2, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run_cfg(cfg, Arc::new(NullEmitter)));
+        assert!(
+            rc2.measured[&group].iter().any(|e| e.measure_floored),
+            "premise: the edit floors a member"
+        );
+        assert!(!logs2.contains("two-pass decision reused"), "the floored pick reused an unfloored decision: {logs2}");
+        let key2 = rig.decision_row(&rc2).unwrap().config_hash;
+        assert_ne!(key1, key2, "the key ignored the floored member");
+    }
+
+    fn ranking_entry(id: i64, weight: Option<f64>, floored: bool) -> MeasuredFrame {
+        use crate::stacking::groups::GroupFrame;
+        MeasuredFrame {
+            frame: GroupFrame {
+                frame_id: id,
+                file_id: id,
+                filename: format!("f{id}.fits"),
+                path: format!("/f{id}.fits"),
+                size: 1,
+                modified_at: "2026-01-01".into(),
+                exposure_s: Some(60.0),
+                date_obs: None,
+                width: 64,
+                height: 48,
+                pixel_scale_arcsec: None,
+                scale_source: None,
+            },
+            calibrated: Some(PathBuf::from(format!("/c_f{id}.fits"))),
+            planes: 1,
+            measurement: None,
+            weight: weight.map(|w| FrameWeight {
+                channels: vec![w],
+                normalized: vec![w],
+                mean: w,
+                normalized_mean: w,
+                missing: None,
+            }),
+            included: true,
+            reason: None,
+            registration: None,
+            cached_calibrated: true,
+            cached_metrics: false,
+            ln_scale: None,
+            cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
+            measure_floored: floored,
+        }
+    }
+
+    /// Ruling R14 (a), (c): the key follows the floored members, the WHOLE weight ranking (a swap below the top N
+    /// moves it), the members whose weight is not finite and the pick version.
+    #[test]
+    fn two_pass_key_follows_the_floor_the_whole_ranking_and_the_pick_version() {
+        let cfg = StackingConfig::default();
+        let hashes: Vec<(i64, String)> = (1..=12).map(|id| (id, format!("h{id}"))).collect();
+        let entries = |weights: &[f64], floored: &[i64]| -> Vec<MeasuredFrame> {
+            weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| ranking_entry(i as i64 + 1, Some(*w), floored.contains(&(i as i64 + 1))))
+                .collect()
+        };
+        let key_of = |entries: &[MeasuredFrame]| {
+            two_pass_key(&cfg, 1, "calib", &two_pass_ranking(entries, 1, None), None, &hashes)
+        };
+        let weights: Vec<f64> = (0..12).map(|i| 1.0 - 0.05 * i as f64).collect();
+        let base = entries(&weights, &[]);
+        assert!(crate::stacking::weights::TWO_PASS_CANDIDATES < 11, "premise: ranks 11 and 12 are below the top N");
+        let base_key = key_of(&base);
+        assert_eq!(base_key, key_of(&entries(&weights, &[])), "premise: the key is deterministic");
+
+        // A floor edit that floors a member.
+        assert_ne!(base_key, key_of(&entries(&weights, &[5])), "a floored member is a key term");
+        // A floored member below the top N leaves the full ranking (a truncated one would not notice).
+        assert_ne!(base_key, key_of(&entries(&weights, &[12])), "a floored member below the top N is a key term");
+        // A floored member a project's WCS rule keeps out of the ranking anyway still leaves the dry pass's median,
+        // so the floored set is a term of its own.
+        let allowed: HashSet<i64> = (1..=12).filter(|id| *id != 5).collect();
+        let allowed_key = |floored: &[i64]| {
+            two_pass_key(
+                &cfg,
+                1,
+                "calib",
+                &two_pass_ranking(&entries(&weights, floored), 1, Some(&allowed)),
+                None,
+                &hashes,
+            )
+        };
+        assert_ne!(allowed_key(&[]), allowed_key(&[5]), "the floored set must be a key term of its own");
+        // The reference itself stays a candidate whatever its flag, so flagging it is not a change.
+        assert_eq!(base_key, key_of(&entries(&weights, &[1])), "the reference is never floored out");
+        // A swap of ranks 11 and 12: outside the top N, inside the ranking.
+        let mut swapped = weights.clone();
+        swapped.swap(10, 11);
+        assert_ne!(base_key, key_of(&entries(&swapped, &[])), "the ranking below the top N is a key term");
+        // A member whose weight is not finite leaves the ranking and is named apart.
+        let mut nan = weights.clone();
+        nan[6] = f64::NAN;
+        let nan_entries = entries(&nan, &[]);
+        let ranking = two_pass_ranking(&nan_entries, 1, None);
+        assert_eq!(ranking.non_finite, vec![7]);
+        assert!(!ranking.ranked.contains(&7));
+        assert_ne!(base_key, key_of(&nan_entries));
+        // A member with no weight at all ranks last, finite.
+        let mut unweighed = entries(&weights, &[]);
+        unweighed[2].weight = None;
+        assert_eq!(*two_pass_ranking(&unweighed, 1, None).ranked.last().unwrap(), 3);
+        // The pick version is a term.
+        let ranking = two_pass_ranking(&base, 1, None);
+        let with_version = |v: u32| two_pass_key_with_version(&cfg, v, 1, "calib", &ranking, None, &hashes);
+        assert_eq!(base_key, with_version(TWO_PASS_PICK_VERSION));
+        assert_ne!(base_key, with_version(TWO_PASS_PICK_VERSION + 1), "the key ignored the pick version");
     }
 
     /// The dry pass names itself in the Register progress ("checking the reference"), the real pass is "aligning",
@@ -35704,6 +35925,66 @@ mod tests {
                 "the frame was rewritten for the moved grid"
             );
         }
+    }
+
+    /// Ruling R14 (b): the landed-file identity check runs BEFORE the two-pass lookup. A cached decision names a
+    /// member whose landed file has changed since (the catalog of a project has no rescan, so the member's hashes did
+    /// not move): the lookup must see the group without it, miss, and run the dry pass over the rest. Without the
+    /// reorder the hit adopts the changed member as the reference and the persisting pass then fails the run
+    /// ("the reference frame changed during the run").
+    #[test]
+    fn a_cached_decision_naming_a_changed_member_is_not_adopted() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 5);
+        let cfg = crate::stacking::config::project_seed_config(StackingConfig::default());
+        assert!(cfg.reference.two_pass, "premise: the project seed keeps the two-pass re-pick on");
+        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
+            .unwrap();
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &tmp.path().join("work"), &tmp.path().join("out"));
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        stage_calibrate(&mut rc).unwrap();
+        stage_measure(&mut rc).unwrap();
+        stage_reference(&mut rc).unwrap();
+
+        // The decision an earlier run cached, under the key this run computes now: "switch to <victim>".
+        let group = rc.plan_groups[0].clone();
+        let reference = rc.reference_frame_id.unwrap();
+        let reference_hash = {
+            let frame = find_frame_in_groups(&rc.plan_groups, reference).unwrap();
+            let conn = db(&rc.ctx).unwrap().conn();
+            rc.memo.calibration_hash_checked(&conn, &cfg, &frame).unwrap()
+        };
+        let victim = group.frames.iter().find(|f| f.frame_id != reference).unwrap().clone();
+        let lookup = two_pass_lookup(&mut rc, &group, reference, &reference_hash, false).unwrap();
+        store_two_pass_decision(&rc, &group, &lookup, Some(victim.frame_id));
+        assert_eq!(
+            two_pass_lookup(&mut rc, &group, reference, &reference_hash, false).unwrap().cached,
+            Some(Some(victim.frame_id)),
+            "premise: the stored decision is a hit before the file changes"
+        );
+
+        // The victim's landed file changes, still a readable FITS.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&victim.path).unwrap();
+            file.write_all(&[0u8; 64]).unwrap();
+        }
+
+        let ((), logs) = crate::stacking::telemetry::capture_logs(|| stage_register(&mut rc).unwrap());
+        assert!(!logs.contains("two-pass decision reused"), "a decision naming a changed member was reused: {logs}");
+        assert_ne!(rc.reference_frame_id, Some(victim.frame_id), "the changed member became the reference");
+        let entry = rc.measured[&group.key].iter().find(|e| e.frame.frame_id == victim.frame_id).unwrap();
+        assert!(!entry.included, "the changed member stayed in the run");
+        assert_eq!(entry.reason.as_deref(), Some(crate::stacking::origin::CHANGED_DURING_THE_RUN));
+        assert_eq!(
+            rc.measured[&group.key].iter().filter(|e| e.included).count(),
+            4,
+            "the other four members are registered"
+        );
     }
 
     /// Plan 6b-3 D2: the plan and the run agree — after a run the plan reports
