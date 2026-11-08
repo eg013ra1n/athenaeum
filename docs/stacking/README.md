@@ -5111,7 +5111,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
 ## Frame-level cache (2026-11-08)
 
 Spec `docs/superpowers/specs/2026-11-08-stacking-frame-level-cache-design.md`, plan `docs/superpowers/plans/2026-11-08-stacking-frame-level-cache-plan.md`,
-rulings R1-R15 in the job's ledger. The principle: **the key says whose result it is, the hash says what it was made from.** A result
+rulings R1-R16 in the job's ledger. The principle: **the key says whose result it is, the hash says what it was made from.** A result
 that is a function of one frame (and the run-wide reference) is keyed on the frame (`group_key = ''`); only a result that is a function
 of the group's membership is keyed on the group. A regroup (exposure mode, tolerance, stops width) recomputes the group-level results
 only: the LN reference, its calibration, the LN sidecars, rejection and the master (co-registered geometry, the default; under Native
@@ -5206,8 +5206,10 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   unless they agree; pass 2 re-runs then (set 270: 1.5 everywhere, the fit's floor, so it never does).
 - **Known residuals.** After a weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by
   weight and re-registers: the run is correct, the gate under-reports. A frame-level file is shared by the dev and the release build when
-  both use one working folder: the first run in either build makes the other's rows stale (a recompute), see open-items. Remaining gates:
-  `docs/superpowers/open-items.md`.
+  both use one working folder: the first run in either build makes the other's rows stale (a recompute), see open-items. The gate and the
+  run take a group's β from their own sources (`measure_betas` vs `rc.measured_groups`): for a group the run does not measure (fewer
+  than 3 included) the run folds None where the gate may fold Some — the gate then over-reports Register stale, never a false hit; do not
+  re-flag it. Remaining gates: `docs/superpowers/open-items.md`.
 - **Acceptance (2026-11-08, headless real-data smoke).** The release `athenaeum-web` of this branch on a copy of the dev catalog (the
   Task 9 migration on it: 1 806 rows re-keyed, 0 duplicates dropped), Manual reference, `seconds` → `none` → `seconds`, `fan-out
   finished` items per run (calibrate / pass1 / pass2 / align): OSC set 163 (16 lights, 300 s + 600 s, β 1.5 throughout) 16/16/16/16,
