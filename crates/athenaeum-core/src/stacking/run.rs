@@ -21682,6 +21682,114 @@ mod tests {
         );
     }
 
+    /// Ruling R3 (b), the negative: a frame that calibrates to ONE plane inside a debayered OSC group (an unparseable
+    /// BAYERPAT) never reaches Measure's `fits.0`, even when a fresh at-floor row is there: registration folds that
+    /// artifact only for a group whose frames read it (`register_reads_measure_fits`), so reading it would be a read
+    /// the hash does not cover. The same row, asked for through a mono group, is admitted (the control).
+    #[test]
+    fn resolve_register_fits_is_none_for_a_group_that_does_not_read_fits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, "floor-fixture");
+        let date_obs = date_obs_at(0);
+        let (frame_id, _path) = test_fixtures::add_light(
+            &fixture,
+            &LightSpec {
+                write_file: false,
+                ..star_light_spec("f0", &date_obs)
+            },
+        );
+
+        let cfg = StackingConfig::default();
+        assert!(cfg.calibration.debayer_osc, "premise: the OSC group is debayered");
+        let group = |key: &str, color_mode| IntegrationGroup {
+            key: key.into(),
+            instrume: None,
+            color_mode,
+            filter: None,
+            binning: 1,
+            cameras: Vec::new(),
+            exposure_s: None,
+            exposure_class: "unknown".into(),
+            frames: Vec::new(),
+            total_exposure_s: 0.0,
+            pixel_scale_arcsec: None,
+        };
+        let rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            1,
+            fixture.set_id,
+            "floor-fixture",
+            cfg.clone(),
+            vec![
+                group("osc__floor_test", ColorMode::Osc),
+                group("mono__floor_test", ColorMode::Mono),
+            ],
+            WorkingLayout::new(fixture.dir.path(), "floor-fixture"),
+            fixture.dir.path().to_path_buf(),
+            HashMap::new(),
+        );
+        let calibrated_hash = "floor-test-calibrated-hash";
+        let expected_hash = measurement_hash_for(&cfg, calibrated_hash, None);
+        let good_fit_at = |i: usize| psf_signal::StarFit {
+            x: 10.0 + i as f64 * 4.0,
+            y: 10.0 + i as f64 * 3.0,
+            background: 100.0,
+            amplitude: 5000.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            fwtm_x: 6.0,
+            fwtm_y: 6.0,
+            theta: 0.0,
+            beta: 4.0,
+            residual: 0.02,
+            signal: 40000.0,
+            area: 28.0,
+            peak5: f64::NAN,
+            sky_ring: f64::NAN,
+            sky_ring_sigma: f64::NAN,
+            sky_ring_n: 0,
+            ap_sum: f64::NAN,
+            snr: f64::NAN,
+            hfr: f64::NAN,
+            flags: crate::star_measure::StarFlags::default(),
+        };
+        let at_floor: Vec<psf_signal::StarFit> = (0..align::MIN_INLIERS).map(good_fit_at).collect();
+        let path = fixture.dir.path().join("floor-at-floor.athf");
+        fits_artifact::write_fits(&path, &at_floor).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len() as i64;
+        crate::db::stacking::upsert_artifact(
+            &fixture.conn,
+            &crate::db::stacking::NewArtifact {
+                subject: &StackSubject::FrameSet(fixture.set_id),
+                frame_id: Some(frame_id),
+                group_key: "",
+                kind: &fits_artifact::artifact_kind(0),
+                path: Some(path.to_str().unwrap()),
+                config_hash: &expected_hash,
+                size: Some(size),
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_register_fits(&rc, "mono__floor_test", frame_id, 1, calibrated_hash)
+                .as_ref()
+                .map(Vec::len),
+            Some(align::MIN_INLIERS),
+            "the control: a mono group reads the fresh at-floor row"
+        );
+        assert!(
+            resolve_register_fits(&rc, "osc__floor_test", frame_id, 1, calibrated_hash).is_none(),
+            "a debayered OSC group's frame detects instead of reading a row its hash does not cover"
+        );
+    }
+
     #[test]
     fn registration_rows_are_written_and_reused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -21932,9 +22040,29 @@ mod tests {
         let rc2 = run_pass(cfg.clone());
         assert_eq!(osc_cached(&rc2), vec![true; 4], "the same config reuses");
 
+        // R5 M2, the round trip: the gate reads what the run wrote. After the repeat pass Register is not stale under
+        // `cfg`, and it is stale under `moved` BEFORE the run that moves (the OSC rows were registered against the
+        // reference's stars at the old config).
+        let register_stale = |cfg: &StackingConfig| -> bool {
+            crate::stacking::plan::build_plan(
+                &fixture.conn,
+                &ctx.settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(fixture.set_id),
+                Some(cfg.clone()),
+            )
+            .expect("the plan should build")
+            .stale_stages
+            .contains(&Stage::Register)
+        };
         let mut moved = cfg.clone();
         moved.measurement.max_stars = cfg.measurement.max_stars - 1000;
-        let rc3 = run_pass(moved);
+        assert!(!register_stale(&cfg), "the run's own rows read fresh at the gate");
+        assert!(
+            register_stale(&moved),
+            "the gate reads Register stale under the moved reference measurement before it runs"
+        );
+        let rc3 = run_pass(moved.clone());
         assert_eq!(
             osc_cached(&rc3),
             vec![false; 4],

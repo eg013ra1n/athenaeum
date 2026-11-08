@@ -804,8 +804,9 @@ fn gate_measure_betas(
 /// `cfg.registration` (already in `registration_subtree`), so its caller
 /// passes `""` and the group's beta no longer re-registers it.
 ///
-/// `reference_measurement_hash` (ruling R3 (a)): a co-registered frame whose reference lives in ANOTHER group is
-/// registered against star lists built from the REFERENCE's `fits.0` when the reference is one plane, Measure output
+/// `reference_measurement_hash` (ruling R3 (a)): any frame whose reference lives in ANOTHER group (the native-geometry
+/// fallback included) is registered against star lists built from the REFERENCE's `fits.0` when the reference is one
+/// plane, Measure output
 /// the frame's own `measure:` term does not cover (it holds the frame's group's config and beta). The caller passes
 /// [`reference_measurement_fold`], folded here as `ref_measure:<h>`; `""` (nothing folded) when the reference is in
 /// the frame's own group, so a single-group set keeps its hashes.
@@ -11441,7 +11442,26 @@ mod tests {
                 (id, memo.calibration_hash(&f.conn, &cfg, gf).unwrap())
             })
             .collect();
-        let betas: HashMap<String, f64> = groups.iter().map(|g| (g.key.clone(), 1.5)).collect();
+        // Each group has its OWN β (R5 M1): the mono group 1.5, the OSC group 2.5. Both folds below read their own
+        // group's value, so a test that moves one group's β sees which fold carries it.
+        let beta_of = |key: &str| -> f64 {
+            if key.starts_with("mono__") {
+                1.5
+            } else {
+                2.5
+            }
+        };
+        let betas: HashMap<String, f64> =
+            groups.iter().map(|g| (g.key.clone(), beta_of(&g.key))).collect();
+        let betas_with = |prefix: &str, beta: f64| -> HashMap<String, f64> {
+            let mut out = betas.clone();
+            for (key, value) in out.iter_mut() {
+                if key.starts_with(prefix) {
+                    *value = beta;
+                }
+            }
+            out
+        };
 
         let run_id = crate::db::stacking::insert_run(
             &f.conn,
@@ -11502,7 +11522,7 @@ mod tests {
         }
 
         // The hash the run writes for one frame under `cfg`, built the way `register_group_pass` builds it.
-        let hash_under = |cfg: &StackingConfig, frame_id: i64| -> String {
+        let hash_under = |cfg: &StackingConfig, betas: &HashMap<String, f64>, frame_id: i64| -> String {
             let (group, _) = find_group_of(&groups, frame_id).unwrap();
             let (reference_group, _) = find_group_of(&groups, reference_id).unwrap();
             registration_hash_for(
@@ -11510,14 +11530,20 @@ mod tests {
                 reference_id,
                 &calib[&reference_id],
                 &calib[&frame_id],
-                &registration_measurement_fold(cfg, group, false, &calib[&frame_id], Some(1.5)),
+                &registration_measurement_fold(
+                    cfg,
+                    group,
+                    false,
+                    &calib[&frame_id],
+                    Some(betas[&group.key]),
+                ),
                 &reference_measurement_fold(
                     cfg,
                     group,
                     reference_group,
                     false,
                     &calib[&reference_id],
-                    Some(1.5),
+                    Some(betas[&reference_group.key]),
                 ),
             )
         };
@@ -11548,41 +11574,82 @@ mod tests {
             filename: None,
             on_disk: true,
         };
-        let stale_under = |cfg: &StackingConfig| -> bool {
+        let stale_under = |cfg: &StackingConfig, betas: &HashMap<String, f64>| -> bool {
             let mut memo = HashMemo::new(origins.clone());
             compute_register_stale(
-                &f.conn, cfg, &subject, &groups, &reference, &mut memo, &origins, None, &betas,
+                &f.conn, cfg, &subject, &groups, &reference, &mut memo, &origins, None, betas,
             )
             .unwrap()
         };
 
         // The premise the test stands on: the OSC frames' hashes move with the reference's measurement.
         for &id in &osc_ids {
-            assert_ne!(hash_under(&cfg, id), hash_under(&moved, id), "osc frame {id}");
+            assert_ne!(
+                hash_under(&cfg, &betas, id),
+                hash_under(&moved, &betas, id),
+                "osc frame {id}"
+            );
+        }
+        // R5 M1, the β choice: the OSC frames' hashes follow the REFERENCE's group β (the mono one) and not their own.
+        let mono_moved = betas_with("mono__", 1.6);
+        let osc_moved = betas_with("osc__", 2.6);
+        for &id in &osc_ids {
+            assert_ne!(
+                hash_under(&cfg, &betas, id),
+                hash_under(&cfg, &mono_moved, id),
+                "osc frame {id}: the reference's beta is folded"
+            );
+            assert_eq!(
+                hash_under(&cfg, &betas, id),
+                hash_under(&cfg, &osc_moved, id),
+                "osc frame {id}: its own beta is not"
+            );
         }
 
         // Every row keyed under `cfg`: cached; under `moved`, stale.
         for &id in &all_ids {
-            seed_row(id, &hash_under(&cfg, id));
+            seed_row(id, &hash_under(&cfg, &betas, id));
         }
-        assert!(!stale_under(&cfg), "the control: nothing moved");
-        assert!(stale_under(&moved));
+        assert!(!stale_under(&cfg, &betas), "the control: nothing moved");
+        assert!(stale_under(&moved, &betas));
+
+        // R5 M1: moving only the OSC group's own β leaves every row fresh; moving only the mono β (the reference's
+        // group) stales the OSC rows, and re-keying the mono rows alone leaves the OSC rows as the cause.
+        assert!(
+            !stale_under(&cfg, &osc_moved),
+            "the OSC group's own beta is no part of its registration hash"
+        );
+        for &id in &mono_ids {
+            seed_row(id, &hash_under(&cfg, &mono_moved, id));
+        }
+        assert!(
+            stale_under(&cfg, &mono_moved),
+            "the reference group's beta moved: the OSC rows registered against it are stale"
+        );
+        for &id in &osc_ids {
+            seed_row(id, &hash_under(&cfg, &mono_moved, id));
+        }
+        assert!(!stale_under(&cfg, &mono_moved));
+        for &id in &all_ids {
+            seed_row(id, &hash_under(&cfg, &betas, id));
+        }
+        assert!(!stale_under(&cfg, &betas), "back to the control");
 
         // The mono rows re-keyed to `moved`, the OSC rows left behind: the OSC frames alone keep it stale.
         for &id in &mono_ids {
-            seed_row(id, &hash_under(&moved, id));
+            seed_row(id, &hash_under(&moved, &betas, id));
         }
         assert!(
-            stale_under(&moved),
+            stale_under(&moved, &betas),
             "an OSC frame registered against a mono reference of another group must re-register when the \
              reference's measurement moves"
         );
 
         // The OSC rows re-keyed too: fresh again.
         for &id in &osc_ids {
-            seed_row(id, &hash_under(&moved, id));
+            seed_row(id, &hash_under(&moved, &betas, id));
         }
-        assert!(!stale_under(&moved));
+        assert!(!stale_under(&moved, &betas));
     }
 
     /// Plan 6b-3 D15 (the 6b-2 leftover): one rule for stage 1 and LN — an
