@@ -7730,6 +7730,21 @@ fn resolve_register_fits(
     if planes != 1 {
         return None;
     }
+    // Ruling R3 (b): the invariant is structural. Registration folds Measure's output only for a group whose frames
+    // read `fits.0` (`register_reads_measure_fits`), so a group that does not read it never reaches the artifact: a
+    // frame that calibrates to one plane inside a three-plane group (an unparseable BAYERPAT) detects instead, the
+    // safe direction.
+    let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
+    let reads_fits = rc
+        .plan_groups
+        .iter()
+        .find(|g| g.key == group_key)
+        .is_some_and(|g| {
+            crate::stacking::plan::register_reads_measure_fits(&rc.config, g, prepare_path)
+        });
+    if !reads_fits {
+        return None;
+    }
     let expected_hash = group_measurement_hash(rc, &rc.config, group_key, calibrated_hash);
     let kind = fits_artifact::artifact_kind(0);
 
@@ -8035,7 +8050,30 @@ fn register_group_pass(
     let mut needs_artifact_rewrite: Vec<ArtifactRewriteItem> = Vec::new();
     // Frame-level cache spec §5.5: the measurement hash is folded only for a frame whose registration reads
     // `fits.0`; the gate derives the same flag (`plan::compute_register_stale`).
-    let prepare_path = crate::stacking::plan::subject_prepares(&rc.subject, &rc.origins);
+    let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
+    // Ruling R3 (a): the reference's own Measure output, when its fits seed the reference stars and its group is not
+    // this one (`plan::reference_measurement_fold`; the gate resolves the same value).
+    let reference_measurement_hash = {
+        let reference_group = rc
+            .plan_groups
+            .iter()
+            .find(|g| g.frames.iter().any(|f| f.frame_id == reference_frame_id))
+            .ok_or_else(|| {
+                RunError::Other(format!(
+                    "registration reference (frame {reference_frame_id}) is in no group"
+                ))
+            })?;
+        crate::stacking::plan::reference_measurement_fold(
+            &cfg,
+            group,
+            reference_group,
+            prepare_path,
+            reference_hash,
+            rc.measured_groups
+                .get(&reference_group.key)
+                .and_then(|g| g.beta),
+        )
+    };
     for (idx, frame, path, is_reference) in snapshot {
         let frame_hash = {
             let conn = db(&rc.ctx)?.conn();
@@ -8058,6 +8096,7 @@ fn register_group_pass(
             reference_hash,
             &frame_hash,
             &frame_measurement_hash,
+            &reference_measurement_hash,
         );
 
         let mut reused: Option<RegisteredFrameOutcome> = None;
@@ -21269,7 +21308,20 @@ mod tests {
             fixture.set_id,
             "floor-fixture",
             cfg.clone(),
-            Vec::new(),
+            // The group `resolve_register_fits` looks up: a mono one, so its frames read `fits.0` (ruling R3 (b)).
+            vec![IntegrationGroup {
+                key: "mono__floor_test".into(),
+                instrume: None,
+                color_mode: ColorMode::Mono,
+                filter: None,
+                binning: 1,
+                cameras: Vec::new(),
+                exposure_s: None,
+                exposure_class: "unknown".into(),
+                frames: Vec::new(),
+                total_exposure_s: 0.0,
+                pixel_scale_arcsec: None,
+            }],
             WorkingLayout::new(fixture.dir.path(), "floor-fixture"),
             fixture.dir.path().to_path_buf(),
             HashMap::new(),
@@ -21509,6 +21561,131 @@ mod tests {
                 "frame {id} must re-register after cfg.registration.max_stars changes"
             );
         }
+    }
+
+    /// Ruling R3 (c), the run: a mixed mono + debayered-OSC set registered onto a mono reference. A repeat pass
+    /// reuses every row; moving `measurement.maxStars` re-registers the OSC frames too (they read the reference's
+    /// stars out of Measure's `fits.0`, which the new config rewrote), where before R3 they stayed cached against
+    /// star lists the reference no longer matched.
+    #[test]
+    fn an_osc_frame_re_registers_when_the_mono_references_measurement_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let mut mono_ids = Vec::new();
+        let mut osc_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("m{i}");
+            let spec = LightSpec {
+                filter: Some("L"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &shifted_stars(dx, dy),
+                600.0,
+                5.0,
+                100 + i as u64,
+            );
+            mono_ids.push(id);
+        }
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i + 4);
+            let stem = format!("o{i}");
+            let spec = LightSpec {
+                bayerpat: Some("RGGB"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &shifted_stars(dx, dy),
+                600.0,
+                5.0,
+                120 + i as u64,
+            );
+            osc_ids.push(id);
+        }
+        let all_ids: Vec<i64> = mono_ids.iter().chain(osc_ids.iter()).copied().collect();
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &all_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, mono_ids[0])
+            .unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let run_pass = |cfg: StackingConfig| -> RunContext {
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 2, "one mono group, one OSC group");
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups,
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Register).unwrap();
+            rc
+        };
+        // Whether each OSC frame's registration this pass was reused.
+        let osc_cached = |rc: &RunContext| -> Vec<bool> {
+            let mut out = Vec::new();
+            for entries in rc.measured.values() {
+                for e in entries.iter().filter(|e| osc_ids.contains(&e.frame.frame_id)) {
+                    match &e.registration {
+                        Some(RegisteredFrameOutcome::Aligned { cached, .. }) => out.push(*cached),
+                        _ => panic!("osc frame {} not aligned", e.frame.frame_id),
+                    }
+                }
+            }
+            out
+        };
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let rc1 = run_pass(cfg.clone());
+        assert_eq!(rc1.reference_frame_id, Some(mono_ids[0]));
+        assert_eq!(osc_cached(&rc1), vec![false; 4], "a first pass registers");
+
+        let rc2 = run_pass(cfg.clone());
+        assert_eq!(osc_cached(&rc2), vec![true; 4], "the same config reuses");
+
+        let mut moved = cfg.clone();
+        moved.measurement.max_stars = cfg.measurement.max_stars - 1000;
+        let rc3 = run_pass(moved);
+        assert_eq!(
+            osc_cached(&rc3),
+            vec![false; 4],
+            "the reference's measurement moved: the OSC frames re-register"
+        );
     }
 
     /// Ruling R-T3-3: `SummaryGroup::reference_frame_id` is `Some` ONLY

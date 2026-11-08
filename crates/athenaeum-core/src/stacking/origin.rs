@@ -17,6 +17,7 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use crate::api::ApiError;
+use crate::db::stacking::StackSubject;
 use crate::collab::frame_meta::ProjectFrameMeta;
 use crate::integration::cfa::CfaGeometry;
 use crate::plate_solve::storage::PlateSolveRecord;
@@ -55,6 +56,16 @@ pub(crate) fn needs_prepare(origin: &FrameOrigin) -> bool {
         FrameOrigin::Catalog { attested, .. } => *attested,
         FrameOrigin::Project { .. } => true,
     }
+}
+
+/// Whether a run of this subject PREPARES its lights instead of calibrating them: a project, or a frame set whose
+/// lights are attested. The gate's `project.is_some() || readiness.attested`, derived from the subject and the frame
+/// origins so the run (which holds no readiness) reaches the same answer.
+pub(crate) fn subject_prepares(subject: &StackSubject, origins: &FrameOrigins) -> bool {
+    matches!(subject, StackSubject::Project(_))
+        || origins
+            .values()
+            .any(|o| matches!(o, FrameOrigin::Catalog { attested: true, .. }))
 }
 
 /// What Prepare reads for one frame, and the uuid its log line carries.
@@ -755,6 +766,25 @@ mod tests {
                 "{file}: a function names a subject/origin variant outside the funnels: {violations:?}"
             );
         }
+    }
+
+    /// Ruling R3 (c): a run PREPARES its lights for a project and for a frame set with an attested light, and
+    /// calibrates a plain frame set's.
+    #[test]
+    fn subject_prepares_follows_the_subject_and_the_attested_lights() {
+        let catalog = |attested| FrameOrigin::Catalog {
+            file_id: 1,
+            attested,
+        };
+        let origins =
+            |o: Vec<FrameOrigin>| -> FrameOrigins { Arc::new((1..).zip(o.into_iter()).collect()) };
+        let set = StackSubject::FrameSet(1);
+        assert!(!subject_prepares(&set, &origins(vec![catalog(false), catalog(false)])));
+        assert!(subject_prepares(&set, &origins(vec![catalog(false), catalog(true)])));
+        assert!(subject_prepares(
+            &StackSubject::Project("p1".into()),
+            &origins(vec![])
+        ));
     }
 
     /// Plan 6b-2 C9: a catalog frame always passes; a project frame passes
