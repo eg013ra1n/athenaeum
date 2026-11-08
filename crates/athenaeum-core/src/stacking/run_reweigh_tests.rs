@@ -1353,10 +1353,24 @@ fn halve_s(h: &Harness, i: usize, plane: usize) {
     )
     .unwrap()
     .expect("the fits artifact");
-    let path = std::path::PathBuf::from(row.path.unwrap());
+    let path = std::path::PathBuf::from(row.path.clone().unwrap());
     let mut fits = crate::stacking::fits_artifact::read_fits(&path).unwrap();
     fits.iter_mut().for_each(|f| f.ap_sum *= 0.5);
     crate::stacking::fits_artifact::write_fits(&path, &fits).unwrap();
+    // The edit stands in for a writer: a writer records the identity of what it wrote (ruling R7 b: a cached file
+    // counts as fresh only while it is the file its row recorded), so the row follows the edited file.
+    let meta = std::fs::metadata(&path).unwrap();
+    h.fixture
+        .conn
+        .execute(
+            "UPDATE stacking_artifacts SET size = ?1, modified_at = ?2 WHERE id = ?3",
+            rusqlite::params![
+                meta.len() as i64,
+                crate::stacking::plan::render_modified_at(meta.modified().unwrap()),
+                row.id
+            ],
+        )
+        .unwrap();
 }
 
 /// Plan D D2d (PD-32): a one-plane group's common flux is the model flux times `c`, the aperture sum is not read - halving

@@ -1040,10 +1040,47 @@ pub(crate) fn seeds_calibration_hash_for(
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
 
+/// A file's modification time in the scanner's own shape (`scanner/mod.rs`'s
+/// `modified_dt.to_rfc3339()`): what every writer in this module family stores in
+/// `stacking_artifacts.modified_at`, and what [`file_matches_identity`] compares
+/// against. One rendering, so a stored identity and a live one can be equal.
+pub(crate) fn render_modified_at(modified: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339()
+}
+
+/// Whether the file at `path` is still the file a row recorded (ruling R7 b): a
+/// stat only, no pixel I/O. Its length equals `size`, and, when the row recorded a
+/// `modified_at`, its modification time renders to exactly that string. A row
+/// without `modified_at` keeps the size-only check (rows written before the
+/// identity was kept); a row without `size` never matches. A writer that
+/// rewrites a file and is cancelled before it records the new identity leaves
+/// the file and its row disagreeing: this is what catches it, for the gate and
+/// the run alike.
+pub(crate) fn file_matches_identity(
+    path: &Path,
+    size: Option<i64>,
+    modified_at: Option<&str>,
+) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if Some(meta.len() as i64) != size {
+        return false;
+    }
+    match modified_at {
+        None => true,
+        Some(recorded) => meta
+            .modified()
+            .is_ok_and(|m| render_modified_at(m) == recorded),
+    }
+}
+
 /// The `calibrated`-artifact reuse contract (spec §9.3): a row is reusable
 /// only when ALL of these hold — its `config_hash` equals the frame's
 /// CURRENT stage-1 hash, its `path` is `Some`, its `size` is `Some`, AND a
-/// live `std::fs::metadata` read of that path reports exactly that size. A
+/// live `std::fs::metadata` read of that path reports exactly that size (and,
+/// when the row recorded a `modified_at`, that modification time:
+/// [`file_matches_identity`]). A
 /// row missing `path`/`size` (an artifact recorded before the pixel phase
 /// ever wrote anything, or one some other kind stores without a path) is
 /// NEVER assumed fresh — "we don't know" is "stale", not "trust the hash
@@ -1059,11 +1096,9 @@ pub(crate) fn seeds_calibration_hash_for(
 /// what "fresh" means.
 pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bool {
     artifact.config_hash == current_hash
-        && artifact
-            .path
-            .as_deref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .is_some_and(|meta| Some(meta.len() as i64) == artifact.size)
+        && artifact.path.as_deref().is_some_and(|p| {
+            file_matches_identity(Path::new(p), artifact.size, artifact.modified_at.as_deref())
+        })
 }
 
 /// Whether every one of a frame's `fits.<plane>` rows is fresh against

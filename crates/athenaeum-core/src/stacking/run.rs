@@ -607,8 +607,7 @@ pub(crate) fn group_anchor_geometry(g: &IntegrationGroup) -> (Option<i64>, Optio
 /// `stacking_artifacts` row's `size`/`modified_at` when deciding freshness.
 fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
     let meta = std::fs::metadata(path)?;
-    let modified = meta.modified()?;
-    let modified_at = chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339();
+    let modified_at = crate::stacking::plan::render_modified_at(meta.modified()?);
     Ok((meta.len() as i64, modified_at))
 }
 
@@ -18256,9 +18255,29 @@ mod tests {
         _tmp: tempfile::TempDir,
         ctx: Arc<ServiceContext>,
         fixture: test_fixtures::Fixture,
+        light_ids: Vec<i64>,
         working: tempfile::TempDir,
         output: tempfile::TempDir,
         layout: WorkingLayout,
+    }
+
+    /// Cancels the run on the last Register tick: every frame's aligned file is written by then, and the controller's
+    /// `check_cancel` after the fan-out returns before it records any of them.
+    struct CancelWhenRegisterDone {
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl ProgressEmitter for CancelWhenRegisterDone {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            let current = payload["current"].as_u64().unwrap_or(0);
+            if event_name == STACKING_PROGRESS_EVENT
+                && payload["stage"] == Stage::Register.as_str()
+                && current > 0
+                && current == payload["total"].as_u64().unwrap_or(u64::MAX)
+            {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     impl RegisterRig {
@@ -18278,7 +18297,7 @@ mod tests {
             crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, light_ids[0])
                 .unwrap();
             let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-            RegisterRig { _tmp: tmp, ctx, fixture, working, output, layout }
+            RegisterRig { _tmp: tmp, ctx, fixture, light_ids, working, output, layout }
         }
 
         /// The config of every run: a manual reference, so a regroup cannot move it.
@@ -18291,6 +18310,19 @@ mod tests {
 
         /// One run through Register under `cfg`'s grouping.
         fn run(&self, cfg: &StackingConfig) -> RunContext {
+            let (rc, res) = self.run_with(cfg, false);
+            res.unwrap();
+            rc
+        }
+
+        /// One run through Register; `cancel_after_register` cancels it right after the Register fan-out wrote its files.
+        fn run_with(&self, cfg: &StackingConfig, cancel_after_register: bool) -> (RunContext, Result<(), RunError>) {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let emitter: Arc<dyn ProgressEmitter> = if cancel_after_register {
+                Arc::new(CancelWhenRegisterDone { cancel: cancel.clone() })
+            } else {
+                Arc::new(NullEmitter)
+            };
             let plan_groups = group_frames(&self.fixture.conn, self.fixture.set_id, &cfg.grouping).unwrap();
             assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
             let (run_id, group_ids) = seed_run_and_groups(
@@ -18302,7 +18334,7 @@ mod tests {
             );
             let mut rc = test_context(
                 self.ctx.clone(),
-                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                emitter,
                 run_id,
                 self.fixture.set_id,
                 SET_NAME,
@@ -18312,8 +18344,9 @@ mod tests {
                 self.output.path().to_path_buf(),
                 group_ids,
             );
-            run_stages_for_test(&mut rc, Stage::Register).unwrap();
-            rc
+            rc.cancel = cancel;
+            let res = run_stages_for_test(&mut rc, Stage::Register);
+            (rc, res)
         }
 
         fn registered_rows(&self) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
@@ -18475,6 +18508,92 @@ mod tests {
             assert!(
                 a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
                 "plane {p}: the migrated registered files stack another master"
+            );
+        }
+    }
+
+    /// Ruling R7 (b) (Task 5): a cached file counts as fresh only while it is the file its row recorded. Run B
+    /// (another manual reference) re-aligns every frame, so its fan-out overwrites the files under their layout names
+    /// with its own pixels; cancelled right there, it records nothing, so the rows still hold run A's hash, size and
+    /// modification time. Run A's config again: the hashes match and the sizes are equal, but the files are not the
+    /// ones the rows recorded. The gate reads Register stale, and the re-run rewrites them: the master is run A's,
+    /// bit for bit.
+    #[test]
+    fn a_cancelled_rewrite_does_not_leave_another_runs_pixels_fresh() {
+        use crate::stacking::config::ExposureMode;
+
+        let master_of = |rc: &RunContext| -> Vec<Vec<f32>> {
+            let master = rc
+                .summary
+                .groups
+                .iter()
+                .find_map(|g| g.master_path.clone())
+                .expect("master path");
+            let reader = PlaneReader::open(Path::new(&master)).unwrap();
+            (0..reader.channels()).map(|p| reader.read_plane(p).unwrap()).collect()
+        };
+
+        let baseline = {
+            let rig = RegisterRig::new();
+            let mut rc = rig.run(&rig.cfg(ExposureMode::Seconds));
+            stage_output(&mut rc).unwrap();
+            master_of(&rc)
+        };
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        let rc_a = rig.run(&cfg);
+        assert!(
+            !crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_a.run_id).unwrap().is_empty(),
+            "premise: the gate reads run A's frame rows, so it is not vacuous"
+        );
+        assert!(!rig.register_stale(&cfg), "run A's own rows read fresh");
+        let rows_a = rig.registered_snapshot();
+        assert_eq!(rows_a.len(), 4);
+
+        // Run B: another reference, cancelled right after its Register fan-out.
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        let rows_b = rig.registered_snapshot();
+        assert_eq!(rows_b.len(), rows_a.len());
+        for (a, b) in rows_a.iter().zip(&rows_b) {
+            assert_eq!((&a.1, &a.4, &a.5), (&b.1, &b.4, &b.5), "the cancelled run recorded a row");
+            assert_ne!(a.6, b.6, "premise: run B overwrote frame {}'s file", a.0);
+            assert_eq!(
+                std::fs::metadata(a.5.as_ref().unwrap()).unwrap().len() as i64,
+                rig.registered_rows()[&a.0].size.unwrap(),
+                "premise: the sizes still agree, so only the modification time tells the files apart"
+            );
+        }
+
+        // Run A's config again.
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[0])
+            .unwrap();
+        // The gate judges the latest run's frame rows, and a run cancelled inside Register has written none (they are
+        // written at the end of the stage). Drop the cancelled run's row so the gate reads run A's frames: what is
+        // under test is whether it trusts the files, not which run it reads.
+        rig.fixture
+            .conn
+            .execute("DELETE FROM stacking_runs WHERE id = ?1", [rc_b.run_id])
+            .unwrap();
+        assert!(rig.register_stale(&cfg), "the gate trusted files another run overwrote");
+        let (mut rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(
+            fan_out_items(&logs, "register", "rewrite"),
+            4,
+            "the re-run did not rewrite the overwritten files: {logs}"
+        );
+        assert!(!rig.register_stale(&cfg), "the rewritten files read fresh");
+        stage_output(&mut rc).unwrap();
+        let planes = master_of(&rc);
+        assert_eq!(planes.len(), baseline.len());
+        for (p, (a, b)) in baseline.iter().zip(&planes).enumerate() {
+            assert_eq!(a.len(), b.len());
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "plane {p}: the master is not run A's"
             );
         }
     }

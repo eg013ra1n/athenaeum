@@ -1857,6 +1857,11 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     meridian-flipped frame (`aligned_flipped`) has its aligned frame too.
   - A frame cut by the weight floor after Register keeps `reg_status = aligned` and stays `available`. A `skipped` frame is
     `notRegistered` even when an earlier run left an artifact for it: that file is not this run's.
+  - A cached file counts as fresh only while it is the file its row recorded (`stacking::plan::file_matches_identity`, a
+    stat only, ruling R7 b): `is_fresh` requires it whenever the row has a `modified_at`, so the gate and every cache hit in
+    the run agree, and Blink uses the same helper. A run cancelled right after a fan-out rewrote files, before it recorded
+    them, leaves the rows with the old identity: the next run finds the files stale and rewrites them. A row without a
+    `modified_at` keeps the size check. A test or tool that edits a cached file in place must record its new identity.
   - The group row of a later run exists from that run's first moment, so a later run that got no further than planning
     already marks the group `replaced`. This is the safe side: never offer pixels a later run may have replaced.
   - The file is the artifact row's absolute `path`, never a path rebuilt from the subject's current name (a rename changes
