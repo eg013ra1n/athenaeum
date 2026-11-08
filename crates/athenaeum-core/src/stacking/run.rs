@@ -1964,12 +1964,16 @@ pub(crate) fn frame_file_stem(frame: &GroupFrame) -> String {
 }
 
 /// After a frame-level file was written and its row upserted: removes the file the row used to point to, when that
-/// path differs from `new_path` (a frame re-written under a new stem or folder), lies under `layout.root` (a Prepare
-/// row may point at a landed file used in place, which is never ours to remove), and no row of ANY subject still
-/// points to it. A failed removal is a `warn!` (`path`, `error`), never an error: the file is only disk.
+/// path differs from `new_path` (a frame re-written under a new stem or folder), lies under `owned_root` and no row
+/// of ANY subject still points to it. A failed removal is a `warn!` (`path`, `error`), never an error: the file is
+/// only disk.
+///
+/// `owned_root` is the root the WRITING kind owns (`calibrated_root()`, `prepared_root()`; ruling R4), passed by the
+/// caller, never `layout.root` in general: a frame set's working folder may overlap a scan root, and an attested
+/// frame used in place has a row pointing at the user's own landed file, which is never ours to remove.
 fn replace_frame_level_file(
     conn: &rusqlite::Connection,
-    layout: &WorkingLayout,
+    owned_root: &Path,
     old: Option<&crate::db::stacking::StackingArtifactRow>,
     new_path: &Path,
 ) {
@@ -1977,7 +1981,7 @@ fn replace_frame_level_file(
         return;
     };
     let old_path = Path::new(old_path);
-    if old_path == new_path || !old_path.starts_with(&layout.root) {
+    if old_path == new_path || !old_path.starts_with(owned_root) {
         return;
     }
     let old_str = old_path.to_string_lossy();
@@ -2506,9 +2510,10 @@ fn commit_calibrated(
         tx.commit()
             .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
         // The rows now point at the new files; the files they used to point at go once nothing references them.
-        replace_frame_level_file(&conn, &rc.layout, job.old_calibrated.as_ref(), &job.out);
+        let owned = rc.layout.calibrated_root();
+        replace_frame_level_file(&conn, &owned, job.old_calibrated.as_ref(), &job.out);
         if let Some((path, _)) = &mosaic_identity {
-            replace_frame_level_file(&conn, &rc.layout, job.old_mosaic.as_ref(), path);
+            replace_frame_level_file(&conn, &owned, job.old_mosaic.as_ref(), path);
         }
     }
 
@@ -2882,11 +2887,12 @@ fn commit_prepared(
     }
     tx.commit()
         .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
-    // The rows now point at the new files; the files they used to point at go once nothing references them. A
-    // landed file Prepare used in place is outside the working tree, so it is never touched.
-    replace_frame_level_file(&conn, &rc.layout, job.old_calibrated.as_ref(), &files.calibrated);
+    // The rows now point at the new files; the files they used to point at go once nothing references them. Only
+    // under `prepared/`: a landed file Prepare used in place is never ours (ruling R4).
+    let owned = rc.layout.prepared_root();
+    replace_frame_level_file(&conn, &owned, job.old_calibrated.as_ref(), &files.calibrated);
     if let Some((path, _)) = &mosaic {
-        replace_frame_level_file(&conn, &rc.layout, job.old_mosaic.as_ref(), path);
+        replace_frame_level_file(&conn, &owned, job.old_mosaic.as_ref(), path);
     }
     Ok(size as u64)
 }
@@ -13996,11 +14002,15 @@ fn run_group_normalization(
     for m in members.iter() {
         let stem = match group_frames_by_id.get(&m.frame_id).copied() {
             Some(gf) => frame_file_stem(gf),
-            None => Path::new(&m.filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&m.filename)
-                .to_string(),
+            // Same `<stem>_f<id>` rule as `frame_file_stem` (a member outside `group_frames_by_id` is not expected).
+            None => format!(
+                "{}_f{}",
+                Path::new(&m.filename)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&m.filename),
+                m.frame_id
+            ),
         };
         sidecar_paths.push(rc.layout.ln_sidecar_path(&group.key, &stem));
         let existing = {
@@ -17692,9 +17702,9 @@ mod tests {
 
     /// Fix round 1, Critical: two frames of one group sharing a source
     /// basename (a capture counter restarted on another night) must not
-    /// collide on one calibrated output — every colliding frame gets
-    /// `_f<frame_id>` inserted before the extension, and a frame whose name
-    /// is unique in the group keeps the plain `c_<stem>.fits` name.
+    /// collide on one calibrated output. Since frame-level cache spec §5.1
+    /// EVERY frame's stem carries `_f<frame_id>`, the unique-named frame
+    /// included, so a merge never renames a file.
     #[test]
     fn calibrate_outputs_disambiguate_same_basename_within_a_group() {
         let tmp = tempfile::tempdir().unwrap();
@@ -30868,6 +30878,121 @@ mod tests {
                 Some(f.path.as_str()),
                 "a mosaic kept as a mosaic is used in place"
             );
+        }
+    }
+
+    /// Ruling R4 (a): `replace_frame_level_file` removes an old file only under the root its writer owns, and only
+    /// when no row of ANY subject still points at it.
+    #[test]
+    fn replace_frame_level_file_removes_only_under_the_owned_root_and_only_if_unreferenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let _ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let owned = tmp.path().join("work").join("calibrated");
+        let elsewhere = tmp.path().join("work").join("landed");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let subject = StackSubject::Project("p1".to_string());
+        let row_for = |path: &Path| crate::db::stacking::StackingArtifactRow {
+            id: 0,
+            subject: subject.clone(),
+            frame_id: Some(1),
+            group_key: String::new(),
+            kind: "calibrated".to_string(),
+            path: path.to_str().map(str::to_string),
+            config_hash: "h".to_string(),
+            size: None,
+            modified_at: None,
+            payload_json: None,
+            created_at: String::new(),
+        };
+        let new = owned.join("c_new.fits");
+
+        // Under the owned root, unreferenced: removed.
+        let gone = owned.join("c_gone.fits");
+        std::fs::write(&gone, b"x").unwrap();
+        replace_frame_level_file(&conn, &owned, Some(&row_for(&gone)), &new);
+        assert!(!gone.exists());
+
+        // Outside the owned root (a landed file in the working folder): kept.
+        let landed = elsewhere.join("c_landed.fits");
+        std::fs::write(&landed, b"x").unwrap();
+        replace_frame_level_file(&conn, &owned, Some(&row_for(&landed)), &new);
+        assert!(landed.exists(), "a file outside the owned root was removed");
+
+        // Under the owned root but still named by a row of ANOTHER subject: kept.
+        let shared = owned.join("c_shared.fits");
+        std::fs::write(&shared, b"x").unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p2");
+        upsert_artifact(
+            &conn,
+            &NewArtifact {
+                subject: &StackSubject::Project("p2".to_string()),
+                frame_id: None,
+                group_key: "g",
+                kind: "solve",
+                path: shared.to_str(),
+                config_hash: "h",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+        replace_frame_level_file(&conn, &owned, Some(&row_for(&shared)), &new);
+        assert!(shared.exists(), "a file another subject's row points at was removed");
+    }
+
+    /// Ruling R4 (a): an attested frame used in place has a `calibrated` row pointing at the user's own landed file.
+    /// Converting the frame later (the debayer turned on) writes a new prepared file and replaces the row, but the
+    /// landed file is never ours to remove, even when the working folder overlaps the scan root (here the landed
+    /// files sit INSIDE the set's working folder, which is only a warning in the settings).
+    #[test]
+    fn converting_an_in_place_frame_keeps_its_landed_file_inside_the_working_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let working = tmp.path().join("work");
+        let subject = StackSubject::Project("p1".to_string());
+        let landed = subject_layout(&conn, &working, &subject).unwrap().root.join("landed");
+        for u in ["o1", "o2"] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = test_fixtures::ProjectFile::Mosaic32;
+            spec.bayerpat = Some("RGGB");
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let out = tmp.path().join("out");
+
+        // Debayer off: the mosaics are used in place, the rows point at the landed files.
+        let mut off = StackingConfig::default();
+        off.calibration.debayer_osc = false;
+        let mut rc = project_rc(&ctx, &conn, "p1", off, &working, &out);
+        stage_calibrate(&mut rc).unwrap();
+        let frames = rc.plan_groups[0].frames.clone();
+        assert_eq!(frames.len(), 2);
+        for f in &frames {
+            let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(f.frame_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.path.as_deref(), Some(f.path.as_str()), "used in place");
+            assert!(Path::new(&f.path).starts_with(&rc.layout.root), "the landed file is inside the working folder");
+        }
+
+        // Debayer on, same working folder: the rows move to `prepared/`, the landed files stay.
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &working, &out);
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        for f in &frames {
+            let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(f.frame_id))
+                .unwrap()
+                .unwrap();
+            let now = PathBuf::from(row.path.unwrap());
+            assert!(now.starts_with(rc.layout.prepared_dir()), "converted under prepared/: {now:?}");
+            assert!(Path::new(&f.path).exists(), "the user's landed file {} was removed", f.path);
         }
     }
 

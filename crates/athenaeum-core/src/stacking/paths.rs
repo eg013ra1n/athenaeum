@@ -195,9 +195,10 @@ impl WorkingLayout {
         }
     }
 
-    /// `root/calibrated` — the parent of every group's calibrated-frame
-    /// subdirectory. One accessor per subtree (this and the three below),
-    /// so `work_usage`/`cleanup_work` never repeat the literal.
+    /// `root/calibrated` — the folder of every frame's calibrated file (flat, frame-level cache spec §5.1; rows
+    /// written before that keep their `calibrated/<group_key>/` sub-folder paths). One accessor per subtree (this
+    /// and the ones below), so `work_usage`/`cleanup_work` never repeat the literal. It is also the root the
+    /// calibrated writer OWNS: a replaced calibrated file is removed only from here (ruling R4).
     pub fn calibrated_root(&self) -> PathBuf {
         self.root.join("calibrated")
     }
@@ -239,7 +240,7 @@ impl WorkingLayout {
     }
 
     /// `root/measured/<group_key>/<stem>.athm` — one frame's first-pass artifact; `stem` is the SAME collision-safe
-    /// stem [`crate::stacking::run::calibrated_file_stem`] gave the calibrated file (as [`Self::fits_path`]'s).
+    /// stem [`crate::stacking::run::frame_file_stem`] gave the calibrated file (as [`Self::fits_path`]'s).
     pub fn measured_path(&self, group_key: &str, stem: &str) -> PathBuf {
         self.measured_dir(group_key).join(format!("{stem}.athm"))
     }
@@ -286,7 +287,7 @@ impl WorkingLayout {
 
     /// `root/fits/<group_key>/<stem>.p<plane>.athf` — one PLANE's persisted
     /// fits (Tier C Task 1): `stem` is the SAME collision-safe stem
-    /// [`crate::stacking::run::calibrated_file_stem`] gave the calibrated
+    /// [`crate::stacking::run::frame_file_stem`] gave the calibrated
     /// file (the same convention `registered_file_name` follows for its
     /// own naming), `plane` the 0-based [`crate::integration::plane_reader::PlaneReader`]
     /// index.

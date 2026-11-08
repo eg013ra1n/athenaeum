@@ -1302,7 +1302,7 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - **In place:** a float FITS (BITPIX −32/−64) that needs no debayer is used as it
     is. The `calibrated` artifact is the landed file, which no cleanup removes.
   - **Converted:** an integer FITS (÷ `scale_divisor_for_bitpix`) or an XISF
-    (`read_raw` ÷ 65535) becomes float32 FITS `prepared/<group>/p_<stem>.fits`.
+    (`read_raw` ÷ 65535) becomes float32 FITS `prepared/p_<stem>_f<frame_id>.fits`.
     An integer FITS is never used in place, although spec §5.1 row 1 allows
     it (narrowed to float, review I2): converting gives an attested set's 16-bit
     lights and a published replica the calibrated-light generator's one unit
