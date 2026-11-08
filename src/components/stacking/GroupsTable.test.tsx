@@ -18,7 +18,6 @@ const grouping = (over: Partial<GroupingConfig> = {}): GroupingConfig => ({
   exposureToleranceSec: 2, exposureMode: 'seconds', stopsWidth: 1, ...over,
 });
 
-const HINT_RECALIBRATE = "The tolerance is part of the calibration hash: changing it re-calibrates this set's lights on the next run.";
 const HINT_EQUIVALENT =
   "Classes by t / N², N = FOCALLEN / APTDIA from each frame's header. Frames without both are grouped by seconds; the plan names how many.";
 
@@ -27,7 +26,6 @@ const show = (
     groups?: PlanGroup[];
     grouping?: GroupingConfig;
     disabled?: boolean;
-    toleranceInCalibrationHash?: boolean;
   } = {},
 ) => {
   const onPatchGrouping = vi.fn();
@@ -36,7 +34,6 @@ const show = (
       groups={over.groups ?? [group()]}
       grouping={over.grouping ?? grouping()}
       disabled={over.disabled}
-      toleranceInCalibrationHash={over.toleranceInCalibrationHash ?? true}
       onPatchGrouping={onPatchGrouping}
     />,
   );
@@ -110,7 +107,6 @@ describe('GroupsTable exposure grouping control', () => {
         <GroupsTable
           groups={[group()]}
           grouping={grouping({ exposureMode: m })}
-          toleranceInCalibrationHash={false}
           onPatchGrouping={vi.fn()}
         />,
       );
@@ -173,55 +169,19 @@ describe('GroupsTable exposure grouping control', () => {
   });
 
   describe('hints', () => {
-    it('says the tolerance is part of the calibration hash, in seconds mode, where the board calibrates', () => {
-      show({ toleranceInCalibrationHash: true });
-      expect(screen.getByText(HINT_RECALIBRATE)).toBeInTheDocument();
-    });
-
-    it('never says it where the board only prepares (a project, an attested set), whatever the mode', () => {
-      for (const m of ['seconds', 'stops', 'equivalent', 'none'] as const) {
-        const { unmount } = render(
-          <GroupsTable
-            groups={[group()]}
-            grouping={grouping({ exposureMode: m })}
-            toleranceInCalibrationHash={false}
-            onPatchGrouping={vi.fn()}
-          />,
-        );
-        expect(screen.queryByText(HINT_RECALIBRATE), m).toBeNull();
-        unmount();
-      }
-    });
-
-    it('does not say it outside seconds mode, where the tolerance is not in use', () => {
-      for (const m of ['stops', 'equivalent', 'none'] as const) {
-        const { unmount } = render(
-          <GroupsTable
-            groups={[group()]}
-            grouping={grouping({ exposureMode: m })}
-            toleranceInCalibrationHash
-            onPatchGrouping={vi.fn()}
-          />,
-        );
-        expect(screen.queryByText(HINT_RECALIBRATE), m).toBeNull();
-        unmount();
-      }
-    });
-
     it('explains t / N² in equivalent mode only', () => {
       for (const m of ['seconds', 'stops', 'none'] as const) {
         const { unmount } = render(
           <GroupsTable
             groups={[group()]}
             grouping={grouping({ exposureMode: m })}
-            toleranceInCalibrationHash={false}
             onPatchGrouping={vi.fn()}
           />,
         );
         expect(screen.queryByText(HINT_EQUIVALENT), m).toBeNull();
         unmount();
       }
-      show({ grouping: grouping({ exposureMode: 'equivalent' }), toleranceInCalibrationHash: false });
+      show({ grouping: grouping({ exposureMode: 'equivalent' }) });
       expect(screen.getByText(HINT_EQUIVALENT)).toBeInTheDocument();
     });
   });

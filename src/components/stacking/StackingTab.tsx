@@ -1321,7 +1321,6 @@ export function StackingTab({ subject, onReferenceChanged }: StackingTabProps) {
               groups={plan.groups}
               grouping={draftConfig.grouping}
               disabled={running || starting}
-              toleranceInCalibrationHash={mode === 'calibrate'}
               onPatchGrouping={handlePatchGrouping}
             />
           </div>

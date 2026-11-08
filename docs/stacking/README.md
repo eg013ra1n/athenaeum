@@ -1668,11 +1668,10 @@ unchanged.
   shows the plan's `exposureClass` token (`180s`, `st120`, `eq0.24`, `all`, `unknown`). A change patches `grouping` and
   the plan refetches as for any config edit. A frame set's default stays `seconds`; a project's stored config is seeded
   `stops` 1.0. The measured zero point of `equivalent` is sub-wave 6.5, not built.
-  - **The tolerance hint** (`The tolerance is part of the calibration hash: changing it re-calibrates this set's lights
-    on the next run.`) shows only where the board calibrates and the mode is `seconds`
-    (`toleranceInCalibrationHash = boardMode(plan) === 'calibrate'`: an ordinary set). An attested set's and a project's
-    Prepare hash holds no grouping, so the hint would be false there. `equivalent` carries its own hint (classes by
-    t / N²; frames without both numbers are grouped by seconds, and the plan names how many).
+  - **No tolerance hint.** The tolerance only regroups frames (frame-level cache spec §5.1, §5.2): calibrated frames,
+    measurements and registrations are kept per frame and reused, so changing it re-calibrates nothing and the table
+    carries no warning about it. `equivalent` carries its own hint (classes by t / N²; frames without both numbers are
+    grouped by seconds, and the plan names how many).
 - **Output and the coverage thumbnail (D4).** The Output panel has `Write a coverage map (frames per pixel) beside each
   master` and `Crop to coverage of at least … frames (0 = no crop)`: the config fields `output.coverageMap` and
   `output.cropToCoverage`, for both subjects and in Settings → Stacking too. The Output board line adds `coverage map`
