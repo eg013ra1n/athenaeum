@@ -27032,6 +27032,352 @@ mod tests {
         );
     }
 
+    /// Frame-level cache spec §7 (Task 12): one debayered-OSC fixture of two exposure classes (60 s and 90 s, three
+    /// frames each) stacked under `seconds` (two groups), `stops` (one group), and `seconds` with a 200 s tolerance (one group),
+    /// co-registered geometry, local normalization on, a Manual reference. After the first run nothing keyed on a
+    /// frame is recomputed: calibrate, pass 1, pass 2 and registration fan out over 0 items, no registered row or
+    /// file moves, the plan gate reads Calibrate, Measure and Register fresh before each regroup, and the
+    /// group-level stages (LN, rejection, the master) run for the new group.
+    ///
+    /// The reference is pinned on purpose. Under Auto the reference is picked again from the new grouping's weights
+    /// and a different pick re-registers every frame by `ref:<id>` (observed on this fixture: frame 4 under
+    /// `seconds`, frame 6 under `stops`), as under Native geometry; with `reference.twoPass` the dry pass is a
+    /// group-level decision keyed on the membership, so a regroup is a miss and registers the new group once more
+    /// without persisting (README, "Frame-level cache").
+    #[test]
+    fn regroup_reuses_every_frame_level_stage() {
+        use crate::stacking::config::ExposureMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0), (2.0, 2.0), (1.0, 0.0)];
+        let mut light_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let spec = LightSpec {
+                exptime: if i < 3 { 60.0 } else { 90.0 },
+                // A debayered OSC set, as set 270: its registration reads no Measure output, so neither its own
+                // group nor its reference's group enters the registration hash and a merge cannot move it.
+                bayerpat: Some("RGGB"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            // A Moffat field whose true beta (1.2) lies below `BETA_BOUNDS`' floor: every fit pegs at the floor, so
+            // every frame, every exposure class and the merged group read the same group beta (as set 270's 1.5).
+            // Without it the lower median of the fitted betas moves with the membership and pass 2 re-runs.
+            let (id, _) = test_fixtures::add_light_with_moffat_field(
+                &fixture,
+                &spec,
+                &ln_shifted_stars(dx, dy),
+                3.4,
+                1.2,
+                600.0,
+                5.0,
+                100 + i as u64,
+            );
+            light_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, light_ids[0]).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        let cfg_for = |mode: ExposureMode, tolerance: f64| {
+            let mut cfg = StackingConfig::default();
+            cfg.grouping.exposure_mode = mode;
+            cfg.grouping.exposure_tolerance_sec = tolerance;
+            cfg.reference.mode = ReferenceMode::Manual;
+            cfg.normalization.local.enabled = true;
+            // As `local_normalization_sidecars_are_cached_on_the_second_run`: the finite selection that cuts
+            // nothing, pinned to PsfSignal (L-24).
+            cfg.normalization.local.flux_estimator =
+                crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+            cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
+                min_peak_snr: 5.0,
+                max_stars: 5000,
+                saturation: 1.0,
+            };
+            cfg
+        };
+        let stale_stages = |cfg: &StackingConfig| {
+            crate::stacking::plan::build_plan(
+                &fixture.conn,
+                &ctx.settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(fixture.set_id),
+                Some(cfg.clone()),
+            )
+            .expect("the plan should build")
+            .stale_stages
+        };
+        // One run through Output under `cfg`; returns the run and the captured logs.
+        let run = |cfg: &StackingConfig| {
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            let (res, logs) = crate::stacking::telemetry::capture_logs(|| {
+                run_stages_for_test(&mut rc, Stage::Register)?;
+                stage_output(&mut rc)
+            });
+            res.unwrap();
+            // `start_stacking` records the reference on the run row; the plan gate reads it from there.
+            fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_runs SET reference_frame_id = ?1 WHERE id = ?2",
+                    rusqlite::params![rc.reference_frame_id, rc.run_id],
+                )
+                .unwrap();
+            (plan_groups, rc, logs)
+        };
+
+        let cfg1 = cfg_for(ExposureMode::Seconds, 2.0);
+        let (groups1, rc1, logs1) = run(&cfg1);
+        assert_eq!(groups1.len(), 2, "one group per exposure class: {groups1:?}");
+        assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 6, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass2"), 6, "{logs1}");
+        let reference1 = rc1.reference_frame_id;
+        assert_eq!(reference1, Some(light_ids[0]), "the pinned reference");
+        assert_eq!(fan_out_items(&logs1, "register", "align"), 6, "{logs1}");
+        let registered_rows = || {
+            let mut rows: Vec<_> = rows_of_kind(&fixture.conn, fixture.set_id, "registered")
+                .into_values()
+                .map(|r| (r.frame_id, r.id, r.created_at, r.config_hash, r.path))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let registered1 = registered_rows();
+        assert_eq!(registered1.len(), 6);
+
+        let regroups = [
+            ("stops", cfg_for(ExposureMode::Stops, 2.0), 1usize),
+            ("a 200 s tolerance", cfg_for(ExposureMode::Seconds, 200.0), 1usize),
+        ];
+        let mut seen_keys = vec![groups1.iter().map(|g| g.key.clone()).collect::<Vec<_>>()];
+        for (what, cfg, n_groups) in regroups {
+            let stale = stale_stages(&cfg);
+            for stage in [Stage::Calibrate, Stage::Measure, Stage::Register] {
+                assert!(
+                    !stale.contains(&stage),
+                    "the gate reads {stage:?} stale before the regroup to {what}: {stale:?}"
+                );
+            }
+            let (groups, rc, logs) = run(&cfg);
+            assert_eq!(groups.len(), n_groups, "{what}: {groups:?}");
+            let keys: Vec<String> = groups.iter().map(|g| g.key.clone()).collect();
+            assert!(!seen_keys.contains(&keys), "{what} must name its group differently: {keys:?}");
+            seen_keys.push(keys);
+            assert_eq!(rc.reference_frame_id, reference1, "{what}: the reference moved");
+            for (stage, pass) in [
+                ("calibrate", "calibrate"),
+                ("measure", "pass1"),
+                ("measure", "pass2"),
+                ("register", "align"),
+                ("register", "rewrite"),
+            ] {
+                assert_eq!(
+                    fan_out_items(&logs, stage, pass),
+                    0,
+                    "a regroup to {what} redid {stage}/{pass}: {logs}"
+                );
+            }
+            assert_eq!(registered_rows(), registered1, "{what}: a registered row moved");
+
+            // The group-level stages ran for the new group: LN scales exist and the master is written.
+            let summary = &rc.summary.groups[0];
+            let included: Vec<_> = summary.frames.iter().filter(|f| f.included).collect();
+            assert_eq!(included.len(), 6, "{what}: {:?}", summary.frames);
+            for f in &included {
+                assert!(f.ln_scale.is_some(), "{what}: {f:?}");
+                assert!(!f.cached_ln, "{what}: LN of a new group is computed, not reused: {f:?}");
+            }
+            let master = summary.master_path.clone().expect("a master path");
+            assert!(Path::new(&master).exists(), "{what}: the master is on disk");
+        }
+
+        // Every frame-level row still sits under the empty key and names one file.
+        for kind in ["calibrated", "measured", "registered"] {
+            let rows = rows_of_kind(&fixture.conn, fixture.set_id, kind);
+            assert_eq!(rows.len(), 6, "{kind}: {rows:?}");
+            assert!(rows.values().all(|r| r.group_key.is_empty()), "{kind}: {rows:?}");
+        }
+    }
+
+    /// Ruling R6 I1 (the registration half of Task 4's review focus 1): a regroup that merges two mono exposure
+    /// classes with different PSF shapes gives the merged group a new beta, so its members' pass 2 and registration
+    /// (the mono registration reads Measure's `fits.0`, which carries the beta) are redone. A debayered-OSC group in the
+    /// same set, registered onto an OSC reference of its own group, reads no Measure output: its frames are reused
+    /// whatever happens to the mono betas. Align items = the mono members only; the OSC frames come back `cached`.
+    #[test]
+    fn a_merged_beta_re_registers_the_mono_members_and_not_the_debayered_osc_frames() {
+        use crate::stacking::config::ExposureMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let mut mono_ids = Vec::new();
+        let mut osc_ids = Vec::new();
+        // Mono: three Moffat (beta 2.5) frames at 60 s and three Gaussian ones at 120 s, as in
+        // `merged_group_with_a_new_beta_reruns_pass_two_only`.
+        for i in 0..6 {
+            let (dx, dy) = shifts[i % 3];
+            let date_obs = date_obs_at(i);
+            let stem = format!("m{i}");
+            let moffat_class = i < 3;
+            let spec = LightSpec {
+                filter: Some("L"),
+                exptime: if moffat_class { 60.0 } else { 120.0 },
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let stars = shifted_stars(dx, dy);
+            let (id, _) = if moffat_class {
+                test_fixtures::add_light_with_moffat_field(&fixture, &spec, &stars, 3.4, 2.5, 600.0, 5.0, 100 + i as u64)
+            } else {
+                test_fixtures::add_light_with_field_fwhm(&fixture, &spec, &stars, 3.4, 600.0, 5.0, 100 + i as u64)
+            };
+            mono_ids.push(id);
+        }
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i + 6);
+            let stem = format!("o{i}");
+            let spec = LightSpec {
+                bayerpat: Some("RGGB"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &shifted_stars(dx, dy),
+                600.0,
+                5.0,
+                120 + i as u64,
+            );
+            osc_ids.push(id);
+        }
+        let all_ids: Vec<i64> = mono_ids.iter().chain(osc_ids.iter()).copied().collect();
+        test_fixtures::add_master_dark_and_flat(&fixture, &all_ids, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        // The reference is an OSC frame: no mono group's beta can move the OSC frames' registration through it.
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, osc_ids[0]).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        let run = |mode: ExposureMode| {
+            let mut cfg = StackingConfig::default();
+            cfg.reference.mode = ReferenceMode::Manual;
+            cfg.grouping.exposure_mode = mode;
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            let (res, logs) =
+                crate::stacking::telemetry::capture_logs(|| run_stages_for_test(&mut rc, Stage::Register));
+            res.unwrap();
+            (plan_groups, rc, logs)
+        };
+        // Whether each member's registration this pass was reused, for the frames in `ids`.
+        let cached_of = |rc: &RunContext, ids: &[i64]| -> Vec<bool> {
+            let mut out = Vec::new();
+            for entries in rc.measured.values() {
+                for e in entries.iter().filter(|e| ids.contains(&e.frame.frame_id)) {
+                    match &e.registration {
+                        Some(RegisteredFrameOutcome::Aligned { cached, .. }) => out.push(*cached),
+                        _ => panic!("frame {} not aligned", e.frame.frame_id),
+                    }
+                }
+            }
+            out
+        };
+        let mono_beta = |rc: &RunContext, groups: &[IntegrationGroup]| -> Vec<f64> {
+            groups
+                .iter()
+                .filter(|g| g.frames.iter().any(|f| mono_ids.contains(&f.frame_id)))
+                .map(|g| rc.measured_groups[&g.key].beta.expect("a measured mono group has a beta"))
+                .collect()
+        };
+
+        let (groups1, rc1, logs1) = run(ExposureMode::Seconds);
+        assert_eq!(groups1.len(), 3, "two mono classes and the OSC group: {groups1:?}");
+        assert_eq!(rc1.reference_frame_id, Some(osc_ids[0]));
+        assert_eq!(fan_out_items(&logs1, "register", "align"), 10, "a first run aligns every frame: {logs1}");
+        assert_eq!(cached_of(&rc1, &all_ids), vec![false; 10]);
+        let betas1 = mono_beta(&rc1, &groups1);
+        assert_eq!(betas1.len(), 2);
+
+        let (groups2, rc2, logs2) = run(ExposureMode::NoSplit);
+        assert_eq!(groups2.len(), 2, "one merged mono group and the OSC group: {groups2:?}");
+        let betas2 = mono_beta(&rc2, &groups2);
+        assert_eq!(betas2.len(), 1);
+        assert!(
+            betas1.iter().all(|b| (b - betas2[0]).abs() > 1e-6),
+            "premise: the merged beta {betas2:?} differs from both source betas {betas1:?}"
+        );
+        assert_eq!(
+            fan_out_items(&logs2, "register", "align"),
+            mono_ids.len(),
+            "the merged mono members re-register and nothing else does: {logs2}"
+        );
+        assert_eq!(cached_of(&rc2, &mono_ids), vec![false; 6], "the mono members re-register");
+        assert_eq!(cached_of(&rc2, &osc_ids), vec![true; 4], "the debayered OSC frames are reused");
+    }
+
     /// T5 (spec 2026-10-04 §3 step 1, L-23): the run writes the
     /// reference-frames saturation map beside the LN reference and reads it
     /// back on a cache hit; a cached reference whose map is missing is
