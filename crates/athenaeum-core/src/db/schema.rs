@@ -4318,6 +4318,9 @@ mod frame_level_keys_migration_tests {
     fn pre_migration() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        // The deletion below only means "before the migration" if `init_db` wrote the marker: a
+        // dropped call from `init_db` would otherwise leave every test here passing.
+        assert!(marker(&conn), "init_db runs the frame-level key migration");
         conn.pragma_update(None, "foreign_keys", false).unwrap();
         conn.execute(
             "DELETE FROM settings WHERE key = ?1",
@@ -4472,6 +4475,95 @@ mod frame_level_keys_migration_tests {
         migrate_frame_level_artifact_keys(&conn).unwrap();
         assert_eq!(rows(&conn, 3, "calibrated")[0].0, OLD);
         assert_eq!(total(&conn), 5);
+    }
+
+    /// A frame-level kind with neither `frame_id` nor `project_frame` names no frame: the
+    /// migration's filter leaves it alone, so two such rows under different group keys both
+    /// survive with their keys (the unique index tells them apart by group key).
+    #[test]
+    fn rows_that_name_no_frame_are_left_alone() {
+        let conn = pre_migration();
+        for (group, path, at) in [
+            (OLD, "calibrated/old/none.fits", "2026-01-01T00:00:00Z"),
+            (NEWER, "calibrated/new/none.fits", "2026-02-01T00:00:00Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO stacking_artifacts (frames_set_id, group_key, kind, path,
+                    config_hash, created_at) VALUES (1, ?1, 'calibrated', ?2, 'h', ?3)",
+                rusqlite::params![group, path, at],
+            )
+            .unwrap();
+        }
+
+        migrate_frame_level_artifact_keys(&conn).unwrap();
+
+        let got: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT group_key, path FROM stacking_artifacts
+                  WHERE frames_set_id = 1 AND kind = 'calibrated' ORDER BY path",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (NEWER.to_string(), "calibrated/new/none.fits".to_string()),
+                (OLD.to_string(), "calibrated/old/none.fits".to_string()),
+            ],
+            "neither row is dropped or re-keyed"
+        );
+        assert!(marker(&conn));
+    }
+
+    /// `init_db` itself runs the migration: a catalog whose rows sit under group keys and
+    /// whose marker is absent (the upgrade) comes out re-keyed, newest kept, marker written.
+    #[test]
+    fn init_db_runs_the_migration_on_an_upgrading_catalog() {
+        let conn = pre_migration();
+        put(
+            &conn,
+            1,
+            1,
+            OLD,
+            "calibrated",
+            "calibrated/old/f1.fits",
+            "2026-01-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            1,
+            NEWER,
+            "calibrated",
+            "calibrated/new/f1.fits",
+            "2026-02-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            2,
+            OLD,
+            "measured",
+            "measured/old/f2.athm",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(!marker(&conn));
+
+        init_db(&conn).unwrap();
+
+        assert!(marker(&conn));
+        assert_eq!(
+            rows(&conn, 1, "calibrated"),
+            vec![("".to_string(), "calibrated/new/f1.fits".to_string())]
+        );
+        assert_eq!(
+            rows(&conn, 2, "measured"),
+            vec![("".to_string(), "measured/old/f2.athm".to_string())]
+        );
+        assert_eq!(total(&conn), 2);
     }
 
     /// Equal `created_at` falls back to the higher `id`.
