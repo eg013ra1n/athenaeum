@@ -131,7 +131,7 @@ use crate::stacking::weights::{
     best_by_weight, compute_weights, defers_weight_gate, reference_coverage, select_frames,
     select_frames_deferring_weight_gate, sky_penalized_order, two_pass_deviation_px,
     two_pass_pick, two_pass_pick_among, weight_gate, FrameWeight, TwoPassCandidate, WeightInput,
-    WeightMode, MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX,
+    WeightMode, MIN_REFERENCE_COVERAGE, TWO_PASS_CANDIDATES, TWO_PASS_MIN_GAIN_PX,
 };
 
 /// Every `fits` artifact path whose write DEGRADED (final fix wave, ruling
@@ -4727,6 +4727,8 @@ pub(crate) struct FanOutTicker {
     /// `bytes_done` until the commit loop emits each group's real figure (final review A, M3).
     bytes_done: u64,
     bytes_total: u64,
+    /// The event's `message` ([`Self::with_message`]); `None` for every stage but Register's two passes.
+    message: Option<&'static str>,
 }
 
 impl FanOutTicker {
@@ -4782,7 +4784,14 @@ impl FanOutTicker {
             ))),
             bytes_done,
             bytes_total,
+            message: None,
         }
+    }
+
+    /// Every event this ticker emits carries `message` (Register's "checking the reference" / "aligning").
+    fn with_message(mut self, message: &'static str) -> Self {
+        self.message = Some(message);
+        self
     }
 
     /// Count in `scale` units per frame (Measure's two passes tick half a frame each, `scale = 2`): `done_so_far`
@@ -4834,7 +4843,7 @@ impl FanOutTicker {
                 bytes_done: self.bytes_done,
                 bytes_total: self.bytes_total,
                 frame_id,
-                message: None,
+                message: self.message.map(str::to_string),
             },
         );
         current
@@ -8048,6 +8057,81 @@ fn note_low_inlier_frames(rc: &RunContext, group: &IntegrationGroup) {
     warn_low_inlier_frames(rc.run_id, &group.key, &rows);
 }
 
+/// The Register stage's progress `message` (frame-level cache spec §5.6): the two-pass dry pass.
+const REGISTER_MESSAGE_CHECKING: &str = "checking the reference";
+/// The Register stage's progress `message` for the persisting pass.
+const REGISTER_MESSAGE_ALIGNING: &str = "aligning";
+
+/// The reference's term of every member's registration hash (ruling R3 (a), [`reference_measurement_fold`]): its own
+/// Measure output when it lives in a group other than `group`, `""` otherwise. `reference_hash` is the reference's
+/// calibration hash. The one place the run, the gate and the two-pass key resolve it.
+///
+/// [`reference_measurement_fold`]: crate::stacking::plan::reference_measurement_fold
+fn reference_measurement_term(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    prepare_path: bool,
+) -> Result<String, RunError> {
+    let reference_group = rc
+        .plan_groups
+        .iter()
+        .find(|g| g.frames.iter().any(|f| f.frame_id == reference_frame_id))
+        .ok_or_else(|| {
+            RunError::Other(format!(
+                "registration reference (frame {reference_frame_id}) is in no group"
+            ))
+        })?;
+    Ok(crate::stacking::plan::reference_measurement_fold(
+        &rc.config,
+        group,
+        reference_group,
+        prepare_path,
+        reference_hash,
+        rc.measured_groups
+            .get(&reference_group.key)
+            .and_then(|g| g.beta),
+    ))
+}
+
+/// One member's calibration hash and the registration hash a row for it must carry against the reference (ruling
+/// R3 (d)): exactly what [`register_group_pass`] compares a stored row to, and what the two-pass decision key folds.
+/// `reference_measurement_hash` is [`reference_measurement_term`]'s value.
+fn member_registration_hash(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    frame: &GroupFrame,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    reference_measurement_hash: &str,
+    prepare_path: bool,
+) -> Result<(String, String), RunError> {
+    let cfg = rc.config.clone();
+    let frame_hash = {
+        let conn = db(&rc.ctx)?.conn();
+        rc.memo.calibration_hash_checked(&conn, &cfg, frame)?
+    };
+    // Ruling C-18: the same measurement hash `plan.rs`'s `compute_register_stale` folds in - must match, or the gate
+    // and the run disagree about whether a stored registration row is fresh.
+    let frame_measurement_hash = crate::stacking::plan::registration_measurement_fold(
+        &cfg,
+        group,
+        prepare_path,
+        &frame_hash,
+        rc.measured_groups.get(&group.key).and_then(|g| g.beta),
+    );
+    let expected = registration_hash_for(
+        &cfg,
+        reference_frame_id,
+        reference_hash,
+        &frame_hash,
+        &frame_measurement_hash,
+        reference_measurement_hash,
+    );
+    Ok((frame_hash, expected))
+}
+
 /// ONE registration pass over ONE group (M4a Task 4, ruling R-M4a-5 — the
 /// body [`stage_register`]'s per-group loop used to inline).
 ///
@@ -8084,6 +8168,12 @@ fn register_group_pass(
     solves: &mut SolveCache,
 ) -> Result<Vec<PassResult>, RunError> {
     let cfg = rc.config.clone();
+    // Every event of the pass names it (frame-level cache spec §5.6).
+    let message = if persist {
+        REGISTER_MESSAGE_ALIGNING
+    } else {
+        REGISTER_MESSAGE_CHECKING
+    };
     let mut pass: Vec<PassResult> = Vec::new();
     let mut write_failures = RegisteredWriteFailures::default();
 
@@ -8158,51 +8248,18 @@ fn register_group_pass(
     let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
     // Ruling R3 (a): the reference's own Measure output, when its fits seed the reference stars and its group is not
     // this one (`plan::reference_measurement_fold`; the gate resolves the same value).
-    let reference_measurement_hash = {
-        let reference_group = rc
-            .plan_groups
-            .iter()
-            .find(|g| g.frames.iter().any(|f| f.frame_id == reference_frame_id))
-            .ok_or_else(|| {
-                RunError::Other(format!(
-                    "registration reference (frame {reference_frame_id}) is in no group"
-                ))
-            })?;
-        crate::stacking::plan::reference_measurement_fold(
-            &cfg,
-            group,
-            reference_group,
-            prepare_path,
-            reference_hash,
-            rc.measured_groups
-                .get(&reference_group.key)
-                .and_then(|g| g.beta),
-        )
-    };
+    let reference_measurement_hash =
+        reference_measurement_term(rc, group, reference_frame_id, reference_hash, prepare_path)?;
     for (idx, frame, path, is_reference) in snapshot {
-        let frame_hash = {
-            let conn = db(&rc.ctx)?.conn();
-            rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
-        };
-        // Ruling C-18: the same measurement hash `plan.rs`'s
-        // `compute_register_stale` folds in — must match, or the gate and
-        // the run disagree about whether a stored registration row is
-        // fresh.
-        let frame_measurement_hash = crate::stacking::plan::registration_measurement_fold(
-            &cfg,
+        let (frame_hash, expected_hash) = member_registration_hash(
+            rc,
             group,
-            prepare_path,
-            &frame_hash,
-            rc.measured_groups.get(&group.key).and_then(|g| g.beta),
-        );
-        let expected_hash = registration_hash_for(
-            &cfg,
+            &frame,
             reference_frame_id,
             reference_hash,
-            &frame_hash,
-            &frame_measurement_hash,
             &reference_measurement_hash,
-        );
+            prepare_path,
+        )?;
 
         let mut reused: Option<RegisteredFrameOutcome> = None;
         if persist && !force_fresh {
@@ -8334,7 +8391,7 @@ fn register_group_pass(
                     0,
                     0,
                     Some(frame.frame_id),
-                    None,
+                    Some(message.to_string()),
                 );
             }
         } else {
@@ -8492,7 +8549,8 @@ fn register_group_pass(
             progress.1,
             0,
             0,
-        );
+        )
+        .with_message(message);
         let rewrite_ticker_ref = &rewrite_ticker;
         let rewrite_results = fan_out(
             needs_artifact_rewrite,
@@ -8631,7 +8689,8 @@ fn register_group_pass(
         progress.1,
         0,
         0,
-    );
+    )
+    .with_message(message);
     let ticker_ref = &ticker;
     let cancel_ref: &AtomicBool = &rc.cancel;
     let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
@@ -9006,7 +9065,7 @@ fn register_group_pass(
         0,
         0,
         None,
-        None,
+        Some(message.to_string()),
     );
 
     write_failures.flush(rc, group);
@@ -9066,6 +9125,248 @@ fn two_pass_candidates(
         .collect()
 }
 
+/// The group-level payload row of a two-pass dry pass's decision (frame-level cache spec §5.6): `config_hash` is
+/// [`two_pass_key`], payload `{"switchTo": <frame id> | null}`. Group-level ([`artifact_group_key`]), outside
+/// `paths::INTERMEDIATE_ARTIFACT_KINDS` (survives "Delete intermediates"), dropped by "All".
+pub(crate) const TWO_PASS_ARTIFACT_KIND: &str = "two_pass";
+
+/// The decision a `two_pass` row holds.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TwoPassPayload {
+    switch_to: Option<i64>,
+}
+
+/// The key of a two-pass decision: everything the dry pass and the pick read. The registration subtree (the dry
+/// pass registers with it), the candidate reference and its calibration hash, the ranked ids the pick scores (rank
+/// order), a project's WCS-allowed ids, and every included member's registration hash against the candidate (which
+/// carries the member's calibration and, where registration reads Measure's fits, its measurement). Registration is
+/// deterministic (RQ-1), so equal inputs give the equal decision.
+pub(crate) fn two_pass_key(
+    cfg: &StackingConfig,
+    candidate_id: i64,
+    candidate_calib_hash: &str,
+    ranked_ids: &[i64],
+    allowed_ids: Option<&[i64]>,
+    member_hashes: &[(i64, String)],
+) -> String {
+    let join = |ids: &[i64]| {
+        ids.iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut upstream: Vec<String> = vec![
+        format!("ref:{candidate_id}"),
+        candidate_calib_hash.to_string(),
+        format!("ranked:{}", join(ranked_ids)),
+    ];
+    if let Some(allowed) = allowed_ids {
+        upstream.push(format!("allowed:{}", join(allowed)));
+    }
+    for (id, hash) in member_hashes {
+        upstream.push(format!("member:{id}:{hash}"));
+    }
+    let refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
+    crate::stacking::config::stage_hash(
+        &crate::stacking::config::registration_subtree(cfg),
+        &refs,
+        &[],
+    )
+}
+
+/// One group's two-pass cache lookup: the key, and the stored decision when the row is fresh.
+struct TwoPassLookup {
+    key: String,
+    /// `Some(switch_to)` on a hit.
+    cached: Option<Option<i64>>,
+}
+
+/// The ids the pick scores, in rank order: the group's included frames with a calibrated file that are not under the
+/// Measure-time floor (the current reference stays whatever its flag, as in [`two_pass_candidates`]), restricted to
+/// `allowed` on a project, ordered by weight with the lower index first on a tie, the top
+/// [`TWO_PASS_CANDIDATES`] (`weights::two_pass_pick_among`).
+fn two_pass_ranked_ids(
+    entries: &[MeasuredFrame],
+    reference_frame_id: i64,
+    allowed: Option<&HashSet<i64>>,
+) -> Vec<i64> {
+    let mut ranked: Vec<(usize, f64, i64)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.included && e.calibrated.is_some())
+        .filter(|(_, e)| e.frame.frame_id == reference_frame_id || !e.measure_floored)
+        .filter(|(_, e)| {
+            e.frame.frame_id == reference_frame_id
+                || allowed.is_none_or(|a| a.contains(&e.frame.frame_id))
+        })
+        .map(|(i, e)| {
+            let weight = e.weight.as_ref().map_or(0.0, |w| w.normalized_mean);
+            (i, weight, e.frame.frame_id)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(TWO_PASS_CANDIDATES);
+    ranked.into_iter().map(|(_, _, id)| id).collect()
+}
+
+/// The two-pass key of `group` against the candidate reference, and the stored decision when its `two_pass` row is
+/// fresh. `force_fresh` (a rerun from Register or earlier) never reads the row. A row that is stale, unparseable, or
+/// names a frame this group cannot adopt reads as a miss (the last two are logged). Member hashes go through
+/// [`member_registration_hash`], the very call [`register_group_pass`] compares its stored rows with (ruling R3 (d)).
+fn two_pass_lookup(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    force_fresh: bool,
+) -> Result<TwoPassLookup, RunError> {
+    let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
+    let reference_measurement_hash =
+        reference_measurement_term(rc, group, reference_frame_id, reference_hash, prepare_path)?;
+    let members: Vec<GroupFrame> = rc
+        .measured
+        .get(&group.key)
+        .map(|v| {
+            v.iter()
+                .filter(|e| e.included && e.calibrated.is_some())
+                .map(|e| e.frame.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut member_hashes: Vec<(i64, String)> = Vec::with_capacity(members.len());
+    for frame in &members {
+        let (_, hash) = member_registration_hash(
+            rc,
+            group,
+            frame,
+            reference_frame_id,
+            reference_hash,
+            &reference_measurement_hash,
+            prepare_path,
+        )?;
+        member_hashes.push((frame.frame_id, hash));
+    }
+    member_hashes.sort_by_key(|(id, _)| *id);
+
+    let allowed: Option<HashSet<i64>> = rc.wcs_rule.as_ref().map(|rule| {
+        members
+            .iter()
+            .map(|f| f.frame_id)
+            .filter(|id| rule.candidates.contains(id))
+            .collect()
+    });
+    let allowed_ids: Option<Vec<i64>> = allowed.as_ref().map(|set| {
+        let mut ids: Vec<i64> = set.iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    });
+    let ranked_ids = rc
+        .measured
+        .get(&group.key)
+        .map(|v| two_pass_ranked_ids(v, reference_frame_id, allowed.as_ref()))
+        .unwrap_or_default();
+    let key = two_pass_key(
+        &rc.config,
+        reference_frame_id,
+        reference_hash,
+        &ranked_ids,
+        allowed_ids.as_deref(),
+        &member_hashes,
+    );
+    if force_fresh {
+        return Ok(TwoPassLookup { key, cached: None });
+    }
+
+    let row = {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key(TWO_PASS_ARTIFACT_KIND, &group.key),
+            TWO_PASS_ARTIFACT_KIND,
+            None,
+        )?
+    };
+    let cached = row.filter(|r| r.config_hash == key).and_then(|r| {
+        let payload: TwoPassPayload = match r
+            .payload_json
+            .as_deref()
+            .map(serde_json::from_str::<TwoPassPayload>)
+        {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    error = %e,
+                    "two-pass decision unreadable; checking the reference again"
+                );
+                return None;
+            }
+            None => return None,
+        };
+        if let Some(id) = payload.switch_to {
+            let adoptable = id != reference_frame_id
+                && members.iter().any(|f| f.frame_id == id)
+                && rc
+                    .measured
+                    .get(&group.key)
+                    .is_some_and(|v| v.iter().any(|e| e.frame.frame_id == id && e.in_reference_pick()));
+            if !adoptable {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    frame_id = id,
+                    "two-pass decision names a frame this group cannot adopt; checking the reference again"
+                );
+                return None;
+            }
+        }
+        Some(payload.switch_to)
+    });
+    Ok(TwoPassLookup { key, cached })
+}
+
+/// Record the dry pass's decision under the key [`two_pass_lookup`] computed before it ran. A failed write is logged
+/// and costs only the next run its cache hit.
+fn store_two_pass_decision(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    lookup: &TwoPassLookup,
+    switch_to: Option<i64>,
+) {
+    let payload = match serde_json::to_string(&TwoPassPayload { switch_to }) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(run_id = rc.run_id, group_key = %group.key, error = %e, "two-pass decision not recorded");
+            return;
+        }
+    };
+    let written = db(&rc.ctx).map_err(|e| e.to_string()).and_then(|d| {
+        let conn = d.conn();
+        upsert_artifact(
+            &conn,
+            &NewArtifact {
+                subject: &rc.subject,
+                frame_id: None,
+                group_key: artifact_group_key(TWO_PASS_ARTIFACT_KIND, &group.key),
+                kind: TWO_PASS_ARTIFACT_KIND,
+                path: None,
+                config_hash: &lookup.key,
+                size: None,
+                modified_at: None,
+                payload_json: Some(&payload),
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    });
+    if let Err(error) = written {
+        tracing::warn!(run_id = rc.run_id, group_key = %group.key, error = %error, "two-pass decision not recorded");
+    }
+}
+
 /// ONE group's two-pass dry pass and re-pick (M4a ruling R-M4a-5, factored
 /// out of `stage_register` by M4b Task 3 so both geometry modes run the
 /// SAME pick: co-registered runs it once, over the run reference's own
@@ -9097,7 +9398,30 @@ fn two_pass_refine(
     progress: &mut (usize, usize),
     solves: &mut SolveCache,
 ) -> Result<Option<TwoPassSwitch>, RunError> {
-    let cfg = rc.config.clone();
+    // Frame-level cache spec §5.6: the decision of an earlier run on the same inputs. A hit skips the dry pass; the
+    // switch is built through `adopt_two_pass_pick`'s fresh-detection fallback (`rc.dry_pass_stars` is empty).
+    let lookup = two_pass_lookup(rc, group, reference_frame_id, reference_hash, force_fresh)?;
+    if let Some(cached) = lookup.cached {
+        tracing::info!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            frame_id = reference_frame_id,
+            "two-pass decision reused"
+        );
+        let Some(switch_to) = cached else {
+            return Ok(None);
+        };
+        // `two_pass_lookup` only reports a hit for a frame of this group.
+        let Some(new_idx) = rc
+            .measured
+            .get(&group.key)
+            .and_then(|v| v.iter().position(|e| e.frame.frame_id == switch_to))
+        else {
+            return Ok(None);
+        };
+        return adopt_two_pass_pick(rc, group, new_idx, reference_frame_id, None);
+    }
+
     let pass = register_group_pass(
         rc,
         group,
@@ -9170,6 +9494,8 @@ fn two_pass_refine(
         ),
     };
     let Some(new_idx) = pick else {
+        // A real decision: no candidate beats the current reference.
+        store_two_pass_decision(rc, group, &lookup, None);
         return Ok(None);
     };
 
@@ -9177,6 +9503,31 @@ fn two_pass_refine(
         two_pass_deviation_px(&candidates, reference_idx, diagonal_px).unwrap_or(f64::NAN);
     let corner_px_after =
         two_pass_deviation_px(&candidates, new_idx, diagonal_px).unwrap_or(f64::NAN);
+    let switch = adopt_two_pass_pick(
+        rc,
+        group,
+        new_idx,
+        reference_frame_id,
+        Some((corner_px_before, corner_px_after)),
+    )?;
+    if let Some(switch) = &switch {
+        store_two_pass_decision(rc, group, &lookup, Some(switch.frame_id));
+    }
+    Ok(switch)
+}
+
+/// Resolve the frame at `new_idx` of the group into a [`TwoPassSwitch`]: the end of [`two_pass_refine`], shared by a
+/// dry-pass pick and a cached decision. `corner_px` is the pick's `(before, after)` corner displacement, `None` when
+/// the decision comes from the cache (the dry pass did not run, so `rc.dry_pass_stars` is empty and the stars come
+/// from the fresh-detection fallback below). `Ok(None)` keeps the current reference, with a warn.
+fn adopt_two_pass_pick(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    new_idx: usize,
+    reference_frame_id: i64,
+    corner_px: Option<(f64, f64)>,
+) -> Result<Option<TwoPassSwitch>, RunError> {
+    let cfg = rc.config.clone();
     let picked = rc
         .measured
         .get(&group.key)
@@ -9309,20 +9660,37 @@ fn two_pass_refine(
         Ok(prepared) => prepared,
     };
 
-    tracing::info!(
-        run_id = rc.run_id,
-        group_key = %group.key,
-        from = reference_frame_id,
-        to = new_frame_id,
-        corner_px_before,
-        corner_px_after,
-        "reference switched by the two-pass pick"
-    );
-    rc.warnings.push(format!(
-        "reference switched by the two-pass pick: {reference_frame_id} → \
-         {new_frame_id} (corner displacement \
-         {corner_px_before:.1} → {corner_px_after:.1} px)"
-    ));
+    match corner_px {
+        Some((corner_px_before, corner_px_after)) => {
+            tracing::info!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                from = reference_frame_id,
+                to = new_frame_id,
+                corner_px_before,
+                corner_px_after,
+                "reference switched by the two-pass pick"
+            );
+            rc.warnings.push(format!(
+                "reference switched by the two-pass pick: {reference_frame_id} → \
+                 {new_frame_id} (corner displacement \
+                 {corner_px_before:.1} → {corner_px_after:.1} px)"
+            ));
+        }
+        None => {
+            tracing::info!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                from = reference_frame_id,
+                to = new_frame_id,
+                "reference switched by the cached two-pass decision"
+            );
+            rc.warnings.push(format!(
+                "reference switched by the two-pass pick: {reference_frame_id} → \
+                 {new_frame_id} (cached decision)"
+            ));
+        }
+    }
 
     Ok(Some(TwoPassSwitch {
         from: reference_frame_id,
@@ -9442,11 +9810,24 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         }
         total += included;
-        let group_reference = rc.geometry_of(&g.key).reference_frame_id;
+        let (group_reference, group_reference_hash) = {
+            let geometry = rc.geometry_of(&g.key);
+            (geometry.reference_frame_id, geometry.hash.clone())
+        };
         if group_two_pass_wanted(&cfg, group_reference, manual_reference_frame_id)
             && group_can_switch(rc, &g.key, group_reference)
         {
-            total += included;
+            // A cached decision removes this group's dry pass from the total.
+            let lookup = two_pass_lookup(
+                rc,
+                g,
+                group_reference,
+                &group_reference_hash,
+                force_fresh,
+            )?;
+            if lookup.cached.is_none() {
+                total += included;
+            }
         }
     }
     let mut progress = (0usize, total);
@@ -9739,10 +10120,18 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         } else {
             None
         };
-    let dry_total = dry_group
-        .as_ref()
-        .map(|g| included_count_of(rc, &g.key))
-        .unwrap_or(0);
+    // A cached two-pass decision removes the dry pass from the total (frame-level cache spec §5.6).
+    let dry_total = match dry_group.as_ref() {
+        Some(g) => {
+            let lookup = two_pass_lookup(rc, g, reference_frame_id, &reference_hash, force_fresh)?;
+            if lookup.cached.is_some() {
+                0
+            } else {
+                included_count_of(rc, &g.key)
+            }
+        }
+        None => 0,
+    };
 
     let mut progress = (0usize, viable_total + dry_total);
     rc.progress(
@@ -21823,6 +22212,202 @@ mod tests {
             .unwrap();
         assert_eq!(row.reference_frame_id, Some(light_ids[0]));
         assert_eq!(row.reference_mode, "manual");
+    }
+
+    // ── two-pass decision cache (frame-level cache spec §5.6, Task 10) ────
+
+    /// Six frames of [`two_pass_fields`] on an Auto reference with `twoPass` on, run through Register as often as a
+    /// test asks: a second run finds the first one's rows, as a user's second run does.
+    struct TwoPassRig {
+        _tmp: tempfile::TempDir,
+        ctx: Arc<ServiceContext>,
+        fixture: test_fixtures::Fixture,
+        light_ids: Vec<i64>,
+        working: tempfile::TempDir,
+        output: tempfile::TempDir,
+        layout: WorkingLayout,
+    }
+
+    impl TwoPassRig {
+        fn new() -> TwoPassRig {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let (fixture, light_ids, working, output) =
+                seed_star_group_with_fields(&db_path, SET_NAME, &two_pass_fields());
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            TwoPassRig { _tmp: tmp, ctx, fixture, light_ids, working, output, layout }
+        }
+
+        /// One run through Register, `emitter` receiving its progress.
+        fn run(&self, emitter: Arc<dyn ProgressEmitter>) -> RunContext {
+            let cfg = StackingConfig::default();
+            let plan_groups = group_frames(&self.fixture.conn, self.fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+            let (run_id, group_ids) = seed_run_and_groups(
+                &self.fixture.conn,
+                self.fixture.set_id,
+                &plan_groups,
+                self.working.path(),
+                self.output.path(),
+            );
+            let mut rc = test_context(
+                self.ctx.clone(),
+                emitter,
+                run_id,
+                self.fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups,
+                self.layout.clone(),
+                self.output.path().to_path_buf(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Register).unwrap();
+            rc
+        }
+
+        /// The group's `two_pass` row, if any.
+        fn decision_row(&self, rc: &RunContext) -> Option<crate::db::stacking::StackingArtifactRow> {
+            let key = &rc.plan_groups[0].key;
+            crate::db::stacking::find_artifact(
+                &self.fixture.conn,
+                &StackSubject::FrameSet(self.fixture.set_id),
+                artifact_group_key(TWO_PASS_ARTIFACT_KIND, key),
+                TWO_PASS_ARTIFACT_KIND,
+                None,
+            )
+            .unwrap()
+        }
+    }
+
+    /// Spec §5.6: the dry pass runs once. Run 1 registers the six members twice (the dry pass, then the real one) and
+    /// records `{"switchTo": <frame>}` on the group; run 2 finds the row fresh, skips the dry pass (no fan-out
+    /// opens: the real pass is all cache hits too), and ends on the same final reference and `switched_from`.
+    #[test]
+    fn two_pass_decision_is_cached_on_the_second_run() {
+        let rig = TwoPassRig::new();
+        let (rc1, logs1) =
+            crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
+        let chosen = rc1.reference_frame_id.unwrap();
+        assert_ne!(chosen, rig.light_ids[0], "premise: the dry pass switched the reference");
+        assert_eq!(
+            fan_out_items(&logs1, "register", "align"),
+            2 * rig.light_ids.len(),
+            "run 1: the dry pass and the real pass each register every member: {logs1}"
+        );
+        let row = rig.decision_row(&rc1).expect("run 1 recorded its decision");
+        assert_eq!(row.group_key, rc1.plan_groups[0].key, "group-level");
+        assert!(row.path.is_none() && row.frame_id.is_none());
+        let payload: serde_json::Value = serde_json::from_str(row.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({ "switchTo": chosen }));
+
+        let (rc2, logs2) =
+            crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
+        assert_eq!(
+            fan_out_items(&logs2, "register", "align"),
+            0,
+            "run 2 opened a registration fan-out (the dry pass ran again?): {logs2}"
+        );
+        assert!(logs2.contains("two-pass decision reused"), "{logs2}");
+        assert_eq!(rc2.reference_frame_id, Some(chosen));
+        assert_eq!(rc2.summary.reference.frame_id, Some(chosen));
+        assert_eq!(rc2.summary.reference.switched_from, Some(rig.light_ids[0]));
+        assert!(
+            rc2.warnings.iter().any(|w| w.starts_with("reference switched by the two-pass pick:")),
+            "{:?}",
+            rc2.warnings
+        );
+        let run_row = crate::db::stacking::get_run(&rig.fixture.conn, rc2.run_id).unwrap().unwrap();
+        assert_eq!(run_row.reference_frame_id, Some(chosen));
+        assert_eq!(
+            rig.decision_row(&rc2).unwrap().config_hash,
+            row.config_hash,
+            "the same inputs, the same key"
+        );
+    }
+
+    /// One member recalibrated (its source file's catalog size moved, so its calibration hash and with it its
+    /// registration hash against the candidate move): the key moves, the row is stale, the dry pass runs again and
+    /// the row is rewritten under the new key.
+    #[test]
+    fn two_pass_cache_misses_when_a_member_changes() {
+        let rig = TwoPassRig::new();
+        let rc1 = rig.run(Arc::new(NullEmitter));
+        let key1 = rig.decision_row(&rc1).unwrap().config_hash;
+
+        rig.fixture
+            .conn
+            .execute(
+                "UPDATE files SET size = size + 1000 WHERE id = \
+                 (SELECT file_id FROM frames WHERE id = ?1)",
+                rusqlite::params![rig.light_ids[2]],
+            )
+            .unwrap();
+        let (rc2, logs2) =
+            crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
+        assert!(!logs2.contains("two-pass decision reused"), "{logs2}");
+        assert!(
+            fan_out_items(&logs2, "register", "align") >= rig.light_ids.len(),
+            "the dry pass did not run again: {logs2}"
+        );
+        let key2 = rig.decision_row(&rc2).unwrap().config_hash;
+        assert_ne!(key1, key2, "the key ignored a changed member");
+    }
+
+    /// The dry pass names itself in the Register progress ("checking the reference"), the real pass is "aligning",
+    /// and the stage total counts the dry pass only while it runs: 12 on run 1, 6 once the decision is cached.
+    #[test]
+    fn dry_pass_progress_names_its_pass() {
+        let register_events = |rec: &Recording| -> Vec<serde_json::Value> {
+            rec.events(STACKING_PROGRESS_EVENT)
+                .into_iter()
+                .filter(|e| e["stage"] == Stage::Register.as_str())
+                .collect()
+        };
+        let rig = TwoPassRig::new();
+        let members = rig.light_ids.len() as u64;
+
+        let rec1 = Arc::new(Recording::new());
+        rig.run(rec1.clone() as Arc<dyn ProgressEmitter>);
+        let events1 = register_events(&rec1);
+        assert!(
+            events1.iter().all(|e| e["total"] == 2 * members),
+            "run 1: the total is the dry pass plus the real one: {events1:?}"
+        );
+        let messages1: Vec<Option<&str>> = events1.iter().map(|e| e["message"].as_str()).collect();
+        let first_aligning = messages1
+            .iter()
+            .position(|m| *m == Some("aligning"))
+            .expect("a real-pass tick carries \"aligning\"");
+        assert!(
+            messages1[..first_aligning].contains(&Some("checking the reference")),
+            "a dry-pass tick carries \"checking the reference\": {messages1:?}"
+        );
+        assert!(
+            !messages1[first_aligning..].contains(&Some("checking the reference")),
+            "the dry pass is over before the real pass starts: {messages1:?}"
+        );
+
+        let rec2 = Arc::new(Recording::new());
+        rig.run(rec2.clone() as Arc<dyn ProgressEmitter>);
+        let events2 = register_events(&rec2);
+        assert!(
+            events2.iter().all(|e| e["total"] == members),
+            "run 2: a cached decision removes the dry pass from the total: {events2:?}"
+        );
+        assert!(
+            events2.iter().all(|e| e["message"] != "checking the reference"),
+            "{events2:?}"
+        );
+        let last = events2.last().expect("Register ticked");
+        assert_eq!((last["current"].as_u64(), last["message"].as_str()), (Some(members), Some("aligning")));
     }
 
     // ── M4b Task 2: mixed pixel scales inside one group ──────────────────

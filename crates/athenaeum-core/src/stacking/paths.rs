@@ -1058,6 +1058,11 @@ pub enum CleanupWhat {
 /// it and its row, like `metrics` and `fits`; only `All` drops it. `Intermediates` still sweeps `measured/` (`.athm`)
 /// and `fits/` (`.athf`) of the writer-named files no `stacking_artifacts` row names ([`sweep_unreferenced`]).
 ///
+/// `two_pass` (`run::TWO_PASS_ARTIFACT_KIND`, the two-pass dry pass's decision, frame-level cache spec §5.6) is the
+/// group-level counterpart of `metrics` here: a payload row with no file, keyed on the group's membership
+/// ([`artifact_group_key`] returns the group key for it), it costs a dry pass (101 s for 551 frames) to rebuild and
+/// nothing in an `Intermediates` cleanup changes what it reads. Only `All` drops it.
+///
 /// `registration` (`plan::REGISTRATION_ARTIFACT_KIND`, a project's star-map
 /// cache) is deliberately absent too: it is a payload row that only `All`
 /// drops.
