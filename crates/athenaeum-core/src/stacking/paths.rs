@@ -203,8 +203,9 @@ impl WorkingLayout {
         self.root.join("calibrated")
     }
 
-    /// `root/registered` — the parent of every group's registered-frame
-    /// subdirectory.
+    /// `root/registered` — the folder of every frame's registered file (flat, frame-level cache spec §5.1; rows
+    /// written before that keep their `registered/<group_key>/` sub-folder paths). It is also the root the
+    /// registered writer OWNS: a replaced registered file is removed only from here (ruling R4 (a)).
     pub fn registered_root(&self) -> PathBuf {
         self.root.join("registered")
     }
@@ -270,10 +271,9 @@ impl WorkingLayout {
         self.prepared_root()
     }
 
-    /// `root/registered/<group_key>` — stage-5 registered frames for one
-    /// integration group.
-    pub fn registered_dir(&self, group_key: &str) -> PathBuf {
-        self.registered_root().join(group_key)
+    /// `root/registered` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn registered_dir(&self) -> PathBuf {
+        self.registered_root()
     }
 
     /// `root/ln/<group_key>` — stage-6 local-normalization intermediates.
@@ -1307,8 +1307,8 @@ mod tests {
             PathBuf::from("/work/LDN_1272/calibrated")
         );
         assert_eq!(
-            layout.registered_dir("g"),
-            PathBuf::from("/work/LDN_1272/registered/g")
+            layout.registered_dir(),
+            PathBuf::from("/work/LDN_1272/registered")
         );
         assert_eq!(layout.ln_dir("g"), PathBuf::from("/work/LDN_1272/ln/g"));
         // Frame-level cache spec §5.1: the Measure kinds are flat too, no group sub-folder.
@@ -2097,7 +2097,7 @@ mod tests {
 
         let calibrated_file = layout.calibrated_dir().join("f1.fits");
         write_bytes(&calibrated_file, 100);
-        let registered_file = layout.registered_dir("g").join("f1.fits");
+        let registered_file = layout.registered_dir().join("f1.fits");
         write_bytes(&registered_file, 200);
 
         seed_artifact(
@@ -2131,7 +2131,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(freed, 200);
-        assert!(!layout.registered_dir("g").exists());
+        assert!(!layout.registered_dir().exists());
         assert!(calibrated_file.exists(), "calibrated/ untouched");
         assert_eq!(
             delete_artifacts(&c, &StackSubject::FrameSet(set_id), &["registered"]).unwrap(),
@@ -2180,7 +2180,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(freed, 300);
-        assert!(!layout.registered_dir("g").exists());
+        assert!(!layout.registered_dir().exists());
         assert!(!layout.calibrated_dir().exists());
         assert!(
             layout.root.exists(),

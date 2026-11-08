@@ -1837,8 +1837,9 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     table shows the change when Blink closes. Each badge is the outcome chip's label, plus `· out of next run`; the context
     label is the group and the outcome's reason. No action shows while a run is active.
 - **Aligned frames in Blink** (`core/api/stacking_aligned.rs`). Stage 5 writes one registered frame per frame to
-  `<working_dir>/<subject>/registered/<group_key>/r_<stem>[_d].fits` and records it in `stacking_artifacts` (kind
-  `registered`). That row has no run id: every later run of the group overwrites the file and the row. So a frame is
+  `<working_dir>/<subject>/registered/r_<stem>[_d].fits` (flat since the frame-level cache: a row written before keeps its
+  `registered/<group_key>/` path, and every reader opens the row's path) and records it in `stacking_artifacts` (kind
+  `registered`, group key `""`). That row has no run id: every later run that registers the frame overwrites the file and the row. So a frame is
   aligned only for its own run, and only while that run is the latest to hold its group. `get_stacking_aligned_frames {
   runId, frameIds }` answers one state per frame. The ids are the run's (catalog frame ids for a set, project-frame
   handles for a project). The checks run in this order, and the first that applies decides:

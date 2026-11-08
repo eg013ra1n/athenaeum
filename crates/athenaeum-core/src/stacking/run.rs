@@ -1963,6 +1963,24 @@ pub(crate) fn frame_file_stem(frame: &GroupFrame) -> String {
     format!("{plain}_f{}", frame.frame_id)
 }
 
+/// The `.rej` file stems of one group's rejection-bitmap set, one per included frame, in `included` order: the
+/// frame's [`frame_file_stem`], never the stem of its calibrated path. A calibrated row written before the
+/// frame-level cache keeps its old `calibrated/<group_key>/c_<name>.fits` path, and a merged group can hold two such
+/// frames of one file name from different old folders; the frame's own stem carries its id, so the two never share
+/// a `.rej` (ruling R4 (c)). A member with no frame in the group (not expected) falls back to its position and id.
+fn rejection_map_stems(group: &IntegrationGroup, included_ids: &[i64]) -> Vec<String> {
+    let frames_by_id: HashMap<i64, &GroupFrame> =
+        group.frames.iter().map(|f| (f.frame_id, f)).collect();
+    included_ids
+        .iter()
+        .enumerate()
+        .map(|(pos, frame_id)| match frames_by_id.get(frame_id) {
+            Some(frame) => frame_file_stem(frame),
+            None => format!("frame_{pos}_f{frame_id}"),
+        })
+        .collect()
+}
+
 /// After a frame-level file was written and its row upserted: removes the file the row used to point to, when that
 /// path differs from `new_path` (a frame re-written under a new stem or folder), lies under `owned_root` and no row
 /// of ANY subject still points to it. A failed removal is a `warn!` (`path`, `error`), never an error: the file is
@@ -8372,9 +8390,10 @@ fn register_group_pass(
         "register",
     );
     // Perf tier A Task 6a fix round 1: both fan-outs below write into the
-    // SAME per-group directory — created once here rather than once per
-    // frame inside the old `write_registered_artifact`.
-    let out_dir = rc.layout.registered_dir(&group.key);
+    // SAME directory — created once here rather than once per frame inside
+    // the old `write_registered_artifact`. Flat since the frame-level cache
+    // (spec §5.1): a frame's registered file does not move with its group.
+    let out_dir = rc.layout.registered_dir();
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| RunError::Other(format!("creating {}: {e}", out_dir.display())))?;
     let interp = cfg.registration.interpolation;
@@ -9820,6 +9839,9 @@ fn record_registered_artifact(
 ) -> anyhow::Result<()> {
     let (size, modified_at) = file_identity(out)?;
     let conn = db(&rc.ctx)?.conn();
+    let group_key = artifact_group_key("registered", group_key);
+    // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
+    let old = crate::db::stacking::find_artifact(&conn, &rc.subject, group_key, "registered", Some(frame_id))?;
     upsert_artifact(
         &conn,
         &NewArtifact {
@@ -9834,6 +9856,7 @@ fn record_registered_artifact(
             payload_json: None,
         },
     )?;
+    replace_frame_level_file(&conn, &rc.layout.registered_root(), old.as_ref(), out);
     Ok(())
 }
 
@@ -9853,7 +9876,7 @@ fn registered_artifact_is_fresh(
     Ok(crate::db::stacking::find_artifact(
         &conn,
         &rc.subject,
-        group_key,
+        artifact_group_key("registered", group_key),
         "registered",
         Some(frame_id),
     )?
@@ -11589,7 +11612,7 @@ fn process_group_output(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    &group.key,
+                    artifact_group_key("registered", &group.key),
                     "registered",
                     Some(e.frame.frame_id),
                 )?
@@ -12071,17 +12094,9 @@ fn process_group_output(
     if bitmaps_for_drizzle || bitmaps_for_large_scale {
         let included_for_rej =
             included_after_min_weight(&stack_frames, reference_idx, group_integration.min_weight);
-        let stems: Vec<String> = included_for_rej
-            .iter()
-            .map(|&i| {
-                stack_frames[i]
-                    .path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("frame_{i}"))
-            })
-            .collect();
+        let included_ids: Vec<i64> =
+            included_for_rej.iter().map(|&i| stack_frames[i].frame_id).collect();
+        let stems = rejection_map_stems(group, &included_ids);
         match RejBitmapSet::create(
             &rc.layout.rej_dir(rc.run_id, &group.key),
             &stems,
@@ -18002,16 +18017,14 @@ mod tests {
 
             if delete_registered {
                 let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-                for g in &plan_groups {
-                    let dir = layout.registered_dir(&g.key);
-                    assert!(
-                        dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
-                        "stage 5 must have written at least one registered file at {}",
-                        dir.display()
-                    );
-                    std::fs::remove_dir_all(&dir)
-                        .expect("remove registered/<group> for the fault injection");
-                }
+                let dir = layout.registered_dir();
+                assert!(
+                    dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
+                    "stage 5 must have written at least one registered file at {}",
+                    dir.display()
+                );
+                std::fs::remove_dir_all(&dir)
+                    .expect("remove registered/ for the fault injection");
             }
 
             fallback_counters::reset();
@@ -18095,10 +18108,7 @@ mod tests {
                 working.path(),
                 output.path(),
             );
-            let reg_dirs: Vec<PathBuf> = plan_groups
-                .iter()
-                .map(|g| layout.registered_dir(&g.key))
-                .collect();
+            let reg_dirs: Vec<PathBuf> = vec![layout.registered_dir()];
             if unwritable {
                 for d in &reg_dirs {
                     std::fs::create_dir_all(d).unwrap();
@@ -18203,16 +18213,13 @@ mod tests {
         );
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        for g in &plan_before.groups {
-            let dir = layout.registered_dir(&g.key);
-            assert!(
-                dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
-                "the run must have written at least one registered file at {}",
-                dir.display()
-            );
-            std::fs::remove_dir_all(&dir)
-                .expect("remove registered/<group> for the fault injection");
-        }
+        let dir = layout.registered_dir();
+        assert!(
+            dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
+            "the run must have written at least one registered file at {}",
+            dir.display()
+        );
+        std::fs::remove_dir_all(&dir).expect("remove registered/ for the fault injection");
 
         let plan_after = build_plan(
             &fixture.conn,
@@ -18228,6 +18235,289 @@ mod tests {
              falsely cached: {:?}",
             plan_after.stale_stages
         );
+    }
+
+    /// Frame-level cache spec §5.1 (Task 5): four mono frames of `seed_star_group` registered onto a manual
+    /// reference, with what the registered-artifact tests count.
+    struct RegisterRig {
+        _tmp: tempfile::TempDir,
+        ctx: Arc<ServiceContext>,
+        fixture: test_fixtures::Fixture,
+        working: tempfile::TempDir,
+        output: tempfile::TempDir,
+        layout: WorkingLayout,
+    }
+
+    impl RegisterRig {
+        fn new() -> RegisterRig {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+            let (fixture, light_ids, working, output) =
+                seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, light_ids[0])
+                .unwrap();
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            RegisterRig { _tmp: tmp, ctx, fixture, working, output, layout }
+        }
+
+        /// The config of every run: a manual reference, so a regroup cannot move it.
+        fn cfg(&self, mode: crate::stacking::config::ExposureMode) -> StackingConfig {
+            let mut cfg = StackingConfig::default();
+            cfg.reference.mode = ReferenceMode::Manual;
+            cfg.grouping.exposure_mode = mode;
+            cfg
+        }
+
+        /// One run through Register under `cfg`'s grouping.
+        fn run(&self, cfg: &StackingConfig) -> RunContext {
+            let plan_groups = group_frames(&self.fixture.conn, self.fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+            let (run_id, group_ids) = seed_run_and_groups(
+                &self.fixture.conn,
+                self.fixture.set_id,
+                &plan_groups,
+                self.working.path(),
+                self.output.path(),
+            );
+            let mut rc = test_context(
+                self.ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                self.fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups,
+                self.layout.clone(),
+                self.output.path().to_path_buf(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Register).unwrap();
+            rc
+        }
+
+        fn registered_rows(&self) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
+            rows_of_kind(&self.fixture.conn, self.fixture.set_id, "registered")
+        }
+
+        /// Every registered row's `(frame, row id, group key, created_at, hash, path, file mtime)`: what a regroup must
+        /// leave untouched.
+        fn registered_snapshot(
+            &self,
+        ) -> Vec<(i64, i64, String, String, String, Option<String>, Option<std::time::SystemTime>)> {
+            let mut out: Vec<_> = self
+                .registered_rows()
+                .into_iter()
+                .map(|(frame_id, r)| {
+                    let mtime = r
+                        .path
+                        .as_ref()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .and_then(|m| m.modified().ok());
+                    (frame_id, r.id, r.group_key, r.created_at, r.config_hash, r.path, mtime)
+                })
+                .collect();
+            out.sort_by_key(|r| r.0);
+            out
+        }
+
+        /// The files under `registered/`, recursively.
+        fn registered_files(&self) -> Vec<PathBuf> {
+            fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+                let Ok(rd) = std::fs::read_dir(dir) else { return };
+                for e in rd {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.layout.registered_root(), &mut out);
+            out.sort();
+            out
+        }
+
+        fn register_stale(&self, cfg: &StackingConfig) -> bool {
+            crate::stacking::plan::build_plan(
+                &self.fixture.conn,
+                &self.ctx.settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(self.fixture.set_id),
+                Some(cfg.clone()),
+            )
+            .expect("the plan should build")
+            .stale_stages
+            .contains(&Stage::Register)
+        }
+    }
+
+    /// Frame-level cache spec §5.1 (Task 5): a regroup (here "one group per exposure" -> "no split") finds the
+    /// registered rows again, with the same reference: no frame is aligned or rewritten, and neither the rows nor
+    /// the files move; the gate reads Register fresh under the new grouping too.
+    #[test]
+    fn registered_frames_are_reused_across_a_regroup() {
+        use crate::stacking::config::ExposureMode;
+        let rig = RegisterRig::new();
+        let cfg_seconds = rig.cfg(ExposureMode::Seconds);
+        let cfg_all = rig.cfg(ExposureMode::NoSplit);
+        let key_of = |cfg: &StackingConfig| {
+            group_frames(&rig.fixture.conn, rig.fixture.set_id, &cfg.grouping).unwrap()[0].key.clone()
+        };
+        assert_ne!(key_of(&cfg_seconds), key_of(&cfg_all), "the two groupings must name the group differently");
+
+        let (rc1, logs1) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg_seconds));
+        assert_eq!(fan_out_items(&logs1, "register", "align"), 4, "{logs1}");
+        let rows1 = rig.registered_snapshot();
+        assert_eq!(rows1.len(), 4);
+        assert!(rows1.iter().all(|r| r.2.is_empty()), "frame-level rows sit under the empty key: {rows1:?}");
+        let files1 = rig.registered_files();
+        assert_eq!(files1.len(), 4, "{files1:?}");
+        assert_eq!(files1.iter().filter(|p| p.parent() != Some(rig.layout.registered_root().as_path())).count(), 0);
+
+        let (rc2, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg_all));
+        assert_eq!(rc2.reference_frame_id, rc1.reference_frame_id);
+        assert_eq!(fan_out_items(&logs2, "register", "align"), 0, "a regroup re-aligned: {logs2}");
+        assert_eq!(fan_out_items(&logs2, "register", "rewrite"), 0, "a regroup rewrote: {logs2}");
+        assert_eq!(rig.registered_snapshot(), rows1, "a regroup rewrote or added rows");
+        assert_eq!(rig.registered_files(), files1, "a regroup added or moved a file");
+        assert!(!rig.register_stale(&cfg_all), "the gate reads the reused rows fresh");
+    }
+
+    /// Frame-level cache spec §5.7, review focus 2 (Task 5): a `registered` row whose path is in an old
+    /// `registered/<group_key>/` folder under another file name is the artifact, read as it stands. Register finds it
+    /// fresh and writes nothing, and Integrate opens the row's path (no fallback to the on-the-fly warp) and stacks
+    /// the same master as a run that never migrated.
+    #[test]
+    fn a_migrated_row_is_read_from_its_stored_path() {
+        use crate::integration::registered_source::fallback_counters;
+        use crate::stacking::config::ExposureMode;
+        let _fallback_guard = fallback_counters::exclusive();
+
+        let master_of = |rc: &RunContext| -> Vec<Vec<f32>> {
+            let master = rc
+                .summary
+                .groups
+                .iter()
+                .find_map(|g| g.master_path.clone())
+                .expect("master path");
+            let reader = PlaneReader::open(Path::new(&master)).unwrap();
+            (0..reader.channels()).map(|p| reader.read_plane(p).unwrap()).collect()
+        };
+
+        let baseline = {
+            let rig = RegisterRig::new();
+            let mut rc = rig.run(&rig.cfg(ExposureMode::Seconds));
+            stage_output(&mut rc).unwrap();
+            master_of(&rc)
+        };
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+        let old_dir = rig.layout.registered_root().join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut moved = Vec::new();
+        for (frame_id, row) in rig.registered_rows() {
+            let old = old_dir.join(format!("legacy_{frame_id}.fits"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            moved.push(old);
+        }
+        assert_eq!(moved.len(), 4);
+        let rows_before = rig.registered_snapshot();
+
+        let (mut rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(fan_out_items(&logs, "register", "align"), 0, "{logs}");
+        assert_eq!(fan_out_items(&logs, "register", "rewrite"), 0, "a migrated row was rewritten: {logs}");
+        assert_eq!(rig.registered_snapshot(), rows_before, "a migrated row moved");
+        assert_eq!(rig.registered_files(), {
+            let mut m = moved.clone();
+            m.sort();
+            m
+        }, "nothing was written to the layout path");
+
+        fallback_counters::reset();
+        stage_output(&mut rc).unwrap();
+        assert_eq!(fallback_counters::snapshot(), 0, "Integrate did not open the stored path");
+        let planes = master_of(&rc);
+        assert_eq!(planes.len(), baseline.len());
+        for (p, (a, b)) in baseline.iter().zip(&planes).enumerate() {
+            assert_eq!(a.len(), b.len());
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "plane {p}: the migrated registered files stack another master"
+            );
+        }
+    }
+
+    /// Ruling R4 (c) (Task 5): the `.rej` stem is the frame's own stem. Two frames of one merged group whose
+    /// registered rows point at `registered/<keyA>/r_Light_0001.fits` and `registered/<keyB>/r_Light_0001.fits` (one
+    /// file name from two old group folders) get two distinct `.rej` files; the stems of their stored paths are equal,
+    /// and a set created with them would be refused.
+    #[test]
+    fn rejection_map_stems_do_not_collide_across_old_group_folders() {
+        let frame = |id: i64| GroupFrame {
+            frame_id: id,
+            file_id: id,
+            filename: "Light_0001.fits".to_string(),
+            path: format!("/data/n{id}/Light_0001.fits"),
+            size: 1,
+            modified_at: String::new(),
+            exposure_s: Some(60.0),
+            date_obs: None,
+            width: 8,
+            height: 8,
+            pixel_scale_arcsec: None,
+            scale_source: None,
+        };
+        let group = IntegrationGroup {
+            key: "merged".into(),
+            instrume: None,
+            color_mode: ColorMode::Mono,
+            filter: None,
+            binning: 1,
+            cameras: Vec::new(),
+            exposure_s: None,
+            exposure_class: "all".into(),
+            frames: vec![frame(7), frame(9)],
+            total_exposure_s: 0.0,
+            pixel_scale_arcsec: None,
+        };
+        let stored = [
+            Path::new("/work/registered/keyA/r_Light_0001.fits"),
+            Path::new("/work/registered/keyB/r_Light_0001.fits"),
+        ];
+        assert_eq!(stored[0].file_stem(), stored[1].file_stem(), "premise: the stored paths share a stem");
+
+        let stems = rejection_map_stems(&group, &[7, 9]);
+        assert_eq!(stems, vec!["Light_0001_f7".to_string(), "Light_0001_f9".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+        let _set = crate::stacking::rej::RejBitmapSet::create(dir.path(), &stems, 8, 8, 1).unwrap();
+        let mut files: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".rej"))
+            .collect();
+        files.sort();
+        assert_eq!(files, vec!["Light_0001_f7.rej".to_string(), "Light_0001_f9.rej".to_string()]);
+        // A member the group does not hold keeps a distinct stem from its position and id.
+        assert_eq!(rejection_map_stems(&group, &[7, 11]), vec!["Light_0001_f7".to_string(), "frame_1_f11".to_string()]);
     }
 
     #[test]
@@ -29748,12 +30038,18 @@ mod tests {
             let plane = reader.read_plane(0).unwrap();
             let level = region_mean(&plane, reader.width(), 165, 110, 20, 20);
             kept_levels.push(level);
+            // The `.rej` stem is the frame's own `frame_file_stem` (ruling R4 (c)); the calibrated file is
+            // `c_<that stem>.fits` (mono: no `_d` marker).
+            let calibrated_stem = Path::new(calibrated_path)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             kept_stems.push(
-                Path::new(calibrated_path)
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
+                calibrated_stem
+                    .strip_prefix("c_")
+                    .unwrap_or_else(|| panic!("calibrated stem {calibrated_stem} has no c_ prefix"))
+                    .to_string(),
             );
         }
 
@@ -29782,7 +30078,7 @@ mod tests {
             (drizzled_level - expected_level).abs()
         );
 
-        // The .rej files: exactly the 4 KEPT frames' own calibrated stems,
+        // The .rej files: exactly the 4 KEPT frames' own frame stems,
         // no more, no less — in particular never the dropped frame's.
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let rej_dir = layout.rej_dir(started.run_id, &group.group_key);
@@ -29802,7 +30098,7 @@ mod tests {
         expected_stems.sort();
         assert_eq!(
             actual_stems, expected_stems,
-            "rej/ must hold exactly the kept frames' bitmaps, named by their own calibrated stems"
+            "rej/ must hold exactly the kept frames' bitmaps, named by their own frame stems"
         );
     }
 
@@ -33802,7 +34098,7 @@ mod tests {
             let row = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                &group,
+                crate::stacking::paths::artifact_group_key("registered", &group),
                 "registered",
                 Some(e.frame.frame_id),
             )
@@ -33906,7 +34202,7 @@ mod tests {
                 let row = crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    &group,
+                    crate::stacking::paths::artifact_group_key("registered", &group),
                     "registered",
                     Some(e.frame.frame_id),
                 )
@@ -33945,7 +34241,7 @@ mod tests {
             let row = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                &group,
+                crate::stacking::paths::artifact_group_key("registered", &group),
                 "registered",
                 Some(e.frame.frame_id),
             )

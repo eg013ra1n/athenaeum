@@ -2028,7 +2028,13 @@ fn compute_register_stale(
                 None => return Ok(true),
             },
         };
-        let artifact = find_artifact(conn, subject, &group.key, "registered", Some(frame_id))?;
+        let artifact = find_artifact(
+            conn,
+            subject,
+            artifact_group_key("registered", &group.key),
+            "registered",
+            Some(frame_id),
+        )?;
         if !artifact.is_some_and(|row| is_fresh(&row, &artifact_hash)) {
             return Ok(true);
         }
@@ -4332,7 +4338,7 @@ mod tests {
                     &crate::db::stacking::NewArtifact {
                         subject: &subject,
                         frame_id: Some(frame_id),
-                        group_key: &group.key,
+                        group_key: artifact_group_key("registered", &group.key),
                         kind: "registered",
                         path: Some(path.to_str().unwrap()),
                         config_hash: &artifact_hash,
@@ -7053,7 +7059,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key,
+                group_key: artifact_group_key("registered", group_key),
                 kind: "registered",
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,

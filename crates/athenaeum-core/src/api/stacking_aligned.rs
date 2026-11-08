@@ -1,9 +1,10 @@
 //! The aligned frames of a stacking run, for Blink (spec 2026-11-06 §5 and §6.7).
 //!
 //! Stage 5 writes one registered ("aligned") file per frame, resampled into the reference geometry, to
-//! `<working_dir>/<subject>/registered/<group_key>/r_<stem>[_d].fits` and records it in `stacking_artifacts` (kind
-//! `registered`). The file belongs to the subject's group and frame, not to a run: every later run of the group
-//! overwrites the file and its row. So a run's aligned frame is offered only while that run is the latest one to hold
+//! `<working_dir>/<subject>/registered/r_<stem>[_d].fits` (rows written before the frame-level cache keep their
+//! `registered/<group_key>/` path) and records it in `stacking_artifacts` (kind `registered`, group key `""`). The file
+//! belongs to the subject's frame, not to a run: every later run that registers the frame overwrites the file and its
+//! row. So a run's aligned frame is offered only while that run is the latest one to hold
 //! the group, and its location is the artifact row's absolute `path` - never a path rebuilt from the subject's current
 //! name, which a rename changes.
 //!
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{db, ApiError};
 use crate::db::stacking::{find_artifact, get_run, StackSubject, StackingRunRow};
 use crate::services::ServiceContext;
+use crate::stacking::paths::artifact_group_key;
 use crate::stacking::plan::registered_status;
 
 /// Whether a run's aligned frame can be shown for one frame, and why not when it cannot.
@@ -198,7 +200,13 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
             ));
             continue;
         }
-        let artifact = find_artifact(conn, &subject, &row.group_key, "registered", Some(frame_id))?;
+        let artifact = find_artifact(
+            conn,
+            &subject,
+            artifact_group_key("registered", &row.group_key),
+            "registered",
+            Some(frame_id),
+        )?;
         if artifact.as_ref().is_some_and(|a| a.path.is_none()) {
             tracing::warn!(
                 run_id,
@@ -425,7 +433,7 @@ mod tests {
         find_artifact(
             &s.fixture.conn,
             &StackSubject::FrameSet(s.fixture.set_id),
-            &group_key,
+            artifact_group_key("registered", &group_key),
             "registered",
             Some(frame_id),
         )
@@ -578,8 +586,8 @@ mod tests {
     fn aligned_older_run_kept_when_later_run_lacks_group() {
         let s = seeded(&[4.0; 4], 0);
         let first = run_once(&s, &config());
-        // Another exposure grouping names another group, so the second run writes elsewhere and holds no group of the
-        // first one's.
+        // Another exposure grouping names another group, so the second run holds no group of the first one's. The
+        // aligned file belongs to the frame (frame-level cache), so the second run finds it fresh and reuses it.
         let mut other = config();
         other.grouping.exposure_mode = ExposureMode::NoSplit;
         let second = run_once(&s, &other);
@@ -594,7 +602,7 @@ mod tests {
         assert_eq!(states(&s, second), vec![AlignedState::Available; 4]);
         let old = resolve_stacking_aligned_path(&s.ctx, first, s.ids[0]).unwrap();
         let new = resolve_stacking_aligned_path(&s.ctx, second, s.ids[0]).unwrap();
-        assert_ne!(old, new);
+        assert_eq!(old, new, "the regroup reused the frame's one registered file");
     }
 
     #[test]
@@ -729,7 +737,7 @@ mod tests {
                 &NewArtifact {
                     subject: &subject,
                     frame_id: Some(frame),
-                    group_key: key,
+                    group_key: "",
                     kind: "registered",
                     path: path.to_str(),
                     config_hash: "h",
