@@ -85,7 +85,7 @@
 //!
 //! cargo run --release -p athenaeum-core --example ln_scale_probe -- \
 //!   --ref <reference.fits> --plane P --beta <b|auto> [--masked] \
-//!   [--max-stars 24576] [--stars-dir DIR] [--tgt-beta <b|auto>] \
+//!   [--max-stars 9000] [--stars-dir DIR] [--tgt-beta <b|auto>] \
 //!   [--ln-scale N] [--max-stars-sel N] [--ln-ring per-side|pair-common] \
 //!   [--interpolation bicubicBSpline] [--clamping 0.3] [--dump-warped DIR] \
 //!   [--ref-saturation <reference-saturation.fits>] \
@@ -213,7 +213,7 @@ fn parse_args() -> Args {
         beta: PsfModel::Auto,
         tgt_beta: None,
         masked: false,
-        max_stars: 24576,
+        max_stars: 9_000,
         stars_dir: None,
         ln_scale: None,
         max_stars_sel: None,

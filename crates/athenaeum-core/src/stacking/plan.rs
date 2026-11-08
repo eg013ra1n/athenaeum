@@ -9363,13 +9363,14 @@ mod tests {
         // 2026-11-02 Plan D DF-a (main merged into plan-d): both sides moved the normalization hashes, so the merged ln_ref, ln and ln_cal are re-recorded on default, maximumQuality and custom (MEASURE_VERSION 8 AND the `local` rejection default move ln_ref, ln and ln_cal; FITS_ARTIFACT_VERSION 3 moves meas, reg and ln only, as the D2c r1 line above says); calib, meas and reg are Plan D's (pcores moves none of them), and the fastPreview line is Plan D's (it pins `scaleZeroOffset`, so only Plan D moved it).
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1 joins the registration subtree): reg and ln move on every line, the fastPreview line included (was default reg=efe8758fbdc4bbbd ln=532bfea1cac2d7b4; fastPreview reg=a038dcae26c2392a ln=4110659e2116091d; maximumQuality reg=bc4925cc6681db3a ln=b88fd0bd410fb46c; custom reg=916582f203cecefc ln=88cef42f95ee4e58); calib, meas, ln_ref and ln_cal are UNCHANGED (ln_ref's call passes the literals "r1,r2" / "m1,m2" and ln_cal folds ln_ref, so neither reads reg).
         // 2026-11-08 frame-level cache Task 1 (spec §5.2): the calibration hash writes a constant grouping tolerance (2.0), so the `custom` line (tolerance 5.0) moves calib, meas, reg and ln (was calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=be7daf8c36663781 ln=d182aadf14a27b04); every other line and ln_ref, ln_cal are UNCHANGED.
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves meas, reg, ln_ref, ln and ln_cal on every line (no line sets maxStars; calib is UNCHANGED). Was default: meas=cc923a65f1b367d7 reg=511225ffae14780f ln_ref=782cf447acae6ace ln=eda6a3f8d83f669c ln_cal=23f55e28c19f3459; fastPreview: meas=cc923a65f1b367d7 reg=f7e86b4f84ea0e62 ln_ref=500204de9b22c23d ln=3212a35f2a771db1 ln_cal=1ed2edc9d7ff5dcb; maximumQuality: meas=cc923a65f1b367d7 reg=cb8b5afc0aaeb3b4 ln_ref=364ed4c8ffba6878 ln=ec1a338d219d6364 ln_cal=86f453747dcafe8b; custom: meas=cc923a65f1b367d7 reg=c93dfd9d2706c88a ln_ref=364ed4c8ffba6878 ln=0a21b864ed61cc65 ln_cal=86f453747dcafe8b.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=511225ffae14780f ln_ref=782cf447acae6ace ln=eda6a3f8d83f669c ln_cal=23f55e28c19f3459",
-                "fastPreview: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=f7e86b4f84ea0e62 ln_ref=500204de9b22c23d ln=3212a35f2a771db1 ln_cal=1ed2edc9d7ff5dcb",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=cb8b5afc0aaeb3b4 ln_ref=364ed4c8ffba6878 ln=ec1a338d219d6364 ln_cal=86f453747dcafe8b",
-                "custom: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=c93dfd9d2706c88a ln_ref=364ed4c8ffba6878 ln=0a21b864ed61cc65 ln_cal=86f453747dcafe8b",
+                "default: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=9ac6df63dfa5ae4e ln_ref=caec6041e0b648d2 ln=849de3ee29964d01 ln_cal=8936f0c89b6aa4fc",
+                "fastPreview: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=17e61b01965e78e7 ln_ref=1758b268745bb40f ln=72bb3c10827ed22d ln_cal=1d604dd931ee4992",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=09b2251a3179e3cb ln_ref=0c672a29f5110c04 ln=461c9d22cc1aebf4 ln_cal=94dac0d536f3b975",
+                "custom: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=04d832dd79a15511 ln_ref=0c672a29f5110c04 ln=27c111578b301060 ln_cal=94dac0d536f3b975",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -9438,13 +9439,16 @@ mod tests {
         assert_eq!(line(&at_max), line(&absent));
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
-        assert_eq!(meas, "cc923a65f1b367d7");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): maxStars 9000 moves meas, reg and ln (was meas "cc923a65f1b367d7").
+        assert_eq!(meas, "5756f9b3d472fa3d");
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "efe8758fbdc4bbbd"); meas did not move.
-        assert_eq!(reg, "511225ffae14780f");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): was "511225ffae14780f".
+        assert_eq!(reg, "9ac6df63dfa5ae4e");
         // 2026-11-01 pcores Task 1 (OD-1a): `ln` moved with the rejection default (was "affdd0e2d03f312e"); meas and reg did not.
         // 2026-11-02 Plan D DF-a: the merge of Plan D's meas / reg (MEASURE_VERSION 8, FITS_ARTIFACT_VERSION 3) with that default; was "f6fe01073ccedcca" on plan-d before the merge.
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "532bfea1cac2d7b4"): `ln` is computed from `reg`.
-        assert_eq!(ln, "eda6a3f8d83f669c");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): was "eda6a3f8d83f669c".
+        assert_eq!(ln, "849de3ee29964d01");
     }
 
     #[test]
@@ -9516,7 +9520,8 @@ mod tests {
             "a pure function of its inputs"
         );
         // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f); re-recorded 2026-11-01, Plan D D2 (MEASURE_VERSION 8; was 5020355fd05d9c71). re-recorded 2026-11-02, Plan D D2c r1 (FITS_ARTIFACT_VERSION 3 folded into the measurement subtree; was d1feba185a3e9a76).
-        assert_eq!(key, "66145a91b19774d5");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): maxStars 9000 moves the first-pass key (was "66145a91b19774d5").
+        assert_eq!(key, "888cfb7cd6acb72f");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over

@@ -123,7 +123,7 @@ impl Default for MeasureOptions {
     fn default() -> Self {
         MeasureOptions {
             psf_model: PsfModel::Auto,
-            max_stars: 24576,
+            max_stars: 9_000,
             scale_estimator: ScaleEstimator::Bwmv,
             min_snr: 5.0,
             seed_prefilter: DEFAULT_SEED_PREFILTER,
@@ -3161,11 +3161,11 @@ pub(crate) mod tests {
     #[test]
     fn options_serde_defaults() {
         let d = MeasureOptions::default();
-        assert_eq!(d.max_stars, 24576);
+        assert_eq!(d.max_stars, 9000);
         assert_eq!(d.psf_model, PsfModel::Auto);
         assert_eq!(d.scale_estimator, ScaleEstimator::Bwmv);
         let json = serde_json::to_string(&d).unwrap();
-        assert!(json.contains("\"psfModel\":\"auto\"") && json.contains("\"maxStars\":24576"));
+        assert!(json.contains("\"psfModel\":\"auto\"") && json.contains("\"maxStars\":9000"));
         assert!(json.contains("\"scaleEstimator\":\"bwmv\"") && json.contains("\"minSnr\":5.0"));
         // M4a Task 2 (ruling R-M4a-1): the seed threshold is a real option
         // now — this used to assert the field's ABSENCE.
