@@ -6147,6 +6147,13 @@ struct Pass2Done {
     fits: Vec<Vec<psf_signal::StarFit>>,
     written: bool,
 }
+/// What a phase-3 worker hands back when the member failed: the exclusion text, and whether the worker had already
+/// written the member's first-pass artifact (it ran pass 1 and pass 2 then failed). The artifact is the work of an
+/// expensive pass and is valid on its own, so its row is recorded either way (ruling R10 M3).
+struct Pass2Failed {
+    message: String,
+    written: bool,
+}
 /// One frame of the group on its way through the two passes.
 struct MeasureMember {
     idx: usize,
@@ -6747,9 +6754,14 @@ fn measure_two_pass_rest(
                 Some(p) => Ok((p, false)),
                 None => run_pass1_and_spill(frame_id, &path, &layout_spill, opts, pool_ref, cancel_ref),
             };
-            // One β per plane of THIS read (a group of one's planes included): every plane at the group β.
-            let out = first
-                .and_then(|(p, written)| {
+            // One β per plane of THIS read (a group of one's planes included): every plane at the group β. A failure
+            // keeps `written` so the controller still records the artifact a failed pass 2 left behind.
+            let out = match first {
+                Err(e) => Err(Pass2Failed {
+                    message: format!("measurement failed: {e}"),
+                    written: false,
+                }),
+                Ok((p, written)) => {
                     let betas = vec![group_beta; p.beta_own().len()];
                     measure_frame_pass2(&path, p, &betas, opts, Some(pool_ref), cancel_ref)
                         .map(|(measurement, fits)| Pass2Done {
@@ -6757,8 +6769,12 @@ fn measure_two_pass_rest(
                             fits,
                             written,
                         })
-                })
-                .map_err(|e| format!("measurement failed: {e}"));
+                        .map_err(|e| Pass2Failed {
+                            message: format!("measurement failed: {e}"),
+                            written,
+                        })
+                }
+            };
             // Phase 1 already ticked the first half of a member it ran; any other member ticks both halves here.
             ticker_ref.tick_units(Some(frame_id), if first_half_ticked { 1 } else { 2 });
             out
@@ -6766,7 +6782,7 @@ fn measure_two_pass_rest(
     );
     // Every artifact a worker wrote gets its row BEFORE a cancel is honoured, as in phase 1.
     for (&i, res) in need_pass2.iter().zip(&results) {
-        if let Some(Ok(Pass2Done { written: true, .. })) = res {
+        if let Some(Ok(Pass2Done { written: true, .. }) | Err(Pass2Failed { written: true, .. })) = res {
             upsert_pass1_row(
                 rc,
                 &members[i].frame,
@@ -6779,7 +6795,9 @@ fn measure_two_pass_rest(
     for (&i, res) in need_pass2.iter().zip(results) {
         match res {
             None => return Err(RunError::Cancelled),
-            Some(Err(msg)) => exclude_measured_member(rc, &mut entries[members[i].idx], msg),
+            Some(Err(failed)) => {
+                exclude_measured_member(rc, &mut entries[members[i].idx], failed.message)
+            }
             Some(Ok(done)) => {
                 let expected = measurement_hash_for(cfg, &members[i].calib_hash, Some(group_beta));
                 persist_measurement(
@@ -19948,6 +19966,63 @@ mod tests {
             );
         }
         assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Ruling R10 M3: a first pass re-run inside a pass-2 worker (its stored artifact fails the whole-file checksum
+    /// after the head check passed) is written there; when that member's pass 2 then fails (here the calibrated file
+    /// is touched right after the first pass, so the read guard refuses the second), the controller still records the
+    /// artifact's row, as phase 1 does. Without it the rewritten file carries a new mtime the old row does not know,
+    /// `plan::is_fresh` refuses it and the frame re-runs pass 1 on every run while its pass 2 keeps failing.
+    #[test]
+    fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        for row in rig.rows("measured").into_values() {
+            let artifact = PathBuf::from(row.path.unwrap());
+            let mut bytes = std::fs::read(&artifact).unwrap();
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0x5a;
+            // The row still describes the file (same size, same mtime), so the controller's head check passes.
+            let modified = std::fs::metadata(&artifact).unwrap().modified().unwrap();
+            std::fs::write(&artifact, &bytes).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&artifact)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        rig.delete_rows(&["metrics", "fits.0"]);
+
+        crate::stacking::measure::PASS1_TOUCH_AFTER
+            .lock()
+            .unwrap()
+            .push((rig.working.path().to_path_buf(), 1));
+        let (second, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        crate::stacking::measure::PASS1_TOUCH_AFTER
+            .lock()
+            .unwrap()
+            .retain(|(dir, _)| dir != rig.working.path());
+        assert_eq!(second.logged.len(), 4, "every artifact was refused after its head passed");
+        assert_eq!(second.excluded, 1, "the touched frame's pass 2 was refused: {logs2}");
+        let rows = rig.rows("measured");
+        assert_eq!(rows.len(), 4);
+        for (id, row) in &rows {
+            assert!(
+                crate::stacking::plan::file_matches_identity(
+                    Path::new(row.path.as_deref().unwrap()),
+                    row.size,
+                    row.modified_at.as_deref()
+                ),
+                "frame {id}: the rewritten artifact's row describes another file"
+            );
+        }
+        let third = rig.run("run 3", None);
+        assert!(
+            third.logged.is_empty(),
+            "pass 1 re-ran for {:?}",
+            third.logged
+        );
     }
 
     /// Plan A Task 11c (R11c-2): an artifact that fails its checksum is recomputed (a `warn!`), never decoded and

@@ -1869,6 +1869,13 @@ pub(crate) static PASS1_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
 pub(crate) static PASS1_CANCEL_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Test-only: `(directory, remaining)` — when the `remaining`-th first pass of a frame under the directory finishes, that
+/// frame's file gets a modification time ten seconds ahead, so the read guard refuses its pass 2 (a deterministic
+/// pass-2 failure after a successful, written first pass; ruling R10 M3). Fires once.
+#[cfg(test)]
+pub(crate) static PASS1_TOUCH_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Test-only: per calibrated directory, `(live, peak)` count of [`FramePass1`] values (Task 11c, bar 3).
 #[cfg(test)]
 static PASS1_LIVE: std::sync::Mutex<Vec<(std::path::PathBuf, usize, usize)>> =
@@ -2195,6 +2202,19 @@ pub fn measure_frame_pass1(
             *remaining = remaining.saturating_sub(1);
             if *remaining == 0 {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        let mut hooks = PASS1_TOUCH_AFTER.lock().unwrap();
+        if let Some((_, remaining)) = hooks.iter_mut().find(|(dir, _)| path.starts_with(dir)) {
+            let fire = *remaining == 1;
+            *remaining = remaining.saturating_sub(1);
+            if fire {
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+                    .unwrap();
             }
         }
     }
