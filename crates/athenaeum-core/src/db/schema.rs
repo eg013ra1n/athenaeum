@@ -3432,6 +3432,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Same contract: all-or-nothing, retried at the next start, never blocks init.
+    if let Err(e) = migrate_frame_level_artifact_keys(conn) {
+        tracing::error!(
+            error = ?e,
+            "frame-level artifact key migration failed; retried at the next start"
+        );
+    }
+
     Ok(())
 }
 
@@ -3534,6 +3542,103 @@ fn migrate_rejection_normalization_local(conn: &Connection) -> Result<()> {
 /// build that opens the catalog.
 #[cfg(not(all(feature = "render", feature = "solver")))]
 fn migrate_rejection_normalization_local(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+/// `settings` row that records the one-time [`migrate_frame_level_artifact_keys`] re-key.
+/// Written in the same transaction as the re-key: absent means it has not happened.
+#[cfg(all(feature = "render", feature = "solver"))]
+const FRAME_LEVEL_KEYS_MARKER: &str = "stacking.migration.frame_level_keys";
+
+/// One-time re-key of the frame-level `stacking_artifacts` rows to `group_key = ''`
+/// (frame-level cache spec §5.7, owner ruling 2026-11-08).
+///
+/// Why: a frame's calibrated file, star measurement, registered file and the like depend on
+/// the frame and the settings, not on how the frames were grouped. Rows keyed by the group
+/// (`…180s`) were lost whenever a regroup changed the key; the writers now store them under
+/// `''` ([`crate::stacking::paths::artifact_group_key`]), and this moves the rows written
+/// before that.
+///
+/// The kinds are [`crate::stacking::paths::FRAME_LEVEL_KINDS`] plus every `fits.<plane>`
+/// kind - the same predicate the writers use, never a second list. A frame that has rows of
+/// one kind under several group keys keeps the NEWEST (`created_at` DESC, then `id` DESC)
+/// and the others are deleted BEFORE the `UPDATE`, which would otherwise hit the unique
+/// index `stacking_artifacts_subject_key`. The ranking runs per subject (frame set or
+/// project), kind and frame, and counts a row already under `''` too, so an existing `''`
+/// row (`solve`, `registration`) is only touched when a newer duplicate exists. A row of a
+/// frame-level kind with neither `frame_id` nor `project_frame` names no frame; it is left
+/// alone. Group-level kinds (`ln`, `master`, `two_pass`, ...) are not touched.
+///
+/// No file is touched and every `path` stays: the readers open the row's stored path, and
+/// "Delete intermediates" sweeps the files no row names any more.
+///
+/// Known limitation: "newest" can be a row whose hash is stale under today's settings (for
+/// example written at a non-default grouping tolerance, which the calibration hash used to
+/// fold); that frame then recomputes once, which is the state it was in before.
+///
+/// Runs inside `BEGIN IMMEDIATE` (`init_db` is outside any transaction) and rolls back on
+/// error - a failed `COMMIT` included - leaving the marker unwritten so the next start
+/// retries.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn migrate_frame_level_artifact_keys(conn: &Connection) -> Result<()> {
+    fn marked(conn: &Connection) -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key = ?1",
+                [FRAME_LEVEL_KEYS_MARKER],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+    if marked(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have migrated between the probe and the write lock.
+    if marked(&tx)? {
+        return Ok(());
+    }
+    let kinds = crate::stacking::paths::FRAME_LEVEL_KINDS;
+    let placeholders = vec!["?"; kinds.len()].join(", ");
+    // `substr` is `starts_with("fits.")` exactly; `LIKE` would ignore case.
+    let frame_level = format!(
+        "(kind IN ({placeholders}) OR substr(kind, 1, 5) = 'fits.')
+         AND (frame_id IS NOT NULL OR project_frame IS NOT NULL)"
+    );
+    let dropped = tx.execute(
+        &format!(
+            "DELETE FROM stacking_artifacts WHERE id IN (
+               SELECT id FROM (
+                 SELECT id, ROW_NUMBER() OVER (
+                          PARTITION BY COALESCE(frames_set_id, 0), COALESCE(project_id, ''),
+                                       kind, COALESCE(frame_id, 0), COALESCE(project_frame, 0)
+                          ORDER BY created_at DESC, id DESC) AS rn
+                   FROM stacking_artifacts
+                  WHERE {frame_level})
+               WHERE rn > 1)"
+        ),
+        rusqlite::params_from_iter(kinds.iter()),
+    )?;
+    let rekeyed = tx.execute(
+        &format!(
+            "UPDATE stacking_artifacts SET group_key = '' WHERE group_key <> '' AND {frame_level}"
+        ),
+        rusqlite::params_from_iter(kinds.iter()),
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO settings (key, value, updated_at)
+         VALUES (?1, 'done', datetime('now'))",
+        [FRAME_LEVEL_KEYS_MARKER],
+    )?;
+    tx.commit()?;
+    tracing::info!(count = rekeyed, "frame-level artifact keys migrated");
+    tracing::info!(count = dropped, "duplicate frame-level artifacts dropped");
+    Ok(())
+}
+
+#[cfg(not(all(feature = "render", feature = "solver")))]
+fn migrate_frame_level_artifact_keys(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
@@ -4195,6 +4300,377 @@ mod rejection_local_migration_tests {
         );
         assert_eq!(set_config(&conn, 1), doc("scaleZeroOffset"));
         assert!(setting(&conn, REJECTION_LOCAL_MARKER).is_none());
+    }
+}
+
+#[cfg(all(feature = "render", feature = "solver"))]
+#[cfg(test)]
+mod frame_level_keys_migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    const OLD: &str = "dark-flat-gain100-180s";
+    const NEWER: &str = "dark-flat-gain100-300s";
+
+    /// A catalog as an upgrading user has it: `init_db` ran once (every table exists), then
+    /// the marker is removed - the state before the migration ever ran. Foreign keys are off
+    /// so rows can be inserted without their parents.
+    fn pre_migration() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [FRAME_LEVEL_KEYS_MARKER],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// One frame-set row (`set_id`, frame `frame`) under `group`.
+    fn put(
+        conn: &Connection,
+        set_id: i64,
+        frame: i64,
+        group: &str,
+        kind: &str,
+        path: &str,
+        at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO stacking_artifacts (frames_set_id, frame_id, group_key, kind, path,
+                config_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'h', ?6)",
+            rusqlite::params![set_id, frame, group, kind, path, at],
+        )
+        .unwrap();
+    }
+
+    /// One project-subject row (`project_frame` = `pf`).
+    fn put_project(conn: &Connection, pf: i64, group: &str, kind: &str, path: &str, at: &str) {
+        conn.execute(
+            "INSERT INTO stacking_artifacts (project_id, project_frame, group_key, kind, path,
+                config_hash, created_at) VALUES ('proj-1', ?1, ?2, ?3, ?4, 'h', ?5)",
+            rusqlite::params![pf, group, kind, path, at],
+        )
+        .unwrap();
+    }
+
+    /// `(group_key, path)` of the rows of `kind` for a frame, ordered by path.
+    fn rows(conn: &Connection, frame: i64, kind: &str) -> Vec<(String, String)> {
+        conn.prepare(
+            "SELECT group_key, path FROM stacking_artifacts
+              WHERE frame_id = ?1 AND kind = ?2 ORDER BY path",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![frame, kind], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    }
+
+    fn total(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM stacking_artifacts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn marker(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM settings WHERE key = ?1",
+            [FRAME_LEVEL_KEYS_MARKER],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn frame_level_rows_rekey_to_the_empty_group_keeping_the_newest() {
+        let conn = pre_migration();
+        put(
+            &conn,
+            1,
+            1,
+            OLD,
+            "calibrated",
+            "calibrated/old/f1.fits",
+            "2026-01-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            1,
+            NEWER,
+            "calibrated",
+            "calibrated/new/f1.fits",
+            "2026-02-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            1,
+            OLD,
+            "fits.0",
+            "fits/old/f1.athf",
+            "2026-01-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            1,
+            OLD,
+            "ln",
+            "ln/old/f1.json",
+            "2026-01-01T00:00:00Z",
+        );
+        // Another frame is its own key: its single row is re-keyed, not merged with frame 1.
+        put(
+            &conn,
+            1,
+            2,
+            OLD,
+            "calibrated",
+            "calibrated/old/f2.fits",
+            "2026-01-01T00:00:00Z",
+        );
+
+        migrate_frame_level_artifact_keys(&conn).unwrap();
+
+        assert_eq!(
+            rows(&conn, 1, "calibrated"),
+            vec![("".to_string(), "calibrated/new/f1.fits".to_string())],
+            "the newer row survives under '' with its path unchanged"
+        );
+        assert_eq!(
+            rows(&conn, 1, "fits.0"),
+            vec![("".to_string(), "fits/old/f1.athf".to_string())]
+        );
+        assert_eq!(
+            rows(&conn, 1, "ln"),
+            vec![(OLD.to_string(), "ln/old/f1.json".to_string())],
+            "a group-level kind stays under its group"
+        );
+        assert_eq!(
+            rows(&conn, 2, "calibrated"),
+            vec![("".to_string(), "calibrated/old/f2.fits".to_string())]
+        );
+        assert_eq!(total(&conn), 4);
+        assert!(marker(&conn));
+
+        // A second call changes nothing - not even a row added since (the marker holds).
+        put(
+            &conn,
+            1,
+            3,
+            OLD,
+            "calibrated",
+            "calibrated/old/f3.fits",
+            "2026-01-01T00:00:00Z",
+        );
+        migrate_frame_level_artifact_keys(&conn).unwrap();
+        assert_eq!(rows(&conn, 3, "calibrated")[0].0, OLD);
+        assert_eq!(total(&conn), 5);
+    }
+
+    /// Equal `created_at` falls back to the higher `id`.
+    #[test]
+    fn a_created_at_tie_keeps_the_higher_id() {
+        let conn = pre_migration();
+        put(
+            &conn,
+            1,
+            1,
+            OLD,
+            "measured",
+            "measured/old/f1.athm",
+            "2026-01-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            1,
+            NEWER,
+            "measured",
+            "measured/new/f1.athm",
+            "2026-01-01T00:00:00Z",
+        );
+
+        migrate_frame_level_artifact_keys(&conn).unwrap();
+
+        assert_eq!(
+            rows(&conn, 1, "measured"),
+            vec![("".to_string(), "measured/new/f1.athm".to_string())]
+        );
+    }
+
+    /// A project subject (`project_frame`) takes the same re-key; its duplicates are per
+    /// project frame and do not merge with a frame set's rows of the same kind.
+    #[test]
+    fn project_frame_rows_rekey_and_keep_the_newest() {
+        let conn = pre_migration();
+        put_project(
+            &conn,
+            7,
+            OLD,
+            "registered",
+            "registered/old/p7.fits",
+            "2026-01-01T00:00:00Z",
+        );
+        put_project(
+            &conn,
+            7,
+            NEWER,
+            "registered",
+            "registered/new/p7.fits",
+            "2026-02-01T00:00:00Z",
+        );
+        put_project(
+            &conn,
+            8,
+            OLD,
+            "registered",
+            "registered/old/p8.fits",
+            "2026-01-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            7,
+            OLD,
+            "registered",
+            "registered/old/f7.fits",
+            "2026-01-01T00:00:00Z",
+        );
+
+        migrate_frame_level_artifact_keys(&conn).unwrap();
+
+        let got: Vec<(i64, String, String)> = conn
+            .prepare(
+                "SELECT project_frame, group_key, path FROM stacking_artifacts
+                  WHERE project_id = 'proj-1' ORDER BY project_frame",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (7, "".to_string(), "registered/new/p7.fits".to_string()),
+                (8, "".to_string(), "registered/old/p8.fits".to_string()),
+            ]
+        );
+        assert_eq!(
+            rows(&conn, 7, "registered").len(),
+            1,
+            "the frame set's row is its own key"
+        );
+        assert_eq!(rows(&conn, 7, "registered")[0].0, "");
+    }
+
+    /// `solve` and `registration` are already stored under `''`: a lone row is untouched
+    /// (path, `created_at`, `id`), and a stray older copy under a group is dropped for it.
+    #[test]
+    fn an_existing_empty_group_row_is_untouched() {
+        let conn = pre_migration();
+        put(
+            &conn,
+            1,
+            1,
+            "",
+            "solve",
+            "solve/f1.json",
+            "2026-03-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            2,
+            "",
+            "registration",
+            "reg/f2.json",
+            "2026-03-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            2,
+            OLD,
+            "registration",
+            "reg/old/f2.json",
+            "2026-01-01T00:00:00Z",
+        );
+        let before: (i64, String) = conn
+            .query_row(
+                "SELECT id, created_at FROM stacking_artifacts WHERE kind = 'solve'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        migrate_frame_level_artifact_keys(&conn).unwrap();
+
+        let after: (i64, String) = conn
+            .query_row(
+                "SELECT id, created_at FROM stacking_artifacts WHERE kind = 'solve'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            rows(&conn, 1, "solve"),
+            vec![("".to_string(), "solve/f1.json".to_string())]
+        );
+        assert_eq!(
+            rows(&conn, 2, "registration"),
+            vec![("".to_string(), "reg/f2.json".to_string())],
+            "the newer '' row wins over the older grouped copy"
+        );
+    }
+
+    /// An error part-way rolls the re-key back and leaves the marker unwritten.
+    #[test]
+    fn a_failure_rolls_everything_back() {
+        let conn = pre_migration();
+        put(
+            &conn,
+            1,
+            1,
+            OLD,
+            "calibrated",
+            "calibrated/old/f1.fits",
+            "2026-01-01T00:00:00Z",
+        );
+        put(
+            &conn,
+            1,
+            1,
+            NEWER,
+            "calibrated",
+            "calibrated/new/f1.fits",
+            "2026-02-01T00:00:00Z",
+        );
+        // The marker insert fails after the DELETE and the UPDATE ran inside the transaction.
+        conn.execute_batch(
+            "CREATE TRIGGER t_marker BEFORE INSERT ON settings
+             WHEN NEW.key = 'stacking.migration.frame_level_keys'
+             BEGIN SELECT RAISE(ABORT, 'no marker'); END;",
+        )
+        .unwrap();
+
+        assert!(migrate_frame_level_artifact_keys(&conn).is_err());
+
+        assert!(conn.is_autocommit(), "the transaction was closed");
+        assert_eq!(total(&conn), 2, "the duplicate is back");
+        assert_eq!(rows(&conn, 1, "calibrated").len(), 2);
+        assert!(rows(&conn, 1, "calibrated")
+            .iter()
+            .all(|(g, _)| !g.is_empty()));
+        assert!(!marker(&conn));
     }
 }
 
