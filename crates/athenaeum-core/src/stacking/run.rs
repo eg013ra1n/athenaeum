@@ -18510,6 +18510,115 @@ mod tests {
                 "plane {p}: the migrated registered files stack another master"
             );
         }
+
+        // The stored path is the file opened, not just a file that happens to stack alike: change one pixel of a moved
+        // file (same size), record the file's new identity as a writer would, and the master moves.
+        let victim = &moved[1];
+        let mut bytes = std::fs::read(victim).unwrap();
+        // A big-endian f32 near the middle of the data section, aligned to 4 bytes (the header is whole 2880-byte
+        // blocks): flip the top mantissa bit, a finite change of a quarter or more of the value.
+        let at = (bytes.len() / 2) & !3;
+        bytes[at + 1] ^= 0x40;
+        std::fs::write(victim, &bytes).unwrap();
+        let meta = std::fs::metadata(victim).unwrap();
+        assert_eq!(
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET size = ?1, modified_at = ?2 WHERE path = ?3",
+                    rusqlite::params![
+                        meta.len() as i64,
+                        crate::stacking::plan::render_modified_at(meta.modified().unwrap()),
+                        victim.to_str().unwrap()
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        let (mut rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(fan_out_items(&logs, "register", "rewrite"), 0, "the edited row was rewritten: {logs}");
+        fallback_counters::reset();
+        stage_output(&mut rc).unwrap();
+        assert_eq!(fallback_counters::snapshot(), 0);
+        let edited = master_of(&rc);
+        assert!(
+            baseline.iter().zip(&edited).any(|(a, b)| a.iter().zip(b).any(|(x, y)| x.to_bits() != y.to_bits())),
+            "the master did not move with the stored file's pixels: Integrate did not open the row's path"
+        );
+    }
+
+    /// Ruling R7 (c) M2 (Task 5): re-registering a frame whose row points into an old `registered/<old_key>/` folder
+    /// writes the new file at the layout path, repoints the row and removes the old file - unless another row still
+    /// points at it.
+    #[test]
+    fn re_registering_a_migrated_row_removes_the_old_file_unless_another_row_points_at_it() {
+        use crate::stacking::config::ExposureMode;
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+        let old_dir = rig.layout.registered_root().join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut legacy: HashMap<i64, PathBuf> = HashMap::new();
+        for (frame_id, row) in rig.registered_rows() {
+            let old = old_dir.join(format!("legacy_{frame_id}.fits"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            legacy.insert(frame_id, old);
+        }
+        assert_eq!(legacy.len(), 4);
+        // Another row, of another group key, still points at one of the old files.
+        let kept_frame = rig.light_ids[3];
+        upsert_artifact(
+            &rig.fixture.conn,
+            &NewArtifact {
+                subject: &StackSubject::FrameSet(rig.fixture.set_id),
+                frame_id: Some(kept_frame),
+                group_key: "stray",
+                kind: "registered",
+                path: legacy[&kept_frame].to_str(),
+                config_hash: "h",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        // Another reference: every frame is registered again.
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (_rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(fan_out_items(&logs, "register", "align"), 4, "{logs}");
+
+        for &frame_id in &rig.light_ids {
+            let row = crate::db::stacking::find_artifact(
+                &rig.fixture.conn,
+                &StackSubject::FrameSet(rig.fixture.set_id),
+                "",
+                "registered",
+                Some(frame_id),
+            )
+            .unwrap()
+            .expect("the frame's registered row");
+            let new = Path::new(row.path.as_ref().unwrap());
+            assert_eq!(new.parent(), Some(rig.layout.registered_dir().as_path()), "frame {frame_id}: {new:?}");
+            assert!(new.is_file());
+        }
+        for (frame_id, old) in &legacy {
+            assert_eq!(
+                old.exists(),
+                *frame_id == kept_frame,
+                "frame {frame_id}: {} should {} its old file",
+                if *frame_id == kept_frame { "keep" } else { "lose" },
+                old.display()
+            );
+        }
     }
 
     /// Ruling R7 (b) (Task 5): a cached file counts as fresh only while it is the file its row recorded. Run B
@@ -18600,8 +18709,9 @@ mod tests {
 
     /// Ruling R4 (c) (Task 5): the `.rej` stem is the frame's own stem. Two frames of one merged group whose
     /// registered rows point at `registered/<keyA>/r_Light_0001.fits` and `registered/<keyB>/r_Light_0001.fits` (one
-    /// file name from two old group folders) get two distinct `.rej` files; the stems of their stored paths are equal,
-    /// and a set created with them would be refused.
+    /// file name from two old group folders) get two distinct `.rej` files: the stems of their stored paths are equal
+    /// (the premise, asserted), the frames' own stems carry their ids, and a set created with those stems writes one
+    /// `.rej` per frame.
     #[test]
     fn rejection_map_stems_do_not_collide_across_old_group_folders() {
         let frame = |id: i64| GroupFrame {
