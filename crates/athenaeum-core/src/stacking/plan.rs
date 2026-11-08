@@ -1060,18 +1060,42 @@ pub(crate) fn file_matches_identity(
     size: Option<i64>,
     modified_at: Option<&str>,
 ) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // A file that is not there is the ordinary "stale"; any other failure (permissions, a dropped mount) is not,
+        // and is logged before it is read as "not the recorded file".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cached file cannot be stat-ed; counted as changed");
+            return false;
+        }
     };
     if Some(meta.len() as i64) != size {
         return false;
     }
-    match modified_at {
-        None => true,
-        Some(recorded) => meta
-            .modified()
-            .is_ok_and(|m| render_modified_at(m) == recorded),
+    let Some(recorded) = modified_at else {
+        return true;
+    };
+    let current = match meta.modified() {
+        Ok(modified) => render_modified_at(modified),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cached file has no modification time; counted as changed");
+            return false;
+        }
+    };
+    if current == recorded {
+        return true;
     }
+    // The size matches and the time does not: the one case where a file looks right and is refused. Say why, once per
+    // look, so "everything recomputed after I moved the folder" is explained by the log (a copy tool that does not
+    // keep mtimes, a filesystem that reports another time after close).
+    tracing::debug!(
+        path = %path.display(),
+        recorded,
+        current = %current,
+        "cached file has the recorded size but another modification time; counted as changed"
+    );
+    false
 }
 
 /// The `calibrated`-artifact reuse contract (spec §9.3): a row is reusable
@@ -4108,6 +4132,78 @@ mod tests {
     use crate::registration::db::set_frame_set_reference;
     use crate::stacking::groups::{group_frames, is_seconds_token};
     use crate::stacking::test_fixtures::{self, LightSpec};
+
+    /// Ruling R10 M2: the rendering of a stored file time is a wire fact (rows already written carry it, and the
+    /// scanner's own `to_rfc3339()` shape is what it must equal), so three literals pin it: a whole second, a
+    /// millisecond time and a nanosecond time.
+    #[test]
+    fn render_modified_at_is_pinned_to_golden_literals() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            render_modified_at(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "2023-11-14T22:13:20+00:00"
+        );
+        assert_eq!(
+            render_modified_at(UNIX_EPOCH + Duration::new(1_700_000_000, 123_000_000)),
+            "2023-11-14T22:13:20.123+00:00"
+        );
+        assert_eq!(
+            render_modified_at(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)),
+            "2023-11-14T22:13:20.123456789+00:00"
+        );
+        // The scanner's shape: the same value through its own call.
+        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        assert_eq!(
+            render_modified_at(t),
+            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+        );
+    }
+
+    /// Ruling R10 M1: a file with the recorded size and another mtime is refused with a `debug!` that names the path
+    /// and both times; a file that is not there, or whose identity matches, logs nothing.
+    #[test]
+    fn identity_refusal_by_mtime_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"12345678").unwrap();
+        let recorded = render_modified_at(std::fs::metadata(&path).unwrap().modified().unwrap());
+
+        let (ok, quiet) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(8), Some(&recorded))
+        });
+        assert!(ok);
+        assert!(!quiet.contains("modification time"), "{quiet}");
+
+        let (gone, quiet) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&dir.path().join("nope.bin"), Some(8), Some(&recorded))
+        });
+        assert!(!gone);
+        assert!(quiet.trim().is_empty(), "a missing file is the ordinary stale: {quiet}");
+
+        let other = "1999-01-01T00:00:00+00:00";
+        let (moved, text) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(8), Some(other))
+        });
+        assert!(!moved);
+        assert!(text.contains("DEBUG"), "{text}");
+        assert!(text.contains("f.bin"), "{text}");
+        assert!(text.contains(other), "the recorded time: {text}");
+        assert!(text.contains(&recorded), "the current time: {text}");
+
+        // A different size is refused without the mtime line (the size already says why).
+        let (resized, text) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(9), Some(&recorded))
+        });
+        assert!(!resized);
+        assert!(!text.contains("modification time"), "{text}");
+
+        // A stat failure that is not "not found" is a warn, not a silent "changed".
+        let (broken, text) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(Path::new("a\0b"), Some(8), Some(&recorded))
+        });
+        assert!(!broken);
+        assert!(text.contains("WARN") && text.contains("cannot be stat-ed"), "{text}");
+    }
 
     /// Plan 6b-3 D6: a frame set's LN upstream is its registration hash,
     /// byte for byte; a project's carries the masked-LN token.
