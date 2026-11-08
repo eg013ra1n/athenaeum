@@ -19278,12 +19278,30 @@ mod tests {
 
     impl Pass1Rig {
         fn new() -> Pass1Rig {
+            Pass1Rig::build(1, false)
+        }
+
+        /// The rig on an `image_pool` of `threads` workers; `osc` seeds RGGB mosaics, which stage 1 debayers into
+        /// three-plane `_d` files.
+        fn build(threads: usize, osc: bool) -> Pass1Rig {
             let tmp = tempfile::tempdir().unwrap();
             let db_path = tmp.path().join("catalog.db");
-            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let mut raw = ServiceContext::new_for_tests(db_path.clone());
+            if threads > 1 {
+                raw.image_pool = Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap(),
+                );
+            }
+            let ctx = Arc::new(raw);
             let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
-            let (fixture, light_ids, working, output) =
-                seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+            let (fixture, light_ids, working, output) = if osc {
+                seed_osc_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4])
+            } else {
+                seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4])
+            };
             test_fixtures::add_master_dark_and_flat(
                 &fixture,
                 &light_ids,
@@ -19964,48 +19982,151 @@ mod tests {
         assert_eq!(rig.rows("metrics").len(), 4);
     }
 
+    /// The widest `admission` any `fan-out admitted` line of `logs` reports: more than 1 means the stage really ran
+    /// its frames in parallel (an unknown RAM total admits one worker whatever the pool).
+    fn widest_admission(logs: &str) -> usize {
+        logs.lines()
+            .filter(|l| l.contains("fan-out admitted"))
+            .filter_map(|l| l.split(" admission=").nth(1)?.split_whitespace().next()?.parse().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Every plane of one FITS file, as bit patterns.
+    fn file_plane_bits(path: &Path) -> Vec<Vec<u32>> {
+        let reader = PlaneReader::open(path).unwrap();
+        (0..reader.channels())
+            .map(|p| reader.read_plane(p).unwrap().iter().map(|v| v.to_bits()).collect())
+            .collect()
+    }
+
     /// Every plane of every calibrated frame of the rig, as bit patterns, by frame id.
     fn calibrated_plane_bits(rig: &Pass1Rig) -> Vec<(i64, Vec<Vec<u32>>)> {
         rig.sorted_ids()
             .into_iter()
-            .map(|id| {
-                let reader = PlaneReader::open(&rig.calibrated_path(id)).unwrap();
-                let planes = (0..reader.channels())
-                    .map(|p| {
-                        reader
-                            .read_plane(p)
-                            .unwrap()
-                            .iter()
-                            .map(|v| v.to_bits())
-                            .collect()
-                    })
-                    .collect();
-                (id, planes)
-            })
+            .map(|id| (id, file_plane_bits(&rig.calibrated_path(id))))
             .collect()
     }
 
-    /// Frame-level cache spec §5.3 / §8 Q1 (Task 8, step 1): the precondition of keeping a first pass across a
-    /// recalibration. A frame calibrated, its file and row deleted and calibrated again in a NEW run context has the
-    /// same planes to the bit. Without this pin the mtime stamp must stay.
-    #[test]
-    fn recalibration_reproduces_the_planes_bit_for_bit() {
-        let rig = Pass1Rig::new();
+    /// The precondition of keeping a first pass across a recalibration, on a rig: a frame calibrated, its file and
+    /// row deleted and calibrated again in a NEW run context has the same planes to the bit. `planes` is the plane
+    /// count every calibrated file must have (1 mono, 3 debayered).
+    fn assert_recalibration_is_bit_identical(rig: &Pass1Rig, planes: usize, parallel: bool) {
         rig.run("run 1", None);
-        let before = calibrated_plane_bits(&rig);
+        let before = calibrated_plane_bits(rig);
         assert_eq!(before.len(), 4);
+        assert!(before.iter().all(|(_, p)| p.len() == planes), "{planes} planes each");
         let calibrated_files: Vec<PathBuf> =
             before.iter().map(|(id, _)| rig.calibrated_path(*id)).collect();
+        assert!(
+            calibrated_files.iter().all(|f| f.starts_with(rig.layout.calibrated_root())),
+            "written under calibrated/: {calibrated_files:?}"
+        );
         rig.delete_rows(&["calibrated"]);
         for file in &calibrated_files {
             std::fs::remove_file(file).unwrap();
         }
-        rig.run("run 2", None);
+        let (_, logs) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        if parallel && total_ram_bytes().is_some() {
+            assert!(widest_admission(&logs) > 1, "run 2 recalibrated in parallel: {logs}");
+        }
         for file in &calibrated_files {
             assert!(file.is_file(), "run 2 recalibrated {}", file.display());
         }
-        let after = calibrated_plane_bits(&rig);
+        let after = calibrated_plane_bits(rig);
         assert_eq!(before, after, "a recalibration changed a pixel");
+    }
+
+    /// Frame-level cache spec §5.3 / §8 Q1 (Task 8, step 1): the precondition of keeping a first pass across a
+    /// recalibration. A frame calibrated, its file and row deleted and calibrated again in a NEW run context has the
+    /// same planes to the bit. Without this pin the mtime stamp must stay. Ruling R12 (b): the mono case on the stock
+    /// one-thread pool and on a four-thread one, and the debayered OSC case (three-plane `_d` files) on four threads.
+    #[test]
+    fn recalibration_reproduces_the_planes_bit_for_bit() {
+        assert_recalibration_is_bit_identical(&Pass1Rig::new(), 1, false);
+        assert_recalibration_is_bit_identical(&Pass1Rig::build(4, false), 1, true);
+        assert_recalibration_is_bit_identical(&Pass1Rig::build(4, true), 3, true);
+    }
+
+    /// Ruling R12 (b): what Prepare writes under `prepared/` (a debayered mosaic, a 16-bit FITS and an XISF converted
+    /// into the unit domain) is reproduced to the bit by a second Prepare of the same frames in a new run context,
+    /// on a four-thread pool. Length-only on the first pass's stamp holds for `prepared/` only if this does.
+    #[test]
+    fn re_preparing_reproduces_the_prepared_planes_bit_for_bit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let mut raw = ServiceContext::new_for_tests(db_path.clone());
+        raw.image_pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap());
+        let ctx = Arc::new(raw);
+        assert!(ctx.image_pool.current_num_threads() > 1);
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for (u, file, bayer) in [
+            ("m1", test_fixtures::ProjectFile::Mosaic32, Some("RGGB")),
+            ("m2", test_fixtures::ProjectFile::Mosaic32, Some("RGGB")),
+            ("m3", test_fixtures::ProjectFile::Mosaic32, Some("RGGB")),
+            ("i1", test_fixtures::ProjectFile::Mono16, None),
+            ("x1", test_fixtures::ProjectFile::Xisf32, None),
+        ] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = file;
+            spec.bayerpat = bayer;
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let working = tmp.path().join("work");
+        let out = tmp.path().join("out");
+        let prepared_bits = |rc: &RunContext| -> Vec<(i64, PathBuf, Vec<Vec<u32>>)> {
+            let mut v: Vec<(i64, PathBuf, Vec<Vec<u32>>)> = rc
+                .plan_groups
+                .iter()
+                .flat_map(|g| g.frames.iter())
+                .map(|f| {
+                    let row = crate::db::stacking::find_artifact(
+                        &conn,
+                        &rc.subject,
+                        "",
+                        "calibrated",
+                        Some(f.frame_id),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let path = PathBuf::from(row.path.unwrap());
+                    let bits = file_plane_bits(&path);
+                    (f.frame_id, path, bits)
+                })
+                .collect();
+            v.sort_by_key(|(id, _, _)| *id);
+            v
+        };
+
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &working, &out);
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        let before = prepared_bits(&rc);
+        assert_eq!(before.len(), 5);
+        assert!(
+            before.iter().all(|(_, p, _)| p.starts_with(rc.layout.prepared_root())),
+            "every frame was written under prepared/: {before:?}"
+        );
+        assert_eq!(before.iter().filter(|(_, _, b)| b.len() == 3).count(), 3, "the mosaics were debayered");
+        for (_, path, _) in &before {
+            std::fs::remove_file(path).unwrap();
+        }
+        crate::db::stacking::delete_artifacts(&conn, &rc.subject, &["calibrated"]).unwrap();
+
+        let mut rc2 = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &working, &out);
+        let (res, logs) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc2));
+        res.unwrap();
+        if total_ram_bytes().is_some() {
+            assert!(widest_admission(&logs) > 1, "the second Prepare ran in parallel: {logs}");
+        }
+        assert!(rc2.runtime_exclusions.is_empty(), "{:?}", rc2.runtime_exclusions);
+        let after = prepared_bits(&rc2);
+        for (_, path, _) in &after {
+            assert!(path.is_file(), "re-prepared {}", path.display());
+        }
+        assert_eq!(before, after, "a second Prepare changed a pixel (or a path)");
     }
 
     /// Frame-level cache spec §5.3 (Task 8): "Delete intermediates" removes `calibrated/` and keeps `measured/`. The
