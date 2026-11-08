@@ -789,6 +789,11 @@ pub fn list_frame_rows(conn: &Connection, run_id: i64) -> Result<Vec<StackingRun
 /// COALESCE(project_id, ''), group_key, kind, COALESCE(frame_id, 0),
 /// COALESCE(project_frame, 0))` — so a NULL frame collapses onto the same row
 /// (a set-level artifact) rather than creating a new one on every rebuild.
+///
+/// Caller contract (frame-level cache spec §5.1): `a.group_key` is
+/// `stacking::paths::artifact_group_key(kind, group_key)` — `""` for a frame-level kind, the group's key otherwise.
+/// This function stores what it is given; the one rule lives in `paths.rs`, and [`find_artifact`] is called the same
+/// way.
 pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
     let created_at = now();
     let (fid, pf) = a.subject.frame_columns(a.frame_id);

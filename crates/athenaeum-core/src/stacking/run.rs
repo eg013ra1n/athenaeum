@@ -98,7 +98,8 @@ use crate::stacking::pass1_artifact::{
 };
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{
-    cleanup_work, subject_layout, CleanupWhat, WorkingLayout, LN_REFERENCE_SATURATION_FILE,
+    artifact_group_key, cleanup_work, cleanup_work_with, subject_layout, CleanupWhat, WorkingLayout,
+    LN_REFERENCE_SATURATION_FILE,
 };
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
@@ -130,7 +131,7 @@ use crate::stacking::weights::{
     best_by_weight, compute_weights, defers_weight_gate, reference_coverage, select_frames,
     select_frames_deferring_weight_gate, sky_penalized_order, two_pass_deviation_px,
     two_pass_pick, two_pass_pick_among, weight_gate, FrameWeight, TwoPassCandidate, WeightInput,
-    WeightMode, MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX,
+    WeightMode, MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX, TWO_PASS_PICK_VERSION,
 };
 
 /// Every `fits` artifact path whose write DEGRADED (final fix wave, ruling
@@ -607,8 +608,7 @@ pub(crate) fn group_anchor_geometry(g: &IntegrationGroup) -> (Option<i64>, Optio
 /// `stacking_artifacts` row's `size`/`modified_at` when deciding freshness.
 fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
     let meta = std::fs::metadata(path)?;
-    let modified = meta.modified()?;
-    let modified_at = chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339();
+    let modified_at = crate::stacking::plan::render_modified_at(meta.modified()?);
     Ok((meta.len() as i64, modified_at))
 }
 
@@ -1196,6 +1196,17 @@ pub(crate) fn start_stacking_with_solver(
     Ok(StartedStacking { run_id })
 }
 
+/// Whether a stacking run of a subject OTHER than `subject` is active (registered in `active_stacks`). Two subjects
+/// can share a working root, and a run writes a pass-1 / fits file before its row, so a sweep for `subject` must not
+/// run meanwhile (ruling R8 (c)).
+pub(crate) fn other_stack_active(ctx: &ServiceContext, subject: &StackSubject) -> bool {
+    ctx.active_stacks
+        .lock()
+        .unwrap()
+        .values()
+        .any(|h| &h.subject != subject)
+}
+
 /// Cancel an active stacking run (queued-in-compute-queue or running).
 pub fn cancel_stacking(ctx: &ServiceContext, run_id: i64) -> Result<(), ApiError> {
     let active = ctx.active_stacks.lock().unwrap();
@@ -1776,7 +1787,10 @@ enum CalibrateResolved {
 /// read).
 struct CalibrateJob {
     frame_id: i64,
-    group_key: String,
+    /// The frame's `calibrated` / `calibrated_mosaic` rows as the resolve step found them (under the frame-level key),
+    /// so the commit can remove a file the rewrite replaced ([`replace_frame_level_file`]).
+    old_calibrated: Option<crate::db::stacking::StackingArtifactRow>,
+    old_mosaic: Option<crate::db::stacking::StackingArtifactRow>,
     hash: String,
     spec: GenerationSpec,
     out: PathBuf,
@@ -1939,46 +1953,93 @@ fn commit_calibrate_group(
     Ok(())
 }
 
-/// The collision-safe calibrated-file STEM for one frame of a group (fix
-/// round 1, Critical): the plain, extension-free source stem
-/// (`Path::file_stem` of `frame.filename`) when it is unique within the
-/// group; `<stem>_f<frame_id>` for EVERY frame that shares that stem with
-/// another member of the group (all of them, not just the later ones) —
-/// deterministic and order-independent, since it depends only on group
-/// membership, never on iteration order.
+/// The file STEM of every frame-level file of one frame (calibrated, prepared, registered, measured spill, fits,
+/// LN sidecar): `<source file stem>_f<frame_id>`, always. A function of the frame alone (frame-level cache spec
+/// §5.1), so a regroup or a merge never renames a frame's file. The `_f<id>` suffix keeps two frames that share a
+/// source basename (a capture program restarting its file counter on another night is routine) from clobbering one
+/// file, and `frame_id` is unique inside one subject (a catalog id, or a project handle).
 ///
-/// Why this exists: `layout.calibrated_dir(key).join(spec.output_filename(&frame.filename))`
-/// used to collide whenever two frames of one group shared a source
-/// basename (a capture program restarting its file counter on a different
-/// night is routine) — the second write silently clobbered the first, both
-/// artifact rows pointed at one file of identical size, and `is_fresh` then
-/// kept the FIRST frame's now-wrong row "fresh" forever, so a later stage
-/// used the second frame's pixels twice and lost the first one silently.
-///
-/// Callers append the generator's own `_d` debayer marker via
-/// `GenerationSpec::output_filename` — never insert it here, so the marker
-/// always stays LAST in the filename (`c_<stem>_f<id>_d.fits`, never
-/// `c_<stem>_d_f<id>.fits`). Task 7's registered-frame writer (both register
-/// fan-out closures, and [`registered_file_name`]) calls this SAME function
-/// for its own `r_<stem>[_d].fits` naming, so the two stay consistent by
+/// Callers append the generator's own `_d` debayer marker via `GenerationSpec::output_filename` — never insert it
+/// here, so the marker always stays LAST in the filename (`c_<stem>_d.fits`, never `c_<stem>_d_f<id>.fits`).
+/// [`registered_file_name`] takes this stem for its own `r_<stem>[_d].fits` naming, so the two stay consistent by
 /// construction rather than by one parsing the other's output.
-pub(crate) fn calibrated_file_stem(group: &IntegrationGroup, frame: &GroupFrame) -> String {
-    fn stem_of(f: &GroupFrame) -> &str {
-        Path::new(&f.filename)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&f.filename)
-    }
-    let this_stem = stem_of(frame);
-    let collisions = group
-        .frames
+///
+/// Rows written before this rule keep their stored `path`, which may carry the old collision-only stem; a reader
+/// opens the row's path and never recomputes it from this function.
+pub(crate) fn frame_file_stem(frame: &GroupFrame) -> String {
+    let plain = Path::new(&frame.filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&frame.filename);
+    format!("{plain}_f{}", frame.frame_id)
+}
+
+/// The `.rej` file stems of one group's rejection-bitmap set, one per included frame, in `included` order: the
+/// frame's [`frame_file_stem`], never the stem of its calibrated path. A calibrated row written before the
+/// frame-level cache keeps its old `calibrated/<group_key>/c_<name>.fits` path, and a merged group can hold two such
+/// frames of one file name from different old folders; the frame's own stem carries its id, so the two never share
+/// a `.rej` (ruling R4 (c)). A member with no frame in the group (not expected) falls back to its position and id.
+fn rejection_map_stems(group: &IntegrationGroup, included_ids: &[i64]) -> Vec<String> {
+    let frames_by_id: HashMap<i64, &GroupFrame> =
+        group.frames.iter().map(|f| (f.frame_id, f)).collect();
+    included_ids
         .iter()
-        .filter(|f| stem_of(f) == this_stem)
-        .count();
-    if collisions > 1 {
-        format!("{this_stem}_f{}", frame.frame_id)
-    } else {
-        this_stem.to_string()
+        .enumerate()
+        .map(|(pos, frame_id)| match frames_by_id.get(frame_id) {
+            Some(frame) => frame_file_stem(frame),
+            None => format!("frame_{pos}_f{frame_id}"),
+        })
+        .collect()
+}
+
+/// After a frame-level file was written and its row upserted: removes the file the row used to point to, when that
+/// path differs from `new_path` (a frame re-written under a new stem or folder), lies under `owned_root` and no row
+/// of ANY subject still points to it. A failed removal is a `warn!` (`path`, `error`), never an error: the file is
+/// only disk.
+///
+/// `owned_root` is the root the WRITING kind owns (`calibrated_root()`, `prepared_root()`, `measured_root()`,
+/// `fits_root()`, `registered_root()`; ruling R4), passed by the caller, never `layout.root` in general: a frame
+/// set's working folder may overlap a scan root, and an attested frame used in place has a row pointing at the
+/// user's own landed file, which is never ours to remove.
+fn replace_frame_level_file(
+    conn: &rusqlite::Connection,
+    owned_root: &Path,
+    old: Option<&crate::db::stacking::StackingArtifactRow>,
+    new_path: &Path,
+) {
+    let Some(old_path) = old.and_then(|row| row.path.as_deref()) else {
+        return;
+    };
+    let old_path = Path::new(old_path);
+    if old_path == new_path || !old_path.starts_with(owned_root) {
+        return;
+    }
+    let old_str = old_path.to_string_lossy();
+    let still_referenced: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM stacking_artifacts WHERE path = ?1",
+        [old_str.as_ref()],
+        |r| r.get(0),
+    );
+    match still_referenced {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                path = %old_path.display(),
+                error = %e,
+                "could not check whether an old frame-level file is still referenced; keeping it"
+            );
+            return;
+        }
+    }
+    match std::fs::remove_file(old_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %old_path.display(),
+            error = %e,
+            "an old frame-level file could not be removed"
+        ),
     }
 }
 
@@ -2022,29 +2083,31 @@ fn resolve_calibrate_job(
     // mosaic, produced by the SAME generation as the debayered artifact.
     let want_mosaic = wants_cfa_mosaic(cfg, group);
 
-    if rc.rerun_from != Some(Stage::Calibrate) {
-        let (existing, mosaic_row) = {
-            let conn = db(&rc.ctx)?.conn();
-            let existing = crate::db::stacking::find_artifact(
+    // The frame's rows sit under the frame-level key (spec §5.1), so a regroup finds them again. They are read even
+    // under `rerun_from = Calibrate` (no reuse then): the commit removes the file a rewrite replaces.
+    let (existing, mosaic_row) = {
+        let conn = db(&rc.ctx)?.conn();
+        let existing = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key("calibrated", group_key),
+            "calibrated",
+            Some(frame.frame_id),
+        )?;
+        let mosaic_row = if want_mosaic {
+            crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                group_key,
-                "calibrated",
+                artifact_group_key("calibrated_mosaic", group_key),
+                "calibrated_mosaic",
                 Some(frame.frame_id),
-            )?;
-            let mosaic_row = if want_mosaic {
-                crate::db::stacking::find_artifact(
-                    &conn,
-                    &rc.subject,
-                    group_key,
-                    "calibrated_mosaic",
-                    Some(frame.frame_id),
-                )?
-            } else {
-                None
-            };
-            (existing, mosaic_row)
+            )?
+        } else {
+            None
         };
+        (existing, mosaic_row)
+    };
+    if rc.rerun_from != Some(Stage::Calibrate) {
         if let Some(row) = &existing {
             // The mosaic rides the calibrated artifact's OWN hash (it is the
             // same generation), so `drizzle.bayer` deliberately stays out of
@@ -2173,10 +2236,10 @@ fn resolve_calibrate_job(
         }
     };
 
-    let stem = calibrated_file_stem(group, frame);
+    let stem = frame_file_stem(frame);
     let out = rc
         .layout
-        .calibrated_dir(group_key)
+        .calibrated_dir()
         .join(spec.output_filename(&format!("{stem}.fits")));
     // M4d Task 1: the mosaic is the same stem under the MONO spelling
     // (`c_<stem>.fits`) — through the one shared naming rule, never a second
@@ -2186,7 +2249,7 @@ fn resolve_calibrate_job(
     // debayering — whose own output already IS this name).
     let mosaic_out = want_mosaic.then(|| {
         rc.layout
-            .calibrated_dir(group_key)
+            .calibrated_dir()
             .join(crate::export::calibrated_output_filename(
                 &format!("{stem}.fits"),
                 false,
@@ -2197,7 +2260,8 @@ fn resolve_calibrate_job(
 
     Ok(CalibrateResolved::Job(Box::new(CalibrateJob {
         frame_id: frame.frame_id,
-        group_key: group_key.to_string(),
+        old_calibrated: existing,
+        old_mosaic: mosaic_row,
         hash,
         spec,
         out,
@@ -2448,7 +2512,7 @@ fn commit_calibrated(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(job.frame_id),
-                group_key: &job.group_key,
+                group_key: artifact_group_key("calibrated", ""),
                 kind: "calibrated",
                 path: job.out.to_str(),
                 config_hash: &job.hash,
@@ -2463,7 +2527,7 @@ fn commit_calibrated(
                 &NewArtifact {
                     subject: &rc.subject,
                     frame_id: Some(job.frame_id),
-                    group_key: &job.group_key,
+                    group_key: artifact_group_key("calibrated_mosaic", ""),
                     kind: "calibrated_mosaic",
                     path: path.to_str(),
                     config_hash: &job.hash,
@@ -2475,6 +2539,12 @@ fn commit_calibrated(
         }
         tx.commit()
             .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
+        // The rows now point at the new files; the files they used to point at go once nothing references them.
+        let owned = rc.layout.calibrated_root();
+        replace_frame_level_file(&conn, &owned, job.old_calibrated.as_ref(), &job.out);
+        if let Some((path, _)) = &mosaic_identity {
+            replace_frame_level_file(&conn, &owned, job.old_mosaic.as_ref(), path);
+        }
     }
 
     Ok(size as u64)
@@ -2502,6 +2572,10 @@ enum PrepareResolved {
 struct PrepareRunJob {
     frame_id: i64,
     group_key: String,
+    /// The frame's `calibrated` / `calibrated_mosaic` rows as the resolve step found them, so the commit can remove a
+    /// file the rewrite replaced ([`replace_frame_level_file`]).
+    old_calibrated: Option<crate::db::stacking::StackingArtifactRow>,
+    old_mosaic: Option<crate::db::stacking::StackingArtifactRow>,
     hash: String,
     /// Bayer drizzle wants this frame's pre-debayer mosaic kept.
     keep_mosaic: bool,
@@ -2653,26 +2727,31 @@ fn resolve_prepare_job(
             }
         );
 
-    if rc.rerun_from != Some(Stage::Calibrate) {
+    // The frame's rows sit under the frame-level key (spec §5.1). Read even under `rerun_from = Calibrate` (no reuse
+    // then): the commit removes the file a rewrite replaces.
+    let (existing, mosaic_row) = {
         let conn = db(&rc.ctx)?.conn();
         let existing = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            &group.key,
+            artifact_group_key("calibrated", &group.key),
             "calibrated",
             Some(frame.frame_id),
         )?;
-        let mosaic_fresh = !keep_mosaic
-            || crate::db::stacking::find_artifact(
-                &conn,
-                &rc.subject,
-                &group.key,
-                "calibrated_mosaic",
-                Some(frame.frame_id),
-            )?
-            .is_some_and(|row| is_fresh(&row, &hash));
-        if let Some(row) = existing {
-            if is_fresh(&row, &hash) && mosaic_fresh {
+        let mosaic_row = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key("calibrated_mosaic", &group.key),
+            "calibrated_mosaic",
+            Some(frame.frame_id),
+        )?;
+        (existing, mosaic_row)
+    };
+    if rc.rerun_from != Some(Stage::Calibrate) {
+        let mosaic_fresh =
+            !keep_mosaic || mosaic_row.as_ref().is_some_and(|row| is_fresh(row, &hash));
+        if let Some(row) = &existing {
+            if is_fresh(row, &hash) && mosaic_fresh {
                 return Ok(PrepareResolved::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
                 });
@@ -2680,21 +2759,9 @@ fn resolve_prepare_job(
         }
     }
 
-    // An attested light's name is not unique by itself, so its stem always
-    // carries the frame id; a project's `c_<uuid>` stems are unique.
-    let stem = if crate::stacking::origin::prepare_stem_needs_frame_id(origin_of(
-        &rc.origins,
-        frame.frame_id,
-    )?) {
-        let plain = Path::new(&frame.filename)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&frame.filename);
-        format!("{plain}_f{}", frame.frame_id)
-    } else {
-        calibrated_file_stem(group, frame)
-    };
-    let dir = rc.layout.prepared_dir(&group.key);
+    // One stem rule for every frame-level file (spec §5.1): the frame's own, `<stem>_f<id>`.
+    let stem = frame_file_stem(frame);
+    let dir = rc.layout.prepared_dir();
     let converted_out = dir.join(format!("p_{stem}.fits"));
     let debayered_out = dir.join(format!("p_{stem}_d.fits"));
     // A zip frame that needs real work (not Reused above) is extracted only now.
@@ -2736,6 +2803,8 @@ fn resolve_prepare_job(
     Ok(PrepareResolved::Job(Box::new(PrepareRunJob {
         frame_id: frame.frame_id,
         group_key: group.key.clone(),
+        old_calibrated: existing,
+        old_mosaic: mosaic_row,
         hash,
         keep_mosaic,
         frame_uuid: input.frame_uuid,
@@ -2821,7 +2890,7 @@ fn commit_prepared(
         &NewArtifact {
             subject: &rc.subject,
             frame_id: Some(job.frame_id),
-            group_key: &job.group_key,
+            group_key: artifact_group_key("calibrated", &job.group_key),
             kind: "calibrated",
             path: files.calibrated.to_str(),
             config_hash: &job.hash,
@@ -2836,7 +2905,7 @@ fn commit_prepared(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(job.frame_id),
-                group_key: &job.group_key,
+                group_key: artifact_group_key("calibrated_mosaic", &job.group_key),
                 kind: "calibrated_mosaic",
                 path: path.to_str(),
                 config_hash: &job.hash,
@@ -2848,6 +2917,13 @@ fn commit_prepared(
     }
     tx.commit()
         .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
+    // The rows now point at the new files; the files they used to point at go once nothing references them. Only
+    // under `prepared/`: a landed file Prepare used in place is never ours (ruling R4).
+    let owned = rc.layout.prepared_root();
+    replace_frame_level_file(&conn, &owned, job.old_calibrated.as_ref(), &files.calibrated);
+    if let Some((path, _)) = &mosaic {
+        replace_frame_level_file(&conn, &owned, job.old_mosaic.as_ref(), path);
+    }
     Ok(size as u64)
 }
 
@@ -3415,7 +3491,7 @@ fn stage_calibrate_with(rc: &mut RunContext, force_merge: Option<bool>) -> Resul
             if group_idx > 0 {
                 stash.push(take_list_stash(rc, warn_mark, excl_mark));
             }
-            std::fs::create_dir_all(rc.layout.calibrated_dir(&group.key))
+            std::fs::create_dir_all(rc.layout.calibrated_dir())
                 .map_err(|e| RunError::Other(format!("failed to create calibrated dir: {e}")))?;
 
             // Owner decision 2026-09-10 (same rule `stage_measure` uses): a
@@ -4651,6 +4727,8 @@ pub(crate) struct FanOutTicker {
     /// `bytes_done` until the commit loop emits each group's real figure (final review A, M3).
     bytes_done: u64,
     bytes_total: u64,
+    /// The event's `message` ([`Self::with_message`]); `None` for every stage but Register's two passes.
+    message: Option<&'static str>,
 }
 
 impl FanOutTicker {
@@ -4706,7 +4784,14 @@ impl FanOutTicker {
             ))),
             bytes_done,
             bytes_total,
+            message: None,
         }
+    }
+
+    /// Every event this ticker emits carries `message` (Register's "checking the reference" / "aligning").
+    fn with_message(mut self, message: &'static str) -> Self {
+        self.message = Some(message);
+        self
     }
 
     /// Count in `scale` units per frame (Measure's two passes tick half a frame each, `scale = 2`): `done_so_far`
@@ -4758,7 +4843,7 @@ impl FanOutTicker {
                 bytes_done: self.bytes_done,
                 bytes_total: self.bytes_total,
                 frame_id,
-                message: None,
+                message: self.message.map(str::to_string),
             },
         );
         current
@@ -4900,15 +4985,21 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
         let hash = solve_hash(&plan.blake3, &identity);
         let conn = db(&rc.ctx)?.conn();
         let cached =
-            crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(frame_id))?
-                .is_some_and(|row| crate::stacking::solve::cached_outcome_holds(&row, &hash));
+            crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                artifact_group_key("solve", &key),
+                "solve",
+                Some(frame_id),
+            )?
+            .is_some_and(|row| crate::stacking::solve::cached_outcome_holds(&row, &hash));
         if cached {
             continue;
         }
         let calibrated = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            &key,
+            artifact_group_key("calibrated", &key),
             "calibrated",
             Some(frame_id),
         )?
@@ -5225,7 +5316,7 @@ fn stage_measure_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<
             );
             // Every file written gets its row BEFORE a cancel is honoured (R11c-5 (1)), group by group.
             for (&g, res) in p1_groups.iter().zip(&results) {
-                if let Err(e) = upsert_pass1_rows(rc, &groups[g], &prepared[g].state, res) {
+                if let Err(e) = upsert_pass1_rows(rc, &prepared[g].state, res) {
                     replay_measure_stash(rc, prepared.into_iter().map(|g| (g.warnings, g.exclusions)));
                     return Err(e);
                 }
@@ -5253,7 +5344,7 @@ fn stage_measure_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<
                     None if state.need_pass1.is_empty() => None,
                     None => {
                         let res = measure_pass1_queue(rc, group, &opts, &state, current, total);
-                        upsert_pass1_rows(rc, group, &state, &res)?;
+                        upsert_pass1_rows(rc, &state, &res)?;
                         Some(res)
                     }
                 };
@@ -5411,7 +5502,7 @@ fn measure_group_prepare(
             crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                &group.key,
+                artifact_group_key("calibrated", &group.key),
                 "calibrated",
                 Some(frame.frame_id),
             )?
@@ -5610,7 +5701,7 @@ fn measure_group_finish(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    &group.key,
+                    artifact_group_key("metrics", &group.key),
                     "metrics",
                     Some(frame.frame_id),
                 )?
@@ -5625,7 +5716,6 @@ fn measure_group_finish(
                                     fits_artifact_fresh(
                                         &conn,
                                         &rc.subject,
-                                        &group.key,
                                         frame.frame_id,
                                         Some(payload.as_str()),
                                         &expected_hash,
@@ -6066,6 +6156,19 @@ struct Pass2Done {
     fits: Vec<Vec<psf_signal::StarFit>>,
     written: bool,
 }
+/// What a phase-3 worker hands back when the member failed: the exclusion text, and whether the worker had already
+/// written the member's first-pass artifact (it ran pass 1 and pass 2 then failed). The artifact is the work of an
+/// expensive pass and is valid on its own, so its row is recorded either way (ruling R10 M3).
+struct Pass2Failed {
+    message: String,
+    written: bool,
+}
+/// Whether `calibrated` is a file Athenaeum writes and replaces itself: under the layout's `calibrated/` or `prepared/`
+/// root. A first pass keeps its stamp's modification time out of the comparison for those only (R12 (a)); a path
+/// spelled differently from the roots compares as not owned, the safe side.
+fn owns_calibrated_file(layout: &WorkingLayout, calibrated: &Path) -> bool {
+    calibrated.starts_with(layout.calibrated_root()) || calibrated.starts_with(layout.prepared_root())
+}
 /// One frame of the group on its way through the two passes.
 struct MeasureMember {
     idx: usize,
@@ -6076,19 +6179,34 @@ struct MeasureMember {
     cached: Option<(FrameMeasurement, String)>,
     /// The frame's own β per plane (pass 1, read or reused).
     own: Option<Vec<f64>>,
-    /// Where the first-pass artifact lives (or will).
+    /// Where the first-pass artifact is READ from: the fresh row's own path (spec §5.7: a row written before the
+    /// frame-level key keeps its old folder), else [`Self::layout_spill`].
     spill: PathBuf,
+    /// Where a first-pass artifact is WRITTEN: the current layout's path for this frame (flat, frame-only stem).
+    /// A refused or stale artifact is rewritten here, never at the old row path, so the write's
+    /// [`replace_frame_level_file`] retires a legacy `measured/<old_key>/` file (ruling R6 M1).
+    layout_spill: PathBuf,
     /// The artifact's key ([`pass1_hash_for`]).
     pass1_key: String,
     source: Pass1Source,
+    /// The calibrated file is not one Athenaeum writes (not under the layout's `calibrated/` or `prepared/`: an attested
+    /// light or a project replica used in place), so its modification time is part of the first pass's stamp (R12 (a)).
+    strict_mtime: bool,
     /// A fresh artifact row exists but its head is not validated yet: the member's own β came from its `metrics`
     /// row, so the artifact is only validated once the member is known to need pass 2 (R11c-5 (3)).
     spill_pending: bool,
 }
 /// The artifact's head validated against the calibrated file now: usable, or `None` after the log line that says
 /// why (stale before use `debug!`, any other refusal `warn!`).
-fn validate_pass1_spill(run_id: i64, frame_id: i64, spill: &Path, path: &Path) -> Option<Pass1Head> {
-    let usable = read_pass1_head(spill).and_then(|head| check_pass1_head(&head, path).map(|()| head));
+fn validate_pass1_spill(
+    run_id: i64,
+    frame_id: i64,
+    spill: &Path,
+    path: &Path,
+    strict_mtime: bool,
+) -> Option<Pass1Head> {
+    let usable = read_pass1_head(spill)
+        .and_then(|head| check_pass1_head(&head, path, strict_mtime).map(|()| head));
     match usable {
         Ok(head) => Some(head),
         // Found stale before use: the calibrated file is not the one the artifact was read from.
@@ -6223,12 +6341,14 @@ fn measure_two_pass_prepare(
             let conn = db(&rc.ctx)?.conn();
             rc.memo.calibration_hash_checked(&conn, cfg, &frame)?
         };
-        let stem = calibrated_file_stem(group, &frame);
+        let stem = frame_file_stem(&frame);
         let mut member = MeasureMember {
             idx,
             frame,
+            strict_mtime: !owns_calibrated_file(&rc.layout, &path),
             path,
-            spill: rc.layout.measured_path(&group.key, &stem),
+            spill: rc.layout.measured_path(&stem),
+            layout_spill: rc.layout.measured_path(&stem),
             pass1_key: pass1_hash_for(cfg, &calib_hash),
             calib_hash,
             cached: None,
@@ -6243,14 +6363,14 @@ fn measure_two_pass_prepare(
                     crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        &group.key,
+                        artifact_group_key("metrics", &group.key),
                         "metrics",
                         Some(member.frame.frame_id),
                     )?,
                     crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        &group.key,
+                        artifact_group_key(PASS1_ARTIFACT_KIND, &group.key),
                         PASS1_ARTIFACT_KIND,
                         Some(member.frame.frame_id),
                     )?,
@@ -6277,16 +6397,26 @@ fn measure_two_pass_prepare(
                     }
                 }
             }
-            if spilled.is_some_and(|row| is_fresh(&row, &member.pass1_key)) {
+            if let Some(row) = spilled.filter(|row| is_fresh(row, &member.pass1_key)) {
+                // The row's own path is the artifact (spec §5.7: a row written before the frame-level key keeps its
+                // `measured/<group_key>/` path, and a frame's stem may have changed since): the layout path is only
+                // for a new write. A fresh row without a path reads as absent (`is_fresh` requires one).
+                if let Some(path) = row.path.as_deref() {
+                    member.spill = PathBuf::from(path);
+                }
                 if member.own.is_none() {
                     if let Some(head) = validate_pass1_spill(
                         rc.run_id,
                         member.frame.frame_id,
                         &member.spill,
                         &member.path,
+                        member.strict_mtime,
                     ) {
                         member.source = Pass1Source::Artifact;
                         member.own = Some(head.beta_own);
+                    } else {
+                        // Refused or stale: pass 1 re-runs and writes the current layout's path.
+                        member.spill = member.layout_spill.clone();
                     }
                 } else {
                     member.spill_pending = true;
@@ -6323,7 +6453,7 @@ fn pass1_jobs(state: &TwoPassState) -> Vec<(i64, PathBuf, PathBuf)> {
             (
                 state.members[i].frame.frame_id,
                 state.members[i].path.clone(),
-                state.members[i].spill.clone(),
+                state.members[i].layout_spill.clone(),
             )
         })
         .collect()
@@ -6400,7 +6530,6 @@ fn measure_pass1_queue(
 /// Every pass-1 file written gets its row BEFORE a cancel is honoured: a cancelled run's re-run reuses it (R11c-5 (1)).
 fn upsert_pass1_rows(
     rc: &RunContext,
-    group: &IntegrationGroup,
     state: &TwoPassState,
     results: &[Option<Result<Pass1Done, String>>],
 ) -> Result<(), RunError> {
@@ -6408,9 +6537,8 @@ fn upsert_pass1_rows(
         if let Some(Ok(Pass1Done { written: true, .. })) = res {
             upsert_pass1_row(
                 rc,
-                group,
                 &state.members[i].frame,
-                &state.members[i].spill,
+                &state.members[i].layout_spill,
                 &state.members[i].pass1_key,
             )?;
         }
@@ -6523,7 +6651,6 @@ fn measure_two_pass_rest(
                     fits_artifact_fresh_for_planes(
                         &conn,
                         &rc.subject,
-                        &group.key,
                         members[i].frame.frame_id,
                         m.channels.len(),
                         &expected,
@@ -6572,10 +6699,14 @@ fn measure_two_pass_rest(
                 members[i].frame.frame_id,
                 &members[i].spill,
                 &members[i].path,
+                members[i].strict_mtime,
             )
             .is_some()
             {
                 members[i].source = Pass1Source::Artifact;
+            } else {
+                // Refused or stale: pass 1 re-runs here and writes the current layout's path.
+                members[i].spill = members[i].layout_spill.clone();
             }
         }
     }
@@ -6595,17 +6726,19 @@ fn measure_two_pass_rest(
             "pass2",
         );
     }
-    // Per job: the frame, its calibrated file, its artifact, where its first pass comes from, and whether its first
-    // half was already ticked by phase 1.
-    let jobs: Vec<(i64, PathBuf, PathBuf, Pass1Source, bool)> = need_pass2
+    // Per job: the frame, its calibrated file, the artifact it reads, the layout path a re-run first pass writes,
+    // where its first pass comes from, and whether its first half was already ticked by phase 1.
+    let jobs: Vec<(i64, PathBuf, PathBuf, PathBuf, Pass1Source, bool, bool)> = need_pass2
         .iter()
         .map(|&i| {
             (
                 members[i].frame.frame_id,
                 members[i].path.clone(),
                 members[i].spill.clone(),
+                members[i].layout_spill.clone(),
                 members[i].source,
                 need_pass1.contains(&i),
+                members[i].strict_mtime,
             )
         })
         .collect();
@@ -6628,11 +6761,11 @@ fn measure_two_pass_rest(
         &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
         FanOutLabel::new(rc, Stage::Measure, Some(&group.key), "pass2"),
         cancel_ref,
-        move |(frame_id, path, spill, source, first_half_ticked)| {
+        move |(frame_id, path, spill, layout_spill, source, first_half_ticked, strict_mtime)| {
             // The first pass: the artifact (the checksum, the stamp), else pass 1 here — which also writes the
             // artifact — for a member owed it or whose artifact is refused now.
             let from_artifact = match source {
-                Pass1Source::Artifact => match read_pass1(&spill, &path, opts) {
+                Pass1Source::Artifact => match read_pass1(&spill, &path, opts, strict_mtime) {
                     Ok(p) => Some(p),
                     Err(e) => {
                         tracing::warn!(
@@ -6648,11 +6781,16 @@ fn measure_two_pass_rest(
             };
             let first = match from_artifact {
                 Some(p) => Ok((p, false)),
-                None => run_pass1_and_spill(frame_id, &path, &spill, opts, pool_ref, cancel_ref),
+                None => run_pass1_and_spill(frame_id, &path, &layout_spill, opts, pool_ref, cancel_ref),
             };
-            // One β per plane of THIS read (a group of one's planes included): every plane at the group β.
-            let out = first
-                .and_then(|(p, written)| {
+            // One β per plane of THIS read (a group of one's planes included): every plane at the group β. A failure
+            // keeps `written` so the controller still records the artifact a failed pass 2 left behind.
+            let out = match first {
+                Err(e) => Err(Pass2Failed {
+                    message: format!("measurement failed: {e}"),
+                    written: false,
+                }),
+                Ok((p, written)) => {
                     let betas = vec![group_beta; p.beta_own().len()];
                     measure_frame_pass2(&path, p, &betas, opts, Some(pool_ref), cancel_ref)
                         .map(|(measurement, fits)| Pass2Done {
@@ -6660,8 +6798,12 @@ fn measure_two_pass_rest(
                             fits,
                             written,
                         })
-                })
-                .map_err(|e| format!("measurement failed: {e}"));
+                        .map_err(|e| Pass2Failed {
+                            message: format!("measurement failed: {e}"),
+                            written,
+                        })
+                }
+            };
             // Phase 1 already ticked the first half of a member it ran; any other member ticks both halves here.
             ticker_ref.tick_units(Some(frame_id), if first_half_ticked { 1 } else { 2 });
             out
@@ -6669,12 +6811,11 @@ fn measure_two_pass_rest(
     );
     // Every artifact a worker wrote gets its row BEFORE a cancel is honoured, as in phase 1.
     for (&i, res) in need_pass2.iter().zip(&results) {
-        if let Some(Ok(Pass2Done { written: true, .. })) = res {
+        if let Some(Ok(Pass2Done { written: true, .. }) | Err(Pass2Failed { written: true, .. })) = res {
             upsert_pass1_row(
                 rc,
-                group,
                 &members[i].frame,
-                &members[i].spill,
+                &members[i].layout_spill,
                 &members[i].pass1_key,
             )?;
         }
@@ -6683,7 +6824,9 @@ fn measure_two_pass_rest(
     for (&i, res) in need_pass2.iter().zip(results) {
         match res {
             None => return Err(RunError::Cancelled),
-            Some(Err(msg)) => exclude_measured_member(rc, &mut entries[members[i].idx], msg),
+            Some(Err(failed)) => {
+                exclude_measured_member(rc, &mut entries[members[i].idx], failed.message)
+            }
             Some(Ok(done)) => {
                 let expected = measurement_hash_for(cfg, &members[i].calib_hash, Some(group_beta));
                 persist_measurement(
@@ -6705,19 +6848,27 @@ fn measure_two_pass_rest(
 /// run's re-run reuses it). The identity recorded is the file's own, as `fits.<plane>`'s is.
 fn upsert_pass1_row(
     rc: &RunContext,
-    group: &IntegrationGroup,
     frame: &GroupFrame,
     spill: &Path,
     key: &str,
 ) -> Result<(), RunError> {
     let (size, modified_at) = file_identity(spill)?;
     let conn = db(&rc.ctx)?.conn();
+    // The row this write replaces, read BEFORE the upsert: its file goes once nothing points to it (a frame whose
+    // stem or folder changed since the old row was written).
+    let old = crate::db::stacking::find_artifact(
+        &conn,
+        &rc.subject,
+        artifact_group_key(PASS1_ARTIFACT_KIND, ""),
+        PASS1_ARTIFACT_KIND,
+        Some(frame.frame_id),
+    )?;
     upsert_artifact(
         &conn,
         &NewArtifact {
             subject: &rc.subject,
             frame_id: Some(frame.frame_id),
-            group_key: &group.key,
+            group_key: artifact_group_key(PASS1_ARTIFACT_KIND, ""),
             kind: PASS1_ARTIFACT_KIND,
             path: spill.to_str(),
             config_hash: key,
@@ -6726,6 +6877,7 @@ fn upsert_pass1_row(
             payload_json: None,
         },
     )?;
+    replace_frame_level_file(&conn, &rc.layout.measured_root(), old.as_ref(), spill);
     Ok(())
 }
 
@@ -6767,7 +6919,7 @@ fn persist_measurement(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(frame.frame_id),
-                group_key: &group.key,
+                group_key: artifact_group_key("metrics", &group.key),
                 kind: "metrics",
                 path: None,
                 config_hash: expected_hash,
@@ -6783,9 +6935,9 @@ fn persist_measurement(
     // plane, keyed on the SAME `expected_hash` — the two
     // are a product of the same computation and share
     // its staleness (see `plan.rs`'s per-frame loop).
-    let stem = calibrated_file_stem(group, frame);
+    let stem = frame_file_stem(frame);
     for (plane, plane_fits) in fits.iter().enumerate() {
-        let fits_path = rc.layout.fits_path(&group.key, &stem, plane);
+        let fits_path = rc.layout.fits_path(&stem, plane);
         // Final fix wave (ruling C-30, the whole-branch
         // review's I1): a `.athf` write failure DEGRADES,
         // it does not fail the run. Every consumer of
@@ -6857,12 +7009,20 @@ fn persist_measurement(
         let (size, modified_at) = file_identity(&fits_path)?;
         let kind = fits_artifact::artifact_kind(plane);
         let conn = db(&rc.ctx)?.conn();
+        // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
+        let old = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key(&kind, &group.key),
+            &kind,
+            Some(frame.frame_id),
+        )?;
         upsert_artifact(
             &conn,
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(frame.frame_id),
-                group_key: &group.key,
+                group_key: artifact_group_key(&kind, &group.key),
                 kind: &kind,
                 path: fits_path.to_str(),
                 config_hash: expected_hash,
@@ -6871,6 +7031,7 @@ fn persist_measurement(
                 payload_json: None,
             },
         )?;
+        replace_frame_level_file(&conn, &rc.layout.fits_root(), old.as_ref(), &fits_path);
     }
     Ok(())
 }
@@ -7448,8 +7609,7 @@ struct RegisterItem {
     frame_id: i64,
     /// Perf tier A Task 6a fix round 1: kept whole (not just `frame_id`) —
     /// the worker's own registered-artifact write needs it for
-    /// `calibrated_file_stem` (which checks stem collisions against every
-    /// OTHER member of the group).
+    /// `frame_file_stem`.
     frame: GroupFrame,
     path: PathBuf,
     is_reference: bool,
@@ -7685,6 +7845,21 @@ fn resolve_register_fits(
     if planes != 1 {
         return None;
     }
+    // Ruling R3 (b): the invariant is structural. Registration folds Measure's output only for a group whose frames
+    // read `fits.0` (`register_reads_measure_fits`), so a group that does not read it never reaches the artifact: a
+    // frame that calibrates to one plane inside a three-plane group (an unparseable BAYERPAT) detects instead, the
+    // safe direction.
+    let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
+    let reads_fits = rc
+        .plan_groups
+        .iter()
+        .find(|g| g.key == group_key)
+        .is_some_and(|g| {
+            crate::stacking::plan::register_reads_measure_fits(&rc.config, g, prepare_path)
+        });
+    if !reads_fits {
+        return None;
+    }
     let expected_hash = group_measurement_hash(rc, &rc.config, group_key, calibrated_hash);
     let kind = fits_artifact::artifact_kind(0);
 
@@ -7698,7 +7873,6 @@ fn resolve_register_fits(
         Ok(fits_artifact_fresh_for_planes(
             &conn,
             &rc.subject,
-            group_key,
             frame_id,
             planes,
             &expected_hash,
@@ -7737,7 +7911,7 @@ fn resolve_register_fits(
         Ok(crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            group_key,
+            artifact_group_key(&kind, group_key),
             &kind,
             Some(frame_id),
         )?)
@@ -7883,6 +8057,81 @@ fn note_low_inlier_frames(rc: &RunContext, group: &IntegrationGroup) {
     warn_low_inlier_frames(rc.run_id, &group.key, &rows);
 }
 
+/// The Register stage's progress `message` (frame-level cache spec §5.6): the two-pass dry pass.
+const REGISTER_MESSAGE_CHECKING: &str = "checking the reference";
+/// The Register stage's progress `message` for the persisting pass.
+const REGISTER_MESSAGE_ALIGNING: &str = "aligning";
+
+/// The reference's term of every member's registration hash (ruling R3 (a), [`reference_measurement_fold`]): its own
+/// Measure output when it lives in a group other than `group`, `""` otherwise. `reference_hash` is the reference's
+/// calibration hash. The one place the run, the gate and the two-pass key resolve it.
+///
+/// [`reference_measurement_fold`]: crate::stacking::plan::reference_measurement_fold
+fn reference_measurement_term(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    prepare_path: bool,
+) -> Result<String, RunError> {
+    let reference_group = rc
+        .plan_groups
+        .iter()
+        .find(|g| g.frames.iter().any(|f| f.frame_id == reference_frame_id))
+        .ok_or_else(|| {
+            RunError::Other(format!(
+                "registration reference (frame {reference_frame_id}) is in no group"
+            ))
+        })?;
+    Ok(crate::stacking::plan::reference_measurement_fold(
+        &rc.config,
+        group,
+        reference_group,
+        prepare_path,
+        reference_hash,
+        rc.measured_groups
+            .get(&reference_group.key)
+            .and_then(|g| g.beta),
+    ))
+}
+
+/// One member's calibration hash and the registration hash a row for it must carry against the reference (ruling
+/// R3 (d)): exactly what [`register_group_pass`] compares a stored row to, and what the two-pass decision key folds.
+/// `reference_measurement_hash` is [`reference_measurement_term`]'s value.
+fn member_registration_hash(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    frame: &GroupFrame,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    reference_measurement_hash: &str,
+    prepare_path: bool,
+) -> Result<(String, String), RunError> {
+    let cfg = rc.config.clone();
+    let frame_hash = {
+        let conn = db(&rc.ctx)?.conn();
+        rc.memo.calibration_hash_checked(&conn, &cfg, frame)?
+    };
+    // Ruling C-18: the same measurement hash `plan.rs`'s `compute_register_stale` folds in - must match, or the gate
+    // and the run disagree about whether a stored registration row is fresh.
+    let frame_measurement_hash = crate::stacking::plan::registration_measurement_fold(
+        &cfg,
+        group,
+        prepare_path,
+        &frame_hash,
+        rc.measured_groups.get(&group.key).and_then(|g| g.beta),
+    );
+    let expected = registration_hash_for(
+        &cfg,
+        reference_frame_id,
+        reference_hash,
+        &frame_hash,
+        &frame_measurement_hash,
+        reference_measurement_hash,
+    );
+    Ok((frame_hash, expected))
+}
+
 /// ONE registration pass over ONE group (M4a Task 4, ruling R-M4a-5 — the
 /// body [`stage_register`]'s per-group loop used to inline).
 ///
@@ -7919,6 +8168,12 @@ fn register_group_pass(
     solves: &mut SolveCache,
 ) -> Result<Vec<PassResult>, RunError> {
     let cfg = rc.config.clone();
+    // Every event of the pass names it (frame-level cache spec §5.6).
+    let message = if persist {
+        REGISTER_MESSAGE_ALIGNING
+    } else {
+        REGISTER_MESSAGE_CHECKING
+    };
     let mut pass: Vec<PassResult> = Vec::new();
     let mut write_failures = RegisteredWriteFailures::default();
 
@@ -7988,23 +8243,23 @@ fn register_group_pass(
     // registrations whose artifact needs (re)writing — see the `reused`
     // branch below.
     let mut needs_artifact_rewrite: Vec<ArtifactRewriteItem> = Vec::new();
+    // Frame-level cache spec §5.5: the measurement hash is folded only for a frame whose registration reads
+    // `fits.0`; the gate derives the same flag (`plan::compute_register_stale`).
+    let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
+    // Ruling R3 (a): the reference's own Measure output, when its fits seed the reference stars and its group is not
+    // this one (`plan::reference_measurement_fold`; the gate resolves the same value).
+    let reference_measurement_hash =
+        reference_measurement_term(rc, group, reference_frame_id, reference_hash, prepare_path)?;
     for (idx, frame, path, is_reference) in snapshot {
-        let frame_hash = {
-            let conn = db(&rc.ctx)?.conn();
-            rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
-        };
-        // Ruling C-18: the same measurement hash `plan.rs`'s
-        // `compute_register_stale` folds in — must match, or the gate and
-        // the run disagree about whether a stored registration row is
-        // fresh.
-        let frame_measurement_hash = group_measurement_hash(rc, &cfg, &group.key, &frame_hash);
-        let expected_hash = registration_hash_for(
-            &cfg,
+        let (frame_hash, expected_hash) = member_registration_hash(
+            rc,
+            group,
+            &frame,
             reference_frame_id,
             reference_hash,
-            &frame_hash,
-            &frame_measurement_hash,
-        );
+            &reference_measurement_hash,
+            prepare_path,
+        )?;
 
         let mut reused: Option<RegisteredFrameOutcome> = None;
         if persist && !force_fresh {
@@ -8136,7 +8391,7 @@ fn register_group_pass(
                     0,
                     0,
                     Some(frame.frame_id),
-                    None,
+                    Some(message.to_string()),
                 );
             }
         } else {
@@ -8255,9 +8510,10 @@ fn register_group_pass(
         "register",
     );
     // Perf tier A Task 6a fix round 1: both fan-outs below write into the
-    // SAME per-group directory — created once here rather than once per
-    // frame inside the old `write_registered_artifact`.
-    let out_dir = rc.layout.registered_dir(&group.key);
+    // SAME directory — created once here rather than once per frame inside
+    // the old `write_registered_artifact`. Flat since the frame-level cache
+    // (spec §5.1): a frame's registered file does not move with its group.
+    let out_dir = rc.layout.registered_dir();
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| RunError::Other(format!("creating {}: {e}", out_dir.display())))?;
     let interp = cfg.registration.interpolation;
@@ -8284,7 +8540,6 @@ fn register_group_pass(
         let out_dir_ref = &out_dir;
         let reference_name_ref = &reference_name;
         let grid_hash_ref = compose.as_ref().map(|(g, _)| g.hash.as_str());
-        let group_ref = group;
         let cancel_ref: &AtomicBool = &rc.cancel;
         let rewrite_ticker = FanOutTicker::new(
             rc,
@@ -8294,7 +8549,8 @@ fn register_group_pass(
             progress.1,
             0,
             0,
-        );
+        )
+        .with_message(message);
         let rewrite_ticker_ref = &rewrite_ticker;
         let rewrite_results = fan_out(
             needs_artifact_rewrite,
@@ -8303,7 +8559,7 @@ fn register_group_pass(
             cancel_ref,
             move |item: ArtifactRewriteItem| -> Result<(i64, String, Result<PathBuf, String>), String> {
                 let frame_id = item.frame_id;
-                let stem = calibrated_file_stem(group_ref, &item.frame);
+                let stem = frame_file_stem(&item.frame);
                 let out = out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
                 let written = write_one_registered_frame(
                     &item.calibrated,
@@ -8433,7 +8689,8 @@ fn register_group_pass(
         progress.1,
         0,
         0,
-    );
+    )
+    .with_message(message);
     let ticker_ref = &ticker;
     let cancel_ref: &AtomicBool = &rc.cancel;
     let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
@@ -8558,7 +8815,7 @@ fn register_group_pass(
                                 (map, hash)
                             }
                         };
-                        let stem = calibrated_file_stem(group, &item.frame);
+                        let stem = frame_file_stem(&item.frame);
                         let out_path =
                             out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
                         let (written, write_error) = match write_one_registered_frame(
@@ -8808,7 +9065,7 @@ fn register_group_pass(
         0,
         0,
         None,
-        None,
+        Some(message.to_string()),
     );
 
     write_failures.flush(rc, group);
@@ -8868,6 +9125,322 @@ fn two_pass_candidates(
         .collect()
 }
 
+/// The group-level payload row of a two-pass dry pass's decision (frame-level cache spec §5.6): `config_hash` is
+/// [`two_pass_key`], payload `{"switchTo": <frame id> | null}`. Group-level ([`artifact_group_key`]), outside
+/// `paths::INTERMEDIATE_ARTIFACT_KINDS` (survives "Delete intermediates"), dropped by "All".
+pub(crate) const TWO_PASS_ARTIFACT_KIND: &str = "two_pass";
+
+/// The decision a `two_pass` row holds.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TwoPassPayload {
+    switch_to: Option<i64>,
+}
+
+/// What the pick draws its finalists from (ruling R14 (a)): the whole weight ranking, not only the top
+/// `TWO_PASS_CANDIDATES` of it, because a member entering or leaving the top ranks through a weight edit or a
+/// floor edit changes the pick's input.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TwoPassRanking {
+    /// Every included member the pick can draw from with a finite weight, ids in rank order (weight descending, the
+    /// lower index first on a tie).
+    ranked: Vec<i64>,
+    /// The ids among them whose weight is not finite (the pick drops them), ascending.
+    non_finite: Vec<i64>,
+    /// The included members under the Measure-time floor that the PSF modes defer, ascending; the candidate reference
+    /// is left out (it stays a candidate whatever its flag).
+    floored: Vec<i64>,
+}
+
+/// The key of a two-pass decision: everything the dry pass and the pick read. The registration subtree (the dry
+/// pass registers with it), [`TWO_PASS_PICK_VERSION`], the candidate reference and its calibration hash, the
+/// [`TwoPassRanking`] (the full ranking, the members whose weight is not finite, the members under the Measure-time
+/// floor), a project's WCS-allowed ids, and every included member's registration hash against the candidate (which
+/// carries the member's calibration and, where registration reads Measure's fits, its measurement). Registration is
+/// deterministic (RQ-1), so equal inputs give the equal decision.
+pub(crate) fn two_pass_key(
+    cfg: &StackingConfig,
+    candidate_id: i64,
+    candidate_calib_hash: &str,
+    ranking: &TwoPassRanking,
+    allowed_ids: Option<&[i64]>,
+    member_hashes: &[(i64, String)],
+) -> String {
+    two_pass_key_with_version(
+        cfg,
+        TWO_PASS_PICK_VERSION,
+        candidate_id,
+        candidate_calib_hash,
+        ranking,
+        allowed_ids,
+        member_hashes,
+    )
+}
+
+/// [`two_pass_key`] with the pick version supplied, so a test can prove the key follows it.
+fn two_pass_key_with_version(
+    cfg: &StackingConfig,
+    pick_version: u32,
+    candidate_id: i64,
+    candidate_calib_hash: &str,
+    ranking: &TwoPassRanking,
+    allowed_ids: Option<&[i64]>,
+    member_hashes: &[(i64, String)],
+) -> String {
+    let join = |ids: &[i64]| {
+        ids.iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut upstream: Vec<String> = vec![
+        format!("pick:{pick_version}"),
+        format!("top:{}", crate::stacking::weights::TWO_PASS_CANDIDATES),
+        format!("gain:{:?}", crate::stacking::weights::TWO_PASS_MIN_GAIN_PX),
+        format!("ref:{candidate_id}"),
+        candidate_calib_hash.to_string(),
+        format!("ranked:{}", join(&ranking.ranked)),
+        format!("unweighed:{}", join(&ranking.non_finite)),
+        format!("floored:{}", join(&ranking.floored)),
+    ];
+    if let Some(allowed) = allowed_ids {
+        upstream.push(format!("allowed:{}", join(allowed)));
+    }
+    for (id, hash) in member_hashes {
+        upstream.push(format!("member:{id}:{hash}"));
+    }
+    let refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
+    crate::stacking::config::stage_hash(
+        &crate::stacking::config::registration_subtree(cfg),
+        &refs,
+        &[],
+    )
+}
+
+/// One group's two-pass cache lookup: the key, and the stored decision when the row is fresh.
+struct TwoPassLookup {
+    key: String,
+    /// `Some(switch_to)` on a hit.
+    cached: Option<Option<i64>>,
+}
+
+/// The [`TwoPassRanking`] of a group's entries: the included frames with a calibrated file, the current reference
+/// whatever its flag and every other one only when it is not under the Measure-time floor (as in
+/// [`two_pass_candidates`]), restricted to `allowed` on a project. The finite-weight ones are ordered by weight with
+/// the lower index first on a tie, as `weights::two_pass_pick_among` orders them, and NOT cut to the top N.
+fn two_pass_ranking(
+    entries: &[MeasuredFrame],
+    reference_frame_id: i64,
+    allowed: Option<&HashSet<i64>>,
+) -> TwoPassRanking {
+    let mut floored: Vec<i64> = entries
+        .iter()
+        .filter(|e| e.included && e.calibrated.is_some())
+        .filter(|e| e.measure_floored && e.frame.frame_id != reference_frame_id)
+        .map(|e| e.frame.frame_id)
+        .collect();
+    floored.sort_unstable();
+    let mut ranked: Vec<(usize, f64, i64)> = Vec::new();
+    let mut non_finite: Vec<i64> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        if !(e.included && e.calibrated.is_some()) {
+            continue;
+        }
+        let id = e.frame.frame_id;
+        if id != reference_frame_id && (e.measure_floored || allowed.is_some_and(|a| !a.contains(&id))) {
+            continue;
+        }
+        let weight = e.weight.as_ref().map_or(0.0, |w| w.normalized_mean);
+        if weight.is_finite() {
+            ranked.push((i, weight, id));
+        } else {
+            non_finite.push(id);
+        }
+    }
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    non_finite.sort_unstable();
+    TwoPassRanking {
+        ranked: ranked.into_iter().map(|(_, _, id)| id).collect(),
+        non_finite,
+        floored,
+    }
+}
+
+/// The two-pass key of `group` against the candidate reference, and the stored decision when its `two_pass` row is
+/// fresh. `force_fresh` (a rerun from Register or earlier) never reads the row. A row that is stale, unparseable, or
+/// names a frame this group cannot adopt reads as a miss (the last two are logged). Member hashes go through
+/// [`member_registration_hash`], the very call [`register_group_pass`] compares its stored rows with (ruling R3 (d)).
+fn two_pass_lookup(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    force_fresh: bool,
+) -> Result<TwoPassLookup, RunError> {
+    let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
+    let reference_measurement_hash =
+        reference_measurement_term(rc, group, reference_frame_id, reference_hash, prepare_path)?;
+    let members: Vec<GroupFrame> = rc
+        .measured
+        .get(&group.key)
+        .map(|v| {
+            v.iter()
+                .filter(|e| e.included && e.calibrated.is_some())
+                .map(|e| e.frame.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut member_hashes: Vec<(i64, String)> = Vec::with_capacity(members.len());
+    for frame in &members {
+        let (_, hash) = member_registration_hash(
+            rc,
+            group,
+            frame,
+            reference_frame_id,
+            reference_hash,
+            &reference_measurement_hash,
+            prepare_path,
+        )?;
+        member_hashes.push((frame.frame_id, hash));
+    }
+    member_hashes.sort_by_key(|(id, _)| *id);
+
+    let allowed: Option<HashSet<i64>> = rc.wcs_rule.as_ref().map(|rule| {
+        members
+            .iter()
+            .map(|f| f.frame_id)
+            .filter(|id| rule.candidates.contains(id))
+            .collect()
+    });
+    let allowed_ids: Option<Vec<i64>> = allowed.as_ref().map(|set| {
+        let mut ids: Vec<i64> = set.iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    });
+    let ranking = rc
+        .measured
+        .get(&group.key)
+        .map(|v| two_pass_ranking(v, reference_frame_id, allowed.as_ref()))
+        .unwrap_or_default();
+    let key = two_pass_key(
+        &rc.config,
+        reference_frame_id,
+        reference_hash,
+        &ranking,
+        allowed_ids.as_deref(),
+        &member_hashes,
+    );
+    if force_fresh {
+        return Ok(TwoPassLookup { key, cached: None });
+    }
+
+    let row = {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key(TWO_PASS_ARTIFACT_KIND, &group.key),
+            TWO_PASS_ARTIFACT_KIND,
+            None,
+        )?
+    };
+    let cached = row.filter(|r| r.config_hash == key).and_then(|r| {
+        let payload: TwoPassPayload = match r
+            .payload_json
+            .as_deref()
+            .map(serde_json::from_str::<TwoPassPayload>)
+        {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    error = %e,
+                    "two-pass decision unreadable; checking the reference again"
+                );
+                return None;
+            }
+            None => return None,
+        };
+        if let Some(id) = payload.switch_to {
+            let adoptable = id != reference_frame_id
+                && members.iter().any(|f| f.frame_id == id)
+                && rc
+                    .measured
+                    .get(&group.key)
+                    .is_some_and(|v| v.iter().any(|e| e.frame.frame_id == id && e.in_reference_pick()));
+            if !adoptable {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    frame_id = id,
+                    "two-pass decision names a frame this group cannot adopt; checking the reference again"
+                );
+                return None;
+            }
+        }
+        Some(payload.switch_to)
+    });
+    Ok(TwoPassLookup { key, cached })
+}
+
+/// [`two_pass_lookup`] after the Register boundary of the landed-file identity check (ruling R14 (b)): a member whose
+/// landed file changed is excluded FIRST, so a hit and a miss see the same members and a cached decision cannot name a
+/// member this run is about to drop. `exclude_changed_members` is idempotent, so the persisting pass repeats it for
+/// nothing. `None` when fewer than 3 included members remain: no decision to look up, and the pass is skipped.
+fn two_pass_lookup_after_identity_check(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    force_fresh: bool,
+) -> Result<Option<TwoPassLookup>, RunError> {
+    exclude_changed_members(rc, group)?;
+    if included_count_of(rc, &group.key) < 3 {
+        return Ok(None);
+    }
+    two_pass_lookup(rc, group, reference_frame_id, reference_hash, force_fresh).map(Some)
+}
+
+/// Record the dry pass's decision under the key [`two_pass_lookup`] computed before it ran. A failed write is logged
+/// and costs only the next run its cache hit.
+fn store_two_pass_decision(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    lookup: &TwoPassLookup,
+    switch_to: Option<i64>,
+) {
+    let payload = match serde_json::to_string(&TwoPassPayload { switch_to }) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(run_id = rc.run_id, group_key = %group.key, error = %e, "two-pass decision not recorded");
+            return;
+        }
+    };
+    let written = db(&rc.ctx).map_err(|e| e.to_string()).and_then(|d| {
+        let conn = d.conn();
+        upsert_artifact(
+            &conn,
+            &NewArtifact {
+                subject: &rc.subject,
+                frame_id: None,
+                group_key: artifact_group_key(TWO_PASS_ARTIFACT_KIND, &group.key),
+                kind: TWO_PASS_ARTIFACT_KIND,
+                path: None,
+                config_hash: &lookup.key,
+                size: None,
+                modified_at: None,
+                payload_json: Some(&payload),
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    });
+    if let Err(error) = written {
+        tracing::warn!(run_id = rc.run_id, group_key = %group.key, error = %error, "two-pass decision not recorded");
+    }
+}
+
 /// ONE group's two-pass dry pass and re-pick (M4a ruling R-M4a-5, factored
 /// out of `stage_register` by M4b Task 3 so both geometry modes run the
 /// SAME pick: co-registered runs it once, over the run reference's own
@@ -8899,7 +9472,39 @@ fn two_pass_refine(
     progress: &mut (usize, usize),
     solves: &mut SolveCache,
 ) -> Result<Option<TwoPassSwitch>, RunError> {
-    let cfg = rc.config.clone();
+    // Frame-level cache spec §5.6: the decision of an earlier run on the same inputs. A hit skips the dry pass; the
+    // switch is built through `adopt_two_pass_pick`'s fresh-detection fallback (`rc.dry_pass_stars` is empty).
+    let Some(lookup) =
+        two_pass_lookup_after_identity_check(rc, group, reference_frame_id, reference_hash, force_fresh)?
+    else {
+        return Ok(None);
+    };
+    if let Some(cached) = lookup.cached {
+        tracing::info!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            frame_id = reference_frame_id,
+            "two-pass decision reused"
+        );
+        let Some(switch_to) = cached else {
+            return Ok(None);
+        };
+        // `two_pass_lookup` only reports a hit for a frame of this group.
+        let Some(new_idx) = rc
+            .measured
+            .get(&group.key)
+            .and_then(|v| v.iter().position(|e| e.frame.frame_id == switch_to))
+        else {
+            return Ok(None);
+        };
+        return adopt_two_pass_pick(rc, group, new_idx, reference_frame_id, None);
+    }
+    // The identity check may have excluded the only frame the re-pick could land on (ruling R15): no dry pass then,
+    // and the progress totals do not count one.
+    if !group_can_switch(rc, &group.key, reference_frame_id) {
+        return Ok(None);
+    }
+
     let pass = register_group_pass(
         rc,
         group,
@@ -8972,6 +9577,8 @@ fn two_pass_refine(
         ),
     };
     let Some(new_idx) = pick else {
+        // A real decision: no candidate beats the current reference.
+        store_two_pass_decision(rc, group, &lookup, None);
         return Ok(None);
     };
 
@@ -8979,6 +9586,31 @@ fn two_pass_refine(
         two_pass_deviation_px(&candidates, reference_idx, diagonal_px).unwrap_or(f64::NAN);
     let corner_px_after =
         two_pass_deviation_px(&candidates, new_idx, diagonal_px).unwrap_or(f64::NAN);
+    let switch = adopt_two_pass_pick(
+        rc,
+        group,
+        new_idx,
+        reference_frame_id,
+        Some((corner_px_before, corner_px_after)),
+    )?;
+    if let Some(switch) = &switch {
+        store_two_pass_decision(rc, group, &lookup, Some(switch.frame_id));
+    }
+    Ok(switch)
+}
+
+/// Resolve the frame at `new_idx` of the group into a [`TwoPassSwitch`]: the end of [`two_pass_refine`], shared by a
+/// dry-pass pick and a cached decision. `corner_px` is the pick's `(before, after)` corner displacement, `None` when
+/// the decision comes from the cache (the dry pass did not run, so `rc.dry_pass_stars` is empty and the stars come
+/// from the fresh-detection fallback below). `Ok(None)` keeps the current reference, with a warn.
+fn adopt_two_pass_pick(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    new_idx: usize,
+    reference_frame_id: i64,
+    corner_px: Option<(f64, f64)>,
+) -> Result<Option<TwoPassSwitch>, RunError> {
+    let cfg = rc.config.clone();
     let picked = rc
         .measured
         .get(&group.key)
@@ -9111,20 +9743,37 @@ fn two_pass_refine(
         Ok(prepared) => prepared,
     };
 
-    tracing::info!(
-        run_id = rc.run_id,
-        group_key = %group.key,
-        from = reference_frame_id,
-        to = new_frame_id,
-        corner_px_before,
-        corner_px_after,
-        "reference switched by the two-pass pick"
-    );
-    rc.warnings.push(format!(
-        "reference switched by the two-pass pick: {reference_frame_id} → \
-         {new_frame_id} (corner displacement \
-         {corner_px_before:.1} → {corner_px_after:.1} px)"
-    ));
+    match corner_px {
+        Some((corner_px_before, corner_px_after)) => {
+            tracing::info!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                from = reference_frame_id,
+                to = new_frame_id,
+                corner_px_before,
+                corner_px_after,
+                "reference switched by the two-pass pick"
+            );
+            rc.warnings.push(format!(
+                "reference switched by the two-pass pick: {reference_frame_id} → \
+                 {new_frame_id} (corner displacement \
+                 {corner_px_before:.1} → {corner_px_after:.1} px)"
+            ));
+        }
+        None => {
+            tracing::info!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                from = reference_frame_id,
+                to = new_frame_id,
+                "reference switched by the cached two-pass decision"
+            );
+            rc.warnings.push(format!(
+                "reference switched by the two-pass pick: {reference_frame_id} → \
+                 {new_frame_id} (cached decision)"
+            ));
+        }
+    }
 
     Ok(Some(TwoPassSwitch {
         from: reference_frame_id,
@@ -9197,6 +9846,52 @@ fn group_can_switch(rc: &RunContext, key: &str, reference_frame_id: i64) -> bool
     })
 }
 
+/// The Register progress total of a native run: every viable group's included members once, plus once more for
+/// each group that will run a dry pass (the same way the co-registered path counts them). The dry pass is counted
+/// only when, AFTER the identity check and the cache lookup (ruling R14 (b)), the decision is not cached and the
+/// group can still switch (ruling R15): a member the check excluded may have been the only frame the re-pick could
+/// land on, and `two_pass_refine` then skips the pass.
+fn native_register_total(
+    rc: &mut RunContext,
+    cfg: &StackingConfig,
+    manual_reference_frame_id: Option<i64>,
+    force_fresh: bool,
+) -> Result<usize, RunError> {
+    let groups = rc.plan_groups.clone();
+    let mut total = 0usize;
+    for g in &groups {
+        if included_count_of(rc, &g.key) < 3 {
+            continue;
+        }
+        let (group_reference, group_reference_hash) = {
+            let geometry = rc.geometry_of(&g.key);
+            (geometry.reference_frame_id, geometry.hash.clone())
+        };
+        if group_two_pass_wanted(cfg, group_reference, manual_reference_frame_id)
+            && group_can_switch(rc, &g.key, group_reference)
+        {
+            let Some(lookup) = two_pass_lookup_after_identity_check(
+                rc,
+                g,
+                group_reference,
+                &group_reference_hash,
+                force_fresh,
+            )?
+            else {
+                continue;
+            };
+            let included = included_count_of(rc, &g.key);
+            total += included;
+            if lookup.cached.is_none() && group_can_switch(rc, &g.key, group_reference) {
+                total += included;
+            }
+        } else {
+            total += included_count_of(rc, &g.key);
+        }
+    }
+    Ok(total)
+}
+
 /// Stage 5 in `native` geometry mode (M4b rulings R-M4b-4/5): every group
 /// registers onto ITS OWN reference, in its own geometry, with no
 /// cross-group registration at all.
@@ -9235,22 +9930,7 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
     let origins = rc.origins.clone();
     let mut solves: SolveCache = SolveCache::new();
 
-    // One progress total for both passes of every group, the same way the
-    // co-registered path counts them.
-    let mut total = 0usize;
-    for g in &groups {
-        let included = included_count_of(rc, &g.key);
-        if included < 3 {
-            continue;
-        }
-        total += included;
-        let group_reference = rc.geometry_of(&g.key).reference_frame_id;
-        if group_two_pass_wanted(&cfg, group_reference, manual_reference_frame_id)
-            && group_can_switch(rc, &g.key, group_reference)
-        {
-            total += included;
-        }
-    }
+    let total = native_register_total(rc, &cfg, manual_reference_frame_id, force_fresh)?;
     let mut progress = (0usize, total);
     rc.progress(
         Stage::Register,
@@ -9517,14 +10197,6 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         solve_of(&mut solves, &conn, &origins, reference_frame_id);
     }
 
-    let mut viable_total = 0usize;
-    for g in &groups {
-        let included = included_count_of(rc, &g.key);
-        if included >= 3 {
-            viable_total += included;
-        }
-    }
-
     // The dry pass's own group (ruling R-M4a-5): Auto mode, two-pass on,
     // and the reference's group viable — a group the persisting loop would
     // skip anyway gives nothing to take a median over.
@@ -9541,10 +10213,27 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         } else {
             None
         };
-    let dry_total = dry_group
-        .as_ref()
-        .map(|g| included_count_of(rc, &g.key))
-        .unwrap_or(0);
+    // A cached two-pass decision removes the dry pass from the total (frame-level cache spec §5.6).
+    // The lookup runs after the identity check, as `two_pass_refine` does (ruling R14 (b)), so the totals count the
+    // members that will register.
+    let dry_total = match dry_group.as_ref() {
+        Some(g) => {
+            match two_pass_lookup_after_identity_check(rc, g, reference_frame_id, &reference_hash, force_fresh)? {
+                Some(lookup) if lookup.cached.is_none() && group_can_switch(rc, &g.key, reference_frame_id) => {
+                    included_count_of(rc, &g.key)
+                }
+                _ => 0,
+            }
+        }
+        None => 0,
+    };
+    let mut viable_total = 0usize;
+    for g in &groups {
+        let included = included_count_of(rc, &g.key);
+        if included >= 3 {
+            viable_total += included;
+        }
+    }
 
     let mut progress = (0usize, viable_total + dry_total);
     rc.progress(
@@ -9704,6 +10393,9 @@ fn record_registered_artifact(
 ) -> anyhow::Result<()> {
     let (size, modified_at) = file_identity(out)?;
     let conn = db(&rc.ctx)?.conn();
+    let group_key = artifact_group_key("registered", group_key);
+    // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
+    let old = crate::db::stacking::find_artifact(&conn, &rc.subject, group_key, "registered", Some(frame_id))?;
     upsert_artifact(
         &conn,
         &NewArtifact {
@@ -9718,6 +10410,7 @@ fn record_registered_artifact(
             payload_json: None,
         },
     )?;
+    replace_frame_level_file(&conn, &rc.layout.registered_root(), old.as_ref(), out);
     Ok(())
 }
 
@@ -9737,15 +10430,15 @@ fn registered_artifact_is_fresh(
     Ok(crate::db::stacking::find_artifact(
         &conn,
         &rc.subject,
-        group_key,
+        artifact_group_key("registered", group_key),
         "registered",
         Some(frame_id),
     )?
     .is_some_and(|row| is_fresh(&row, hash)))
 }
 
-/// `r_<stem>[_d].fits` for the SAME collision-safe `stem`
-/// [`calibrated_file_stem`] gave the calibrated file (fix round 1: the two
+/// `r_<stem>[_d].fits` for the SAME frame-only `stem`
+/// [`frame_file_stem`] gave the calibrated file (fix round 1: the two
 /// naming schemes must agree by construction). `debayered` is the caller's
 /// own known fact (`MeasuredFrame::planes == 3`) — NOT inferred by
 /// checking whether the calibrated file's own on-disk name ends in `_d`
@@ -9843,7 +10536,6 @@ struct ReweighMember {
 /// back.
 fn read_member_fits(
     rc: &RunContext,
-    group_key: &str,
     member: &ReweighMember,
     plane: usize,
 ) -> Result<Option<Vec<psf_signal::StarFit>>, RunError> {
@@ -9853,7 +10545,7 @@ fn read_member_fits(
         crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            group_key,
+            artifact_group_key(&kind, ""),
             &kind,
             Some(member.frame_id),
         )?
@@ -9869,7 +10561,6 @@ fn read_member_fits(
         Err(e) => {
             tracing::warn!(
                 run_id = rc.run_id,
-                group_key,
                 frame_id = member.frame_id,
                 plane,
                 path = %path,
@@ -9907,7 +10598,7 @@ fn plane_outcome(
         let Some((ch, map)) = plane_of(anchor) else {
             return Ok(missing(anchor));
         };
-        let Some(fits) = read_member_fits(rc, group_key, &members[anchor], plane)? else {
+        let Some(fits) = read_member_fits(rc, &members[anchor], plane)? else {
             return Ok(missing(anchor));
         };
         common_set::candidates(&common_set::MemberPlane {
@@ -9927,7 +10618,7 @@ fn plane_outcome(
         let Some((ch, map)) = plane_of(k) else {
             return Ok(missing(k));
         };
-        let Some(fits) = read_member_fits(rc, group_key, &members[k], plane)? else {
+        let Some(fits) = read_member_fits(rc, &members[k], plane)? else {
             return Ok(missing(k));
         };
         usable.push(common_set::match_member(
@@ -11475,7 +12166,7 @@ fn process_group_output(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    &group.key,
+                    artifact_group_key("registered", &group.key),
                     "registered",
                     Some(e.frame.frame_id),
                 )?
@@ -11957,17 +12648,9 @@ fn process_group_output(
     if bitmaps_for_drizzle || bitmaps_for_large_scale {
         let included_for_rej =
             included_after_min_weight(&stack_frames, reference_idx, group_integration.min_weight);
-        let stems: Vec<String> = included_for_rej
-            .iter()
-            .map(|&i| {
-                stack_frames[i]
-                    .path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("frame_{i}"))
-            })
-            .collect();
+        let included_ids: Vec<i64> =
+            included_for_rej.iter().map(|&i| stack_frames[i].frame_id).collect();
+        let stems = rejection_map_stems(group, &included_ids);
         match RejBitmapSet::create(
             &rc.layout.rej_dir(rc.run_id, &group.key),
             &stems,
@@ -12711,7 +13394,7 @@ fn process_group_output(
                     let path = crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        &group.key,
+                        artifact_group_key("calibrated_mosaic", &group.key),
                         "calibrated_mosaic",
                         Some(frame_id),
                     )?
@@ -13876,7 +14559,7 @@ fn run_group_normalization(
                         crate::db::stacking::find_artifact(
                             &conn,
                             &rc.subject,
-                            &group.key,
+                            artifact_group_key(&kind, &group.key),
                             &kind,
                             Some(m.frame_id),
                         )?
@@ -13903,12 +14586,16 @@ fn run_group_normalization(
         Vec::with_capacity(members.len());
     for m in members.iter() {
         let stem = match group_frames_by_id.get(&m.frame_id).copied() {
-            Some(gf) => calibrated_file_stem(group, gf),
-            None => Path::new(&m.filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&m.filename)
-                .to_string(),
+            Some(gf) => frame_file_stem(gf),
+            // Same `<stem>_f<id>` rule as `frame_file_stem` (a member outside `group_frames_by_id` is not expected).
+            None => format!(
+                "{}_f{}",
+                Path::new(&m.filename)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&m.filename),
+                m.frame_id
+            ),
         };
         sidecar_paths.push(rc.layout.ln_sidecar_path(&group.key, &stem));
         let existing = {
@@ -15222,7 +15909,14 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
         CleanupPolicy::DeleteIntermediates => {
             let freed = {
                 let conn = db(&rc.ctx)?.conn();
-                cleanup_work(&conn, &rc.subject, &rc.layout, CleanupWhat::Intermediates)?
+                let sweep = !other_stack_active(&rc.ctx, &rc.subject);
+                cleanup_work_with(
+                    &conn,
+                    &rc.subject,
+                    &rc.layout,
+                    CleanupWhat::Intermediates,
+                    sweep,
+                )?
             };
             tracing::info!(run_id = rc.run_id, freed_bytes = freed, "cleanup applied");
         }
@@ -16832,7 +17526,8 @@ mod tests {
         assert!(opts.hot_pixel_correction);
         let job = |id: i64, dark: &Path| CalibrateJob {
             frame_id: id,
-            group_key: "g".into(),
+            old_calibrated: None,
+            old_mosaic: None,
             hash: String::new(),
             spec: GenerationSpec {
                 inputs: crate::calibration_library::light_cal::LightCalInputs {
@@ -16974,7 +17669,6 @@ mod tests {
         let cfg = StackingConfig::default();
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-        let group_key = plan_groups[0].key.clone();
 
         // Fix round 1: `admission_with_shared` (like `admission`) treats an
         // unknown RAM total as an exhausted budget — admission 1 always,
@@ -17007,7 +17701,7 @@ mod tests {
         );
         stage_calibrate(&mut rc_seq).unwrap();
 
-        let seq_dir = layout_seq.calibrated_dir(&group_key);
+        let seq_dir = layout_seq.calibrated_dir();
         let mut seq_files: Vec<PathBuf> = std::fs::read_dir(&seq_dir)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -17063,7 +17757,7 @@ mod tests {
         rc_par.rerun_from = Some(Stage::Calibrate);
         stage_calibrate(&mut rc_par).unwrap();
 
-        let par_dir = layout_par.calibrated_dir(&group_key);
+        let par_dir = layout_par.calibrated_dir();
         let mut par_files: Vec<PathBuf> = std::fs::read_dir(&par_dir)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -17134,7 +17828,6 @@ mod tests {
             let layout = WorkingLayout::new(working_dir, &set_slug(SET_NAME));
             let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
             assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-            let key = plan_groups[0].key.clone();
             let mut rc = test_context(
                 ctx.clone(),
                 Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
@@ -17149,7 +17842,7 @@ mod tests {
             );
             stage_calibrate(&mut rc).unwrap();
             assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
-            let dir = layout.calibrated_dir(&key);
+            let dir = layout.calibrated_dir();
             let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
@@ -17235,13 +17928,12 @@ mod tests {
 
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-        let group_key = plan_groups[0].key.clone();
 
         // First pass: 3 calibrated files, 3 artifact rows.
         let mut rc1 = build(1, plan_groups.clone());
         stage_calibrate(&mut rc1).unwrap();
 
-        let calibrated_dir = layout.calibrated_dir(&group_key);
+        let calibrated_dir = layout.calibrated_dir();
         let files_on_disk = std::fs::read_dir(&calibrated_dir).unwrap().count();
         assert_eq!(files_on_disk, 3);
 
@@ -17334,11 +18026,277 @@ mod tests {
         }
     }
 
+    /// The sum of `items` over the `fan-out finished` lines of `stage` and `pass` in a
+    /// `crate::stacking::telemetry::capture_logs` text; 0 when there is none (a stage whose work was all cached
+    /// opens no fan-out).
+    pub(super) fn fan_out_items(logs: &str, stage: &str, pass: &str) -> usize {
+        logs.lines()
+            .filter(|l| {
+                l.contains("fan-out finished")
+                    && l.contains(&format!("stage=\"{stage}\""))
+                    && l.contains(&format!("pass=\"{pass}\""))
+            })
+            .map(|l| {
+                let rest = l.split("items=").nth(1).expect("items field");
+                rest.split_whitespace().next().unwrap().parse::<usize>().unwrap()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn frame_file_stem_ignores_group_membership() {
+        let frame = |id: i64, filename: &str| GroupFrame {
+            frame_id: id,
+            file_id: id,
+            filename: filename.to_string(),
+            path: format!("/data/{filename}"),
+            size: 1,
+            modified_at: String::new(),
+            exposure_s: Some(60.0),
+            date_obs: None,
+            width: 8,
+            height: 8,
+            pixel_scale_arcsec: None,
+            scale_source: None,
+        };
+        // Two frames sharing a source basename: each stem carries its own id, whoever else is in the group.
+        assert_eq!(frame_file_stem(&frame(7, "Light_0001.fits")), "Light_0001_f7");
+        assert_eq!(frame_file_stem(&frame(9, "Light_0001.fits")), "Light_0001_f9");
+        // A lone frame gets the suffix too: the stem does not change when a merge brings a namesake in.
+        assert_eq!(frame_file_stem(&frame(3, "Light_0001.fits")), "Light_0001_f3");
+        assert_eq!(frame_file_stem(&frame(4, "no_extension")), "no_extension_f4");
+    }
+
+    /// Frame-level cache spec §5.1: a regroup (here "one group per exposure" -> "no split") finds the calibrated
+    /// rows again; nothing is recalibrated and no file is rewritten.
+    #[test]
+    fn calibrated_artifact_is_reused_across_a_regroup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _light_ids, working, output) = seed_ready(&db_path, SET_NAME);
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        let mut cfg_seconds = StackingConfig::default();
+        cfg_seconds.grouping.exposure_mode = crate::stacking::config::ExposureMode::Seconds;
+        let mut cfg_all = StackingConfig::default();
+        cfg_all.grouping.exposure_mode = crate::stacking::config::ExposureMode::NoSplit;
+        let groups_of = |cfg: &StackingConfig| {
+            group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap()
+        };
+        let (groups_seconds, groups_all) = (groups_of(&cfg_seconds), groups_of(&cfg_all));
+        assert_ne!(
+            groups_seconds[0].key, groups_all[0].key,
+            "the two groupings must name the group differently"
+        );
+        let build = |run_id: i64, cfg: &StackingConfig, groups: Vec<IntegrationGroup>| {
+            test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                groups,
+                layout.clone(),
+                output.path().to_path_buf(),
+                HashMap::new(),
+            )
+        };
+        let rows = || {
+            crate::db::stacking::list_artifacts(
+                &fixture.conn,
+                &StackSubject::FrameSet(fixture.set_id),
+                Some("calibrated"),
+            )
+            .unwrap()
+        };
+
+        let mut rc1 = build(1, &cfg_seconds, groups_seconds);
+        let (res, text1) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc1));
+        res.unwrap();
+        assert_eq!(fan_out_items(&text1, "calibrate", "calibrate"), 3, "{text1}");
+        let first = rows();
+        assert_eq!(first.len(), 3);
+        assert!(first.iter().all(|r| r.group_key.is_empty()), "{first:?}");
+        let mtimes = |rows: &[crate::db::stacking::StackingArtifactRow]| -> Vec<std::time::SystemTime> {
+            rows.iter()
+                .map(|r| std::fs::metadata(r.path.as_ref().unwrap()).unwrap().modified().unwrap())
+                .collect()
+        };
+        let first_mtimes = mtimes(&first);
+
+        let mut rc2 = build(2, &cfg_all, groups_all);
+        let (res, text2) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc2));
+        res.unwrap();
+        assert_eq!(
+            fan_out_items(&text2, "calibrate", "calibrate"),
+            0,
+            "a regroup recalibrated: {text2}"
+        );
+        let second = rows();
+        assert_eq!(second.len(), 3, "a regroup added rows");
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!((a.id, &a.created_at, &a.path), (b.id, &b.created_at, &b.path));
+            assert_eq!(b.group_key, "");
+        }
+        assert_eq!(mtimes(&second), first_mtimes, "a regroup rewrote a calibrated file");
+    }
+
+    /// Frame-level cache spec §5.1/§5.7 (review focus 3): a frame re-written under a new stem or folder takes its
+    /// old file with it, unless another row still points to it.
+    #[test]
+    fn rewriting_a_frame_removes_its_old_file_once_unreferenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, output) = seed_ready(&db_path, SET_NAME);
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let cfg = StackingConfig::default();
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let build = |run_id: i64| {
+            test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                HashMap::new(),
+            )
+        };
+        let mut rc1 = build(1);
+        stage_calibrate(&mut rc1).unwrap();
+
+        // Rows as an older version left them: the file in `calibrated/<group_key>/` under the old stem.
+        let old_dir = layout.calibrated_dir().join(&plan_groups[0].key);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut old_paths = Vec::new();
+        for &id in &light_ids[..2] {
+            let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", "calibrated", Some(id))
+                .unwrap()
+                .unwrap();
+            let old = old_dir.join(format!("c_old_{id}.fits"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            old_paths.push(old);
+        }
+        // Another row (of another kind) still points to the second frame's old file.
+        upsert_artifact(
+            &fixture.conn,
+            &NewArtifact {
+                subject: &subject,
+                frame_id: Some(light_ids[1]),
+                group_key: "",
+                kind: "solve",
+                path: old_paths[1].to_str(),
+                config_hash: "h",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        let mut rc2 = build(2);
+        rc2.rerun_from = Some(Stage::Calibrate);
+        stage_calibrate(&mut rc2).unwrap();
+
+        for (n, &id) in light_ids[..2].iter().enumerate() {
+            let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", "calibrated", Some(id))
+                .unwrap()
+                .unwrap();
+            let new = PathBuf::from(row.path.unwrap());
+            assert_eq!(new.parent().unwrap(), layout.calibrated_dir(), "{new:?}");
+            let name = new.file_name().unwrap().to_str().unwrap().to_string();
+            assert!(name.ends_with(&format!("_f{id}.fits")), "{name}");
+            assert!(new.exists());
+            assert_eq!(
+                old_paths[n].exists(),
+                n == 1,
+                "frame {id}: the old file {} be gone",
+                if n == 0 { "must" } else { "must not" }
+            );
+        }
+    }
+
+    /// Frame-level cache spec §5.1 (review focus 4): a collab project frame (`StackSubject::Project`) takes the
+    /// same frame-level key and the frame-only stem.
+    #[test]
+    fn a_project_frame_uses_the_frame_level_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for (u, file) in [
+            ("m1", test_fixtures::ProjectFile::Mono32),
+            ("x1", test_fixtures::ProjectFile::Xisf32),
+        ] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = file;
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        let rows = crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("calibrated")).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            assert_eq!(row.group_key, "", "{row:?}");
+            assert!(matches!(row.subject, StackSubject::Project(_)), "{row:?}");
+            let handle = row.frame_id.expect("a project frame handle");
+            let found = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(handle))
+                .unwrap();
+            assert_eq!(found.map(|r| r.id), Some(row.id));
+        }
+        // The converted file is named by the frame alone: `p_<stem>_f<handle>.fits`, in the flat folder.
+        let converted = rows
+            .iter()
+            .map(|r| PathBuf::from(r.path.as_ref().unwrap()))
+            .find(|p| p.starts_with(rc.layout.prepared_dir()))
+            .expect("the XISF frame is converted under prepared/");
+        let handle = rows
+            .iter()
+            .find(|r| PathBuf::from(r.path.as_ref().unwrap()) == converted)
+            .unwrap()
+            .frame_id
+            .unwrap();
+        assert_eq!(converted.parent().unwrap(), rc.layout.prepared_dir());
+        assert!(
+            converted
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("_f{handle}.fits")),
+            "{converted:?}"
+        );
+    }
+
     /// Fix round 1, Critical: two frames of one group sharing a source
     /// basename (a capture counter restarted on another night) must not
-    /// collide on one calibrated output — every colliding frame gets
-    /// `_f<frame_id>` inserted before the extension, and a frame whose name
-    /// is unique in the group keeps the plain `c_<stem>.fits` name.
+    /// collide on one calibrated output. Since frame-level cache spec §5.1
+    /// EVERY frame's stem carries `_f<frame_id>`, the unique-named frame
+    /// included, so a merge never renames a file.
     #[test]
     fn calibrate_outputs_disambiguate_same_basename_within_a_group() {
         let tmp = tempfile::tempdir().unwrap();
@@ -17406,7 +18364,6 @@ mod tests {
 
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
-        let group_key = plan_groups[0].key.clone();
 
         let mut rc = test_context(
             ctx.clone(),
@@ -17455,12 +18412,14 @@ mod tests {
             path_b.contains(&format!("_f{dup_b}")),
             "colliding frame {dup_b} must carry the disambiguating suffix: {path_b}"
         );
+        // Spec §5.1: the stem is a function of the frame alone, so a frame with a unique name carries its id too
+        // (a merge that brings a namesake in must not rename it).
         assert!(
-            !path_uniq.contains("_f"),
-            "a frame with a unique source name keeps the plain name: {path_uniq}"
+            path_uniq.contains(&format!("_f{uniq}")),
+            "a frame with a unique source name carries its own id as well: {path_uniq}"
         );
 
-        let calibrated_dir = layout.calibrated_dir(&group_key);
+        let calibrated_dir = layout.calibrated_dir();
         let files_on_disk = std::fs::read_dir(&calibrated_dir).unwrap().count();
         assert_eq!(
             files_on_disk, 3,
@@ -17619,16 +18578,14 @@ mod tests {
 
             if delete_registered {
                 let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-                for g in &plan_groups {
-                    let dir = layout.registered_dir(&g.key);
-                    assert!(
-                        dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
-                        "stage 5 must have written at least one registered file at {}",
-                        dir.display()
-                    );
-                    std::fs::remove_dir_all(&dir)
-                        .expect("remove registered/<group> for the fault injection");
-                }
+                let dir = layout.registered_dir();
+                assert!(
+                    dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
+                    "stage 5 must have written at least one registered file at {}",
+                    dir.display()
+                );
+                std::fs::remove_dir_all(&dir)
+                    .expect("remove registered/ for the fault injection");
             }
 
             fallback_counters::reset();
@@ -17712,10 +18669,7 @@ mod tests {
                 working.path(),
                 output.path(),
             );
-            let reg_dirs: Vec<PathBuf> = plan_groups
-                .iter()
-                .map(|g| layout.registered_dir(&g.key))
-                .collect();
+            let reg_dirs: Vec<PathBuf> = vec![layout.registered_dir()];
             if unwritable {
                 for d in &reg_dirs {
                     std::fs::create_dir_all(d).unwrap();
@@ -17820,16 +18774,13 @@ mod tests {
         );
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        for g in &plan_before.groups {
-            let dir = layout.registered_dir(&g.key);
-            assert!(
-                dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
-                "the run must have written at least one registered file at {}",
-                dir.display()
-            );
-            std::fs::remove_dir_all(&dir)
-                .expect("remove registered/<group> for the fault injection");
-        }
+        let dir = layout.registered_dir();
+        assert!(
+            dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
+            "the run must have written at least one registered file at {}",
+            dir.display()
+        );
+        std::fs::remove_dir_all(&dir).expect("remove registered/ for the fault injection");
 
         let plan_after = build_plan(
             &fixture.conn,
@@ -17845,6 +18796,617 @@ mod tests {
              falsely cached: {:?}",
             plan_after.stale_stages
         );
+    }
+
+    /// Frame-level cache spec §5.1 (Task 5): four mono frames of `seed_star_group` registered onto a manual
+    /// reference, with what the registered-artifact tests count.
+    struct RegisterRig {
+        _tmp: tempfile::TempDir,
+        ctx: Arc<ServiceContext>,
+        fixture: test_fixtures::Fixture,
+        light_ids: Vec<i64>,
+        working: tempfile::TempDir,
+        output: tempfile::TempDir,
+        layout: WorkingLayout,
+    }
+
+    /// Cancels the run on the last Register tick: every frame's aligned file is written by then, and the controller's
+    /// `check_cancel` after the fan-out returns before it records any of them.
+    struct CancelWhenRegisterDone {
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl ProgressEmitter for CancelWhenRegisterDone {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            let current = payload["current"].as_u64().unwrap_or(0);
+            if event_name == STACKING_PROGRESS_EVENT
+                && payload["stage"] == Stage::Register.as_str()
+                && current > 0
+                && current == payload["total"].as_u64().unwrap_or(u64::MAX)
+            {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl RegisterRig {
+        fn new() -> RegisterRig {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+            let (fixture, light_ids, working, output) =
+                seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, light_ids[0])
+                .unwrap();
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            RegisterRig { _tmp: tmp, ctx, fixture, light_ids, working, output, layout }
+        }
+
+        /// The config of every run: a manual reference, so a regroup cannot move it.
+        fn cfg(&self, mode: crate::stacking::config::ExposureMode) -> StackingConfig {
+            let mut cfg = StackingConfig::default();
+            cfg.reference.mode = ReferenceMode::Manual;
+            cfg.grouping.exposure_mode = mode;
+            cfg
+        }
+
+        /// One run through Register under `cfg`'s grouping.
+        fn run(&self, cfg: &StackingConfig) -> RunContext {
+            let (rc, res) = self.run_with(cfg, false);
+            res.unwrap();
+            rc
+        }
+
+        /// One run through Register; `cancel_after_register` cancels it right after the Register fan-out wrote its files.
+        fn run_with(&self, cfg: &StackingConfig, cancel_after_register: bool) -> (RunContext, Result<(), RunError>) {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let emitter: Arc<dyn ProgressEmitter> = if cancel_after_register {
+                Arc::new(CancelWhenRegisterDone { cancel: cancel.clone() })
+            } else {
+                Arc::new(NullEmitter)
+            };
+            let plan_groups = group_frames(&self.fixture.conn, self.fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+            let (run_id, group_ids) = seed_run_and_groups(
+                &self.fixture.conn,
+                self.fixture.set_id,
+                &plan_groups,
+                self.working.path(),
+                self.output.path(),
+            );
+            let mut rc = test_context(
+                self.ctx.clone(),
+                emitter,
+                run_id,
+                self.fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups,
+                self.layout.clone(),
+                self.output.path().to_path_buf(),
+                group_ids,
+            );
+            rc.cancel = cancel;
+            let res = run_stages_for_test(&mut rc, Stage::Register);
+            (rc, res)
+        }
+
+        fn registered_rows(&self) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
+            rows_of_kind(&self.fixture.conn, self.fixture.set_id, "registered")
+        }
+
+        /// Every registered row's `(frame, row id, group key, created_at, hash, path, file mtime)`: what a regroup must
+        /// leave untouched.
+        fn registered_snapshot(
+            &self,
+        ) -> Vec<(i64, i64, String, String, String, Option<String>, Option<std::time::SystemTime>)> {
+            let mut out: Vec<_> = self
+                .registered_rows()
+                .into_iter()
+                .map(|(frame_id, r)| {
+                    let mtime = r
+                        .path
+                        .as_ref()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .and_then(|m| m.modified().ok());
+                    (frame_id, r.id, r.group_key, r.created_at, r.config_hash, r.path, mtime)
+                })
+                .collect();
+            out.sort_by_key(|r| r.0);
+            out
+        }
+
+        /// The files under `registered/`, recursively.
+        fn registered_files(&self) -> Vec<PathBuf> {
+            fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+                let Ok(rd) = std::fs::read_dir(dir) else { return };
+                for e in rd {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.layout.registered_root(), &mut out);
+            out.sort();
+            out
+        }
+
+        fn register_stale(&self, cfg: &StackingConfig) -> bool {
+            crate::stacking::plan::build_plan(
+                &self.fixture.conn,
+                &self.ctx.settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(self.fixture.set_id),
+                Some(cfg.clone()),
+            )
+            .expect("the plan should build")
+            .stale_stages
+            .contains(&Stage::Register)
+        }
+    }
+
+    /// Frame-level cache spec §5.1 (Task 5): a regroup (here "one group per exposure" -> "no split") finds the
+    /// registered rows again, with the same reference: no frame is aligned or rewritten, and neither the rows nor
+    /// the files move; the gate reads Register fresh under the new grouping too.
+    #[test]
+    fn registered_frames_are_reused_across_a_regroup() {
+        use crate::stacking::config::ExposureMode;
+        let rig = RegisterRig::new();
+        let cfg_seconds = rig.cfg(ExposureMode::Seconds);
+        let cfg_all = rig.cfg(ExposureMode::NoSplit);
+        let key_of = |cfg: &StackingConfig| {
+            group_frames(&rig.fixture.conn, rig.fixture.set_id, &cfg.grouping).unwrap()[0].key.clone()
+        };
+        assert_ne!(key_of(&cfg_seconds), key_of(&cfg_all), "the two groupings must name the group differently");
+
+        let (rc1, logs1) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg_seconds));
+        assert_eq!(fan_out_items(&logs1, "register", "align"), 4, "{logs1}");
+        let rows1 = rig.registered_snapshot();
+        assert_eq!(rows1.len(), 4);
+        assert!(rows1.iter().all(|r| r.2.is_empty()), "frame-level rows sit under the empty key: {rows1:?}");
+        let files1 = rig.registered_files();
+        assert_eq!(files1.len(), 4, "{files1:?}");
+        assert_eq!(files1.iter().filter(|p| p.parent() != Some(rig.layout.registered_root().as_path())).count(), 0);
+
+        let (rc2, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg_all));
+        assert_eq!(rc2.reference_frame_id, rc1.reference_frame_id);
+        assert_eq!(fan_out_items(&logs2, "register", "align"), 0, "a regroup re-aligned: {logs2}");
+        assert_eq!(fan_out_items(&logs2, "register", "rewrite"), 0, "a regroup rewrote: {logs2}");
+        assert_eq!(rig.registered_snapshot(), rows1, "a regroup rewrote or added rows");
+        assert_eq!(rig.registered_files(), files1, "a regroup added or moved a file");
+        assert!(!rig.register_stale(&cfg_all), "the gate reads the reused rows fresh");
+    }
+
+    /// Frame-level cache spec §5.7, review focus 2 (Task 5): a `registered` row whose path is in an old
+    /// `registered/<group_key>/` folder under another file name is the artifact, read as it stands. Register finds it
+    /// fresh and writes nothing, and Integrate opens the row's path (no fallback to the on-the-fly warp) and stacks
+    /// the same master as a run that never migrated.
+    #[test]
+    fn a_migrated_row_is_read_from_its_stored_path() {
+        use crate::integration::registered_source::fallback_counters;
+        use crate::stacking::config::ExposureMode;
+        let _fallback_guard = fallback_counters::exclusive();
+
+        let master_of = |rc: &RunContext| -> Vec<Vec<f32>> {
+            let master = rc
+                .summary
+                .groups
+                .iter()
+                .find_map(|g| g.master_path.clone())
+                .expect("master path");
+            let reader = PlaneReader::open(Path::new(&master)).unwrap();
+            (0..reader.channels()).map(|p| reader.read_plane(p).unwrap()).collect()
+        };
+
+        let baseline = {
+            let rig = RegisterRig::new();
+            let mut rc = rig.run(&rig.cfg(ExposureMode::Seconds));
+            stage_output(&mut rc).unwrap();
+            master_of(&rc)
+        };
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+        let old_dir = rig.layout.registered_root().join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut moved = Vec::new();
+        for (frame_id, row) in rig.registered_rows() {
+            let old = old_dir.join(format!("legacy_{frame_id}.fits"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            moved.push(old);
+        }
+        assert_eq!(moved.len(), 4);
+        let rows_before = rig.registered_snapshot();
+
+        let (mut rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(fan_out_items(&logs, "register", "align"), 0, "{logs}");
+        assert_eq!(fan_out_items(&logs, "register", "rewrite"), 0, "a migrated row was rewritten: {logs}");
+        assert_eq!(rig.registered_snapshot(), rows_before, "a migrated row moved");
+        assert_eq!(rig.registered_files(), {
+            let mut m = moved.clone();
+            m.sort();
+            m
+        }, "nothing was written to the layout path");
+
+        fallback_counters::reset();
+        stage_output(&mut rc).unwrap();
+        assert_eq!(fallback_counters::snapshot(), 0, "Integrate did not open the stored path");
+        let planes = master_of(&rc);
+        assert_eq!(planes.len(), baseline.len());
+        for (p, (a, b)) in baseline.iter().zip(&planes).enumerate() {
+            assert_eq!(a.len(), b.len());
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "plane {p}: the migrated registered files stack another master"
+            );
+        }
+
+        // The stored path is the file opened, not just a file that happens to stack alike: change one pixel of a moved
+        // file (same size), record the file's new identity as a writer would, and the master moves.
+        let victim = &moved[1];
+        let mut bytes = std::fs::read(victim).unwrap();
+        // A big-endian f32 near the middle of the data section, aligned to 4 bytes (the header is whole 2880-byte
+        // blocks): flip the top mantissa bit, a finite change of a quarter or more of the value.
+        let at = (bytes.len() / 2) & !3;
+        bytes[at + 1] ^= 0x40;
+        std::fs::write(victim, &bytes).unwrap();
+        let meta = std::fs::metadata(victim).unwrap();
+        assert_eq!(
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET size = ?1, modified_at = ?2 WHERE path = ?3",
+                    rusqlite::params![
+                        meta.len() as i64,
+                        crate::stacking::plan::render_modified_at(meta.modified().unwrap()),
+                        victim.to_str().unwrap()
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        let (mut rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(fan_out_items(&logs, "register", "rewrite"), 0, "the edited row was rewritten: {logs}");
+        fallback_counters::reset();
+        stage_output(&mut rc).unwrap();
+        assert_eq!(fallback_counters::snapshot(), 0);
+        let edited = master_of(&rc);
+        assert!(
+            baseline.iter().zip(&edited).any(|(a, b)| a.iter().zip(b).any(|(x, y)| x.to_bits() != y.to_bits())),
+            "the master did not move with the stored file's pixels: Integrate did not open the row's path"
+        );
+    }
+
+    /// Ruling R7 (c) M2 (Task 5): re-registering a frame whose row points into an old `registered/<old_key>/` folder
+    /// writes the new file at the layout path, repoints the row and removes the old file - unless another row still
+    /// points at it.
+    #[test]
+    fn re_registering_a_migrated_row_removes_the_old_file_unless_another_row_points_at_it() {
+        use crate::stacking::config::ExposureMode;
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+        let old_dir = rig.layout.registered_root().join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut legacy: HashMap<i64, PathBuf> = HashMap::new();
+        for (frame_id, row) in rig.registered_rows() {
+            let old = old_dir.join(format!("legacy_{frame_id}.fits"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            legacy.insert(frame_id, old);
+        }
+        assert_eq!(legacy.len(), 4);
+        // Another row, of another group key, still points at one of the old files.
+        let kept_frame = rig.light_ids[3];
+        upsert_artifact(
+            &rig.fixture.conn,
+            &NewArtifact {
+                subject: &StackSubject::FrameSet(rig.fixture.set_id),
+                frame_id: Some(kept_frame),
+                group_key: "stray",
+                kind: "registered",
+                path: legacy[&kept_frame].to_str(),
+                config_hash: "h",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        // Another reference: every frame is registered again.
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (_rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(fan_out_items(&logs, "register", "align"), 4, "{logs}");
+
+        for &frame_id in &rig.light_ids {
+            let row = crate::db::stacking::find_artifact(
+                &rig.fixture.conn,
+                &StackSubject::FrameSet(rig.fixture.set_id),
+                "",
+                "registered",
+                Some(frame_id),
+            )
+            .unwrap()
+            .expect("the frame's registered row");
+            let new = Path::new(row.path.as_ref().unwrap());
+            assert_eq!(new.parent(), Some(rig.layout.registered_dir().as_path()), "frame {frame_id}: {new:?}");
+            assert!(new.is_file());
+        }
+        for (frame_id, old) in &legacy {
+            assert_eq!(
+                old.exists(),
+                *frame_id == kept_frame,
+                "frame {frame_id}: {} should {} its old file",
+                if *frame_id == kept_frame { "keep" } else { "lose" },
+                old.display()
+            );
+        }
+    }
+
+    /// Ruling R7 (b) (Task 5): a cached file counts as fresh only while it is the file its row recorded. Run B
+    /// (another manual reference) re-aligns every frame, so its fan-out overwrites the files under their layout names
+    /// with its own pixels; cancelled right there, it records nothing, so the rows still hold run A's hash, size and
+    /// modification time. Run A's config again: the hashes match and the sizes are equal, but the files are not the
+    /// ones the rows recorded. The gate reads Register stale, and the re-run rewrites them: the master is run A's,
+    /// bit for bit.
+    #[test]
+    fn a_cancelled_rewrite_does_not_leave_another_runs_pixels_fresh() {
+        use crate::stacking::config::ExposureMode;
+
+        let master_of = |rc: &RunContext| -> Vec<Vec<f32>> {
+            let master = rc
+                .summary
+                .groups
+                .iter()
+                .find_map(|g| g.master_path.clone())
+                .expect("master path");
+            let reader = PlaneReader::open(Path::new(&master)).unwrap();
+            (0..reader.channels()).map(|p| reader.read_plane(p).unwrap()).collect()
+        };
+
+        let baseline = {
+            let rig = RegisterRig::new();
+            let mut rc = rig.run(&rig.cfg(ExposureMode::Seconds));
+            stage_output(&mut rc).unwrap();
+            master_of(&rc)
+        };
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        let rc_a = rig.run(&cfg);
+        assert!(
+            !crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_a.run_id).unwrap().is_empty(),
+            "premise: the gate reads run A's frame rows, so it is not vacuous"
+        );
+        assert!(!rig.register_stale(&cfg), "run A's own rows read fresh");
+        let rows_a = rig.registered_snapshot();
+        assert_eq!(rows_a.len(), 4);
+
+        // Run B: another reference, cancelled right after its Register fan-out.
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (_rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        let rows_b = rig.registered_snapshot();
+        assert_eq!(rows_b.len(), rows_a.len());
+        for (a, b) in rows_a.iter().zip(&rows_b) {
+            assert_eq!((&a.1, &a.4, &a.5), (&b.1, &b.4, &b.5), "the cancelled run recorded a row");
+            assert_ne!(a.6, b.6, "premise: run B overwrote frame {}'s file", a.0);
+            assert_eq!(
+                std::fs::metadata(a.5.as_ref().unwrap()).unwrap().len() as i64,
+                rig.registered_rows()[&a.0].size.unwrap(),
+                "premise: the sizes still agree, so only the modification time tells the files apart"
+            );
+        }
+
+        // Run A's config again.
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[0])
+            .unwrap();
+        // Run B, cancelled inside Register, wrote no frame rows; the gate (ruling R9) reads run A's, and what is under
+        // test is that it does not trust the files B overwrote.
+        assert!(rig.register_stale(&cfg), "the gate trusted files another run overwrote");
+        let (mut rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
+        assert_eq!(
+            fan_out_items(&logs, "register", "rewrite"),
+            4,
+            "the re-run did not rewrite the overwritten files: {logs}"
+        );
+        assert!(!rig.register_stale(&cfg), "the rewritten files read fresh");
+        stage_output(&mut rc).unwrap();
+        let planes = master_of(&rc);
+        assert_eq!(planes.len(), baseline.len());
+        for (p, (a, b)) in baseline.iter().zip(&planes).enumerate() {
+            assert_eq!(a.len(), b.len());
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "plane {p}: the master is not run A's"
+            );
+        }
+    }
+
+    /// Ruling R9: a run cancelled inside Register is the newest run and has no frame rows (they are written when the
+    /// stage is done). The gate used to judge those no rows and read Register fresh; it now judges the latest run that
+    /// has rows. Run A, then run B on another manual reference cancelled inside Register, then the gate under B's
+    /// config: run A's rows name another reference, so Register is stale.
+    #[test]
+    fn a_run_cancelled_inside_register_reads_register_stale() {
+        use crate::stacking::config::ExposureMode;
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        let rc_a = rig.run(&cfg);
+        assert!(!rig.register_stale(&cfg), "run A's own rows read fresh");
+
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        assert!(
+            crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_b.run_id).unwrap().is_empty(),
+            "premise: the cancelled run wrote no frame rows"
+        );
+        assert!(
+            !crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_a.run_id).unwrap().is_empty(),
+            "premise: run A did"
+        );
+        assert!(rig.register_stale(&cfg), "the gate read the cancelled run's empty frame list as fresh");
+    }
+
+    /// Ruling R14 (e), the fresh side of R9: run A registers under a config, then run B on the SAME config is
+    /// cancelled inside Register and writes no frame rows. The gate looks back past B to A's rows, which are fresh,
+    /// and reads Register fresh.
+    #[test]
+    fn a_run_cancelled_inside_register_leaves_an_older_fresh_run_fresh() {
+        use crate::stacking::config::ExposureMode;
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+        assert!(!rig.register_stale(&cfg), "run A's own rows read fresh");
+
+        let (rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        assert!(
+            crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_b.run_id).unwrap().is_empty(),
+            "premise: the cancelled run wrote no frame rows"
+        );
+        assert!(
+            !rig.register_stale(&cfg),
+            "the gate stopped at the cancelled run instead of looking back to run A"
+        );
+    }
+
+    /// Ruling R14 (d): a run that ended inside Register can hold frame rows that are all excluded (a changed landed
+    /// file takes members out before the stage's rows are complete). Those rows say nothing about what was
+    /// registered, so the gate skips such a run like an empty one and judges the run before it. Run A, then run B on
+    /// another manual reference cancelled inside Register with one excluded row: the gate under B's config reads run
+    /// A's rows, which name the other reference, and Register is stale (the excluded-only rows alone would judge no
+    /// frame and read fresh).
+    #[test]
+    fn a_run_with_only_excluded_rows_is_skipped_by_the_register_gate() {
+        use crate::stacking::config::ExposureMode;
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        rig.run(&cfg);
+
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        let group_id = *rc_b.group_ids.values().next().unwrap();
+        crate::db::stacking::upsert_frame_row(
+            &rig.fixture.conn,
+            &StackSubject::FrameSet(rig.fixture.set_id),
+            &crate::db::stacking::NewFrameRow {
+                run_id: rc_b.run_id,
+                group_id,
+                frame_id: rig.light_ids[2],
+                included: false,
+                exclusion_reason: Some("changed during the run"),
+                weight: None,
+                weight_channels_json: None,
+                metrics_json: None,
+                reg_status: None,
+                reg_model: None,
+                reg_rms_px: None,
+                reg_inliers: None,
+                reg_inlier_ratio: None,
+                reg_flipped: None,
+                rejected_fraction: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_b.run_id)
+                .unwrap()
+                .iter()
+                .all(|r| !r.included),
+            "premise: the newest run has a row, and it is not included"
+        );
+        assert!(rig.register_stale(&cfg), "the gate judged a run with no included row");
+    }
+
+    /// Ruling R4 (c) (Task 5): the `.rej` stem is the frame's own stem. Two frames of one merged group whose
+    /// registered rows point at `registered/<keyA>/r_Light_0001.fits` and `registered/<keyB>/r_Light_0001.fits` (one
+    /// file name from two old group folders) get two distinct `.rej` files: the stems of their stored paths are equal
+    /// (the premise, asserted), the frames' own stems carry their ids, and a set created with those stems writes one
+    /// `.rej` per frame.
+    #[test]
+    fn rejection_map_stems_do_not_collide_across_old_group_folders() {
+        let frame = |id: i64| GroupFrame {
+            frame_id: id,
+            file_id: id,
+            filename: "Light_0001.fits".to_string(),
+            path: format!("/data/n{id}/Light_0001.fits"),
+            size: 1,
+            modified_at: String::new(),
+            exposure_s: Some(60.0),
+            date_obs: None,
+            width: 8,
+            height: 8,
+            pixel_scale_arcsec: None,
+            scale_source: None,
+        };
+        let group = IntegrationGroup {
+            key: "merged".into(),
+            instrume: None,
+            color_mode: ColorMode::Mono,
+            filter: None,
+            binning: 1,
+            cameras: Vec::new(),
+            exposure_s: None,
+            exposure_class: "all".into(),
+            frames: vec![frame(7), frame(9)],
+            total_exposure_s: 0.0,
+            pixel_scale_arcsec: None,
+        };
+        let stored = [
+            Path::new("/work/registered/keyA/r_Light_0001.fits"),
+            Path::new("/work/registered/keyB/r_Light_0001.fits"),
+        ];
+        assert_eq!(stored[0].file_stem(), stored[1].file_stem(), "premise: the stored paths share a stem");
+
+        let stems = rejection_map_stems(&group, &[7, 9]);
+        assert_eq!(stems, vec!["Light_0001_f7".to_string(), "Light_0001_f9".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+        let _set = crate::stacking::rej::RejBitmapSet::create(dir.path(), &stems, 8, 8, 1).unwrap();
+        let mut files: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".rej"))
+            .collect();
+        files.sort();
+        assert_eq!(files, vec!["Light_0001_f7.rej".to_string(), "Light_0001_f9.rej".to_string()]);
+        // A member the group does not hold keeps a distinct stem from its position and id.
+        assert_eq!(rejection_map_stems(&group, &[7, 11]), vec!["Light_0001_f7".to_string(), "frame_1_f11".to_string()]);
     }
 
     #[test]
@@ -18017,7 +19579,7 @@ mod tests {
                 &NewArtifact {
                     subject: &subject,
                     frame_id: Some(frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &hash,
@@ -18105,7 +19667,6 @@ mod tests {
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-        let group_key = plan_groups[0].key.clone();
         let subject = StackSubject::FrameSet(fixture.set_id);
         let run = |label: &str| {
             let (run_id, group_ids) = seed_run_and_groups(
@@ -18147,7 +19708,7 @@ mod tests {
             crate::db::stacking::find_artifact(
                 &fixture.conn,
                 &subject,
-                &group_key,
+                "",
                 "calibrated",
                 Some(frame_id),
             )
@@ -18207,7 +19768,7 @@ mod tests {
                 &NewArtifact {
                     subject: &subject,
                     frame_id: Some(frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &hash,
@@ -18292,6 +19853,8 @@ mod tests {
         plan_groups: Vec<IntegrationGroup>,
         group_key: String,
         subject: StackSubject,
+        /// The run's frame origins when the set is attested (`test_context` assumes a plain catalog origin).
+        origins: Option<FrameOrigins>,
     }
 
     /// What one Measure stage did.
@@ -18304,12 +19867,30 @@ mod tests {
 
     impl Pass1Rig {
         fn new() -> Pass1Rig {
+            Pass1Rig::build(1, false)
+        }
+
+        /// The rig on an `image_pool` of `threads` workers; `osc` seeds RGGB mosaics, which stage 1 debayers into
+        /// three-plane `_d` files.
+        fn build(threads: usize, osc: bool) -> Pass1Rig {
             let tmp = tempfile::tempdir().unwrap();
             let db_path = tmp.path().join("catalog.db");
-            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let mut raw = ServiceContext::new_for_tests(db_path.clone());
+            if threads > 1 {
+                raw.image_pool = Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap(),
+                );
+            }
+            let ctx = Arc::new(raw);
             let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
-            let (fixture, light_ids, working, output) =
-                seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+            let (fixture, light_ids, working, output) = if osc {
+                seed_osc_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4])
+            } else {
+                seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4])
+            };
             test_fixtures::add_master_dark_and_flat(
                 &fixture,
                 &light_ids,
@@ -18332,7 +19913,28 @@ mod tests {
                 plan_groups,
                 group_key,
                 subject,
+                origins: None,
             }
+        }
+
+        /// An attested set (externally calibrated, ruling R12 (a)): the four lights are three-plane float FITS used IN
+        /// PLACE, so each `calibrated` row points at the user's own file, outside `calibrated/` and `prepared/`.
+        fn attested() -> Pass1Rig {
+            let mut rig = Pass1Rig::new();
+            let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+            make_lights_three_plane(&rig.fixture, &shifts, &[0, 1, 2, 3]);
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                    [rig.fixture.set_id],
+                )
+                .unwrap();
+            let (groups, origins) = frame_source(&rig.fixture.conn, &rig.subject, &rig.cfg).unwrap();
+            rig.group_key = groups[0].key.clone();
+            rig.plan_groups = groups;
+            rig.origins = Some(origins);
+            rig
         }
 
         fn run(&self, label: &str, rerun_from: Option<Stage>) -> Pass1Out {
@@ -18347,7 +19949,8 @@ mod tests {
             rerun_from: Option<Stage>,
             cancel_after: Option<usize>,
         ) -> Result<Pass1Out, RunError> {
-            let before = pass1_logged_under(self.working.path()).len();
+            let log_root = self.log_root();
+            let before = pass1_logged_under(&log_root).len();
             let (run_id, group_ids) = seed_run_and_groups(
                 &self.fixture.conn,
                 self.fixture.set_id,
@@ -18368,6 +19971,9 @@ mod tests {
                 group_ids,
             );
             rc.rerun_from = rerun_from;
+            if let Some(origins) = &self.origins {
+                rc.origins = origins.clone();
+            }
             if let Some(n) = cancel_after {
                 crate::stacking::measure::PASS1_CANCEL_AFTER
                     .lock()
@@ -18382,9 +19988,19 @@ mod tests {
             result?;
             Ok(Pass1Out {
                 beta: crate::db::stacking::list_groups(&self.fixture.conn, run_id).unwrap()[0].beta,
-                logged: pass1_logged_under(self.working.path())[before..].to_vec(),
+                logged: pass1_logged_under(&log_root)[before..].to_vec(),
                 excluded: rc.runtime_exclusions.len(),
             })
+        }
+
+        /// The folder whose first passes this rig counts: the working folder, or (an attested set, whose lights are
+        /// measured in place) the folder of the fixture's own lights.
+        fn log_root(&self) -> PathBuf {
+            if self.origins.is_some() {
+                self.fixture.dir.path().to_path_buf()
+            } else {
+                self.working.path().to_path_buf()
+            }
         }
 
         fn rows(&self, kind: &str) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
@@ -18395,7 +20011,7 @@ mod tests {
             let row = crate::db::stacking::find_artifact(
                 &self.fixture.conn,
                 &self.subject,
-                &self.group_key,
+                "",
                 "calibrated",
                 Some(frame_id),
             )
@@ -18427,7 +20043,7 @@ mod tests {
                     &NewArtifact {
                         subject: &self.subject,
                         frame_id: Some(frame_id),
-                        group_key: &self.group_key,
+                        group_key: "",
                         kind: "metrics",
                         path: None,
                         config_hash: &hash,
@@ -18447,12 +20063,358 @@ mod tests {
         }
     }
 
+    /// The `(group key, created_at, config hash, path)` of every `metrics`, `measured` and `fits.0` row, by (kind,
+    /// frame): what a regroup must leave untouched.
+    fn measure_rows_snapshot(
+        rig: &Pass1Rig,
+    ) -> Vec<(String, i64, String, String, String, Option<String>)> {
+        let mut out = Vec::new();
+        for kind in ["metrics", "measured", "fits.0"] {
+            for (frame_id, row) in rig.rows(kind) {
+                out.push((
+                    kind.to_string(),
+                    frame_id,
+                    row.group_key.clone(),
+                    row.created_at.clone(),
+                    row.config_hash.clone(),
+                    row.path.clone(),
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Frame-level cache spec §5.1 (Task 4): a regroup (here "one group per exposure" -> "no split") finds the
+    /// `metrics`, `measured` and `fits.0` rows again: neither pass runs, the group beta is the same, and no row or
+    /// file is rewritten.
+    #[test]
+    fn measure_rows_are_reused_across_a_regroup() {
+        let mut rig = Pass1Rig::new();
+        rig.cfg.grouping.exposure_mode = crate::stacking::config::ExposureMode::Seconds;
+        rig.plan_groups =
+            group_frames(&rig.fixture.conn, rig.fixture.set_id, &rig.cfg.grouping).unwrap();
+        let (first, logs1) =
+            crate::stacking::telemetry::capture_logs(|| rig.run("run 1", None));
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 4, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass2"), 4, "{logs1}");
+        let rows1 = measure_rows_snapshot(&rig);
+        assert_eq!(rows1.len(), 12, "metrics, measured and fits.0 for four frames");
+        assert!(rows1.iter().all(|r| r.2.is_empty()), "frame-level rows sit under the empty key: {rows1:?}");
+
+        let old_key = rig.plan_groups[0].key.clone();
+        rig.cfg.grouping.exposure_mode = crate::stacking::config::ExposureMode::NoSplit;
+        rig.plan_groups =
+            group_frames(&rig.fixture.conn, rig.fixture.set_id, &rig.cfg.grouping).unwrap();
+        assert_ne!(rig.plan_groups[0].key, old_key, "the two groupings must name the group differently");
+        let (second, logs2) =
+            crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        assert_eq!(fan_out_items(&logs2, "measure", "pass1"), 0, "a regroup re-ran pass 1: {logs2}");
+        assert_eq!(fan_out_items(&logs2, "measure", "pass2"), 0, "a regroup re-ran pass 2: {logs2}");
+        assert!(second.logged.is_empty(), "{:?}", second.logged);
+        assert_eq!(second.beta, first.beta, "the same members, the same group beta");
+        assert_eq!(measure_rows_snapshot(&rig), rows1, "a regroup rewrote or added rows");
+    }
+
+    /// Frame-level cache spec §5.1, review focus 1 (Task 4): two exposure classes with different PSF shapes (one
+    /// Moffat at beta 2.5, one Gaussian) have different group betas; merged into one group the group beta is a third
+    /// value. Pass 1 is reused (it is keyed on the calibration hash and the measurement subtree, not on the group
+    /// beta) and pass 2 re-runs for every member.
+    #[test]
+    fn merged_group_with_a_new_beta_reruns_pass_two_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        // Three frames per class: a group needs three included frames to be measured at all.
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (0.0, 0.0), (3.0, 0.0), (0.0, 3.0)];
+        let mut light_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let moffat_class = i < 3;
+            let spec = LightSpec {
+                exptime: if moffat_class { 60.0 } else { 120.0 },
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let stars = shifted_stars(dx, dy);
+            let (id, _) = if moffat_class {
+                test_fixtures::add_light_with_moffat_field(
+                    &fixture,
+                    &spec,
+                    &stars,
+                    3.4,
+                    2.5,
+                    600.0,
+                    5.0,
+                    100 + i as u64,
+                )
+            } else {
+                test_fixtures::add_light_with_field_fwhm(
+                    &fixture,
+                    &spec,
+                    &stars,
+                    3.4,
+                    600.0,
+                    5.0,
+                    100 + i as u64,
+                )
+            };
+            light_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        // One Measure stage under `mode`; returns every group's beta and the captured logs.
+        let measure = |mode: crate::stacking::config::ExposureMode| {
+            let mut cfg = StackingConfig::default();
+            cfg.grouping.exposure_mode = mode;
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            let (res, logs) = crate::stacking::telemetry::capture_logs(|| {
+                run_stages_for_test(&mut rc, Stage::Measure)
+            });
+            res.unwrap();
+            let betas: Vec<f64> = plan_groups
+                .iter()
+                .map(|g| rc.measured_groups[&g.key].beta.expect("a measured group has a beta"))
+                .collect();
+            (plan_groups.len(), betas, logs)
+        };
+
+        let (n_split, betas_split, logs1) = measure(crate::stacking::config::ExposureMode::Seconds);
+        assert_eq!(n_split, 2, "one group per exposure class");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 6, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass2"), 6, "{logs1}");
+
+        let (n_merged, betas_merged, logs2) =
+            measure(crate::stacking::config::ExposureMode::NoSplit);
+        assert_eq!(n_merged, 1);
+        assert!(
+            betas_split.iter().any(|b| *b != betas_merged[0]),
+            "premise: the merged group's beta differs from a source group's: {betas_split:?} -> {betas_merged:?}"
+        );
+        assert!(
+            betas_split.iter().all(|b| *b != betas_merged[0]),
+            "premise: ... and from both of them: {betas_split:?} -> {betas_merged:?}"
+        );
+        assert_eq!(
+            fan_out_items(&logs2, "measure", "pass1"),
+            0,
+            "the first passes are the frames', not the group's: {logs2}"
+        );
+        assert_eq!(
+            fan_out_items(&logs2, "measure", "pass2"),
+            6,
+            "every member is refitted at the new group beta: {logs2}"
+        );
+    }
+
+    /// Frame-level cache spec §5.7 (Task 4): a `measured` row whose path is in an old `measured/<group_key>/` folder
+    /// under another stem is the artifact, read as it stands: no pass 1, no spurious refusal for the file the layout
+    /// would name now, nothing written to the layout path.
+    #[test]
+    fn the_spill_is_read_from_the_row_path() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let old_dir = rig.measured_root().join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut moved = Vec::new();
+        for (frame_id, row) in rig.rows("measured") {
+            let old = old_dir.join(format!("legacy_{frame_id}.athm"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            moved.push(old);
+        }
+        assert_eq!(moved.len(), 4);
+        // Pass 2 is lost; the first passes are only on disk under their old names.
+        rig.delete_rows(&["metrics", "fits.0"]);
+
+        let (second, logs) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        assert_eq!(fan_out_items(&logs, "measure", "pass1"), 0, "pass 1 re-ran: {logs}");
+        assert_eq!(fan_out_items(&logs, "measure", "pass2"), 4, "{logs}");
+        assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
+        assert!(
+            !logs.contains("first-pass artifact"),
+            "no refusal or stale line for a spill read from its row: {logs}"
+        );
+        let rows = rig.rows("measured");
+        assert_eq!(rows.len(), 4);
+        for row in rows.values() {
+            let path = PathBuf::from(row.path.as_ref().unwrap());
+            assert!(moved.contains(&path), "the row keeps its path: {path:?}");
+            assert!(path.is_file());
+        }
+        let in_layout_root: Vec<_> = std::fs::read_dir(rig.measured_root())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(in_layout_root.is_empty(), "nothing was written to the layout path: {in_layout_root:?}");
+    }
+
+    /// Moves each frame's `kind` file into `<root>/old_group_key/legacy_<id><suffix>` and points its row there: what the
+    /// migration (spec §5.7) leaves. Returns the new path by frame id.
+    fn move_rows_to_legacy_folder(
+        rig: &Pass1Rig,
+        kind: &str,
+        root: &Path,
+        suffix: &str,
+    ) -> HashMap<i64, PathBuf> {
+        let old_dir = root.join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut moved = HashMap::new();
+        for (frame_id, row) in rig.rows(kind) {
+            let old = old_dir.join(format!("legacy_{frame_id}{suffix}"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            moved.insert(frame_id, old);
+        }
+        moved
+    }
+
+    /// The layout's pass-1 path for one frame of the rig's group.
+    fn layout_spill_of(rig: &Pass1Rig, frame_id: i64) -> PathBuf {
+        let frame = rig.plan_groups[0]
+            .frames
+            .iter()
+            .find(|f| f.frame_id == frame_id)
+            .expect("a frame of the group");
+        rig.layout.measured_path(&frame_file_stem(frame))
+    }
+
+    /// Ruling R6 M1 (Task 7): a REFUSED first-pass artifact is rewritten at the layout path, not the old row path, so
+    /// `replace_frame_level_file` retires the legacy `measured/<old_key>/` file. Three refusal arms: a head refused
+    /// with the member's own beta on its `metrics` row (validated when pass 2 needs it), a head refused on the
+    /// controller at prepare time (no `metrics` row), and a body refused by the worker's whole-file checksum; the
+    /// fourth member's legacy file is valid and stays where it is.
+    #[test]
+    fn a_refused_spill_is_rewritten_at_the_layout_path() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let ids = rig.sorted_ids();
+        assert_eq!(ids.len(), 4);
+        let moved = move_rows_to_legacy_folder(&rig, "measured", &rig.measured_root(), ".athm");
+        let flip = |path: &Path, at: usize| {
+            let mut bytes = std::fs::read(path).unwrap();
+            let at = if at == usize::MAX { bytes.len() / 2 } else { at };
+            bytes[at] ^= 0x5a;
+            std::fs::write(path, &bytes).unwrap();
+        };
+        let head = crate::stacking::pass1_artifact::PREFIX_LEN;
+        flip(&moved[&ids[0]], head); // pending arm: metrics row present, head refused
+        flip(&moved[&ids[1]], usize::MAX); // worker arm: head fine, whole-file checksum refused
+        flip(&moved[&ids[3]], head); // prepare arm: metrics row gone, head refused
+        rig.fixture
+            .conn
+            .execute(
+                "DELETE FROM stacking_artifacts WHERE kind = 'metrics' AND frame_id = ?1",
+                [ids[3]],
+            )
+            .unwrap();
+        // Pass 2 is owed for all four: their `fits.0` rows are gone.
+        rig.delete_rows(&["fits.0"]);
+
+        let second = rig.run("run 2", None);
+        let mut rerun = second.logged.clone();
+        rerun.sort();
+        let mut expected: Vec<PathBuf> = [ids[0], ids[1], ids[3]]
+            .iter()
+            .map(|&id| rig.calibrated_path(id))
+            .collect();
+        expected.sort();
+        assert_eq!(rerun, expected, "exactly the three refused artifacts re-ran pass 1");
+        assert_eq!(second.excluded, 0);
+
+        let rows = rig.rows("measured");
+        assert_eq!(rows.len(), 4);
+        for &id in &[ids[0], ids[1], ids[3]] {
+            let path = PathBuf::from(rows[&id].path.clone().unwrap());
+            assert_eq!(path, layout_spill_of(&rig, id), "frame {id}: rewritten at the layout path");
+            assert!(path.is_file(), "frame {id}");
+            assert!(!moved[&id].exists(), "frame {id}: the legacy file is retired");
+        }
+        let kept = PathBuf::from(rows[&ids[2]].path.clone().unwrap());
+        assert_eq!(kept, moved[&ids[2]], "a valid legacy artifact keeps its row path");
+        assert!(kept.is_file());
+    }
+
+    /// Ruling R6 M2 (Task 7): stale `fits.0` and `measured` rows pointing into `fits/<old_key>/` and
+    /// `measured/<old_key>/`, `rerun_from = Measure`: the old files are gone and the new ones sit at
+    /// `<stem>_f<id>` in the flat folders.
+    #[test]
+    fn a_forced_measure_replaces_files_in_old_group_folders() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let old_measured = move_rows_to_legacy_folder(&rig, "measured", &rig.measured_root(), ".athm");
+        let old_fits = move_rows_to_legacy_folder(&rig, "fits.0", &rig.layout.fits_root(), ".p0.athf");
+        assert_eq!((old_measured.len(), old_fits.len()), (4, 4));
+
+        rig.run("run 2", Some(Stage::Measure));
+        for group_frame in &rig.plan_groups[0].frames {
+            let id = group_frame.frame_id;
+            let stem = frame_file_stem(group_frame);
+            assert!(!old_measured[&id].exists(), "frame {id}: the old pass-1 file is gone");
+            assert!(!old_fits[&id].exists(), "frame {id}: the old fits file is gone");
+            let measured = rig.rows("measured")[&id].path.clone().unwrap();
+            assert_eq!(PathBuf::from(&measured), rig.layout.measured_path(&stem));
+            assert!(Path::new(&measured).is_file());
+            let fits = rig.rows("fits.0")[&id].path.clone().unwrap();
+            assert_eq!(PathBuf::from(&fits), rig.layout.fits_path(&stem, 0));
+            assert!(Path::new(&fits).is_file());
+        }
+    }
+
     /// Plan A Task 11c, bar 3: a first pass is alive only while its worker holds it, so the peak over a fresh run
     /// and over a group-β-move run is the admitted workers (one here), never the group (four).
     #[test]
     fn measure_pass1_residency_is_the_admitted_workers() {
         let rig = Pass1Rig::new();
-        let calibrated_dir = rig.layout.calibrated_dir(&rig.group_key);
+        let calibrated_dir = rig.layout.calibrated_dir();
         rig.run("run 1", None);
         assert_eq!(
             crate::stacking::measure::pass1_peak(&calibrated_dir),
@@ -18493,10 +20455,11 @@ mod tests {
         );
     }
 
-    /// Plan A Task 11c (R11c-4): a calibrated file whose mtime moved since the artifact was written makes THAT
-    /// frame's first pass stale; it re-runs, the others do not, nothing is excluded.
+    /// Plan A Task 11c (R11c-4), amended by the frame-level cache (spec §5.3): a calibrated file whose mtime moved
+    /// since the artifact was written is recalibrated by the calibrate stage (its row records the old mtime), and the
+    /// first pass survives: validity follows the calibration hash, not the mtime. Nothing is excluded.
     #[test]
-    fn measure_pass1_artifact_of_a_changed_source_reruns_pass_one() {
+    fn measure_pass1_artifact_survives_a_touched_source() {
         let rig = Pass1Rig::new();
         rig.run("run 1", None);
         let ids = rig.sorted_ids();
@@ -18510,9 +20473,370 @@ mod tests {
         drop(file);
         rig.delete_rows(&["fits.0"]);
         let second = rig.run("run 2", None);
-        assert_eq!(second.logged, vec![touched], "only the touched file re-ran pass 1");
+        assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
         assert_eq!(second.excluded, 0);
         assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Ruling R12 (a): a file Athenaeum never rewrites (an attested light used in place) keeps its modification time in
+    /// the first pass's stamp. A same-size pixel edit by someone else (a new mtime, the catalog row refreshed as a
+    /// rescan does) makes THAT frame's first pass stale; it re-runs, the others do not, nothing is excluded. Without
+    /// the mtime the edit would be silently reused (the length is the same).
+    #[test]
+    fn measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one() {
+        let rig = Pass1Rig::attested();
+        let first = rig.run("run 1", None);
+        assert_eq!(first.logged.len(), 4);
+        let ids = rig.sorted_ids();
+        assert_eq!(ids.len(), 4);
+        for id in &ids {
+            let p = rig.calibrated_path(*id);
+            assert!(
+                !p.starts_with(rig.layout.calibrated_root()) && !p.starts_with(rig.layout.prepared_root()),
+                "{p:?} is used in place"
+            );
+        }
+        let edited = rig.calibrated_path(ids[2]);
+        let before = std::fs::metadata(&edited).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            // One pixel inside the data unit, same size: 1.0f32 big endian.
+            let mut file = std::fs::OpenOptions::new().write(true).open(&edited).unwrap();
+            file.seek(SeekFrom::Start(before.len() / 2)).unwrap();
+            file.write_all(&1.0f32.to_be_bytes()).unwrap();
+            file.set_modified(before.modified().unwrap() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let after = std::fs::metadata(&edited).unwrap();
+        assert_eq!(after.len(), before.len(), "a same-size edit");
+        assert_ne!(after.modified().unwrap(), before.modified().unwrap());
+        let (size, modified_at) = file_identity(&edited).unwrap();
+        rig.fixture
+            .conn
+            .execute(
+                "UPDATE files SET size = ?1, modified_at = ?2 WHERE path = ?3",
+                rusqlite::params![size, modified_at, edited.to_str().unwrap()],
+            )
+            .unwrap();
+        rig.delete_rows(&["metrics", "fits.0"]);
+        let second = rig.run("run 2", None);
+        assert_eq!(second.logged, vec![edited], "only the edited file re-ran pass 1");
+        assert_eq!(second.excluded, 0);
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Plan A Task 11c (R11c-4), amended (spec §5.3): a calibrated file of another SIZE than the one pass 1 read, whose
+    /// row says so too (the calibrate stage reuses it), makes THAT frame's first pass stale; it re-runs, the others do
+    /// not, nothing is excluded.
+    #[test]
+    fn measure_pass1_artifact_of_a_source_of_another_size_reruns_pass_one() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let ids = rig.sorted_ids();
+        let resized = rig.calibrated_path(ids[2]);
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&resized).unwrap();
+            file.write_all(&[0u8; 2880]).unwrap();
+        }
+        let row = crate::db::stacking::find_artifact(
+            &rig.fixture.conn,
+            &rig.subject,
+            "",
+            "calibrated",
+            Some(ids[2]),
+        )
+        .unwrap()
+        .unwrap();
+        let (size, modified_at) = file_identity(&resized).unwrap();
+        upsert_artifact(
+            &rig.fixture.conn,
+            &NewArtifact {
+                subject: &rig.subject,
+                frame_id: Some(ids[2]),
+                group_key: "",
+                kind: "calibrated",
+                path: row.path.as_deref(),
+                config_hash: &row.config_hash,
+                size: Some(size),
+                modified_at: Some(&modified_at),
+                payload_json: row.payload_json.as_deref(),
+            },
+        )
+        .unwrap();
+        rig.delete_rows(&["fits.0"]);
+        let second = rig.run("run 2", None);
+        assert_eq!(second.logged, vec![resized], "only the resized file re-ran pass 1");
+        assert_eq!(second.excluded, 0);
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// The widest `admission` any `fan-out admitted` line of `logs` reports: more than 1 means the stage really ran
+    /// its frames in parallel (an unknown RAM total admits one worker whatever the pool).
+    fn widest_admission(logs: &str) -> usize {
+        logs.lines()
+            .filter(|l| l.contains("fan-out admitted"))
+            .filter_map(|l| l.split(" admission=").nth(1)?.split_whitespace().next()?.parse().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Every plane of one FITS file, as bit patterns.
+    fn file_plane_bits(path: &Path) -> Vec<Vec<u32>> {
+        let reader = PlaneReader::open(path).unwrap();
+        (0..reader.channels())
+            .map(|p| reader.read_plane(p).unwrap().iter().map(|v| v.to_bits()).collect())
+            .collect()
+    }
+
+    /// Every plane of every calibrated frame of the rig, as bit patterns, by frame id.
+    fn calibrated_plane_bits(rig: &Pass1Rig) -> Vec<(i64, Vec<Vec<u32>>)> {
+        rig.sorted_ids()
+            .into_iter()
+            .map(|id| (id, file_plane_bits(&rig.calibrated_path(id))))
+            .collect()
+    }
+
+    /// The precondition of keeping a first pass across a recalibration, on a rig: a frame calibrated, its file and
+    /// row deleted and calibrated again in a NEW run context has the same planes to the bit. `planes` is the plane
+    /// count every calibrated file must have (1 mono, 3 debayered).
+    fn assert_recalibration_is_bit_identical(rig: &Pass1Rig, planes: usize, parallel: bool) {
+        rig.run("run 1", None);
+        let before = calibrated_plane_bits(rig);
+        assert_eq!(before.len(), 4);
+        assert!(before.iter().all(|(_, p)| p.len() == planes), "{planes} planes each");
+        let calibrated_files: Vec<PathBuf> =
+            before.iter().map(|(id, _)| rig.calibrated_path(*id)).collect();
+        assert!(
+            calibrated_files.iter().all(|f| f.starts_with(rig.layout.calibrated_root())),
+            "written under calibrated/: {calibrated_files:?}"
+        );
+        rig.delete_rows(&["calibrated"]);
+        for file in &calibrated_files {
+            std::fs::remove_file(file).unwrap();
+        }
+        let (_, logs) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        if parallel && total_ram_bytes().is_some() {
+            assert!(widest_admission(&logs) > 1, "run 2 recalibrated in parallel: {logs}");
+        }
+        for file in &calibrated_files {
+            assert!(file.is_file(), "run 2 recalibrated {}", file.display());
+        }
+        let after = calibrated_plane_bits(rig);
+        assert_eq!(before, after, "a recalibration changed a pixel");
+    }
+
+    /// Frame-level cache spec §5.3 / §8 Q1 (Task 8, step 1): the precondition of keeping a first pass across a
+    /// recalibration. A frame calibrated, its file and row deleted and calibrated again in a NEW run context has the
+    /// same planes to the bit. Without this pin the mtime stamp must stay. Ruling R12 (b): the mono case on the stock
+    /// one-thread pool and on a four-thread one, and the debayered OSC case (three-plane `_d` files) on four threads.
+    #[test]
+    fn recalibration_reproduces_the_planes_bit_for_bit() {
+        assert_recalibration_is_bit_identical(&Pass1Rig::new(), 1, false);
+        assert_recalibration_is_bit_identical(&Pass1Rig::build(4, false), 1, true);
+        assert_recalibration_is_bit_identical(&Pass1Rig::build(4, true), 3, true);
+    }
+
+    /// Ruling R12 (b): what Prepare writes under `prepared/` (a debayered mosaic, a 16-bit FITS and an XISF converted
+    /// into the unit domain) is reproduced to the bit by a second Prepare of the same frames in a new run context,
+    /// on a four-thread pool. Length-only on the first pass's stamp holds for `prepared/` only if this does.
+    #[test]
+    fn re_preparing_reproduces_the_prepared_planes_bit_for_bit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let mut raw = ServiceContext::new_for_tests(db_path.clone());
+        raw.image_pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap());
+        let ctx = Arc::new(raw);
+        assert!(ctx.image_pool.current_num_threads() > 1);
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for (u, file, bayer) in [
+            ("m1", test_fixtures::ProjectFile::Mosaic32, Some("RGGB")),
+            ("m2", test_fixtures::ProjectFile::Mosaic32, Some("RGGB")),
+            ("m3", test_fixtures::ProjectFile::Mosaic32, Some("RGGB")),
+            ("i1", test_fixtures::ProjectFile::Mono16, None),
+            ("x1", test_fixtures::ProjectFile::Xisf32, None),
+        ] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = file;
+            spec.bayerpat = bayer;
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let working = tmp.path().join("work");
+        let out = tmp.path().join("out");
+        let prepared_bits = |rc: &RunContext| -> Vec<(i64, PathBuf, Vec<Vec<u32>>)> {
+            let mut v: Vec<(i64, PathBuf, Vec<Vec<u32>>)> = rc
+                .plan_groups
+                .iter()
+                .flat_map(|g| g.frames.iter())
+                .map(|f| {
+                    let row = crate::db::stacking::find_artifact(
+                        &conn,
+                        &rc.subject,
+                        "",
+                        "calibrated",
+                        Some(f.frame_id),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let path = PathBuf::from(row.path.unwrap());
+                    let bits = file_plane_bits(&path);
+                    (f.frame_id, path, bits)
+                })
+                .collect();
+            v.sort_by_key(|(id, _, _)| *id);
+            v
+        };
+
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &working, &out);
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        let before = prepared_bits(&rc);
+        assert_eq!(before.len(), 5);
+        assert!(
+            before.iter().all(|(_, p, _)| p.starts_with(rc.layout.prepared_root())),
+            "every frame was written under prepared/: {before:?}"
+        );
+        assert_eq!(before.iter().filter(|(_, _, b)| b.len() == 3).count(), 3, "the mosaics were debayered");
+        for (_, path, _) in &before {
+            std::fs::remove_file(path).unwrap();
+        }
+        crate::db::stacking::delete_artifacts(&conn, &rc.subject, &["calibrated"]).unwrap();
+
+        let mut rc2 = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &working, &out);
+        let (res, logs) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc2));
+        res.unwrap();
+        if total_ram_bytes().is_some() {
+            assert!(widest_admission(&logs) > 1, "the second Prepare ran in parallel: {logs}");
+        }
+        assert!(rc2.runtime_exclusions.is_empty(), "{:?}", rc2.runtime_exclusions);
+        let after = prepared_bits(&rc2);
+        for (_, path, _) in &after {
+            assert!(path.is_file(), "re-prepared {}", path.display());
+        }
+        assert_eq!(before, after, "a second Prepare changed a pixel (or a path)");
+    }
+
+    /// Frame-level cache spec §5.3 (Task 8): "Delete intermediates" removes `calibrated/` and keeps `measured/`. The
+    /// next run recalibrates every frame (a new file, a new mtime, the same bytes) and, because it needs pass 2 again
+    /// (here: the `metrics` and `fits.0` rows of the measurement are gone), reads the stored first pass: the calibration
+    /// hash in the artifact's key is its validity, not the calibrated file's mtime. No `rerun_from`: that would force
+    /// Measure fresh.
+    #[test]
+    fn pass1_survives_a_byte_identical_recalibration() {
+        let rig = Pass1Rig::new();
+        let (first, logs1) = crate::stacking::telemetry::capture_logs(|| rig.run("run 1", None));
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 4, "{logs1}");
+        let calibrated_before: Vec<PathBuf> = rig
+            .sorted_ids()
+            .into_iter()
+            .map(|id| rig.calibrated_path(id))
+            .collect();
+        let measured_before: Vec<(i64, String, std::time::SystemTime)> = rig
+            .rows("measured")
+            .into_iter()
+            .map(|(id, row)| {
+                let path = row.path.unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (id, path, modified)
+            })
+            .collect();
+        assert_eq!(measured_before.len(), 4);
+
+        cleanup_work(
+            &rig.fixture.conn,
+            &rig.subject,
+            &rig.layout,
+            crate::stacking::paths::CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert!(calibrated_before.iter().all(|p| !p.exists()), "calibrated/ went");
+        assert!(
+            measured_before.iter().all(|(_, p, _)| Path::new(p).is_file()),
+            "measured/ stayed"
+        );
+        rig.delete_rows(&["metrics", "fits.0"]);
+
+        let (second, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        assert!(
+            calibrated_before.iter().all(|p| p.is_file()),
+            "run 2 recalibrated every frame"
+        );
+        assert_eq!(fan_out_items(&logs2, "measure", "pass1"), 0, "pass 1 re-ran: {logs2}");
+        assert_eq!(fan_out_items(&logs2, "measure", "pass2"), 4, "{logs2}");
+        assert!(second.logged.is_empty(), "{:?}", second.logged);
+        assert_eq!(second.excluded, 0);
+        assert_eq!(
+            second.beta.map(f64::to_bits),
+            first.beta.map(f64::to_bits),
+            "the group beta from the stored first passes is the one the pixels gave"
+        );
+        for (id, path, modified) in &measured_before {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                *modified,
+                "frame {id}: the first-pass file was rewritten"
+            );
+        }
+        assert_eq!(rig.rows("metrics").len(), 4);
+    }
+
+    /// Ruling R10 M3: a first pass re-run inside a pass-2 worker (its stored artifact fails the whole-file checksum
+    /// after the head check passed) is written there; when that member's pass 2 then fails (here the calibrated file
+    /// is touched right after the first pass, so the read guard refuses the second), the controller still records the
+    /// artifact's row, as phase 1 does. Without it the rewritten file carries a new mtime the old row does not know,
+    /// `plan::is_fresh` refuses it and the frame re-runs pass 1 on every run while its pass 2 keeps failing.
+    #[test]
+    fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        for row in rig.rows("measured").into_values() {
+            let artifact = PathBuf::from(row.path.unwrap());
+            let mut bytes = std::fs::read(&artifact).unwrap();
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0x5a;
+            // The row still describes the file (same size, same mtime), so the controller's head check passes.
+            let modified = std::fs::metadata(&artifact).unwrap().modified().unwrap();
+            std::fs::write(&artifact, &bytes).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&artifact)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        rig.delete_rows(&["metrics", "fits.0"]);
+
+        crate::stacking::measure::PASS1_TOUCH_AFTER
+            .lock()
+            .unwrap()
+            .push((rig.working.path().to_path_buf(), 1));
+        let (second, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        crate::stacking::measure::PASS1_TOUCH_AFTER
+            .lock()
+            .unwrap()
+            .retain(|(dir, _)| dir != rig.working.path());
+        assert_eq!(second.logged.len(), 4, "every artifact was refused after its head passed");
+        assert_eq!(second.excluded, 1, "the touched frame's pass 2 was refused: {logs2}");
+        let rows = rig.rows("measured");
+        assert_eq!(rows.len(), 4);
+        for (id, row) in &rows {
+            assert!(
+                crate::stacking::plan::file_matches_identity(
+                    Path::new(row.path.as_deref().unwrap()),
+                    row.size,
+                    row.modified_at.as_deref()
+                ),
+                "frame {id}: the rewritten artifact's row describes another file"
+            );
+        }
+        let third = rig.run("run 3", None);
+        assert!(
+            third.logged.is_empty(),
+            "pass 1 re-ran for {:?}",
+            third.logged
+        );
     }
 
     /// Plan A Task 11c (R11c-2): an artifact that fails its checksum is recomputed (a `warn!`), never decoded and
@@ -18621,15 +20945,16 @@ mod tests {
     #[test]
     fn measure_pass1_write_failure_recomputes_in_pass_two() {
         let rig = Pass1Rig::new();
-        std::fs::create_dir_all(rig.measured_root()).unwrap();
-        std::fs::write(rig.measured_root().join(&rig.group_key), b"not a directory").unwrap();
+        // The spill folder is flat now (frame-level cache): a file stands where `measured/` belongs.
+        std::fs::create_dir_all(rig.measured_root().parent().unwrap()).unwrap();
+        std::fs::write(rig.measured_root(), b"not a directory").unwrap();
         let out = rig.run("run 1", None);
         assert!(rig.rows("measured").is_empty(), "no row for a file that is not there");
         assert_eq!(rig.rows("metrics").len(), 4);
         assert_eq!(out.excluded, 0);
         assert_eq!(out.logged.len(), 8, "pass 1 ran twice per member");
         assert_eq!(
-            crate::stacking::measure::pass1_peak(&rig.layout.calibrated_dir(&rig.group_key)),
+            crate::stacking::measure::pass1_peak(&rig.layout.calibrated_dir()),
             1
         );
     }
@@ -18799,7 +21124,7 @@ mod tests {
             let calibrated = crate::db::stacking::find_artifact(
                 &fixture.conn,
                 &subject,
-                &plan_groups[0].key,
+                "",
                 "calibrated",
                 Some(frame_id),
             )
@@ -19285,7 +21610,7 @@ mod tests {
     /// resolve: `create_dir_all(parent)` and the tmp write both succeed,
     /// the final rename onto a directory does not) — one frame, so the
     /// degrade fires exactly ONCE and its three siblings prove the run is
-    /// otherwise untouched. Blocking the whole `fits/<group>` directory
+    /// otherwise untouched. Blocking the whole `fits/` directory
     /// instead would fail all four writes and could not tell a per-plane
     /// `continue` apart from a stage that gave up.
     #[test]
@@ -19365,7 +21690,7 @@ mod tests {
         // this test's own tree for the reason `FITS_WRITE_FAILURE_LOG`'s
         // own doc gives — sibling tests measure frames concurrently under
         // `cargo test`'s default parallelism. The prefix is the victim's
-        // own `fits/<group>` directory as the DB spells it, NOT
+        // own `fits/` directory as the DB spells it, NOT
         // `working.path()`: on macOS the tempdir hands out `/var/folders/…`
         // while everything the run writes carries the canonical
         // `/private/var/folders/…`, so a `working.path()` prefix matches
@@ -20087,6 +22412,377 @@ mod tests {
             .unwrap();
         assert_eq!(row.reference_frame_id, Some(light_ids[0]));
         assert_eq!(row.reference_mode, "manual");
+    }
+
+    // ── two-pass decision cache (frame-level cache spec §5.6, Task 10) ────
+
+    /// Six frames of [`two_pass_fields`] on an Auto reference with `twoPass` on, run through Register as often as a
+    /// test asks: a second run finds the first one's rows, as a user's second run does.
+    struct TwoPassRig {
+        _tmp: tempfile::TempDir,
+        ctx: Arc<ServiceContext>,
+        fixture: test_fixtures::Fixture,
+        light_ids: Vec<i64>,
+        working: tempfile::TempDir,
+        output: tempfile::TempDir,
+        layout: WorkingLayout,
+    }
+
+    impl TwoPassRig {
+        fn new() -> TwoPassRig {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let (fixture, light_ids, working, output) =
+                seed_star_group_with_fields(&db_path, SET_NAME, &two_pass_fields());
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            TwoPassRig { _tmp: tmp, ctx, fixture, light_ids, working, output, layout }
+        }
+
+        /// One run through Register, `emitter` receiving its progress.
+        fn run(&self, emitter: Arc<dyn ProgressEmitter>) -> RunContext {
+            self.run_cfg(StackingConfig::default(), emitter)
+        }
+
+        /// One run through Register under `cfg`.
+        fn run_cfg(&self, cfg: StackingConfig, emitter: Arc<dyn ProgressEmitter>) -> RunContext {
+            let plan_groups = group_frames(&self.fixture.conn, self.fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+            let (run_id, group_ids) = seed_run_and_groups(
+                &self.fixture.conn,
+                self.fixture.set_id,
+                &plan_groups,
+                self.working.path(),
+                self.output.path(),
+            );
+            let mut rc = test_context(
+                self.ctx.clone(),
+                emitter,
+                run_id,
+                self.fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups,
+                self.layout.clone(),
+                self.output.path().to_path_buf(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Register).unwrap();
+            rc
+        }
+
+        /// Every member's stored registration transform (`registration_results`), by frame id.
+        fn transforms(&self) -> HashMap<i64, Option<String>> {
+            get_registration_for_frame_set(&self.fixture.conn, self.fixture.set_id)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.frame_id, r.transform_json))
+                .collect()
+        }
+
+        /// The group's `two_pass` row, if any.
+        fn decision_row(&self, rc: &RunContext) -> Option<crate::db::stacking::StackingArtifactRow> {
+            let key = &rc.plan_groups[0].key;
+            crate::db::stacking::find_artifact(
+                &self.fixture.conn,
+                &StackSubject::FrameSet(self.fixture.set_id),
+                artifact_group_key(TWO_PASS_ARTIFACT_KIND, key),
+                TWO_PASS_ARTIFACT_KIND,
+                None,
+            )
+            .unwrap()
+        }
+    }
+
+    /// Spec §5.6: the dry pass runs once. Run 1 registers the six members twice (the dry pass, then the real one) and
+    /// records `{"switchTo": <frame>}` on the group; run 2 finds the row fresh, skips the dry pass (no fan-out
+    /// opens: the real pass is all cache hits too), and ends on the same final reference and `switched_from`.
+    #[test]
+    fn two_pass_decision_is_cached_on_the_second_run() {
+        let rig = TwoPassRig::new();
+        let (rc1, logs1) =
+            crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
+        let chosen = rc1.reference_frame_id.unwrap();
+        assert_ne!(chosen, rig.light_ids[0], "premise: the dry pass switched the reference");
+        assert_eq!(
+            fan_out_items(&logs1, "register", "align"),
+            2 * rig.light_ids.len(),
+            "run 1: the dry pass and the real pass each register every member: {logs1}"
+        );
+        let row = rig.decision_row(&rc1).expect("run 1 recorded its decision");
+        assert_eq!(row.group_key, rc1.plan_groups[0].key, "group-level");
+        assert!(row.path.is_none() && row.frame_id.is_none());
+        let payload: serde_json::Value = serde_json::from_str(row.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({ "switchTo": chosen }));
+
+        // Ruling R14 (e): the stars a hit builds for the switched reference are the ones the dry pass built. One
+        // member that is neither the old nor the new reference loses its registration row, so run 2 registers it
+        // again against the hit's reference stars: its transform must be run 1's bit for bit.
+        let transforms1 = rig.transforms();
+        let probe = *rig
+            .light_ids
+            .iter()
+            .find(|&&id| id != chosen && id != rig.light_ids[0])
+            .unwrap();
+        assert!(transforms1[&probe].is_some(), "premise: run 1 stored the probe's transform");
+        assert_eq!(
+            rig.fixture
+                .conn
+                .execute(
+                    "DELETE FROM registration_results WHERE frames_set_id = ?1 AND frame_id = ?2",
+                    rusqlite::params![rig.fixture.set_id, probe],
+                )
+                .unwrap(),
+            1
+        );
+
+        let (rc2, logs2) =
+            crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
+        assert_eq!(
+            fan_out_items(&logs2, "register", "align"),
+            1,
+            "run 2 registers the probe only: no dry pass, every other member reused: {logs2}"
+        );
+        let transforms2 = rig.transforms();
+        assert_eq!(
+            transforms2[&probe], transforms1[&probe],
+            "the probe's transform moved: the stars built on a hit differ from the dry pass's"
+        );
+        assert!(logs2.contains("two-pass decision reused"), "{logs2}");
+        assert_eq!(rc2.reference_frame_id, Some(chosen));
+        assert_eq!(rc2.summary.reference.frame_id, Some(chosen));
+        assert_eq!(rc2.summary.reference.switched_from, Some(rig.light_ids[0]));
+        assert!(
+            rc2.warnings.iter().any(|w| w.starts_with("reference switched by the two-pass pick:")),
+            "{:?}",
+            rc2.warnings
+        );
+        let run_row = crate::db::stacking::get_run(&rig.fixture.conn, rc2.run_id).unwrap().unwrap();
+        assert_eq!(run_row.reference_frame_id, Some(chosen));
+        assert_eq!(
+            rig.decision_row(&rc2).unwrap().config_hash,
+            row.config_hash,
+            "the same inputs, the same key"
+        );
+    }
+
+    /// One member recalibrated (its source file's catalog size moved, so its calibration hash and with it its
+    /// registration hash against the candidate move): the key moves, the row is stale, the dry pass runs again and
+    /// the row is rewritten under the new key.
+    #[test]
+    fn two_pass_cache_misses_when_a_member_changes() {
+        let rig = TwoPassRig::new();
+        let rc1 = rig.run(Arc::new(NullEmitter));
+        let key1 = rig.decision_row(&rc1).unwrap().config_hash;
+
+        rig.fixture
+            .conn
+            .execute(
+                "UPDATE files SET size = size + 1000 WHERE id = \
+                 (SELECT file_id FROM frames WHERE id = ?1)",
+                rusqlite::params![rig.light_ids[2]],
+            )
+            .unwrap();
+        let (rc2, logs2) =
+            crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
+        assert!(!logs2.contains("two-pass decision reused"), "{logs2}");
+        assert!(
+            fan_out_items(&logs2, "register", "align") >= rig.light_ids.len(),
+            "the dry pass did not run again: {logs2}"
+        );
+        let key2 = rig.decision_row(&rc2).unwrap().config_hash;
+        assert_ne!(key1, key2, "the key ignored a changed member");
+    }
+
+    /// A `selection.minWeightFraction` that floors three of [`two_pass_fields`]' six members at Measure time (their
+    /// weights are about 0.296, 0.296, 0.304 against 0.39, 0.40 and 1.0), with a margin of 0.036 either side.
+    const FLOOR_FLOORING_THREE_MEMBERS: f64 = 0.34;
+
+    /// Ruling R14 (a): a `selection.minWeightFraction` edit changes no hash the members carry, but it moves which
+    /// members the Measure-time floor takes out of the pick (PSF modes defer the gate). The floored set is a term of
+    /// the key, so the edit is a miss.
+    #[test]
+    fn two_pass_cache_misses_when_a_floor_edit_floors_a_member() {
+        let rig = TwoPassRig::new();
+        let rc1 = rig.run(Arc::new(NullEmitter));
+        let key1 = rig.decision_row(&rc1).unwrap().config_hash;
+        let group = rc1.plan_groups[0].key.clone();
+        assert!(
+            !rc1.measured[&group].iter().any(|e| e.measure_floored),
+            "premise: the default floor takes nobody out"
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.selection.min_weight_fraction = FLOOR_FLOORING_THREE_MEMBERS;
+        let (rc2, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run_cfg(cfg, Arc::new(NullEmitter)));
+        assert!(
+            rc2.measured[&group].iter().any(|e| e.measure_floored),
+            "premise: the edit floors a member"
+        );
+        assert!(!logs2.contains("two-pass decision reused"), "the floored pick reused an unfloored decision: {logs2}");
+        let key2 = rig.decision_row(&rc2).unwrap().config_hash;
+        assert_ne!(key1, key2, "the key ignored the floored member");
+    }
+
+    fn ranking_entry(id: i64, weight: Option<f64>, floored: bool) -> MeasuredFrame {
+        use crate::stacking::groups::GroupFrame;
+        MeasuredFrame {
+            frame: GroupFrame {
+                frame_id: id,
+                file_id: id,
+                filename: format!("f{id}.fits"),
+                path: format!("/f{id}.fits"),
+                size: 1,
+                modified_at: "2026-01-01".into(),
+                exposure_s: Some(60.0),
+                date_obs: None,
+                width: 64,
+                height: 48,
+                pixel_scale_arcsec: None,
+                scale_source: None,
+            },
+            calibrated: Some(PathBuf::from(format!("/c_f{id}.fits"))),
+            planes: 1,
+            measurement: None,
+            weight: weight.map(|w| FrameWeight {
+                channels: vec![w],
+                normalized: vec![w],
+                mean: w,
+                normalized_mean: w,
+                missing: None,
+            }),
+            included: true,
+            reason: None,
+            registration: None,
+            cached_calibrated: true,
+            cached_metrics: false,
+            ln_scale: None,
+            cached_ln: false,
+            ln_growth_factor: None,
+            ln_growth_pairs: None,
+            ln_aperture_correction: None,
+            measure_floored: floored,
+        }
+    }
+
+    /// Ruling R14 (a), (c): the key follows the floored members, the WHOLE weight ranking (a swap below the top N
+    /// moves it), the members whose weight is not finite and the pick version.
+    #[test]
+    fn two_pass_key_follows_the_floor_the_whole_ranking_and_the_pick_version() {
+        let cfg = StackingConfig::default();
+        let hashes: Vec<(i64, String)> = (1..=12).map(|id| (id, format!("h{id}"))).collect();
+        let entries = |weights: &[f64], floored: &[i64]| -> Vec<MeasuredFrame> {
+            weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| ranking_entry(i as i64 + 1, Some(*w), floored.contains(&(i as i64 + 1))))
+                .collect()
+        };
+        let key_of = |entries: &[MeasuredFrame]| {
+            two_pass_key(&cfg, 1, "calib", &two_pass_ranking(entries, 1, None), None, &hashes)
+        };
+        let weights: Vec<f64> = (0..12).map(|i| 1.0 - 0.05 * i as f64).collect();
+        let base = entries(&weights, &[]);
+        assert!(crate::stacking::weights::TWO_PASS_CANDIDATES < 11, "premise: ranks 11 and 12 are below the top N");
+        let base_key = key_of(&base);
+        assert_eq!(base_key, key_of(&entries(&weights, &[])), "premise: the key is deterministic");
+
+        // A floor edit that floors a member.
+        assert_ne!(base_key, key_of(&entries(&weights, &[5])), "a floored member is a key term");
+        // A floored member below the top N leaves the full ranking (a truncated one would not notice).
+        assert_ne!(base_key, key_of(&entries(&weights, &[12])), "a floored member below the top N is a key term");
+        // A floored member a project's WCS rule keeps out of the ranking anyway still leaves the dry pass's median,
+        // so the floored set is a term of its own.
+        let allowed: HashSet<i64> = (1..=12).filter(|id| *id != 5).collect();
+        let allowed_key = |floored: &[i64]| {
+            two_pass_key(
+                &cfg,
+                1,
+                "calib",
+                &two_pass_ranking(&entries(&weights, floored), 1, Some(&allowed)),
+                None,
+                &hashes,
+            )
+        };
+        assert_ne!(allowed_key(&[]), allowed_key(&[5]), "the floored set must be a key term of its own");
+        // The reference itself stays a candidate whatever its flag, so flagging it is not a change.
+        assert_eq!(base_key, key_of(&entries(&weights, &[1])), "the reference is never floored out");
+        // A swap of ranks 11 and 12: outside the top N, inside the ranking.
+        let mut swapped = weights.clone();
+        swapped.swap(10, 11);
+        assert_ne!(base_key, key_of(&entries(&swapped, &[])), "the ranking below the top N is a key term");
+        // A member whose weight is not finite leaves the ranking and is named apart.
+        let mut nan = weights.clone();
+        nan[6] = f64::NAN;
+        let nan_entries = entries(&nan, &[]);
+        let ranking = two_pass_ranking(&nan_entries, 1, None);
+        assert_eq!(ranking.non_finite, vec![7]);
+        assert!(!ranking.ranked.contains(&7));
+        assert_ne!(base_key, key_of(&nan_entries));
+        // A member with no weight at all ranks last, finite.
+        let mut unweighed = entries(&weights, &[]);
+        unweighed[2].weight = None;
+        assert_eq!(*two_pass_ranking(&unweighed, 1, None).ranked.last().unwrap(), 3);
+        // The pick version is a term.
+        let ranking = two_pass_ranking(&base, 1, None);
+        let with_version = |v: u32| two_pass_key_with_version(&cfg, v, 1, "calib", &ranking, None, &hashes);
+        assert_eq!(base_key, with_version(TWO_PASS_PICK_VERSION));
+        assert_ne!(base_key, with_version(TWO_PASS_PICK_VERSION + 1), "the key ignored the pick version");
+    }
+
+    /// The dry pass names itself in the Register progress ("checking the reference"), the real pass is "aligning",
+    /// and the stage total counts the dry pass only while it runs: 12 on run 1, 6 once the decision is cached.
+    #[test]
+    fn dry_pass_progress_names_its_pass() {
+        let register_events = |rec: &Recording| -> Vec<serde_json::Value> {
+            rec.events(STACKING_PROGRESS_EVENT)
+                .into_iter()
+                .filter(|e| e["stage"] == Stage::Register.as_str())
+                .collect()
+        };
+        let rig = TwoPassRig::new();
+        let members = rig.light_ids.len() as u64;
+
+        let rec1 = Arc::new(Recording::new());
+        rig.run(rec1.clone() as Arc<dyn ProgressEmitter>);
+        let events1 = register_events(&rec1);
+        assert!(
+            events1.iter().all(|e| e["total"] == 2 * members),
+            "run 1: the total is the dry pass plus the real one: {events1:?}"
+        );
+        let messages1: Vec<Option<&str>> = events1.iter().map(|e| e["message"].as_str()).collect();
+        let first_aligning = messages1
+            .iter()
+            .position(|m| *m == Some("aligning"))
+            .expect("a real-pass tick carries \"aligning\"");
+        assert!(
+            messages1[..first_aligning].contains(&Some("checking the reference")),
+            "a dry-pass tick carries \"checking the reference\": {messages1:?}"
+        );
+        assert!(
+            !messages1[first_aligning..].contains(&Some("checking the reference")),
+            "the dry pass is over before the real pass starts: {messages1:?}"
+        );
+
+        let rec2 = Arc::new(Recording::new());
+        rig.run(rec2.clone() as Arc<dyn ProgressEmitter>);
+        let events2 = register_events(&rec2);
+        assert!(
+            events2.iter().all(|e| e["total"] == members),
+            "run 2: a cached decision removes the dry pass from the total: {events2:?}"
+        );
+        assert!(
+            events2.iter().all(|e| e["message"] != "checking the reference"),
+            "{events2:?}"
+        );
+        let last = events2.last().expect("Register ticked");
+        assert_eq!((last["current"].as_u64(), last["message"].as_str()), (Some(members), Some("aligning")));
     }
 
     // ── M4b Task 2: mixed pixel scales inside one group ──────────────────
@@ -20951,7 +23647,20 @@ mod tests {
             fixture.set_id,
             "floor-fixture",
             cfg.clone(),
-            Vec::new(),
+            // The group `resolve_register_fits` looks up: a mono one, so its frames read `fits.0` (ruling R3 (b)).
+            vec![IntegrationGroup {
+                key: "mono__floor_test".into(),
+                instrume: None,
+                color_mode: ColorMode::Mono,
+                filter: None,
+                binning: 1,
+                cameras: Vec::new(),
+                exposure_s: None,
+                exposure_class: "unknown".into(),
+                frames: Vec::new(),
+                total_exposure_s: 0.0,
+                pixel_scale_arcsec: None,
+            }],
             WorkingLayout::new(fixture.dir.path(), "floor-fixture"),
             fixture.dir.path().to_path_buf(),
             HashMap::new(),
@@ -21001,7 +23710,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(fixture.set_id),
                     frame_id: Some(frame_id),
-                    group_key,
+                    group_key: "",
                     kind: &fits_artifact::artifact_kind(0),
                     path: Some(path.to_str().unwrap()),
                     config_hash: &expected_hash,
@@ -21055,6 +23764,114 @@ mod tests {
             resolved_at_floor.as_ref().map(Vec::len),
             Some(align::MIN_INLIERS),
             "exactly MIN_INLIERS fits must be admitted whole: {resolved_at_floor:?}"
+        );
+    }
+
+    /// Ruling R3 (b), the negative: a frame that calibrates to ONE plane inside a debayered OSC group (an unparseable
+    /// BAYERPAT) never reaches Measure's `fits.0`, even when a fresh at-floor row is there: registration folds that
+    /// artifact only for a group whose frames read it (`register_reads_measure_fits`), so reading it would be a read
+    /// the hash does not cover. The same row, asked for through a mono group, is admitted (the control).
+    #[test]
+    fn resolve_register_fits_is_none_for_a_group_that_does_not_read_fits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, "floor-fixture");
+        let date_obs = date_obs_at(0);
+        let (frame_id, _path) = test_fixtures::add_light(
+            &fixture,
+            &LightSpec {
+                write_file: false,
+                ..star_light_spec("f0", &date_obs)
+            },
+        );
+
+        let cfg = StackingConfig::default();
+        assert!(cfg.calibration.debayer_osc, "premise: the OSC group is debayered");
+        let group = |key: &str, color_mode| IntegrationGroup {
+            key: key.into(),
+            instrume: None,
+            color_mode,
+            filter: None,
+            binning: 1,
+            cameras: Vec::new(),
+            exposure_s: None,
+            exposure_class: "unknown".into(),
+            frames: Vec::new(),
+            total_exposure_s: 0.0,
+            pixel_scale_arcsec: None,
+        };
+        let rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            1,
+            fixture.set_id,
+            "floor-fixture",
+            cfg.clone(),
+            vec![
+                group("osc__floor_test", ColorMode::Osc),
+                group("mono__floor_test", ColorMode::Mono),
+            ],
+            WorkingLayout::new(fixture.dir.path(), "floor-fixture"),
+            fixture.dir.path().to_path_buf(),
+            HashMap::new(),
+        );
+        let calibrated_hash = "floor-test-calibrated-hash";
+        let expected_hash = measurement_hash_for(&cfg, calibrated_hash, None);
+        let good_fit_at = |i: usize| psf_signal::StarFit {
+            x: 10.0 + i as f64 * 4.0,
+            y: 10.0 + i as f64 * 3.0,
+            background: 100.0,
+            amplitude: 5000.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            fwtm_x: 6.0,
+            fwtm_y: 6.0,
+            theta: 0.0,
+            beta: 4.0,
+            residual: 0.02,
+            signal: 40000.0,
+            area: 28.0,
+            peak5: f64::NAN,
+            sky_ring: f64::NAN,
+            sky_ring_sigma: f64::NAN,
+            sky_ring_n: 0,
+            ap_sum: f64::NAN,
+            snr: f64::NAN,
+            hfr: f64::NAN,
+            flags: crate::star_measure::StarFlags::default(),
+        };
+        let at_floor: Vec<psf_signal::StarFit> = (0..align::MIN_INLIERS).map(good_fit_at).collect();
+        let path = fixture.dir.path().join("floor-at-floor.athf");
+        fits_artifact::write_fits(&path, &at_floor).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len() as i64;
+        crate::db::stacking::upsert_artifact(
+            &fixture.conn,
+            &crate::db::stacking::NewArtifact {
+                subject: &StackSubject::FrameSet(fixture.set_id),
+                frame_id: Some(frame_id),
+                group_key: "",
+                kind: &fits_artifact::artifact_kind(0),
+                path: Some(path.to_str().unwrap()),
+                config_hash: &expected_hash,
+                size: Some(size),
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_register_fits(&rc, "mono__floor_test", frame_id, 1, calibrated_hash)
+                .as_ref()
+                .map(Vec::len),
+            Some(align::MIN_INLIERS),
+            "the control: a mono group reads the fresh at-floor row"
+        );
+        assert!(
+            resolve_register_fits(&rc, "osc__floor_test", frame_id, 1, calibrated_hash).is_none(),
+            "a debayered OSC group's frame detects instead of reading a row its hash does not cover"
         );
     }
 
@@ -21191,6 +24008,152 @@ mod tests {
                 "frame {id} must re-register after cfg.registration.max_stars changes"
             );
         }
+    }
+
+    /// Ruling R3 (c), the run: a mixed mono + debayered-OSC set registered onto a mono reference. A repeat pass
+    /// reuses every row; moving `measurement.maxStars` re-registers the OSC frames too (they read the reference's
+    /// stars out of Measure's `fits.0`, which the new config rewrote), where before R3 they stayed cached against
+    /// star lists the reference no longer matched.
+    #[test]
+    fn an_osc_frame_re_registers_when_the_mono_references_measurement_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let mut mono_ids = Vec::new();
+        let mut osc_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("m{i}");
+            let spec = LightSpec {
+                filter: Some("L"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &shifted_stars(dx, dy),
+                600.0,
+                5.0,
+                100 + i as u64,
+            );
+            mono_ids.push(id);
+        }
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i + 4);
+            let stem = format!("o{i}");
+            let spec = LightSpec {
+                bayerpat: Some("RGGB"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &shifted_stars(dx, dy),
+                600.0,
+                5.0,
+                120 + i as u64,
+            );
+            osc_ids.push(id);
+        }
+        let all_ids: Vec<i64> = mono_ids.iter().chain(osc_ids.iter()).copied().collect();
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &all_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, mono_ids[0])
+            .unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let run_pass = |cfg: StackingConfig| -> RunContext {
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 2, "one mono group, one OSC group");
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups,
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Register).unwrap();
+            rc
+        };
+        // Whether each OSC frame's registration this pass was reused.
+        let osc_cached = |rc: &RunContext| -> Vec<bool> {
+            let mut out = Vec::new();
+            for entries in rc.measured.values() {
+                for e in entries.iter().filter(|e| osc_ids.contains(&e.frame.frame_id)) {
+                    match &e.registration {
+                        Some(RegisteredFrameOutcome::Aligned { cached, .. }) => out.push(*cached),
+                        _ => panic!("osc frame {} not aligned", e.frame.frame_id),
+                    }
+                }
+            }
+            out
+        };
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let rc1 = run_pass(cfg.clone());
+        assert_eq!(rc1.reference_frame_id, Some(mono_ids[0]));
+        assert_eq!(osc_cached(&rc1), vec![false; 4], "a first pass registers");
+
+        let rc2 = run_pass(cfg.clone());
+        assert_eq!(osc_cached(&rc2), vec![true; 4], "the same config reuses");
+
+        // R5 M2, the round trip on this fixture: after the repeat pass the gate reads Register not stale under `cfg`,
+        // and stale under `moved` before the run that moves, because the OSC rows' registration hash folds the
+        // mono reference's measurement hash (ruling R3 (a)). It pins that the gate and the run agree on this one
+        // reference move, not the gate's staleness in general.
+        let register_stale = |cfg: &StackingConfig| -> bool {
+            crate::stacking::plan::build_plan(
+                &fixture.conn,
+                &ctx.settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(fixture.set_id),
+                Some(cfg.clone()),
+            )
+            .expect("the plan should build")
+            .stale_stages
+            .contains(&Stage::Register)
+        };
+        let mut moved = cfg.clone();
+        moved.measurement.max_stars = cfg.measurement.max_stars - 1000;
+        assert!(!register_stale(&cfg), "the run's own rows read fresh at the gate");
+        assert!(
+            register_stale(&moved),
+            "the gate reads Register stale under the moved reference measurement before it runs"
+        );
+        let rc3 = run_pass(moved.clone());
+        assert_eq!(
+            osc_cached(&rc3),
+            vec![false; 4],
+            "the reference's measurement moved: the OSC frames re-register"
+        );
     }
 
     /// Ruling R-T3-3: `SummaryGroup::reference_frame_id` is `Some` ONLY
@@ -22047,7 +25010,7 @@ mod tests {
                 .collect();
             let mut files = Vec::new();
             for g in &plan_groups {
-                let dir = layout.calibrated_dir(&g.key);
+                let dir = layout.calibrated_dir();
                 let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
                     .unwrap()
                     .map(|e| e.unwrap().path())
@@ -22487,17 +25450,16 @@ mod tests {
                 .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
                 .collect();
             let mut files = Vec::new();
-            for g in &plan_groups {
-                for dir in [layout.measured_dir(&g.key), layout.fits_dir(&g.key)] {
-                    let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-                    let mut names: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
-                    names.sort();
-                    for n in names {
-                        files.push((
-                            format!("{}/{}", g.key, n.file_name().unwrap().to_string_lossy()),
-                            std::fs::read(&n).unwrap(),
-                        ));
-                    }
+            // Frame-level folders: flat, no group sub-folder (spec §5.1).
+            for dir in [layout.measured_dir(), layout.fits_dir()] {
+                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                let mut names: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
+                names.sort();
+                for n in names {
+                    files.push((
+                        n.file_name().unwrap().to_string_lossy().to_string(),
+                        std::fs::read(&n).unwrap(),
+                    ));
                 }
             }
             let mut order = Vec::new();
@@ -23685,7 +26647,7 @@ mod tests {
         assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
 
         for i in 0..4 {
-            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}"));
+            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}_f{}", light_ids[i]));
             assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
         }
 
@@ -23840,7 +26802,7 @@ mod tests {
             .find(|f| f.frame_id == light_ids[0])
             .expect("f0 must be a group member")
             .clone();
-        let stem = calibrated_file_stem(&plan_groups[0], &target_frame);
+        let stem = frame_file_stem(&target_frame);
 
         let (run_id, group_ids) = seed_run_and_groups(
             &fixture.conn,
@@ -23864,7 +26826,7 @@ mod tests {
 
         run_stages_for_test(&mut rc, Stage::Register).unwrap();
 
-        let fits_path = layout.fits_path(&group_key, &stem, 0);
+        let fits_path = layout.fits_path(&stem, 0);
         assert!(
             fits_path.exists(),
             "f0's fits artifact must exist right after Measure: {fits_path:?}"
@@ -24089,6 +27051,352 @@ mod tests {
             "{:?}",
             plan_after.groups[0]
         );
+    }
+
+    /// Frame-level cache spec §7 (Task 12): one debayered-OSC fixture of two exposure classes (60 s and 90 s, three
+    /// frames each) stacked under `seconds` (two groups), `stops` (one group), and `seconds` with a 200 s tolerance (one group),
+    /// co-registered geometry, local normalization on, a Manual reference. After the first run nothing keyed on a
+    /// frame is recomputed: calibrate, pass 1, pass 2 and registration fan out over 0 items, no registered row or
+    /// file moves, the plan gate reads Calibrate, Measure and Register fresh before each regroup, and the
+    /// group-level stages (LN, rejection, the master) run for the new group.
+    ///
+    /// The reference is pinned on purpose. Under Auto the reference is picked again from the new grouping's weights
+    /// and a different pick re-registers every frame by `ref:<id>` (observed on this fixture: frame 4 under
+    /// `seconds`, frame 6 under `stops`), as under Native geometry; with `reference.twoPass` the dry pass is a
+    /// group-level decision keyed on the membership, so a regroup is a miss and registers the new group once more
+    /// without persisting (README, "Frame-level cache").
+    #[test]
+    fn regroup_reuses_every_frame_level_stage() {
+        use crate::stacking::config::ExposureMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0), (2.0, 2.0), (1.0, 0.0)];
+        let mut light_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let spec = LightSpec {
+                exptime: if i < 3 { 60.0 } else { 90.0 },
+                // A debayered OSC set, as set 270: its registration reads no Measure output, so neither its own
+                // group nor its reference's group enters the registration hash and a merge cannot move it.
+                bayerpat: Some("RGGB"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            // A Moffat field whose true beta (1.2) lies below `BETA_BOUNDS`' floor: every fit pegs at the floor, so
+            // every frame, every exposure class and the merged group read the same group beta (as set 270's 1.5).
+            // Without it the lower median of the fitted betas moves with the membership and pass 2 re-runs.
+            let (id, _) = test_fixtures::add_light_with_moffat_field(
+                &fixture,
+                &spec,
+                &ln_shifted_stars(dx, dy),
+                3.4,
+                1.2,
+                600.0,
+                5.0,
+                100 + i as u64,
+            );
+            light_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, light_ids[0]).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        let cfg_for = |mode: ExposureMode, tolerance: f64| {
+            let mut cfg = StackingConfig::default();
+            cfg.grouping.exposure_mode = mode;
+            cfg.grouping.exposure_tolerance_sec = tolerance;
+            cfg.reference.mode = ReferenceMode::Manual;
+            cfg.normalization.local.enabled = true;
+            // As `local_normalization_sidecars_are_cached_on_the_second_run`: the finite selection that cuts
+            // nothing, pinned to PsfSignal (L-24).
+            cfg.normalization.local.flux_estimator =
+                crate::stacking::integrate::LnFluxEstimator::PsfSignal;
+            cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
+                min_peak_snr: 5.0,
+                max_stars: 5000,
+                saturation: 1.0,
+            };
+            cfg
+        };
+        let stale_stages = |cfg: &StackingConfig| {
+            crate::stacking::plan::build_plan(
+                &fixture.conn,
+                &ctx.settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(fixture.set_id),
+                Some(cfg.clone()),
+            )
+            .expect("the plan should build")
+            .stale_stages
+        };
+        // One run through Output under `cfg`; returns the run and the captured logs.
+        let run = |cfg: &StackingConfig| {
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            let (res, logs) = crate::stacking::telemetry::capture_logs(|| {
+                run_stages_for_test(&mut rc, Stage::Register)?;
+                stage_output(&mut rc)
+            });
+            res.unwrap();
+            // `start_stacking` records the reference on the run row; the plan gate reads it from there.
+            fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_runs SET reference_frame_id = ?1 WHERE id = ?2",
+                    rusqlite::params![rc.reference_frame_id, rc.run_id],
+                )
+                .unwrap();
+            (plan_groups, rc, logs)
+        };
+
+        let cfg1 = cfg_for(ExposureMode::Seconds, 2.0);
+        let (groups1, rc1, logs1) = run(&cfg1);
+        assert_eq!(groups1.len(), 2, "one group per exposure class: {groups1:?}");
+        assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 6, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass2"), 6, "{logs1}");
+        let reference1 = rc1.reference_frame_id;
+        assert_eq!(reference1, Some(light_ids[0]), "the pinned reference");
+        assert_eq!(fan_out_items(&logs1, "register", "align"), 6, "{logs1}");
+        let registered_rows = || {
+            let mut rows: Vec<_> = rows_of_kind(&fixture.conn, fixture.set_id, "registered")
+                .into_values()
+                .map(|r| (r.frame_id, r.id, r.created_at, r.config_hash, r.path))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let registered1 = registered_rows();
+        assert_eq!(registered1.len(), 6);
+
+        let regroups = [
+            ("stops", cfg_for(ExposureMode::Stops, 2.0), 1usize),
+            ("a 200 s tolerance", cfg_for(ExposureMode::Seconds, 200.0), 1usize),
+        ];
+        let mut seen_keys = vec![groups1.iter().map(|g| g.key.clone()).collect::<Vec<_>>()];
+        for (what, cfg, n_groups) in regroups {
+            let stale = stale_stages(&cfg);
+            for stage in [Stage::Calibrate, Stage::Measure, Stage::Register] {
+                assert!(
+                    !stale.contains(&stage),
+                    "the gate reads {stage:?} stale before the regroup to {what}: {stale:?}"
+                );
+            }
+            let (groups, rc, logs) = run(&cfg);
+            assert_eq!(groups.len(), n_groups, "{what}: {groups:?}");
+            let keys: Vec<String> = groups.iter().map(|g| g.key.clone()).collect();
+            assert!(!seen_keys.contains(&keys), "{what} must name its group differently: {keys:?}");
+            seen_keys.push(keys);
+            assert_eq!(rc.reference_frame_id, reference1, "{what}: the reference moved");
+            for (stage, pass) in [
+                ("calibrate", "calibrate"),
+                ("measure", "pass1"),
+                ("measure", "pass2"),
+                ("register", "align"),
+                ("register", "rewrite"),
+            ] {
+                assert_eq!(
+                    fan_out_items(&logs, stage, pass),
+                    0,
+                    "a regroup to {what} redid {stage}/{pass}: {logs}"
+                );
+            }
+            assert_eq!(registered_rows(), registered1, "{what}: a registered row moved");
+
+            // The group-level stages ran for the new group: LN scales exist and the master is written.
+            let summary = &rc.summary.groups[0];
+            let included: Vec<_> = summary.frames.iter().filter(|f| f.included).collect();
+            assert_eq!(included.len(), 6, "{what}: {:?}", summary.frames);
+            for f in &included {
+                assert!(f.ln_scale.is_some(), "{what}: {f:?}");
+                assert!(!f.cached_ln, "{what}: LN of a new group is computed, not reused: {f:?}");
+            }
+            let master = summary.master_path.clone().expect("a master path");
+            assert!(Path::new(&master).exists(), "{what}: the master is on disk");
+        }
+
+        // Every frame-level row still sits under the empty key and names one file.
+        for kind in ["calibrated", "measured", "registered"] {
+            let rows = rows_of_kind(&fixture.conn, fixture.set_id, kind);
+            assert_eq!(rows.len(), 6, "{kind}: {rows:?}");
+            assert!(rows.values().all(|r| r.group_key.is_empty()), "{kind}: {rows:?}");
+        }
+    }
+
+    /// Ruling R6 I1 (the registration half of Task 4's review focus 1): a regroup that merges two mono exposure
+    /// classes with different PSF shapes gives the merged group a new beta, so its members' pass 2 and registration
+    /// (the mono registration reads Measure's `fits.0`, which carries the beta) are redone. A debayered-OSC group in the
+    /// same set, registered onto an OSC reference of its own group, reads no Measure output: its frames are reused
+    /// whatever happens to the mono betas. Align items = the mono members only; the OSC frames come back `cached`.
+    #[test]
+    fn a_merged_beta_re_registers_the_mono_members_and_not_the_debayered_osc_frames() {
+        use crate::stacking::config::ExposureMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let mut mono_ids = Vec::new();
+        let mut osc_ids = Vec::new();
+        // Mono: three Moffat (beta 2.5) frames at 60 s and three Gaussian ones at 120 s, as in
+        // `merged_group_with_a_new_beta_reruns_pass_two_only`.
+        for i in 0..6 {
+            let (dx, dy) = shifts[i % 3];
+            let date_obs = date_obs_at(i);
+            let stem = format!("m{i}");
+            let moffat_class = i < 3;
+            let spec = LightSpec {
+                filter: Some("L"),
+                exptime: if moffat_class { 60.0 } else { 120.0 },
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let stars = shifted_stars(dx, dy);
+            let (id, _) = if moffat_class {
+                test_fixtures::add_light_with_moffat_field(&fixture, &spec, &stars, 3.4, 2.5, 600.0, 5.0, 100 + i as u64)
+            } else {
+                test_fixtures::add_light_with_field_fwhm(&fixture, &spec, &stars, 3.4, 600.0, 5.0, 100 + i as u64)
+            };
+            mono_ids.push(id);
+        }
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i + 6);
+            let stem = format!("o{i}");
+            let spec = LightSpec {
+                bayerpat: Some("RGGB"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &shifted_stars(dx, dy),
+                600.0,
+                5.0,
+                120 + i as u64,
+            );
+            osc_ids.push(id);
+        }
+        let all_ids: Vec<i64> = mono_ids.iter().chain(osc_ids.iter()).copied().collect();
+        test_fixtures::add_master_dark_and_flat(&fixture, &all_ids, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        // The reference is an OSC frame: no mono group's beta can move the OSC frames' registration through it.
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, osc_ids[0]).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        let run = |mode: ExposureMode| {
+            let mut cfg = StackingConfig::default();
+            cfg.reference.mode = ReferenceMode::Manual;
+            cfg.grouping.exposure_mode = mode;
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            let (res, logs) =
+                crate::stacking::telemetry::capture_logs(|| run_stages_for_test(&mut rc, Stage::Register));
+            res.unwrap();
+            (plan_groups, rc, logs)
+        };
+        // Whether each member's registration this pass was reused, for the frames in `ids`.
+        let cached_of = |rc: &RunContext, ids: &[i64]| -> Vec<bool> {
+            let mut out = Vec::new();
+            for entries in rc.measured.values() {
+                for e in entries.iter().filter(|e| ids.contains(&e.frame.frame_id)) {
+                    match &e.registration {
+                        Some(RegisteredFrameOutcome::Aligned { cached, .. }) => out.push(*cached),
+                        _ => panic!("frame {} not aligned", e.frame.frame_id),
+                    }
+                }
+            }
+            out
+        };
+        let mono_beta = |rc: &RunContext, groups: &[IntegrationGroup]| -> Vec<f64> {
+            groups
+                .iter()
+                .filter(|g| g.frames.iter().any(|f| mono_ids.contains(&f.frame_id)))
+                .map(|g| rc.measured_groups[&g.key].beta.expect("a measured mono group has a beta"))
+                .collect()
+        };
+
+        let (groups1, rc1, logs1) = run(ExposureMode::Seconds);
+        assert_eq!(groups1.len(), 3, "two mono classes and the OSC group: {groups1:?}");
+        assert_eq!(rc1.reference_frame_id, Some(osc_ids[0]));
+        assert_eq!(fan_out_items(&logs1, "register", "align"), 10, "a first run aligns every frame: {logs1}");
+        assert_eq!(cached_of(&rc1, &all_ids), vec![false; 10]);
+        let betas1 = mono_beta(&rc1, &groups1);
+        assert_eq!(betas1.len(), 2);
+
+        let (groups2, rc2, logs2) = run(ExposureMode::NoSplit);
+        assert_eq!(groups2.len(), 2, "one merged mono group and the OSC group: {groups2:?}");
+        let betas2 = mono_beta(&rc2, &groups2);
+        assert_eq!(betas2.len(), 1);
+        assert!(
+            betas1.iter().all(|b| (b - betas2[0]).abs() > 1e-6),
+            "premise: the merged beta {betas2:?} differs from both source betas {betas1:?}"
+        );
+        assert_eq!(
+            fan_out_items(&logs2, "register", "align"),
+            mono_ids.len(),
+            "the merged mono members re-register and nothing else does: {logs2}"
+        );
+        assert_eq!(cached_of(&rc2, &mono_ids), vec![false; 6], "the mono members re-register");
+        assert_eq!(cached_of(&rc2, &osc_ids), vec![true; 4], "the debayered OSC frames are reused");
     }
 
     /// T5 (spec 2026-10-04 §3 step 1, L-23): the run writes the
@@ -24469,7 +27777,7 @@ mod tests {
             assert!(f.ln_scale.is_some(), "{f:?}");
         }
         for i in 0..4 {
-            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}"));
+            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}_f{}", light_ids[i]));
             assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
         }
 
@@ -24813,10 +28121,9 @@ mod tests {
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         let group_key = plan_groups[0].key.clone();
 
-        // f1's stem is plain "f1" (no basename collisions in this fixture —
-        // `calibrated_file_stem` only appends `_f<id>` when two frames
-        // share a source name).
-        let blocked_sidecar = layout.ln_sidecar_path(&group_key, "f1");
+        // f1's stem is `f1_f<frame id>` (`frame_file_stem`).
+        let blocked_sidecar =
+            layout.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
         std::fs::create_dir_all(&blocked_sidecar).unwrap();
 
         let (run_id, group_ids) = seed_run_and_groups(
@@ -25125,7 +28432,7 @@ mod tests {
         // artifact row's stored size/hash are untouched, so the second
         // run's `is_fresh` check still calls this a cache hit.
         let touched_frame_id = light_ids[1];
-        let sidecar = layout.ln_sidecar_path(&group_key, "f1");
+        let sidecar = layout.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
         let mut bytes = std::fs::read(&sidecar).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
@@ -25549,9 +28856,10 @@ mod tests {
             group_frames(&fixture.conn, fixture.set_id, &cfg_rejection_only.grouping).unwrap();
         let group_key = plan_groups_a[0].key.clone();
 
-        // f1's stem is plain "f1" — same deterministic write-failure trick
+        // f1's stem is `f1_f<frame id>` — same deterministic write-failure trick
         // as the OUTPUT-normalization exclusion test above.
-        let blocked_sidecar = layout_a.ln_sidecar_path(&group_key, "f1");
+        let blocked_sidecar =
+            layout_a.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
         std::fs::create_dir_all(&blocked_sidecar).unwrap();
 
         let (run_id_a, group_ids_a) = seed_run_and_groups(
@@ -28872,12 +32180,18 @@ mod tests {
             let plane = reader.read_plane(0).unwrap();
             let level = region_mean(&plane, reader.width(), 165, 110, 20, 20);
             kept_levels.push(level);
+            // The `.rej` stem is the frame's own `frame_file_stem` (ruling R4 (c)); the calibrated file is
+            // `c_<that stem>.fits` (mono: no `_d` marker).
+            let calibrated_stem = Path::new(calibrated_path)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             kept_stems.push(
-                Path::new(calibrated_path)
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
+                calibrated_stem
+                    .strip_prefix("c_")
+                    .unwrap_or_else(|| panic!("calibrated stem {calibrated_stem} has no c_ prefix"))
+                    .to_string(),
             );
         }
 
@@ -28906,7 +32220,7 @@ mod tests {
             (drizzled_level - expected_level).abs()
         );
 
-        // The .rej files: exactly the 4 KEPT frames' own calibrated stems,
+        // The .rej files: exactly the 4 KEPT frames' own frame stems,
         // no more, no less — in particular never the dropped frame's.
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let rej_dir = layout.rej_dir(started.run_id, &group.group_key);
@@ -28926,7 +32240,7 @@ mod tests {
         expected_stems.sort();
         assert_eq!(
             actual_stems, expected_stems,
-            "rej/ must hold exactly the kept frames' bitmaps, named by their own calibrated stems"
+            "rej/ must hold exactly the kept frames' bitmaps, named by their own frame stems"
         );
     }
 
@@ -29962,7 +33276,7 @@ mod tests {
         cfg.paths.working_dir = Some(working.path().to_string_lossy().into_owned());
         crate::api::stacking::set_stacking_config(&ctx, fixture.set_id, cfg, Vec::new()).unwrap();
 
-        let set_group = WorkingLayout::new(working.path(), &set_slug(SET_NAME)).calibrated_dir("g");
+        let set_group = WorkingLayout::new(working.path(), &set_slug(SET_NAME)).calibrated_dir();
         std::fs::create_dir_all(&set_group).unwrap();
         std::fs::write(set_group.join("x.bin"), vec![0u8; 1024]).unwrap();
         let project_group = working
@@ -30171,7 +33485,7 @@ mod tests {
                     &NewArtifact {
                         subject: &rc.subject,
                         frame_id: Some(f.frame_id),
-                        group_key: &g.key,
+                        group_key: artifact_group_key("calibrated", &g.key),
                         kind: "calibrated",
                         path: Some(&f.path),
                         config_hash: &hash,
@@ -30315,7 +33629,7 @@ mod tests {
             "{:?}",
             rc.runtime_exclusions
         );
-        let key = "osc__L__300s";
+        let key = "";
         for f in rc.plan_groups[0].frames.clone() {
             let row = |kind: &str| {
                 crate::db::stacking::find_artifact(&conn, &rc.subject, key, kind, Some(f.frame_id))
@@ -30332,7 +33646,9 @@ mod tests {
             let calibrated = PathBuf::from(row("calibrated"));
             assert_eq!(
                 calibrated,
-                rc.layout.prepared_dir(key).join(format!("p_{stem}_d.fits"))
+                rc.layout
+                    .prepared_dir()
+                    .join(format!("p_{stem}_f{}_d.fits", f.frame_id))
             );
             assert_eq!(row("calibrated_mosaic"), f.path, "the landed mosaic itself");
             let h = FitsHeader::from_path(&calibrated).unwrap();
@@ -30360,7 +33676,7 @@ mod tests {
             let a = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                "cfa__L__300s",
+                "",
                 "calibrated",
                 Some(f.frame_id),
             )
@@ -30371,6 +33687,121 @@ mod tests {
                 Some(f.path.as_str()),
                 "a mosaic kept as a mosaic is used in place"
             );
+        }
+    }
+
+    /// Ruling R4 (a): `replace_frame_level_file` removes an old file only under the root its writer owns, and only
+    /// when no row of ANY subject still points at it.
+    #[test]
+    fn replace_frame_level_file_removes_only_under_the_owned_root_and_only_if_unreferenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let _ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let owned = tmp.path().join("work").join("calibrated");
+        let elsewhere = tmp.path().join("work").join("landed");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let subject = StackSubject::Project("p1".to_string());
+        let row_for = |path: &Path| crate::db::stacking::StackingArtifactRow {
+            id: 0,
+            subject: subject.clone(),
+            frame_id: Some(1),
+            group_key: String::new(),
+            kind: "calibrated".to_string(),
+            path: path.to_str().map(str::to_string),
+            config_hash: "h".to_string(),
+            size: None,
+            modified_at: None,
+            payload_json: None,
+            created_at: String::new(),
+        };
+        let new = owned.join("c_new.fits");
+
+        // Under the owned root, unreferenced: removed.
+        let gone = owned.join("c_gone.fits");
+        std::fs::write(&gone, b"x").unwrap();
+        replace_frame_level_file(&conn, &owned, Some(&row_for(&gone)), &new);
+        assert!(!gone.exists());
+
+        // Outside the owned root (a landed file in the working folder): kept.
+        let landed = elsewhere.join("c_landed.fits");
+        std::fs::write(&landed, b"x").unwrap();
+        replace_frame_level_file(&conn, &owned, Some(&row_for(&landed)), &new);
+        assert!(landed.exists(), "a file outside the owned root was removed");
+
+        // Under the owned root but still named by a row of ANOTHER subject: kept.
+        let shared = owned.join("c_shared.fits");
+        std::fs::write(&shared, b"x").unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p2");
+        upsert_artifact(
+            &conn,
+            &NewArtifact {
+                subject: &StackSubject::Project("p2".to_string()),
+                frame_id: None,
+                group_key: "g",
+                kind: "solve",
+                path: shared.to_str(),
+                config_hash: "h",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+        replace_frame_level_file(&conn, &owned, Some(&row_for(&shared)), &new);
+        assert!(shared.exists(), "a file another subject's row points at was removed");
+    }
+
+    /// Ruling R4 (a): an attested frame used in place has a `calibrated` row pointing at the user's own landed file.
+    /// Converting the frame later (the debayer turned on) writes a new prepared file and replaces the row, but the
+    /// landed file is never ours to remove, even when the working folder overlaps the scan root (here the landed
+    /// files sit INSIDE the set's working folder, which is only a warning in the settings).
+    #[test]
+    fn converting_an_in_place_frame_keeps_its_landed_file_inside_the_working_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let working = tmp.path().join("work");
+        let subject = StackSubject::Project("p1".to_string());
+        let landed = subject_layout(&conn, &working, &subject).unwrap().root.join("landed");
+        for u in ["o1", "o2"] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = test_fixtures::ProjectFile::Mosaic32;
+            spec.bayerpat = Some("RGGB");
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let out = tmp.path().join("out");
+
+        // Debayer off: the mosaics are used in place, the rows point at the landed files.
+        let mut off = StackingConfig::default();
+        off.calibration.debayer_osc = false;
+        let mut rc = project_rc(&ctx, &conn, "p1", off, &working, &out);
+        stage_calibrate(&mut rc).unwrap();
+        let frames = rc.plan_groups[0].frames.clone();
+        assert_eq!(frames.len(), 2);
+        for f in &frames {
+            let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(f.frame_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.path.as_deref(), Some(f.path.as_str()), "used in place");
+            assert!(Path::new(&f.path).starts_with(&rc.layout.root), "the landed file is inside the working folder");
+        }
+
+        // Debayer on, same working folder: the rows move to `prepared/`, the landed files stay.
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &working, &out);
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        for f in &frames {
+            let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(f.frame_id))
+                .unwrap()
+                .unwrap();
+            let now = PathBuf::from(row.path.unwrap());
+            assert!(now.starts_with(rc.layout.prepared_dir()), "converted under prepared/: {now:?}");
+            assert!(Path::new(&f.path).exists(), "the user's landed file {} was removed", f.path);
         }
     }
 
@@ -30414,19 +33845,22 @@ mod tests {
             "{:?}",
             rc.runtime_exclusions
         );
-        let calibrated_of = |uuid: &str| -> PathBuf {
-            let f = rc.plan_groups[0]
+        let handle_of = |uuid: &str| -> i64 {
+            rc.plan_groups[0]
                 .frames
                 .iter()
                 .find(|f| f.path == landed_of[uuid].to_str().unwrap())
-                .unwrap();
+                .unwrap()
+                .frame_id
+        };
+        let calibrated_of = |uuid: &str| -> PathBuf {
             PathBuf::from(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    key,
+                    "",
                     "calibrated",
-                    Some(f.frame_id),
+                    Some(handle_of(uuid)),
                 )
                 .unwrap()
                 .and_then(|a| a.path)
@@ -30438,7 +33872,9 @@ mod tests {
             let p = calibrated_of(uuid);
             assert_eq!(
                 p,
-                rc.layout.prepared_dir(key).join(format!("p_c_{uuid}.fits"))
+                rc.layout
+                    .prepared_dir()
+                    .join(format!("p_c_{uuid}_f{}.fits", handle_of(uuid)))
             );
             let h = FitsHeader::from_path(&p).unwrap();
             assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("converted"));
@@ -30605,7 +34041,7 @@ mod tests {
         assert!(crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            "mono__L__300s",
+            "",
             "calibrated",
             Some(b)
         )
@@ -30666,7 +34102,7 @@ mod tests {
             let a = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                "mono__L__300s",
+                "",
                 "calibrated",
                 Some(f.frame_id),
             )
@@ -31772,6 +35208,61 @@ mod tests {
         }
     }
 
+    /// Ruling R15 (M1): the native Register total counts a group's dry pass only if, AFTER the identity check, the
+    /// group can still switch. A project group whose only other WCS candidate changed on disk drops it at the
+    /// Register boundary, so `two_pass_refine` runs no pass and the total is the members that register, once.
+    #[test]
+    fn native_register_total_counts_no_dry_pass_once_the_only_candidate_is_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        // One group of four: only g1 and g2 carry a manifest WCS, so g2 is g1's only switchable candidate.
+        for i in 1..=4 {
+            let uuid = format!("g{i}");
+            let mut spec = test_fixtures::project_frame_spec(&uuid);
+            spec.filter = "G";
+            if i <= 2 {
+                spec.wcs = Some(test_fixtures::manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+            }
+            test_fixtures::add_project_frame(&conn, &tmp.path().join("collab"), "p1", &spec);
+        }
+        let weights: HashMap<&str, f64> = [("c_g1.fits", 0.9), ("c_g2.fits", 0.5)].into_iter().collect();
+        let mut cfg = StackingConfig::default();
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        assert!(cfg.reference.two_pass && cfg.reference.mode == ReferenceMode::Auto);
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &tmp.path().join("work"), &tmp.path().join("out"));
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        let key = rc.plan_groups[0].key.clone();
+        let reference = rc.geometry_of(&key).reference_frame_id;
+        let candidate = rc.measured[&key]
+            .iter()
+            .find(|e| e.frame.filename == "c_g2.fits")
+            .map(|e| e.frame.frame_id)
+            .unwrap();
+        assert_ne!(reference, candidate, "premise: g2 is not the reference");
+        assert!(group_can_switch(&rc, &key, reference), "premise: g2 is a switchable candidate");
+
+        // Untouched: the group runs a dry pass, so its four members count twice.
+        assert_eq!(native_register_total(&mut rc, &cfg, None, false).unwrap(), 8);
+
+        // g2's landed file changes: the check excludes it, the group keeps three members and nothing to switch to.
+        let path = match origin_of(&rc.origins, candidate).unwrap() {
+            FrameOrigin::Project { landed_path, .. } => landed_path.clone(),
+            other => panic!("not a project origin: {other:?}"),
+        };
+        std::fs::write(&path, vec![0u8; 5000]).unwrap();
+        assert_eq!(
+            native_register_total(&mut rc, &cfg, None, false).unwrap(),
+            3,
+            "the total counted a dry pass `two_pass_refine` will not run"
+        );
+        assert_eq!(included_count_of(&rc, &key), 3);
+        assert!(!group_can_switch(&rc, &key, reference));
+    }
+
     /// Review round 1, B1: a native project group with no WCS candidate
     /// borrows the run reference and has nothing to switch to, so it gets no
     /// dry pass; a group holding another candidate may switch.
@@ -32804,7 +36295,7 @@ mod tests {
             let row = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                &group,
+                crate::stacking::paths::artifact_group_key("registered", &group),
                 "registered",
                 Some(e.frame.frame_id),
             )
@@ -32908,7 +36399,7 @@ mod tests {
                 let row = crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    &group,
+                    crate::stacking::paths::artifact_group_key("registered", &group),
                     "registered",
                     Some(e.frame.frame_id),
                 )
@@ -32947,7 +36438,7 @@ mod tests {
             let row = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                &group,
+                crate::stacking::paths::artifact_group_key("registered", &group),
                 "registered",
                 Some(e.frame.frame_id),
             )
@@ -32966,6 +36457,66 @@ mod tests {
                 "the frame was rewritten for the moved grid"
             );
         }
+    }
+
+    /// Ruling R14 (b): the landed-file identity check runs BEFORE the two-pass lookup. A cached decision names a
+    /// member whose landed file has changed since (the catalog of a project has no rescan, so the member's hashes did
+    /// not move): the lookup must see the group without it, miss, and run the dry pass over the rest. Without the
+    /// reorder the hit adopts the changed member as the reference and the persisting pass then fails the run
+    /// ("the reference frame changed during the run").
+    #[test]
+    fn a_cached_decision_naming_a_changed_member_is_not_adopted() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 5);
+        let cfg = crate::stacking::config::project_seed_config(StackingConfig::default());
+        assert!(cfg.reference.two_pass, "premise: the project seed keeps the two-pass re-pick on");
+        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
+            .unwrap();
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &tmp.path().join("work"), &tmp.path().join("out"));
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        stage_calibrate(&mut rc).unwrap();
+        stage_measure(&mut rc).unwrap();
+        stage_reference(&mut rc).unwrap();
+
+        // The decision an earlier run cached, under the key this run computes now: "switch to <victim>".
+        let group = rc.plan_groups[0].clone();
+        let reference = rc.reference_frame_id.unwrap();
+        let reference_hash = {
+            let frame = find_frame_in_groups(&rc.plan_groups, reference).unwrap();
+            let conn = db(&rc.ctx).unwrap().conn();
+            rc.memo.calibration_hash_checked(&conn, &cfg, &frame).unwrap()
+        };
+        let victim = group.frames.iter().find(|f| f.frame_id != reference).unwrap().clone();
+        let lookup = two_pass_lookup(&mut rc, &group, reference, &reference_hash, false).unwrap();
+        store_two_pass_decision(&rc, &group, &lookup, Some(victim.frame_id));
+        assert_eq!(
+            two_pass_lookup(&mut rc, &group, reference, &reference_hash, false).unwrap().cached,
+            Some(Some(victim.frame_id)),
+            "premise: the stored decision is a hit before the file changes"
+        );
+
+        // The victim's landed file changes, still a readable FITS.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&victim.path).unwrap();
+            file.write_all(&[0u8; 64]).unwrap();
+        }
+
+        let ((), logs) = crate::stacking::telemetry::capture_logs(|| stage_register(&mut rc).unwrap());
+        assert!(!logs.contains("two-pass decision reused"), "a decision naming a changed member was reused: {logs}");
+        assert_ne!(rc.reference_frame_id, Some(victim.frame_id), "the changed member became the reference");
+        let entry = rc.measured[&group.key].iter().find(|e| e.frame.frame_id == victim.frame_id).unwrap();
+        assert!(!entry.included, "the changed member stayed in the run");
+        assert_eq!(entry.reason.as_deref(), Some(crate::stacking::origin::CHANGED_DURING_THE_RUN));
+        assert_eq!(
+            rc.measured[&group.key].iter().filter(|e| e.included).count(),
+            4,
+            "the other four members are registered"
+        );
     }
 
     /// Plan 6b-3 D2: the plan and the run agree — after a run the plan reports

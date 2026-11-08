@@ -159,6 +159,35 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
     out
 }
 
+/// The artifact kinds that belong to a FRAME, not to a group (frame-level cache spec §5.1): their rows carry
+/// `group_key = ""`, so a regroup (another tolerance, another split, a merge) finds them again. `fits.<plane>` kinds
+/// are frame-level too ([`is_frame_level_kind`]). Prepare writes `calibrated` / `calibrated_mosaic` as well; there is
+/// no `prepared` kind.
+pub const FRAME_LEVEL_KINDS: &[&str] = &[
+    "calibrated",
+    "calibrated_mosaic",
+    "measured",
+    "metrics",
+    "registered",
+    "registration",
+    "solve",
+];
+
+/// Whether `kind` is frame-level: one of [`FRAME_LEVEL_KINDS`] or a `fits.<plane>` kind.
+pub fn is_frame_level_kind(kind: &str) -> bool {
+    FRAME_LEVEL_KINDS.contains(&kind) || kind.starts_with("fits.")
+}
+
+/// The `group_key` a `stacking_artifacts` row of `kind` is stored and looked up under: `""` for a frame-level kind,
+/// the group's key otherwise. The one rule every `find_artifact` / `upsert_artifact` call site goes through.
+pub fn artifact_group_key<'a>(kind: &str, group_key: &'a str) -> &'a str {
+    if is_frame_level_kind(kind) {
+        ""
+    } else {
+        group_key
+    }
+}
+
 impl WorkingLayout {
     pub fn new(working_dir: &Path, set_slug: &str) -> Self {
         WorkingLayout {
@@ -166,15 +195,17 @@ impl WorkingLayout {
         }
     }
 
-    /// `root/calibrated` — the parent of every group's calibrated-frame
-    /// subdirectory. One accessor per subtree (this and the three below),
-    /// so `work_usage`/`cleanup_work` never repeat the literal.
+    /// `root/calibrated` — the folder of every frame's calibrated file (flat, frame-level cache spec §5.1; rows
+    /// written before that keep their `calibrated/<group_key>/` sub-folder paths). One accessor per subtree (this
+    /// and the ones below), so `work_usage`/`cleanup_work` never repeat the literal. It is also the root the
+    /// calibrated writer OWNS: a replaced calibrated file is removed only from here (ruling R4).
     pub fn calibrated_root(&self) -> PathBuf {
         self.root.join("calibrated")
     }
 
-    /// `root/registered` — the parent of every group's registered-frame
-    /// subdirectory.
+    /// `root/registered` — the folder of every frame's registered file (flat, frame-level cache spec §5.1; rows
+    /// written before that keep their `registered/<group_key>/` sub-folder paths). It is also the root the
+    /// registered writer OWNS: a replaced registered file is removed only from here (ruling R4 (a)).
     pub fn registered_root(&self) -> PathBuf {
         self.root.join("registered")
     }
@@ -186,33 +217,36 @@ impl WorkingLayout {
         self.root.join("ln")
     }
 
-    /// `root/fits` — the parent of every group's persisted star-fits
-    /// subdirectory (Tier C Task 1, spec §2.2.1): one `.athf` file per
-    /// (frame, plane), the fits Measure's PSF fitter accepted, cached like
-    /// `metrics` (same hash, same `CleanupWhat::All`-only sweep) but with a
-    /// file on disk behind each row.
+    /// `root/fits` — the folder of every frame's persisted star-fits files (Tier C Task 1, spec §2.2.1; flat since
+    /// the frame-level cache, spec §5.1): one `.athf` file per (frame, plane), the fits Measure's PSF fitter
+    /// accepted, cached like `metrics` (same hash) with a file on disk behind each row. `Intermediates` keeps the
+    /// folder and its rows and removes from it only the `.athf` files (and crashed-write temporaries) no row names;
+    /// `All` removes the folder. Rows written before the frame-level cache keep their `fits/<group_key>/`
+    /// sub-folder paths. It is also the root the fits writer OWNS: a replaced fits file is removed only from here
+    /// (ruling R4).
     pub fn fits_root(&self) -> PathBuf {
         self.root.join("fits")
     }
 
-    /// `root/measured` — the parent of every group's Measure first-pass artifacts (Plan A Task 11c, R11c-6): one
-    /// `.athm` file per frame holding every plane's pass-1 records, with a `stacking_artifacts` row of kind
-    /// `measured` behind it. An intermediate: it goes with `Intermediates` and `All` (not with `metrics`, which
-    /// keys on the calibration CONFIG hash and survives a re-calibration: a re-calibration rewrites the calibrated
-    /// file, whose new identity stales every first-pass artifact anyway).
+    /// `root/measured` — the folder of every frame's Measure first-pass artifact (Plan A Task 11c, R11c-6; flat since
+    /// the frame-level cache, spec §5.1, rows written before that keep their `measured/<group_key>/` sub-folder
+    /// paths): one `.athm` file per frame holding every plane's pass-1 records, with a `stacking_artifacts` row of
+    /// kind `measured` behind it. It is also the root the pass-1 writer OWNS (ruling R4). Like `metrics` and `fits` it survives `Intermediates`
+    /// (a pass-1 file costs minutes per set to rebuild, frame-level cache spec §5.3) apart from the files no row names,
+    /// and goes with `All`.
     pub fn measured_root(&self) -> PathBuf {
         self.root.join("measured")
     }
 
-    /// `root/measured/<group_key>` — one group's first-pass artifacts.
-    pub fn measured_dir(&self, group_key: &str) -> PathBuf {
-        self.measured_root().join(group_key)
+    /// `root/measured` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn measured_dir(&self) -> PathBuf {
+        self.measured_root()
     }
 
-    /// `root/measured/<group_key>/<stem>.athm` — one frame's first-pass artifact; `stem` is the SAME collision-safe
-    /// stem [`crate::stacking::run::calibrated_file_stem`] gave the calibrated file (as [`Self::fits_path`]'s).
-    pub fn measured_path(&self, group_key: &str, stem: &str) -> PathBuf {
-        self.measured_dir(group_key).join(format!("{stem}.athm"))
+    /// `root/measured/<stem>.athm` — one frame's first-pass artifact; `stem` is the SAME frame-only stem
+    /// [`crate::stacking::run::frame_file_stem`] gave the calibrated file (as [`Self::fits_path`]'s).
+    pub fn measured_path(&self, stem: &str) -> PathBuf {
+        self.measured_dir().join(format!("{stem}.athm"))
     }
 
     /// `root/runs` — one JSON snapshot per run (see [`Self::run_json`]).
@@ -220,10 +254,11 @@ impl WorkingLayout {
         self.root.join("runs")
     }
 
-    /// `root/calibrated/<group_key>` — stage-1 calibrated frames for one
-    /// integration group.
-    pub fn calibrated_dir(&self, group_key: &str) -> PathBuf {
-        self.calibrated_root().join(group_key)
+    /// `root/calibrated` — stage-1 calibrated frames. Flat (frame-level cache spec §5.1): a calibrated file belongs
+    /// to its frame, never to a group, so there is no group sub-folder. Rows written before that change keep their
+    /// stored `path` under `calibrated/<group_key>/`; readers open the row's path.
+    pub fn calibrated_dir(&self) -> PathBuf {
+        self.calibrated_root()
     }
 
     /// `root/prepared` — Prepare's converted and debayered copies (plan
@@ -233,15 +268,14 @@ impl WorkingLayout {
         self.root.join("prepared")
     }
 
-    /// `root/prepared/<group_key>`.
-    pub fn prepared_dir(&self, group_key: &str) -> PathBuf {
-        self.prepared_root().join(group_key)
+    /// `root/prepared` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn prepared_dir(&self) -> PathBuf {
+        self.prepared_root()
     }
 
-    /// `root/registered/<group_key>` — stage-5 registered frames for one
-    /// integration group.
-    pub fn registered_dir(&self, group_key: &str) -> PathBuf {
-        self.registered_root().join(group_key)
+    /// `root/registered` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn registered_dir(&self) -> PathBuf {
+        self.registered_root()
     }
 
     /// `root/ln/<group_key>` — stage-6 local-normalization intermediates.
@@ -249,20 +283,19 @@ impl WorkingLayout {
         self.ln_root().join(group_key)
     }
 
-    /// `root/fits/<group_key>` — one group's persisted star-fits files.
-    pub fn fits_dir(&self, group_key: &str) -> PathBuf {
-        self.fits_root().join(group_key)
+    /// `root/fits` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn fits_dir(&self) -> PathBuf {
+        self.fits_root()
     }
 
-    /// `root/fits/<group_key>/<stem>.p<plane>.athf` — one PLANE's persisted
-    /// fits (Tier C Task 1): `stem` is the SAME collision-safe stem
-    /// [`crate::stacking::run::calibrated_file_stem`] gave the calibrated
+    /// `root/fits/<stem>.p<plane>.athf` — one PLANE's persisted
+    /// fits (Tier C Task 1): `stem` is the SAME frame-only stem
+    /// [`crate::stacking::run::frame_file_stem`] gave the calibrated
     /// file (the same convention `registered_file_name` follows for its
     /// own naming), `plane` the 0-based [`crate::integration::plane_reader::PlaneReader`]
     /// index.
-    pub fn fits_path(&self, group_key: &str, stem: &str, plane: usize) -> PathBuf {
-        self.fits_dir(group_key)
-            .join(format!("{stem}.p{plane}.athf"))
+    pub fn fits_path(&self, stem: &str, plane: usize) -> PathBuf {
+        self.fits_dir().join(format!("{stem}.p{plane}.athf"))
     }
 
     /// `root/ln/<group_key>/reference.fits` — the group's chosen local-
@@ -1009,7 +1042,7 @@ pub enum CleanupWhat {
 /// and correctly re-measure anyway (see `plan.rs`'s Measure staleness) —
 /// keeping `fits` alongside it just avoids paying that re-measure for
 /// nothing. Its directory (`fits/`) is removed only under `All`, alongside
-/// `metrics`' own drop.
+/// `metrics`' own drop; `Intermediates` sweeps it of the `.athf` files no row names ([`sweep_unreferenced`]).
 ///
 /// `ln_calibration` (the group's seeds calibration, Tier C Task 2 fix round
 /// 4) is the third deliberate omission, on `metrics`' own reasoning: it is a
@@ -1020,9 +1053,15 @@ pub enum CleanupWhat {
 /// inputs, so the stored `k` is still a measurement of exactly this group
 /// against exactly this reference. Only `All` drops it.
 ///
-/// `measured` (Plan A Task 11c) is in the list although it sits beside `metrics` and `fits`: unlike them it is keyed
-/// on the calibrated file's IDENTITY (a stored size + mtime stamp, R11c-4), which a re-calibration after this cleanup
-/// rewrites, so a kept artifact would never be usable again; its directory goes with `calibrated/`.
+/// `measured` (the Measure first-pass artifact, a file behind each row) is NOT here since the frame-level cache
+/// (spec §5.3): a pass-1 file is about 13 MB per frame and costs 24-34 min per set to rebuild, so `Intermediates` keeps
+/// it and its row, like `metrics` and `fits`; only `All` drops it. `Intermediates` still sweeps `measured/` (`.athm`)
+/// and `fits/` (`.athf`) of the writer-named files no `stacking_artifacts` row names ([`sweep_unreferenced`]).
+///
+/// `two_pass` (`run::TWO_PASS_ARTIFACT_KIND`, the two-pass dry pass's decision, frame-level cache spec §5.6) is the
+/// group-level counterpart of `metrics` here: a payload row with no file, keyed on the group's membership
+/// ([`artifact_group_key`] returns the group key for it), it costs a dry pass (101 s for 551 frames) to rebuild and
+/// nothing in an `Intermediates` cleanup changes what it reads. Only `All` drops it.
 ///
 /// `registration` (`plan::REGISTRATION_ARTIFACT_KIND`, a project's star-map
 /// cache) is deliberately absent too: it is a payload row that only `All`
@@ -1030,9 +1069,6 @@ pub enum CleanupWhat {
 const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "registered",
     "calibrated",
-    // Plan A Task 11c (R11c-6): the Measure first-pass artifact (`measured/`, a file behind each row) goes with the
-    // calibrated frames it was read from, whose identity it is stamped with.
-    "measured",
     // M4d Task 1: the calibrated CFA mosaic lives IN `calibrated/` beside
     // its debayered sibling, so the directory removal above already takes
     // the file — this is its row.
@@ -1091,6 +1127,147 @@ fn remove_runs_keeping_uncropped(runs: &Path) -> anyhow::Result<u64> {
     Ok(freed)
 }
 
+/// The files a pass-1 / star-fits WRITER produces, and so the only names [`sweep_unreferenced`] may remove: the
+/// artifact itself (`<stem>.<ext>`) and the temporary a crashed write leaves
+/// (`<stem>.<ext>.tmp.<pid>.<seq>`, `pass1_artifact::write_pass1` / `fits_artifact::write_fits`). `ext` is `athm`
+/// under `measured/` and `athf` under `fits/`. Anything else under those folders is not ours.
+fn is_writer_file_name(name: &str, ext: &str) -> bool {
+    if name.ends_with(&format!(".{ext}")) {
+        return true;
+    }
+    let Some((_, tail)) = name.rsplit_once(&format!(".{ext}.tmp.")) else {
+        return false;
+    };
+    let Some((pid, seq)) = tail.split_once('.') else {
+        return false;
+    };
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(seq)
+}
+
+/// Removes from `root` (recursively) the files its writer produced ([`is_writer_file_name`] with `ext`) that no
+/// `measured` / `fits.<plane>` row of ANY subject names, then the sub-folders that are left empty (`root` itself
+/// stays), and returns the bytes freed. Two sets with one slug share a working root
+/// (`WorkingLayout::new(working_dir, set_slug(name))`), and a migrated row keeps a path inside an old
+/// `<group_key>/` sub-folder, hence the walk and the all-subject lookup. Any other file (a user's `light.fits` a
+/// frame set's working folder happens to overlap) is never touched, nor is a folder that still holds one.
+///
+/// A file is kept when its path is a row's, or — so a different spelling of the same folder (a symlinked or
+/// non-canonical working path) can never wipe the cache — when its FILE NAME equals the file name of any such row
+/// (the names carry `_f<id>`). Symlinks are never followed: a symlinked folder is left alone, a symlinked file is an
+/// ordinary file. A missing `root` frees nothing. Each failed removal or unreadable folder is a `warn!` (`path`,
+/// `error`) and the sweep goes on; only a failed lookup of the rows is an error, because without them nothing may
+/// be removed.
+fn sweep_unreferenced(conn: &Connection, root: &Path, ext: &str) -> anyhow::Result<u64> {
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let read_failed = |e: rusqlite::Error| {
+        tracing::warn!(path = %root.display(), error = %e, "stacking cleanup: reading artifact rows failed");
+        anyhow::anyhow!("failed to read artifact rows: {e}")
+    };
+    let mut keep = KeepSet::default();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path FROM stacking_artifacts \
+                 WHERE path IS NOT NULL AND (kind = 'measured' OR kind LIKE 'fits.%')",
+            )
+            .map_err(read_failed)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+            .map_err(read_failed)?;
+        for path in rows {
+            if let Some(name) = Path::new(&path).file_name() {
+                keep.names.insert(name.to_string_lossy().into_owned());
+            }
+            keep.paths.insert(path);
+        }
+    }
+    let mut freed = 0u64;
+    sweep_dir(root, ext, &keep, &mut freed);
+    Ok(freed)
+}
+
+/// The rows [`sweep_unreferenced`] consults: full paths and bare file names.
+#[derive(Default)]
+struct KeepSet {
+    paths: std::collections::HashSet<String>,
+    names: std::collections::HashSet<String>,
+}
+
+/// One folder of [`sweep_unreferenced`]; returns whether the folder is empty afterwards.
+fn sweep_dir(dir: &Path, ext: &str, keep: &KeepSet, freed: &mut u64) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "stacking cleanup: reading a folder failed");
+            return false;
+        }
+    };
+    let mut empty = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "stacking cleanup: reading a folder failed");
+                empty = false;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: reading a file type failed");
+                empty = false;
+                continue;
+            }
+        };
+        if file_type.is_dir() {
+            if sweep_dir(&path, ext, keep, freed) {
+                match std::fs::remove_dir(&path) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: removing an empty folder failed");
+                        empty = false;
+                    }
+                }
+            } else {
+                empty = false;
+            }
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = !file_type.is_symlink() || !path.is_dir();
+        if !ours
+            || !is_writer_file_name(&name, ext)
+            || keep.paths.contains(path.to_string_lossy().as_ref())
+            || keep.names.contains(&name)
+        {
+            // A symlinked folder, a file its writer does not name, or a file a row names: not ours to remove.
+            empty = false;
+            continue;
+        }
+        let len = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: reading a file size failed");
+                0
+            }
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => *freed += len,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: removing an unreferenced file failed");
+                empty = false;
+            }
+        }
+    }
+    empty
+}
+
 /// Remove a working layout's subtrees per `what` and the matching
 /// `stacking_artifacts` rows, returning the bytes freed (summed by walking
 /// each subtree, symlink-safe via [`crate::api::sync::dir_size_bytes`],
@@ -1103,7 +1280,10 @@ fn remove_runs_keeping_uncropped(runs: &Path) -> anyhow::Result<u64> {
 /// is added to the removed DIRECTORIES on the same levels as `calibrated`/
 /// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
 /// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
-/// pointing at a file used in place loses its row, never its file.
+/// pointing at a file used in place loses its row, never its file. `Intermediates` keeps `measured/` and `fits/`
+/// with their rows and removes from them only the `.athm` / `.athf` files (and crashed-write temporaries) no row of
+/// any subject names ([`sweep_unreferenced`]); `sweep_intermediates = false` skips that sweep (ruling R8 (c): another
+/// stacking run is writing into a root it may share).
 /// `runs/run-<id>-uncropped` folders are never removed (see
 /// [`remove_runs_keeping_uncropped`]). Plan 6b-3 D17: `tmp/` (crash
 /// leftovers, no artifact rows) goes with `Intermediates` and `All`.
@@ -1113,13 +1293,26 @@ pub fn cleanup_work(
     layout: &WorkingLayout,
     what: CleanupWhat,
 ) -> anyhow::Result<u64> {
+    cleanup_work_with(conn, subject, layout, what, true)
+}
+
+/// [`cleanup_work`] with the `Intermediates` sweep of `measured/` and `fits/` switchable. A caller that holds a
+/// [`crate::services::ServiceContext`] passes `false` while ANOTHER subject's stacking run is active
+/// ([`crate::stacking::run::other_stack_active`]): that run writes a pass-1 / fits file before its row, and the two
+/// subjects may share a working root, so the file would look unreferenced.
+pub fn cleanup_work_with(
+    conn: &Connection,
+    subject: &StackSubject,
+    layout: &WorkingLayout,
+    what: CleanupWhat,
+    sweep_intermediates: bool,
+) -> anyhow::Result<u64> {
     let mut dirs = vec![layout.registered_root()];
     match what {
         CleanupWhat::Registered => {}
         CleanupWhat::Intermediates => {
             dirs.push(layout.calibrated_root());
             dirs.push(layout.prepared_root());
-            dirs.push(layout.measured_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
             dirs.push(layout.tmp_root());
@@ -1141,7 +1334,8 @@ pub fn cleanup_work(
             dirs.push(layout.previews_root());
             // Tier C Task 1: `fits/` follows `metrics` — see
             // `INTERMEDIATE_ARTIFACT_KINDS`'s own doc for why both survive
-            // `Intermediates` and drop only here.
+            // `Intermediates` and drop only here. `measured/` (pass 1) joins
+            // them since the frame-level cache (spec §5.3).
             dirs.push(layout.fits_root());
         }
     }
@@ -1167,6 +1361,18 @@ pub fn cleanup_work(
         }
         CleanupWhat::Intermediates => {
             crate::db::stacking::delete_artifacts(conn, subject, INTERMEDIATE_ARTIFACT_KINDS)?;
+            // `measured/` and `fits/` survive with their rows; the writer-named files no row of any subject names
+            // go (a migrated file of a deleted duplicate, a leftover of a crashed write). After the row deletion
+            // above, so the rows consulted are the ones that remain.
+            if sweep_intermediates {
+                for (root, ext) in [(layout.measured_root(), "athm"), (layout.fits_root(), "athf")] {
+                    freed += sweep_unreferenced(conn, &root, ext)?;
+                }
+            } else {
+                tracing::warn!(
+                    "stacking cleanup: another stacking run is active; measured/ and fits/ are not swept"
+                );
+            }
         }
         CleanupWhat::All => {
             crate::db::stacking::delete_all_artifacts(conn, subject)?;
@@ -1210,6 +1416,22 @@ pub fn subject_output_dir(output_root: &Path, subject: &StackSubject, label: &st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_level_kinds_use_the_empty_group_key() {
+        assert_eq!(artifact_group_key("calibrated", "osc__x__bin1__180s"), "");
+        assert_eq!(artifact_group_key("calibrated_mosaic", "k"), "");
+        assert_eq!(artifact_group_key("solve", "k"), "");
+        assert_eq!(artifact_group_key("registration", "k"), "");
+        assert_eq!(artifact_group_key("fits.2", "k"), "");
+        assert_eq!(artifact_group_key("ln", "k"), "k");
+        assert_eq!(artifact_group_key("ln_reference", "k"), "k");
+        assert_eq!(artifact_group_key("two_pass", "k"), "k");
+        for kind in FRAME_LEVEL_KINDS {
+            assert!(is_frame_level_kind(kind), "{kind}");
+        }
+        assert!(!is_frame_level_kind("ln"));
+    }
+
     use super::*;
 
     use crate::db::schema::init_db;
@@ -1256,14 +1478,25 @@ mod tests {
         let layout = WorkingLayout::new(Path::new("/work"), "LDN_1272");
         assert_eq!(layout.root, PathBuf::from("/work/LDN_1272"));
         assert_eq!(
-            layout.calibrated_dir("cam__mono__Ha__bin1__100x100"),
-            PathBuf::from("/work/LDN_1272/calibrated/cam__mono__Ha__bin1__100x100")
+            layout.calibrated_dir(),
+            PathBuf::from("/work/LDN_1272/calibrated")
         );
         assert_eq!(
-            layout.registered_dir("g"),
-            PathBuf::from("/work/LDN_1272/registered/g")
+            layout.registered_dir(),
+            PathBuf::from("/work/LDN_1272/registered")
         );
         assert_eq!(layout.ln_dir("g"), PathBuf::from("/work/LDN_1272/ln/g"));
+        // Frame-level cache spec §5.1: the Measure kinds are flat too, no group sub-folder.
+        assert_eq!(layout.measured_dir(), PathBuf::from("/work/LDN_1272/measured"));
+        assert_eq!(
+            layout.measured_path("Light_0001_f7"),
+            PathBuf::from("/work/LDN_1272/measured/Light_0001_f7.athm")
+        );
+        assert_eq!(layout.fits_dir(), PathBuf::from("/work/LDN_1272/fits"));
+        assert_eq!(
+            layout.fits_path("Light_0001_f7", 2),
+            PathBuf::from("/work/LDN_1272/fits/Light_0001_f7.p2.athf")
+        );
         assert_eq!(layout.runs_dir(), PathBuf::from("/work/LDN_1272/runs"));
         assert_eq!(
             layout.run_json(42),
@@ -1989,11 +2222,11 @@ mod tests {
             tmp.path().join("set").join("prepared")
         );
         assert_eq!(
-            layout.prepared_dir("g"),
-            tmp.path().join("set").join("prepared").join("g")
+            layout.prepared_dir(),
+            tmp.path().join("set").join("prepared")
         );
-        write_bytes(&layout.calibrated_dir("g").join("c_a.fits"), 100);
-        write_bytes(&layout.prepared_dir("g").join("p_b.fits"), 50);
+        write_bytes(&layout.calibrated_dir().join("c_a.fits"), 100);
+        write_bytes(&layout.prepared_dir().join("p_b.fits"), 50);
         let usage = work_usage(&layout);
         assert_eq!(usage.calibrated_bytes, 150);
         assert_eq!(usage.total_bytes, 150);
@@ -2037,9 +2270,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = WorkingLayout::new(tmp.path(), "set");
 
-        let calibrated_file = layout.calibrated_dir("g").join("f1.fits");
+        let calibrated_file = layout.calibrated_dir().join("f1.fits");
         write_bytes(&calibrated_file, 100);
-        let registered_file = layout.registered_dir("g").join("f1.fits");
+        let registered_file = layout.registered_dir().join("f1.fits");
         write_bytes(&registered_file, 200);
 
         seed_artifact(
@@ -2073,7 +2306,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(freed, 200);
-        assert!(!layout.registered_dir("g").exists());
+        assert!(!layout.registered_dir().exists());
         assert!(calibrated_file.exists(), "calibrated/ untouched");
         assert_eq!(
             delete_artifacts(&c, &StackSubject::FrameSet(set_id), &["registered"]).unwrap(),
@@ -2122,8 +2355,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(freed, 300);
-        assert!(!layout.registered_dir("g").exists());
-        assert!(!layout.calibrated_dir("g").exists());
+        assert!(!layout.registered_dir().exists());
+        assert!(!layout.calibrated_dir().exists());
         assert!(
             layout.root.exists(),
             "the layout's own root is never removed"
@@ -2173,7 +2406,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = WorkingLayout::new(tmp.path(), "set");
 
-        let group_dir = layout.calibrated_dir("g");
+        let group_dir = layout.calibrated_dir();
         let real_dir = group_dir.join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
         write_bytes(&real_dir.join("f.fits"), 1024);
@@ -2197,7 +2430,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(freed, 1024);
-        assert!(!layout.calibrated_dir("g").exists());
+        assert!(!layout.calibrated_dir().exists());
     }
 
     /// M3 Task 2, brief test (j): `rej/` bytes are counted by `work_usage`
@@ -2289,20 +2522,20 @@ mod tests {
         assert!(!layout.rej_root().exists());
     }
 
-    /// Plan A Task 11c (R11c-6): `measured/` bytes are counted by `work_usage` (and in the total), survive
-    /// `Registered` with their rows, and are removed with their rows by `Intermediates` and by `All`.
+    /// `measured/` bytes are counted by `work_usage` (and in the total), survive `Registered` and `Intermediates`
+    /// with their rows (frame-level cache spec §5.3), and are removed with their rows by `All`.
     #[test]
-    fn measured_bytes_are_counted_and_intermediates_or_all_remove_them() {
+    fn measured_bytes_are_counted_and_only_all_removes_them() {
         let c = conn();
         c.execute("INSERT INTO frames_set (id, name) VALUES (4, 'Measured')", [])
             .unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let layout = WorkingLayout::new(tmp.path(), "set");
         assert_eq!(
-            layout.measured_path("g", "f1"),
-            layout.root.join("measured").join("g").join("f1.athm")
+            layout.measured_path("f1"),
+            layout.root.join("measured").join("f1.athm")
         );
-        let file = layout.measured_path("g", "f1");
+        let file = layout.measured_path("f1");
         write_bytes(&file, 96);
         seed_artifact(&c, 4, "measured", file.to_str().unwrap(), 96);
 
@@ -2329,18 +2562,289 @@ mod tests {
             CleanupWhat::Intermediates,
         )
         .unwrap();
-        assert_eq!(freed, 96);
-        assert!(!layout.measured_root().exists());
-        assert_eq!(row_count(&c), 0, "Intermediates drops the rows too");
-        assert_eq!(work_usage(&layout).measured_bytes, 0);
+        assert_eq!(freed, 0);
+        assert!(file.exists(), "Intermediates keeps the referenced pass-1 file");
+        assert_eq!(row_count(&c), 1, "…and its row");
+        assert_eq!(work_usage(&layout).measured_bytes, 96);
 
-        write_bytes(&file, 64);
-        seed_artifact(&c, 4, "measured", file.to_str().unwrap(), 64);
         let freed =
             cleanup_work(&c, &StackSubject::FrameSet(4), &layout, CleanupWhat::All).unwrap();
-        assert_eq!(freed, 64);
+        assert_eq!(freed, 96);
         assert!(!layout.measured_root().exists());
         assert_eq!(row_count(&c), 0, "All drops the rows too");
+    }
+
+    /// A frame-level row (group key `''`) of the given kind, as the frame-level writers leave it.
+    fn seed_frame_row(c: &Connection, set_id: i64, frame_id: i64, kind: &str, path: &Path) {
+        // The foreign key wants the frame; a second row of the same frame finds it already there.
+        c.execute(
+            "INSERT OR IGNORE INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, 'f.fits', 100, '2026-09-09T00:00:00Z', 'FITS')",
+            rusqlite::params![frame_id, format!("/f/{frame_id}.fits")],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR IGNORE INTO frames (id, file_id) VALUES (?1, ?1)",
+            rusqlite::params![frame_id],
+        )
+        .unwrap();
+        crate::db::stacking::upsert_artifact(
+            c,
+            &NewArtifact {
+                subject: &StackSubject::FrameSet(set_id),
+                frame_id: Some(frame_id),
+                group_key: "",
+                kind,
+                path: path.to_str(),
+                config_hash: "h",
+                size: Some(1),
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Frame-level cache spec §5.3 / §5.7 (Review Focus 5): `Intermediates` removes `calibrated/` but keeps the
+    /// `measured/` and `fits/` files their rows name (flat ones and a migrated one in an old `<group_key>/`
+    /// sub-folder), with the rows; the files no row names go, and the sub-folders they leave empty.
+    #[test]
+    fn intermediates_sweep_keeps_referenced_pass1_files() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (6, 'Sweep')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        let m1 = layout.measured_path("a_f1");
+        let m2 = layout.measured_root().join("old_key").join("b_f2.athm");
+        let f1 = layout.fits_path("a_f1", 0);
+        let stray_m = layout.measured_path("gone_f9");
+        let stray_deep = layout.measured_root().join("old_key2").join("dup_f9.athm");
+        let stray_f = layout.fits_root().join("old_key").join("dup_f9.p0.athf");
+        let calibrated = layout.calibrated_dir().join("a_f1.fits");
+        for (path, n) in [
+            (&m1, 10),
+            (&m2, 20),
+            (&f1, 30),
+            (&stray_m, 1),
+            (&stray_deep, 2),
+            (&stray_f, 4),
+            (&calibrated, 100),
+        ] {
+            write_bytes(path, n);
+        }
+        seed_frame_row(&c, 6, 1, "measured", &m1);
+        seed_frame_row(&c, 6, 2, "measured", &m2);
+        seed_frame_row(&c, 6, 1, "fits.0", &f1);
+        seed_frame_row(&c, 6, 1, "calibrated", &calibrated);
+
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(6),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(freed, 100 + 1 + 2 + 4, "calibrated/ plus the unreferenced files, nothing else");
+        assert!(!layout.calibrated_root().exists());
+        for kept in [&m1, &m2, &f1] {
+            assert!(kept.exists(), "{} is referenced", kept.display());
+        }
+        for gone in [&stray_m, &stray_deep, &stray_f] {
+            assert!(!gone.exists(), "{} is not", gone.display());
+        }
+        assert!(
+            !layout.measured_root().join("old_key2").exists()
+                && !layout.fits_root().join("old_key").exists(),
+            "a sub-folder left empty goes"
+        );
+        assert!(layout.measured_root().join("old_key").exists(), "…one with a kept file stays");
+        let count = |kind: &str| {
+            crate::db::stacking::list_artifacts(&c, &StackSubject::FrameSet(6), Some(kind))
+                .unwrap()
+                .len()
+        };
+        assert_eq!((count("measured"), count("fits.0"), count("calibrated")), (2, 1, 0));
+
+        // A second pass changes nothing, and a layout that never wrote `fits/` is not an error.
+        std::fs::remove_dir_all(layout.fits_root()).unwrap();
+        let again = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(6),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(again, 0);
+        assert!(m1.exists() && m2.exists());
+    }
+
+    /// Ruling R8 (a), data loss: a frame set's working folder may overlap a scan root, so `measured/` and `fits/` can
+    /// hold a user's own files. The sweep removes only the names its writers produce (`*.athm`, `*.athf`, and their
+    /// `.tmp.<pid>.<seq>` temporaries); every other file, and the folder that holds it, is left alone.
+    #[test]
+    fn the_sweep_removes_only_the_names_its_writers_produce() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (9, 'Mine')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        let user_fits = layout.fits_root().join("light.fits");
+        let user_measured = layout.measured_root().join("sub").join("light.fits");
+        let user_note = layout.measured_root().join("sub").join("notes.txt");
+        let lookalike_a = layout.measured_root().join("a.athm.bak");
+        let lookalike_b = layout.measured_root().join("b.athm.tmp.x.y");
+        let lookalike_c = layout.fits_root().join("c.athf.tmp.1");
+        let lookalike_d = layout.fits_root().join("d.athm");
+        let writer_athm = layout.measured_path("o_f1");
+        let writer_athm_tmp = layout.measured_root().join("old").join("p_f2.athm.tmp.4242.7");
+        let writer_athf = layout.fits_path("o_f1", 0);
+        let writer_athf_tmp = layout.fits_root().join("q_f2.p1.athf.tmp.4242.8");
+        for (path, n) in [
+            (&user_fits, 5),
+            (&user_measured, 6),
+            (&user_note, 7),
+            (&lookalike_a, 8),
+            (&lookalike_b, 9),
+            (&lookalike_c, 10),
+            (&lookalike_d, 11),
+            (&writer_athm, 1),
+            (&writer_athm_tmp, 2),
+            (&writer_athf, 3),
+            (&writer_athf_tmp, 4),
+        ] {
+            write_bytes(path, n);
+        }
+
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(9),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(freed, 1 + 2 + 3 + 4, "only the four writer-named files");
+        for kept in [
+            &user_fits,
+            &user_measured,
+            &user_note,
+            &lookalike_a,
+            &lookalike_b,
+            &lookalike_c,
+            &lookalike_d,
+        ] {
+            assert!(kept.exists(), "{} is not a writer name", kept.display());
+        }
+        for gone in [&writer_athm, &writer_athm_tmp, &writer_athf, &writer_athf_tmp] {
+            assert!(!gone.exists(), "{} is an unreferenced writer file", gone.display());
+        }
+        assert!(
+            !layout.measured_root().join("old").exists(),
+            "a folder the sweep emptied goes"
+        );
+        assert!(
+            layout.measured_root().join("sub").exists(),
+            "a folder that holds a foreign file stays"
+        );
+    }
+
+    /// Ruling R8 (b), fail-safe: a row spelling a folder differently from the layout the cleanup walks (a symlinked
+    /// or non-canonical working path, `/var` vs `/private/var`) must never make the cache look unreferenced; a file
+    /// whose NAME a row names is kept.
+    #[test]
+    #[cfg(unix)]
+    fn the_sweep_keeps_a_file_a_row_names_under_another_spelling_of_the_folder() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (10, 'Spelled')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The rows hold the resolved spelling, the cleanup walks the symlink's.
+        let rows_layout = WorkingLayout::new(&real, "set");
+        let walked_layout = WorkingLayout::new(&link, "set");
+        let pass1 = rows_layout.measured_path("a_f1");
+        let fits = rows_layout.fits_path("a_f1", 0);
+        let stray = rows_layout.measured_path("gone_f9");
+        write_bytes(&pass1, 10);
+        write_bytes(&fits, 20);
+        write_bytes(&stray, 3);
+        seed_frame_row(&c, 10, 1, "measured", &pass1);
+        seed_frame_row(&c, 10, 1, "fits.0", &fits);
+
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(10),
+            &walked_layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert!(pass1.exists() && fits.exists(), "the cache survives a spelling mismatch");
+        assert!(!stray.exists(), "a file no row names still goes");
+        assert_eq!(freed, 3);
+    }
+
+    /// Ruling R8 (c): with `sweep_intermediates = false` (another stacking run is active) nothing under `measured/` or
+    /// `fits/` is removed, the rest of `Intermediates` still is.
+    #[test]
+    fn the_sweep_can_be_skipped_while_another_run_is_active() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (11, 'Busy')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        let in_flight = layout.measured_path("w_f3");
+        let calibrated = layout.calibrated_dir().join("a_f1.fits");
+        write_bytes(&in_flight, 6);
+        write_bytes(&calibrated, 100);
+
+        let freed = cleanup_work_with(
+            &c,
+            &StackSubject::FrameSet(11),
+            &layout,
+            CleanupWhat::Intermediates,
+            false,
+        )
+        .unwrap();
+        assert_eq!(freed, 100);
+        assert!(in_flight.exists(), "a pass-1 file a running run has not recorded yet");
+        assert!(!layout.calibrated_root().exists());
+    }
+
+    /// Two sets with one slug share a working root, so a file only ANOTHER subject's row names is still referenced.
+    #[test]
+    fn the_sweep_keeps_a_file_only_another_subject_references() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (7, 'Twin')", [])
+            .unwrap();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (8, 'Twin')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "twin");
+        let theirs = layout.measured_path("t_f5");
+        let orphan = layout.measured_path("o_f6");
+        write_bytes(&theirs, 8);
+        write_bytes(&orphan, 3);
+        seed_frame_row(&c, 8, 5, "measured", &theirs);
+
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(7),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(freed, 3);
+        assert!(theirs.exists(), "set 8's pass-1 file survives set 7's cleanup");
+        assert!(!orphan.exists());
+        assert_eq!(
+            crate::db::stacking::list_artifacts(&c, &StackSubject::FrameSet(8), Some("measured"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Plan 6b-3 D10 (fix round 1): a crop run's scratch folder can hold the

@@ -51,6 +51,7 @@ use athenaeum_core::stacking::ln::{
     LnScaleSeeds, ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
+use athenaeum_core::stacking::paths::artifact_group_key;
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
 use athenaeum_core::stacking::weights::FrameWeight;
 
@@ -344,7 +345,7 @@ fn main() {
         let calibrated = match find_artifact(
             &conn,
             &StackSubject::FrameSet(args.set_id),
-            &group.key,
+            artifact_group_key("calibrated", &group.key),
             "calibrated",
             Some(gf.frame_id),
         ) {
@@ -352,12 +353,16 @@ fn main() {
                 Some(p) => PathBuf::from(p),
                 None => continue,
             },
-            _ => continue,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("frame {}: reading the calibrated row failed ({e}), skipping", gf.frame_id);
+                continue;
+            }
         };
         let measurement = match find_artifact(
             &conn,
             &StackSubject::FrameSet(args.set_id),
-            &group.key,
+            artifact_group_key("metrics", &group.key),
             "metrics",
             Some(gf.frame_id),
         ) {
@@ -369,7 +374,11 @@ fn main() {
                 Some(m) => m,
                 None => continue,
             },
-            _ => continue,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("frame {}: reading the metrics row failed ({e}), skipping", gf.frame_id);
+                continue;
+            }
         };
         let Some(reg) = registration_by_frame.get(&gf.frame_id) else {
             continue;

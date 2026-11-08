@@ -1162,11 +1162,12 @@ see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
   dispatcher too: `paths::subject_layout` (`<working>/<set_slug(name)>` for a
   frame set, `<working>/_projects/<set_slug(slug)>` for a project; 6b-1 wrote `projects/`).
 - **The config pin.** `calibration_subtree` writes grouping as
-  `{"exposureToleranceSec": x}` only, pinned by
+  `{"exposureToleranceSec": 2.0}`, the shipped default as a CONSTANT and not the config's value (frame-level cache
+  spec §5.2: the key holds the hash's shape, the grouping says nothing about a frame's calibration), pinned by
   `stage_hashes_are_pinned_to_golden_literals` (pure helpers, literal inputs).
   A new grouping or output field must leave those literals unchanged, so an
   existing frame set keeps its caches across an upgrade; only
-  `config_hash_is_canonical_and_pinned` moves.
+  `config_hash_is_canonical_and_pinned` moves. See "Frame-level cache (2026-11-08)" below.
 - **For future editors**: ts-rs copies `///` docs of exported fields into
   `src/types`; exported fields carry `//` comments so the generated files stay
   byte-identical (`git diff --exit-code src/types`).
@@ -1248,8 +1249,7 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   entry has its reason. The per-frame dispatch points the run calls live in
   `stacking::origin`, which the test does not scan: `stored_solve`,
   `cfa_geometry`, `landed_unchanged`, `needs_prepare`, `prepare_input`,
-  `prepare_stem_needs_frame_id`, `solve_plan`, `wcs_tier` and
-  `local_solve_outcome`. A third subject or origin touches exactly these and the
+  `solve_plan`, `wcs_tier` and `local_solve_outcome`. A third subject or origin touches exactly these and the
   named funnels.
 - **The identity check.** `origin::landed_unchanged` compares a landed file with
   its row's `size:mtime` (2 s tolerance). It runs at Prepare, Solve, Measure,
@@ -1303,7 +1303,7 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - **In place:** a float FITS (BITPIX −32/−64) that needs no debayer is used as it
     is. The `calibrated` artifact is the landed file, which no cleanup removes.
   - **Converted:** an integer FITS (÷ `scale_divisor_for_bitpix`) or an XISF
-    (`read_raw` ÷ 65535) becomes float32 FITS `prepared/<group>/p_<stem>.fits`.
+    (`read_raw` ÷ 65535) becomes float32 FITS `prepared/p_<stem>_f<frame_id>.fits`.
     An integer FITS is never used in place, although spec §5.1 row 1 allows
     it (narrowed to float, review I2): converting gives an attested set's 16-bit
     lights and a published replica the calibrated-light generator's one unit
@@ -1311,11 +1311,10 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - **Debayered:** a CFA mosaic, when `debayerOsc` is on, goes through the
     generator's own VNG (`debayer_plane`) into `p_<stem>_d.fits`. The
     pre-debayer mosaic is the `calibrated_mosaic` for Bayer drizzle.
-  - **Names:** a project frame keeps the replica's stem (`p_c_<uuid>.fits`); an
-    attested light's prepared name carries its catalog id
-    (`p_<stem>_f<frame_id>.fits`, decided by `origin::prepare_stem_needs_frame_id`),
-    because two files of one set may share a stem. A prepared output equal to
-    its source is refused (error log, frame excluded).
+  - **Names:** every prepared name is `p_<stem>_f<frame_id>.fits` (`run::frame_file_stem`,
+    the one frame-only stem of every frame-level file; a project frame's id is its handle),
+    because two files of one set may share a stem. `prepared/` is flat. A prepared output
+    equal to its source is refused (error log, frame excluded).
   - **Excluded:** a tile-compressed FITS, an extension image, a distributed
     XISF or a file that cannot be opened, as "unsupported file: …" (the
     decoder's reason reads "not a 1- or 3-plane 8/16/32-bit or float primary
@@ -1669,11 +1668,10 @@ unchanged.
   shows the plan's `exposureClass` token (`180s`, `st120`, `eq0.24`, `all`, `unknown`). A change patches `grouping` and
   the plan refetches as for any config edit. A frame set's default stays `seconds`; a project's stored config is seeded
   `stops` 1.0. The measured zero point of `equivalent` is sub-wave 6.5, not built.
-  - **The tolerance hint** (`The tolerance is part of the calibration hash: changing it re-calibrates this set's lights
-    on the next run.`) shows only where the board calibrates and the mode is `seconds`
-    (`toleranceInCalibrationHash = boardMode(plan) === 'calibrate'`: an ordinary set). An attested set's and a project's
-    Prepare hash holds no grouping, so the hint would be false there. `equivalent` carries its own hint (classes by
-    t / N²; frames without both numbers are grouped by seconds, and the plan names how many).
+  - **No tolerance hint.** The tolerance only regroups frames (frame-level cache spec §5.1, §5.2): calibrated frames,
+    measurements and registrations are kept per frame and reused, so changing it re-calibrates nothing and the table
+    carries no warning about it. `equivalent` carries its own hint (classes by t / N²; frames without both numbers are
+    grouped by seconds, and the plan names how many).
 - **Output and the coverage thumbnail (D4).** The Output panel has `Write a coverage map (frames per pixel) beside each
   master` and `Crop to coverage of at least … frames (0 = no crop)`: the config fields `output.coverageMap` and
   `output.cropToCoverage`, for both subjects and in Settings → Stacking too. The Output board line adds `coverage map`
@@ -1839,9 +1837,12 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     table shows the change when Blink closes. Each badge is the outcome chip's label, plus `· out of next run`; the context
     label is the group and the outcome's reason. No action shows while a run is active.
 - **Aligned frames in Blink** (`core/api/stacking_aligned.rs`). Stage 5 writes one registered frame per frame to
-  `<working_dir>/<subject>/registered/<group_key>/r_<stem>[_d].fits` and records it in `stacking_artifacts` (kind
-  `registered`). That row has no run id: every later run of the group overwrites the file and the row. So a frame is
-  aligned only for its own run, and only while that run is the latest to hold its group. `get_stacking_aligned_frames {
+  `<working_dir>/<subject>/registered/r_<stem>[_d].fits` (flat since the frame-level cache: a row written before keeps its
+  `registered/<group_key>/` path, and every reader opens the row's path) and records it in `stacking_artifacts` (kind
+  `registered`, group key `""`). That row has no run id: a later run that registers the frame again overwrites the file and
+  the row, and one that finds the file fresh reuses it and touches neither. So a frame is aligned for its own run for as long
+  as nothing has replaced it: no later run holds its group, the row was not written after the run finished, and the file is
+  still the one the row recorded. `get_stacking_aligned_frames {
   runId, frameIds }` answers one state per frame. The ids are the run's (catalog frame ids for a set, project-frame
   handles for a project). The checks run in this order, and the first that applies decides:
 
@@ -1849,7 +1850,7 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
   | ---- | ---- | ---- |
   | `notRegistered` | the run holds no row for the frame | `original — not registered in run #N` |
   | `registrationFailed` | the run row's `reg_status` is `failed` | `original — registration failed in run #N` |
-  | `replaced` | a later run of the subject holds the frame's group | `original — a later run replaced it` |
+  | `replaced` | a later run of the subject holds the frame's group, or the artifact row's `created_at` is later than the run's `finished_at` (a later run re-registered the frame, whatever its grouping), or the file is no longer the one the row recorded (size and modification time) | `original — a later run replaced it` |
   | `available` | `reg_status` is `aligned`, `aligned_flipped` or `reference`, and the artifact row names a file on disk | none: the aligned frame is shown |
   | `missing` | the same `reg_status`, but the artifact row has no path or the file is gone | `original — not in the working folder any more` |
   | `notRegistered` | any other `reg_status` (`skipped`: the run cut the frame before Register) | `original — not registered in run #N` |
@@ -1858,6 +1859,11 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     meridian-flipped frame (`aligned_flipped`) has its aligned frame too.
   - A frame cut by the weight floor after Register keeps `reg_status = aligned` and stays `available`. A `skipped` frame is
     `notRegistered` even when an earlier run left an artifact for it: that file is not this run's.
+  - A cached file counts as fresh only while it is the file its row recorded (`stacking::plan::file_matches_identity`, a
+    stat only, ruling R7 b): `is_fresh` requires it whenever the row has a `modified_at`, so the gate and every cache hit in
+    the run agree, and Blink uses the same helper. A run cancelled right after a fan-out rewrote files, before it recorded
+    them, leaves the rows with the old identity: the next run finds the files stale and rewrites them. A row without a
+    `modified_at` keeps the size check. A test or tool that edits a cached file in place must record its new identity.
   - The group row of a later run exists from that run's first moment, so a later run that got no further than planning
     already marks the group `replaced`. This is the safe side: never offer pixels a later run may have replaced.
   - The file is the artifact row's absolute `path`, never a path rebuilt from the subject's current name (a rename changes
@@ -3739,8 +3745,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       still labels the model "Auto (per-frame β)" (`stageSummary.ts`), which now names the diagnostic, not the β the
       fits are made at — a label line owed with the next frontend touch.
     - **The 11c amendment: the pass-1 spill (Plan A Task 11c; rulings R11c-1 … R11c-7; `PASS1_ARTIFACT_VERSION` = 1).**
-      Under `Auto`, pass 1 writes one artifact per member, `<working_dir>/<set_slug>/measured/<group>/<stem>.athm`
-      (a project's under `_projects/<slug>/`), the new `stacking_artifacts` kind `measured`; pass 2 reads it back and a
+      Under `Auto`, pass 1 writes one artifact per member, `<working_dir>/<set_slug>/measured/<stem>.athm`
+      (flat since the frame-level cache: a row written before keeps its `measured/<group>/` path, and a reader opens the
+      row's path; a project's under `_projects/<slug>/`), the new `stacking_artifacts` kind `measured`; pass 2 reads it back and a
       valid artifact skips every pass-1 plane read, detection, verdict pass and own-β sample. Pass 2 still reads the
       frame (its fits need the pixels).
       - R11c-1 stored vs derived: the `PlanePrep` verbatim, the head's timings, `w`, `h`, gain, `beta_own` and the
@@ -3751,13 +3758,23 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
         `warn!` and pass 1 re-runs, never a mis-decode.
       - R11c-3 key: `pass1_hash_for(cfg, calib)` = the measurement subtree + the calib hash + `measure_pass1:v<N>`,
         independent of the group β, so a β move re-runs pass 2 only; `Moffat4` / `Fixed` write nothing.
-      - R11c-4 identity: the stamp is the read guard's size + mtime at pass 1's first plane read; a mismatch re-runs
-        pass 1 (never an exclusion).
+      - R11c-4 identity: the stamp is the read guard's size + mtime at pass 1's first plane read; a LENGTH mismatch
+        re-runs pass 1 (never an exclusion). Since the frame-level cache (spec §5.3) the mtime is stored but not compared:
+        validity follows the calibration hash in the row's key, because a recalibration reproduces the planes to the bit
+        (`recalibration_reproduces_the_planes_bit_for_bit`), so "Delete intermediates" plus a rerun keeps the first pass.
+        Ruling R12 (a): that holds only for a file Athenaeum writes (under the layout's `calibrated/` or `prepared/`); a
+        calibrated file anywhere else (an attested light or a project replica used in place) is never rewritten by us, so
+        a moved mtime there means someone edited it and the mtime IS compared (`strict_mtime`; a path spelled differently
+        from the two roots falls back to strict). Pin: `measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one`.
       - R11c-5 flow: validate on the controller, pass 1 fanned out and written inside the worker (records dropped
         there), the group β, then pass 2 from the artifact or, with none, pass 1 in the worker (the upgrade ripple).
         A write failure is a `warn!`, no row, pass 1 again in pass 2's worker: nothing is ever held.
-      - R11c-6 lifecycle: `measured/` goes with `Intermediates` and `All`, an excluded frame's artifact stays;
-        `WorkUsage.measuredBytes`; no command changes on either host.
+      - R11c-6 lifecycle: `measured/` goes with `All` only (frame-level cache spec §5.3: `Intermediates` keeps the
+        pass-1 files and their rows, and sweeps `measured/` and `fits/` of the writer-named files (`*.athm` / `*.athf` and their
+        `.tmp.<pid>.<seq>` temporaries, nothing else: a user's file in an overlapping working folder is never touched) no
+        `measured` / `fits.<plane>` row of any subject names, keeping any file whose NAME a row names, and skipping the sweep
+        while another subject's run is active; the cleanup commands lay the working folder out as the run does, canonicalized);
+        an excluded frame's artifact stays; `WorkUsage.measuredBytes`; no command changes on either host.
       - R11c-7 (owner): bar 1 on real colour data, set 204's OSC and mono groups.
       - **Bars (lab c4d9b92, `star-lab/results/plan-a/t11c-wall/bars.txt`; A = ec39507e, B = 89958c3f).**
 
@@ -5090,6 +5107,115 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       d03a6950 (rustafits v1.8.0) against b3cbeb85: `SMPORT: PASS`, 152 image-arms identical, 0 moved (lab 656e914). In rustafits: renders and
       `info` byte-identical to 8b25b85, port digest a07688d0 identical, `rustafits analyze` equal to `measure_raw_frame` + `FrameSummary` on four
       real frames, the `convert -a` overlay checked by the owner.
+
+## Frame-level cache (2026-11-08)
+
+Spec `docs/superpowers/specs/2026-11-08-stacking-frame-level-cache-design.md`, plan `docs/superpowers/plans/2026-11-08-stacking-frame-level-cache-plan.md`,
+rulings R1-R16 in the job's ledger. The principle: **the key says whose result it is, the hash says what it was made from.** A result
+that is a function of one frame (and the run-wide reference) is keyed on the frame (`group_key = ''`); only a result that is a function
+of the group's membership is keyed on the group. A regroup (exposure mode, tolerance, stops width) recomputes the group-level results
+only: the LN reference, its calibration, the LN sidecars, rejection and the master (co-registered geometry, the default; under Native
+geometry each group has its own reference, so a regroup also re-registers by `ref:<id>`, by design). Set 270 (551 lights) was the
+evidence: a stops regroup missed every frame by key (3.5 GB recalibrated before the run was cancelled), and a tolerance-200 regroup missed
+every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-run, Register again).
+
+- **Kinds.** `paths::FRAME_LEVEL_KINDS` plus every `fits.<plane>` (`is_frame_level_kind`); `paths::artifact_group_key(kind, group_key)` is
+  the one rule every `find_artifact` / `upsert_artifact` call site goes through (the run and the plan gate alike).
+
+  | Class | Kinds | Key | Survives "Delete intermediates" |
+  | ---- | ---- | ---- | ---- |
+  | Frame-level | `calibrated`, `calibrated_mosaic` (Prepare writes these too, no `prepared` kind), `registered` | `''` | no (the files are removed whole) |
+  | Frame-level | `measured` (pass 1), `metrics`, `fits.<plane>` (pass 2), `registration`, `solve` | `''` | yes (only `All` drops them) |
+  | Group-level | `ln`, `ln_reference`, `ln_calibration`, `ln_global`, rejection maps | the group key | `ln*` no, as before |
+  | Group-level | `two_pass` (the dry pass's decision, below) | the group key | yes (only `All` drops it) |
+
+  Files are flat: `calibrated/`, `prepared/`, `measured/`, `fits/`, `registered/` have no group sub-folder. The stem is a function of the
+  frame alone, `<stem>_f<frame_id>` always (`frame_file_stem`; `.rej` and the LN sidecar fallback follow it), so a merge cannot rename a
+  frame's file. Projects follow the same rule on `project_frame`. A row keeps its stored `path`: every reader opens the row's path, never a
+  layout path (a row migrated from `measured/<old>/` is read where it stands).
+- **Two hashes that carry a constant.** `calibration_subtree` writes `grouping.exposureToleranceSec` as the shipped default 2.0, and
+  `measurement_subtree` writes `weightMode` / `formula` / `keyword` as the shipped defaults (`psfSignalWeight`, `FormulaWeights::default()`,
+  `"SSWEIGHT"`). Both are shape-holders: the golden literals of a default config do not move, a non-default tolerance recomputes once, custom
+  weights re-measure once, and after that neither edit invalidates anything. Weights are computed from the stored measurements every run
+  (`compute_weights`); no fit reads those fields. A changed reference (re-picked by weight) still re-registers through `ref:<id>`.
+- **The registration fold rule.** `registration_hash_for` folds `measure:<hash>` only for a frame whose registration READS Measure's `fits.0`
+  (`register_reads_measure_fits`: `stage_one_planes == 1`, mono or an OSC set calibrated with `debayerOsc` off); a debayered OSC frame keeps its
+  luminance detection, which reads `cfg.registration` only, so the group beta no longer re-registers it. A frame whose reference lives in
+  ANOTHER group also folds `ref_measure:<h>` (`reference_measurement_fold`: the reference's own fold, its group's config and beta), because
+  its star list comes from the reference's `fits.0`; same group folds nothing, so a single-group set keeps its hashes. The run and the gate
+  take both folds from the same helpers (`registration_measurement_fold`, `reference_measurement_fold`); `resolve_register_fits` returns None
+  unless `register_reads_measure_fits` holds. The group beta stays a VALUE in the pass-2 hash (`measure_beta:{:.6}`), never in the key: the
+  same beta is a hit, another beta re-runs pass 2 only (pass 1 is keyed on the calibration hash and the measurement options).
+- **Pass 1 and its stamp.** A pass-1 artifact is valid for as long as the calibration hash in its key is. Its source stamp compares the
+  calibrated file's LENGTH only when the file sits under the layout's `calibrated_root()` or `prepared_root()` (files Athenaeum writes: a
+  recalibration with the same hash reproduces the planes to the bit, pinned by `recalibration_reproduces_the_planes_bit_for_bit` for mono,
+  debayered OSC and Prepare outputs on a pool of more than one thread, aarch64 only), and the mtime TOO anywhere else (an attested light or a
+  project replica used in place: a moved mtime means someone else edited it; `strict_mtime` threaded to `check_pass1_head` / `read_pass1`).
+  A path spelled differently falls back to strict. Pass 2 still reads the pixels.
+- **Identity check.** `plan::file_matches_identity(path, size, modified_at)` (stat only, the RFC 3339 rendering `file_identity` uses) is
+  required by `plan::is_fresh` whenever the row records `modified_at`; rows without one keep the size check. It covers every file kind for
+  the gate and the run at once, and closes the cancelled-rewrite hole (a writer cancelled after rewriting a file but before recording its
+  identity). A size match with another mtime logs `debug!` (`path`, `recorded`, `current`: a copy tool that does not keep mtimes, or a
+  folder moved, explains "everything recomputed"); a stat error other than NotFound is a `warn!`. Blink reports an aligned frame
+  `Replaced` when its `registered` row is newer than the run's `finished_at` or its file no longer matches the row (the group rule stays).
+  The gate judges Register on the latest run that HAS included frame rows (a run cancelled inside Register has none).
+- **The two-pass decision.** With `reference.twoPass` and an Auto reference, the dry pass registers the reference's group with
+  `persist = false` before the real one. Its decision is a group-level payload row (`two_pass`, `{"switchTo": <frame id> | null}`) keyed by
+  `two_pass_key`: the registration subtree, `TWO_PASS_PICK_VERSION`, the candidate and its calibration hash, the FULL weight ranking, the
+  members whose weight is not finite, the members floored at Measure time, a project's WCS-allowed ids, and every included member's
+  registration hash against the candidate. A hit skips the dry pass (`two-pass decision reused`) and builds the switch through the fresh
+  detection fallback. `exclude_changed_members` runs before the lookup, so a hit and a miss see the same members. A regroup is a MISS (the
+  membership is a term), so the dry pass runs once over the new group; the real registration is still all hits. Register progress names
+  the pass ("checking the reference", "aligning"), and a hit removes the dry pass from the total. Stored plate solves (seed, policy, scale
+  gate) are in neither the registration hash nor this key (open-items).
+- **Cleanup.** "Delete intermediates" removes `calibrated/`, `prepared/`, `registered/` and `ln/` whole, as before, and keeps the pass-1
+  and pass-2 files and rows. `measured/` and `fits/` get `sweep_unreferenced`: only names the writers produce (`*.athm`, `*.athf` and their
+  `.tmp.<pid>.<seq>` temporaries) that no `measured` / `fits.%` row of any subject names, by path OR by file name (so a spelling mismatch of
+  the folder can never wipe the cache); symlinks are not followed, any other file and its folder stay. Cleanup resolves the working folder
+  exactly as `start_stacking` does, and skips the sweep with a `warn!` while another stacking run is active. A writer that replaces a row
+  whose stored path differs removes the old file (`replace_frame_level_file`) only under a root its kind OWNS (`calibrated_root`,
+  `prepared_root`, `measured_root`, `fits_root`, `registered_root`), and only when no other row names it, never elsewhere under the working
+  folder (it may overlap a scan root; an attested light used in place has a `calibrated` row that points at the user's own file).
+- **Migration.** `db::schema::migrate_frame_level_artifact_keys`, once (`stacking.migration.frame_level_keys` marker in `settings`, written
+  in the same `BEGIN IMMEDIATE` transaction): the frame-level kinds are re-keyed to `''`, a frame with rows of one kind under several group
+  keys keeps the newest (`created_at`, then `id`) and the others are deleted before the `UPDATE`; a row naming no frame is left alone; no
+  file is moved or deleted, every `path` stays. The files no row names (the deleted duplicates, a folder like `calibrated/<old>/`) go with
+  "Delete intermediates" (`calibrated/` whole; `measured/` / `fits/` by the sweep). No new `WorkUsage` field.
+- **`measurement.maxStars` 24 576 to 9 000 (owner ruling 2026-11-08, spec §5.8).** `MeasurementConfig::default` and the probe defaults
+  (`MeasureOptions::default`, `ln_scale_probe`). NO truth bar and no master-level check was run before shipping. The cap keeps the first N
+  seeds in detection order, brightest first, the selection `fitStars = K` makes, and K = 4 000 / 5 000 / 8 000 failed the fast-measurement
+  truth run (R-OSP-14); that is the known risk, recorded so a later reading of the numbers has it. `maxStars` also sets LN's fit budget
+  (`normalization_subtree`), so LN moves with it. Stored documents are NOT migrated: a stored per-set config IS the run's config and carries
+  its `maxStars`, so every set, project, preset or global default stored before the update keeps its value (set 109, 182 and 270 keep
+  24 576) and its caches stay valid; 9 000 reaches a document only when it is created from the built-in default.
+- **One-time recomputes after the update** (spec §6): a set at a non-default exposure tolerance recomputes Calibrate and everything after it;
+  a set with custom weights re-measures and everything after it; a set with no stored config and no stored global default (item 8)
+  recomputes Measure, Register and LN; a debayered-OSC frame's registration rows written with the old `measure:` fold read stale once
+  and re-register (spec §5.5). The migration keeps the newest row per frame, so a set whose newest rows were written at a non-default
+  tolerance (set 270: run 11 at 200 s) recalibrates once, because the constant tolerance hash no longer matches them. That cannot be
+  fixed in SQL, and it is said, not hidden. Everything else is reused from the first run on.
+- **What a regroup does not reuse.** (1) Under an Auto reference the pick is made again from the new grouping's weights, and a different
+  frame re-registers every frame by `ref:<id>` (seen on the synthetic OSC fixture: frame 4 under `seconds`, frame 6 under `stops`), as under
+  Native geometry. The plan gate reads the last run's reference, so it can say Register is cached when the pick will move (the
+  weighting-edit residual below is the same mechanism). A Manual reference is stable across regroups; the acceptance test pins one.
+  (2) With `reference.twoPass` the dry pass runs once over the new group (it persists nothing; the real pass is all hits). (3) A MONO frame
+  folds `ref_measure:` only when its reference sits in another group (above), so a regroup that merges or splits the reference's group
+  flips that term for the frames of the other group and they re-register once, even at an equal beta. Not pinned by a test: on a mono
+  fixture the gate read Register stale before a `stops` regroup that left the beta at 1.5. A debayered-OSC set (set 270) folds neither
+  term and is unaffected. (4) A merged group's beta is the lower median of the members' own betas, so it differs from the source groups'
+  unless they agree; pass 2 re-runs then (set 270: 1.5 everywhere, the fit's floor, so it never does).
+- **Known residuals.** After a weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by
+  weight and re-registers: the run is correct, the gate under-reports. A frame-level file is shared by the dev and the release build when
+  both use one working folder: the first run in either build makes the other's rows stale (a recompute), see open-items. The gate and the
+  run take a group's β from their own sources (`measure_betas` vs `rc.measured_groups`): for a group the run does not measure (fewer
+  than 3 included) the run folds None where the gate may fold Some — the gate then over-reports Register stale, never a false hit; do not
+  re-flag it. Remaining gates: `docs/superpowers/open-items.md`.
+- **Acceptance (2026-11-08, headless real-data smoke).** The release `athenaeum-web` of this branch on a copy of the dev catalog (the
+  Task 9 migration on it: 1 806 rows re-keyed, 0 duplicates dropped), Manual reference, `seconds` → `none` → `seconds`, `fan-out
+  finished` items per run (calibrate / pass1 / pass2 / align): OSC set 163 (16 lights, 300 s + 600 s, β 1.5 throughout) 16/16/16/16,
+  then 0/0/0/0 (LN and Integrate only), then 0/0/0/0 with every LN sidecar reused; mono set 185 (67 lights; the merged β moves, L 3.49 →
+  3.30) 67/67/67/67, then 0/0/67/67 twice (pass 2 and the mono registration follow the β, by design). The plan gate before the third
+  run reported Normalize stale while the run reused LN (open-items: the gate reads only the latest run's group β).
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 

@@ -1,5 +1,6 @@
 //! The Measure stage's first-pass artifact (Plan A Task 11c, rulings R11c-1 .. R11c-6): every plane's pass-1 records
-//! of one calibrated frame, written once to `<working_dir>/<set_slug>/measured/<group_key>/<stem>.athm` and read back
+//! of one calibrated frame, written once to `<working_dir>/<set_slug>/measured/<stem>.athm` (flat since the
+//! frame-level cache; rows written before it keep their `measured/<group_key>/` paths) and read back
 //! by pass 2 and by every later run whose key and source stamp still match. A second pass over the same pixels then
 //! costs a read and the fits, never the detection and the verdict pass again.
 //!
@@ -42,7 +43,10 @@ pub(crate) const PREFIX_LEN: usize = 4 + 2 + 4 + 4 + 8;
 const MAX_HEAD_LEN: usize = 1 << 20;
 
 /// The calibrated file's identity at pass 1's first plane read (the read guard's identity, stored): its size and its
-/// modification time as signed nanoseconds since the Unix epoch (`None` where the filesystem has none).
+/// modification time as signed nanoseconds since the Unix epoch (`None` where the filesystem has none). Validity
+/// follows the calibration hash in the artifact's key (frame-level cache spec §5.3); on a read only `len` is compared
+/// for a file Athenaeum writes (so a recalibration that reproduces the pixels, a new file with a new mtime, keeps the
+/// first pass), and `modified_ns` too for any other file (an attested light used in place: ruling R12 (a)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceStamp {
     pub len: u64,
@@ -290,16 +294,17 @@ pub fn read_pass1_head(path: &Path) -> Result<Pass1Head, Pass1ArtifactError> {
     decode_head(&head_bytes, head_sum)
 }
 
-/// The whole record: the checksum, the stamp against `calibrated` now ([`Pass1ArtifactError::Stale`]), the heads
-/// rebuilt from `opts` ([`FramePass1::from_record`]).
+/// The whole record: the checksum, the stamp against `calibrated` now ([`Pass1ArtifactError::Stale`]; the mtime is
+/// compared under `strict_mtime` only), the heads rebuilt from `opts` ([`FramePass1::from_record`]).
 pub fn read_pass1(
     path: &Path,
     calibrated: &Path,
     opts: &MeasureOptions,
+    strict_mtime: bool,
 ) -> Result<FramePass1, Pass1ArtifactError> {
     let bytes = std::fs::read(path)?;
     let (head, body) = decode(&bytes)?;
-    FramePass1::from_record(head, body, calibrated, opts)
+    FramePass1::from_record(head, body, calibrated, opts, strict_mtime)
 }
 
 #[cfg(test)]
@@ -366,7 +371,7 @@ mod tests {
             let first = dir.path().join(format!("{name}.athm"));
             let written = write_pass1(&first, &pass1).unwrap();
             assert_eq!(written, std::fs::metadata(&first).unwrap().len(), "{name}");
-            let back = read_pass1(&first, &path, &opts).unwrap();
+            let back = read_pass1(&first, &path, &opts, false).unwrap();
             let bits = |b: &[f64]| b.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(back.beta_own()), bits(pass1.beta_own()), "{name}");
             assert_eq!(back.source(), pass1.source(), "{name}");
@@ -417,7 +422,7 @@ mod tests {
                 let fresh = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
                 let artifact = dir.path().join(format!("{name}.athm"));
                 write_pass1(&artifact, &fresh).unwrap();
-                read_pass1(&artifact, &path, &opts).unwrap()
+                read_pass1(&artifact, &path, &opts, false).unwrap()
             };
             let beta = group_beta(in_memory.beta_own());
             let betas = vec![beta; in_memory.beta_own().len()];
@@ -465,7 +470,7 @@ mod tests {
                 let fresh = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
                 let artifact = dir.path().join(format!("{name}.athm"));
                 write_pass1(&artifact, &fresh).unwrap();
-                read_pass1(&artifact, &path, &opts).unwrap()
+                read_pass1(&artifact, &path, &opts, false).unwrap()
             };
             let beta = group_beta(in_memory.beta_own());
             let betas = vec![beta; in_memory.beta_own().len()];
@@ -597,7 +602,7 @@ mod tests {
             "the body is not read"
         );
         assert!(matches!(
-            read_pass1(&artifact, &path, &opts),
+            read_pass1(&artifact, &path, &opts, false),
             Err(Pass1ArtifactError::Checksum)
         ));
 
@@ -610,11 +615,12 @@ mod tests {
         ));
     }
 
-    /// R11c-4: the stamp is the calibrated file's size and mtime at pass 1's first read; a file touched since reads
-    /// `Stale` with both stamps — from the whole read and from the controller's head check — and an untouched one
+    /// R11c-4, amended by the frame-level cache (spec §5.3): the stamp is the calibrated file's size and mtime at pass
+    /// 1's first read, and only the size is compared. A file of another size reads `Stale` with both stamps — from the
+    /// whole read and from the controller's head check — a file whose mtime moved reads fine, and an untouched one
     /// reads fine.
     #[test]
-    fn a_changed_source_reads_stale() {
+    fn a_source_of_another_size_reads_stale() {
         let dir = tempfile::tempdir().unwrap();
         let opts = MeasureOptions::default();
         let path = frames(dir.path()).remove(0);
@@ -622,27 +628,56 @@ mod tests {
         let artifact = dir.path().join("mono.athm");
         write_pass1(&artifact, &pass1).unwrap();
         let head = read_pass1_head(&artifact).unwrap();
-        check_pass1_head(&head, &path).unwrap();
-        read_pass1(&artifact, &path, &opts).unwrap();
+        check_pass1_head(&head, &path, false).unwrap();
+        read_pass1(&artifact, &path, &opts, false).unwrap();
+        check_pass1_head(&head, &path, true).unwrap();
+        read_pass1(&artifact, &path, &opts, true).unwrap();
 
+        let stored = pass1.source().unwrap();
+
+        // A moved mtime alone is not a change (a recalibration writes a new file with the same bytes).
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
             .unwrap();
         drop(file);
-        let stored = pass1.source().unwrap();
-        match read_pass1(&artifact, &path, &opts) {
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before,
+            "the touch moved the mtime"
+        );
+        check_pass1_head(&head, &path, false).unwrap();
+        read_pass1(&artifact, &path, &opts, false).unwrap();
+
+        // Under `strict_mtime` (a file Athenaeum never rewrites: ruling R12 (a)) the moved mtime IS a change, from
+        // the whole read and from the controller's head check.
+        assert!(matches!(
+            check_pass1_head(&head, &path, true),
+            Err(Pass1ArtifactError::Stale { .. })
+        ));
+        assert!(matches!(
+            read_pass1(&artifact, &path, &opts, true),
+            Err(Pass1ArtifactError::Stale { .. })
+        ));
+
+        // Another size is.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&[0u8; 8]).unwrap();
+        }
+        match read_pass1(&artifact, &path, &opts, false) {
             Err(Pass1ArtifactError::Stale {
                 stored: s,
                 now: Some(n),
             }) => {
                 assert_eq!(s, Some(stored));
-                assert_eq!(n.len, stored.len);
-                assert_ne!(n.modified_ns, stored.modified_ns);
+                assert_eq!(n.len, stored.len + 8);
             }
             other => panic!("expected Stale, got {:?}", other.map(|_| ())),
         }
         assert!(matches!(
-            check_pass1_head(&head, &path),
+            check_pass1_head(&head, &path, false),
             Err(Pass1ArtifactError::Stale { .. })
         ));
     }

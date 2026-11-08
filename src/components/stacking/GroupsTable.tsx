@@ -50,21 +50,18 @@ const MODES: { value: ExposureMode; label: string }[] = [
 const MIN_EXPOSURE_TOLERANCE_SEC = 0.01;
 const MIN_STOPS_WIDTH = 0.1;
 
-const RECALIBRATE_HINT =
-  "The tolerance is part of the calibration hash: changing it re-calibrates this set's lights on the next run.";
 const EQUIVALENT_HINT =
   "Classes by t / N², N = FOCALLEN / APTDIA from each frame's header. Frames without both are grouped by seconds; the plan names how many.";
 
 interface ExposureGroupingControlProps {
   grouping: GroupingConfig;
   disabled?: boolean;
-  toleranceInCalibrationHash: boolean;
   onPatchGrouping: (patch: Partial<GroupingConfig>) => void;
 }
 
 /** How a group's exposure classes are formed (spec §8, D1): the mode and that mode's threshold. A change patches
  *  `grouping`; the tab re-plans as for any config edit. */
-function ExposureGroupingControl({ grouping, disabled, toleranceInCalibrationHash, onPatchGrouping }: ExposureGroupingControlProps) {
+function ExposureGroupingControl({ grouping, disabled, onPatchGrouping }: ExposureGroupingControlProps) {
   const { exposureMode: mode } = grouping;
   return (
     <div className="mb-2 space-y-1.5">
@@ -106,11 +103,6 @@ function ExposureGroupingControl({ grouping, disabled, toleranceInCalibrationHas
           </div>
         )}
       </div>
-      {/* The tolerance enters the stage-1 hash only where the run calibrates (`calibration_subtree`); a Prepare hash
-          (a project's, an attested set's) has no grouping in it. */}
-      {toleranceInCalibrationHash && mode === 'seconds' && (
-        <p className="text-[11px] text-content-muted">{RECALIBRATE_HINT}</p>
-      )}
       {mode === 'equivalent' && <p className="text-[11px] text-content-muted">{EQUIVALENT_HINT}</p>}
     </div>
   );
@@ -121,19 +113,15 @@ export interface GroupsTableProps {
   /** The draft config's grouping: what the control shows and patches. */
   grouping: GroupingConfig;
   disabled?: boolean;
-  /** Whether the tolerance is part of the stage-1 hash, which decides if the re-calibration hint applies: true when
-   *  the board calibrates (an ordinary frame set), false when it only prepares (a project, an attested set). */
-  toleranceInCalibrationHash: boolean;
   onPatchGrouping: (patch: Partial<GroupingConfig>) => void;
 }
 
 /** The plan's frame groups (spec §11.1), under the control that decides how their exposure classes are formed. */
-export function GroupsTable({ groups, grouping, disabled, toleranceInCalibrationHash, onPatchGrouping }: GroupsTableProps) {
+export function GroupsTable({ groups, grouping, disabled, onPatchGrouping }: GroupsTableProps) {
   const control = (
     <ExposureGroupingControl
       grouping={grouping}
       disabled={disabled}
-      toleranceInCalibrationHash={toleranceInCalibrationHash}
       onPatchGrouping={onPatchGrouping}
     />
   );

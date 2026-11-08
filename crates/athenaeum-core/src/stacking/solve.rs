@@ -33,6 +33,7 @@ use crate::plate_solve::storage::PlateSolveRecord;
 use crate::plate_solve::SolveHints;
 use crate::services::ServiceContext;
 use crate::stacking::config::stage_hash;
+use crate::stacking::paths::artifact_group_key;
 
 /// One solve the run asks for.
 #[derive(Debug, Clone)]
@@ -185,7 +186,14 @@ pub(crate) fn stored_outcome(
     blake3: &str,
 ) -> anyhow::Result<Option<SolveOutcome>> {
     let subject = StackSubject::Project(project_id.to_string());
-    let Some(row) = find_artifact(conn, &subject, "", "solve", Some(frame_id))? else {
+    let Some(row) = find_artifact(
+        conn,
+        &subject,
+        artifact_group_key("solve", ""),
+        "solve",
+        Some(frame_id),
+    )?
+    else {
         return Ok(None);
     };
     let Some(payload) = row.payload_json.as_deref() else {
@@ -247,7 +255,7 @@ pub(crate) fn write_artifact(
         &NewArtifact {
             subject: &subject,
             frame_id: Some(frame_id),
-            group_key: "",
+            group_key: artifact_group_key("solve", ""),
             kind: "solve",
             path: None,
             config_hash: hash,

@@ -433,9 +433,9 @@ pub struct PrepareJob {
     pub src: PathBuf,
     pub shape: FileShape,
     pub action: PrepareAction,
-    /// `prepared/<group>/p_<stem>.fits`, for a converted copy.
+    /// `prepared/p_<stem>_f<frame_id>.fits`, for a converted copy.
     pub converted_out: PathBuf,
-    /// `prepared/<group>/p_<stem>_d.fits`, for a debayered copy.
+    /// `prepared/p_<stem>_f<frame_id>_d.fits`, for a debayered copy.
     pub debayered_out: PathBuf,
     pub durability: Durability,
 }

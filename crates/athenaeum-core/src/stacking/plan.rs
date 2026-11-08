@@ -43,7 +43,7 @@ use crate::stacking::groups::{
 use crate::stacking::ln::SeedsCalibration;
 use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::origin::{origin_of, FrameOrigin, FrameOrigins};
-use crate::stacking::paths::{self, EstimateInputs};
+use crate::stacking::paths::{self, artifact_group_key, EstimateInputs};
 use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
@@ -745,7 +745,13 @@ fn gate_measure_betas(
     'groups: for g in groups {
         let mut own: Vec<f64> = Vec::new();
         for f in g.frames.iter().filter(|f| !excluded.contains(&f.frame_id)) {
-            let Some(row) = find_artifact(conn, subject, &g.key, "metrics", Some(f.frame_id))?
+            let Some(row) = find_artifact(
+                conn,
+                subject,
+                artifact_group_key("metrics", &g.key),
+                "metrics",
+                Some(f.frame_id),
+            )?
             else {
                 continue 'groups;
             };
@@ -790,19 +796,26 @@ fn gate_measure_betas(
 /// `measurement_hash_for(cfg, frame_calibrated_hash)` value, empty-string
 /// skipped as "not recorded" rather than folded in as some other frame's.
 ///
-/// The invalidation is uniform across BOTH mono and OSC frames, even though
-/// only mono frames ever actually read the `fits` artifact (OSC keeps the
-/// luminance detection, ruling C-6): a per-plane-count hash (folding the
-/// measurement hash in for mono only) would split this rule into two cases
-/// every caller has to get right for the SAME field, in exchange for
-/// sparing an OSC frame's `registration_results` row an invalidation it
-/// never needed — a far smaller cost than a second hash-construction path.
+/// The fold follows what the frame's registration READS (frame-level cache
+/// spec §5.5, reversing ruling C-18's "uniform across mono and OSC"): a
+/// frame whose registration reads Measure's `fits.0` (a 1-plane calibrated
+/// frame, [`register_reads_measure_fits`]) folds its measurement hash; a
+/// debayered OSC frame keeps its luminance detection, which reads only
+/// `cfg.registration` (already in `registration_subtree`), so its caller
+/// passes `""` and the group's beta no longer re-registers it.
+///
+/// `reference_measurement_hash` (ruling R3 (a)): any frame whose reference lives in ANOTHER group (the native-geometry
+/// fallback included) is registered against star lists built from the REFERENCE's `fits.0` when the reference is one
+/// plane, which is Measure output the frame's own `measure:` term does not cover (it holds the frame's group's config
+/// and beta). The caller passes [`reference_measurement_fold`], folded here as `ref_measure:<h>`; `""` (nothing
+/// folded) when the reference is in the frame's own group, so a single-group set keeps its hashes.
 pub(crate) fn registration_hash_for(
     cfg: &StackingConfig,
     reference_frame_id: i64,
     reference_calibrated_hash: &str,
     frame_calibrated_hash: &str,
     frame_measurement_hash: &str,
+    reference_measurement_hash: &str,
 ) -> String {
     let reference_token = format!("ref:{reference_frame_id}");
     let mut upstream: Vec<String> = vec![
@@ -812,6 +825,9 @@ pub(crate) fn registration_hash_for(
     ];
     if !frame_measurement_hash.is_empty() {
         upstream.push(format!("measure:{frame_measurement_hash}"));
+    }
+    if !reference_measurement_hash.is_empty() {
+        upstream.push(format!("ref_measure:{reference_measurement_hash}"));
     }
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&registration_subtree(cfg), &upstream_refs, &[])
@@ -1023,10 +1039,71 @@ pub(crate) fn seeds_calibration_hash_for(
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
 
+/// A file's modification time in the scanner's own shape (`scanner/mod.rs`'s
+/// `modified_dt.to_rfc3339()`): what every writer in this module family stores in
+/// `stacking_artifacts.modified_at`, and what [`file_matches_identity`] compares
+/// against. One rendering, so a stored identity and a live one can be equal.
+pub(crate) fn render_modified_at(modified: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339()
+}
+
+/// Whether the file at `path` is still the file a row recorded (ruling R7 b): a
+/// stat only, no pixel I/O. Its length equals `size`, and, when the row recorded a
+/// `modified_at`, its modification time renders to exactly that string. A row
+/// without `modified_at` keeps the size-only check (rows written before the
+/// identity was kept); a row without `size` never matches. A writer that
+/// rewrites a file and is cancelled before it records the new identity leaves
+/// the file and its row disagreeing: this is what catches it, for the gate and
+/// the run alike.
+pub(crate) fn file_matches_identity(
+    path: &Path,
+    size: Option<i64>,
+    modified_at: Option<&str>,
+) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // A file that is not there is the ordinary "stale"; any other failure (permissions, a dropped mount) is not,
+        // and is logged before it is read as "not the recorded file".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cached file cannot be stat-ed; counted as changed");
+            return false;
+        }
+    };
+    if Some(meta.len() as i64) != size {
+        return false;
+    }
+    let Some(recorded) = modified_at else {
+        return true;
+    };
+    let current = match meta.modified() {
+        Ok(modified) => render_modified_at(modified),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cached file has no modification time; counted as changed");
+            return false;
+        }
+    };
+    if current == recorded {
+        return true;
+    }
+    // The size matches and the time does not: the one case where a file looks right and is refused. Say why, once per
+    // look, so "everything recomputed after I moved the folder" is explained by the log (a copy tool that does not
+    // keep mtimes, a filesystem that reports another time after close).
+    tracing::debug!(
+        path = %path.display(),
+        recorded,
+        current = %current,
+        "cached file has the recorded size but another modification time; counted as changed"
+    );
+    false
+}
+
 /// The `calibrated`-artifact reuse contract (spec §9.3): a row is reusable
 /// only when ALL of these hold — its `config_hash` equals the frame's
 /// CURRENT stage-1 hash, its `path` is `Some`, its `size` is `Some`, AND a
-/// live `std::fs::metadata` read of that path reports exactly that size. A
+/// live `std::fs::metadata` read of that path reports exactly that size (and,
+/// when the row recorded a `modified_at`, that modification time:
+/// [`file_matches_identity`]). A
 /// row missing `path`/`size` (an artifact recorded before the pixel phase
 /// ever wrote anything, or one some other kind stores without a path) is
 /// NEVER assumed fresh — "we don't know" is "stale", not "trust the hash
@@ -1042,11 +1119,9 @@ pub(crate) fn seeds_calibration_hash_for(
 /// what "fresh" means.
 pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bool {
     artifact.config_hash == current_hash
-        && artifact
-            .path
-            .as_deref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .is_some_and(|meta| Some(meta.len() as i64) == artifact.size)
+        && artifact.path.as_deref().is_some_and(|p| {
+            file_matches_identity(Path::new(p), artifact.size, artifact.modified_at.as_deref())
+        })
 }
 
 /// Whether every one of a frame's `fits.<plane>` rows is fresh against
@@ -1062,7 +1137,6 @@ pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bo
 pub(crate) fn fits_artifact_fresh(
     conn: &Connection,
     subject: &StackSubject,
-    group_key: &str,
     frame_id: i64,
     metrics_payload: Option<&str>,
     expected_hash: &str,
@@ -1073,7 +1147,7 @@ pub(crate) fn fits_artifact_fresh(
     else {
         return Ok(false);
     };
-    fits_artifact_fresh_for_planes(conn, subject, group_key, frame_id, planes, expected_hash)
+    fits_artifact_fresh_for_planes(conn, subject, frame_id, planes, expected_hash)
 }
 
 /// [`fits_artifact_fresh`]'s own per-plane freshness loop, with the plane
@@ -1087,7 +1161,6 @@ pub(crate) fn fits_artifact_fresh(
 pub(crate) fn fits_artifact_fresh_for_planes(
     conn: &Connection,
     subject: &StackSubject,
-    group_key: &str,
     frame_id: i64,
     planes: usize,
     expected_hash: &str,
@@ -1097,8 +1170,15 @@ pub(crate) fn fits_artifact_fresh_for_planes(
     }
     for plane in 0..planes {
         let kind = fits_artifact::artifact_kind(plane);
-        let plane_fresh = find_artifact(conn, subject, group_key, &kind, Some(frame_id))?
-            .is_some_and(|row| is_fresh(&row, expected_hash));
+        // A frame-level kind: its rows sit under the empty key, whatever group the frame is in now.
+        let plane_fresh = find_artifact(
+            conn,
+            subject,
+            artifact_group_key(&kind, ""),
+            &kind,
+            Some(frame_id),
+        )?
+        .is_some_and(|row| is_fresh(&row, expected_hash));
         if !plane_fresh {
             return Ok(false);
         }
@@ -1160,6 +1240,60 @@ pub(crate) fn stage_one_planes(
         ColorMode::Osc if cfg.calibration.debayer_osc => 3,
         ColorMode::Osc if prepare_path && group.key.starts_with("osc__") => 3,
         ColorMode::Osc => 1,
+    }
+}
+
+/// Whether a frame's registration reads Measure's `fits.0` artifact (frame-level cache spec §5.5): the group's
+/// stage-1 frames are one plane (`stage_one_planes == 1`: mono, or an OSC frame set calibrated with `debayerOsc`
+/// off, whose mosaic reads `fits.0`, `run.rs::resolve_register_fits`). Only then does the registration hash fold the
+/// measurement hash. NOT `run.rs::expected_stage_one_planes`, which always assumes the Prepare path.
+pub(crate) fn register_reads_measure_fits(
+    cfg: &StackingConfig,
+    group: &IntegrationGroup,
+    prepare_path: bool,
+) -> bool {
+    stage_one_planes(cfg, group, prepare_path) == 1
+}
+
+/// The `frame_measurement_hash` a caller hands [`registration_hash_for`]: the frame's [`measurement_hash_for`] at the
+/// group beta when its registration reads Measure's `fits.0` ([`register_reads_measure_fits`]), `""` (folded as
+/// nothing) otherwise. The one place the run and the gate decide it.
+pub(crate) fn registration_measurement_fold(
+    cfg: &StackingConfig,
+    group: &IntegrationGroup,
+    prepare_path: bool,
+    frame_calibrated_hash: &str,
+    group_beta: Option<f64>,
+) -> String {
+    if register_reads_measure_fits(cfg, group, prepare_path) {
+        measurement_hash_for(cfg, frame_calibrated_hash, group_beta)
+    } else {
+        String::new()
+    }
+}
+
+/// The `reference_measurement_hash` a caller hands [`registration_hash_for`] (ruling R3 (a)): the reference's own
+/// [`registration_measurement_fold`] (its group's config and beta, its calibration hash) when the reference lives in a
+/// group other than the frame's, `""` when both share a group (the frame's own `measure:` term already covers config
+/// and beta, and the reference's calibration hash is folded). The one place the run and the gate decide it.
+pub(crate) fn reference_measurement_fold(
+    cfg: &StackingConfig,
+    frame_group: &IntegrationGroup,
+    reference_group: &IntegrationGroup,
+    prepare_path: bool,
+    reference_calibrated_hash: &str,
+    reference_group_beta: Option<f64>,
+) -> String {
+    if reference_group.key == frame_group.key {
+        String::new()
+    } else {
+        registration_measurement_fold(
+            cfg,
+            reference_group,
+            prepare_path,
+            reference_calibrated_hash,
+            reference_group_beta,
+        )
     }
 }
 
@@ -1277,7 +1411,7 @@ pub(crate) fn store_registration(
                 &NewArtifact {
                     subject,
                     frame_id: Some(record.frame_id),
-                    group_key: "",
+                    group_key: artifact_group_key(REGISTRATION_ARTIFACT_KIND, ""),
                     kind: REGISTRATION_ARTIFACT_KIND,
                     path: None,
                     config_hash: record.config_hash.as_deref().unwrap_or_default(),
@@ -1542,9 +1676,9 @@ fn find_group_of<'a>(
 /// M4b ruling R-T1-1: the plan-time comparison point for the pixel-scale
 /// warning in `Auto` reference mode, first choice — the last run's OWN
 /// recorded `reference_frame_id`, the SAME lookup [`compute_register_stale`]
-/// already performs (`list_runs(_, _, 1)` → `last_run.reference_frame_id`),
-/// so a set that has run once compares against the reference it actually
-/// used rather than a guess. `None` when there is no previous run, the run
+/// already performs ([`latest_run_with_frame_rows`] → `last_run.reference_frame_id`,
+/// ruling R15), so a set that has run once compares against the reference it
+/// actually used rather than a guess. `None` when there is no previous run, the run
 /// recorded no reference, that frame isn't found among the current groups
 /// (deleted/re-typed since), or it carries no scale of its own.
 fn last_run_reference_scale(
@@ -1552,7 +1686,7 @@ fn last_run_reference_scale(
     subject: &StackSubject,
     groups: &[IntegrationGroup],
 ) -> Result<Option<f64>, ApiError> {
-    let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
+    let Some((last_run, _)) = latest_run_with_frame_rows(conn, subject)? else {
         return Ok(None);
     };
     Ok(last_run
@@ -1758,9 +1892,10 @@ fn cleanup_stale_note(
 /// the run actually chose) went the other way: it read "fresh" even when
 /// the run's own chosen reference had since changed.
 ///
-/// No previous run at all ([`list_runs`] empty) is stale by construction —
-/// there is nothing to compare against. Otherwise: the frames to check are
-/// the latest run's `stacking_run_frames` rows with `included = true` (a
+/// No previous run with an included frame row ([`latest_run_with_frame_rows`]
+/// finds none) is stale by construction — there is nothing to compare
+/// against. Otherwise: the frames to check are
+/// the latest such run's `stacking_run_frames` rows with `included = true` (a
 /// frame the run itself excluded needs no registration row at all to read
 /// as not stale — it was never going to be registered by that run either).
 /// The reference to check against is the plan's OWN manual reference
@@ -1785,9 +1920,13 @@ fn compute_register_stale(
     grid: Option<&crate::collab::grid::CanonicalGrid>,
     measure_betas: &HashMap<String, f64>,
 ) -> Result<bool, ApiError> {
-    let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
+    // Ruling R9: the latest run that HAS frame rows. A run cancelled before the end of Register wrote none (they are
+    // written once the stage is done), and reading it would judge no frame at all and call Register fresh while the
+    // files that run overwrote are not the ones the rows recorded.
+    let Some((last_run, last_run_frames)) = latest_run_with_frame_rows(conn, subject)? else {
         return Ok(true);
     };
+    let prepare_path = crate::stacking::origin::subject_prepares(subject, origins);
 
     let manual_reference = match reference.mode {
         ReferenceMode::Manual => {
@@ -1878,7 +2017,7 @@ fn compute_register_stale(
     let by_frame: HashMap<i64, &RegistrationRecord> =
         rows.iter().map(|r| (r.frame_id, r)).collect();
 
-    let included_frame_ids: Vec<i64> = list_frame_rows(conn, last_run.id)?
+    let included_frame_ids: Vec<i64> = last_run_frames
         .into_iter()
         .filter(|f| f.included)
         .map(|f| f.frame_id)
@@ -1900,10 +2039,23 @@ fn compute_register_stale(
         // Ruling C-18: the same measurement hash `stacking::run` folds in
         // when it builds this frame's registration row — at the group β
         // `build_plan` resolved for the Measure check (Task 11b).
-        let frame_measurement_hash = measurement_hash_for(
+        let frame_measurement_hash = registration_measurement_fold(
             cfg,
+            group,
+            prepare_path,
             &frame_calib_hash,
             measure_betas.get(&group.key).copied(),
+        );
+        let Some((reference_group, _)) = find_group_of(groups, reference_frame_id) else {
+            return Ok(true);
+        };
+        let reference_measurement_hash = reference_measurement_fold(
+            cfg,
+            group,
+            reference_group,
+            prepare_path,
+            reference_calib_hash,
+            measure_betas.get(&reference_group.key).copied(),
         );
         let expected = registration_hash_for(
             cfg,
@@ -1911,6 +2063,7 @@ fn compute_register_stale(
             reference_calib_hash,
             &frame_calib_hash,
             &frame_measurement_hash,
+            &reference_measurement_hash,
         );
         let Some(row) = by_frame.get(&frame_id) else {
             return Ok(true);
@@ -1937,13 +2090,45 @@ fn compute_register_stale(
                 None => return Ok(true),
             },
         };
-        let artifact = find_artifact(conn, subject, &group.key, "registered", Some(frame_id))?;
+        let artifact = find_artifact(
+            conn,
+            subject,
+            artifact_group_key("registered", &group.key),
+            "registered",
+            Some(frame_id),
+        )?;
         if !artifact.is_some_and(|row| is_fresh(&row, &artifact_hash)) {
             return Ok(true);
         }
     }
 
     Ok(false)
+}
+
+/// How many of the latest runs [`latest_run_with_frame_rows`] looks through.
+const REGISTER_GATE_RUN_WINDOW: usize = 20;
+
+/// The latest run of `subject` that has an INCLUDED `stacking_run_frames` row, with its rows (rulings R9, R14 (d)). A
+/// run that failed or was cancelled before the end of Register has none; one that ended inside Register after
+/// excluding frames can have only excluded rows, which say nothing about what was registered. The gate then judges
+/// the run before it. `None` when no recent run has any, which reads Register stale.
+fn latest_run_with_frame_rows(
+    conn: &Connection,
+    subject: &StackSubject,
+) -> Result<
+    Option<(
+        crate::db::stacking::StackingRunRow,
+        Vec<crate::db::stacking::StackingRunFrameRow>,
+    )>,
+    ApiError,
+> {
+    for run in list_runs(conn, subject, REGISTER_GATE_RUN_WINDOW)? {
+        let frames = list_frame_rows(conn, run.id)?;
+        if frames.iter().any(|f| f.included) {
+            return Ok(Some((run, frames)));
+        }
+    }
+    Ok(None)
 }
 
 /// `group key -> that group's OWN registration reference`, read out of the
@@ -3511,9 +3696,16 @@ pub fn build_plan(
         // reports fresh against the OLD set until a real run updates it —
         // documented, not fixed, here (weights are pixel-phase data).
         let ln_reference_info: Option<LnReferencePayload> = if local_normalization_active {
+            // Ruling R10 M4: the run reuses the reference only while its file is the one its row recorded
+            // (`is_fresh` on the payload's own hash); a deleted or replaced file reads as no reference.
             find_artifact(conn, subject, &g.key, "ln_reference", None)?
-                .and_then(|row| row.payload_json)
-                .and_then(|s| serde_json::from_str::<LnReferencePayload>(&s).ok())
+                .and_then(|row| {
+                    let payload = serde_json::from_str::<LnReferencePayload>(
+                        row.payload_json.as_deref()?,
+                    )
+                    .ok()?;
+                    is_fresh(&row, &payload.reference_hash).then_some(payload)
+                })
         } else {
             None
         };
@@ -3597,10 +3789,21 @@ pub fn build_plan(
                 included_count += 1;
             }
 
-            let calib_artifact =
-                find_artifact(conn, subject, &g.key, "calibrated", Some(f.frame_id))?;
-            let metrics_artifact =
-                find_artifact(conn, subject, &g.key, "metrics", Some(f.frame_id))?;
+            // Frame-level rows sit under the empty key (spec §5.1), so a regroup finds them.
+            let calib_artifact = find_artifact(
+                conn,
+                subject,
+                artifact_group_key("calibrated", &g.key),
+                "calibrated",
+                Some(f.frame_id),
+            )?;
+            let metrics_artifact = find_artifact(
+                conn,
+                subject,
+                artifact_group_key("metrics", &g.key),
+                "metrics",
+                Some(f.frame_id),
+            )?;
 
             // Only worth resolving the frame's current stage-1 hash when
             // there is an existing artifact to compare it against — a frame
@@ -3623,8 +3826,13 @@ pub fn build_plan(
             // the calibrated half already passed, so a group without Bayer
             // drizzle costs no extra query at all.
             let calib_fresh = if calib_fresh && group_wants_mosaic {
-                let mosaic_artifact =
-                    find_artifact(conn, subject, &g.key, "calibrated_mosaic", Some(f.frame_id))?;
+                let mosaic_artifact = find_artifact(
+                    conn,
+                    subject,
+                    artifact_group_key("calibrated_mosaic", &g.key),
+                    "calibrated_mosaic",
+                    Some(f.frame_id),
+                )?;
                 match (&mosaic_artifact, &current_calib_hash) {
                     (Some(row), Some(hash)) => is_fresh(row, hash),
                     _ => false,
@@ -3665,7 +3873,6 @@ pub fn build_plan(
                 fits_artifact_fresh(
                     conn,
                     subject,
-                    &g.key,
                     f.frame_id,
                     metrics_artifact
                         .as_ref()
@@ -3963,6 +4170,78 @@ mod tests {
     use crate::stacking::groups::{group_frames, is_seconds_token};
     use crate::stacking::test_fixtures::{self, LightSpec};
 
+    /// Ruling R10 M2: the rendering of a stored file time is a wire fact (rows already written carry it, and the
+    /// scanner's own `to_rfc3339()` shape is what it must equal), so three literals pin it: a whole second, a
+    /// millisecond time and a nanosecond time.
+    #[test]
+    fn render_modified_at_is_pinned_to_golden_literals() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            render_modified_at(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "2023-11-14T22:13:20+00:00"
+        );
+        assert_eq!(
+            render_modified_at(UNIX_EPOCH + Duration::new(1_700_000_000, 123_000_000)),
+            "2023-11-14T22:13:20.123+00:00"
+        );
+        assert_eq!(
+            render_modified_at(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)),
+            "2023-11-14T22:13:20.123456789+00:00"
+        );
+        // The scanner's shape: the same value through its own call.
+        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        assert_eq!(
+            render_modified_at(t),
+            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+        );
+    }
+
+    /// Ruling R10 M1: a file with the recorded size and another mtime is refused with a `debug!` that names the path
+    /// and both times; a file that is not there, or whose identity matches, logs nothing.
+    #[test]
+    fn identity_refusal_by_mtime_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"12345678").unwrap();
+        let recorded = render_modified_at(std::fs::metadata(&path).unwrap().modified().unwrap());
+
+        let (ok, quiet) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(8), Some(&recorded))
+        });
+        assert!(ok);
+        assert!(!quiet.contains("modification time"), "{quiet}");
+
+        let (gone, quiet) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&dir.path().join("nope.bin"), Some(8), Some(&recorded))
+        });
+        assert!(!gone);
+        assert!(quiet.trim().is_empty(), "a missing file is the ordinary stale: {quiet}");
+
+        let other = "1999-01-01T00:00:00+00:00";
+        let (moved, text) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(8), Some(other))
+        });
+        assert!(!moved);
+        assert!(text.contains("DEBUG"), "{text}");
+        assert!(text.contains("f.bin"), "{text}");
+        assert!(text.contains(other), "the recorded time: {text}");
+        assert!(text.contains(&recorded), "the current time: {text}");
+
+        // A different size is refused without the mtime line (the size already says why).
+        let (resized, text) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(9), Some(&recorded))
+        });
+        assert!(!resized);
+        assert!(!text.contains("modification time"), "{text}");
+
+        // A stat failure that is not "not found" is a warn, not a silent "changed".
+        let (broken, text) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(Path::new("a\0b"), Some(8), Some(&recorded))
+        });
+        assert!(!broken);
+        assert!(text.contains("WARN") && text.contains("cannot be stat-ed"), "{text}");
+    }
+
     /// Plan 6b-3 D6: a frame set's LN upstream is its registration hash,
     /// byte for byte; a project's carries the masked-LN token.
     #[test]
@@ -4198,6 +4477,7 @@ mod tests {
                     &reference_calib,
                     &frame_calib,
                     &measurement_hash_for(&cfg, &frame_calib, None),
+                    "",
                 );
                 store_registration(&f.conn, &subject, |set_id| RegistrationRecord {
                     frames_set_id: set_id,
@@ -4225,7 +4505,7 @@ mod tests {
                     &crate::db::stacking::NewArtifact {
                         subject: &subject,
                         frame_id: Some(frame_id),
-                        group_key: &group.key,
+                        group_key: artifact_group_key("registered", &group.key),
                         kind: "registered",
                         path: Some(path.to_str().unwrap()),
                         config_hash: &artifact_hash,
@@ -6719,7 +6999,6 @@ mod tests {
         let cfg = StackingConfig::default();
         let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
         assert_eq!(groups.len(), 1);
-        let group_key = groups[0].key.clone();
         let frame = groups[0].frames[0].clone();
 
         let mut divisors = DivisorCache::new();
@@ -6731,7 +7010,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
-                group_key: &group_key,
+                group_key: "",
                 kind: "calibrated",
                 path: None,
                 config_hash: &hash,
@@ -6766,7 +7045,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
-                group_key: &group_key,
+                group_key: "",
                 kind: "calibrated",
                 path: Some(path.to_str().unwrap()),
                 config_hash: &hash,
@@ -6791,6 +7070,68 @@ mod tests {
             plan2.stale_stages
         );
         assert_eq!(plan2.groups[0].calibrated_cached, 0);
+    }
+
+    /// Frame-level cache spec §5.1: the plan gate reads `calibrated` rows under the empty key, so a regroup does not
+    /// make Calibrate stale.
+    #[test]
+    fn plan_gate_reads_calibrated_rows_under_the_empty_key() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let mut cfg_seconds = StackingConfig::default();
+        cfg_seconds.grouping.exposure_mode = crate::stacking::config::ExposureMode::Seconds;
+        let mut cfg_all = StackingConfig::default();
+        cfg_all.grouping.exposure_mode = crate::stacking::config::ExposureMode::NoSplit;
+        let groups_seconds = group_frames(&f.conn, f.set_id, &cfg_seconds.grouping).unwrap();
+        let groups_all = group_frames(&f.conn, f.set_id, &cfg_all.grouping).unwrap();
+        assert_ne!(groups_seconds[0].key, groups_all[0].key);
+
+        let mut divisors = DivisorCache::new();
+        for gf in &groups_seconds[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg_seconds, gf, &mut divisors).unwrap();
+            let cal_path = f.dir.path().join(format!("calibrated_{}.fits", gf.frame_id));
+            std::fs::write(&cal_path, [0u8]).unwrap();
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &StackSubject::FrameSet(f.set_id),
+                    frame_id: Some(gf.frame_id),
+                    group_key: artifact_group_key("calibrated", &groups_seconds[0].key),
+                    kind: "calibrated",
+                    path: Some(cal_path.to_str().unwrap()),
+                    config_hash: &hash,
+                    size: Some(1),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        for cfg in [cfg_seconds, cfg_all] {
+            let plan = build_plan(
+                &f.conn,
+                &settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(f.set_id),
+                Some(cfg),
+            )
+            .unwrap();
+            assert!(
+                !plan.stale_stages.contains(&Stage::Calibrate),
+                "{:?}",
+                plan.stale_stages
+            );
+            assert_eq!(plan.groups[0].calibrated_cached, plan.groups[0].frame_count);
+        }
     }
 
     /// Seed a `stacking_runs` row (a stand-in for "a previous run already
@@ -6885,7 +7226,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key,
+                group_key: artifact_group_key("registered", group_key),
                 kind: "registered",
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
@@ -6943,7 +7284,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key,
+                group_key: artifact_group_key(&fits_artifact::artifact_kind(plane), group_key),
                 kind: &fits_artifact::artifact_kind(plane),
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
@@ -6981,7 +7322,7 @@ mod tests {
         );
         assert_ne!(current, earlier, "premise: the two versions key apart");
         let fresh = |planes: usize| {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, group_key, frame_id, planes, &current)
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, planes, &current)
                 .unwrap()
         };
         for plane in 0..3 {
@@ -7008,7 +7349,7 @@ mod tests {
             seed_fits_artifact(&f, group_key, frame_id, plane, hash);
         }
         let fresh = || {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, group_key, frame_id, 3, hash)
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, 3, hash)
                 .unwrap()
         };
         assert!(fresh(), "premise");
@@ -7102,7 +7443,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "calibrated",
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
@@ -7120,7 +7461,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &metrics_hash,
@@ -7152,6 +7493,7 @@ mod tests {
                 &reference_hash,
                 frame_hash,
                 frame_measurement_hash,
+                "",
             );
             let is_reference = gf.frame_id == ids[0];
             let rec = RegistrationRecord {
@@ -7505,7 +7847,7 @@ mod tests {
         let measurement = measurement_hash_for(&cfg, calibrated, Some(4.0));
 
         let reg = |cfg: &StackingConfig, measurement: &str| {
-            registration_hash_for(cfg, 7, reference_calibrated, calibrated, measurement)
+            registration_hash_for(cfg, 7, reference_calibrated, calibrated, measurement, "")
         };
 
         // Same config, same inputs -> the same hash, twice.
@@ -7610,7 +7952,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "calibrated",
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
@@ -7628,7 +7970,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &metrics_hash,
@@ -7653,6 +7995,7 @@ mod tests {
                 &reference_calib_hash,
                 frame_hash,
                 frame_measurement_hash,
+                "",
             );
             registration_hashes.insert(gf.frame_id, expected.clone());
             let is_reference = gf.frame_id == ids[0];
@@ -7801,6 +8144,24 @@ mod tests {
             plan2.stale_stages
         );
         assert_eq!(plan2.groups[0].ln_cached, 0, "{:?}", plan2.groups[0]);
+
+        // Ruling R10 M4: the run reuses the LN reference only while its file is the one its row recorded. With the
+        // file gone the gate must not verify the `ln` rows against the stored payload: Normalize is stale.
+        std::fs::remove_file(&reference_path).unwrap();
+        let plan3 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            plan3.stale_stages.contains(&Stage::Normalize),
+            "a deleted LN reference file read as fresh: {:?}",
+            plan3.stale_stages
+        );
+        assert_eq!(plan3.groups[0].ln_cached, 0, "{:?}", plan3.groups[0]);
     }
 
     /// M2 Task 7 carry-over (c) (Task 5's re-review): a frame the LATEST run
@@ -7880,7 +8241,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "calibrated",
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
@@ -7898,7 +8259,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &metrics_hash,
@@ -7989,6 +8350,7 @@ mod tests {
                 &reference_calib_hash,
                 frame_hash,
                 &frame_measurement_hash,
+                "",
             );
             registration_hashes.insert(frame_id, expected.clone());
             let is_reference = frame_id == ids[0];
@@ -8284,7 +8646,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &groups[0].key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &measurement_hash_for(&cfg, &calib_hash, None),
@@ -8442,6 +8804,7 @@ mod tests {
                 &reference_hash,
                 frame_hash,
                 &frame_measurement_hash,
+                "",
             );
             let is_reference = frame_id == ids[0];
             let rec = RegistrationRecord {
@@ -8528,6 +8891,7 @@ mod tests {
                 &reference_hash,
                 frame_hash,
                 &frame_measurement_hash,
+                "",
             );
             let is_reference = frame_id == ids[0];
             let rec = RegistrationRecord {
@@ -8631,6 +8995,7 @@ mod tests {
                 &reference_hash,
                 frame_hash,
                 &frame_measurement_hash,
+                "",
             );
             let is_reference = frame_id == group_reference;
             let rec = RegistrationRecord {
@@ -8750,6 +9115,7 @@ mod tests {
                 &reference_hash,
                 frame_hash,
                 &frame_measurement_hash,
+                "",
             );
             let is_reference = frame_id == switched_to;
             let rec = RegistrationRecord {
@@ -8957,7 +9323,7 @@ mod tests {
         let line = |name: &str, cfg: &StackingConfig| {
             let calib = stage_hash(&calibration_subtree(cfg), &masters, &src());
             let meas = measurement_hash_for(cfg, &calib, Some(1.5));
-            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
+            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas, "");
             let ln_ref =
                 normalization_hash_for(cfg, "r1,r2", "m1,m2", &[11, 22], "", None, Some(1.5), None);
             let ln = normalization_hash_for(
@@ -8998,13 +9364,15 @@ mod tests {
         // 2026-11-02 Plan D D2c r1 (review M1 of D2b): FITS_ARTIFACT_VERSION 3 folded into meas (the measurement subtree, beside MEASURE_VERSION) - meas, reg and ln move on every line (was meas=326ee3f03ffce101 on the default line); calib is UNCHANGED, and ln_ref and ln_cal too (this golden feeds them no measurement hash).
         // 2026-11-02 Plan D DF-a (main merged into plan-d): both sides moved the normalization hashes, so the merged ln_ref, ln and ln_cal are re-recorded on default, maximumQuality and custom (MEASURE_VERSION 8 AND the `local` rejection default move ln_ref, ln and ln_cal; FITS_ARTIFACT_VERSION 3 moves meas, reg and ln only, as the D2c r1 line above says); calib, meas and reg are Plan D's (pcores moves none of them), and the fastPreview line is Plan D's (it pins `scaleZeroOffset`, so only Plan D moved it).
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1 joins the registration subtree): reg and ln move on every line, the fastPreview line included (was default reg=efe8758fbdc4bbbd ln=532bfea1cac2d7b4; fastPreview reg=a038dcae26c2392a ln=4110659e2116091d; maximumQuality reg=bc4925cc6681db3a ln=b88fd0bd410fb46c; custom reg=916582f203cecefc ln=88cef42f95ee4e58); calib, meas, ln_ref and ln_cal are UNCHANGED (ln_ref's call passes the literals "r1,r2" / "m1,m2" and ln_cal folds ln_ref, so neither reads reg).
+        // 2026-11-08 frame-level cache Task 1 (spec §5.2): the calibration hash writes a constant grouping tolerance (2.0), so the `custom` line (tolerance 5.0) moves calib, meas, reg and ln (was calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=be7daf8c36663781 ln=d182aadf14a27b04); every other line and ln_ref, ln_cal are UNCHANGED.
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves meas, reg, ln_ref, ln and ln_cal on every line (no line sets maxStars; calib is UNCHANGED). Was default: meas=cc923a65f1b367d7 reg=511225ffae14780f ln_ref=782cf447acae6ace ln=eda6a3f8d83f669c ln_cal=23f55e28c19f3459; fastPreview: meas=cc923a65f1b367d7 reg=f7e86b4f84ea0e62 ln_ref=500204de9b22c23d ln=3212a35f2a771db1 ln_cal=1ed2edc9d7ff5dcb; maximumQuality: meas=cc923a65f1b367d7 reg=cb8b5afc0aaeb3b4 ln_ref=364ed4c8ffba6878 ln=ec1a338d219d6364 ln_cal=86f453747dcafe8b; custom: meas=cc923a65f1b367d7 reg=c93dfd9d2706c88a ln_ref=364ed4c8ffba6878 ln=0a21b864ed61cc65 ln_cal=86f453747dcafe8b.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=511225ffae14780f ln_ref=782cf447acae6ace ln=eda6a3f8d83f669c ln_cal=23f55e28c19f3459",
-                "fastPreview: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=f7e86b4f84ea0e62 ln_ref=500204de9b22c23d ln=3212a35f2a771db1 ln_cal=1ed2edc9d7ff5dcb",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=cc923a65f1b367d7 reg=cb8b5afc0aaeb3b4 ln_ref=364ed4c8ffba6878 ln=ec1a338d219d6364 ln_cal=86f453747dcafe8b",
-                "custom: calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=be7daf8c36663781 ln_ref=364ed4c8ffba6878 ln=d182aadf14a27b04 ln_cal=86f453747dcafe8b",
+                "default: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=9ac6df63dfa5ae4e ln_ref=caec6041e0b648d2 ln=849de3ee29964d01 ln_cal=8936f0c89b6aa4fc",
+                "fastPreview: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=17e61b01965e78e7 ln_ref=1758b268745bb40f ln=72bb3c10827ed22d ln_cal=1d604dd931ee4992",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=09b2251a3179e3cb ln_ref=0c672a29f5110c04 ln=461c9d22cc1aebf4 ln_cal=94dac0d536f3b975",
+                "custom: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=04d832dd79a15511 ln_ref=0c672a29f5110c04 ln=27c111578b301060 ln_cal=94dac0d536f3b975",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -9052,7 +9420,7 @@ mod tests {
             };
             let calib = stage_hash(&calibration_subtree(cfg), &masters, &src);
             let meas = measurement_hash_for(cfg, &calib, Some(1.5));
-            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
+            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas, "");
             let ln_ref =
                 normalization_hash_for(cfg, "r1,r2", "m1,m2", &[11, 22], "", None, Some(1.5), None);
             let ln = normalization_hash_for(
@@ -9073,13 +9441,16 @@ mod tests {
         assert_eq!(line(&at_max), line(&absent));
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
-        assert_eq!(meas, "cc923a65f1b367d7");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): maxStars 9000 moves meas, reg and ln (was meas "cc923a65f1b367d7").
+        assert_eq!(meas, "5756f9b3d472fa3d");
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "efe8758fbdc4bbbd"); meas did not move.
-        assert_eq!(reg, "511225ffae14780f");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): was "511225ffae14780f".
+        assert_eq!(reg, "9ac6df63dfa5ae4e");
         // 2026-11-01 pcores Task 1 (OD-1a): `ln` moved with the rejection default (was "affdd0e2d03f312e"); meas and reg did not.
         // 2026-11-02 Plan D DF-a: the merge of Plan D's meas / reg (MEASURE_VERSION 8, FITS_ARTIFACT_VERSION 3) with that default; was "f6fe01073ccedcca" on plan-d before the merge.
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "532bfea1cac2d7b4"): `ln` is computed from `reg`.
-        assert_eq!(ln, "eda6a3f8d83f669c");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): was "eda6a3f8d83f669c".
+        assert_eq!(ln, "849de3ee29964d01");
     }
 
     #[test]
@@ -9088,7 +9459,7 @@ mod tests {
         let line = |cfg: &StackingConfig| {
             let calib = stage_hash(&calibration_subtree(cfg), &["m"], &[]);
             let meas = measurement_hash_for(cfg, &calib, Some(1.5));
-            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
+            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas, "");
             let ln = normalization_hash_for(
                 cfg,
                 &reg,
@@ -9151,7 +9522,8 @@ mod tests {
             "a pure function of its inputs"
         );
         // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f); re-recorded 2026-11-01, Plan D D2 (MEASURE_VERSION 8; was 5020355fd05d9c71). re-recorded 2026-11-02, Plan D D2c r1 (FITS_ARTIFACT_VERSION 3 folded into the measurement subtree; was d1feba185a3e9a76).
-        assert_eq!(key, "66145a91b19774d5");
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): maxStars 9000 moves the first-pass key (was "66145a91b19774d5").
+        assert_eq!(key, "888cfb7cd6acb72f");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over
@@ -11072,6 +11444,410 @@ mod tests {
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
+    /// A registration hash of one frame at a group beta, built the way both callers build it.
+    fn registration_hash_at_beta(
+        cfg: &StackingConfig,
+        group: &IntegrationGroup,
+        prepare_path: bool,
+        beta: f64,
+    ) -> String {
+        registration_hash_for(
+            cfg,
+            7,
+            "ref-calib",
+            "frame-calib",
+            &registration_measurement_fold(cfg, group, prepare_path, "frame-calib", Some(beta)),
+            "",
+        )
+    }
+
+    fn registration_test_group(key: &str, color_mode: ColorMode) -> IntegrationGroup {
+        IntegrationGroup {
+            key: key.into(),
+            instrume: None,
+            color_mode,
+            filter: None,
+            binning: 1,
+            cameras: Vec::new(),
+            exposure_s: Some(300.0),
+            exposure_class: "st300".into(),
+            frames: Vec::new(),
+            total_exposure_s: 0.0,
+            pixel_scale_arcsec: None,
+        }
+    }
+
+    /// Frame-level cache spec §5.5: a debayered OSC frame's registration reads only `cfg.registration`, so the
+    /// group beta (a Measure product) no longer moves its registration hash.
+    #[test]
+    fn osc_registration_hash_ignores_the_group_beta() {
+        let cfg = StackingConfig::default();
+        assert!(cfg.calibration.debayer_osc);
+        let group = registration_test_group("osc__None__bin1__300s", ColorMode::Osc);
+        assert!(!register_reads_measure_fits(&cfg, &group, false));
+        assert_eq!(
+            registration_hash_at_beta(&cfg, &group, false, 1.5),
+            registration_hash_at_beta(&cfg, &group, false, 2.5)
+        );
+    }
+
+    /// A mono frame's registration reads `fits.0`, so the group beta keeps moving its hash (ruling C-6 / C-18).
+    #[test]
+    fn mono_registration_hash_follows_the_group_beta() {
+        let cfg = StackingConfig::default();
+        let group = registration_test_group("mono__L__bin1__300s", ColorMode::Mono);
+        assert!(register_reads_measure_fits(&cfg, &group, false));
+        assert_ne!(
+            registration_hash_at_beta(&cfg, &group, false, 1.5),
+            registration_hash_at_beta(&cfg, &group, false, 2.5)
+        );
+    }
+
+    /// A frame set's OSC group calibrated with `debayerOsc` off is a 1-plane mosaic that DOES read `fits.0`: its
+    /// hash follows the beta (and `expected_stage_one_planes`, which assumes Prepare, would have said otherwise).
+    #[test]
+    fn osc_without_debayer_registration_hash_follows_the_group_beta() {
+        let mut cfg = StackingConfig::default();
+        cfg.calibration.debayer_osc = false;
+        let group = registration_test_group("osc__None__bin1__300s", ColorMode::Osc);
+        assert!(register_reads_measure_fits(&cfg, &group, false));
+        assert_ne!(
+            registration_hash_at_beta(&cfg, &group, false, 1.5),
+            registration_hash_at_beta(&cfg, &group, false, 2.5)
+        );
+        // On the Prepare path the same `osc__` group is three planes and reads nothing.
+        assert!(!register_reads_measure_fits(&cfg, &group, true));
+        assert_eq!(
+            registration_hash_at_beta(&cfg, &group, true, 1.5),
+            registration_hash_at_beta(&cfg, &group, true, 2.5)
+        );
+    }
+
+    /// Ruling R3 (a), the hash level: a frame registered against a reference of ANOTHER group folds the reference's
+    /// own Measure output (its group's config and beta), so a moved `measurement.maxStars` or a moved reference beta
+    /// moves the hash of a debayered OSC frame too; a reference in the frame's own group folds nothing, so a
+    /// single-group set keeps the hashes it had.
+    #[test]
+    fn registration_hash_folds_the_reference_measurement_across_groups_only() {
+        let cfg = StackingConfig::default();
+        let mono = registration_test_group("mono__L__bin1__300s", ColorMode::Mono);
+        let osc = registration_test_group("osc__None__bin1__300s", ColorMode::Osc);
+        let hash_of = |cfg: &StackingConfig, frame_group: &IntegrationGroup, ref_beta: f64| {
+            registration_hash_for(
+                cfg,
+                7,
+                "ref-calib",
+                "frame-calib",
+                &registration_measurement_fold(cfg, frame_group, false, "frame-calib", Some(1.5)),
+                &reference_measurement_fold(
+                    cfg,
+                    frame_group,
+                    &mono,
+                    false,
+                    "ref-calib",
+                    Some(ref_beta),
+                ),
+            )
+        };
+        let mut moved = cfg.clone();
+        moved.measurement.max_stars = cfg.measurement.max_stars - 1000;
+
+        // A debayered OSC frame, mono reference of another group: the reference's measurement is folded.
+        assert_ne!(hash_of(&cfg, &osc, 2.0), hash_of(&moved, &osc, 2.0));
+        assert_ne!(hash_of(&cfg, &osc, 2.0), hash_of(&cfg, &osc, 2.5));
+
+        // A mono frame whose reference sits in its own group: nothing is folded, the hash is the pre-R3 one.
+        assert_eq!(
+            reference_measurement_fold(&cfg, &mono, &mono, false, "ref-calib", Some(2.0)),
+            ""
+        );
+        assert_eq!(
+            hash_of(&cfg, &mono, 2.0),
+            hash_of(&cfg, &mono, 2.5),
+            "the reference beta is the frame's own group beta here, already in `measure:`"
+        );
+        assert_eq!(
+            hash_of(&cfg, &mono, 2.0),
+            registration_hash_for(
+                &cfg,
+                7,
+                "ref-calib",
+                "frame-calib",
+                &registration_measurement_fold(&cfg, &mono, false, "frame-calib", Some(1.5)),
+                "",
+            )
+        );
+
+        // A reference that does not read `fits.0` (a debayered OSC group) contributes nothing across groups.
+        assert_eq!(
+            reference_measurement_fold(&cfg, &mono, &osc, false, "ref-calib", Some(2.0)),
+            ""
+        );
+    }
+
+    /// Ruling R3 (c), the gate: a mixed mono + debayered-OSC set registered against a mono reference. Moving
+    /// `measurement.maxStars` reads Register stale for the OSC frames alone (the mono rows are re-keyed to the new
+    /// config, the OSC rows are not), and re-keyed OSC rows read it fresh again.
+    #[test]
+    fn register_stale_follows_the_reference_measurement_for_an_osc_frame() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut mono_ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let stem = format!("m{i}");
+            let spec = LightSpec {
+                filter: Some("L"),
+                ..light_spec_written(&stem, t)
+            };
+            mono_ids.push(test_fixtures::add_light(&f, &spec).0);
+        }
+        let mut osc_ids = Vec::new();
+        for (i, t) in [
+            "2025-01-01T01:00:00",
+            "2025-01-01T01:05:00",
+            "2025-01-01T01:10:00",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let stem = format!("o{i}");
+            let spec = LightSpec {
+                bayerpat: Some("RGGB"),
+                ..light_spec_written(&stem, t)
+            };
+            osc_ids.push(test_fixtures::add_light(&f, &spec).0);
+        }
+        let all_ids: Vec<i64> = mono_ids.iter().chain(osc_ids.iter()).copied().collect();
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+        let reference_id = mono_ids[0];
+        set_frame_set_reference(&f.conn, f.set_id, reference_id).unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        assert!(cfg.calibration.debayer_osc);
+        let mut moved = cfg.clone();
+        moved.measurement.max_stars = cfg.measurement.max_stars - 1000;
+
+        let subject = StackSubject::FrameSet(f.set_id);
+        let (groups, origins) = frame_source(&f.conn, &subject, &cfg).unwrap();
+        assert_eq!(groups.len(), 2, "one mono group, one OSC group");
+        let mut memo = HashMemo::new(origins.clone());
+        let calib: HashMap<i64, String> = all_ids
+            .iter()
+            .map(|&id| {
+                let (_, gf) = find_group_of(&groups, id).unwrap();
+                (id, memo.calibration_hash(&f.conn, &cfg, gf).unwrap())
+            })
+            .collect();
+        // Each group has its OWN β (R5 M1): the mono group 1.5, the OSC group 2.5. Both folds below read their own
+        // group's value, so a test that moves one group's β sees which fold carries it.
+        let beta_of = |key: &str| -> f64 {
+            if key.starts_with("mono__") {
+                1.5
+            } else {
+                2.5
+            }
+        };
+        let betas: HashMap<String, f64> =
+            groups.iter().map(|g| (g.key.clone(), beta_of(&g.key))).collect();
+        let betas_with = |prefix: &str, beta: f64| -> HashMap<String, f64> {
+            let mut out = betas.clone();
+            for (key, value) in out.iter_mut() {
+                if key.starts_with(prefix) {
+                    *value = beta;
+                }
+            }
+            out
+        };
+
+        let run_id = crate::db::stacking::insert_run(
+            &f.conn,
+            &crate::db::stacking::NewRun {
+                subject: &subject,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: Some(reference_id),
+                reference_mode: "manual",
+                working_dir: "/w",
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        for g in &groups {
+            let group_id = crate::db::stacking::insert_group(
+                &f.conn,
+                &crate::db::stacking::NewGroup {
+                    run_id,
+                    group_key: &g.key,
+                    instrume: None,
+                    color_mode: "mono",
+                    filter: None,
+                    binning: Some(1),
+                    width: Some(1),
+                    height: Some(1),
+                    exposure: None,
+                    exposure_class: None,
+                    frame_count: 3,
+                    included_count: 3,
+                },
+            )
+            .unwrap();
+            for gf in &g.frames {
+                crate::db::stacking::upsert_frame_row(
+                    &f.conn,
+                    &subject,
+                    &crate::db::stacking::NewFrameRow {
+                        run_id,
+                        group_id,
+                        frame_id: gf.frame_id,
+                        included: true,
+                        exclusion_reason: None,
+                        weight: None,
+                        weight_channels_json: None,
+                        metrics_json: None,
+                        reg_status: None,
+                        reg_model: None,
+                        reg_rms_px: None,
+                        reg_inliers: None,
+                        reg_inlier_ratio: None,
+                        reg_flipped: None,
+                        rejected_fraction: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        // The hash the run writes for one frame under `cfg`, built the way `register_group_pass` builds it.
+        let hash_under = |cfg: &StackingConfig, betas: &HashMap<String, f64>, frame_id: i64| -> String {
+            let (group, _) = find_group_of(&groups, frame_id).unwrap();
+            let (reference_group, _) = find_group_of(&groups, reference_id).unwrap();
+            registration_hash_for(
+                cfg,
+                reference_id,
+                &calib[&reference_id],
+                &calib[&frame_id],
+                &registration_measurement_fold(
+                    cfg,
+                    group,
+                    false,
+                    &calib[&frame_id],
+                    Some(betas[&group.key]),
+                ),
+                &reference_measurement_fold(
+                    cfg,
+                    group,
+                    reference_group,
+                    false,
+                    &calib[&reference_id],
+                    Some(betas[&reference_group.key]),
+                ),
+            )
+        };
+        let seed_row = |frame_id: i64, hash: &str| {
+            let is_reference = frame_id == reference_id;
+            let (group, _) = find_group_of(&groups, frame_id).unwrap();
+            seed_registered_artifact(&f, &group.key, frame_id, hash);
+            crate::registration::db::upsert_registration(
+                &f.conn,
+                &RegistrationRecord {
+                    frames_set_id: f.set_id,
+                    frame_id,
+                    reference_frame_id: reference_id,
+                    is_reference,
+                    status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                    compute_time_ms: 0,
+                    registered_at: "2025-01-01T00:00:00Z".to_string(),
+                    config_hash: Some(hash.to_string()),
+                    source_kind: Some("calibrated".to_string()),
+                    ..RegistrationRecord::default()
+                },
+            )
+            .unwrap();
+        };
+        let reference = PlanReference {
+            mode: ReferenceMode::Manual,
+            frame_id: Some(reference_id),
+            filename: None,
+            on_disk: true,
+        };
+        let stale_under = |cfg: &StackingConfig, betas: &HashMap<String, f64>| -> bool {
+            let mut memo = HashMemo::new(origins.clone());
+            compute_register_stale(
+                &f.conn, cfg, &subject, &groups, &reference, &mut memo, &origins, None, betas,
+            )
+            .unwrap()
+        };
+
+        // The premise the test stands on: the OSC frames' hashes move with the reference's measurement.
+        for &id in &osc_ids {
+            assert_ne!(
+                hash_under(&cfg, &betas, id),
+                hash_under(&moved, &betas, id),
+                "osc frame {id}"
+            );
+        }
+        // R5 M1, the β choice: the OSC frames' hashes follow the REFERENCE's group β (the mono one) and not their own.
+        let mono_moved = betas_with("mono__", 1.6);
+        let osc_moved = betas_with("osc__", 2.6);
+        for &id in &osc_ids {
+            assert_ne!(
+                hash_under(&cfg, &betas, id),
+                hash_under(&cfg, &mono_moved, id),
+                "osc frame {id}: the reference's beta is folded"
+            );
+            assert_eq!(
+                hash_under(&cfg, &betas, id),
+                hash_under(&cfg, &osc_moved, id),
+                "osc frame {id}: its own beta is not"
+            );
+        }
+
+        // Every row keyed under `cfg`: cached; under `moved`, stale.
+        for &id in &all_ids {
+            seed_row(id, &hash_under(&cfg, &betas, id));
+        }
+        assert!(!stale_under(&cfg, &betas), "the control: nothing moved");
+        assert!(stale_under(&moved, &betas));
+
+        // R5 M1: moving only the OSC group's own β leaves every row fresh; moving only the mono β (the reference's
+        // group) stales the OSC rows, and re-keying the mono rows alone leaves the OSC rows as the cause.
+        assert!(
+            !stale_under(&cfg, &osc_moved),
+            "the OSC group's own beta is no part of its registration hash"
+        );
+        for &id in &mono_ids {
+            seed_row(id, &hash_under(&cfg, &mono_moved, id));
+        }
+        assert!(
+            stale_under(&cfg, &mono_moved),
+            "the reference group's beta moved: the OSC rows registered against it are stale"
+        );
+        for &id in &osc_ids {
+            seed_row(id, &hash_under(&cfg, &mono_moved, id));
+        }
+        assert!(!stale_under(&cfg, &mono_moved));
+        for &id in &all_ids {
+            seed_row(id, &hash_under(&cfg, &betas, id));
+        }
+        assert!(!stale_under(&cfg, &betas), "back to the control");
+
+        // The mono rows re-keyed to `moved`, the OSC rows left behind: the OSC frames alone keep it stale.
+        for &id in &mono_ids {
+            seed_row(id, &hash_under(&moved, &betas, id));
+        }
+        assert!(
+            stale_under(&moved, &betas),
+            "an OSC frame registered against a mono reference of another group must re-register when the \
+             reference's measurement moves"
+        );
+
+        // The OSC rows re-keyed too: fresh again.
+        for &id in &osc_ids {
+            seed_row(id, &hash_under(&moved, &betas, id));
+        }
+        assert!(!stale_under(&moved, &betas));
+    }
+
     /// Plan 6b-3 D15 (the 6b-2 leftover): one rule for stage 1 and LN — an
     /// `osc__` group on the Prepare path with the debayer off keeps three
     /// planes (and three LN channels); on the Calibrate path a mosaic stays
@@ -11169,7 +11945,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &subject,
                     frame_id,
-                    group_key: &group_key,
+                    group_key: artifact_group_key(kind, &group_key),
                     kind,
                     path,
                     config_hash: hash,
@@ -11198,6 +11974,7 @@ mod tests {
                 &calib[&ids[0]],
                 &calib[&gf.frame_id],
                 &metrics[&gf.frame_id],
+                "",
             );
             registration.insert(gf.frame_id, h.clone());
             let is_ref = gf.frame_id == ids[0];

@@ -123,7 +123,7 @@ impl Default for MeasureOptions {
     fn default() -> Self {
         MeasureOptions {
             psf_model: PsfModel::Auto,
-            max_stars: 24576,
+            max_stars: 9_000,
             scale_estimator: ScaleEstimator::Bwmv,
             min_snr: 5.0,
             seed_prefilter: DEFAULT_SEED_PREFILTER,
@@ -1869,6 +1869,13 @@ pub(crate) static PASS1_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
 pub(crate) static PASS1_CANCEL_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Test-only: `(directory, remaining)` — when the `remaining`-th first pass of a frame under the directory finishes, that
+/// frame's file gets a modification time ten seconds ahead, so the read guard refuses its pass 2 (a deterministic
+/// pass-2 failure after a successful, written first pass; ruling R10 M3). Fires once.
+#[cfg(test)]
+pub(crate) static PASS1_TOUCH_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Test-only: per calibrated directory, `(live, peak)` count of [`FramePass1`] values (Task 11c, bar 3).
 #[cfg(test)]
 static PASS1_LIVE: std::sync::Mutex<Vec<(std::path::PathBuf, usize, usize)>> =
@@ -1921,7 +1928,9 @@ impl FramePass1 {
         self.planes.beta_own()
     }
 
-    /// The calibrated file's identity at this first pass's first plane read (Plan A Task 11c, R11c-4).
+    /// The calibrated file's identity at this first pass's first plane read (Plan A Task 11c, R11c-4). Only its length is
+    /// compared when the artifact is read back for a file Athenaeum owns, its modification time too for any other
+    /// ([`check_stamp_len`]).
     pub(crate) fn source(&self) -> Option<SourceStamp> {
         self.identity.map(stamp_of)
     }
@@ -1960,12 +1969,14 @@ impl FramePass1 {
 
     /// A stored first pass read back (Task 11c, R11c-1 / R11c-4): the heads rebuilt from `opts`, the plane index, the
     /// plane count and the stored gain through the ONE [`module_options`] builder, the read guard seeded with the
-    /// identity of `calibrated` NOW, which must equal the stored stamp ([`Pass1ArtifactError::Stale`] otherwise).
+    /// identity of `calibrated` NOW, whose length must equal the stored stamp's ([`Pass1ArtifactError::Stale`]
+    /// otherwise; the mtime too under `strict_mtime`, see [`check_stamp_len`]).
     pub(crate) fn from_record(
         head: Pass1Head,
         body: Pass1Body,
         calibrated: &Path,
         opts: &MeasureOptions,
+        strict_mtime: bool,
     ) -> Result<FramePass1, Pass1ArtifactError> {
         let n = head.beta_own.len();
         if n == 0 || body.planes.len() != n || body.read_ms.len() != n {
@@ -1977,12 +1988,7 @@ impl FramePass1 {
             )));
         }
         let now = FileIdentity::of(calibrated)?;
-        if head.source != Some(stamp_of(now)) {
-            return Err(Pass1ArtifactError::Stale {
-                stored: head.source,
-                now: Some(stamp_of(now)),
-            });
-        }
+        check_stamp_len(head.source, now, strict_mtime)?;
         let detector = resolve_detector(SeedOverride::Fast, opts);
         let colour = n == 3;
         let mut heads = Vec::with_capacity(n);
@@ -2093,19 +2099,14 @@ impl Pass1Body {
 }
 
 /// Whether a stored head describes `calibrated` as it is now (the controller's check in step (0), Plan A Task 11c,
-/// R11c-5): the stamp equals the file's identity now ([`Pass1ArtifactError::Stale`] otherwise) and the geometry and
-/// the plane count are the file's own (a header probe, no pixel read).
+/// R11c-5): the stamp equals the file's now ([`Pass1ArtifactError::Stale`] otherwise; [`check_stamp_len`], the length
+/// only unless `strict_mtime`) and the geometry and the plane count are the file's own (a header probe, no pixel read).
 pub(crate) fn check_pass1_head(
     head: &Pass1Head,
     calibrated: &Path,
+    strict_mtime: bool,
 ) -> Result<(), Pass1ArtifactError> {
-    let now = stamp_of(FileIdentity::of(calibrated)?);
-    if head.source != Some(now) {
-        return Err(Pass1ArtifactError::Stale {
-            stored: head.source,
-            now: Some(now),
-        });
-    }
+    check_stamp_len(head.source, FileIdentity::of(calibrated)?, strict_mtime)?;
     let reader = PlaneReader::open(calibrated).map_err(|e| {
         Pass1ArtifactError::Io(std::io::Error::other(format!("the calibrated file: {e}")))
     })?;
@@ -2121,6 +2122,28 @@ pub(crate) fn check_pass1_head(
         )));
     }
     Ok(())
+}
+
+/// The one validity check of a stored stamp against `calibrated` now (frame-level cache spec §5.3). The LENGTH must
+/// equal the stored one ([`Pass1ArtifactError::Stale`] otherwise). The modification time is compared only under
+/// `strict_mtime`: for a calibrated or prepared file Athenaeum writes (under the working folder's `calibrated/` or
+/// `prepared/`) a first pass is valid for as long as the calibration hash in its artifact's key is, and a
+/// recalibration with the same hash reproduces the pixels to the bit (pinned by
+/// `recalibration_reproduces_the_planes_bit_for_bit`) while writing a file with a new mtime. A file Athenaeum never
+/// rewrites (an attested light or a project replica used in place) moves its mtime only when someone else edited
+/// it, so there the mtime is compared too. A stamp without a recorded source never matches.
+fn check_stamp_len(
+    stored: Option<SourceStamp>,
+    now: FileIdentity,
+    strict_mtime: bool,
+) -> Result<(), Pass1ArtifactError> {
+    match stored {
+        Some(s) if s.len == now.len && (!strict_mtime || s.modified_ns == stamp_of(now).modified_ns) => Ok(()),
+        _ => Err(Pass1ArtifactError::Stale {
+            stored,
+            now: Some(stamp_of(now)),
+        }),
+    }
 }
 
 /// A read guard identity as the stored stamp: the size and the modification time as signed nanoseconds since the Unix
@@ -2188,6 +2211,19 @@ pub fn measure_frame_pass1(
             *remaining = remaining.saturating_sub(1);
             if *remaining == 0 {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        let mut hooks = PASS1_TOUCH_AFTER.lock().unwrap();
+        if let Some((_, remaining)) = hooks.iter_mut().find(|(dir, _)| path.starts_with(dir)) {
+            let fire = *remaining == 1;
+            *remaining = remaining.saturating_sub(1);
+            if fire {
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+                    .unwrap();
             }
         }
     }
@@ -3125,11 +3161,11 @@ pub(crate) mod tests {
     #[test]
     fn options_serde_defaults() {
         let d = MeasureOptions::default();
-        assert_eq!(d.max_stars, 24576);
+        assert_eq!(d.max_stars, 9000);
         assert_eq!(d.psf_model, PsfModel::Auto);
         assert_eq!(d.scale_estimator, ScaleEstimator::Bwmv);
         let json = serde_json::to_string(&d).unwrap();
-        assert!(json.contains("\"psfModel\":\"auto\"") && json.contains("\"maxStars\":24576"));
+        assert!(json.contains("\"psfModel\":\"auto\"") && json.contains("\"maxStars\":9000"));
         assert!(json.contains("\"scaleEstimator\":\"bwmv\"") && json.contains("\"minSnr\":5.0"));
         // M4a Task 2 (ruling R-M4a-1): the seed threshold is a real option
         // now — this used to assert the field's ABSENCE.
@@ -3952,7 +3988,7 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             let fresh = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
             let artifact = dir.path().join(format!("{name}.athm"));
             write_pass1(&artifact, &fresh).unwrap();
-            let back = read_pass1(&artifact, &path, &opts).unwrap();
+            let back = read_pass1(&artifact, &path, &opts, false).unwrap();
             let beta = back.beta_own()[0];
             measure_frame_pass2(&path, back, &[beta], &opts, None, &cancel)
                 .unwrap()

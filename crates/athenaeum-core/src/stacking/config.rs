@@ -132,7 +132,7 @@ pub struct GroupingConfig {
     /// [`resolve_config`] — never trusted raw from a stored document.
     pub exposure_tolerance_sec: f64,
     // How exposure classes are formed (spec 2026-10-02 §8). Enters no stage
-    // hash: `calibration_subtree` writes only `exposureToleranceSec`.
+    // hash: `calibration_subtree` writes a constant tolerance.
     pub exposure_mode: ExposureMode,
     // The class width of `stops` / `equivalent`, in stops. Clamped to
     // `MIN_STOPS_WIDTH` by `resolve_config`.
@@ -302,7 +302,7 @@ impl Default for MeasurementConfig {
         MeasurementConfig {
             weight_mode: WeightMode::PsfSignalWeight,
             psf_model: PsfModel::Auto,
-            max_stars: 24_576,
+            max_stars: 9_000,
             formula: FormulaWeights::default(),
             keyword: "SSWEIGHT".to_string(),
             detection_sigma: default_detection_sigma(),
@@ -971,9 +971,16 @@ pub fn prepare_subtree(cfg: &StackingConfig) -> serde_json::Value {
     })
 }
 
+/// The `grouping.exposureToleranceSec` value [`calibration_subtree`] writes, whatever the config says (spec
+/// 2026-11-08 §5.2). It holds the hash shape — a set at the shipped default tolerance keeps a byte-identical hash —
+/// and says nothing about the run: the tolerance decides which frames share a group, never what a calibrated frame
+/// contains.
+pub const CALIBRATION_HASH_GROUPING_TOLERANCE_SEC: f64 = 2.0;
+
 /// Stage 1 (calibration) config subtree (spec §9.3): the frame's
-/// calibration options plus the grouping rule that decided which frames
-/// share a group.
+/// calibration options plus the grouping key's shape, written as the
+/// constant [`CALIBRATION_HASH_GROUPING_TOLERANCE_SEC`] (not the config's
+/// tolerance).
 pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     // `calibration.format` (the XISF plan, 2026-09-18, ruling R6) is the
     // container an EXPORT or a SEND writes; the run forces FITS for its own
@@ -994,7 +1001,7 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     // `stage_hashes_are_pinned_to_golden_literals`.
     serde_json::json!({
         "calibration": calibration,
-        "grouping": { "exposureToleranceSec": cfg.grouping.exposure_tolerance_sec },
+        "grouping": { "exposureToleranceSec": CALIBRATION_HASH_GROUPING_TOLERANCE_SEC },
     })
 }
 
@@ -1030,8 +1037,17 @@ fn measurement_subtree_with_measure_version(
     cfg: &StackingConfig,
     measure_version: u32,
 ) -> serde_json::Value {
+    // Spec 2026-11-08 §5.4: the weights are computed in every run from the stored measurements (`run.rs`
+    // `stage_measure_with`, `compute_weights`) and no fit reads `weightMode`, `formula` or `keyword`, so they are
+    // written as the shipped defaults: changing the weighting must not re-measure. A set with default weights keeps
+    // its hash byte for byte.
+    let defaults = MeasurementConfig::default();
+    let mut measurement = cfg.measurement.clone();
+    measurement.weight_mode = defaults.weight_mode;
+    measurement.formula = defaults.formula;
+    measurement.keyword = defaults.keyword;
     serde_json::json!({
-        "measurement": cfg.measurement,
+        "measurement": measurement,
         "normalization": { "scaleEstimator": cfg.normalization.scale_estimator },
         "measureVersion": measure_version,
     })
@@ -1277,9 +1293,10 @@ mod tests {
         );
         // The measurement subtree takes no align version: the same default
         // config hashes the same as at the unmoved version-8 literal.
+        // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves it (was "ef32610c8173c47f").
         assert_eq!(
             stage_hash(&measurement_subtree(&cfg), &[], &[]),
-            "ef32610c8173c47f"
+            "1a598ed663844a86"
         );
     }
 
@@ -1331,7 +1348,7 @@ mod tests {
         let c: StackingConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(c, StackingConfig::default());
         assert_eq!(c.version, 1);
-        assert_eq!(c.measurement.max_stars, 24576);
+        assert_eq!(c.measurement.max_stars, 9000);
         assert_eq!(c.measurement.keyword, "SSWEIGHT");
         assert!(c.selection.exclude_on_registration_failure);
         assert_eq!(c.registration.max_stars, 2000);
@@ -1387,6 +1404,53 @@ mod tests {
             stage_hash(&calibration_subtree(&cfg), &[], &[]),
             stage_hash(&calibration_subtree(&other), &[], &[]),
         );
+    }
+
+    /// Spec 2026-11-08 §5.4: the weights are computed every run from stored
+    /// measurements and no fit reads the weight fields, so changing them
+    /// must not re-measure; a field a fit does read still moves the hash.
+    #[test]
+    fn measurement_hash_ignores_the_weight_settings() {
+        let default = StackingConfig::default();
+        let h = |c: &StackingConfig| stage_hash(&measurement_subtree(c), &[], &[]);
+        let base = h(&default);
+
+        let mut noise = default.clone();
+        noise.measurement.weight_mode = WeightMode::Noise;
+        assert_eq!(h(&noise), base, "weightMode Noise must not move it");
+
+        let mut formula = default.clone();
+        formula.measurement.weight_mode = WeightMode::Formula;
+        formula.measurement.formula.fwhm = 40.0;
+        assert_eq!(h(&formula), base, "weightMode Formula and formula.fwhm must not move it");
+
+        let mut keyword = default.clone();
+        keyword.measurement.weight_mode = WeightMode::Keyword;
+        keyword.measurement.keyword = "WEIGHT".to_string();
+        assert_eq!(h(&keyword), base, "weightMode Keyword and its keyword must not move it");
+
+        let mut max_stars = default.clone();
+        max_stars.measurement.max_stars += 1;
+        assert_ne!(h(&max_stars), base, "maxStars still moves it");
+
+        let mut seed = default.clone();
+        seed.measurement.seed_threshold += 1.0;
+        assert_ne!(h(&seed), base, "seedThreshold still moves it");
+    }
+
+    /// Spec 2026-11-08 §5.2: the grouping tolerance decides which frames share
+    /// a group, never what a calibrated frame contains; a set at another
+    /// tolerance or exposure mode keeps its calibration hash.
+    #[test]
+    fn calibration_hash_ignores_the_grouping_tolerance() {
+        let default = StackingConfig::default();
+        let mut wide = default.clone();
+        wide.grouping.exposure_tolerance_sec = 200.0;
+        let mut stops = default.clone();
+        stops.grouping.exposure_mode = ExposureMode::Stops;
+        let h = |c: &StackingConfig| stage_hash(&calibration_subtree(c), &["m"], &[]);
+        assert_eq!(h(&default), h(&wide), "a wider tolerance must not move it");
+        assert_eq!(h(&default), h(&stops), "the exposure mode must not move it");
     }
 
     /// Ruling R-M4c-8's own "the `.athln` config hash folds `localScale`
@@ -1972,7 +2036,8 @@ mod tests {
         let cfg = StackingConfig::default();
         assert_eq!(
             stage_hash(&measurement_subtree_with_measure_version(&cfg, 4), &[], &[]),
-            "e4320e05f86c1550",
+            // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves this literal and the normalization one below (was "e4320e05f86c1550" and "eee085e20921f75c"); registration did not move.
+            "72a681ead04cfdb4",
             "measurement"
         );
         assert_eq!(
@@ -1993,7 +2058,7 @@ mod tests {
             // 2026-11-01 pcores Task 1 (OD-1a): the default rejection normalization is `local` and the normalization
             // subtree folds the whole block, so this literal moved (was "209f262fd5e90fec"); measurement and
             // registration did not.
-            "eee085e20921f75c",
+            "9d2387df58a49708",
             "normalization"
         );
     }
@@ -2013,10 +2078,11 @@ mod tests {
                 stage_hash(&calibration_subtree(&cfg), &[], &[]),
             ),
             (
-                "0d5c198c7abb7132".to_string(),
+                // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves measurement and normalization (was "0d5c198c7abb7132" and "75a4d889a865b845").
+                "067a2f2abedfef87".to_string(),
                 "71627dbef71e5f50".to_string(),
                 // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "d1f5adda37fa2f11".
-                "75a4d889a865b845".to_string(),
+                "647a6be3cd557a37".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "version, measurement, registration, normalization, calibration"
@@ -2061,10 +2127,11 @@ mod tests {
                 stage_hash(&calibration_subtree(&cfg), &[], &[]),
             ),
             (
-                "92ce74a473b23d1e".to_string(),
+                // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves measurement and normalization (was "92ce74a473b23d1e" and "32d84d26ce058018").
+                "d1dfe4a0d0bb0619".to_string(),
                 "40084109c5bdfb9a".to_string(),
                 // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "babef50774a4c396".
-                "32d84d26ce058018".to_string(),
+                "b897594f344fed5a".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "measurement, registration, normalization, calibration"
@@ -2111,10 +2178,11 @@ mod tests {
             ),
             (
                 7,
-                "458fe47fbbf6cf96".to_string(),
+                // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves measurement and normalization (was "458fe47fbbf6cf96" and "08ccc8d4872ab886").
+                "e803462813ff0942".to_string(),
                 "58b254a7ba5d0808".to_string(),
                 // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "6f83ebdc535ec8a1".
-                "08ccc8d4872ab886".to_string(),
+                "16bee8907ba483c3".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "version, measurement, registration, normalization, calibration"
@@ -2172,10 +2240,11 @@ mod tests {
             ),
             (
                 8,
-                "ef32610c8173c47f".to_string(),
+                // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves measurement and normalization (was "ef32610c8173c47f" and "48ebdb2f76923cba").
+                "1a598ed663844a86".to_string(),
                 "e6c1ddfad3f06299".to_string(),
                 // 2026-11-02 Plan D DF-a (main merged into plan-d): rejection defaults to `local` (pcores Task 1, OD-1a), which the normalization subtree folds; was "f37aa67a46c48a56". The measurement, registration and calibration literals stand.
-                "48ebdb2f76923cba".to_string(),
+                "3e2dfb49bb8448fb".to_string(),
                 "9653a478603091dc".to_string(),
             ),
             "version, measurement, registration, normalization, calibration"
@@ -2710,7 +2779,9 @@ mod tests {
         //
         // And here (2026-11-01 pcores Task 1, OD-1a): `normalization.rejection` defaults to `local`. Was
         // "1de1a3136b8dc4ac".
-        assert_eq!(default_hash, "8bb369a197d1a3f4");
+        //
+        // And here (2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000): the serialized default config carries `maxStars` 9000. Was "8bb369a197d1a3f4".
+        assert_eq!(default_hash, "936429b7aeb6c9c4");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part
@@ -2798,6 +2869,16 @@ mod tests {
         assert_eq!(c.measurement.fit_stars, None);
         let c = resolve_config(Some("{}"), None).unwrap();
         assert_eq!(c.measurement.fit_stars, None);
+    }
+
+    /// Spec 2026-11-08 §5.8 (owner ruling): 9 000 is the default for NEW documents only; a stored document carries
+    /// its `maxStars` explicitly and keeps it, so its caches stay valid.
+    #[test]
+    fn a_stored_document_keeps_its_max_stars() {
+        let c = resolve_config(Some(r#"{"measurement":{"maxStars":24576}}"#), None).unwrap();
+        assert_eq!(c.measurement.max_stars, 24_576);
+        let c = resolve_config(Some("{}"), None).unwrap();
+        assert_eq!(c.measurement.max_stars, 9_000);
     }
 
     #[test]

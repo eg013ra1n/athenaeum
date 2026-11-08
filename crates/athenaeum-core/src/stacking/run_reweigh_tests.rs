@@ -557,7 +557,7 @@ fn a_member_without_a_fresh_fits_artifact_sends_the_plane_back_to_its_measure_ti
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &key,
+        "",
         "fits.0",
         Some(h.ids[2]),
     )
@@ -590,7 +590,7 @@ fn a_group_that_fell_back_reaches_the_output_stage_as_a_fallback() {
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &key,
+        "",
         "fits.0",
         Some(h.ids[2]),
     )
@@ -906,7 +906,7 @@ fn a_fallback_outside_the_psf_family_warns_of_the_gain_not_the_weights() {
         let row = crate::db::stacking::find_artifact(
             &h.fixture.conn,
             &StackSubject::FrameSet(h.fixture.set_id),
-            &key,
+            "",
             "fits.0",
             Some(h.ids[2]),
         )
@@ -1312,7 +1312,7 @@ fn a_plane_that_falls_back_leaves_its_siblings_reweighed() {
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &key,
+        "",
         "fits.1",
         Some(h.ids[3]),
     )
@@ -1347,16 +1347,30 @@ fn halve_s(h: &Harness, i: usize, plane: usize) {
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &h.key(),
+        "",
         &crate::stacking::fits_artifact::artifact_kind(plane),
         Some(h.ids[i]),
     )
     .unwrap()
     .expect("the fits artifact");
-    let path = std::path::PathBuf::from(row.path.unwrap());
+    let path = std::path::PathBuf::from(row.path.clone().unwrap());
     let mut fits = crate::stacking::fits_artifact::read_fits(&path).unwrap();
     fits.iter_mut().for_each(|f| f.ap_sum *= 0.5);
     crate::stacking::fits_artifact::write_fits(&path, &fits).unwrap();
+    // The edit stands in for a writer: a writer records the identity of what it wrote (ruling R7 b: a cached file
+    // counts as fresh only while it is the file its row recorded), so the row follows the edited file.
+    let meta = std::fs::metadata(&path).unwrap();
+    h.fixture
+        .conn
+        .execute(
+            "UPDATE stacking_artifacts SET size = ?1, modified_at = ?2 WHERE id = ?3",
+            rusqlite::params![
+                meta.len() as i64,
+                crate::stacking::plan::render_modified_at(meta.modified().unwrap()),
+                row.id
+            ],
+        )
+        .unwrap();
 }
 
 /// Plan D D2d (PD-32): a one-plane group's common flux is the model flux times `c`, the aperture sum is not read - halving
