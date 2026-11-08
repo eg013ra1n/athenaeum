@@ -98,7 +98,8 @@ use crate::stacking::pass1_artifact::{
 };
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{
-    artifact_group_key, cleanup_work, subject_layout, CleanupWhat, WorkingLayout, LN_REFERENCE_SATURATION_FILE,
+    artifact_group_key, cleanup_work, cleanup_work_with, subject_layout, CleanupWhat, WorkingLayout,
+    LN_REFERENCE_SATURATION_FILE,
 };
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
@@ -1195,6 +1196,17 @@ pub(crate) fn start_stacking_with_solver(
     Ok(StartedStacking { run_id })
 }
 
+/// Whether a stacking run of a subject OTHER than `subject` is active (registered in `active_stacks`). Two subjects
+/// can share a working root, and a run writes a pass-1 / fits file before its row, so a sweep for `subject` must not
+/// run meanwhile (ruling R8 (c)).
+pub(crate) fn other_stack_active(ctx: &ServiceContext, subject: &StackSubject) -> bool {
+    ctx.active_stacks
+        .lock()
+        .unwrap()
+        .values()
+        .any(|h| &h.subject != subject)
+}
+
 /// Cancel an active stacking run (queued-in-compute-queue or running).
 pub fn cancel_stacking(ctx: &ServiceContext, run_id: i64) -> Result<(), ApiError> {
     let active = ctx.active_stacks.lock().unwrap();
@@ -1986,8 +1998,9 @@ fn rejection_map_stems(group: &IntegrationGroup, included_ids: &[i64]) -> Vec<St
 /// only disk.
 ///
 /// `owned_root` is the root the WRITING kind owns (`calibrated_root()`, `prepared_root()`, `measured_root()`,
-/// `fits_root()`, `registered_root()`; ruling R4), passed by the caller, never `layout.root` in general: a frame set's working folder may overlap a scan root, and an attested
-/// frame used in place has a row pointing at the user's own landed file, which is never ours to remove.
+/// `fits_root()`, `registered_root()`; ruling R4), passed by the caller, never `layout.root` in general: a frame
+/// set's working folder may overlap a scan root, and an attested frame used in place has a row pointing at the
+/// user's own landed file, which is never ours to remove.
 fn replace_frame_level_file(
     conn: &rusqlite::Connection,
     owned_root: &Path,
@@ -15367,7 +15380,14 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
         CleanupPolicy::DeleteIntermediates => {
             let freed = {
                 let conn = db(&rc.ctx)?.conn();
-                cleanup_work(&conn, &rc.subject, &rc.layout, CleanupWhat::Intermediates)?
+                let sweep = !other_stack_active(&rc.ctx, &rc.subject);
+                cleanup_work_with(
+                    &conn,
+                    &rc.subject,
+                    &rc.layout,
+                    CleanupWhat::Intermediates,
+                    sweep,
+                )?
             };
             tracing::info!(run_id = rc.run_id, freed_bytes = freed, "cleanup applied");
         }

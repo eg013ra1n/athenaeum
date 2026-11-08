@@ -33,7 +33,7 @@ use crate::stacking::config::{
     preset, resolve_config, PathsConfig, StackingConfig, StackingPreset,
 };
 use crate::stacking::paths::{
-    cleanup_work, resolve_dirs, subject_layout, validate_dirs, work_usage, CleanupWhat,
+    cleanup_work_with, resolve_dirs, subject_layout, validate_dirs, work_usage, CleanupWhat,
     ValidateMode, WorkUsage, WorkingLayout,
 };
 use crate::stacking::plan::{
@@ -836,6 +836,29 @@ fn layout_for(
     Ok(subject_layout(conn, working, subject)?)
 }
 
+/// The working folder spelled as the run spells it (ruling R8 (b)). `start_stacking` validates the folders in
+/// `ValidateMode::Save`, which resolves each through [`validate_transfer_dir`] (canonicalized), and every artifact
+/// row stores a path under THAT spelling, so a cleanup that lays its layout out on the configured, un-resolved
+/// string (`/var/…` where the run saw `/private/var/…`) would see no row for any file. A folder that does not
+/// exist yet has nothing to clean and no row under it, so it is returned as configured and nothing is created.
+/// Cleanup has no host sandbox to consult, as before: [`PathPolicy::AllowAll`].
+fn working_dir_as_run_spells_it(
+    conn: &rusqlite::Connection,
+    raw: &str,
+) -> Result<PathBuf, ApiError> {
+    if !Path::new(raw.trim()).exists() {
+        return Ok(PathBuf::from(raw.trim()));
+    }
+    let (path, _overlap) = validate_transfer_dir(
+        conn,
+        &PathPolicy::AllowAll,
+        raw,
+        "Stacking working folder",
+        OverlapRule::Warn,
+    )?;
+    Ok(path)
+}
+
 /// A frame set's working-layout byte usage. Fix round 1, item 2: resolves
 /// the SET's own config (its `paths.workingDir` override, if any, else the
 /// global default — [`resolve_set_stacking_config`], the same reader
@@ -904,8 +927,10 @@ pub fn cleanup_stacking_work(
     let Some(working) = dirs.working else {
         return Ok(0);
     };
-    let layout = layout_for(&conn, Path::new(&working), &subject)?;
-    let freed = cleanup_work(&conn, &subject, &layout, what)?;
+    let working = working_dir_as_run_spells_it(&conn, &working)?;
+    let layout = layout_for(&conn, &working, &subject)?;
+    let sweep = !run::other_stack_active(ctx, &subject);
+    let freed = cleanup_work_with(&conn, &subject, &layout, what, sweep)?;
     Ok(freed)
 }
 
@@ -1109,7 +1134,8 @@ pub fn cleanup_project_stacking_work(
     }
     let layout = match project_working_dir(&conn, &ctx.settings, project_id)? {
         Some(working) => {
-            let layout = layout_for(&conn, Path::new(&working), &subject)?;
+            let working = working_dir_as_run_spells_it(&conn, &working)?;
+            let layout = layout_for(&conn, &working, &subject)?;
             if let Some(why) = crate::stacking::paths::project_root_overlap(&conn, &layout.root)? {
                 tracing::warn!(project_id, path = %layout.root.display(), "project cleanup refused: the working folder overlaps a scan root");
                 return Err(ApiError::Invalid(why));
@@ -1122,7 +1148,8 @@ pub fn cleanup_project_stacking_work(
     let Some(layout) = layout else {
         return Ok(0);
     };
-    Ok(cleanup_work(&conn, &subject, &layout, what)?)
+    let sweep = !run::other_stack_active(ctx, &subject);
+    Ok(cleanup_work_with(&conn, &subject, &layout, what, sweep)?)
 }
 
 // ── Master lights (M4d Task 3, rulings R-M4d-4/5) ───────────────────────
@@ -1819,6 +1846,153 @@ mod tests {
         let freed = cleanup_stacking_work(&ctx, set_id, CleanupWhat::Intermediates).unwrap();
         assert_eq!(freed, 1024);
         assert!(!group_dir.join("x.bin").exists());
+    }
+
+    /// A pass-1 file and a star-fits file of frame `frame_id` in `layout`, with their rows, and one stray writer-named
+    /// pass-1 file no row names. Returns `(pass1, fits, stray)`.
+    fn seed_pass1_cache(
+        conn: &rusqlite::Connection,
+        set_id: i64,
+        frame_id: i64,
+        layout: &WorkingLayout,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let pass1 = layout.measured_path("a_f1");
+        let fits = layout.fits_path("a_f1", 0);
+        let stray = layout.measured_path("gone_f9");
+        for path in [&pass1, &fits, &stray] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, [0u8; 16]).unwrap();
+        }
+        for (kind, path) in [("measured", &pass1), ("fits.0", &fits)] {
+            crate::db::stacking::upsert_artifact(
+                conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &StackSubject::FrameSet(set_id),
+                    frame_id: Some(frame_id),
+                    group_key: "",
+                    kind,
+                    path: path.to_str(),
+                    config_hash: "h",
+                    size: Some(16),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
+        (pass1, fits, stray)
+    }
+
+    /// Ruling R8 (b): the cleanup resolves the working folder the way the run does (`validate_dirs(Save)`:
+    /// canonicalized), so a folder configured through a symlink or a non-canonical spelling (`/var` vs
+    /// `/private/var`) is laid out on the spelling the rows hold.
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_resolves_the_working_folder_as_the_run_does() {
+        let (tmp, ctx) = test_ctx();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let db_handle = db(&ctx).unwrap();
+        let conn = db_handle.conn();
+        let resolved = working_dir_as_run_spells_it(&conn, link.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, crate::test_support::canonical_path(&real));
+
+        // A folder that does not exist yet has nothing to clean: returned as configured, never created.
+        let missing = tmp.path().join("missing");
+        let resolved = working_dir_as_run_spells_it(&conn, missing.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, missing);
+        assert!(!missing.exists());
+    }
+
+    /// Ruling R8 (b), the pin: a working folder configured through a spelling that differs from the resolved one,
+    /// pass-1 / fits rows under the resolved spelling (what the run stores) — `Intermediates` keeps both files and
+    /// removes the unreferenced one.
+    #[test]
+    #[cfg(unix)]
+    fn intermediates_cleanup_keeps_the_pass1_cache_under_another_spelling_of_the_working_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = ServiceContext::new_for_tests(db_path.clone());
+        let (fixture, light_ids) = seed_ready_fixture(&db_path, "Test Set");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            keys::STACKING_WORKING_DIR,
+            link.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let resolved = crate::test_support::canonical_path(&real);
+        let layout =
+            subject_layout(&fixture.conn, &resolved, &StackSubject::FrameSet(fixture.set_id)).unwrap();
+        let (pass1, fits, stray) =
+            seed_pass1_cache(&fixture.conn, fixture.set_id, light_ids[0], &layout);
+
+        cleanup_stacking_work(&ctx, fixture.set_id, CleanupWhat::Intermediates).unwrap();
+        assert!(pass1.exists() && fits.exists(), "the pass-1 / fits cache survives");
+        assert!(!stray.exists(), "a pass-1 file no row names is swept");
+    }
+
+    /// Ruling R8 (c): while ANOTHER subject's run is active the sweep is skipped (its writer puts a file down before
+    /// its row), and the rest of the cleanup proceeds; with no other run the same file goes.
+    #[test]
+    fn cleanup_skips_the_sweep_while_another_run_is_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = ServiceContext::new_for_tests(db_path.clone());
+        let (fixture, light_ids) = seed_ready_fixture(&db_path, "Test Set");
+        let work = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            keys::STACKING_WORKING_DIR,
+            work.path().to_str().unwrap(),
+        )
+        .unwrap();
+        let resolved = crate::test_support::canonical_path(work.path());
+        let layout =
+            subject_layout(&fixture.conn, &resolved, &StackSubject::FrameSet(fixture.set_id)).unwrap();
+        let (pass1, _fits, stray) =
+            seed_pass1_cache(&fixture.conn, fixture.set_id, light_ids[0], &layout);
+        let calibrated = layout.calibrated_root().join("x.fits");
+        std::fs::create_dir_all(layout.calibrated_root()).unwrap();
+        std::fs::write(&calibrated, [0u8; 8]).unwrap();
+
+        let other_set = crate::db::create_frames_set(
+            &fixture.conn,
+            Some("Other"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ctx.active_stacks.lock().unwrap().insert(
+            9001,
+            crate::services::StackHandle {
+                cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                subject: StackSubject::FrameSet(other_set),
+            },
+        );
+        cleanup_stacking_work(&ctx, fixture.set_id, CleanupWhat::Intermediates).unwrap();
+        assert!(stray.exists(), "the sweep is skipped while another run is active");
+        assert!(pass1.exists());
+        assert!(!calibrated.exists(), "the rest of the cleanup proceeds");
+
+        ctx.active_stacks.lock().unwrap().clear();
+        cleanup_stacking_work(&ctx, fixture.set_id, CleanupWhat::Intermediates).unwrap();
+        assert!(!stray.exists(), "with no other run the stray goes");
+        assert!(pass1.exists());
     }
 
     /// Fix round 1, item 7: no active run ⇒ `cleanup_stacking_work` reads
