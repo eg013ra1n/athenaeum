@@ -1676,9 +1676,9 @@ fn find_group_of<'a>(
 /// M4b ruling R-T1-1: the plan-time comparison point for the pixel-scale
 /// warning in `Auto` reference mode, first choice — the last run's OWN
 /// recorded `reference_frame_id`, the SAME lookup [`compute_register_stale`]
-/// already performs (`list_runs(_, _, 1)` → `last_run.reference_frame_id`),
-/// so a set that has run once compares against the reference it actually
-/// used rather than a guess. `None` when there is no previous run, the run
+/// already performs ([`latest_run_with_frame_rows`] → `last_run.reference_frame_id`,
+/// ruling R15), so a set that has run once compares against the reference it
+/// actually used rather than a guess. `None` when there is no previous run, the run
 /// recorded no reference, that frame isn't found among the current groups
 /// (deleted/re-typed since), or it carries no scale of its own.
 fn last_run_reference_scale(
@@ -1686,7 +1686,7 @@ fn last_run_reference_scale(
     subject: &StackSubject,
     groups: &[IntegrationGroup],
 ) -> Result<Option<f64>, ApiError> {
-    let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
+    let Some((last_run, _)) = latest_run_with_frame_rows(conn, subject)? else {
         return Ok(None);
     };
     Ok(last_run
@@ -1892,9 +1892,10 @@ fn cleanup_stale_note(
 /// the run actually chose) went the other way: it read "fresh" even when
 /// the run's own chosen reference had since changed.
 ///
-/// No previous run at all ([`list_runs`] empty) is stale by construction —
-/// there is nothing to compare against. Otherwise: the frames to check are
-/// the latest run's `stacking_run_frames` rows with `included = true` (a
+/// No previous run with an included frame row ([`latest_run_with_frame_rows`]
+/// finds none) is stale by construction — there is nothing to compare
+/// against. Otherwise: the frames to check are
+/// the latest such run's `stacking_run_frames` rows with `included = true` (a
 /// frame the run itself excluded needs no registration row at all to read
 /// as not stale — it was never going to be registered by that run either).
 /// The reference to check against is the plan's OWN manual reference

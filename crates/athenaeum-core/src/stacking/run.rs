@@ -9195,6 +9195,8 @@ fn two_pass_key_with_version(
     };
     let mut upstream: Vec<String> = vec![
         format!("pick:{pick_version}"),
+        format!("top:{}", crate::stacking::weights::TWO_PASS_CANDIDATES),
+        format!("gain:{:?}", crate::stacking::weights::TWO_PASS_MIN_GAIN_PX),
         format!("ref:{candidate_id}"),
         candidate_calib_hash.to_string(),
         format!("ranked:{}", join(&ranking.ranked)),
@@ -9496,6 +9498,11 @@ fn two_pass_refine(
             return Ok(None);
         };
         return adopt_two_pass_pick(rc, group, new_idx, reference_frame_id, None);
+    }
+    // The identity check may have excluded the only frame the re-pick could land on (ruling R15): no dry pass then,
+    // and the progress totals do not count one.
+    if !group_can_switch(rc, &group.key, reference_frame_id) {
+        return Ok(None);
     }
 
     let pass = register_group_pass(
@@ -9839,6 +9846,52 @@ fn group_can_switch(rc: &RunContext, key: &str, reference_frame_id: i64) -> bool
     })
 }
 
+/// The Register progress total of a native run: every viable group's included members once, plus once more for
+/// each group that will run a dry pass (the same way the co-registered path counts them). The dry pass is counted
+/// only when, AFTER the identity check and the cache lookup (ruling R14 (b)), the decision is not cached and the
+/// group can still switch (ruling R15): a member the check excluded may have been the only frame the re-pick could
+/// land on, and `two_pass_refine` then skips the pass.
+fn native_register_total(
+    rc: &mut RunContext,
+    cfg: &StackingConfig,
+    manual_reference_frame_id: Option<i64>,
+    force_fresh: bool,
+) -> Result<usize, RunError> {
+    let groups = rc.plan_groups.clone();
+    let mut total = 0usize;
+    for g in &groups {
+        if included_count_of(rc, &g.key) < 3 {
+            continue;
+        }
+        let (group_reference, group_reference_hash) = {
+            let geometry = rc.geometry_of(&g.key);
+            (geometry.reference_frame_id, geometry.hash.clone())
+        };
+        if group_two_pass_wanted(cfg, group_reference, manual_reference_frame_id)
+            && group_can_switch(rc, &g.key, group_reference)
+        {
+            let Some(lookup) = two_pass_lookup_after_identity_check(
+                rc,
+                g,
+                group_reference,
+                &group_reference_hash,
+                force_fresh,
+            )?
+            else {
+                continue;
+            };
+            let included = included_count_of(rc, &g.key);
+            total += included;
+            if lookup.cached.is_none() && group_can_switch(rc, &g.key, group_reference) {
+                total += included;
+            }
+        } else {
+            total += included_count_of(rc, &g.key);
+        }
+    }
+    Ok(total)
+}
+
 /// Stage 5 in `native` geometry mode (M4b rulings R-M4b-4/5): every group
 /// registers onto ITS OWN reference, in its own geometry, with no
 /// cross-group registration at all.
@@ -9877,41 +9930,7 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
     let origins = rc.origins.clone();
     let mut solves: SolveCache = SolveCache::new();
 
-    // One progress total for both passes of every group, the same way the
-    // co-registered path counts them.
-    let mut total = 0usize;
-    for g in &groups {
-        if included_count_of(rc, &g.key) < 3 {
-            continue;
-        }
-        let (group_reference, group_reference_hash) = {
-            let geometry = rc.geometry_of(&g.key);
-            (geometry.reference_frame_id, geometry.hash.clone())
-        };
-        if group_two_pass_wanted(&cfg, group_reference, manual_reference_frame_id)
-            && group_can_switch(rc, &g.key, group_reference)
-        {
-            // A cached decision removes this group's dry pass from the total. The lookup runs after the identity
-            // check, as `two_pass_refine` does (ruling R14 (b)), so the count is of the members that will register.
-            let Some(lookup) = two_pass_lookup_after_identity_check(
-                rc,
-                g,
-                group_reference,
-                &group_reference_hash,
-                force_fresh,
-            )?
-            else {
-                continue;
-            };
-            let included = included_count_of(rc, &g.key);
-            total += included;
-            if lookup.cached.is_none() {
-                total += included;
-            }
-        } else {
-            total += included_count_of(rc, &g.key);
-        }
-    }
+    let total = native_register_total(rc, &cfg, manual_reference_frame_id, force_fresh)?;
     let mut progress = (0usize, total);
     rc.progress(
         Stage::Register,
@@ -10200,7 +10219,9 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     let dry_total = match dry_group.as_ref() {
         Some(g) => {
             match two_pass_lookup_after_identity_check(rc, g, reference_frame_id, &reference_hash, force_fresh)? {
-                Some(lookup) if lookup.cached.is_none() => included_count_of(rc, &g.key),
+                Some(lookup) if lookup.cached.is_none() && group_can_switch(rc, &g.key, reference_frame_id) => {
+                    included_count_of(rc, &g.key)
+                }
                 _ => 0,
             }
         }
@@ -35185,6 +35206,61 @@ mod tests {
                 "native={native}: {err:?}"
             );
         }
+    }
+
+    /// Ruling R15 (M1): the native Register total counts a group's dry pass only if, AFTER the identity check, the
+    /// group can still switch. A project group whose only other WCS candidate changed on disk drops it at the
+    /// Register boundary, so `two_pass_refine` runs no pass and the total is the members that register, once.
+    #[test]
+    fn native_register_total_counts_no_dry_pass_once_the_only_candidate_is_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        // One group of four: only g1 and g2 carry a manifest WCS, so g2 is g1's only switchable candidate.
+        for i in 1..=4 {
+            let uuid = format!("g{i}");
+            let mut spec = test_fixtures::project_frame_spec(&uuid);
+            spec.filter = "G";
+            if i <= 2 {
+                spec.wcs = Some(test_fixtures::manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+            }
+            test_fixtures::add_project_frame(&conn, &tmp.path().join("collab"), "p1", &spec);
+        }
+        let weights: HashMap<&str, f64> = [("c_g1.fits", 0.9), ("c_g2.fits", 0.5)].into_iter().collect();
+        let mut cfg = StackingConfig::default();
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        assert!(cfg.reference.two_pass && cfg.reference.mode == ReferenceMode::Auto);
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &tmp.path().join("work"), &tmp.path().join("out"));
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        let key = rc.plan_groups[0].key.clone();
+        let reference = rc.geometry_of(&key).reference_frame_id;
+        let candidate = rc.measured[&key]
+            .iter()
+            .find(|e| e.frame.filename == "c_g2.fits")
+            .map(|e| e.frame.frame_id)
+            .unwrap();
+        assert_ne!(reference, candidate, "premise: g2 is not the reference");
+        assert!(group_can_switch(&rc, &key, reference), "premise: g2 is a switchable candidate");
+
+        // Untouched: the group runs a dry pass, so its four members count twice.
+        assert_eq!(native_register_total(&mut rc, &cfg, None, false).unwrap(), 8);
+
+        // g2's landed file changes: the check excludes it, the group keeps three members and nothing to switch to.
+        let path = match origin_of(&rc.origins, candidate).unwrap() {
+            FrameOrigin::Project { landed_path, .. } => landed_path.clone(),
+            other => panic!("not a project origin: {other:?}"),
+        };
+        std::fs::write(&path, vec![0u8; 5000]).unwrap();
+        assert_eq!(
+            native_register_total(&mut rc, &cfg, None, false).unwrap(),
+            3,
+            "the total counted a dry pass `two_pass_refine` will not run"
+        );
+        assert_eq!(included_count_of(&rc, &key), 3);
+        assert!(!group_can_switch(&rc, &key, reference));
     }
 
     /// Review round 1, B1: a native project group with no WCS candidate
