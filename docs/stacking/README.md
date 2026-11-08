@@ -5206,8 +5206,14 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   unless they agree; pass 2 re-runs then (set 270: 1.5 everywhere, the fit's floor, so it never does).
 - **Known residuals.** After a weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by
   weight and re-registers: the run is correct, the gate under-reports. A frame-level file is shared by the dev and the release build when
-  both use one working folder: the first run in either build makes the other's rows stale (a recompute), see open-items. Gates and the
-  real-data regroup smoke: `docs/superpowers/open-items.md`.
+  both use one working folder: the first run in either build makes the other's rows stale (a recompute), see open-items. Remaining gates:
+  `docs/superpowers/open-items.md`.
+- **Acceptance (2026-11-08, headless real-data smoke).** The release `athenaeum-web` of this branch on a copy of the dev catalog (the
+  Task 9 migration on it: 1 806 rows re-keyed, 0 duplicates dropped), Manual reference, `seconds` → `none` → `seconds`, `fan-out
+  finished` items per run (calibrate / pass1 / pass2 / align): OSC set 163 (16 lights, 300 s + 600 s, β 1.5 throughout) 16/16/16/16,
+  then 0/0/0/0 (LN and Integrate only), then 0/0/0/0 with every LN sidecar reused; mono set 185 (67 lights; the merged β moves, L 3.49 →
+  3.30) 67/67/67/67, then 0/0/67/67 twice (pass 2 and the mono registration follow the β, by design). The plan gate before the third
+  run reported Normalize stale while the run reused LN (open-items: the gate reads only the latest run's group β).
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
