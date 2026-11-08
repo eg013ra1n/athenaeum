@@ -219,9 +219,11 @@ impl WorkingLayout {
 
     /// `root/fits` — the folder of every frame's persisted star-fits files (Tier C Task 1, spec §2.2.1; flat since
     /// the frame-level cache, spec §5.1): one `.athf` file per (frame, plane), the fits Measure's PSF fitter
-    /// accepted, cached like `metrics` (same hash, same `CleanupWhat::All`-only sweep) but with a file on disk
-    /// behind each row. Rows written before that change keep their `fits/<group_key>/` sub-folder paths. It is also
-    /// the root the fits writer OWNS: a replaced fits file is removed only from here (ruling R4).
+    /// accepted, cached like `metrics` (same hash) with a file on disk behind each row. `Intermediates` keeps the
+    /// folder and its rows and removes from it only the `.athf` files (and crashed-write temporaries) no row names;
+    /// `All` removes the folder. Rows written before the frame-level cache keep their `fits/<group_key>/`
+    /// sub-folder paths. It is also the root the fits writer OWNS: a replaced fits file is removed only from here
+    /// (ruling R4).
     pub fn fits_root(&self) -> PathBuf {
         self.root.join("fits")
     }
@@ -1040,7 +1042,7 @@ pub enum CleanupWhat {
 /// and correctly re-measure anyway (see `plan.rs`'s Measure staleness) —
 /// keeping `fits` alongside it just avoids paying that re-measure for
 /// nothing. Its directory (`fits/`) is removed only under `All`, alongside
-/// `metrics`' own drop.
+/// `metrics`' own drop; `Intermediates` sweeps it of the `.athf` files no row names ([`sweep_unreferenced`]).
 ///
 /// `ln_calibration` (the group's seeds calibration, Tier C Task 2 fix round
 /// 4) is the third deliberate omission, on `metrics`' own reasoning: it is a
@@ -1053,8 +1055,8 @@ pub enum CleanupWhat {
 ///
 /// `measured` (the Measure first-pass artifact, a file behind each row) is NOT here since the frame-level cache
 /// (spec §5.3): a pass-1 file is about 13 MB per frame and costs 24-34 min per set to rebuild, so `Intermediates` keeps
-/// it and its row, like `metrics` and `fits`; only `All` drops it. `Intermediates` still sweeps `measured/` and
-/// `fits/` of the files no `stacking_artifacts` row names ([`sweep_unreferenced`]).
+/// it and its row, like `metrics` and `fits`; only `All` drops it. `Intermediates` still sweeps `measured/` (`.athm`)
+/// and `fits/` (`.athf`) of the writer-named files no `stacking_artifacts` row names ([`sweep_unreferenced`]).
 ///
 /// `registration` (`plan::REGISTRATION_ARTIFACT_KIND`, a project's star-map
 /// cache) is deliberately absent too: it is a payload row that only `All`
@@ -1120,48 +1122,78 @@ fn remove_runs_keeping_uncropped(runs: &Path) -> anyhow::Result<u64> {
     Ok(freed)
 }
 
-/// Removes from `root` (recursively) every file that no `stacking_artifacts.path` of ANY subject names, then the
-/// sub-folders that are left empty (`root` itself stays), and returns the bytes freed. Two sets with one slug share a
-/// working root (`WorkingLayout::new(working_dir, set_slug(name))`), and a migrated row keeps a path inside an old
-/// `<group_key>/` sub-folder, hence the walk and the all-subject lookup. A path is compared as the row spells it
-/// (the writers store the layout's own spelling; nothing is canonicalized). A missing `root` frees nothing. Symlinks
-/// are never followed: a symlinked folder is left alone, a symlinked file is an ordinary file. Each failed removal or
-/// unreadable folder is a `warn!` (`path`, `error`) and the sweep goes on; only a failed lookup of the rows is an
-/// error, because without them nothing may be removed.
-fn sweep_unreferenced(conn: &Connection, root: &Path) -> anyhow::Result<u64> {
+/// The files a pass-1 / star-fits WRITER produces, and so the only names [`sweep_unreferenced`] may remove: the
+/// artifact itself (`<stem>.<ext>`) and the temporary a crashed write leaves
+/// (`<stem>.<ext>.tmp.<pid>.<seq>`, `pass1_artifact::write_pass1` / `fits_artifact::write_fits`). `ext` is `athm`
+/// under `measured/` and `athf` under `fits/`. Anything else under those folders is not ours.
+fn is_writer_file_name(name: &str, ext: &str) -> bool {
+    if name.ends_with(&format!(".{ext}")) {
+        return true;
+    }
+    let Some((_, tail)) = name.rsplit_once(&format!(".{ext}.tmp.")) else {
+        return false;
+    };
+    let Some((pid, seq)) = tail.split_once('.') else {
+        return false;
+    };
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(seq)
+}
+
+/// Removes from `root` (recursively) the files its writer produced ([`is_writer_file_name`] with `ext`) that no
+/// `measured` / `fits.<plane>` row of ANY subject names, then the sub-folders that are left empty (`root` itself
+/// stays), and returns the bytes freed. Two sets with one slug share a working root
+/// (`WorkingLayout::new(working_dir, set_slug(name))`), and a migrated row keeps a path inside an old
+/// `<group_key>/` sub-folder, hence the walk and the all-subject lookup. Any other file (a user's `light.fits` a
+/// frame set's working folder happens to overlap) is never touched, nor is a folder that still holds one.
+///
+/// A file is kept when its path is a row's, or — so a different spelling of the same folder (a symlinked or
+/// non-canonical working path) can never wipe the cache — when its FILE NAME equals the file name of any such row
+/// (the names carry `_f<id>`). Symlinks are never followed: a symlinked folder is left alone, a symlinked file is an
+/// ordinary file. A missing `root` frees nothing. Each failed removal or unreadable folder is a `warn!` (`path`,
+/// `error`) and the sweep goes on; only a failed lookup of the rows is an error, because without them nothing may
+/// be removed.
+fn sweep_unreferenced(conn: &Connection, root: &Path, ext: &str) -> anyhow::Result<u64> {
     if !root.is_dir() {
         return Ok(0);
     }
-    let mut prefix = root.to_string_lossy().into_owned();
-    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
-        prefix.push(std::path::MAIN_SEPARATOR);
-    }
-    let referenced: std::collections::HashSet<String> = {
+    let read_failed = |e: rusqlite::Error| {
+        tracing::warn!(path = %root.display(), error = %e, "stacking cleanup: reading artifact rows failed");
+        anyhow::anyhow!("failed to read artifact rows: {e}")
+    };
+    let mut keep = KeepSet::default();
+    {
         let mut stmt = conn
             .prepare(
                 "SELECT path FROM stacking_artifacts \
-                 WHERE path IS NOT NULL AND substr(path, 1, length(?1)) = ?1",
+                 WHERE path IS NOT NULL AND (kind = 'measured' OR kind LIKE 'fits.%')",
             )
-            .map_err(|e| {
-                tracing::warn!(path = %root.display(), error = %e, "stacking cleanup: reading artifact rows failed");
-                anyhow::anyhow!("failed to read artifact rows: {e}")
-            })?;
+            .map_err(read_failed)?;
         let rows = stmt
-            .query_map([&prefix], |r| r.get::<_, String>(0))
+            .query_map([], |r| r.get::<_, String>(0))
             .and_then(|it| it.collect::<Result<Vec<_>, _>>())
-            .map_err(|e| {
-                tracing::warn!(path = %root.display(), error = %e, "stacking cleanup: reading artifact rows failed");
-                anyhow::anyhow!("failed to read artifact rows: {e}")
-            })?;
-        rows.into_iter().collect()
-    };
+            .map_err(read_failed)?;
+        for path in rows {
+            if let Some(name) = Path::new(&path).file_name() {
+                keep.names.insert(name.to_string_lossy().into_owned());
+            }
+            keep.paths.insert(path);
+        }
+    }
     let mut freed = 0u64;
-    sweep_dir(root, &referenced, &mut freed);
+    sweep_dir(root, ext, &keep, &mut freed);
     Ok(freed)
 }
 
+/// The rows [`sweep_unreferenced`] consults: full paths and bare file names.
+#[derive(Default)]
+struct KeepSet {
+    paths: std::collections::HashSet<String>,
+    names: std::collections::HashSet<String>,
+}
+
 /// One folder of [`sweep_unreferenced`]; returns whether the folder is empty afterwards.
-fn sweep_dir(dir: &Path, referenced: &std::collections::HashSet<String>, freed: &mut u64) -> bool {
+fn sweep_dir(dir: &Path, ext: &str, keep: &KeepSet, freed: &mut u64) -> bool {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -1189,7 +1221,7 @@ fn sweep_dir(dir: &Path, referenced: &std::collections::HashSet<String>, freed: 
             }
         };
         if file_type.is_dir() {
-            if sweep_dir(&path, referenced, freed) {
+            if sweep_dir(&path, ext, keep, freed) {
                 match std::fs::remove_dir(&path) {
                     Ok(()) => {}
                     Err(e) => {
@@ -1200,19 +1232,31 @@ fn sweep_dir(dir: &Path, referenced: &std::collections::HashSet<String>, freed: 
             } else {
                 empty = false;
             }
-        } else if file_type.is_symlink() && path.is_dir() {
-            // A symlinked folder is not ours to walk.
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = !file_type.is_symlink() || !path.is_dir();
+        if !ours
+            || !is_writer_file_name(&name, ext)
+            || keep.paths.contains(path.to_string_lossy().as_ref())
+            || keep.names.contains(&name)
+        {
+            // A symlinked folder, a file its writer does not name, or a file a row names: not ours to remove.
             empty = false;
-        } else if referenced.contains(path.to_string_lossy().as_ref()) {
-            empty = false;
-        } else {
-            let len = std::fs::symlink_metadata(&path).map(|m| m.len()).unwrap_or(0);
-            match std::fs::remove_file(&path) {
-                Ok(()) => *freed += len,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: removing an unreferenced file failed");
-                    empty = false;
-                }
+            continue;
+        }
+        let len = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: reading a file size failed");
+                0
+            }
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => *freed += len,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: removing an unreferenced file failed");
+                empty = false;
             }
         }
     }
@@ -1232,7 +1276,9 @@ fn sweep_dir(dir: &Path, referenced: &std::collections::HashSet<String>, freed: 
 /// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
 /// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
 /// pointing at a file used in place loses its row, never its file. `Intermediates` keeps `measured/` and `fits/`
-/// with their rows and removes from them only the files no row of any subject names ([`sweep_unreferenced`]).
+/// with their rows and removes from them only the `.athm` / `.athf` files (and crashed-write temporaries) no row of
+/// any subject names ([`sweep_unreferenced`]); `sweep_intermediates = false` skips that sweep (ruling R8 (c): another
+/// stacking run is writing into a root it may share).
 /// `runs/run-<id>-uncropped` folders are never removed (see
 /// [`remove_runs_keeping_uncropped`]). Plan 6b-3 D17: `tmp/` (crash
 /// leftovers, no artifact rows) goes with `Intermediates` and `All`.
@@ -1241,6 +1287,20 @@ pub fn cleanup_work(
     subject: &StackSubject,
     layout: &WorkingLayout,
     what: CleanupWhat,
+) -> anyhow::Result<u64> {
+    cleanup_work_with(conn, subject, layout, what, true)
+}
+
+/// [`cleanup_work`] with the `Intermediates` sweep of `measured/` and `fits/` switchable. A caller that holds a
+/// [`crate::services::ServiceContext`] passes `false` while ANOTHER subject's stacking run is active
+/// ([`crate::stacking::run::other_stack_active`]): that run writes a pass-1 / fits file before its row, and the two
+/// subjects may share a working root, so the file would look unreferenced.
+pub fn cleanup_work_with(
+    conn: &Connection,
+    subject: &StackSubject,
+    layout: &WorkingLayout,
+    what: CleanupWhat,
+    sweep_intermediates: bool,
 ) -> anyhow::Result<u64> {
     let mut dirs = vec![layout.registered_root()];
     match what {
@@ -1296,11 +1356,17 @@ pub fn cleanup_work(
         }
         CleanupWhat::Intermediates => {
             crate::db::stacking::delete_artifacts(conn, subject, INTERMEDIATE_ARTIFACT_KINDS)?;
-            // `measured/` and `fits/` survive with their rows; what no row of any subject names goes (a migrated
-            // file of a deleted duplicate, a leftover of a crashed write). After the row deletion above, so the
-            // rows consulted are the ones that remain.
-            for root in [layout.measured_root(), layout.fits_root()] {
-                freed += sweep_unreferenced(conn, &root)?;
+            // `measured/` and `fits/` survive with their rows; the writer-named files no row of any subject names
+            // go (a migrated file of a deleted duplicate, a leftover of a crashed write). After the row deletion
+            // above, so the rows consulted are the ones that remain.
+            if sweep_intermediates {
+                for (root, ext) in [(layout.measured_root(), "athm"), (layout.fits_root(), "athf")] {
+                    freed += sweep_unreferenced(conn, &root, ext)?;
+                }
+            } else {
+                tracing::warn!(
+                    "stacking cleanup: another stacking run is active; measured/ and fits/ are not swept"
+                );
             }
         }
         CleanupWhat::All => {
@@ -2549,7 +2615,7 @@ mod tests {
         let f1 = layout.fits_path("a_f1", 0);
         let stray_m = layout.measured_path("gone_f9");
         let stray_deep = layout.measured_root().join("old_key2").join("dup_f9.athm");
-        let stray_f = layout.fits_root().join("old_key").join("dup_f9.0.athf");
+        let stray_f = layout.fits_root().join("old_key").join("dup_f9.p0.athf");
         let calibrated = layout.calibrated_dir().join("a_f1.fits");
         for (path, n) in [
             (&m1, 10),
@@ -2606,6 +2672,140 @@ mod tests {
         .unwrap();
         assert_eq!(again, 0);
         assert!(m1.exists() && m2.exists());
+    }
+
+    /// Ruling R8 (a), data loss: a frame set's working folder may overlap a scan root, so `measured/` and `fits/` can
+    /// hold a user's own files. The sweep removes only the names its writers produce (`*.athm`, `*.athf`, and their
+    /// `.tmp.<pid>.<seq>` temporaries); every other file, and the folder that holds it, is left alone.
+    #[test]
+    fn the_sweep_removes_only_the_names_its_writers_produce() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (9, 'Mine')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        let user_fits = layout.fits_root().join("light.fits");
+        let user_measured = layout.measured_root().join("sub").join("light.fits");
+        let user_note = layout.measured_root().join("sub").join("notes.txt");
+        let lookalike_a = layout.measured_root().join("a.athm.bak");
+        let lookalike_b = layout.measured_root().join("b.athm.tmp.x.y");
+        let lookalike_c = layout.fits_root().join("c.athf.tmp.1");
+        let lookalike_d = layout.fits_root().join("d.athm");
+        let writer_athm = layout.measured_path("o_f1");
+        let writer_athm_tmp = layout.measured_root().join("old").join("p_f2.athm.tmp.4242.7");
+        let writer_athf = layout.fits_path("o_f1", 0);
+        let writer_athf_tmp = layout.fits_root().join("q_f2.p1.athf.tmp.4242.8");
+        for (path, n) in [
+            (&user_fits, 5),
+            (&user_measured, 6),
+            (&user_note, 7),
+            (&lookalike_a, 8),
+            (&lookalike_b, 9),
+            (&lookalike_c, 10),
+            (&lookalike_d, 11),
+            (&writer_athm, 1),
+            (&writer_athm_tmp, 2),
+            (&writer_athf, 3),
+            (&writer_athf_tmp, 4),
+        ] {
+            write_bytes(path, n);
+        }
+
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(9),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(freed, 1 + 2 + 3 + 4, "only the four writer-named files");
+        for kept in [
+            &user_fits,
+            &user_measured,
+            &user_note,
+            &lookalike_a,
+            &lookalike_b,
+            &lookalike_c,
+            &lookalike_d,
+        ] {
+            assert!(kept.exists(), "{} is not a writer name", kept.display());
+        }
+        for gone in [&writer_athm, &writer_athm_tmp, &writer_athf, &writer_athf_tmp] {
+            assert!(!gone.exists(), "{} is an unreferenced writer file", gone.display());
+        }
+        assert!(
+            !layout.measured_root().join("old").exists(),
+            "a folder the sweep emptied goes"
+        );
+        assert!(
+            layout.measured_root().join("sub").exists(),
+            "a folder that holds a foreign file stays"
+        );
+    }
+
+    /// Ruling R8 (b), fail-safe: a row spelling a folder differently from the layout the cleanup walks (a symlinked
+    /// or non-canonical working path, `/var` vs `/private/var`) must never make the cache look unreferenced; a file
+    /// whose NAME a row names is kept.
+    #[test]
+    #[cfg(unix)]
+    fn the_sweep_keeps_a_file_a_row_names_under_another_spelling_of_the_folder() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (10, 'Spelled')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The rows hold the resolved spelling, the cleanup walks the symlink's.
+        let rows_layout = WorkingLayout::new(&real, "set");
+        let walked_layout = WorkingLayout::new(&link, "set");
+        let pass1 = rows_layout.measured_path("a_f1");
+        let fits = rows_layout.fits_path("a_f1", 0);
+        let stray = rows_layout.measured_path("gone_f9");
+        write_bytes(&pass1, 10);
+        write_bytes(&fits, 20);
+        write_bytes(&stray, 3);
+        seed_frame_row(&c, 10, 1, "measured", &pass1);
+        seed_frame_row(&c, 10, 1, "fits.0", &fits);
+
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(10),
+            &walked_layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert!(pass1.exists() && fits.exists(), "the cache survives a spelling mismatch");
+        assert!(!stray.exists(), "a file no row names still goes");
+        assert_eq!(freed, 3);
+    }
+
+    /// Ruling R8 (c): with `sweep_intermediates = false` (another stacking run is active) nothing under `measured/` or
+    /// `fits/` is removed, the rest of `Intermediates` still is.
+    #[test]
+    fn the_sweep_can_be_skipped_while_another_run_is_active() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (11, 'Busy')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        let in_flight = layout.measured_path("w_f3");
+        let calibrated = layout.calibrated_dir().join("a_f1.fits");
+        write_bytes(&in_flight, 6);
+        write_bytes(&calibrated, 100);
+
+        let freed = cleanup_work_with(
+            &c,
+            &StackSubject::FrameSet(11),
+            &layout,
+            CleanupWhat::Intermediates,
+            false,
+        )
+        .unwrap();
+        assert_eq!(freed, 100);
+        assert!(in_flight.exists(), "a pass-1 file a running run has not recorded yet");
+        assert!(!layout.calibrated_root().exists());
     }
 
     /// Two sets with one slug share a working root, so a file only ANOTHER subject's row names is still referenced.

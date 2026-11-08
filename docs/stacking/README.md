@@ -3764,7 +3764,10 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
         there), the group β, then pass 2 from the artifact or, with none, pass 1 in the worker (the upgrade ripple).
         A write failure is a `warn!`, no row, pass 1 again in pass 2's worker: nothing is ever held.
       - R11c-6 lifecycle: `measured/` goes with `All` only (frame-level cache spec §5.3: `Intermediates` keeps the
-        pass-1 files and their rows, and sweeps `measured/` and `fits/` of the files no row of any subject names);
+        pass-1 files and their rows, and sweeps `measured/` and `fits/` of the writer-named files (`*.athm` / `*.athf` and their
+        `.tmp.<pid>.<seq>` temporaries, nothing else: a user's file in an overlapping working folder is never touched) no
+        `measured` / `fits.<plane>` row of any subject names, keeping any file whose NAME a row names, and skipping the sweep
+        while another subject's run is active; the cleanup commands lay the working folder out as the run does, canonicalized);
         an excluded frame's artifact stays; `WorkUsage.measuredBytes`; no command changes on either host.
       - R11c-7 (owner): bar 1 on real colour data, set 204's OSC and mono groups.
       - **Bars (lab c4d9b92, `star-lab/results/plan-a/t11c-wall/bars.txt`; A = ec39507e, B = 89958c3f).**
