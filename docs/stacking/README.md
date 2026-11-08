@@ -1839,8 +1839,10 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
 - **Aligned frames in Blink** (`core/api/stacking_aligned.rs`). Stage 5 writes one registered frame per frame to
   `<working_dir>/<subject>/registered/r_<stem>[_d].fits` (flat since the frame-level cache: a row written before keeps its
   `registered/<group_key>/` path, and every reader opens the row's path) and records it in `stacking_artifacts` (kind
-  `registered`, group key `""`). That row has no run id: every later run that registers the frame overwrites the file and the row. So a frame is
-  aligned only for its own run, and only while that run is the latest to hold its group. `get_stacking_aligned_frames {
+  `registered`, group key `""`). That row has no run id: a later run that registers the frame again overwrites the file and
+  the row, and one that finds the file fresh reuses it and touches neither. So a frame is aligned for its own run for as long
+  as nothing has replaced it: no later run holds its group, the row was not written after the run finished, and the file is
+  still the one the row recorded. `get_stacking_aligned_frames {
   runId, frameIds }` answers one state per frame. The ids are the run's (catalog frame ids for a set, project-frame
   handles for a project). The checks run in this order, and the first that applies decides:
 
@@ -1848,7 +1850,7 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
   | ---- | ---- | ---- |
   | `notRegistered` | the run holds no row for the frame | `original — not registered in run #N` |
   | `registrationFailed` | the run row's `reg_status` is `failed` | `original — registration failed in run #N` |
-  | `replaced` | a later run of the subject holds the frame's group | `original — a later run replaced it` |
+  | `replaced` | a later run of the subject holds the frame's group, or the artifact row's `created_at` is later than the run's `finished_at` (a later run re-registered the frame, whatever its grouping), or the file is no longer the one the row recorded (size and modification time) | `original — a later run replaced it` |
   | `available` | `reg_status` is `aligned`, `aligned_flipped` or `reference`, and the artifact row names a file on disk | none: the aligned frame is shown |
   | `missing` | the same `reg_status`, but the artifact row has no path or the file is gone | `original — not in the working folder any more` |
   | `notRegistered` | any other `reg_status` (`skipped`: the run cut the frame before Register) | `original — not registered in run #N` |

@@ -3,10 +3,11 @@
 //! Stage 5 writes one registered ("aligned") file per frame, resampled into the reference geometry, to
 //! `<working_dir>/<subject>/registered/r_<stem>[_d].fits` (rows written before the frame-level cache keep their
 //! `registered/<group_key>/` path) and records it in `stacking_artifacts` (kind `registered`, group key `""`). The file
-//! belongs to the subject's frame, not to a run: every later run that registers the frame overwrites the file and its
-//! row. So a run's aligned frame is offered only while that run is the latest one to hold
-//! the group, and its location is the artifact row's absolute `path` - never a path rebuilt from the subject's current
-//! name, which a rename changes.
+//! belongs to the subject's frame, not to a run: a later run that registers the frame again overwrites the file and its
+//! row, while a later run that finds the file fresh reuses it and leaves both alone. So a run's aligned frame is offered
+//! while nothing has replaced it: no later run holds its group, its row was not written after the run finished, and the
+//! file is still the one the row recorded. Its location is the artifact row's absolute `path` - never a path rebuilt from
+//! the subject's current name, which a rename changes.
 //!
 //! Two handlers: [`get_stacking_aligned_frames`] says, per frame, whether the aligned frame is available and, if not,
 //! why; [`resolve_stacking_aligned_path`] gives the file to render. The hosts render it with the same pipeline as the
@@ -22,7 +23,7 @@ use crate::api::{db, ApiError};
 use crate::db::stacking::{find_artifact, get_run, StackSubject, StackingRunRow};
 use crate::services::ServiceContext;
 use crate::stacking::paths::artifact_group_key;
-use crate::stacking::plan::registered_status;
+use crate::stacking::plan::{file_matches_identity, registered_status};
 
 /// Whether a run's aligned frame can be shown for one frame, and why not when it cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -36,7 +37,8 @@ pub enum AlignedState {
     NotRegistered,
     /// The run registered the frame but its aligned file is gone (cleanup, a deleted working folder).
     Missing,
-    /// A later run of the same group overwrote the aligned file.
+    /// A later run overwrote the aligned file: it holds the same group, or it re-registered the frame (the row was
+    /// written after this run finished), or the file is no longer the one the row recorded.
     Replaced,
 }
 
@@ -156,7 +158,10 @@ fn file_exists(path: &Path, run_id: i64, frame_id: i64) -> bool {
 /// 3. a later run of the subject holds the frame's group: `Replaced`;
 /// 4. the run registered it (`aligned`, `aligned_flipped` or `reference`: [`registered_status`]) and its `registered`
 ///    artifact row names a file on disk: `Available` - whether or not the frame is still in the stack, since a frame
-///    the weight floor cut after Register keeps its aligned file and is worth blinking; no file: `Missing`;
+///    the weight floor cut after Register keeps its aligned file and is worth blinking; no file: `Missing`. A row
+///    written after the run finished (a later run re-registered the frame, whatever its grouping) or a file that is no
+///    longer the one the row recorded (a later run overwrote it and was cancelled before recording it) is `Replaced`
+///    instead - the group rule alone misses both, since a regroup names other groups;
 /// 5. anything else (`skipped`: cut before Register): `NotRegistered`. Such a frame may still have an artifact row, from
 ///    an earlier run that registered it; that file is not this run's.
 fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Resolved>, ApiError> {
@@ -207,6 +212,16 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
             "registered",
             Some(frame_id),
         )?;
+        // Both timestamps are RFC 3339 UTC with milliseconds from one `now()`, so they compare as strings. A run still
+        // going has no `finished_at`: nothing can have replaced its files yet, and the group rule has no say either.
+        if artifact.as_ref().is_some_and(|a| {
+            run.finished_at
+                .as_deref()
+                .is_some_and(|finished| a.created_at.as_str() > finished)
+        }) {
+            out.push(Resolved::without_file(frame_id, AlignedState::Replaced));
+            continue;
+        }
         if artifact.as_ref().is_some_and(|a| a.path.is_none()) {
             tracing::warn!(
                 run_id,
@@ -215,11 +230,21 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
                 "registered artifact row has no path"
             );
         }
+        let (size, modified_at) = artifact
+            .as_ref()
+            .map_or((None, None), |a| (a.size, a.modified_at.clone()));
         let path = artifact
             .and_then(|artifact| artifact.path)
             .map(PathBuf::from)
             .filter(|p| file_exists(p, run_id, frame_id));
         out.push(match path {
+            // Rows that recorded no modification time keep the existence check alone.
+            Some(path)
+                if modified_at.is_some()
+                    && !file_matches_identity(&path, size, modified_at.as_deref()) =>
+            {
+                Resolved::without_file(frame_id, AlignedState::Replaced)
+            }
             Some(path) => Resolved {
                 frame_id,
                 state: AlignedState::Available,
@@ -582,10 +607,30 @@ mod tests {
         assert!(resolve_stacking_aligned_path(&s.ctx, second, s.ids[0]).is_ok());
     }
 
+    /// Every frame's registered row `(id, created_at, hash, path)` and its file's modification time.
+    fn registered_state(
+        s: &Seeded,
+        run_id: i64,
+    ) -> Vec<(i64, String, String, Option<String>, Option<std::time::SystemTime>)> {
+        s.ids
+            .iter()
+            .map(|&frame_id| {
+                let row = registered_artifact(s, run_id, frame_id).expect("a registered row");
+                let mtime = row
+                    .path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok());
+                (row.id, row.created_at, row.config_hash, row.path, mtime)
+            })
+            .collect()
+    }
+
     #[test]
     fn aligned_older_run_kept_when_later_run_lacks_group() {
         let s = seeded(&[4.0; 4], 0);
         let first = run_once(&s, &config());
+        let before = registered_state(&s, first);
         // Another exposure grouping names another group, so the second run holds no group of the first one's. The
         // aligned file belongs to the frame (frame-level cache), so the second run finds it fresh and reuses it.
         let mut other = config();
@@ -598,11 +643,74 @@ mod tests {
         };
         assert_ne!(key_of(first), key_of(second));
 
+        // A reusing run neither rewrites a file nor touches its row, so the first run's aligned frames are still its own.
+        assert_eq!(
+            registered_state(&s, second),
+            before,
+            "the second run rewrote a registered file or its row"
+        );
         assert_eq!(states(&s, first), vec![AlignedState::Available; 4]);
         assert_eq!(states(&s, second), vec![AlignedState::Available; 4]);
         let old = resolve_stacking_aligned_path(&s.ctx, first, s.ids[0]).unwrap();
         let new = resolve_stacking_aligned_path(&s.ctx, second, s.ids[0]).unwrap();
         assert_eq!(old, new, "the regroup reused the frame's one registered file");
+    }
+
+    /// The sibling of the test above: a second run that names another group AND re-registers the frames (here a manual
+    /// reference on another frame) overwrites the files and rewrites the rows, so the first run's aligned frames are
+    /// the second run's now. The group rule does not see it - the groups differ - the row's `created_at` does.
+    #[test]
+    fn aligned_older_run_replaced_when_later_run_with_other_group_re_registers() {
+        let s = seeded(&[4.0; 4], 0);
+        let first = run_once(&s, &config());
+        let before = registered_state(&s, first);
+        assert_eq!(states(&s, first), vec![AlignedState::Available; 4]);
+
+        crate::registration::db::set_frame_set_reference(&s.fixture.conn, s.fixture.set_id, s.ids[1]).unwrap();
+        let mut other = config();
+        other.grouping.exposure_mode = ExposureMode::NoSplit;
+        other.reference.mode = crate::stacking::config::ReferenceMode::Manual;
+        let second = run_once(&s, &other);
+        let key_of = |run_id| {
+            list_groups(&s.fixture.conn, run_id).unwrap()[0]
+                .group_key
+                .clone()
+        };
+        assert_ne!(key_of(first), key_of(second), "premise: no group in common");
+        let after = registered_state(&s, second);
+        assert!(
+            before.iter().zip(&after).all(|(b, a)| b.2 != a.2 && b.1 != a.1),
+            "premise: the second run re-registered every frame: {before:?} {after:?}"
+        );
+
+        assert_eq!(states(&s, first), vec![AlignedState::Replaced; 4]);
+        assert_eq!(states(&s, second), vec![AlignedState::Available; 4]);
+        assert!(matches!(
+            resolve_stacking_aligned_path(&s.ctx, first, s.ids[0]),
+            Err(ApiError::NotFound(m)) if m.contains("later run")
+        ));
+    }
+
+    /// A file that is no longer the one its row recorded - a later run overwrote it and was cancelled before it recorded
+    /// the new identity - is not the run's aligned frame either, whatever the groups say.
+    #[test]
+    fn aligned_file_that_is_not_the_recorded_one_is_replaced() {
+        let s = seeded(&[4.0; 4], 0);
+        let run_id = run_once(&s, &config());
+        let path = resolve_stacking_aligned_path(&s.ctx, run_id, s.ids[2]).unwrap();
+        let recorded = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Same bytes, later modification time: only the identity tells the files apart.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(recorded + std::time::Duration::from_secs(5)).unwrap();
+        drop(file);
+
+        let mut expected = vec![AlignedState::Available; 4];
+        expected[2] = AlignedState::Replaced;
+        assert_eq!(states(&s, run_id), expected);
+        assert!(matches!(
+            resolve_stacking_aligned_path(&s.ctx, run_id, s.ids[2]),
+            Err(ApiError::NotFound(m)) if m.contains("later run")
+        ));
     }
 
     #[test]
