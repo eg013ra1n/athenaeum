@@ -19110,7 +19110,7 @@ mod tests {
         // Run B: another reference, cancelled right after its Register fan-out.
         crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
             .unwrap();
-        let (rc_b, res) = rig.run_with(&cfg, true);
+        let (_rc_b, res) = rig.run_with(&cfg, true);
         assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
         let rows_b = rig.registered_snapshot();
         assert_eq!(rows_b.len(), rows_a.len());
@@ -19127,13 +19127,8 @@ mod tests {
         // Run A's config again.
         crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[0])
             .unwrap();
-        // The gate judges the latest run's frame rows, and a run cancelled inside Register has written none (they are
-        // written at the end of the stage). Drop the cancelled run's row so the gate reads run A's frames: what is
-        // under test is whether it trusts the files, not which run it reads.
-        rig.fixture
-            .conn
-            .execute("DELETE FROM stacking_runs WHERE id = ?1", [rc_b.run_id])
-            .unwrap();
+        // Run B, cancelled inside Register, wrote no frame rows; the gate (ruling R9) reads run A's, and what is under
+        // test is that it does not trust the files B overwrote.
         assert!(rig.register_stale(&cfg), "the gate trusted files another run overwrote");
         let (mut rc, logs) = crate::stacking::telemetry::capture_logs(|| rig.run(&cfg));
         assert_eq!(
@@ -19152,6 +19147,34 @@ mod tests {
                 "plane {p}: the master is not run A's"
             );
         }
+    }
+
+    /// Ruling R9: a run cancelled inside Register is the newest run and has no frame rows (they are written when the
+    /// stage is done). The gate used to judge those no rows and read Register fresh; it now judges the latest run that
+    /// has rows. Run A, then run B on another manual reference cancelled inside Register, then the gate under B's
+    /// config: run A's rows name another reference, so Register is stale.
+    #[test]
+    fn a_run_cancelled_inside_register_reads_register_stale() {
+        use crate::stacking::config::ExposureMode;
+
+        let rig = RegisterRig::new();
+        let cfg = rig.cfg(ExposureMode::Seconds);
+        let rc_a = rig.run(&cfg);
+        assert!(!rig.register_stale(&cfg), "run A's own rows read fresh");
+
+        crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
+            .unwrap();
+        let (rc_b, res) = rig.run_with(&cfg, true);
+        assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+        assert!(
+            crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_b.run_id).unwrap().is_empty(),
+            "premise: the cancelled run wrote no frame rows"
+        );
+        assert!(
+            !crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc_a.run_id).unwrap().is_empty(),
+            "premise: run A did"
+        );
+        assert!(rig.register_stale(&cfg), "the gate read the cancelled run's empty frame list as fresh");
     }
 
     /// Ruling R4 (c) (Task 5): the `.rej` stem is the frame's own stem. Two frames of one merged group whose

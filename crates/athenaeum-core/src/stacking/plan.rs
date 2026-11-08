@@ -1919,7 +1919,10 @@ fn compute_register_stale(
     grid: Option<&crate::collab::grid::CanonicalGrid>,
     measure_betas: &HashMap<String, f64>,
 ) -> Result<bool, ApiError> {
-    let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
+    // Ruling R9: the latest run that HAS frame rows. A run cancelled before the end of Register wrote none (they are
+    // written once the stage is done), and reading it would judge no frame at all and call Register fresh while the
+    // files that run overwrote are not the ones the rows recorded.
+    let Some((last_run, last_run_frames)) = latest_run_with_frame_rows(conn, subject)? else {
         return Ok(true);
     };
     let prepare_path = crate::stacking::origin::subject_prepares(subject, origins);
@@ -2013,7 +2016,7 @@ fn compute_register_stale(
     let by_frame: HashMap<i64, &RegistrationRecord> =
         rows.iter().map(|r| (r.frame_id, r)).collect();
 
-    let included_frame_ids: Vec<i64> = list_frame_rows(conn, last_run.id)?
+    let included_frame_ids: Vec<i64> = last_run_frames
         .into_iter()
         .filter(|f| f.included)
         .map(|f| f.frame_id)
@@ -2099,6 +2102,31 @@ fn compute_register_stale(
     }
 
     Ok(false)
+}
+
+/// How many of the latest runs [`latest_run_with_frame_rows`] looks through.
+const REGISTER_GATE_RUN_WINDOW: usize = 20;
+
+/// The latest run of `subject` that has `stacking_run_frames` rows, with them (ruling R9). A run that failed or was
+/// cancelled before the end of Register has none; the gate then judges the run before it. `None` when no recent run
+/// has any, which reads Register stale.
+fn latest_run_with_frame_rows(
+    conn: &Connection,
+    subject: &StackSubject,
+) -> Result<
+    Option<(
+        crate::db::stacking::StackingRunRow,
+        Vec<crate::db::stacking::StackingRunFrameRow>,
+    )>,
+    ApiError,
+> {
+    for run in list_runs(conn, subject, REGISTER_GATE_RUN_WINDOW)? {
+        let frames = list_frame_rows(conn, run.id)?;
+        if !frames.is_empty() {
+            return Ok(Some((run, frames)));
+        }
+    }
+    Ok(None)
 }
 
 /// `group key -> that group's OWN registration reference`, read out of the
@@ -3666,9 +3694,16 @@ pub fn build_plan(
         // reports fresh against the OLD set until a real run updates it —
         // documented, not fixed, here (weights are pixel-phase data).
         let ln_reference_info: Option<LnReferencePayload> = if local_normalization_active {
+            // Ruling R10 M4: the run reuses the reference only while its file is the one its row recorded
+            // (`is_fresh` on the payload's own hash); a deleted or replaced file reads as no reference.
             find_artifact(conn, subject, &g.key, "ln_reference", None)?
-                .and_then(|row| row.payload_json)
-                .and_then(|s| serde_json::from_str::<LnReferencePayload>(&s).ok())
+                .and_then(|row| {
+                    let payload = serde_json::from_str::<LnReferencePayload>(
+                        row.payload_json.as_deref()?,
+                    )
+                    .ok()?;
+                    is_fresh(&row, &payload.reference_hash).then_some(payload)
+                })
         } else {
             None
         };
@@ -8107,6 +8142,24 @@ mod tests {
             plan2.stale_stages
         );
         assert_eq!(plan2.groups[0].ln_cached, 0, "{:?}", plan2.groups[0]);
+
+        // Ruling R10 M4: the run reuses the LN reference only while its file is the one its row recorded. With the
+        // file gone the gate must not verify the `ln` rows against the stored payload: Normalize is stale.
+        std::fs::remove_file(&reference_path).unwrap();
+        let plan3 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            plan3.stale_stages.contains(&Stage::Normalize),
+            "a deleted LN reference file read as fresh: {:?}",
+            plan3.stale_stages
+        );
+        assert_eq!(plan3.groups[0].ln_cached, 0, "{:?}", plan3.groups[0]);
     }
 
     /// M2 Task 7 carry-over (c) (Task 5's re-review): a frame the LATEST run
