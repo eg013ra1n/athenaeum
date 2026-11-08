@@ -5277,7 +5277,7 @@ fn stage_measure_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<
             );
             // Every file written gets its row BEFORE a cancel is honoured (R11c-5 (1)), group by group.
             for (&g, res) in p1_groups.iter().zip(&results) {
-                if let Err(e) = upsert_pass1_rows(rc, &groups[g], &prepared[g].state, res) {
+                if let Err(e) = upsert_pass1_rows(rc, &prepared[g].state, res) {
                     replay_measure_stash(rc, prepared.into_iter().map(|g| (g.warnings, g.exclusions)));
                     return Err(e);
                 }
@@ -5305,7 +5305,7 @@ fn stage_measure_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<
                     None if state.need_pass1.is_empty() => None,
                     None => {
                         let res = measure_pass1_queue(rc, group, &opts, &state, current, total);
-                        upsert_pass1_rows(rc, group, &state, &res)?;
+                        upsert_pass1_rows(rc, &state, &res)?;
                         Some(res)
                     }
                 };
@@ -5662,7 +5662,7 @@ fn measure_group_finish(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    &group.key,
+                    artifact_group_key("metrics", &group.key),
                     "metrics",
                     Some(frame.frame_id),
                 )?
@@ -5677,7 +5677,6 @@ fn measure_group_finish(
                                     fits_artifact_fresh(
                                         &conn,
                                         &rc.subject,
-                                        &group.key,
                                         frame.frame_id,
                                         Some(payload.as_str()),
                                         &expected_hash,
@@ -6280,7 +6279,7 @@ fn measure_two_pass_prepare(
             idx,
             frame,
             path,
-            spill: rc.layout.measured_path(&group.key, &stem),
+            spill: rc.layout.measured_path(&stem),
             pass1_key: pass1_hash_for(cfg, &calib_hash),
             calib_hash,
             cached: None,
@@ -6295,14 +6294,14 @@ fn measure_two_pass_prepare(
                     crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        &group.key,
+                        artifact_group_key("metrics", &group.key),
                         "metrics",
                         Some(member.frame.frame_id),
                     )?,
                     crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        &group.key,
+                        artifact_group_key(PASS1_ARTIFACT_KIND, &group.key),
                         PASS1_ARTIFACT_KIND,
                         Some(member.frame.frame_id),
                     )?,
@@ -6329,7 +6328,13 @@ fn measure_two_pass_prepare(
                     }
                 }
             }
-            if spilled.is_some_and(|row| is_fresh(&row, &member.pass1_key)) {
+            if let Some(row) = spilled.filter(|row| is_fresh(row, &member.pass1_key)) {
+                // The row's own path is the artifact (spec §5.7: a row written before the frame-level key keeps its
+                // `measured/<group_key>/` path, and a frame's stem may have changed since): the layout path is only
+                // for a new write. A fresh row without a path reads as absent (`is_fresh` requires one).
+                if let Some(path) = row.path.as_deref() {
+                    member.spill = PathBuf::from(path);
+                }
                 if member.own.is_none() {
                     if let Some(head) = validate_pass1_spill(
                         rc.run_id,
@@ -6452,7 +6457,6 @@ fn measure_pass1_queue(
 /// Every pass-1 file written gets its row BEFORE a cancel is honoured: a cancelled run's re-run reuses it (R11c-5 (1)).
 fn upsert_pass1_rows(
     rc: &RunContext,
-    group: &IntegrationGroup,
     state: &TwoPassState,
     results: &[Option<Result<Pass1Done, String>>],
 ) -> Result<(), RunError> {
@@ -6460,7 +6464,6 @@ fn upsert_pass1_rows(
         if let Some(Ok(Pass1Done { written: true, .. })) = res {
             upsert_pass1_row(
                 rc,
-                group,
                 &state.members[i].frame,
                 &state.members[i].spill,
                 &state.members[i].pass1_key,
@@ -6575,7 +6578,6 @@ fn measure_two_pass_rest(
                     fits_artifact_fresh_for_planes(
                         &conn,
                         &rc.subject,
-                        &group.key,
                         members[i].frame.frame_id,
                         m.channels.len(),
                         &expected,
@@ -6724,7 +6726,6 @@ fn measure_two_pass_rest(
         if let Some(Ok(Pass2Done { written: true, .. })) = res {
             upsert_pass1_row(
                 rc,
-                group,
                 &members[i].frame,
                 &members[i].spill,
                 &members[i].pass1_key,
@@ -6757,19 +6758,27 @@ fn measure_two_pass_rest(
 /// run's re-run reuses it). The identity recorded is the file's own, as `fits.<plane>`'s is.
 fn upsert_pass1_row(
     rc: &RunContext,
-    group: &IntegrationGroup,
     frame: &GroupFrame,
     spill: &Path,
     key: &str,
 ) -> Result<(), RunError> {
     let (size, modified_at) = file_identity(spill)?;
     let conn = db(&rc.ctx)?.conn();
+    // The row this write replaces, read BEFORE the upsert: its file goes once nothing points to it (a frame whose
+    // stem or folder changed since the old row was written).
+    let old = crate::db::stacking::find_artifact(
+        &conn,
+        &rc.subject,
+        artifact_group_key(PASS1_ARTIFACT_KIND, ""),
+        PASS1_ARTIFACT_KIND,
+        Some(frame.frame_id),
+    )?;
     upsert_artifact(
         &conn,
         &NewArtifact {
             subject: &rc.subject,
             frame_id: Some(frame.frame_id),
-            group_key: &group.key,
+            group_key: artifact_group_key(PASS1_ARTIFACT_KIND, ""),
             kind: PASS1_ARTIFACT_KIND,
             path: spill.to_str(),
             config_hash: key,
@@ -6778,6 +6787,7 @@ fn upsert_pass1_row(
             payload_json: None,
         },
     )?;
+    replace_frame_level_file(&conn, &rc.layout.measured_root(), old.as_ref(), spill);
     Ok(())
 }
 
@@ -6819,7 +6829,7 @@ fn persist_measurement(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(frame.frame_id),
-                group_key: &group.key,
+                group_key: artifact_group_key("metrics", &group.key),
                 kind: "metrics",
                 path: None,
                 config_hash: expected_hash,
@@ -6837,7 +6847,7 @@ fn persist_measurement(
     // its staleness (see `plan.rs`'s per-frame loop).
     let stem = frame_file_stem(frame);
     for (plane, plane_fits) in fits.iter().enumerate() {
-        let fits_path = rc.layout.fits_path(&group.key, &stem, plane);
+        let fits_path = rc.layout.fits_path(&stem, plane);
         // Final fix wave (ruling C-30, the whole-branch
         // review's I1): a `.athf` write failure DEGRADES,
         // it does not fail the run. Every consumer of
@@ -6909,12 +6919,20 @@ fn persist_measurement(
         let (size, modified_at) = file_identity(&fits_path)?;
         let kind = fits_artifact::artifact_kind(plane);
         let conn = db(&rc.ctx)?.conn();
+        // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
+        let old = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            artifact_group_key(&kind, &group.key),
+            &kind,
+            Some(frame.frame_id),
+        )?;
         upsert_artifact(
             &conn,
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(frame.frame_id),
-                group_key: &group.key,
+                group_key: artifact_group_key(&kind, &group.key),
                 kind: &kind,
                 path: fits_path.to_str(),
                 config_hash: expected_hash,
@@ -6923,6 +6941,7 @@ fn persist_measurement(
                 payload_json: None,
             },
         )?;
+        replace_frame_level_file(&conn, &rc.layout.fits_root(), old.as_ref(), &fits_path);
     }
     Ok(())
 }
@@ -7764,7 +7783,6 @@ fn resolve_register_fits(
         Ok(fits_artifact_fresh_for_planes(
             &conn,
             &rc.subject,
-            group_key,
             frame_id,
             planes,
             &expected_hash,
@@ -7803,7 +7821,7 @@ fn resolve_register_fits(
         Ok(crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            group_key,
+            artifact_group_key(&kind, group_key),
             &kind,
             Some(frame_id),
         )?)
@@ -9941,7 +9959,6 @@ struct ReweighMember {
 /// back.
 fn read_member_fits(
     rc: &RunContext,
-    group_key: &str,
     member: &ReweighMember,
     plane: usize,
 ) -> Result<Option<Vec<psf_signal::StarFit>>, RunError> {
@@ -9951,7 +9968,7 @@ fn read_member_fits(
         crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            group_key,
+            artifact_group_key(&kind, ""),
             &kind,
             Some(member.frame_id),
         )?
@@ -9967,7 +9984,6 @@ fn read_member_fits(
         Err(e) => {
             tracing::warn!(
                 run_id = rc.run_id,
-                group_key,
                 frame_id = member.frame_id,
                 plane,
                 path = %path,
@@ -10005,7 +10021,7 @@ fn plane_outcome(
         let Some((ch, map)) = plane_of(anchor) else {
             return Ok(missing(anchor));
         };
-        let Some(fits) = read_member_fits(rc, group_key, &members[anchor], plane)? else {
+        let Some(fits) = read_member_fits(rc, &members[anchor], plane)? else {
             return Ok(missing(anchor));
         };
         common_set::candidates(&common_set::MemberPlane {
@@ -10025,7 +10041,7 @@ fn plane_outcome(
         let Some((ch, map)) = plane_of(k) else {
             return Ok(missing(k));
         };
-        let Some(fits) = read_member_fits(rc, group_key, &members[k], plane)? else {
+        let Some(fits) = read_member_fits(rc, &members[k], plane)? else {
             return Ok(missing(k));
         };
         usable.push(common_set::match_member(
@@ -13974,7 +13990,7 @@ fn run_group_normalization(
                         crate::db::stacking::find_artifact(
                             &conn,
                             &rc.subject,
-                            &group.key,
+                            artifact_group_key(&kind, &group.key),
                             &kind,
                             Some(m.frame_id),
                         )?
@@ -18384,7 +18400,7 @@ mod tests {
                 &NewArtifact {
                     subject: &subject,
                     frame_id: Some(frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &hash,
@@ -18472,7 +18488,6 @@ mod tests {
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-        let group_key = plan_groups[0].key.clone();
         let subject = StackSubject::FrameSet(fixture.set_id);
         let run = |label: &str| {
             let (run_id, group_ids) = seed_run_and_groups(
@@ -18574,7 +18589,7 @@ mod tests {
                 &NewArtifact {
                     subject: &subject,
                     frame_id: Some(frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &hash,
@@ -18794,7 +18809,7 @@ mod tests {
                     &NewArtifact {
                         subject: &self.subject,
                         frame_id: Some(frame_id),
-                        group_key: &self.group_key,
+                        group_key: "",
                         kind: "metrics",
                         path: None,
                         config_hash: &hash,
@@ -18812,6 +18827,234 @@ mod tests {
             ids.sort_unstable();
             ids
         }
+    }
+
+    /// The `(group key, created_at, config hash, path)` of every `metrics`, `measured` and `fits.0` row, by (kind,
+    /// frame): what a regroup must leave untouched.
+    fn measure_rows_snapshot(
+        rig: &Pass1Rig,
+    ) -> Vec<(String, i64, String, String, String, Option<String>)> {
+        let mut out = Vec::new();
+        for kind in ["metrics", "measured", "fits.0"] {
+            for (frame_id, row) in rig.rows(kind) {
+                out.push((
+                    kind.to_string(),
+                    frame_id,
+                    row.group_key.clone(),
+                    row.created_at.clone(),
+                    row.config_hash.clone(),
+                    row.path.clone(),
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Frame-level cache spec §5.1 (Task 4): a regroup (here "one group per exposure" -> "no split") finds the
+    /// `metrics`, `measured` and `fits.0` rows again: neither pass runs, the group beta is the same, and no row or
+    /// file is rewritten.
+    #[test]
+    fn measure_rows_are_reused_across_a_regroup() {
+        let mut rig = Pass1Rig::new();
+        rig.cfg.grouping.exposure_mode = crate::stacking::config::ExposureMode::Seconds;
+        rig.plan_groups =
+            group_frames(&rig.fixture.conn, rig.fixture.set_id, &rig.cfg.grouping).unwrap();
+        let (first, logs1) =
+            crate::stacking::telemetry::capture_logs(|| rig.run("run 1", None));
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 4, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass2"), 4, "{logs1}");
+        let rows1 = measure_rows_snapshot(&rig);
+        assert_eq!(rows1.len(), 12, "metrics, measured and fits.0 for four frames");
+        assert!(rows1.iter().all(|r| r.2.is_empty()), "frame-level rows sit under the empty key: {rows1:?}");
+
+        let old_key = rig.plan_groups[0].key.clone();
+        rig.cfg.grouping.exposure_mode = crate::stacking::config::ExposureMode::NoSplit;
+        rig.plan_groups =
+            group_frames(&rig.fixture.conn, rig.fixture.set_id, &rig.cfg.grouping).unwrap();
+        assert_ne!(rig.plan_groups[0].key, old_key, "the two groupings must name the group differently");
+        let (second, logs2) =
+            crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        assert_eq!(fan_out_items(&logs2, "measure", "pass1"), 0, "a regroup re-ran pass 1: {logs2}");
+        assert_eq!(fan_out_items(&logs2, "measure", "pass2"), 0, "a regroup re-ran pass 2: {logs2}");
+        assert!(second.logged.is_empty(), "{:?}", second.logged);
+        assert_eq!(second.beta, first.beta, "the same members, the same group beta");
+        assert_eq!(measure_rows_snapshot(&rig), rows1, "a regroup rewrote or added rows");
+    }
+
+    /// Frame-level cache spec §5.1, review focus 1 (Task 4): two exposure classes with different PSF shapes (one
+    /// Moffat at beta 2.5, one Gaussian) have different group betas; merged into one group the group beta is a third
+    /// value. Pass 1 is reused (it is keyed on the calibration hash and the measurement subtree, not on the group
+    /// beta) and pass 2 re-runs for every member.
+    #[test]
+    fn merged_group_with_a_new_beta_reruns_pass_two_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        // Three frames per class: a group needs three included frames to be measured at all.
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (0.0, 0.0), (3.0, 0.0), (0.0, 3.0)];
+        let mut light_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let moffat_class = i < 3;
+            let spec = LightSpec {
+                exptime: if moffat_class { 60.0 } else { 120.0 },
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let stars = shifted_stars(dx, dy);
+            let (id, _) = if moffat_class {
+                test_fixtures::add_light_with_moffat_field(
+                    &fixture,
+                    &spec,
+                    &stars,
+                    3.4,
+                    2.5,
+                    600.0,
+                    5.0,
+                    100 + i as u64,
+                )
+            } else {
+                test_fixtures::add_light_with_field_fwhm(
+                    &fixture,
+                    &spec,
+                    &stars,
+                    3.4,
+                    600.0,
+                    5.0,
+                    100 + i as u64,
+                )
+            };
+            light_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+
+        // One Measure stage under `mode`; returns every group's beta and the captured logs.
+        let measure = |mode: crate::stacking::config::ExposureMode| {
+            let mut cfg = StackingConfig::default();
+            cfg.grouping.exposure_mode = mode;
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups.clone(),
+                layout.clone(),
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            let (res, logs) = crate::stacking::telemetry::capture_logs(|| {
+                run_stages_for_test(&mut rc, Stage::Measure)
+            });
+            res.unwrap();
+            let betas: Vec<f64> = plan_groups
+                .iter()
+                .map(|g| rc.measured_groups[&g.key].beta.expect("a measured group has a beta"))
+                .collect();
+            (plan_groups.len(), betas, logs)
+        };
+
+        let (n_split, betas_split, logs1) = measure(crate::stacking::config::ExposureMode::Seconds);
+        assert_eq!(n_split, 2, "one group per exposure class");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 6, "{logs1}");
+        assert_eq!(fan_out_items(&logs1, "measure", "pass2"), 6, "{logs1}");
+
+        let (n_merged, betas_merged, logs2) =
+            measure(crate::stacking::config::ExposureMode::NoSplit);
+        assert_eq!(n_merged, 1);
+        assert!(
+            betas_split.iter().any(|b| *b != betas_merged[0]),
+            "premise: the merged group's beta differs from a source group's: {betas_split:?} -> {betas_merged:?}"
+        );
+        assert!(
+            betas_split.iter().all(|b| *b != betas_merged[0]),
+            "premise: ... and from both of them: {betas_split:?} -> {betas_merged:?}"
+        );
+        assert_eq!(
+            fan_out_items(&logs2, "measure", "pass1"),
+            0,
+            "the first passes are the frames', not the group's: {logs2}"
+        );
+        assert_eq!(
+            fan_out_items(&logs2, "measure", "pass2"),
+            6,
+            "every member is refitted at the new group beta: {logs2}"
+        );
+    }
+
+    /// Frame-level cache spec §5.7 (Task 4): a `measured` row whose path is in an old `measured/<group_key>/` folder
+    /// under another stem is the artifact, read as it stands: no pass 1, no spurious refusal for the file the layout
+    /// would name now, nothing written to the layout path.
+    #[test]
+    fn the_spill_is_read_from_the_row_path() {
+        let rig = Pass1Rig::new();
+        rig.run("run 1", None);
+        let old_dir = rig.measured_root().join("old_group_key");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let mut moved = Vec::new();
+        for (frame_id, row) in rig.rows("measured") {
+            let old = old_dir.join(format!("legacy_{frame_id}.athm"));
+            std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
+            rig.fixture
+                .conn
+                .execute(
+                    "UPDATE stacking_artifacts SET path = ?1 WHERE id = ?2",
+                    rusqlite::params![old.to_str().unwrap(), row.id],
+                )
+                .unwrap();
+            moved.push(old);
+        }
+        assert_eq!(moved.len(), 4);
+        // Pass 2 is lost; the first passes are only on disk under their old names.
+        rig.delete_rows(&["metrics", "fits.0"]);
+
+        let (second, logs) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
+        assert_eq!(fan_out_items(&logs, "measure", "pass1"), 0, "pass 1 re-ran: {logs}");
+        assert_eq!(fan_out_items(&logs, "measure", "pass2"), 4, "{logs}");
+        assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
+        assert!(
+            !logs.contains("first-pass artifact"),
+            "no refusal or stale line for a spill read from its row: {logs}"
+        );
+        let rows = rig.rows("measured");
+        assert_eq!(rows.len(), 4);
+        for row in rows.values() {
+            let path = PathBuf::from(row.path.as_ref().unwrap());
+            assert!(moved.contains(&path), "the row keeps its path: {path:?}");
+            assert!(path.is_file());
+        }
+        let in_layout_root: Vec<_> = std::fs::read_dir(rig.measured_root())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(in_layout_root.is_empty(), "nothing was written to the layout path: {in_layout_root:?}");
     }
 
     /// Plan A Task 11c, bar 3: a first pass is alive only while its worker holds it, so the peak over a fresh run
@@ -18988,8 +19231,9 @@ mod tests {
     #[test]
     fn measure_pass1_write_failure_recomputes_in_pass_two() {
         let rig = Pass1Rig::new();
-        std::fs::create_dir_all(rig.measured_root()).unwrap();
-        std::fs::write(rig.measured_root().join(&rig.group_key), b"not a directory").unwrap();
+        // The spill folder is flat now (frame-level cache): a file stands where `measured/` belongs.
+        std::fs::create_dir_all(rig.measured_root().parent().unwrap()).unwrap();
+        std::fs::write(rig.measured_root(), b"not a directory").unwrap();
         let out = rig.run("run 1", None);
         assert!(rig.rows("measured").is_empty(), "no row for a file that is not there");
         assert_eq!(rig.rows("metrics").len(), 4);
@@ -19652,7 +19896,7 @@ mod tests {
     /// resolve: `create_dir_all(parent)` and the tmp write both succeed,
     /// the final rename onto a directory does not) — one frame, so the
     /// degrade fires exactly ONCE and its three siblings prove the run is
-    /// otherwise untouched. Blocking the whole `fits/<group>` directory
+    /// otherwise untouched. Blocking the whole `fits/` directory
     /// instead would fail all four writes and could not tell a per-plane
     /// `continue` apart from a stage that gave up.
     #[test]
@@ -19732,7 +19976,7 @@ mod tests {
         // this test's own tree for the reason `FITS_WRITE_FAILURE_LOG`'s
         // own doc gives — sibling tests measure frames concurrently under
         // `cargo test`'s default parallelism. The prefix is the victim's
-        // own `fits/<group>` directory as the DB spells it, NOT
+        // own `fits/` directory as the DB spells it, NOT
         // `working.path()`: on macOS the tempdir hands out `/var/folders/…`
         // while everything the run writes carries the canonical
         // `/private/var/folders/…`, so a `working.path()` prefix matches
@@ -21381,7 +21625,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(fixture.set_id),
                     frame_id: Some(frame_id),
-                    group_key,
+                    group_key: "",
                     kind: &fits_artifact::artifact_kind(0),
                     path: Some(path.to_str().unwrap()),
                     config_hash: &expected_hash,
@@ -22992,17 +23236,16 @@ mod tests {
                 .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
                 .collect();
             let mut files = Vec::new();
-            for g in &plan_groups {
-                for dir in [layout.measured_dir(&g.key), layout.fits_dir(&g.key)] {
-                    let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-                    let mut names: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
-                    names.sort();
-                    for n in names {
-                        files.push((
-                            format!("{}/{}", g.key, n.file_name().unwrap().to_string_lossy()),
-                            std::fs::read(&n).unwrap(),
-                        ));
-                    }
+            // Frame-level folders: flat, no group sub-folder (spec §5.1).
+            for dir in [layout.measured_dir(), layout.fits_dir()] {
+                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                let mut names: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
+                names.sort();
+                for n in names {
+                    files.push((
+                        n.file_name().unwrap().to_string_lossy().to_string(),
+                        std::fs::read(&n).unwrap(),
+                    ));
                 }
             }
             let mut order = Vec::new();
@@ -24369,7 +24612,7 @@ mod tests {
 
         run_stages_for_test(&mut rc, Stage::Register).unwrap();
 
-        let fits_path = layout.fits_path(&group_key, &stem, 0);
+        let fits_path = layout.fits_path(&stem, 0);
         assert!(
             fits_path.exists(),
             "f0's fits artifact must exist right after Measure: {fits_path:?}"

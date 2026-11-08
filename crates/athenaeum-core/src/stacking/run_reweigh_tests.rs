@@ -557,7 +557,7 @@ fn a_member_without_a_fresh_fits_artifact_sends_the_plane_back_to_its_measure_ti
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &key,
+        "",
         "fits.0",
         Some(h.ids[2]),
     )
@@ -590,7 +590,7 @@ fn a_group_that_fell_back_reaches_the_output_stage_as_a_fallback() {
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &key,
+        "",
         "fits.0",
         Some(h.ids[2]),
     )
@@ -906,7 +906,7 @@ fn a_fallback_outside_the_psf_family_warns_of_the_gain_not_the_weights() {
         let row = crate::db::stacking::find_artifact(
             &h.fixture.conn,
             &StackSubject::FrameSet(h.fixture.set_id),
-            &key,
+            "",
             "fits.0",
             Some(h.ids[2]),
         )
@@ -1312,7 +1312,7 @@ fn a_plane_that_falls_back_leaves_its_siblings_reweighed() {
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &key,
+        "",
         "fits.1",
         Some(h.ids[3]),
     )
@@ -1347,7 +1347,7 @@ fn halve_s(h: &Harness, i: usize, plane: usize) {
     let row = crate::db::stacking::find_artifact(
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
-        &h.key(),
+        "",
         &crate::stacking::fits_artifact::artifact_kind(plane),
         Some(h.ids[i]),
     )

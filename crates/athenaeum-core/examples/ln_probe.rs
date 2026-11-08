@@ -362,7 +362,7 @@ fn main() {
         let measurement = match find_artifact(
             &conn,
             &StackSubject::FrameSet(args.set_id),
-            &group.key,
+            artifact_group_key("metrics", &group.key),
             "metrics",
             Some(gf.frame_id),
         ) {
@@ -374,7 +374,11 @@ fn main() {
                 Some(m) => m,
                 None => continue,
             },
-            _ => continue,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("frame {}: reading the metrics row failed ({e}), skipping", gf.frame_id);
+                continue;
+            }
         };
         let Some(reg) = registration_by_frame.get(&gf.frame_id) else {
             continue;

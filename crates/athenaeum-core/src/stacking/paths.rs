@@ -216,33 +216,34 @@ impl WorkingLayout {
         self.root.join("ln")
     }
 
-    /// `root/fits` — the parent of every group's persisted star-fits
-    /// subdirectory (Tier C Task 1, spec §2.2.1): one `.athf` file per
-    /// (frame, plane), the fits Measure's PSF fitter accepted, cached like
-    /// `metrics` (same hash, same `CleanupWhat::All`-only sweep) but with a
-    /// file on disk behind each row.
+    /// `root/fits` — the folder of every frame's persisted star-fits files (Tier C Task 1, spec §2.2.1; flat since
+    /// the frame-level cache, spec §5.1): one `.athf` file per (frame, plane), the fits Measure's PSF fitter
+    /// accepted, cached like `metrics` (same hash, same `CleanupWhat::All`-only sweep) but with a file on disk
+    /// behind each row. Rows written before that change keep their `fits/<group_key>/` sub-folder paths. It is also
+    /// the root the fits writer OWNS: a replaced fits file is removed only from here (ruling R4).
     pub fn fits_root(&self) -> PathBuf {
         self.root.join("fits")
     }
 
-    /// `root/measured` — the parent of every group's Measure first-pass artifacts (Plan A Task 11c, R11c-6): one
-    /// `.athm` file per frame holding every plane's pass-1 records, with a `stacking_artifacts` row of kind
-    /// `measured` behind it. An intermediate: it goes with `Intermediates` and `All` (not with `metrics`, which
+    /// `root/measured` — the folder of every frame's Measure first-pass artifact (Plan A Task 11c, R11c-6; flat since
+    /// the frame-level cache, spec §5.1, rows written before that keep their `measured/<group_key>/` sub-folder
+    /// paths): one `.athm` file per frame holding every plane's pass-1 records, with a `stacking_artifacts` row of
+    /// kind `measured` behind it. It is also the root the pass-1 writer OWNS (ruling R4). An intermediate: it goes with `Intermediates` and `All` (not with `metrics`, which
     /// keys on the calibration CONFIG hash and survives a re-calibration: a re-calibration rewrites the calibrated
     /// file, whose new identity stales every first-pass artifact anyway).
     pub fn measured_root(&self) -> PathBuf {
         self.root.join("measured")
     }
 
-    /// `root/measured/<group_key>` — one group's first-pass artifacts.
-    pub fn measured_dir(&self, group_key: &str) -> PathBuf {
-        self.measured_root().join(group_key)
+    /// `root/measured` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn measured_dir(&self) -> PathBuf {
+        self.measured_root()
     }
 
-    /// `root/measured/<group_key>/<stem>.athm` — one frame's first-pass artifact; `stem` is the SAME collision-safe
-    /// stem [`crate::stacking::run::frame_file_stem`] gave the calibrated file (as [`Self::fits_path`]'s).
-    pub fn measured_path(&self, group_key: &str, stem: &str) -> PathBuf {
-        self.measured_dir(group_key).join(format!("{stem}.athm"))
+    /// `root/measured/<stem>.athm` — one frame's first-pass artifact; `stem` is the SAME frame-only stem
+    /// [`crate::stacking::run::frame_file_stem`] gave the calibrated file (as [`Self::fits_path`]'s).
+    pub fn measured_path(&self, stem: &str) -> PathBuf {
+        self.measured_dir().join(format!("{stem}.athm"))
     }
 
     /// `root/runs` — one JSON snapshot per run (see [`Self::run_json`]).
@@ -280,20 +281,19 @@ impl WorkingLayout {
         self.ln_root().join(group_key)
     }
 
-    /// `root/fits/<group_key>` — one group's persisted star-fits files.
-    pub fn fits_dir(&self, group_key: &str) -> PathBuf {
-        self.fits_root().join(group_key)
+    /// `root/fits` — flat like [`Self::calibrated_dir`] (frame-level cache spec §5.1).
+    pub fn fits_dir(&self) -> PathBuf {
+        self.fits_root()
     }
 
-    /// `root/fits/<group_key>/<stem>.p<plane>.athf` — one PLANE's persisted
-    /// fits (Tier C Task 1): `stem` is the SAME collision-safe stem
+    /// `root/fits/<stem>.p<plane>.athf` — one PLANE's persisted
+    /// fits (Tier C Task 1): `stem` is the SAME frame-only stem
     /// [`crate::stacking::run::frame_file_stem`] gave the calibrated
     /// file (the same convention `registered_file_name` follows for its
     /// own naming), `plane` the 0-based [`crate::integration::plane_reader::PlaneReader`]
     /// index.
-    pub fn fits_path(&self, group_key: &str, stem: &str, plane: usize) -> PathBuf {
-        self.fits_dir(group_key)
-            .join(format!("{stem}.p{plane}.athf"))
+    pub fn fits_path(&self, stem: &str, plane: usize) -> PathBuf {
+        self.fits_dir().join(format!("{stem}.p{plane}.athf"))
     }
 
     /// `root/ln/<group_key>/reference.fits` — the group's chosen local-
@@ -1311,6 +1311,17 @@ mod tests {
             PathBuf::from("/work/LDN_1272/registered/g")
         );
         assert_eq!(layout.ln_dir("g"), PathBuf::from("/work/LDN_1272/ln/g"));
+        // Frame-level cache spec §5.1: the Measure kinds are flat too, no group sub-folder.
+        assert_eq!(layout.measured_dir(), PathBuf::from("/work/LDN_1272/measured"));
+        assert_eq!(
+            layout.measured_path("Light_0001_f7"),
+            PathBuf::from("/work/LDN_1272/measured/Light_0001_f7.athm")
+        );
+        assert_eq!(layout.fits_dir(), PathBuf::from("/work/LDN_1272/fits"));
+        assert_eq!(
+            layout.fits_path("Light_0001_f7", 2),
+            PathBuf::from("/work/LDN_1272/fits/Light_0001_f7.p2.athf")
+        );
         assert_eq!(layout.runs_dir(), PathBuf::from("/work/LDN_1272/runs"));
         assert_eq!(
             layout.run_json(42),
@@ -2346,10 +2357,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = WorkingLayout::new(tmp.path(), "set");
         assert_eq!(
-            layout.measured_path("g", "f1"),
-            layout.root.join("measured").join("g").join("f1.athm")
+            layout.measured_path("f1"),
+            layout.root.join("measured").join("f1.athm")
         );
-        let file = layout.measured_path("g", "f1");
+        let file = layout.measured_path("f1");
         write_bytes(&file, 96);
         seed_artifact(&c, 4, "measured", file.to_str().unwrap(), 96);
 

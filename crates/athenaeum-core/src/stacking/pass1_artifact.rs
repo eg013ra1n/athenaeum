@@ -1,5 +1,6 @@
 //! The Measure stage's first-pass artifact (Plan A Task 11c, rulings R11c-1 .. R11c-6): every plane's pass-1 records
-//! of one calibrated frame, written once to `<working_dir>/<set_slug>/measured/<group_key>/<stem>.athm` and read back
+//! of one calibrated frame, written once to `<working_dir>/<set_slug>/measured/<stem>.athm` (flat since the
+//! frame-level cache; rows written before it keep their `measured/<group_key>/` paths) and read back
 //! by pass 2 and by every later run whose key and source stamp still match. A second pass over the same pixels then
 //! costs a read and the fits, never the detection and the verdict pass again.
 //!

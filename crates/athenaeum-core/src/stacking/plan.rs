@@ -745,7 +745,13 @@ fn gate_measure_betas(
     'groups: for g in groups {
         let mut own: Vec<f64> = Vec::new();
         for f in g.frames.iter().filter(|f| !excluded.contains(&f.frame_id)) {
-            let Some(row) = find_artifact(conn, subject, &g.key, "metrics", Some(f.frame_id))?
+            let Some(row) = find_artifact(
+                conn,
+                subject,
+                artifact_group_key("metrics", &g.key),
+                "metrics",
+                Some(f.frame_id),
+            )?
             else {
                 continue 'groups;
             };
@@ -1072,7 +1078,6 @@ pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bo
 pub(crate) fn fits_artifact_fresh(
     conn: &Connection,
     subject: &StackSubject,
-    group_key: &str,
     frame_id: i64,
     metrics_payload: Option<&str>,
     expected_hash: &str,
@@ -1083,7 +1088,7 @@ pub(crate) fn fits_artifact_fresh(
     else {
         return Ok(false);
     };
-    fits_artifact_fresh_for_planes(conn, subject, group_key, frame_id, planes, expected_hash)
+    fits_artifact_fresh_for_planes(conn, subject, frame_id, planes, expected_hash)
 }
 
 /// [`fits_artifact_fresh`]'s own per-plane freshness loop, with the plane
@@ -1097,7 +1102,6 @@ pub(crate) fn fits_artifact_fresh(
 pub(crate) fn fits_artifact_fresh_for_planes(
     conn: &Connection,
     subject: &StackSubject,
-    group_key: &str,
     frame_id: i64,
     planes: usize,
     expected_hash: &str,
@@ -1107,8 +1111,15 @@ pub(crate) fn fits_artifact_fresh_for_planes(
     }
     for plane in 0..planes {
         let kind = fits_artifact::artifact_kind(plane);
-        let plane_fresh = find_artifact(conn, subject, group_key, &kind, Some(frame_id))?
-            .is_some_and(|row| is_fresh(&row, expected_hash));
+        // A frame-level kind: its rows sit under the empty key, whatever group the frame is in now.
+        let plane_fresh = find_artifact(
+            conn,
+            subject,
+            artifact_group_key(&kind, ""),
+            &kind,
+            Some(frame_id),
+        )?
+        .is_some_and(|row| is_fresh(&row, expected_hash));
         if !plane_fresh {
             return Ok(false);
         }
@@ -3684,8 +3695,13 @@ pub fn build_plan(
                 "calibrated",
                 Some(f.frame_id),
             )?;
-            let metrics_artifact =
-                find_artifact(conn, subject, &g.key, "metrics", Some(f.frame_id))?;
+            let metrics_artifact = find_artifact(
+                conn,
+                subject,
+                artifact_group_key("metrics", &g.key),
+                "metrics",
+                Some(f.frame_id),
+            )?;
 
             // Only worth resolving the frame's current stage-1 hash when
             // there is an existing artifact to compare it against — a frame
@@ -3755,7 +3771,6 @@ pub fn build_plan(
                 fits_artifact_fresh(
                     conn,
                     subject,
-                    &g.key,
                     f.frame_id,
                     metrics_artifact
                         .as_ref()
@@ -7095,7 +7110,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key,
+                group_key: artifact_group_key(&fits_artifact::artifact_kind(plane), group_key),
                 kind: &fits_artifact::artifact_kind(plane),
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
@@ -7133,7 +7148,7 @@ mod tests {
         );
         assert_ne!(current, earlier, "premise: the two versions key apart");
         let fresh = |planes: usize| {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, group_key, frame_id, planes, &current)
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, planes, &current)
                 .unwrap()
         };
         for plane in 0..3 {
@@ -7160,7 +7175,7 @@ mod tests {
             seed_fits_artifact(&f, group_key, frame_id, plane, hash);
         }
         let fresh = || {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, group_key, frame_id, 3, hash)
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, 3, hash)
                 .unwrap()
         };
         assert!(fresh(), "premise");
@@ -7272,7 +7287,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &metrics_hash,
@@ -7781,7 +7796,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &metrics_hash,
@@ -8052,7 +8067,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &group_key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &metrics_hash,
@@ -8439,7 +8454,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: &groups[0].key,
+                    group_key: "",
                     kind: "metrics",
                     path: None,
                     config_hash: &measurement_hash_for(&cfg, &calib_hash, None),
@@ -11667,7 +11682,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &subject,
                     frame_id,
-                    group_key: &group_key,
+                    group_key: artifact_group_key(kind, &group_key),
                     kind,
                     path,
                     config_hash: hash,

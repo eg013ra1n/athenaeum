@@ -3737,8 +3737,9 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       still labels the model "Auto (per-frame β)" (`stageSummary.ts`), which now names the diagnostic, not the β the
       fits are made at — a label line owed with the next frontend touch.
     - **The 11c amendment: the pass-1 spill (Plan A Task 11c; rulings R11c-1 … R11c-7; `PASS1_ARTIFACT_VERSION` = 1).**
-      Under `Auto`, pass 1 writes one artifact per member, `<working_dir>/<set_slug>/measured/<group>/<stem>.athm`
-      (a project's under `_projects/<slug>/`), the new `stacking_artifacts` kind `measured`; pass 2 reads it back and a
+      Under `Auto`, pass 1 writes one artifact per member, `<working_dir>/<set_slug>/measured/<stem>.athm`
+      (flat since the frame-level cache: a row written before keeps its `measured/<group>/` path, and a reader opens the
+      row's path; a project's under `_projects/<slug>/`), the new `stacking_artifacts` kind `measured`; pass 2 reads it back and a
       valid artifact skips every pass-1 plane read, detection, verdict pass and own-β sample. Pass 2 still reads the
       frame (its fits need the pixels).
       - R11c-1 stored vs derived: the `PlanePrep` verbatim, the head's timings, `w`, `h`, gain, `beta_own` and the

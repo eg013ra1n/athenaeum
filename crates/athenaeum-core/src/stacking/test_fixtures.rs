@@ -198,6 +198,45 @@ pub(crate) fn add_light_with_field_fwhm(
     (frame_id, path)
 }
 
+/// As [`add_light_with_field_fwhm`], but the stars are round MOFFAT profiles `A (1 + r²/α²)^(−beta)` of the given `fwhm`
+/// (px), through [`crate::test_support::moffat_field`]; `stars` carry the amplitude `A` (peak ADU above the background).
+/// Frame-level cache Task 4 renders two exposure classes at different PSF shapes so their group betas differ.
+pub(crate) fn add_light_with_moffat_field(
+    f: &Fixture,
+    spec: &LightSpec<'_>,
+    stars: &[(f64, f64, f64)],
+    fwhm: f64,
+    beta: f64,
+    background: f32,
+    noise_sigma: f32,
+    noise_seed: u64,
+) -> (i64, PathBuf) {
+    let filename = format!("{}.fits", spec.stem);
+    let path = f.dir.path().join(&filename);
+    // FWHM = 2 α √(2^(1/β) − 1).
+    let alpha = fwhm / (2.0 * (2.0_f64.powf(1.0 / beta) - 1.0).sqrt());
+    let moffat: Vec<crate::test_support::MoffatStar> = stars
+        .iter()
+        .map(|&(x, y, amp)| crate::test_support::MoffatStar {
+            x,
+            y,
+            amp,
+            alpha_x: alpha,
+            alpha_y: alpha,
+            theta: 0.0,
+        })
+        .collect();
+    let mut plane =
+        crate::test_support::moffat_field(spec.width, spec.height, &moffat, beta, background);
+    if noise_sigma > 0.0 {
+        crate::test_support::add_noise(&mut plane, noise_sigma, noise_seed);
+    }
+    write_light_fits_plane(&path, spec, &plane);
+    let (size, modified_at) = file_identity(&path);
+    let frame_id = insert_light_row(f, spec, &path, &filename, size, &modified_at);
+    (frame_id, path)
+}
+
 /// As [`add_light_with_field`], plus full-width horizontal BANDS — each
 /// `(y_start, y_end, excess_adu)` adds `excess_adu` to every pixel of rows
 /// `[y_start, y_end)` before the noise goes on top. A flat-topped trail,
@@ -689,6 +728,12 @@ fn write_light_fits_field_sigma(
     if noise_sigma > 0.0 {
         crate::test_support::add_noise(&mut plane, noise_sigma, noise_seed);
     }
+    write_light_fits_plane(path, spec, &plane);
+}
+
+/// Encodes `plane` (physical ADU) as the 16-bit light FITS `spec` describes and writes it to `path`.
+fn write_light_fits_plane(path: &Path, spec: &LightSpec<'_>, plane: &[f32]) {
+    let (w, h) = (spec.width, spec.height);
     // Encode as unsigned 16-bit via the standard BZERO=32768 offset: stored
     // signed value = physical value - 32768.
     let data: Vec<i16> = plane
