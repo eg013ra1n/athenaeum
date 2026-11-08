@@ -510,7 +510,11 @@ Frame-set keys are unchanged.
     (`{"exposureToleranceSec": x}`) and nothing else;
   - the new fields enter no stage hash. A different exposure mode changes
     the group keys, and the group-keyed artifacts are recomputed under the
-    new keys; that is the existing behaviour for any regrouping;
+    new keys; that is the existing behaviour for any regrouping
+    (**superseded 2026-11-08** by `2026-11-08-stacking-frame-level-cache-design.md`:
+    a frame's own artifacts are keyed on the frame, `group_key = ''`, and the
+    calibration hash carries the tolerance as a constant, so a regroup reuses
+    them; only group-level results are recomputed);
   - the pin compares against a golden hash literal recorded on `main`
     before the change, not old-config against new-config.
 - `output.*` is in no stage subtree today (`config.rs:~589-760`); the new
