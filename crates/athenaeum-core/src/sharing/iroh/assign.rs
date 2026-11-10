@@ -96,7 +96,7 @@
 //! want: a stalled peer is not necessarily a dead one, and closing its
 //! connection would make the next attempt pay a fresh handshake.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -282,37 +282,91 @@ impl CompletionWindow {
 ///
 /// **It starts FULL.** The design says what the bucket EARNS
 /// ([`HEDGE_BUDGET_RATIO`] × the bytes of every completed child) and what it is
-/// capped at ([`HEDGE_BUDGET_RATIO`] × the whole collection), but not where it
-/// starts; a bucket that starts empty can never pay for the very first hedge,
-/// which is the one that matters on a package whose first assignment lands on a
-/// useless peer. Starting full is also what a token bucket means everywhere
-/// else, and the cap still bounds the total spend.
+/// capped at, but not where it starts; a bucket that starts empty can never pay
+/// for the very first hedge, which is the one that matters on a package whose
+/// first assignment lands on a useless peer. Starting full is also what a token
+/// bucket means everywhere else, and the cap still bounds the total spend.
+///
+/// **A live run's cap** follows the items IN FLIGHT: the larger of
+/// [`HEDGE_BUDGET_RATIO`] × their bytes and half of the largest one — the cost
+/// of one hedge of it — and `0` when nothing is in flight. Tokens only come back
+/// as a refund of bytes that were never duplicated or as a share of completed
+/// bytes, so the duplicate bytes outstanding stay bounded by the cap, at most
+/// half the largest item. A full bucket can always pay for one hedge, so the
+/// stranded tail of a run is hedged one item at a time instead of waiting out
+/// the stall ceiling.
 #[derive(Debug)]
 pub(crate) struct HedgeBudget {
     tokens: f64,
     cap: f64,
+    /// The sizes of the items in flight, with how many of each (a multiset:
+    /// equal sizes retire one at a time).
+    in_flight: BTreeMap<u64, usize>,
+    /// The sum of `in_flight`, counting every item.
+    in_flight_bytes: u64,
 }
 
 impl HedgeBudget {
+    /// An empty live budget: no item in flight, so no cap.
+    fn live() -> Self {
+        Self {
+            tokens: 0.0,
+            cap: 0.0,
+            in_flight: BTreeMap::new(),
+            in_flight_bytes: 0,
+        }
+    }
+
+    /// A budget with a fixed cap of [`HEDGE_BUDGET_RATIO`] × `total_bytes`, for
+    /// the arithmetic tests; `extend`/`retire` replace the fixed cap with the
+    /// live one.
+    #[cfg(test)]
     fn new(total_bytes: u64) -> Self {
         let cap = HEDGE_BUDGET_RATIO * total_bytes as f64;
-        Self { tokens: cap, cap }
+        Self {
+            tokens: cap,
+            cap,
+            ..Self::live()
+        }
     }
 
-    /// A live run's item joins the run: the cap grows by its share, and so do
-    /// the tokens, as if it had been part of the batch from the start.
+    /// The cap the items in flight call for.
+    fn live_cap(&self) -> f64 {
+        match self.in_flight.keys().next_back() {
+            None => 0.0,
+            Some(&largest) => {
+                (HEDGE_BUDGET_RATIO * self.in_flight_bytes as f64).max(largest as f64 / 2.0)
+            }
+        }
+    }
+
+    /// A live run's item joins the run: the cap grows to what the items in
+    /// flight call for, and the tokens grow by the same amount, as if the item
+    /// had been part of the batch from the start.
     fn extend(&mut self, bytes: u64) {
-        let share = HEDGE_BUDGET_RATIO * bytes as f64;
-        self.cap += share;
-        self.tokens += share;
+        *self.in_flight.entry(bytes).or_insert(0) += 1;
+        self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes);
+        let cap = self.live_cap();
+        self.tokens += (cap - self.cap).max(0.0);
+        self.cap = cap;
     }
 
-    /// A live run's item has ended: its share leaves the cap, so the budget
-    /// stays [`HEDGE_BUDGET_RATIO`] of the items IN FLIGHT — what a batch of
-    /// them would have had — instead of growing with everything ever taken.
+    /// A live run's item has ended: the cap falls to what the items still in
+    /// flight call for, and the tokens follow it down.
     fn retire(&mut self, bytes: u64) {
-        let share = HEDGE_BUDGET_RATIO * bytes as f64;
-        self.cap = (self.cap - share).max(0.0);
+        match self.in_flight.get_mut(&bytes) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                self.in_flight.remove(&bytes);
+            }
+            None => {
+                debug_assert!(false, "a retired item was taken first");
+                tracing::error!(bytes, "hedge budget retired an item it never took");
+                return;
+            }
+        }
+        self.in_flight_bytes = self.in_flight_bytes.saturating_sub(bytes);
+        self.cap = self.live_cap();
         self.tokens = self.tokens.min(self.cap);
     }
 
@@ -887,10 +941,10 @@ pub(crate) async fn run_live(
 ) -> AssignmentReport {
     let remote: Remote = store.remote().clone();
     let blobs: Blobs = store.blobs().clone();
-    // The hedge budget grows with every item taken (`HedgeBudget::extend`):
-    // a live run has no batch size to take 5 % of.
+    // The hedge budget follows the items in flight (`HedgeBudget::extend` /
+    // `retire`): a live run has no batch size to take 5 % of.
     let ledger: Ledger = Arc::new(Mutex::new(HedgeLedger {
-        budget: HedgeBudget::new(0),
+        budget: HedgeBudget::live(),
         completions: CompletionWindow::default(),
         hedges: 0,
         hedge_bytes: 0,
@@ -2846,28 +2900,116 @@ mod tests {
         assert!(!waiting_on_busy(&states, &[a]));
     }
 
-    /// A live run's budget is 5 % of the items in flight: it grows with each
-    /// item taken and shrinks as each ends, and the tokens never exceed it.
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    /// A live run's cap follows the items in flight — the larger of 5 % of their
+    /// bytes and half the largest — growing with each item taken and shrinking
+    /// as each ends; the tokens never exceed it.
     #[test]
     fn a_live_budget_follows_the_items_in_flight() {
-        let mut b = HedgeBudget::new(0);
+        let mut b = HedgeBudget::live();
+        assert!(close(b.cap, 0.0) && close(b.tokens, 0.0), "empty at the start");
         b.extend(1_000_000);
+        assert!(close(b.cap, 500_000.0), "one hedge of the item: {}", b.cap);
+        assert!(close(b.tokens, 500_000.0), "an item brings its share");
         b.extend(3_000_000);
-        assert!((b.cap - 200_000.0).abs() < 1e-6);
-        assert!(
-            (b.tokens - 200_000.0).abs() < 1e-6,
-            "an item brings its share"
-        );
+        // 5 % of 4 MB is 200 kB; half of the 3 MB item is 1.5 MB.
+        assert!(close(b.cap, 1_500_000.0), "{}", b.cap);
+        assert!(close(b.tokens, 1_500_000.0), "the cap's increase joins: {}", b.tokens);
         assert!(b.try_charge(60_000));
         b.retire(3_000_000);
-        assert!((b.cap - 50_000.0).abs() < 1e-6);
+        assert!(close(b.cap, 500_000.0), "the floor drops to the 1 MB item: {}", b.cap);
         assert!(b.tokens <= b.cap, "the tokens follow the cap down");
         b.retire(1_000_000);
-        assert!(
-            b.cap.abs() < 1e-6,
-            "nothing in flight, no budget: {}",
-            b.cap
-        );
+        assert!(close(b.cap, 0.0), "nothing in flight, no budget: {}", b.cap);
+        assert!(b.tokens <= b.cap);
+    }
+
+    /// One item in flight: a full bucket pays for one hedge of half that item, a
+    /// second identical one waits for a refund.
+    #[test]
+    fn a_live_budget_admits_one_hedge_of_a_lone_item() {
+        let mut b = HedgeBudget::live();
+        b.extend(1_000_000);
+        assert!(b.try_charge(500_000), "half the item, from a full bucket");
+        assert!(!b.try_charge(500_000), "a second one is refused");
+        b.refund(500_000);
+        assert!(b.try_charge(500_000), "the refund pays for it again");
+        assert!(!b.try_charge(500_001), "more than half the item is never payable");
+    }
+
+    /// The cap is the larger of the ratio term and the floor, and the crossover
+    /// sits where the in-flight bytes are ten times the largest item.
+    #[test]
+    fn a_live_budget_cap_is_the_larger_of_the_ratio_and_the_floor() {
+        let mut b = HedgeBudget::live();
+        for _ in 0..10 {
+            b.extend(1_000_000);
+            assert!(close(b.cap, 500_000.0), "the floor holds up to ten items: {}", b.cap);
+            assert!(close(b.tokens, 500_000.0), "no increase, no new tokens");
+        }
+        // The eleventh item takes the ratio term (550 kB) past the floor.
+        b.extend(1_000_000);
+        assert!(close(b.cap, 550_000.0), "{}", b.cap);
+        assert!(close(b.tokens, 550_000.0), "{}", b.tokens);
+
+        // Many small items and one large: the floor wins, then the ratio again.
+        let mut b = HedgeBudget::live();
+        for _ in 0..100 {
+            b.extend(100_000);
+        }
+        assert!(close(b.cap, 500_000.0), "ratio term, 5 % of 10 MB: {}", b.cap);
+        b.extend(10_000_000);
+        assert!(close(b.cap, 5_000_000.0), "floor term, half of 10 MB: {}", b.cap);
+        b.retire(10_000_000);
+        assert!(close(b.cap, 500_000.0), "back to the ratio term: {}", b.cap);
+        assert!(b.tokens <= b.cap);
+    }
+
+    /// Retiring the largest item drops the floor to the next largest and clamps
+    /// the tokens to the new cap.
+    #[test]
+    fn a_live_budget_retiring_the_largest_item_lowers_the_floor() {
+        let mut b = HedgeBudget::live();
+        b.extend(4_000_000);
+        b.extend(1_000_000);
+        b.extend(1_000_000);
+        assert!(close(b.cap, 2_000_000.0), "{}", b.cap);
+        assert!(b.try_charge(1_000_000));
+        assert!(close(b.tokens, 1_000_000.0), "{}", b.tokens);
+        b.retire(4_000_000);
+        assert!(close(b.cap, 500_000.0), "half of the next largest: {}", b.cap);
+        assert!(close(b.tokens, 500_000.0), "clamped to the new cap: {}", b.tokens);
+    }
+
+    /// With nothing in flight there is no budget and nothing is admitted.
+    #[test]
+    fn a_live_budget_with_nothing_in_flight_admits_nothing() {
+        let mut b = HedgeBudget::live();
+        assert!(!b.try_charge(1), "an empty budget admits nothing");
+        b.extend(2_000_000);
+        b.retire(2_000_000);
+        assert!(close(b.cap, 0.0) && close(b.tokens, 0.0));
+        assert!(!b.try_charge(1), "a drained run admits nothing");
+        b.refund(1_000);
+        b.earn(1_000_000);
+        assert!(close(b.tokens, 0.0), "nothing can be earned past a zero cap");
+    }
+
+    /// Items of equal size retire one at a time.
+    #[test]
+    fn a_live_budget_counts_equal_sized_items_separately() {
+        let mut b = HedgeBudget::live();
+        b.extend(1_000_000);
+        b.extend(1_000_000);
+        b.extend(100_000);
+        assert!(close(b.cap, 500_000.0), "{}", b.cap);
+        b.retire(1_000_000);
+        assert!(close(b.cap, 500_000.0), "one 1 MB item is still in flight: {}", b.cap);
+        b.retire(1_000_000);
+        assert!(close(b.cap, 50_000.0), "only the 100 kB item is left: {}", b.cap);
         assert!(b.tokens <= b.cap);
     }
 }
