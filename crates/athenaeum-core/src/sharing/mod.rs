@@ -3,7 +3,7 @@
 //! This module defines [`SharingTransport`] — the seam between the sync engine
 //! (task A4) and whatever moves bytes between peers. It has exactly two
 //! implementors: a real iroh transport (task A5) and the in-process
-//! [`LoopbackTransport`] mock in [`loopback`], used to exercise the engine
+//! `LoopbackTransport` mock in `loopback`, used to exercise the engine
 //! (announce/fetch/serve/ack/events, plus fault injection) without a network.
 //!
 //! Scope discipline: this layer knows only about announcements, blobs, and
@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 pub mod iroh;
+#[cfg(any(test, feature = "test-support"))]
 pub mod loopback;
 pub mod types;
 
@@ -365,7 +366,7 @@ pub trait SharingTransport: Send + Sync {
     /// registration lingering. A host that wants a clean close awaits this on
     /// shutdown (receiver stop, web/Tauri exit, Perseus `Agent::shutdown`).
     ///
-    /// The default is a no-op: the in-process [`LoopbackTransport`] and the
+    /// The default is a no-op: the in-process `LoopbackTransport` and the
     /// legacy owned-`IrohTransport::shutdown` path have nothing extra to do here.
     /// The [`SharedIrohNode`](crate::sharing::iroh::node::SharedIrohNode) role
     /// handles route it to the node's single bounded teardown. Idempotent.

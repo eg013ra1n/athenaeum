@@ -1,77 +1,60 @@
-//! A2a — our own swarm assignment loop over `store.remote()` (D4 §4.5, T4).
+//! The live collab fetch engine: [`run_live`] over `store.remote()`.
 //!
-//! This module is the live collab fetch engine ([`run_live`]); it replaced
-//! iroh-blobs' `SplitStrategy::Split` fan-out (the package-era batch swarm
-//! fetch, removed 2026-11-10). The stock loop
-//! (`iroh_blobs::api::downloader::execute_get`) is a strictly sequential
-//! first-fit walk of the provider list per child: dial, `local_for_request`,
-//! `execute_get_sink`, and on an `Err` `continue` to the next provider, asking
-//! it only for `local.missing()`. That is sound and its byte-level resume is
-//! free — but it switches providers **only on an error**, never on
-//! uselessness, and it throws away the `get::Stats` every transfer produces.
+//! Frames arrive on a channel as [`LiveItem`]s. Each is one raw blob with its
+//! own `GetRequest`, hash, [`ProviderSet`] and cancel switch; the run assigns it
+//! to a provider, moves the bytes still missing, and sends its [`ItemOutcome`]
+//! the moment it ends. One item's failure is its own result and never aborts a
+//! sibling. Every round recomputes the missing range from the local store, so a
+//! reassignment resumes at the byte and never restarts the frame.
 //!
-//! D4 §1(б) calls that the correctness defect: a peer that accepts the
-//! connection and then dribbles 20 KB/s never errors, so the child request
-//! never moves, and if it is the last child of a package the whole package
-//! waits for it. This loop adds the two things the stock one cannot have:
+//! ## Providers and back-off
 //!
-//! - a **progress deadline** per assignment — no growth in the request's
-//!   `bytes_read` for [`STALL_HARD_LIMIT`] is a provider failure, whatever QUIC
-//!   thinks (D4 §6, the `piece_timeout = 20 s` precedent);
-//! - **per-provider accounting** ([`ProviderStats`]) — the ground truth the
-//!   stock downloader discards, and the input A4's ranking will need.
+//! Per-provider state is run-wide: one ledger ([`ProviderStats`]), one back-off
+//! ladder and one in-flight count per provider, whichever items it serves.
+//! [`pick_provider`] is a deliberately dumb least-loaded pick, kept as ONE
+//! function so a ranking is one edit. A [`ProviderSet`] may be live: a provider
+//! that appears is picked up at the item's next round, and an item with no
+//! provider sleeps until one appears.
 //!
-//! Everything else is deliberately the same as upstream, because it already
-//! works: one `GetRequest` per item, the missing-range recomputed
-//! from the local store before every attempt (so a reassignment resumes at the
-//! byte, never restarts the frame), and the full provider set available to
-//! every item.
+//! [`EVICT_AFTER_FAILURES`] consecutive failures put a provider in back-off
+//! (`BACKOFF_BASE`, doubling per further failure up to `BACKOFF_MAX_RUNGS`
+//! rungs). An item that finds every provider parked waits for the earliest and
+//! tries again, at most `MAX_BACKOFF_ROUNDS` times. A refusal is read, not
+//! struck: `ERR_LIMIT` parks the provider for [`LIMIT_RETRY`], `ERR_PERMISSION`
+//! excludes it for that item only, and bytes that fail verification exclude it
+//! for the item and strike it like any failure.
 //!
-//! ## Independent items
+//! ## The stall ceiling
 //!
-//! The engine runs over [`FetchItem`]s — each with its own `GetRequest`, hash
-//! and provider list. Collab frames are raw blob items with per-frame holders
-//! on the collab ALPN, where one item's failure is its own result and never
-//! aborts a sibling. Per-provider state is run-wide: one pool, one ledger, one
-//! backoff ladder per provider, whichever items it serves.
+//! An assignment whose `bytes_read` has not grown for [`STALL_HARD_LIMIT`] is a
+//! provider failure, whatever QUIC thinks: a peer that accepts the connection
+//! and then dribbles 20 KB/s never errors, so without this deadline the item
+//! would never move off it.
 //!
 //! ## Hedging
 //!
-//! Task 8 added the second, racing assignment: while a child's primary
-//! transfer runs unhedged, it is re-evaluated every
+//! While an item's primary transfer runs unhedged it is re-evaluated every
 //! [`HEDGE_REEVALUATE_INTERVAL`] against the trigger `max(p95 of recent
-//! completions, [`HEDGE_EXPECTED_MULTIPLIER`] × expected)` — late by either
-//! measure arms a hedge on a different provider for the BACK HALF of the
-//! child's still-missing range, split at the midpoint
-//! ([`split_missing_at_midpoint`]), under a gRPC-shaped [`HedgeBudget`] that
-//! caps total spend at [`HEDGE_BUDGET_RATIO`] of the collection. Whichever
-//! side finishes first wins the round; the loser is cancelled by dropping its
-//! `GetProgress` stream (see Cancellation above), which is enough — no pooled
-//! connection needs closing. A primary that fails while its hedge is still
-//! live does not cancel the hedge: the hedge is a real transfer, not a
-//! speculative copy, so it is promoted and carries the round alone
-//! (`primary_gone`). See [`try_arm_hedge`] for the trigger and the budget
-//! check, and [`HedgeBudget`] for the accounting.
-//!
-//! No persistence, no ranking: [`pick_provider`] is a deliberately dumb
-//! least-loaded pick, kept as ONE function so A4's `RankedProviders` is one
-//! edit.
-//!
-//! ## The live run
-//!
-//! Collab v3 wave 3 (spec §7.2, §7.3, §8) adds [`run_live`]: the same child
-//! loop fed from a channel of [`LiveItem`]s, each result sent the moment it
-//! lands, over a [`ProviderSet`] that may be live (providers appear while an
-//! item waits) and through the dedicated collab pool ([`Dialer::Collab`]).
-//! Every path now reads the provider's refusal: `ERR_LIMIT` is a busy
-//! provider retried after [`LIMIT_RETRY`] with no strike, `ERR_PERMISSION`
-//! excludes the provider for that item only.
+//! completions, [`HEDGE_EXPECTED_MULTIPLIER`] × expected)`. Late by either
+//! measure arms a hedge on a different provider for the BACK HALF of the item's
+//! still-missing range, split at the midpoint ([`split_missing_at_midpoint`]).
+//! A hedge is paid from the [`HedgeBudget`], whose cap follows the items in
+//! flight: the larger of [`HEDGE_BUDGET_RATIO`] of their bytes and half the
+//! largest one. A hedge's charge stays outstanding until it settles and what it
+//! duplicated is owed back at 5 % of the bytes of completing rounds, so a budget with nothing
+//! outstanding and no debt pays for one hedge of the largest item, and no more
+//! than the cap is ever spent on top of the 5 % that completed bytes repay.
+//! Whichever side finishes first wins the round and the loser is cancelled (see
+//! Cancellation below). A primary that fails while its hedge is still live does
+//! not cancel the hedge: it is a real transfer, so it is promoted and carries
+//! the round alone (`primary_gone`). See [`try_arm_hedge`] for the trigger and
+//! the budget check.
 //!
 //! ## Progress truth
 //!
-//! Nothing here emits UI progress. D4 T7 fixed `store.observe()` as the single
-//! progress oracle — the get streams are consumed here only to watch for
-//! movement, and the `Progress(u64)` values never leave this module.
+//! Nothing here emits UI progress. `store.observe()` is the single progress
+//! oracle: the get streams are consumed here only to watch for movement, and
+//! the `Progress(u64)` values never leave this module.
 //!
 //! ## Cancellation
 //!
@@ -92,11 +75,11 @@
 //!    promptly.
 //!
 //! The pooled `ConnectionRef` is dropped with it, releasing the pool permit
-//! while leaving the connection warm for the next child — which is what we
+//! while leaving the connection warm for the next item — which is what we
 //! want: a stalled peer is not necessarily a dead one, and closing its
 //! connection would make the next attempt pay a fresh handshake.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -192,8 +175,8 @@ const GOODPUT_ALPHA: f64 = 0.25;
 /// bound if it ever went to disk on a cold cache.
 const HEDGE_REEVALUATE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Per-provider transfer facts — the ground truth the stock downloader throws
-/// away (`Ok(_stats)`).
+/// Per-provider transfer facts — what each provider actually moved, for the
+/// run's report.
 ///
 /// `bytes` is payload bytes THIS provider delivered: `Stats.payload_bytes_read`
 /// on a completed assignment, and the last observed progress value on one that
@@ -210,9 +193,6 @@ pub(crate) struct ProviderStats {
 }
 
 /// What one assignment run did, per provider plus the swarm-wide counters.
-///
-/// `hedges` / `hedge_bytes` are Task 8's; they are reported as `0` here rather
-/// than omitted so the shape does not move when hedging lands.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AssignmentReport {
     pub per_provider: HashMap<EndpointId, ProviderStats>,
@@ -220,7 +200,7 @@ pub(crate) struct AssignmentReport {
     /// Hedges ARMED during the run.
     pub hedges: u32,
     /// DUPLICATE bytes hedging actually cost: the part of each hedge's charge
-    /// that was not refunded, i.e. bytes some peer sent that another peer had
+    /// that became debt, i.e. bytes some peer sent that another peer had
     /// already sent. This is the quantity [`HEDGE_BUDGET_RATIO`] is a budget
     /// FOR, and it is deliberately not "bytes a hedge delivered" — a hedge that
     /// wins delivers the half its primary never would have and duplicates
@@ -234,13 +214,12 @@ impl AssignmentReport {
         self.per_provider.values().map(|s| s.bytes).sum()
     }
 
-    /// Total children some provider carried to completion (test oracle).
+    /// Total items some provider carried to completion (test oracle).
     ///
-    /// Report-only: a child already complete at its first round (a resumed
-    /// fetch finding it already local) or a duplicate-hash entry never runs
-    /// `record_success`, so it is credited to nobody and this sum undercounts
-    /// the collection's own child count by exactly that many. Nothing here
-    /// re-derives that figure from the collection to true it up.
+    /// Report-only: an item already complete at its first round (a resumed
+    /// fetch finding it already local) never runs `record_success`, so it is
+    /// credited to nobody and this sum undercounts the run's items by exactly
+    /// that many.
     #[cfg(test)]
     pub(crate) fn total_children(&self) -> u32 {
         self.per_provider.values().map(|s| s.children).sum()
@@ -277,73 +256,127 @@ impl CompletionWindow {
     }
 }
 
-/// The gRPC-shaped token bucket that keeps hedging from turning a degraded
-/// network into a byte storm (D4 §4.5).
+/// What keeps hedging from turning a degraded network into a byte storm
+/// (D4 §4.5): a cap that follows the items in flight, the charges of the hedges
+/// in flight, and the duplicated bytes not yet repaid.
 ///
-/// **It starts FULL.** The design says what the bucket EARNS
-/// ([`HEDGE_BUDGET_RATIO`] × the bytes of every completed child) and what it is
-/// capped at ([`HEDGE_BUDGET_RATIO`] × the whole collection), but not where it
-/// starts; a bucket that starts empty can never pay for the very first hedge,
-/// which is the one that matters on a package whose first assignment lands on a
-/// useless peer. Starting full is also what a token bucket means everywhere
-/// else, and the cap still bounds the total spend.
+/// The cap is the larger of [`HEDGE_BUDGET_RATIO`] × the bytes in flight and
+/// half of the largest item in flight — one hedge of it — and `0` when nothing
+/// is. A hedge's charge stays `outstanding` until it settles, and what it
+/// duplicated becomes `debt`, repaid at [`HEDGE_BUDGET_RATIO`] of the bytes of
+/// each round that completes an item. Only `available = cap - outstanding - debt`
+/// is ever spent; it is a function of those three alone, so a cap that falls and
+/// rises again gives back nothing that is outstanding or owed. So: at every admission
+/// `outstanding + debt <= cap`; with nothing outstanding and no debt one hedge
+/// of the largest item is always payable; over a run the duplicated bytes stay
+/// within 5 % of the completed bytes plus one cap; hedges that duplicate
+/// nothing cost nothing. A hedge dropped unsettled (its item cancelled, the run
+/// cut) is counted as duplicating nothing: what it and its primary both moved
+/// is not measured there. The floor uses an item's ANNOUNCED size and a charge
+/// the real one, so an item announced smaller than it is (or `0`, unknown) may
+/// not be hedgeable.
 #[derive(Debug)]
 pub(crate) struct HedgeBudget {
-    tokens: f64,
-    cap: f64,
+    /// The sizes of the items in flight, with how many of each (a multiset:
+    /// equal sizes retire one at a time).
+    in_flight: BTreeMap<u64, usize>,
+    /// The sum of `in_flight`, counting every item.
+    in_flight_bytes: u64,
+    /// The sum of the charges of the hedges admitted and not yet settled.
+    outstanding: u64,
+    /// Duplicated bytes not yet repaid by completed ones.
+    debt: f64,
 }
 
 impl HedgeBudget {
-    fn new(total_bytes: u64) -> Self {
-        let cap = HEDGE_BUDGET_RATIO * total_bytes as f64;
-        Self { tokens: cap, cap }
+    /// An empty live budget: no item in flight, so no cap.
+    fn live() -> Self {
+        Self {
+            in_flight: BTreeMap::new(),
+            in_flight_bytes: 0,
+            outstanding: 0,
+            debt: 0.0,
+        }
     }
 
-    /// A live run's item joins the run: the cap grows by its share, and so do
-    /// the tokens, as if it had been part of the batch from the start.
+    /// What the items in flight call for.
+    fn cap(&self) -> f64 {
+        match self.in_flight.keys().next_back() {
+            None => 0.0,
+            Some(&largest) => {
+                (HEDGE_BUDGET_RATIO * self.in_flight_bytes as f64).max(largest as f64 / 2.0)
+            }
+        }
+    }
+
+    /// What a hedge may still be charged: the cap less the charges outstanding
+    /// and the debt, never below zero.
+    fn available(&self) -> f64 {
+        (self.cap() - self.outstanding as f64 - self.debt).max(0.0)
+    }
+
+    /// A live run's item joins the run.
     fn extend(&mut self, bytes: u64) {
-        let share = HEDGE_BUDGET_RATIO * bytes as f64;
-        self.cap += share;
-        self.tokens += share;
+        *self.in_flight.entry(bytes).or_insert(0) += 1;
+        self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes);
     }
 
-    /// A live run's item has ended: its share leaves the cap, so the budget
-    /// stays [`HEDGE_BUDGET_RATIO`] of the items IN FLIGHT — what a batch of
-    /// them would have had — instead of growing with everything ever taken.
+    /// A live run's item has ended.
     fn retire(&mut self, bytes: u64) {
-        let share = HEDGE_BUDGET_RATIO * bytes as f64;
-        self.cap = (self.cap - share).max(0.0);
-        self.tokens = self.tokens.min(self.cap);
+        match self.in_flight.get_mut(&bytes) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                self.in_flight.remove(&bytes);
+            }
+            None => {
+                debug_assert!(false, "a retired item was taken first");
+                tracing::error!(bytes, "hedge budget retired an item it never took");
+                return;
+            }
+        }
+        self.in_flight_bytes = self.in_flight_bytes.saturating_sub(bytes);
     }
 
-    /// A completed child refills the bucket, never past the cap.
+    /// Completed bytes repay duplicated ones at [`HEDGE_BUDGET_RATIO`].
     fn earn(&mut self, bytes: u64) {
-        self.tokens = (self.tokens + HEDGE_BUDGET_RATIO * bytes as f64).min(self.cap);
+        self.debt = (self.debt - HEDGE_BUDGET_RATIO * bytes as f64).max(0.0);
     }
 
-    /// D4 §4.5: hedge only while the bucket is at least half full AND can pay
-    /// for this hedge's whole range. The half rule is the storm brake — it
-    /// stops hedging long before the budget is actually exhausted, so a
-    /// degraded run cannot ride the bucket to zero one hedge at a time.
+    /// D4 §4.5: hedge only while at least half the cap is available AND this
+    /// hedge's whole range fits. The half rule is the storm brake — it stops
+    /// hedging long before the budget is actually exhausted, so a degraded run
+    /// cannot ride it to zero one hedge at a time.
     ///
-    /// The comparison is `>=`, not `>`, and that is load-bearing rather than
-    /// cosmetic: tokens land on EXACTLY `cap / 2` in an ordinary case — two
-    /// providers splitting the children evenly, where completed bytes are half
-    /// the collection and the cap is 5 % of it — and a strict `>` refused every
-    /// hedge there for pure arithmetic reasons. Controller ruling R1.
+    /// The comparison is `>=`, not `>`: `available` lands on EXACTLY `cap / 2`
+    /// in ordinary cases (a hedge of a quarter of the largest item outstanding
+    /// against a floor cap, a debt repaid down to the half), and a strict `>`
+    /// refused every hedge there for arithmetic reasons.
     fn try_charge(&mut self, bytes: u64) -> bool {
-        let want = bytes as f64;
-        if self.tokens >= self.cap / 2.0 && self.tokens >= want {
-            self.tokens -= want;
+        let available = self.available();
+        if available >= self.cap() / 2.0 && available >= bytes as f64 {
+            self.outstanding = self.outstanding.saturating_add(bytes);
             true
         } else {
             false
         }
     }
 
-    /// Give back the part of a charge that never became a duplicate byte.
-    fn refund(&mut self, bytes: u64) {
-        self.tokens = (self.tokens + bytes as f64).min(self.cap);
+    /// A hedge ends: its charge stops being outstanding and what it duplicated
+    /// becomes debt. Settling a charge that is not outstanding is a bug, not a
+    /// refill.
+    fn settle(&mut self, charge: u64, duplicated: u64) {
+        if charge > self.outstanding {
+            debug_assert!(false, "a hedge was settled twice");
+            tracing::error!(
+                charge,
+                outstanding = self.outstanding,
+                "hedge budget settled a charge it never took"
+            );
+            self.outstanding = 0;
+        } else {
+            self.outstanding -= charge;
+        }
+        self.debt += duplicated.min(charge) as f64;
     }
 }
 
@@ -371,27 +404,25 @@ pub(crate) struct AssignmentOptions {
     /// [`STALL_HARD_LIMIT`]; tests shorten it so a deliberately trickling peer
     /// trips it inside a test's patience.
     pub stall_hard_limit: Duration,
-    /// A2b: race a second assignment for the back half of a slow child's
-    /// missing range, under [`HedgeBudget`].
+    /// Race a second assignment for the back half of a slow item's missing
+    /// range, under [`HedgeBudget`].
     pub hedging: bool,
     /// Per-provider attempt telemetry (advisory).
     pub telemetry: ProviderTelemetrySink,
     /// Fed the exact bytes a transfer just moved, per (item key, provider) —
-    /// `None` for every caller that has no receive-feed UI to keep (Task 10).
+    /// `None` for every caller that has no receive-feed UI to keep.
     pub delivered: Option<DeliveredSink>,
 }
 
 /// One independently fetched blob: its own request, its own provider list,
 /// its own result.
 ///
-/// `request` is `GetRequest::blob(hash)` for a raw blob, or
-/// `GetRequest::builder().child(i, ChunkRanges::all()).build(root)` for a
-/// collection child — the engine never builds a request itself, it only
-/// narrows this one's ranges for a hedge ([`hedge_back_half_request`]).
-/// `hash` is the blob the request lands (the child's own hash for a child
-/// request), which the hedge observes. `size` is the caller's announced size,
-/// informational only (`0` when unknown); the live run extends its hedge
-/// budget by it ([`HedgeBudget::extend`]).
+/// `request` is `GetRequest::blob(hash)` for a raw blob — the engine never
+/// builds a request itself, it only narrows this one's ranges for a hedge
+/// ([`hedge_back_half_request`]). `hash` is the blob the request lands, which
+/// the hedge observes. `size` is the caller's announced size, informational
+/// only (`0` when unknown); the live run extends its hedge budget by it
+/// ([`HedgeBudget::extend`]).
 ///
 /// `providers` is a [`ProviderSet`], which may be live ([`run_live`]).
 pub(crate) struct FetchItem {
@@ -406,8 +437,8 @@ pub(crate) struct FetchItem {
 }
 
 impl FetchItem {
-    /// How error messages name the item. A child keeps the exact wording the
-    /// collection path always used (`child {index} of {root}`).
+    /// How error messages name the item. A request that is not a raw blob is
+    /// named `child {index} of {root}`.
     fn describe(&self) -> String {
         if self.request.ranges.is_blob() {
             format!("blob {} ({})", self.key, self.hash)
@@ -527,10 +558,8 @@ pub(crate) fn is_refused_by_every_provider(e: &anyhow::Error) -> bool {
 /// minor). A round that ends in a hedge win or a fault and goes straight
 /// into the next round stays "transferring", so a yield never cuts an item
 /// whose blob is about to be complete (the hedge-win window).
-fn set_transferring(flag: &Option<Arc<AtomicBool>>, on: bool) {
-    if let Some(f) = flag {
-        f.store(on, Ordering::Release);
-    }
+fn set_transferring(flag: &AtomicBool, on: bool) {
+    flag.store(on, Ordering::Release);
 }
 
 /// How the live run finds a provider's dial address (the scheduler's holder
@@ -540,15 +569,13 @@ pub(crate) type ProviderAddrs =
 
 /// How transfers get their connection.
 ///
-/// `Collab` is the dedicated collab pool (spec §7.3): one kept-open connection
-/// per provider, dialled with its own transport config at the address `addrs`
+/// The dedicated collab pool (spec §7.3): one kept-open connection per
+/// provider, dialled with its own transport config at the address `addrs`
 /// gives.
 #[derive(Clone)]
-pub(crate) enum Dialer {
-    Collab {
-        pool: Arc<CollabPool>,
-        addrs: ProviderAddrs,
-    },
+pub(crate) struct Dialer {
+    pub(crate) pool: Arc<CollabPool>,
+    pub(crate) addrs: ProviderAddrs,
 }
 
 /// One frame handed to [`run_live`], with its own cancel switch: `true`
@@ -611,27 +638,25 @@ pub(crate) struct LiveRunOptions {
     /// has moved this many bytes since the yield.
     pub unit_cap_bytes: u64,
     /// Fed the exact bytes a transfer just moved, per (item key, provider) —
-    /// forwarded into every child [`AssignmentOptions`] this run builds
-    /// (Task 10). `None` when nothing downstream wants the receive feed.
+    /// forwarded into every item's [`AssignmentOptions`] this run builds.
+    /// `None` when nothing downstream wants the receive feed.
     pub delivered: Option<DeliveredSink>,
 }
 
-/// Why one assignment ended without the child's bytes.
+/// Why one assignment ended without the item's bytes.
 ///
 /// Every variant carries the bytes the attempt did move, because that is what
-/// the provider is credited with and — Task 8 — what tells a hedge whether the
-/// loser was worth anything.
+/// the provider is credited with and what tells a hedge whether the loser was
+/// worth anything.
 ///
 /// `Refused`, `Busy` and `Corrupt` read the provider's answer (spec §7.2,
-/// T12 ruling R2). The personal provider never refuses a get with a code, so
-/// on the personal path only `Corrupt` can occur, and it is struck exactly
-/// like the `Failed` it used to be.
+/// T12 ruling R2).
 #[derive(Debug)]
 enum TransferFault {
     /// No growth in `bytes_read` for `stall_hard_limit`. No error was raised;
-    /// this is the judgement the stock loop cannot make.
+    /// this is a judgement the transport cannot make.
     Stalled { bytes: u64 },
-    /// The transfer errored — the stock loop's own trigger.
+    /// The transfer errored.
     Failed { bytes: u64, error: anyhow::Error },
     /// The dial failed. Struck exactly like `Failed`; told apart only so the
     /// live run can report it ([`LiveVerdict::DialFailed`]).
@@ -818,7 +843,7 @@ fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> any
     let cause = if is_refused_by_every_provider(&e) {
         None
     } else {
-        last_failure_cause(states, Some(&label.providers.current()))
+        last_failure_cause(states, &label.providers.current())
     };
     let e = match cause {
         Some(c) => e.context(format!("last provider fault: {c}")),
@@ -834,30 +859,27 @@ fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> any
     e
 }
 
-/// The most recently recorded `TransferFault::Failed` cause across providers
-/// — every provider of the run (`None`), or only `among`.
-fn last_failure_cause(states: &States, among: Option<&[EndpointId]>) -> Option<String> {
+/// The most recently recorded `TransferFault::Failed` cause among the
+/// providers `among`.
+fn last_failure_cause(states: &States, among: &[EndpointId]) -> Option<String> {
     let guard = states.lock().expect("assignment states mutex poisoned");
-    let scoped: Vec<&ProviderState> = match among {
-        None => guard.values().collect(),
-        Some(ids) => ids.iter().filter_map(|p| guard.get(p)).collect(),
-    };
-    scoped
-        .into_iter()
+    among
+        .iter()
+        .filter_map(|p| guard.get(p))
         .filter_map(|st| Some((st.last_error_at?, st.last_error.clone()?)))
         .max_by_key(|(at, _)| *at)
         .map(|(_, cause)| cause)
 }
 
 /// The live assignment run (spec §7.2, §8 receive side): the item engine fed
-/// from a channel instead of a batch.
+/// from a channel.
 ///
 /// - **Items** arrive on `items`, each with a [`ProviderSet`] (usually live)
 ///   and its own cancel switch. One is taken only while fewer than
 ///   `opts.max_in_flight` are in flight and no yield is requested.
 /// - **Results** go out on `done` the moment each item ends, so the caller
-///   lands a frame at once rather than at the end of a batch. Items are
-///   always isolated: one item's failure is its own.
+///   lands a frame at once. Items are isolated: one item's failure is its
+///   own.
 /// - **Verdicts** — refusals, busy providers, corrupt bytes, failed dials —
 ///   go out on `verdicts` for the scheduler's per-provider health.
 /// - **Cancel.** An item's switch set to `true` stops that item alone; its
@@ -887,10 +909,10 @@ pub(crate) async fn run_live(
 ) -> AssignmentReport {
     let remote: Remote = store.remote().clone();
     let blobs: Blobs = store.blobs().clone();
-    // The hedge budget grows with every item taken (`HedgeBudget::extend`):
-    // a live run has no batch size to take 5 % of.
+    // The hedge budget follows the items in flight (`HedgeBudget::extend` /
+    // `retire`), so there is no fixed total to take 5 % of.
     let ledger: Ledger = Arc::new(Mutex::new(HedgeLedger {
-        budget: HedgeBudget::new(0),
+        budget: HedgeBudget::live(),
         completions: CompletionWindow::default(),
         hedges: 0,
         hedge_bytes: 0,
@@ -987,8 +1009,8 @@ pub(crate) async fn run_live(
                         Arc::clone(&ledger),
                         item,
                         child_opts.clone(),
-                        Some(verdicts.clone()),
-                        Some(Arc::clone(&transferring)),
+                        verdicts.clone(),
+                        Arc::clone(&transferring),
                     );
                     let cut = cut_at_yield(
                         yield_now.clone(),
@@ -1136,8 +1158,8 @@ async fn local_bytes(blobs: &Blobs, hash: Hash) -> u64 {
 /// One child: pick a provider, transfer what is still missing, repeat until the
 /// child is complete locally or the ladder runs out.
 ///
-/// `verdicts` is the live run's channel ([`run_live`]); `None` on the batch
-/// paths, which then behave exactly as before the live run existed.
+/// `verdicts` is the live run's channel ([`run_live`]); `transferring` is the
+/// item's flag for [`cut_at_yield`].
 #[allow(clippy::too_many_arguments)]
 async fn run_child(
     dialer: Dialer,
@@ -1147,25 +1169,23 @@ async fn run_child(
     ledger: Ledger,
     item: FetchItem,
     opts: AssignmentOptions,
-    verdicts: Option<VerdictSink>,
-    transferring: Option<Arc<AtomicBool>>,
+    verdicts: VerdictSink,
+    transferring: Arc<AtomicBool>,
 ) -> Result<()> {
     let request = item.request.clone();
-    // Log fields keep the collection path's names: `root_hash` is the hash the
-    // request addresses (the collection root, or the raw blob itself), `child`
-    // is the item's key (the child index for a collection).
+    // Log field names are a spec: `root_hash` is the hash the request
+    // addresses (the raw blob itself), `child` is the item's key.
     let root = item.request.hash;
     let index = item.key.as_str();
     let hash = item.hash;
     let mut providers = item.providers.clone();
-    // Providers this item will not ask again: a refusal (`ERR_PERMISSION`)
-    // on the live and batch paths alike, and on the live path also a
-    // provider whose bytes failed verification (spec §7.2, §7.3).
+    // Providers this item will not ask again: one that refused it
+    // (`ERR_PERMISSION`) or whose bytes failed verification (spec §7.2, §7.3).
     let mut excluded: HashSet<EndpointId> = HashSet::new();
     let faults = FaultScope {
         states: &states,
         opts: &opts,
-        verdicts: verdicts.as_ref(),
+        verdicts: &verdicts,
         key: index,
         hash,
     };
@@ -1175,8 +1195,7 @@ async fn run_child(
     let mut forced: Option<EndpointId> = None;
     'child: loop {
         // Recomputed EVERY round, so a reassignment asks the next provider only
-        // for the bytes still missing — the byte-level resume upstream gets for
-        // free and we must not lose.
+        // for the bytes still missing, resuming at the byte.
         let local = remote
             .local_for_request(request.clone())
             .await
@@ -1325,17 +1344,17 @@ async fn run_child(
             };
             match step {
                 Step::Primary(Ok(stats)) => {
-                    if let Some(h) = hedge.take() {
+                    if let Some(mut h) = hedge.take() {
                         // The primary finished the WHOLE missing range, so every
                         // byte the hedge moved was fetched twice. Its own
                         // progress is already request-relative to the hedged
                         // range, so it needs no offsetting.
-                        let duplicated = h.progress.load(Ordering::Relaxed).min(h.charge);
-                        settle_hedge_loser(&ledger, &h, duplicated);
+                        let duplicated = h.progress.load(Ordering::Relaxed).min(h.charge.bytes);
+                        settle_hedge_loser(&mut h, duplicated);
                         tracing::debug!(
                             child = index,
                             loser = %h.provider.fmt_short(),
-                            refunded_bytes = h.charge - duplicated,
+                            refunded_bytes = h.charge.bytes - duplicated,
                             "swarm hedge loser cancelled"
                         );
                     }
@@ -1368,7 +1387,7 @@ async fn run_child(
                     primary = Box::pin(std::future::pending());
                 }
                 Step::Hedge(r) => {
-                    let h = hedge.take().expect("the hedge branch only runs when armed");
+                    let mut h = hedge.take().expect("the hedge branch only runs when armed");
                     match r {
                         Ok(stats) => {
                             // Sampled before the completeness query below, so
@@ -1402,15 +1421,6 @@ async fn run_child(
                                 hedge_elapsed,
                                 completed_child,
                             );
-                            if completed_child {
-                                // The hedge finished the child outright (ruling
-                                // R3's "the last of the child" case above) — it
-                                // is a completed assignment exactly like the
-                                // unhedged success path below, so it feeds the
-                                // same p95 window and earns the same budget
-                                // refill.
-                                note_completion(&ledger, hedge_elapsed, stats.payload_bytes_read);
-                            }
                             let moved = primary_progress.load(Ordering::Relaxed);
                             // `moved` counts payload bytes inside the PRIMARY's
                             // request, which began at ROUND START; the hedged
@@ -1420,8 +1430,17 @@ async fn run_child(
                             // fetched twice.
                             let duplicated = moved
                                 .saturating_sub(h.armed_at.saturating_add(h.split_rel))
-                                .min(h.charge);
-                            settle_hedge_loser(&ledger, &h, duplicated);
+                                .min(h.charge.bytes);
+                            settle_hedge_loser(&mut h, duplicated);
+                            if completed_child {
+                                // The hedge finished the child outright (ruling
+                                // R3's "the last of the child" case above) — it
+                                // is a completed assignment exactly like the
+                                // unhedged success path below, so it feeds the
+                                // same p95 window and repays debt the same way
+                                // (after the settlement, as on that path).
+                                note_completion(&ledger, hedge_elapsed, stats.payload_bytes_read);
+                            }
                             if !primary_gone {
                                 // Cancelling the primary IS dropping it; the
                                 // `continue` below ends its scope.
@@ -1429,7 +1448,7 @@ async fn run_child(
                                 tracing::debug!(
                                     child = index,
                                     loser = %provider.fmt_short(),
-                                    refunded_bytes = h.charge - duplicated,
+                                    refunded_bytes = h.charge.bytes - duplicated,
                                     "swarm hedge loser cancelled"
                                 );
                             }
@@ -1450,7 +1469,20 @@ async fn run_child(
                                 &fault,
                                 h.started.elapsed(),
                             );
-                            settle_hedge_loser(&ledger, &h, fault.bytes().min(h.charge));
+                            // With the primary still running, it fetches the
+                            // hedge's bytes again: all of them were moved twice.
+                            // With the primary gone, nothing does — only what
+                            // the primary had already moved past the split was.
+                            let moved = if primary_gone {
+                                primary_progress
+                                    .load(Ordering::Relaxed)
+                                    .saturating_sub(h.armed_at.saturating_add(h.split_rel))
+                                    .min(fault.bytes())
+                            } else {
+                                fault.bytes()
+                            }
+                            .min(h.charge.bytes);
+                            settle_hedge_loser(&mut h, moved);
                             if primary_gone {
                                 // Nothing is left running. Both failures are
                                 // already recorded against their OWN providers,
@@ -1551,21 +1583,19 @@ async fn run_child(
 struct FaultScope<'a> {
     states: &'a States,
     opts: &'a AssignmentOptions,
-    verdicts: Option<&'a VerdictSink>,
-    /// The item's key (a frame uuid on the collab paths).
+    verdicts: &'a VerdictSink,
+    /// The item's key (a frame uuid).
     key: &'a str,
     hash: Hash,
 }
 
 impl FaultScope<'_> {
     fn verdict(&self, v: LiveVerdict) {
-        if let Some(tx) = self.verdicts {
-            if tx.send(v).is_err() {
-                tracing::debug!(
-                    frame_uuid = self.key,
-                    "live verdict dropped: nobody is listening"
-                );
-            }
+        if self.verdicts.send(v).is_err() {
+            tracing::debug!(
+                frame_uuid = self.key,
+                "live verdict dropped: nobody is listening"
+            );
         }
     }
 }
@@ -1573,15 +1603,14 @@ impl FaultScope<'_> {
 /// Book one provider's fault against it (spec §7.2, §7.3, T12 ruling R2).
 ///
 /// - `Stalled`, `Failed`, `DialFailed`: the backoff ladder
-///   ([`record_failure`]) and a `Failed` telemetry event — unchanged.
+///   ([`record_failure`]) and a `Failed` telemetry event.
 /// - `Busy` (`ERR_LIMIT`): the provider is skipped for [`LIMIT_RETRY`] for
 ///   every hash; no strike, no fault telemetry.
 /// - `Refused` (`ERR_PERMISSION`): excluded for this item only; no strike,
 ///   no fault telemetry. On a live set the exclusion ends when the provider
 ///   leaves the set and comes back.
-/// - `Corrupt` (verification failed): struck like any failure; on the live
-///   path also excluded for this item. The batch paths keep retrying it on
-///   the ladder exactly as they always did.
+/// - `Corrupt` (verification failed): struck like any failure and excluded
+///   for this item.
 fn note_fault(
     scope: &FaultScope<'_>,
     excluded: &mut HashSet<EndpointId>,
@@ -1631,9 +1660,7 @@ fn note_fault(
                 error = %format!("{error:#}"),
                 "provider served bytes that failed verification"
             );
-            if scope.verdicts.is_some() {
-                excluded.insert(provider);
-            }
+            excluded.insert(provider);
             scope.verdict(LiveVerdict::Corrupt {
                 provider,
                 hash: scope.hash,
@@ -1744,11 +1771,10 @@ fn split_missing_at_midpoint(missing: &ChunkRanges, size: u64) -> Option<Missing
 /// lands.
 ///
 /// A raw blob request (`GetRequest::blob`) becomes
-/// `GetRequest::blob_ranges(hash, back)`; a collection child
-/// (`child(i).build(root)`, i.e. one non-empty range at offset `i + 1`) keeps
-/// the builder shape the collection path always sent,
-/// `child(i, back).build(root)`. Any other shape is not an item this engine
-/// builds, and gets no hedge (`None`) rather than a guessed request.
+/// `GetRequest::blob_ranges(hash, back)`; a request for one child of a
+/// collection (`child(i).build(root)`, i.e. one non-empty range at offset
+/// `i + 1`) is narrowed to `child(i, back).build(root)`. Any other shape gets
+/// no hedge (`None`) rather than a guessed request.
 pub(crate) fn hedge_back_half_request(
     request: &GetRequest,
     hash: Hash,
@@ -1767,9 +1793,9 @@ struct HedgeRun {
     provider: EndpointId,
     fut: BoxedTransfer,
     progress: Arc<AtomicU64>,
-    /// Bytes charged to the budget when this hedge was armed — the size of the
-    /// back range it asked for.
-    charge: u64,
+    /// The bytes charged to the budget when this hedge was armed — the size of
+    /// the back range it asked for — and the duty to settle them.
+    charge: HedgeCharge,
     /// How many bytes of the primary's OWN request come before the hedged
     /// range, so its progress counter can be turned into "how much of the
     /// charged range did it duplicate". Request-relative, never a blob offset
@@ -1796,6 +1822,46 @@ struct HedgeRun {
     _claim: InflightGuard,
 }
 
+/// A hedge's charge, settled exactly once: by [`HedgeCharge::settle`] when the
+/// hedge ends in a race, or by `Drop` with nothing duplicated when it is dropped
+/// unsettled (its item was cancelled, the run was cut, the future was dropped).
+///
+/// The ledger mutex is only ever taken for a moment and no future is dropped
+/// while it is held, so `Drop` cannot run under the lock it takes.
+struct HedgeCharge {
+    ledger: Ledger,
+    bytes: u64,
+    settled: bool,
+}
+
+impl HedgeCharge {
+    /// Settle with `duplicated` bytes of the range moved twice (at most the
+    /// charge); a second call does nothing.
+    fn settle(&mut self, duplicated: u64) {
+        if std::mem::replace(&mut self.settled, true) {
+            debug_assert!(false, "a hedge charge was settled twice");
+            tracing::error!(bytes = self.bytes, "hedge charge settled twice");
+            return;
+        }
+        let duplicated = duplicated.min(self.bytes);
+        let mut l = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        l.budget.settle(self.bytes, duplicated);
+        // What was moved twice is what hedging actually cost.
+        l.hedge_bytes = l.hedge_bytes.saturating_add(duplicated);
+    }
+}
+
+impl Drop for HedgeCharge {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            // Poisoning is tolerated: this may run while a panic unwinds.
+            let mut l = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            l.budget.settle(self.bytes, 0);
+        }
+    }
+}
+
 type BoxedTransfer =
     std::pin::Pin<Box<dyn std::future::Future<Output = TransferResult> + Send + 'static>>;
 type TransferResult = std::result::Result<Stats, TransferFault>;
@@ -1820,28 +1886,25 @@ async fn poll_slot(slot: Option<&mut BoxedTransfer>) -> TransferResult {
     }
 }
 
-/// A completed assignment: refill the budget and widen the p95 sample.
+/// A completed assignment: repay hedge debt and widen the p95 sample.
 fn note_completion(ledger: &Ledger, elapsed: Duration, bytes: u64) {
     let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
     l.completions.record(elapsed);
     l.budget.earn(bytes);
 }
 
-/// Settle a hedge: give back the part of its charge that never became a
-/// duplicate byte.
+/// Settle a hedge that ran to an end: its charge stops being outstanding and
+/// the part of it the loser actually moved becomes debt.
 ///
-/// `duplicated` is how much of the CHARGED range the loser actually moved —
-/// the hedge's own progress when the primary won, or the primary's progress
-/// past the split point when the hedge won. A hedge that wins outright against
+/// `duplicated` is how much of the CHARGED range was moved twice — the hedge's
+/// own progress when the primary won or the hedge failed beside a live primary
+/// (the primary fetches those bytes again), or the primary's progress past the
+/// split point when the hedge won or failed after the primary was gone. A hedge that wins outright against
 /// a primary still below the split therefore costs nothing, which is the honest
-/// answer: nothing was fetched twice.
-fn settle_hedge_loser(ledger: &Ledger, hedge: &HedgeRun, duplicated: u64) {
-    let duplicated = duplicated.min(hedge.charge);
-    let refund = hedge.charge - duplicated;
-    let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
-    l.budget.refund(refund);
-    // What the bucket did NOT get back is what hedging actually cost.
-    l.hedge_bytes = l.hedge_bytes.saturating_add(duplicated);
+/// answer: nothing was fetched twice. A hedge that ends any other way is
+/// settled by its [`HedgeCharge`] with nothing duplicated.
+fn settle_hedge_loser(hedge: &mut HedgeRun, duplicated: u64) {
+    hedge.charge.settle(duplicated);
 }
 
 /// Decide whether to hedge this assignment, and start one if so.
@@ -1901,8 +1964,9 @@ async fn try_arm_hedge(
     // own standard. A 50 KB/s peer with 256 KiB left gets a 10.5 s deadline. An
     // instrumented run of 21 children showed 388 refusals on this branch
     // against 6 hedges armed. That is D4 §4.5 as written, not a defect: hedging
-    // is for the TAIL, and a uniformly slow peer is the stall ceiling's and
-    // A4's ranking problem, not the hedge's.
+    // is for the TAIL. A uniformly slow peer that keeps moving is never cut by
+    // the stall ceiling (it fires only on no progress at all), so its item
+    // simply crawls at that peer's rate: that is A4's ranking problem.
     let goodput = ewma_goodput(states, primary)?;
     let expected = Duration::from_secs_f64((missing_bytes as f64 / goodput.max(1.0)).min(86_400.0));
     let p95 = ledger
@@ -1946,6 +2010,13 @@ async fn try_arm_hedge(
     {
         return None;
     }
+    // From here the charge is outstanding, and this guard owes its settlement
+    // however the hedge ends.
+    let charge_guard = HedgeCharge {
+        ledger: Arc::clone(ledger),
+        bytes: charge,
+        settled: false,
+    };
 
     let hedge_provider = claim.provider();
     let progress = Arc::new(AtomicU64::new(0));
@@ -1984,7 +2055,7 @@ async fn try_arm_hedge(
         provider: hedge_provider,
         fut,
         progress,
-        charge,
+        charge: charge_guard,
         split_rel: split.split_rel,
         armed_at,
         started: Instant::now(),
@@ -2004,8 +2075,8 @@ async fn try_arm_hedge(
 ///
 /// `on_bytes`, when set, is fed each round's exact byte delta as it is
 /// observed, plus the tail on `Done` — the sum equals `payload_bytes_read`
-/// (Task 10's [`DeliveredSink`] plumbing; `None` for every caller with no
-/// receive feed to keep).
+/// (the [`DeliveredSink`] plumbing; `None` for every caller with no receive
+/// feed to keep).
 async fn transfer_once(
     dialer: Dialer,
     remote: Remote,
@@ -2079,19 +2150,16 @@ async fn dial(
     dialer: &Dialer,
     provider: EndpointId,
 ) -> std::result::Result<PooledConn, TransferFault> {
-    match dialer {
-        Dialer::Collab { pool, addrs } => {
-            let Some(addr) = addrs(&provider) else {
-                return Err(TransferFault::DialFailed {
-                    error: anyhow::anyhow!("no dial address for {}", provider.fmt_short()),
-                });
-            };
-            // The pool logs the failure itself (`collab dial failed`).
-            pool.get(addr).await.map_err(|e| TransferFault::DialFailed {
-                error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
-            })
-        }
-    }
+    let Dialer { pool, addrs } = dialer;
+    let Some(addr) = addrs(&provider) else {
+        return Err(TransferFault::DialFailed {
+            error: anyhow::anyhow!("no dial address for {}", provider.fmt_short()),
+        });
+    };
+    // The pool logs the failure itself (`collab dial failed`).
+    pool.get(addr).await.map_err(|e| TransferFault::DialFailed {
+        error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
+    })
 }
 
 /// Pick a provider and reserve a slot on it, under ONE lock.
@@ -2159,9 +2227,7 @@ fn pick_provider(
 /// Scoped to the ITEM's own providers, never the run-wide union: under
 /// per-item provider lists a sibling's provider whose backoff has already
 /// elapsed would otherwise read as "wait 0", and an item whose only holder is
-/// parked would burn every round of its ladder in a few milliseconds. For a
-/// collection every child shares the full list, so this is the same minimum it
-/// always took.
+/// parked would burn every round of its ladder in a few milliseconds.
 fn earliest_wait(states: &States, providers: &[EndpointId]) -> Duration {
     let now = Instant::now();
     let guard = states.lock().expect("assignment states mutex poisoned");
@@ -2529,62 +2595,27 @@ mod tests {
         assert_eq!(g[&a].stats.children, 1);
     }
 
-    /// The bucket starts FULL, refuses below half, refuses a charge it cannot
-    /// cover, refunds, and never earns past the cap.
-    #[test]
-    fn hedge_budget_starts_full_refuses_below_half_and_refunds() {
-        // 1 MiB collection ⇒ cap = 52 428.8 tokens (5 %).
-        let total = 1024 * 1024u64;
-        let cap = HEDGE_BUDGET_RATIO * total as f64;
-        let mut b = HedgeBudget::new(total);
-        assert_eq!(b.tokens, cap, "a token bucket starts full");
-
-        // A charge just under half the cap leaves it above half ⇒ admitted.
-        assert!(
-            b.try_charge((cap * 0.4) as u64),
-            "the first hedge is payable"
-        );
-        assert!(b.tokens > cap / 2.0);
-
-        // The next one would take it below half — the half rule is checked
-        // BEFORE the charge, so this is admitted and lands under half...
-        assert!(b.try_charge((cap * 0.4) as u64));
-        assert!(b.tokens < cap / 2.0);
-        // ...and now nothing more is admitted, however small.
-        assert!(
-            !b.try_charge(1),
-            "below half the cap the bucket refuses even a one-byte hedge — that \
-             is the storm brake, not the exhaustion check"
-        );
-
-        // A refund puts it back over half and reopens hedging.
-        b.refund((cap * 0.4) as u64);
-        assert!(b.tokens > cap / 2.0);
-        assert!(b.try_charge(1), "a refund reopens the gate");
-
-        // Earning never exceeds the cap.
-        b.earn(u64::MAX / 2);
-        assert_eq!(b.tokens, cap, "the bucket cannot earn past its cap");
-
-        // And a charge bigger than the whole bucket is refused outright.
-        assert!(
-            !b.try_charge((cap * 2.0) as u64),
-            "a hedge the budget cannot cover is refused even with a full bucket"
-        );
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
     }
 
-    /// A package too small for its own hedge can never hedge: the cap is a
-    /// fraction of the COLLECTION, so one child's half-range can exceed it.
-    #[test]
-    fn hedge_budget_refuses_when_one_hedge_exceeds_the_whole_cap() {
-        // 6 children of 512 KiB ⇒ cap = 157 286; half a child = 262 144.
-        let total = 6 * 512 * 1024u64;
-        let mut b = HedgeBudget::new(total);
-        assert!(
-            !b.try_charge(256 * 1024),
-            "half a 512 KiB child is 262 144 bytes against a 157 286 cap — no \
-             hedge on this package is ever affordable"
-        );
+    /// A live budget with `n` items of `size` bytes in flight.
+    fn budget_with(n: usize, size: u64) -> HedgeBudget {
+        let mut b = HedgeBudget::live();
+        for _ in 0..n {
+            b.extend(size);
+        }
+        b
+    }
+
+    /// A ledger around `budget`, for the charge guard.
+    fn ledger_of(budget: HedgeBudget) -> Ledger {
+        Arc::new(Mutex::new(HedgeLedger {
+            budget,
+            completions: CompletionWindow::default(),
+            hedges: 0,
+            hedge_bytes: 0,
+        }))
     }
 
     /// The midpoint cut works on the RANGES, not on the blob's end, and the
@@ -2632,18 +2663,18 @@ mod tests {
         );
     }
 
-    /// The bucket admits at EXACTLY half the cap (ruling R1): that is where two
-    /// providers splitting a collection evenly land, and a strict `>` refused
-    /// every hedge there.
+    /// A hedge is admitted at EXACTLY half the cap (ruling R1): `available`
+    /// lands there when a hedge of a quarter of the largest item is outstanding
+    /// against a floor cap, and a strict `>` refused every hedge there.
     #[test]
     fn hedge_budget_admits_at_exactly_half_the_cap() {
-        let total = 1024 * 1024u64;
-        let cap = HEDGE_BUDGET_RATIO * total as f64;
-        let mut b = HedgeBudget::new(total);
-        b.tokens = cap / 2.0;
+        let mut b = budget_with(1, 2_000_000);
+        assert!(close(b.cap(), 1_000_000.0));
+        assert!(b.try_charge(500_000));
+        assert!(close(b.available(), b.cap() / 2.0), "{}", b.available());
         assert!(
             b.try_charge(1),
-            "tokens sitting exactly on cap/2 must still admit a hedge"
+            "available sitting exactly on cap/2 must still admit a hedge"
         );
     }
 
@@ -2846,28 +2877,273 @@ mod tests {
         assert!(!waiting_on_busy(&states, &[a]));
     }
 
-    /// A live run's budget is 5 % of the items in flight: it grows with each
-    /// item taken and shrinks as each ends, and the tokens never exceed it.
+    /// A live run's cap follows the items in flight — the larger of 5 % of their
+    /// bytes and half the largest — growing with each item taken and shrinking
+    /// as each ends, and `available` never exceeds it.
     #[test]
     fn a_live_budget_follows_the_items_in_flight() {
-        let mut b = HedgeBudget::new(0);
+        let mut b = HedgeBudget::live();
+        assert!(close(b.cap(), 0.0) && close(b.available(), 0.0), "empty at the start");
         b.extend(1_000_000);
+        assert!(close(b.cap(), 500_000.0), "one hedge of the item: {}", b.cap());
+        assert!(close(b.available(), 500_000.0), "an item brings its share");
         b.extend(3_000_000);
-        assert!((b.cap - 200_000.0).abs() < 1e-6);
-        assert!(
-            (b.tokens - 200_000.0).abs() < 1e-6,
-            "an item brings its share"
-        );
+        // 5 % of 4 MB is 200 kB; half of the 3 MB item is 1.5 MB.
+        assert!(close(b.cap(), 1_500_000.0), "{}", b.cap());
+        assert!(close(b.available(), 1_500_000.0), "{}", b.available());
         assert!(b.try_charge(60_000));
         b.retire(3_000_000);
-        assert!((b.cap - 50_000.0).abs() < 1e-6);
-        assert!(b.tokens <= b.cap, "the tokens follow the cap down");
+        assert!(close(b.cap(), 500_000.0), "the floor drops to the 1 MB item: {}", b.cap());
+        assert!(b.available() <= b.cap(), "available follows the cap down");
         b.retire(1_000_000);
+        assert!(close(b.cap(), 0.0), "nothing in flight, no budget: {}", b.cap());
+        assert!(close(b.available(), 0.0));
+    }
+
+    /// One item in flight: one hedge of half that item is admitted, a second is
+    /// refused while the first is outstanding, and the settlement of the first
+    /// (nothing duplicated) pays for it again.
+    #[test]
+    fn a_live_budget_admits_one_hedge_of_a_lone_item() {
+        let mut b = budget_with(1, 1_000_000);
+        assert!(b.try_charge(500_000), "half the item, from an idle budget");
+        assert!(!b.try_charge(500_000), "a second one is refused while the first is out");
+        b.settle(500_000, 0);
+        assert!(b.try_charge(500_000), "the settlement pays for it again");
+        b.settle(500_000, 0);
+        assert!(!b.try_charge(500_001), "more than half the item is never payable");
+    }
+
+    /// `settle` turns what was duplicated into debt and takes the charge off the
+    /// outstanding sum; completed bytes repay the debt at 5 %, never below zero.
+    #[test]
+    fn a_settlement_leaves_debt_that_completed_bytes_repay() {
+        let mut b = budget_with(1, 2_000_000);
+        assert!(b.try_charge(400_000));
+        assert_eq!(b.outstanding, 400_000);
+        assert!(close(b.available(), 600_000.0));
+        b.settle(400_000, 150_000);
+        assert_eq!(b.outstanding, 0);
+        assert!(close(b.debt, 150_000.0), "{}", b.debt);
+        assert!(close(b.available(), 850_000.0), "debt reduces what is available");
+        // 5 % of 1 MB repays 50 kB.
+        b.earn(1_000_000);
+        assert!(close(b.debt, 100_000.0), "{}", b.debt);
+        b.earn(u64::MAX / 2);
+        assert!(close(b.debt, 0.0), "repaying never goes below zero: {}", b.debt);
+        assert!(close(b.available(), 1_000_000.0));
+        // A loser cannot have duplicated more than its charge.
+        assert!(b.try_charge(10_000));
+        b.settle(10_000, 99_999);
+        assert!(close(b.debt, 10_000.0), "{}", b.debt);
+    }
+
+    /// The half rule: with a hedge outstanding that takes `available` below
+    /// half the cap nothing is admitted, however small; its settlement reopens
+    /// hedging.
+    #[test]
+    fn a_live_budget_refuses_below_half_the_cap_and_a_hedge_larger_than_available() {
+        // 100 items of 100 kB: cap = 5 % of 10 MB = 500 kB, the floor is 50 kB.
+        let mut b = budget_with(100, 100_000);
+        assert!(close(b.cap(), 500_000.0));
+        assert!(b.try_charge(200_000));
+        assert!(b.try_charge(60_000), "300 kB available is above half the cap");
+        assert!(close(b.available(), 240_000.0));
         assert!(
-            b.cap.abs() < 1e-6,
-            "nothing in flight, no budget: {}",
-            b.cap
+            !b.try_charge(1),
+            "below half the cap the budget refuses even a one-byte hedge — that is \
+             the storm brake, not the exhaustion check"
         );
-        assert!(b.tokens <= b.cap);
+        b.settle(60_000, 0);
+        assert!(b.try_charge(1), "a settlement reopens the gate");
+        b.settle(1, 0);
+        assert!(!b.try_charge(300_001), "a hedge larger than what is available is refused");
+    }
+
+    /// The review's sequence: the cap falls when the large item completes and
+    /// rises when the next one joins, while a hedge on the small item is still
+    /// out. The cap moving must not refill the budget: the hedge's charge is
+    /// still outstanding. (Token arithmetic gave 50 available here and admitted
+    /// a second hedge of 50.)
+    #[test]
+    fn the_cap_falling_and_rising_does_not_refill_the_budget() {
+        const MB: u64 = 1_000_000;
+        let mut b = HedgeBudget::live();
+        b.extend(100 * MB);
+        assert!(close(b.cap(), 50.0 * MB as f64));
+        b.extend(20 * MB);
+        assert!(close(b.cap(), 50.0 * MB as f64), "the floor still rules: {}", b.cap());
+        assert!(b.try_charge(10 * MB), "a hedge on the 20 MB item");
+        // The 100 MB item completes: it earns, then retires.
+        b.earn(100 * MB);
+        b.retire(100 * MB);
+        assert!(close(b.cap(), 10.0 * MB as f64), "{}", b.cap());
+        assert!(close(b.available(), 0.0), "{}", b.available());
+        b.extend(100 * MB);
+        assert!(close(b.cap(), 50.0 * MB as f64), "{}", b.cap());
+        assert!(
+            close(b.available(), b.cap() - (10 * MB) as f64),
+            "the 10 MB still outstanding is not given back: {}",
+            b.available()
+        );
+        assert!(!b.try_charge(50 * MB), "a hedge of half the new item is refused");
+        assert!(b.try_charge(40 * MB), "what is really left still pays");
+    }
+
+    /// One receive stream, frames one at a time: every frame's hedge duplicates
+    /// its whole charge. A frame that completes does not hand the next one a
+    /// fresh budget; the duplicated bytes admitted stay within 5 % of the
+    /// completed bytes plus one cap, and hedging does come back as the debt is
+    /// repaid.
+    #[test]
+    fn one_stream_frames_one_at_a_time_cannot_outspend_the_ratio() {
+        const FRAME: u64 = 100_000;
+        let mut b = HedgeBudget::live();
+        let (mut completed, mut duplicated, mut hedges) = (0u64, 0u64, 0u32);
+        let mut frame_two_admitted = None;
+        for i in 1..=200u32 {
+            b.extend(FRAME);
+            let admitted = b.try_charge(FRAME / 2);
+            if admitted {
+                hedges += 1;
+                duplicated += FRAME / 2;
+                b.settle(FRAME / 2, FRAME / 2);
+            }
+            if i == 2 {
+                frame_two_admitted = Some(admitted);
+            }
+            b.earn(FRAME);
+            b.retire(FRAME);
+            completed += FRAME;
+            let bound = HEDGE_BUDGET_RATIO * completed as f64 + (FRAME / 2) as f64;
+            assert!(
+                duplicated as f64 <= bound,
+                "frame {i}: {duplicated} duplicated against {bound}"
+            );
+        }
+        assert_eq!(
+            frame_two_admitted,
+            Some(false),
+            "frame 2 starts in debt for frame 1's whole hedge"
+        );
+        assert!(
+            hedges >= 10,
+            "the debt is repaid, so hedging comes back: {hedges}"
+        );
+    }
+
+    /// The cap is the larger of the ratio term and the floor, and the crossover
+    /// sits where the in-flight bytes are ten times the largest item.
+    #[test]
+    fn a_live_budget_cap_is_the_larger_of_the_ratio_and_the_floor() {
+        let mut b = HedgeBudget::live();
+        for _ in 0..10 {
+            b.extend(1_000_000);
+            assert!(close(b.cap(), 500_000.0), "the floor holds up to ten items: {}", b.cap());
+        }
+        // The eleventh item takes the ratio term (550 kB) past the floor.
+        b.extend(1_000_000);
+        assert!(close(b.cap(), 550_000.0), "{}", b.cap());
+        assert!(close(b.available(), 550_000.0), "{}", b.available());
+
+        // Many small items and one large: the ratio wins, then the floor, then
+        // the ratio again.
+        let mut b = budget_with(100, 100_000);
+        assert!(close(b.cap(), 500_000.0), "ratio term, 5 % of 10 MB: {}", b.cap());
+        b.extend(10_000_000);
+        assert!(close(b.cap(), 5_000_000.0), "floor term, half of 10 MB: {}", b.cap());
+        b.retire(10_000_000);
+        assert!(close(b.cap(), 500_000.0), "back to the ratio term: {}", b.cap());
+        assert!(b.available() <= b.cap());
+    }
+
+    /// Retiring the largest item drops the floor to the next largest; what is
+    /// outstanding stays outstanding.
+    #[test]
+    fn a_live_budget_retiring_the_largest_item_lowers_the_floor() {
+        let mut b = HedgeBudget::live();
+        b.extend(4_000_000);
+        b.extend(1_000_000);
+        b.extend(1_000_000);
+        assert!(close(b.cap(), 2_000_000.0), "{}", b.cap());
+        assert!(b.try_charge(1_000_000));
+        assert!(close(b.available(), 1_000_000.0), "{}", b.available());
+        b.retire(4_000_000);
+        assert!(close(b.cap(), 500_000.0), "half of the next largest: {}", b.cap());
+        assert!(close(b.available(), 0.0), "the outstanding charge exceeds the new cap");
+        b.settle(1_000_000, 0);
+        assert!(close(b.available(), 500_000.0), "{}", b.available());
+    }
+
+    /// With nothing in flight there is no budget and nothing is admitted, and
+    /// nothing earned or repaid changes that.
+    #[test]
+    fn a_live_budget_with_nothing_in_flight_admits_nothing() {
+        let mut b = HedgeBudget::live();
+        assert!(!b.try_charge(1), "an empty budget admits nothing");
+        b.extend(2_000_000);
+        b.retire(2_000_000);
+        assert!(close(b.cap(), 0.0) && close(b.available(), 0.0));
+        assert!(!b.try_charge(1), "a drained run admits nothing");
+        b.earn(1_000_000);
+        assert!(close(b.available(), 0.0), "nothing can be earned past a zero cap");
+    }
+
+    /// Items of equal size retire one at a time.
+    #[test]
+    fn a_live_budget_counts_equal_sized_items_separately() {
+        let mut b = HedgeBudget::live();
+        b.extend(1_000_000);
+        b.extend(1_000_000);
+        b.extend(100_000);
+        assert!(close(b.cap(), 500_000.0), "{}", b.cap());
+        b.retire(1_000_000);
+        assert!(close(b.cap(), 500_000.0), "one 1 MB item is still in flight: {}", b.cap());
+        b.retire(1_000_000);
+        assert!(close(b.cap(), 50_000.0), "only the 100 kB item is left: {}", b.cap());
+        assert!(b.available() <= b.cap());
+    }
+
+    /// A hedge charge that is dropped unsettled gives its bytes back and adds no
+    /// debt; one that was settled does not settle again on drop.
+    #[test]
+    fn a_dropped_hedge_charge_returns_its_bytes_and_a_settled_one_does_not_settle_twice() {
+        let mut b = budget_with(1, 1_000_000);
+        assert!(b.try_charge(500_000));
+        let ledger = ledger_of(b);
+        let guard = HedgeCharge {
+            ledger: Arc::clone(&ledger),
+            bytes: 500_000,
+            settled: false,
+        };
+        assert_eq!(ledger.lock().unwrap().budget.outstanding, 500_000);
+        drop(guard);
+        {
+            let l = ledger.lock().unwrap();
+            assert_eq!(l.budget.outstanding, 0, "the charge came back");
+            assert!(close(l.budget.debt, 0.0), "and a dropped hedge duplicated nothing");
+            assert_eq!(l.hedge_bytes, 0);
+        }
+
+        // Settled with debt, then dropped: the drop settles nothing more. A
+        // second charge stays outstanding beside it, so a drop that settled
+        // again would take that one's bytes and show here.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.budget.extend(1_000_000);
+            assert!(l.budget.try_charge(200_000));
+            assert!(l.budget.try_charge(200_000));
+        }
+        let mut guard = HedgeCharge {
+            ledger: Arc::clone(&ledger),
+            bytes: 200_000,
+            settled: false,
+        };
+        guard.settle(123);
+        drop(guard);
+        let l = ledger.lock().unwrap();
+        assert_eq!(l.budget.outstanding, 200_000, "the other charge is untouched");
+        assert!(close(l.budget.debt, 123.0), "{}", l.budget.debt);
+        assert_eq!(l.hedge_bytes, 123);
     }
 }

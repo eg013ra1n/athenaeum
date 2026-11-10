@@ -5,7 +5,7 @@
 //!
 //! - the **sync transport** — the iroh endpoint binds this key, so its node id
 //!   (== ed25519 public key) is the peer address other devices dial
-//!   ([`crate::sharing::iroh::IrohTransport::new`]);
+//!   (`IrohTransport::new`);
 //! - the **account layer** — the same public key, base64-encoded, is the
 //!   `devicePubkey` registered with the hub on sign-in.
 //!
@@ -61,7 +61,7 @@ impl DeviceKey {
     }
 
     /// The raw 32-byte secret, as consumed by
-    /// [`IrohTransport::new`](crate::sharing::iroh::IrohTransport::new).
+    /// `IrohTransport::new`.
     pub fn secret_bytes(&self) -> [u8; 32] {
         self.secret
     }
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(key.node_id(), expected);
     }
 
-    /// End-to-end unification assertion: an [`IrohTransport`] bound from the
+    /// End-to-end unification assertion: an `IrohTransport` bound from the
     /// shared device key reports the same node id `DeviceKey` computes — proof
     /// the account pubkey and the transport peer address are one identity.
     #[tokio::test]

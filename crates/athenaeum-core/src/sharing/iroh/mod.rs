@@ -1,7 +1,7 @@
 //! Real peer-to-peer transport over [iroh] (task A5).
 //!
-//! [`IrohTransport`] implements the same [`SharingTransport`] contract as the
-//! in-process [`LoopbackTransport`](crate::sharing::loopback::LoopbackTransport)
+//! `IrohTransport` implements the same [`SharingTransport`](crate::sharing::SharingTransport) contract as the
+//! in-process `LoopbackTransport`
 //! mock, so the sync engine (task A4) runs unchanged over a real QUIC network.
 //! It composes two iroh protocols on one endpoint:
 //!
@@ -10,17 +10,17 @@
 //!   downloads that collection (verified, resumable) and rebuilds the directory.
 //!   See [`blobs`].
 //! - **a custom control protocol** ([`SYNC_ALPN`]) moves the *metadata* —
-//!   [`PackageAnnounce`]s and per-frame acks — as postcard [`Msg`]s over
+//!   [`PackageAnnounce`](crate::sharing::PackageAnnounce)s and per-frame acks — as postcard [`Msg`]s over
 //!   bidirectional QUIC streams (a one-byte reply confirms in-process delivery
 //!   before the connection closes). See [`proto`].
 //!
 //! # Root hash
 //!
-//! The engine builds a [`PackageAnnounce`] with a placeholder `root_hash`. On
-//! [`serve`](SharingTransport::serve) the transport imports the package into its
+//! The engine builds a [`PackageAnnounce`](crate::sharing::PackageAnnounce) with a placeholder `root_hash`. On
+//! [`serve`](crate::sharing::SharingTransport::serve) the transport imports the package into its
 //! blob store and remembers the resulting collection hash; on
-//! [`announce`](SharingTransport::announce) it substitutes that hash into the
-//! wire announce, so the receiver's [`fetch`](SharingTransport::fetch) downloads
+//! [`announce`](crate::sharing::SharingTransport::announce) it substitutes that hash into the
+//! wire announce, so the receiver's [`fetch`](crate::sharing::SharingTransport::fetch) downloads
 //! by it. The `package_id` is preserved unchanged, so ack correlation in the
 //! engine is unaffected.
 //!
@@ -28,8 +28,8 @@
 //!
 //! The trait addresses peers by [`NodeId`] (== the iroh endpoint's ed25519
 //! public key). Endpoints learn each other's dialable address out of band via a
-//! pairing ticket ([`StartInfo::pairing_ticket`], an [`EndpointTicket`]): each
-//! side calls [`add_peer_ticket`](IrohTransport::add_peer_ticket) once. The
+//! pairing ticket ([`StartInfo::pairing_ticket`](crate::sharing::StartInfo::pairing_ticket), an [`EndpointTicket`](iroh_tickets::endpoint::EndpointTicket)): each
+//! side calls `add_peer_ticket` once. The
 //! address feeds both the control channel and the blobs downloader through the
 //! endpoint's in-memory address lookup — no dependence on external discovery,
 //! which is what lets the in-process tests run with the relay disabled.
@@ -38,33 +38,50 @@
 //! [collection]: iroh_blobs::format::collection::Collection
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(any(test, feature = "test-support"))]
+use anyhow::{anyhow, Context};
+use anyhow::Result;
+#[cfg(any(test, feature = "test-support"))]
 use async_trait::async_trait;
-use iroh::endpoint::{presets, Connection};
+#[cfg(any(test, feature = "test-support"))]
+use iroh::endpoint::presets;
+use iroh::endpoint::Connection;
 use iroh::protocol::{ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
+#[cfg(any(test, feature = "test-support"))]
+use iroh::{EndpointAddr, EndpointId, RelayMode};
+use iroh::{Endpoint, SecretKey};
 use iroh_blobs::api::Store;
 use iroh_blobs::protocol::ChunkRangesSeq;
 use iroh_blobs::provider::events::{
     AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
     ThrottleMode,
 };
+#[cfg(any(test, feature = "test-support"))]
 use iroh_blobs::store::fs::options::Options as FsOptions;
+#[cfg(any(test, feature = "test-support"))]
 use iroh_blobs::store::fs::FsStore;
+#[cfg(any(test, feature = "test-support"))]
 use iroh_blobs::store::mem::MemStore;
+#[cfg(any(test, feature = "test-support"))]
 use iroh_blobs::store::GcConfig;
 use iroh_blobs::{BlobsProtocol, Hash};
+#[cfg(any(test, feature = "test-support"))]
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
 
+#[cfg(any(test, feature = "test-support"))]
 use super::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
-    PackageId, PackageLayout, RevokeReason, StartInfo, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
+    PackageLayout, RevokeReason, StartInfo,
 };
+use super::types::{NodeId, PackageId, TransportEvent};
+#[cfg(any(test, feature = "test-support"))]
 use super::{FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::DedupResponder;
 
@@ -83,7 +100,9 @@ pub(crate) mod telemetry;
 mod tests;
 
 use pacer::{UploadClass, UploadPacer};
-use proto::{announce_received_from_msg, Msg, OfferEntry};
+use proto::{announce_received_from_msg, Msg};
+#[cfg(any(test, feature = "test-support"))]
+use proto::OfferEntry;
 
 /// Custom ALPN for the announce/ack control channel. Distinct from
 /// [`iroh_blobs::ALPN`] so the two protocols coexist on one endpoint.
@@ -112,6 +131,7 @@ pub const COLLAB_BLOBS_ALPN: &[u8] = b"athenaeum/collab-blobs/1";
 /// Deterministic blob-store tag for a package collection. `release` deletes by
 /// this exact name, so both the import (serve) and download (fetch) sides pin
 /// with it — never with an auto-named tag.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn package_tag(package_id: &PackageId) -> String {
     format!("pkg/{}", package_id.0)
 }
@@ -142,7 +162,7 @@ const MAX_CONTROL_BYTES: usize = 16 * 1024 * 1024;
 /// dead peer surfaces as a retryable error instead of wedging the engine.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on waiting for a home relay in [`start`](SharingTransport::start). With
+/// Bound on waiting for a home relay in [`start`](crate::sharing::SharingTransport::start). With
 /// a relay configured this is ample for it to connect; if it can't, we proceed
 /// on direct addresses rather than hang. Never reached with the relay disabled
 /// (that path skips the wait entirely — there is no home relay to connect to,
@@ -151,7 +171,7 @@ const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connection-level authorization predicate over a dialing peer's node id
 /// (collab exchange, slice 4). Installed via
-/// [`IrohTransport::set_connect_gate`] and shared (behind a mutexed `Option`) by
+/// `IrohTransport::set_connect_gate` and shared (behind a mutexed `Option`) by
 /// the control-channel and gated-blobs handlers. `true` ⇒ admit; `false` ⇒ close
 /// the connection before any control dispatch or blob byte. A transport with no
 /// gate installed accepts every connection (today's behavior — Perseus + sender
@@ -160,14 +180,14 @@ pub type ConnectGate = Arc<dyn Fn(&NodeId) -> bool + Send + Sync>;
 
 /// Shared, late-bindable slot for the [`ConnectGate`]. Cloned into both protocol
 /// handlers at construction; the host installs the actual predicate afterwards
-/// via [`IrohTransport::set_connect_gate`], so an already-spawned router picks it
+/// via `IrohTransport::set_connect_gate`, so an already-spawned router picks it
 /// up without a rebuild.
 type SharedConnectGate = Arc<Mutex<Option<ConnectGate>>>;
 
 /// Shared, late-bindable slot for the dedup [`DedupResponder`]. Same shape as
 /// [`SharedConnectGate`]: cloned into [`SyncControlProtocol`] at construction so
 /// an already-spawned router can have its responder installed afterwards. The
-/// [`IrohTransport`] fills it once at build time (from its `responder` arg); the
+/// `IrohTransport` fills it once at build time (from its `responder` arg); the
 /// shared node ([`node::SharedIrohNode`]) leaves it empty until the receiver
 /// migrates onto it and calls
 /// [`set_dedup_responder`](node::SharedIrohNode::set_dedup_responder). Absent ⇒
@@ -191,11 +211,11 @@ pub type PresenceHook = Arc<dyn Fn(NodeId) + Send + Sync>;
 pub(crate) type SharedPresenceHook = Arc<Mutex<Option<PresenceHook>>>;
 
 /// Resolves a served collection's root hash back to the [`PackageId`] whose
-/// [`serve`](SharingTransport::serve) registered it — so the provider-upload-events
+/// [`serve`](crate::sharing::SharingTransport::serve) registered it — so the provider-upload-events
 /// consumer (Task 13) can label an outgoing [`ServeProgress`](TransportEvent::ServeProgress).
 /// `None` for a child-blob / hash-seq-internal / foreign hash (drained but not
 /// emitted). Cloned into the consumer task at router build; each construction site
-/// supplies its own (the legacy [`IrohTransport`] resolves nothing, the shared node
+/// supplies its own (the legacy `IrohTransport` resolves nothing, the shared node
 /// scans its role-prefixed `served` map).
 pub(crate) type ServeRootResolver = Arc<dyn Fn(Hash) -> Option<PackageId> + Send + Sync>;
 
@@ -206,7 +226,7 @@ pub(crate) type ServeRootResolver = Arc<dyn Fn(Hash) -> Option<PackageId> + Send
 /// hash: two byte-identical files share one blob hash but occupy distinct
 /// collection entries, so only the index disambiguates them. Cloned into the
 /// consumer task at router build beside the [`ServeRootResolver`]; each
-/// construction site supplies its own (the legacy [`IrohTransport`] resolves
+/// construction site supplies its own (the legacy `IrohTransport` resolves
 /// nothing, the shared node scans its role-prefixed `served_files` map).
 pub(crate) type ServeFileResolver = Arc<dyn Fn(Hash, u64) -> Option<(String, u64)> + Send + Sync>;
 
@@ -513,15 +533,15 @@ pub(crate) fn connect_gate_admits(gate: &SharedConnectGate, from: &NodeId) -> bo
 }
 
 /// Mount both ALPNs on `endpoint` and spawn the accept loop — the single
-/// construction shape shared by the legacy [`IrohTransport::new`], the shared
+/// construction shape shared by the legacy `IrohTransport::new`, the shared
 /// node's [`bind`](node::SharedIrohNode) and its relay [`rebuild`]. Each of the
 /// three sites previously hand-built the identical
 /// [`GatedBlobs`] + [`SyncControlProtocol`] + [`Router`] triple; the only
 /// per-site variation is threaded through the parameters:
 ///
-/// - `sink` — [`EventSink::Direct`] for the legacy owned-endpoint transport,
+/// - `sink` — `EventSink::Direct` for the legacy owned-endpoint transport,
 ///   [`EventSink::Demux`] for the shared node (both bind and rebuild).
-/// - `flush_store_on_shutdown` — `true` only for [`IrohTransport`], whose router
+/// - `flush_store_on_shutdown` — `true` only for `IrohTransport`, whose router
 ///   teardown IS its store flush; `false` for the shared node, whose store is
 ///   shared across relay rebuilds and flushed explicitly at node shutdown (T8).
 /// - `collab` — the shared node's [`CollabSlotBlobs`], mounted on
@@ -1487,7 +1507,8 @@ async fn collab_serve_verdict(
     }
 }
 
-/// Where an [`IrohTransport`] keeps downloaded/served blob content.
+/// Where an `IrohTransport` keeps downloaded/served blob content.
+#[cfg(any(test, feature = "test-support"))]
 pub enum BlobStore {
     /// Ephemeral in-memory store (tests, or a stateless hop).
     Memory,
@@ -1496,6 +1517,7 @@ pub enum BlobStore {
 }
 
 /// A peer-to-peer sharing transport backed by an iroh endpoint.
+#[cfg(any(test, feature = "test-support"))]
 pub struct IrohTransport {
     /// Endpoint handle (clone of the router's), used to dial peers + download.
     endpoint: Endpoint,
@@ -1536,6 +1558,7 @@ pub struct IrohTransport {
     upload_pacer: Arc<UploadPacer>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl IrohTransport {
     /// Build and bind a transport from a persisted 32-byte secret key.
     ///
@@ -1847,6 +1870,7 @@ impl IrohTransport {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl SharingTransport for IrohTransport {
     async fn start(&self) -> Result<StartInfo> {
@@ -2201,10 +2225,10 @@ impl SharingTransport for IrohTransport {
 
 /// Where a control-accept handler routes a decoded inbound [`TransportEvent`],
 /// and how the accept loop should react (whether to send the transport-level
-/// delivery ack). Two shapes coexist while [`IrohTransport`] and the
+/// delivery ack). Two shapes coexist while `IrohTransport` and the
 /// [`SharedIrohNode`](node::SharedIrohNode) both live (Task 3 removes the former):
 ///
-/// - [`Direct`](EventSink::Direct): the legacy single-stream transport — one
+/// - `Direct`: the legacy single-stream transport — one
 ///   channel, ack on a successful send, stop on a gone consumer.
 /// - [`Demux`](EventSink::Demux): the shared node's per-`(peer, package)`
 ///   ack-claim + single Recv-consumer router (Д4), which additionally
@@ -2212,6 +2236,7 @@ impl SharingTransport for IrohTransport {
 ///   the delivery ack and the sender retries instead of losing the message.
 #[derive(Clone)]
 pub(crate) enum EventSink {
+    #[cfg(any(test, feature = "test-support"))]
     Direct(mpsc::Sender<TransportEvent>),
     Demux(Arc<node::EventDemux>),
 }
@@ -2234,6 +2259,7 @@ impl EventSink {
     /// loop should proceed.
     async fn deliver(&self, event: TransportEvent) -> Delivery {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             EventSink::Direct(tx) => match tx.send(event).await {
                 Ok(()) => Delivery::Delivered,
                 Err(_) => Delivery::ConsumerGone,
@@ -2248,7 +2274,7 @@ impl EventSink {
     /// is CORRECT — upload progress is best-effort UI data, and blocking here would
     /// stall the consumer that must keep draining request updates for the transfer.
     ///
-    /// - [`Direct`](EventSink::Direct): the legacy single-stream transport is
+    /// - `Direct`: the legacy single-stream transport is
     ///   test-only and does NOT surface serve-progress — folding it into the shared
     ///   announce/ack stream is the exact misrouting hazard the demux exists to
     ///   avoid (audit C1). No-op; production flows through `Demux` below.
@@ -2257,6 +2283,7 @@ impl EventSink {
     ///   dropped.
     fn route_serve_progress(&self, package_id: &PackageId, bytes_sent: u64) {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             EventSink::Direct(_) => {}
             EventSink::Demux(demux) => demux.route_serve_progress(package_id, bytes_sent),
         }
@@ -2271,6 +2298,7 @@ impl EventSink {
     /// through the demux to the ack-claim owner(s) for this `package_id`.
     fn route_serve_complete(&self, package_id: &PackageId) {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             EventSink::Direct(_) => {}
             EventSink::Demux(demux) => demux.route_serve_complete(package_id),
         }
@@ -2292,6 +2320,7 @@ impl EventSink {
         bytes_total: u64,
     ) {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             EventSink::Direct(_) => {}
             EventSink::Demux(demux) => {
                 demux.route_serve_file_progress(package_id, file, bytes_done, bytes_total)
@@ -2582,7 +2611,7 @@ pub(crate) struct GatedBlobs {
     inner: BlobsProtocol,
     gate: SharedConnectGate,
     /// Whether a router shutdown should flush the backing blob store (iroh
-    /// hardening T8). `true` for the legacy [`IrohTransport`], whose only store
+    /// hardening T8). `true` for the legacy `IrohTransport`, whose only store
     /// flush IS this router-driven path. `false` for the [`SharedIrohNode`], whose
     /// store is SHARED across relay rebuilds: its per-rebuild router teardown must
     /// NOT tear the store down (the accept loop calls `protocols.shutdown()` when

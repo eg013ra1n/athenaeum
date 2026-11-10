@@ -115,6 +115,8 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 
 [dev-dependencies]
 tempfile = "3"
+# The loopback / legacy-iroh test transports exist only behind core's `test-support` feature; dev-only so `cargo build -p perseus` never compiles them.
+athenaeum-core = { path = "../athenaeum-core", default-features = false, features = ["test-support"] }
 # DST arms of the scheduler math (schedule.rs, 0.5.1 T12): a REAL IANA zone
 # (America/New_York) so the spring-forward gap and fall-back fold are the ones the
 # tz database defines, not ones a hand-rolled fake TimeZone invented. Dev-only —

@@ -3347,7 +3347,7 @@ fn live_collab_dialer(me: &SharedIrohNode, providers: &[&Arc<SharedIrohNode>]) -
         })
         .collect();
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
-    Dialer::Collab {
+    Dialer {
         pool: super::collab_pool::CollabPool::with_connect_timeout(
             me.endpoint(),
             events,
@@ -3429,46 +3429,9 @@ async fn run_live_items(
     opts: LiveRunOptions,
     patience: Duration,
 ) -> LiveOut {
-    run_live_items_ballasted(store, dialer, items, opts, patience, 0).await
-}
-
-/// As [`run_live_items`], with `ballast_bytes` of extra budget: a run-long item
-/// of that size that waits on an empty provider set, holding a stream slot and
-/// its 5 % share of the hedge budget until every real item has ended. `0`: no
-/// ballast. (A live run's hedge budget is 5 % of the bytes of the items IN
-/// FLIGHT, so it shrinks as a run drains; the ballast stands in for the items
-/// that would still be in flight beside a long tail.) The ballast's own outcome
-/// is not reported.
-async fn run_live_items_ballasted(
-    store: &Store,
-    dialer: Dialer,
-    items: Vec<LiveItem>,
-    opts: LiveRunOptions,
-    patience: Duration,
-    ballast_bytes: u64,
-) -> LiveOut {
     let real = items.len();
-    let mut queue = Vec::with_capacity(real + 1);
-    // Held until the run ends: dropping the sender never fires the switch, and
-    // the empty provider set never changes.
-    let (_empty_tx, empty_rx) = tokio::sync::watch::channel(Arc::new(Vec::<EndpointId>::new()));
-    let (ballast_cancel_tx, ballast_cancel) = tokio::sync::watch::channel(false);
-    if ballast_bytes > 0 {
-        let hash = Hash::new(b"hedge budget ballast");
-        queue.push(LiveItem {
-            item: FetchItem {
-                key: LIVE_BALLAST_KEY.to_string(),
-                request: GetRequest::blob(hash),
-                hash,
-                size: ballast_bytes,
-                providers: ProviderSet::Live(empty_rx),
-            },
-            cancel: ballast_cancel,
-        });
-    }
-    queue.extend(items);
-    let (item_tx, item_rx) = tokio::sync::mpsc::channel(queue.len().max(1));
-    for item in queue {
+    let (item_tx, item_rx) = tokio::sync::mpsc::channel(real.max(1));
+    for item in items {
         item_tx.send(item).await.unwrap();
     }
     drop(item_tx);
@@ -3479,14 +3442,8 @@ async fn run_live_items_ballasted(
     // Outcomes arrive as items end; the channel closes when the run returns.
     let collect = async {
         let mut outcomes = Vec::new();
-        while let Some((key, out)) = done_rx.recv().await {
-            if key == LIVE_BALLAST_KEY {
-                continue;
-            }
-            outcomes.push((key, out));
-            if outcomes.len() == real {
-                ballast_cancel_tx.send_replace(true);
-            }
+        while let Some(done) = done_rx.recv().await {
+            outcomes.push(done);
         }
         outcomes
     };
@@ -3503,8 +3460,6 @@ async fn run_live_items_ballasted(
         report,
     }
 }
-
-const LIVE_BALLAST_KEY: &str = "ballast";
 
 /// A receiver and N collab providers, paired, each provider holding the same
 /// `items` raw blobs of `size` bytes (`f0` .. `f{items-1}`).
@@ -3712,7 +3667,7 @@ async fn live_one_connection_per_provider_for_many_items() {
     const SIZE: usize = 8 * 1024;
     let swarm = live_swarm(1, ITEMS, SIZE).await;
     let dialer = swarm.dialer();
-    let Dialer::Collab { pool, .. } = &dialer;
+    let Dialer { pool, .. } = &dialer;
     let pool = Arc::clone(pool);
     let (telemetry, _seen) = recording_telemetry();
     let out = run_live_items(
@@ -3965,28 +3920,43 @@ async fn live_report_matches_provider_send_counters() {
     swarm.shutdown().await;
 }
 
-/// The hedge swarm: forty 256 KiB items on three providers. The budget is 5 % of
-/// the items in flight and one hedge costs half of what an item still needs, so
-/// forty items in flight give the bucket room for several hedges at once.
+/// The hedge swarm: forty 256 KiB items on three providers. A live run's hedge
+/// cap is never smaller than one hedge of the largest item in flight, so an
+/// idle budget pays for the hedge of a stranded item however few items are left.
 const LIVE_HEDGE_ITEMS: usize = 40;
 const LIVE_HEDGE_SIZE: usize = 256 * 1024;
 
 /// A provider that goes slow MID-TRANSFER triggers a hedge well before the stall
 /// ceiling, and the run finishes on the healthy peers. Every provider is paced
-/// the same, then one collapses to 1 KB/s: fast history, slow now.
-///
-/// The budget is held up by a run-long ballast item (see
-/// [`run_live_items_ballasted`]). Without it the stranded tail cannot afford a
-/// hedge: a live run's budget is 5 % of the bytes in flight and shrinks as items
-/// end, so the tail waits out the stall ceiling instead (`docs/transfers/README.md`,
-/// "Live hedge budget"). This test pins the hedge mechanics, not that budget rule.
+/// the same, then one collapses to 1 KB/s: fast history, slow now. This pins the
+/// trigger and the cap floor (an idle budget pays for one hedge), not a byte
+/// bound: the hedge goes to a healthy peer and the collapsed primary moves ~0
+/// bytes past the split, so nothing is duplicated.
 #[tokio::test]
-async fn live_hedge_fires_with_the_budget_held_up() {
-    live_hedge_fires_scenario((LIVE_HEDGE_ITEMS * LIVE_HEDGE_SIZE) as u64).await;
+async fn live_hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
+    live_hedge_fires_scenario(LIVE_HEDGE_ITEMS, LIVE_HEDGE_ITEMS).await;
 }
 
-async fn live_hedge_fires_scenario(ballast_bytes: u64) {
-    let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
+/// The same scenario with the production receive-stream limit (8) and eight
+/// items, all in flight from the start. When the trigger fires only the two or
+/// three stranded items are still in flight, and 5 % of those cannot pay for a
+/// hedge of one of them; the half-item floor does. (More items than
+/// streams would hand the collapsed peer NEW items, which have no size for
+/// ~16 s and so cannot be hedged — the stall ceiling's case, not the budget's.)
+#[tokio::test]
+async fn live_hedge_fires_with_the_default_stream_limit() {
+    const ITEMS: usize = 8;
+    let report = live_hedge_fires_scenario(ITEMS, 8).await;
+    // Not a byte bound (the budget bounds bytes, and these hedges duplicate
+    // nothing): a sanity bound against a re-arm loop on the same item.
+    assert!(
+        report.hedges as usize <= 2 * ITEMS,
+        "a hedge storm: {report:?}"
+    );
+}
+
+async fn live_hedge_fires_scenario(items: usize, max_in_flight: usize) -> AssignmentReport {
+    let swarm = live_swarm(3, items, LIVE_HEDGE_SIZE).await;
     for n in &swarm.nodes {
         n.set_upload_limit(400_000);
     }
@@ -3999,24 +3969,18 @@ async fn live_hedge_fires_scenario(ballast_bytes: u64) {
         })
     };
     let started = Instant::now();
-    let out = run_live_items_ballasted(
+    let out = run_live_items(
         &swarm.store(),
         swarm.dialer(),
         swarm.items(),
         // The 60 s ceiling is long enough that it cannot be what rescues the run.
-        live_run_opts(
-            Duration::from_secs(60),
-            true,
-            LIVE_HEDGE_ITEMS + 1,
-            telemetry,
-        ),
+        live_run_opts(Duration::from_secs(60), true, max_in_flight, telemetry),
         Duration::from_secs(120),
-        ballast_bytes,
     )
     .await;
     let elapsed = started.elapsed();
     collapse.await.ok();
-    out.assert_all_done(LIVE_HEDGE_ITEMS);
+    out.assert_all_done(items);
     swarm.assert_landed().await;
     assert!(
         elapsed < Duration::from_secs(45),
@@ -4034,40 +3998,39 @@ async fn live_hedge_fires_scenario(ballast_bytes: u64) {
         out.report
     );
     swarm.shutdown().await;
+    out.report
 }
 
 /// The loser is REALLY cancelled: the slow provider's own socket send counter
-/// stays under four items' worth though it was handed many more, and hedging
-/// does not double the payload. At 5 KB/s a 256 KiB item needs ~52 s, so the
-/// peer never completes one and never measures itself into hedge immunity. The
-/// budget is held up by a ballast item, as in
-/// [`live_hedge_fires_with_the_budget_held_up`].
+/// stays under four items' worth though it was handed many more. The byte bound
+/// on `hedge_bytes` is only a gross sanity check (the loser is the slow peer
+/// and moves ~0 bytes past the split). At 5 KB/s a 256 KiB item needs ~52 s, so
+/// the peer never completes one and never measures itself into hedge immunity.
 #[tokio::test]
-async fn live_hedge_cancels_the_loser_with_the_budget_held_up() {
-    live_hedge_cancels_scenario((LIVE_HEDGE_ITEMS * LIVE_HEDGE_SIZE) as u64).await;
+async fn live_hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
+    live_hedge_cancels_scenario().await;
 }
 
-async fn live_hedge_cancels_scenario(ballast_bytes: u64) {
+async fn live_hedge_cancels_scenario() {
     let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
     let slow = &swarm.nodes[2];
     slow.set_upload_limit(5_000);
     let (telemetry, _) = recording_telemetry();
     let slow_before = sent_bytes(slow);
     let started = Instant::now();
-    let out = run_live_items_ballasted(
+    let out = run_live_items(
         &swarm.store(),
         swarm.dialer(),
         swarm.items(),
         live_run_opts(
             Duration::from_secs(60),
             true,
-            LIVE_HEDGE_ITEMS + 1,
+            LIVE_HEDGE_ITEMS,
             telemetry,
         ),
         // A byte budget, not a clock: a loaded runner must not fail it. An
         // uncancelled primary would need about eleven minutes.
         Duration::from_secs(240),
-        ballast_bytes,
     )
     .await;
     let elapsed = started.elapsed();
@@ -4102,15 +4065,14 @@ async fn live_hedge_cancels_scenario(ballast_bytes: u64) {
     swarm.shutdown().await;
 }
 
-/// The bucket keeps a storm bounded: a peer that strands many items at once does
-/// NOT duplicate whole ranges. The byte
-/// bound end to end is also what pins the refund rule.
+/// Many items stranded on a peer at once: hedging engages, every item lands
+/// and is credited once, and `hedge_bytes` stays under twice the run's 5 %.
+/// This is a gross end-to-end bound, not a pin of the budget's rule — the
+/// hedges go to healthy peers and the collapsed primary moves ~0 bytes past the
+/// split, so little is duplicated whatever the budget; the rule itself is
+/// pinned by the `HedgeBudget` unit tests in `assign.rs`.
 #[tokio::test]
 async fn live_hedge_budget_stops_a_storm() {
-    // The budget is held up by a ballast item, as in the two scenarios above:
-    // without it the tail is unhedged (so few hedges that the byte bound passes
-    // vacuously) and the run grinds on to the 60 s stall ceiling, ~95 s.
-    let ballast_bytes = (LIVE_HEDGE_ITEMS * LIVE_HEDGE_SIZE) as u64;
     let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
     for n in &swarm.nodes {
         n.set_upload_limit(400_000);
@@ -4124,18 +4086,17 @@ async fn live_hedge_budget_stops_a_storm() {
             slow.set_upload_limit(1_000);
         })
     };
-    let out = run_live_items_ballasted(
+    let out = run_live_items(
         &swarm.store(),
         swarm.dialer(),
         swarm.items(),
         live_run_opts(
             Duration::from_secs(60),
             true,
-            LIVE_HEDGE_ITEMS + 1,
+            LIVE_HEDGE_ITEMS,
             telemetry,
         ),
         Duration::from_secs(120),
-        ballast_bytes,
     )
     .await;
     collapse.await.ok();
@@ -4156,7 +4117,7 @@ async fn live_hedge_budget_stops_a_storm() {
     assert!(
         out.report.hedge_bytes <= 2 * cap,
         "hedging must stay inside its byte budget — it duplicated {} B against a {cap} B cap \
-         (2x allowed for refills) over {} hedges: {:?}",
+         (2x allowed) over {} hedges: {:?}",
         out.report.hedge_bytes,
         out.report.hedges,
         out.report
@@ -4629,7 +4590,7 @@ mod live_run {
         let dialer = {
             let book = Arc::clone(&book);
             let (events, _) = tokio::sync::mpsc::unbounded_channel();
-            Dialer::Collab {
+            Dialer {
                 pool: crate::sharing::iroh::collab_pool::CollabPool::new(me.endpoint(), events),
                 addrs: Arc::new(move |_| book.lock().unwrap().clone()),
             }

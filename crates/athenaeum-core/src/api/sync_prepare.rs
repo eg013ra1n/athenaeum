@@ -133,7 +133,6 @@ fn emit_preparing_progress(
             stage: "preparing".to_string(),
             peer_device: node_id_hex(&peer),
             frame_count,
-            project_id: None,
             bytes_done: Some(0),
             bytes_total: Some(bytes_total),
         },
@@ -414,7 +413,6 @@ pub(crate) fn stage_records(
                     stage: "preparing".to_string(),
                     peer_device: peer_hex.clone(),
                     frame_count,
-                    project_id: None,
                     bytes_done: Some(bytes_done),
                     bytes_total: Some(total),
                 },
@@ -1088,7 +1086,6 @@ fn terminalize(
                 failed: Vec::new(),
                 new_count: 0,
                 duplicate_count: 0,
-                project_id: None,
             },
         );
     }

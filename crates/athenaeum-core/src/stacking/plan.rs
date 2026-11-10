@@ -4172,7 +4172,8 @@ mod tests {
 
     /// Ruling R10 M2: the rendering of a stored file time is a wire fact (rows already written carry it, and the
     /// scanner's own `to_rfc3339()` shape is what it must equal), so three literals pin it: a whole second, a
-    /// millisecond time and a nanosecond time.
+    /// millisecond time and a sub-microsecond time. The last one is a multiple of 100 ns, the finest step a Windows
+    /// file time holds, so the same literal is exact on every platform.
     #[test]
     fn render_modified_at_is_pinned_to_golden_literals() {
         use std::time::{Duration, UNIX_EPOCH};
@@ -4185,11 +4186,11 @@ mod tests {
             "2023-11-14T22:13:20.123+00:00"
         );
         assert_eq!(
-            render_modified_at(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)),
-            "2023-11-14T22:13:20.123456789+00:00"
+            render_modified_at(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700)),
+            "2023-11-14T22:13:20.123456700+00:00"
         );
         // The scanner's shape: the same value through its own call.
-        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700);
         assert_eq!(
             render_modified_at(t),
             chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()

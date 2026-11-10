@@ -672,21 +672,6 @@ pub trait SyncStore: Send + Sync {
     /// terminal-state eligibility is the caller's policy.
     fn reset_outbound_for_resend(&self, id: i64, new_wire_id: &str) -> Result<()>;
 
-    /// Stamp the collab `project_id` on an outbound row (spec §D6). Delegates to
-    /// the free [`set_outbound_project_id`]. The engine calls it best-effort at the
-    /// enqueue path for a project package (a personal send never calls it — no
-    /// stamp). No behavioral use this wave; the column just distinguishes collab
-    /// rows for the future planner.
-    ///
-    /// Default is a no-op so a transport-less / personal-only store
-    /// (Perseus's mock + its decorator, which never handle project packages) needs
-    /// no override; the two real catalog/standalone stores back the only rows that
-    /// ever carry a project stamp and override it.
-    fn set_outbound_project_id(&self, id: i64, project_id: Option<&str>) -> Result<()> {
-        let _ = (id, project_id);
-        Ok(())
-    }
-
     /// Append one audit row.
     fn append_history(&self, h: HistoryRow) -> Result<()>;
 
@@ -703,7 +688,6 @@ type OutboundRaw = (
     String,
     i64,
     String,
-    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -726,7 +710,6 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         next_retry_at,
         wire_package_id,
         display_name,
-        project_id,
         generation,
         layout,
     ) = raw;
@@ -742,7 +725,6 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         next_retry_at,
         wire_package_id,
         display_name,
-        project_id,
         generation: generation.max(0) as u32,
         layout: PackageLayout::from_db(&layout),
     })
@@ -796,7 +778,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
 }
 
 const OUTBOUND_COLS: &str =
-    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name, project_id, generation, layout";
+    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name, generation, layout";
 const HISTORY_COLS: &str =
     "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id, batch_name";
 
@@ -818,7 +800,6 @@ fn outbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<OutboundRaw> {
         r.get(10)?,
         r.get(11)?,
         r.get(12)?,
-        r.get(13)?,
     ))
 }
 
@@ -1081,21 +1062,6 @@ pub fn reset_outbound_for_resend(conn: &Connection, id: i64, new_wire_id: &str) 
     )
     .with_context(|| format!("reset sync_outbound_files for {id}"))?;
     tx.commit().context("commit reset_outbound_for_resend")?;
-    Ok(())
-}
-
-/// Stamp (or clear with `None`) the collab `project_id` on an outbound row (spec
-/// §D6). The engine writes it at the store enqueue path from the package's
-/// manifest stamp so collab transfers are distinguishable from personal ones; a
-/// personal send never carries a stamp and this is not called. No behavioral use
-/// this wave — the column is the collab planner's future key. A missing row is a
-/// benign no-op (the caller is best-effort).
-pub fn set_outbound_project_id(conn: &Connection, id: i64, project_id: Option<&str>) -> Result<()> {
-    conn.execute(
-        "UPDATE sync_outbound SET project_id = ?1 WHERE id = ?2",
-        params![project_id, id],
-    )
-    .with_context(|| format!("set project_id for outbound {id}"))?;
     Ok(())
 }
 
@@ -2938,11 +2904,6 @@ impl SyncStore for StandaloneSyncStore {
         reset_outbound_for_resend(&conn, id, new_wire_id)
     }
 
-    fn set_outbound_project_id(&self, id: i64, project_id: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().expect("sync store mutex poisoned");
-        set_outbound_project_id(&conn, id, project_id)
-    }
-
     fn append_history(&self, h: HistoryRow) -> Result<()> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         insert_history_row(&conn, &h)
@@ -3352,11 +3313,6 @@ impl SyncStore for CatalogSyncStore {
     fn reset_outbound_for_resend(&self, id: i64, new_wire_id: &str) -> Result<()> {
         let conn = self.lock_conn();
         reset_outbound_for_resend(&conn, id, new_wire_id)
-    }
-
-    fn set_outbound_project_id(&self, id: i64, project_id: Option<&str>) -> Result<()> {
-        let conn = self.lock_conn();
-        set_outbound_project_id(&conn, id, project_id)
     }
 
     fn append_history(&self, h: HistoryRow) -> Result<()> {

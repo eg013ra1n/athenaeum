@@ -331,13 +331,6 @@ struct Pending {
     /// the sender's `sync-finished` `{new, duplicate}` outcome.
     new_count: u32,
     duplicate_count: u32,
-    /// The project id read from the manifest's
-    /// [`ProjectStamp`](crate::package::ProjectStamp) on the first build, kept only
-    /// to tag this package's `sync-progress` / `sync-finished` events (the UI's
-    /// project-branch notification). The package itself is sent as an ordinary
-    /// personal-sync package; `None` for every package no stamp was ever written
-    /// into.
-    project_id: Option<String>,
     /// Snapshot of the manifest records read on the first successful build,
     /// cached so a terminal-fail epilogue (`fail_package`) can still name every
     /// frame in the `failed` history outcome even when the package dir has since
@@ -999,14 +992,6 @@ impl Worker {
                         match self.store.enqueue(&dir.to_string_lossy(), self.peer, display_name.as_deref(), &files, layout) {
                             Ok(id) => {
                                 tracing::info!(package_id = id, state = "queued", "sync state");
-                                // §D6: stamp the collab `project_id` onto the row at
-                                // the store enqueue path so collab transfers are
-                                // distinguishable from personal ones. The stamp lives
-                                // in the on-disk manifest (a project package's records
-                                // carry it); read it once here, best-effort — a
-                                // personal send finds no stamp and skips the write. No
-                                // behavioral use this wave.
-                                self.persist_project_id(id, &dir);
                                 // Journal the batch's first lifecycle event (§D7).
                                 let byte_size: u64 = files.iter().map(|f| f.byte_size).sum();
                                 self.journal(id, "enqueued", Some(&format!("frames={} bytes={}", files.len(), byte_size)));
@@ -1070,10 +1055,6 @@ impl Worker {
     /// lifecycle) so the Transfers UI can correlate it to the Active-tab row.
     fn emit_progress(&self, id: i64, stage: &str, frame_count: u32) {
         if let Some(em) = &self.emitter {
-            // Collab exchange (slice 4): tag the tick with the project id if this
-            // package is a project exchange. Read from the live slot (present for
-            // every progress tick); `None` for personal sync.
-            let project_id = self.pending.get(&id).and_then(|p| p.project_id.clone());
             emit_event(
                 em.as_ref(),
                 "sync-progress",
@@ -1083,7 +1064,6 @@ impl Worker {
                     stage: stage.to_string(),
                     peer_device: node_id_hex(&self.peer),
                     frame_count,
-                    project_id,
                     // Sender-side ticks carry no byte figure (Task 11 fetch bytes are
                     // a receive-side concern).
                     bytes_done: None,
@@ -1108,7 +1088,6 @@ impl Worker {
         bytes_total: u64,
     ) {
         if let Some(em) = &self.emitter {
-            let project_id = self.pending.get(&id).and_then(|p| p.project_id.clone());
             emit_event(
                 em.as_ref(),
                 "sync-progress",
@@ -1118,7 +1097,6 @@ impl Worker {
                     stage: stage.to_string(),
                     peer_device: node_id_hex(&self.peer),
                     frame_count,
-                    project_id,
                     bytes_done: Some(bytes_done),
                     bytes_total: Some(bytes_total),
                 },
@@ -1160,7 +1138,6 @@ impl Worker {
         failed: Vec<String>,
         new_count: u32,
         duplicate_count: u32,
-        project_id: Option<String>,
     ) {
         if let Some(em) = &self.emitter {
             emit_event(
@@ -1175,7 +1152,6 @@ impl Worker {
                     failed,
                     new_count,
                     duplicate_count,
-                    project_id,
                 },
             );
         }
@@ -1298,7 +1274,6 @@ impl Worker {
                 want: None,
                 new_count: 0,
                 duplicate_count: 0,
-                project_id: None,
                 manifest_records: None,
                 last_attempt_class: None,
                 file_states: HashMap::new(),
@@ -1485,7 +1460,6 @@ impl Worker {
                         stage: "indexing".to_string(),
                         peer_device: peer_device.clone(),
                         frame_count,
-                        project_id: None,
                         bytes_done: Some(bytes_done),
                         bytes_total: Some(bytes_total),
                     },
@@ -1690,15 +1664,6 @@ impl Worker {
             }
         }
 
-        // A manifest carrying a (retired) project stamp is still read, only to tag
-        // this package's events on the slot (see `Pending::project_id`); the
-        // package is sent and deduplicated like any personal-sync package.
-        if let Some(s) = records.iter().find_map(|r| r.project.as_ref()) {
-            if let Some(p) = self.pending.get_mut(&id) {
-                p.project_id = Some(s.project_id.clone());
-            }
-        }
-
         // Build the offer (sampling hashes). ANY hashing error abandons the
         // handshake for the whole package → full send (`want = None`).
         let want: Option<HashSet<String>> = {
@@ -1882,7 +1847,6 @@ impl Worker {
             Vec::new(),
             0,
             records.len() as u32,
-            pending.project_id.clone(),
         );
         Ok(())
     }
@@ -2290,25 +2254,6 @@ impl Worker {
         let dir = PathBuf::from(&row.package_ref);
         if let Err(e) = self.start_package(id, dir, row.state).await {
             tracing::error!(package_id = id, reason, error = %format!("{e:#}"), "start_package failed");
-        }
-    }
-
-    /// Persist the collab `project_id` onto a freshly-enqueued outbound row (§D6),
-    /// read from the package's on-disk manifest stamp. Best-effort and skipped
-    /// entirely for a personal-sync package (no stamp): so collab rows become
-    /// distinguishable in `sync_outbound` without any behavioral use this wave. A
-    /// manifest-read or store-write failure only `warn!`s — it must never fail the
-    /// enqueue.
-    fn persist_project_id(&self, id: i64, dir: &Path) {
-        let project_id = package::read_manifest(dir).ok().and_then(|records| {
-            records
-                .iter()
-                .find_map(|r| r.project.as_ref().map(|p| p.project_id.clone()))
-        });
-        if let Some(pid) = project_id {
-            if let Err(e) = self.store.set_outbound_project_id(id, Some(&pid)) {
-                tracing::warn!(package_id = id, error = %format!("{e:#}"), "persist project_id failed");
-            }
         }
     }
 
@@ -2870,7 +2815,6 @@ impl Worker {
                 Vec::new(),
                 0,
                 0,
-                pending.project_id.clone(),
             );
             return Ok(());
         }
@@ -2985,7 +2929,6 @@ impl Worker {
             Vec::new(),
             pending.new_count,
             pending.duplicate_count,
-            pending.project_id.clone(),
         );
         Ok(())
     }
@@ -3151,16 +3094,15 @@ impl Worker {
     /// (not `Failed`, and not routed through here).
     fn fail_package(&mut self, id: i64) -> Result<()> {
         let removed = self.pending.remove(&id);
-        let (dir, last_rejected, pkg_id, project_id, manifest_records, started) = match removed {
+        let (dir, last_rejected, pkg_id, manifest_records, started) = match removed {
             Some(p) => (
                 Some(p.dir),
                 p.last_rejected,
                 p.announce.map(|a| a.package_id),
-                p.project_id,
                 p.manifest_records,
                 p.started,
             ),
-            None => (None, Vec::new(), None, None, None, false),
+            None => (None, Vec::new(), None, None, false),
         };
         self.store.set_state(id, OutboundState::Failed)?;
         // Terminal: no retry is pending — clear the persisted countdown (Task 2).
@@ -3201,7 +3143,7 @@ impl Worker {
             }
         }
         self.journal(id, "failed", Some(&outcome));
-        self.emit_finished(id, &outcome, 0, last_rejected, 0, 0, project_id);
+        self.emit_finished(id, &outcome, 0, last_rejected, 0, 0);
         Ok(())
     }
 
@@ -3213,11 +3155,10 @@ impl Worker {
         // in-flight entry also carries the minted announce whose blobs need
         // releasing; a row resolved only from the store was never served this
         // session, so there is nothing to release (`pkg_id` stays `None`).
-        let (dir, pkg_id, project_id, started) = if let Some(p) = self.pending.remove(&id) {
+        let (dir, pkg_id, started) = if let Some(p) = self.pending.remove(&id) {
             (
                 Some(p.dir),
                 p.announce.map(|a| a.package_id),
-                p.project_id,
                 p.started,
             )
         } else {
@@ -3227,7 +3168,6 @@ impl Worker {
                     .into_iter()
                     .find(|r| r.id == id)
                     .map(|r| PathBuf::from(r.package_ref)),
-                None,
                 None,
                 false,
             )
@@ -3270,7 +3210,7 @@ impl Worker {
         if let Some(sink) = &self.cleanup_sink {
             sink.on_terminal(&dir);
         }
-        self.emit_finished(id, "cancelled", 0, Vec::new(), 0, 0, project_id);
+        self.emit_finished(id, "cancelled", 0, Vec::new(), 0, 0);
         Ok(())
     }
 
