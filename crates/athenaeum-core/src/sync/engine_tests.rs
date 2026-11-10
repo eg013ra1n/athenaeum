@@ -3552,11 +3552,11 @@ async fn mixed_batch_serves_only_want_subset() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice-4 collab exchange: project-aware announce + the request_project wire.
+// A manifest carrying a retired project stamp is sent as a personal-sync package.
 // ---------------------------------------------------------------------------
 
-/// Build a one-frame package whose manifest carries a [`ProjectStamp`], so the
-/// engine routes its announce through `announce_project` (slice 4).
+/// Build a one-frame package whose manifest carries a [`ProjectStamp`] (the
+/// retired collab-package era's manifest shape).
 fn build_project_package(
     src_root: &Path,
     frame_uuid: &str,
@@ -3597,15 +3597,15 @@ fn build_project_package(
     pkg_dir
 }
 
-/// A project package (manifest carries a `ProjectStamp`) enqueued into the engine
-/// is advertised to the peer as `ProjectAnnounceReceived` — carrying the hub id
-/// and project id — NOT a plain `AnnounceReceived`.
+/// A package whose manifest carries a (retired) `ProjectStamp` is advertised to
+/// the peer as an ordinary personal-sync `AnnounceReceived` — never as a project
+/// advertisement — and goes through the Offer/Want dedup like any other package.
 #[tokio::test]
-async fn project_package_announces_via_announce_project() {
+async fn stamped_package_announces_as_personal_sync() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
 
-    // Receiver endpoint records the first inbound project advertisement.
+    // Receiver endpoint records the first inbound announce.
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
     let seen: Arc<std::sync::Mutex<Option<TransportEvent>>> = Arc::new(std::sync::Mutex::new(None));
@@ -3615,12 +3615,12 @@ async fn project_package_announces_via_announce_project() {
         tokio::spawn(async move {
             let mut events = receiver.events().await;
             while let Some(ev) = events.recv().await {
-                // A project package must never arrive as a plain announce.
+                // A stamped package must never arrive as a project advertisement.
                 assert!(
-                    !matches!(ev, TransportEvent::AnnounceReceived { .. }),
-                    "project package must not arrive as a plain AnnounceReceived"
+                    !matches!(ev, TransportEvent::ProjectAnnounceReceived { .. }),
+                    "a stamped package must not arrive as a ProjectAnnounceReceived"
                 );
-                if matches!(ev, TransportEvent::ProjectAnnounceReceived { .. }) {
+                if matches!(ev, TransportEvent::AnnounceReceived { .. }) {
                     *seen.lock().unwrap() = Some(ev);
                     break;
                 }
@@ -3649,49 +3649,12 @@ async fn project_package_announces_via_announce_project() {
 
     wait_until(|| seen.lock().unwrap().is_some(), WAIT).await;
     match seen.lock().unwrap().take().unwrap() {
-        TransportEvent::ProjectAnnounceReceived {
-            project_id,
-            package_id,
-            announce,
-            ..
-        } => {
-            assert_eq!(project_id, "p-1");
-            assert_eq!(package_id, "hub-pkg-1");
+        TransportEvent::AnnounceReceived { announce, .. } => {
             assert_eq!(announce.frame_count, 1);
         }
-        other => panic!("expected ProjectAnnounceReceived, got {other:?}"),
+        other => panic!("expected AnnounceReceived, got {other:?}"),
     }
     engine.shutdown().await;
-}
-
-/// `request_project` delivers a `ProjectRequestReceived` (carrying the hub id) to
-/// the holder — the receive-role member's pull request over the loopback wire.
-#[tokio::test]
-async fn request_project_delivers_project_request_event() {
-    let net = LoopbackNetwork::new();
-    let holder = net.endpoint();
-    holder.start().await.unwrap();
-    let holder_id = holder.node_id();
-    let mut events = holder.events().await;
-
-    let member = net.endpoint();
-    member.start().await.unwrap();
-    member
-        .request_project(holder_id, "p-1", "hub-pkg-1")
-        .await
-        .unwrap();
-
-    match events.recv().await.unwrap() {
-        TransportEvent::ProjectRequestReceived {
-            project_id,
-            package_id,
-            ..
-        } => {
-            assert_eq!(project_id, "p-1");
-            assert_eq!(package_id, "hub-pkg-1");
-        }
-        other => panic!("expected ProjectRequestReceived, got {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -193,6 +193,47 @@ impl LoopbackTransport {
             .unwrap_or(false)
     }
 
+    /// Test-only: deliver a retired project-announce event to peer `to`, as an
+    /// old peer's wire message would arrive. Nothing in production sends it any
+    /// more; the receive side still decodes it and ignores it.
+    #[cfg(test)]
+    pub(crate) async fn inject_project_announce(
+        &self,
+        to: NodeId,
+        project_id: &str,
+        package_id: &str,
+        a: &PackageAnnounce,
+    ) -> anyhow::Result<()> {
+        self.peer_tx(to)?
+            .send(TransportEvent::ProjectAnnounceReceived {
+                from: self.node_id,
+                project_id: project_id.to_string(),
+                package_id: package_id.to_string(),
+                announce: a.clone(),
+            })
+            .await
+            .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))
+    }
+
+    /// Test-only: deliver a retired project-request event to peer `to` (see
+    /// [`inject_project_announce`](Self::inject_project_announce)).
+    #[cfg(test)]
+    pub(crate) async fn inject_project_request(
+        &self,
+        to: NodeId,
+        project_id: &str,
+        package_id: &str,
+    ) -> anyhow::Result<()> {
+        self.peer_tx(to)?
+            .send(TransportEvent::ProjectRequestReceived {
+                from: self.node_id,
+                project_id: project_id.to_string(),
+                package_id: package_id.to_string(),
+            })
+            .await
+            .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))
+    }
+
     /// Test-only: seed a receiver-side in-flight download tag for `package_id`
     /// (the loopback stand-in for `in-flight/recv/pkg/<package_id>`). The B7
     /// orphan sweep enumerates these via
@@ -294,55 +335,6 @@ impl SharingTransport for LoopbackTransport {
             package_id = %package_id.0,
             ?reason,
             "loopback revoke delivered"
-        );
-        Ok(())
-    }
-
-    async fn announce_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-        a: &PackageAnnounce,
-    ) -> anyhow::Result<()> {
-        let tx = self.peer_tx(to)?;
-        tx.send(TransportEvent::ProjectAnnounceReceived {
-            from: self.node_id,
-            project_id: project_id.to_string(),
-            package_id: package_id.to_string(),
-            announce: a.clone(),
-        })
-        .await
-        .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))?;
-        tracing::debug!(
-            to = %hex32(&to),
-            project_id,
-            package_id,
-            wire_package_id = %a.package_id.0,
-            "loopback project announce delivered"
-        );
-        Ok(())
-    }
-
-    async fn request_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-    ) -> anyhow::Result<()> {
-        let tx = self.peer_tx(to)?;
-        tx.send(TransportEvent::ProjectRequestReceived {
-            from: self.node_id,
-            project_id: project_id.to_string(),
-            package_id: package_id.to_string(),
-        })
-        .await
-        .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))?;
-        tracing::debug!(
-            to = %hex32(&to),
-            project_id,
-            package_id,
-            "loopback project request delivered"
         );
         Ok(())
     }

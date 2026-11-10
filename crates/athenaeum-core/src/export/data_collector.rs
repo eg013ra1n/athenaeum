@@ -22,7 +22,7 @@ thread_local! {
     /// Task 6 fix round 1 (ruling R7): the collab gate must collect ONE
     /// `ExportData` per linked set (not once per frame), and this is how a
     /// test proves it. Thread-local rather than a global atomic for the same
-    /// reason `sharing::iroh::assign::POOLS_OPENED` is: the lib's tests run
+    /// reason a per-thread counter suits parallel tests: the lib's tests run
     /// in parallel, and several of them collect export data, so a global
     /// counter's delta would be another test's noise.
     static COLLECT_EXPORT_DATA_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

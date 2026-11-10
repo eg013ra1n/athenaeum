@@ -35,12 +35,13 @@
 //! # State machine (v1, collapsed)
 //!
 //! The full lifecycle enum is `Queued | Announced | Transferring | Delivered |
-//! Confirmed | Failed`, but v1 collapses it: the sender learns a transfer
-//! completed only via the peer's ack (loopback `fetch` is receiver-driven —
-//! the sender sees no distinct "delivered" signal), so [`OutboundState::Delivered`]
-//! is retained in the enum (and therefore in the DDL text) but never written.
-//! The live path is `Queued → Announced → Transferring → Confirmed`, with
-//! `Failed` terminal (max-attempts exhaustion or explicit cancel).
+//! Confirmed | Failed`. The sender learns a transfer completed only via the
+//! peer's ack, so [`OutboundState::Delivered`] is a non-terminal "uploaded —
+//! awaiting confirmation" state: the engine writes it when the transport reports
+//! it has finished serving what the peer asked for, and treats it exactly like
+//! `Transferring` afterwards. The live path is
+//! `Queued → Announced → Transferring → Delivered → Confirmed`, with `Failed`
+//! terminal (max-attempts exhaustion or explicit cancel).
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;

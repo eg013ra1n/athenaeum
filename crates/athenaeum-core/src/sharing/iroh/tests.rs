@@ -54,7 +54,7 @@ use crate::sharing::{
 };
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
-use super::assign::{AssignmentReport, ProviderStats, SwarmFetchMode};
+use super::assign::{AssignmentReport, ProviderStats};
 use super::node::{NodeOptions, Role, SharedIrohNode};
 use super::{random_secret, BlobStore, IrohTransport};
 
@@ -2065,18 +2065,6 @@ async fn upload_pacer_limits_real_transfer_wall_clock() {
     receiver.shutdown().await;
 }
 
-// ---------------------------------------------------------------------------
-// D3 Task 1 — `fetch_collection_multi`: one collection, MANY providers.
-//
-// Three real `SharedIrohNode`s on localhost with the relay disabled. Providers
-// A and B serve the SAME package directory — identical bytes ⇒ identical
-// collection hash, because the import is a deterministic sorted-name walk — and
-// puller C pulls it from both at once with `SplitStrategy::Split`, which issues
-// one request per collection child across the full (re-shuffled) provider set.
-// Per-provider telemetry is the oracle: it is the only thing that can say a
-// child actually went to a given provider.
-// ---------------------------------------------------------------------------
-
 /// A [`ProviderTelemetrySink`] that records every event, plus the vec to inspect
 /// after the fetch — the per-provider counterpart of [`recording_sink`].
 fn recording_telemetry() -> (ProviderTelemetrySink, Arc<Mutex<Vec<ProviderEvent>>>) {
@@ -2130,8 +2118,8 @@ fn sent_bytes(node: &Arc<SharedIrohNode>) -> u64 {
 /// A provider's send delta must clear this to count as "served real payload".
 ///
 /// Sits between the two populations it has to separate, both measured by forcing
-/// the regression it guards against (`SplitStrategy::Split` → `None`, so one
-/// provider serves everything): the serving provider sent 1_430_494 B, the
+/// the regression it guards against (one provider serving everything): the
+/// serving provider sent 1_430_494 B, the
 /// non-serving one 15_789 B — phase-1 meta plus QUIC/TLS handshake and ACKs, not
 /// the near-zero a naive reading would predict. 64 KiB leaves 4x headroom below
 /// the noise floor and 21x below one served child, so the assertion has teeth
@@ -2161,22 +2149,10 @@ async fn home_relay_url_and_watch_start_at_none_with_relay_disabled() {
     assert!(watch.changed().await.is_err());
 }
 
-async fn tag_present(store: &Store, name: &str) -> bool {
-    store
-        .tags()
-        .get(name.as_bytes())
-        .await
-        .expect("tags().get")
-        .is_some()
-}
-
 /// Write an N-payload package and return `(pkg_dir, announce)`.
 ///
-/// The swarm tests need MANY collection children: `SplitStrategy::Split` issues
-/// one request per child and re-shuffles the provider list for EACH of them, so
-/// the chance that a given provider is never tried falls off as 2^-children.
-/// With a dozen-plus payloads a "both providers were used" assertion is not a
-/// coin flip.
+/// A package with MANY collection children, so that spreading work over several
+/// providers is observable rather than a coin flip.
 fn build_many_file_package(
     src_root: &Path,
     prefix: &str,
@@ -2217,1354 +2193,16 @@ fn build_many_file_package(
     (pkg_dir, announce)
 }
 
-/// Assert every payload of `pkg_dir` landed byte-identical under `dest_dir`.
-fn assert_package_landed(pkg_dir: &Path, dest_dir: &Path, files: usize) {
-    for i in 0..files {
-        let name = format!("frame_{i:02}.fits");
-        let landed = dest_dir.join(&name);
-        assert!(
-            landed.exists(),
-            "swarm fetch must land every collection entry, {name} is missing"
-        );
-        assert_eq!(
-            xxh3_of(&pkg_dir.join(&name)),
-            xxh3_of(&landed),
-            "{name} must land byte-identical (a mis-attributed child would differ)"
-        );
-    }
-    assert!(
-        dest_dir.join("manifest.ndjson").exists(),
-        "the manifest entry must land alongside the payloads"
-    );
-}
-
-/// Two providers serve the same package; the puller's Split fan-out uses BOTH.
-#[tokio::test]
-async fn multi_fetch_uses_both_providers() {
-    let da = tempdir().unwrap();
-    let db = tempdir().unwrap();
-    let dc = tempdir().unwrap();
-    let src = tempdir().unwrap();
-
-    let a = bind_disabled(da.path()).await;
-    let b = bind_disabled(db.path()).await;
-    let c = bind_disabled(dc.path()).await;
-
-    let a_out = a.handle(Role::Out);
-    let b_out = b.handle(Role::Out);
-    let c_recv = c.handle(Role::Recv);
-    let a_info = a_out.start().await.unwrap();
-    let b_info = b_out.start().await.unwrap();
-    let c_info = c_recv.start().await.unwrap();
-
-    // Relay-disabled endpoints have no discovery, so the puller needs BOTH
-    // providers' addresses out of band (in production those are the holder dial
-    // hints); the providers get the puller's address for symmetry with pairing.
-    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
-    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
-    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-
-    // ONE package dir, served by BOTH: the swarm's load-bearing invariant is
-    // that identical bytes yield the identical collection hash on every holder.
-    const FILES: usize = 14;
-    let (pkg_dir, announce) =
-        build_many_file_package(&src.path().join("src"), "swarm", FILES, 96 * 1024);
-    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-
-    let root_a = a
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider A recorded a served collection hash");
-    let root_b = b
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider B recorded a served collection hash");
-    assert_eq!(
-        root_a, root_b,
-        "the same package bytes must import to the same collection hash on both \
-         holders — without that there is no swarm to fetch from"
-    );
-
-    let (telemetry, seen) = recording_telemetry();
-    let dest = tempdir().unwrap();
-
-    // The oracle: each provider's OWN socket send counter, bracketed around the
-    // fetch. Ground truth, and immune to the progress stream's lossiness.
-    let a_before = sent_bytes(&a);
-    let b_before = sent_bytes(&b);
-
-    c_recv
-        .fetch_collection_multi(
-            vec![a_info.node_id, b_info.node_id],
-            &root_a.to_string(),
-            announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-        )
-        .await
-        .expect("the swarm fetch must complete");
-
-    assert_package_landed(&pkg_dir, dest.path(), FILES);
-
-    // With 15 children each independently re-shuffling a 2-provider list, the
-    // chance that one provider wins zero first picks is 2^-15 — and a
-    // single-provider regression puts the other's delta in the handshake range,
-    // two orders of magnitude below the floor.
-    let a_sent = sent_bytes(&a).saturating_sub(a_before);
-    let b_sent = sent_bytes(&b).saturating_sub(b_before);
-    assert!(
-        a_sent > SERVED_PAYLOAD_FLOOR && b_sent > SERVED_PAYLOAD_FLOOR,
-        "Split must spread the collection's children over BOTH providers — \
-         a sent {a_sent} B, b sent {b_sent} B (floor {SERVED_PAYLOAD_FLOOR} B)"
-    );
-
-    // Sanity only: the telemetry pipe is wired and delivers SOMETHING. It cannot
-    // be asserted per-provider — see `tried_providers`.
-    assert!(
-        !tried_providers(&seen).is_empty(),
-        "the provider telemetry sink must receive at least one event"
-    );
-
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
-}
-
-/// A provider killed mid-transfer costs its in-flight children a provider
-/// switch, not the fetch: the survivor finishes the package.
-#[tokio::test]
-async fn multi_fetch_survives_a_provider_dying_mid_transfer() {
-    let da = tempdir().unwrap();
-    let db = tempdir().unwrap();
-    let dc = tempdir().unwrap();
-    let src = tempdir().unwrap();
-
-    let a = bind_disabled(da.path()).await;
-    let b = bind_disabled(db.path()).await;
-    let c = bind_disabled(dc.path()).await;
-
-    let a_out = a.handle(Role::Out);
-    let b_out = b.handle(Role::Out);
-    let c_recv = c.handle(Role::Recv);
-    let a_info = a_out.start().await.unwrap();
-    let b_info = b_out.start().await.unwrap();
-    let c_info = c_recv.start().await.unwrap();
-
-    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
-    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
-    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-
-    const FILES: usize = 16;
-    let (pkg_dir, announce) =
-        build_many_file_package(&src.path().join("src"), "dying", FILES, 512 * 1024);
-    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    let root = a
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider A recorded a served collection hash");
-
-    // Sizing note: 8 MiB paced at 2 MB/s PER PROVIDER (~4 MB/s combined) puts the
-    // transfer in the multi-second range, so the 150 ms kill below lands solidly
-    // mid-fetch on any machine. Pacing rather than a huge package keeps the test
-    // I/O small; the assertion right before the kill is what makes "mid-transfer"
-    // a fact rather than a hope — if it ever fails, lower the rate.
-    a.set_upload_limit(2_000_000);
-    b.set_upload_limit(2_000_000);
-
-    let (telemetry, seen) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    let a_before = sent_bytes(&a);
-    let b_before = sent_bytes(&b);
-    let fetch_done = Arc::new(AtomicBool::new(false));
-    let task = {
-        let c_recv = Arc::clone(&c_recv);
-        let done = Arc::clone(&fetch_done);
-        let dest_path = dest.path().to_path_buf();
-        let hash = root.to_string();
-        let providers = vec![a_info.node_id, b_info.node_id];
-        let byte_size = announce.byte_size;
-        tokio::spawn(async move {
-            let res = c_recv
-                .fetch_collection_multi(
-                    providers,
-                    &hash,
-                    byte_size,
-                    &dest_path,
-                    noop_fetch_sink(),
-                    telemetry,
-                )
-                .await;
-            done.store(true, Ordering::SeqCst);
-            res
-        })
-    };
-
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        !fetch_done.load(Ordering::SeqCst),
-        "the fetch finished before the provider could be killed — the kill would \
-         prove nothing; lower the upload limit or grow the package"
-    );
-    // Read A's contribution BEFORE killing it: a shut-down endpoint's counters
-    // are not something to lean on, and this is the number that says the victim
-    // was genuinely serving when it died (17 children each re-shuffle a
-    // 2-provider list, so A wins ~half the first picks and, paced at 2 MB/s, has
-    // pushed ~300 KB by now).
-    let a_sent = sent_bytes(&a).saturating_sub(a_before);
-    a.shutdown().await;
-
-    let res = tokio::time::timeout(Duration::from_secs(120), task)
-        .await
-        .expect("the fetch must not hang after a provider dies")
-        .expect("fetch task panicked");
-    res.expect("the surviving provider must finish the package");
-
-    assert_package_landed(&pkg_dir, dest.path(), FILES);
-
-    // Both halves of the story, on provider-side byte counters rather than the
-    // lossy progress stream: the victim was really serving when it died, and the
-    // survivor really carried the package home.
-    let b_sent = sent_bytes(&b).saturating_sub(b_before);
-    assert!(
-        a_sent > SERVED_PAYLOAD_FLOOR,
-        "the provider we killed must have been serving payload when it died — \
-         it sent only {a_sent} B (floor {SERVED_PAYLOAD_FLOOR} B)"
-    );
-    assert!(
-        b_sent > SERVED_PAYLOAD_FLOOR,
-        "the surviving provider must have served the rest of the package — \
-         it sent only {b_sent} B (floor {SERVED_PAYLOAD_FLOOR} B)"
-    );
-
-    // Sanity only, never per-provider — see `tried_providers`.
-    assert!(
-        !tried_providers(&seen).is_empty(),
-        "the provider telemetry sink must receive at least one event"
-    );
-
-    b.shutdown().await;
-    c.shutdown().await;
-}
-
-/// Every provider dead ⇒ a bounded, clean failure — and no in-flight GC tag,
-/// because phase 1 never landed the root that tag would protect.
-#[tokio::test]
-async fn multi_fetch_with_all_dead_providers_fails_cleanly() {
-    let dc = tempdir().unwrap();
-    let c = bind_disabled(dc.path()).await;
-    let c_recv = c.handle(Role::Recv);
-    c_recv.start().await.unwrap();
-
-    // Well-formed ids nobody ever bound: the puller holds no address for either,
-    // so both fail at the dial.
-    let dead_a: NodeId = *iroh::SecretKey::generate().public().as_bytes();
-    let dead_b: NodeId = *iroh::SecretKey::generate().public().as_bytes();
-    let root = Hash::new(b"a collection nobody serves");
-
-    let (telemetry, _seen) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    let dest_dir = dest.path().join("landing");
-    let res = tokio::time::timeout(
-        Duration::from_secs(60),
-        c_recv.fetch_collection_multi(
-            vec![dead_a, dead_b],
-            &root.to_string(),
-            1024,
-            &dest_dir,
-            noop_fetch_sink(),
-            telemetry,
-        ),
-    )
-    .await
-    .expect("an all-dead provider set must fail, never hang");
-    assert!(
-        res.is_err(),
-        "a fetch whose every provider is unreachable must return Err"
-    );
-
-    // The in-flight GC tag is set only AFTER phase 1 lands the root hash-seq —
-    // the very thing that failed here — so nothing was tagged. (Had phase 1
-    // succeeded and phase 2 failed, the tag would deliberately be RETAINED so a
-    // retry resumes from the verified partial bytes; that asymmetry is the
-    // scalar fetch's documented contract and this sibling keeps it.)
-    assert!(
-        !tag_present(c.store(), &format!("in-flight/recv/pkg/{}", root.to_hex())).await,
-        "a fetch that never got past phase 1 must leave no in-flight tag behind"
-    );
-    assert!(
-        !dest_dir.exists(),
-        "a failed fetch must not even create the destination directory"
-    );
-
-    c.shutdown().await;
-}
-
-// ---------------------------------------------------------------------------
-// A2a Task 7 — `SwarmFetchMode::Assigned`: our own assignment loop.
-//
-// The same three-node localhost harness as the D3 tests above, driven through
-// `fetch_collection_multi_tuned_for_test` so the test can shorten the progress
-// deadline and read the `AssignmentReport` production throws away.
-// ---------------------------------------------------------------------------
-
 /// A [`StartInfo`]-shaped node id as the assignment report keys it.
 fn endpoint_id(id: NodeId) -> EndpointId {
     EndpointId::from_bytes(&id).expect("a node id from StartInfo is a valid endpoint id")
-}
-
-fn provider_stats(report: &AssignmentReport, id: NodeId) -> ProviderStats {
-    report
-        .per_provider
-        .get(&endpoint_id(id))
-        .cloned()
-        .expect("every provider handed to the loop appears in its report")
-}
-
-/// A provider that ACCEPTS and then trickles must not pin the fetch: the
-/// assignment loop's stall ceiling reassigns its children and the fetch
-/// finishes on the healthy provider inside a bounded time.
-///
-/// **On the trickle rate.** B is paced at 1 KB/s — two orders of magnitude
-/// below the *product's* 100 KB/s floor, which is a Settings validation rule
-/// (`api::sync::validate_upload_limit`), not a transport clamp. That is
-/// deliberate and it is the only rate that tests what this test is for: the
-/// provider emits one progress item per ~16 KiB chunk, so at the product floor
-/// the gap between two items is ~164 ms and NO stall ceiling short of ~200 ms
-/// could ever fire — and a 200 ms ceiling would be tripped by a loaded CI
-/// runner on a perfectly healthy provider. At 1 KB/s a 16 KiB chunk needs 16 s,
-/// so "no growth for 1500 ms" is unambiguous: B is the useless-but-alive peer
-/// of D4 §1(б), not a slow one.
-#[tokio::test]
-async fn assigned_fetch_reassigns_a_trickling_provider() {
-    let da = tempdir().unwrap();
-    let db = tempdir().unwrap();
-    let dc = tempdir().unwrap();
-    let src = tempdir().unwrap();
-
-    let a = bind_disabled(da.path()).await;
-    let b = bind_disabled(db.path()).await;
-    let c = bind_disabled(dc.path()).await;
-
-    let a_out = a.handle(Role::Out);
-    let b_out = b.handle(Role::Out);
-    let c_recv = c.handle(Role::Recv);
-    let a_info = a_out.start().await.unwrap();
-    let b_info = b_out.start().await.unwrap();
-    let c_info = c_recv.start().await.unwrap();
-
-    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
-    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
-    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-
-    const FILES: usize = 8;
-    const FILE_SIZE: usize = 256 * 1024;
-    let (pkg_dir, announce) =
-        build_many_file_package(&src.path().join("src"), "trickle", FILES, FILE_SIZE);
-    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    let root = a
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider A recorded a served collection hash");
-
-    // A unthrottled, B trickling — see the doc comment for the arithmetic.
-    b.set_upload_limit(1_000);
-
-    let (telemetry, seen) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    let started = Instant::now();
-    let report = tokio::time::timeout(
-        // Was 30 s; raised to 120 s (Wave 1 final review item 3) for the same
-        // CI-margin reason as the other assignment-loop tests below — a
-        // 4-CPU runner saturated by the rest of the workspace has left this
-        // test past its old deadline before.
-        Duration::from_secs(120),
-        c.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            vec![a_info.node_id, b_info.node_id],
-            &root.to_string(),
-            announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-            SwarmFetchMode::Assigned,
-            Duration::from_millis(1500),
-            true,
-        ),
-    )
-    .await
-    .expect("a trickling provider must not pin the fetch past the stall ceiling")
-    .expect("the healthy provider must finish the package")
-    .expect("the assigned loop always reports");
-    let elapsed = started.elapsed();
-
-    assert_package_landed(&pkg_dir, dest.path(), FILES);
-
-    let a_stats = provider_stats(&report, a_info.node_id);
-    let b_stats = provider_stats(&report, b_info.node_id);
-
-    // A carried the bulk. B cannot have completed a single child: one 256 KiB
-    // child needs 262 s at 1 KB/s and the ceiling cuts it at 1.5 s, so the
-    // remaining 8 frames + the manifest are all A's.
-    assert!(
-        a_stats.bytes > 6 * FILE_SIZE as u64,
-        "the healthy provider must have served the bulk of the package — \
-         a delivered {} B of {} B, b delivered {} B (elapsed {elapsed:?})",
-        a_stats.bytes,
-        (FILES * FILE_SIZE) as u64,
-        b_stats.bytes
-    );
-
-    // And the trickling one was stalled out rather than waited on.
-    assert!(
-        b_stats.failures >= 1,
-        "the trickling provider must have been failed out by the stall ceiling, \
-         not waited for — its stats are {b_stats:?}"
-    );
-    assert!(
-        report.stalls >= 1,
-        "the failure must be attributed to the progress deadline (a stall), not \
-         to an error the stock loop would also have caught — report {report:?}"
-    );
-
-    // The loop's own telemetry is not lossy the way the Split stream is: every
-    // attempt it made is reported, so the trickling provider IS visible here.
-    assert!(
-        tried_providers(&seen).contains(&b_info.node_id),
-        "the assignment loop must report the attempts it made on the trickling provider"
-    );
-
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
-}
-
-/// Every provider dead (connection refused) ⇒ the loop exhausts its backoff
-/// ladder and returns Err inside a bounded time instead of spinning — and it
-/// keeps the in-flight GC tag, because the verified partial bytes are what
-/// makes the next attempt cheap.
-///
-/// **On the bound.** The brief says "≈ 32 s", which is the ladder's own
-/// `0.5 + 1 + 2 + 4 + 8 + 16` of WAITING and omits the dial between each rung:
-/// the connection pool's `connect_timeout` is 1 s (iroh-util 0.6.0's default)
-/// and there are seven or so of them, so the honest figure is ≈ 40 s. Measured
-/// at 38-41 s on this machine; the 60 s bound below is that plus room for a
-/// loaded runner, not the brief's number plus a guess.
-///
-/// **Why phase 1 is primed first.** The in-flight tag is set only after phase 1
-/// lands the root hash-seq (`multi_fetch_with_all_dead_providers_fails_cleanly`
-/// pins the other half of that contract: no phase 1, no tag). To reach the
-/// assignment loop at all with a dead provider set, the puller must already
-/// hold the root and the collection meta — so the test fetches the manifest
-/// from A while A is alive, which is exactly phase 1's request, and only then
-/// kills A. The stock `execute_get` short-circuits on `local.is_complete()`
-/// before it awaits the dial, so phase 1 then succeeds against a corpse.
-#[tokio::test]
-async fn assigned_fetch_fails_fast_when_every_provider_is_dead() {
-    let da = tempdir().unwrap();
-    let dc = tempdir().unwrap();
-    let src = tempdir().unwrap();
-
-    let a = bind_disabled(da.path()).await;
-    let c = bind_disabled(dc.path()).await;
-
-    let a_out = a.handle(Role::Out);
-    let c_recv = c.handle(Role::Recv);
-    let a_info = a_out.start().await.unwrap();
-    let c_info = c_recv.start().await.unwrap();
-    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
-    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-
-    const FILES: usize = 3;
-    let (pkg_dir, announce) =
-        build_many_file_package(&src.path().join("src"), "dead", FILES, 64 * 1024);
-    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    let root = a
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider A recorded a served collection hash");
-
-    // Prime phase 1 (root hash-seq + collection meta) while A still answers.
-    // `write_package`'s announce carries a placeholder root hash, so point this
-    // one at the real collection hash.
-    let mut real = announce.clone();
-    real.root_hash = root.to_string();
-    let manifest_dir = tempdir().unwrap();
-    c_recv
-        .fetch_manifest(a_info.node_id, &real, manifest_dir.path())
-        .await
-        .expect("the manifest fetch primes the root hash-seq and the collection meta");
-
-    a.shutdown().await;
-
-    let (telemetry, _seen) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    let started = Instant::now();
-    let res = tokio::time::timeout(
-        // Was 60 s; raised to 120 s (Wave 1 final review item 3) for CI
-        // margin — the ladder's own ~40 s measured bound plus dials already
-        // ate most of 60 s on a quiet machine, leaving nothing for a
-        // saturated 4-CPU runner.
-        Duration::from_secs(120),
-        c.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            vec![a_info.node_id],
-            &root.to_string(),
-            announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-            SwarmFetchMode::Assigned,
-            // Production's ceiling: nothing here ever connects, so the ladder,
-            // not the stall watchdog, is what bounds this test.
-            super::assign::STALL_HARD_LIMIT,
-            true,
-        ),
-    )
-    .await
-    .expect("a dead swarm must fail inside the backoff ladder, never hang");
-    let elapsed = started.elapsed();
-
-    assert!(
-        res.is_err(),
-        "a fetch whose every provider is unreachable must return Err, got {res:?}"
-    );
-    // The ladder is 500 ms doubling six times ≈ 31.5 s of waiting plus the
-    // dials between the rungs. A lower bound is the honest assertion here: it
-    // fails if the loop ever gives up on the first dial (no ladder at all),
-    // and the 120 s timeout above fails if it spins.
-    assert!(
-        elapsed >= Duration::from_secs(5),
-        "the loop must walk its backoff ladder before giving up, not fail on the \
-         first dial — it gave up after {elapsed:?}"
-    );
-
-    // The partial bytes phase 1 landed stay GC-protected: a later attempt
-    // against a different holder set resumes from them. Same contract as the
-    // stock path, which is the point of keeping the tag out of the phase-2 arm.
-    assert!(
-        tag_present(c.store(), &format!("in-flight/recv/pkg/{}", root.to_hex())).await,
-        "a failed assignment loop must KEEP the in-flight tag so the verified \
-         partial bytes survive for the next attempt"
-    );
-
-    c.shutdown().await;
-}
-
-/// The mode flag: Stock and Assigned both land the identical package, and the
-/// Assigned report accounts every byte the providers' socket counters saw.
-///
-/// The report is our own bookkeeping; `sent_bytes` is iroh's socket counter on
-/// the other side of the wire. Bracketing one against the other is the only
-/// check that the loop's per-provider attribution is real rather than
-/// self-consistent — and it is what A4's ranking will be built on.
-///
-/// **Hedging is forced OFF here, and it has to be.** Once a hedge can fire, a
-/// provider's `bytes` and its socket egress stop being the same quantity: a
-/// cancelled loser puts bytes on the wire that its `Stats` never report, and a
-/// hedge adds a second assignment to a provider that the child-count no longer
-/// counts. Per-provider bytes are an attribution oracle, not an egress oracle,
-/// the moment hedging is on — so the reconciliation is pinned in the one mode
-/// where the two do line up, and the hedge path is measured by its own tests.
-#[tokio::test]
-async fn assigned_fetch_report_matches_provider_send_counters() {
-    let da = tempdir().unwrap();
-    let db = tempdir().unwrap();
-    let dc = tempdir().unwrap();
-    let dd = tempdir().unwrap();
-    let src = tempdir().unwrap();
-
-    let a = bind_disabled(da.path()).await;
-    let b = bind_disabled(db.path()).await;
-    let c = bind_disabled(dc.path()).await;
-    let d = bind_disabled(dd.path()).await;
-
-    let a_out = a.handle(Role::Out);
-    let b_out = b.handle(Role::Out);
-    let c_recv = c.handle(Role::Recv);
-    let d_recv = d.handle(Role::Recv);
-    let a_info = a_out.start().await.unwrap();
-    let b_info = b_out.start().await.unwrap();
-    let c_info = c_recv.start().await.unwrap();
-    let d_info = d_recv.start().await.unwrap();
-
-    for puller in [&c, &d] {
-        puller.add_peer_ticket(&a_info.pairing_ticket).unwrap();
-        puller.add_peer_ticket(&b_info.pairing_ticket).unwrap();
-    }
-    for provider in [&a, &b] {
-        provider.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-        provider.add_peer_ticket(&d_info.pairing_ticket).unwrap();
-    }
-
-    // 256 KiB per entry, not the D3 tests' 96 KiB: the byte-reconciliation
-    // below compares payload against total socket egress, and a provider's
-    // fixed handshake + phase-1 cost (~16 KB, measured in `SERVED_PAYLOAD_FLOOR`)
-    // is 16 % of a 96 KiB child but under 6 % of a 256 KiB one.
-    const FILES: usize = 14;
-    let (pkg_dir, announce) =
-        build_many_file_package(&src.path().join("src"), "report", FILES, 256 * 1024);
-    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    let root = a
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider A recorded a served collection hash");
-
-    // Arm 1: the stock Split fan-out, into puller C.
-    let stock_dest = tempdir().unwrap();
-    let (stock_telemetry, _) = recording_telemetry();
-    // 120 s harness timeout (Wave 1 final review item 3): this test had none,
-    // so a wedge here hung the whole CI job instead of failing it.
-    let stock_report = tokio::time::timeout(
-        Duration::from_secs(120),
-        c.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            vec![a_info.node_id, b_info.node_id],
-            &root.to_string(),
-            announce.byte_size,
-            stock_dest.path(),
-            noop_fetch_sink(),
-            stock_telemetry,
-            SwarmFetchMode::Stock,
-            super::assign::STALL_HARD_LIMIT,
-            false,
-        ),
-    )
-    .await
-    .expect("arm 1 must not hang")
-    .expect("the stock fan-out must still complete");
-    assert!(
-        stock_report.is_none(),
-        "the stock path runs upstream's loop and has no per-provider report to give"
-    );
-    assert_package_landed(&pkg_dir, stock_dest.path(), FILES);
-
-    // Arm 2: the assignment loop, into a FRESH puller D so nothing is already
-    // local — bracketed by both providers' socket counters.
-    let dest = tempdir().unwrap();
-    let (telemetry, _) = recording_telemetry();
-    let a_before = sent_bytes(&a);
-    let b_before = sent_bytes(&b);
-    // Same 120 s harness timeout as arm 1 above, same reason.
-    let report = tokio::time::timeout(
-        Duration::from_secs(120),
-        d.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            vec![a_info.node_id, b_info.node_id],
-            &root.to_string(),
-            announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-            SwarmFetchMode::Assigned,
-            super::assign::STALL_HARD_LIMIT,
-            // See the doc: with hedging on, `bytes` and egress are different
-            // quantities and this reconciliation would be asserting nonsense.
-            false,
-        ),
-    )
-    .await
-    .expect("arm 2 must not hang")
-    .expect("the assigned loop must complete")
-    .expect("the assigned loop always reports");
-    let a_sent = sent_bytes(&a).saturating_sub(a_before);
-    let b_sent = sent_bytes(&b).saturating_sub(b_before);
-
-    // Both modes land the identical package: each is byte-identical to the
-    // source, so they are byte-identical to each other.
-    assert_package_landed(&pkg_dir, dest.path(), FILES);
-
-    for (name, id, sent) in [("a", a_info.node_id, a_sent), ("b", b_info.node_id, b_sent)] {
-        let stats = provider_stats(&report, id);
-        assert!(
-            stats.bytes <= sent,
-            "provider {name} cannot have delivered more payload than its socket \
-             sent: report {} B vs sent {sent} B",
-            stats.bytes
-        );
-        assert!(
-            stats.bytes * 10 >= sent * 9,
-            "provider {name}'s reported payload must account for its egress \
-             bar framing: report {} B vs sent {sent} B ({:.1} %)",
-            stats.bytes,
-            stats.bytes as f64 * 100.0 / sent.max(1) as f64
-        );
-    }
-
-    // Every collection child is attributed to exactly one provider. The
-    // collection carries FILES payload entries PLUS `manifest.ndjson`, which is
-    // an ordinary entry and an ordinary child — the hash-seq's child 0 (the
-    // collection meta) is phase 1's and is not assigned here.
-    assert_eq!(
-        report.total_children() as usize,
-        FILES + 1,
-        "every child, manifest included, must be accounted for exactly once: {report:?}"
-    );
-
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
-    d.shutdown().await;
-}
-
-/// The Assigned path's aggregate progress is a well-formed series.
-///
-/// It is summed from the per-file `store.observe()` observers (D4 T7 — the get
-/// streams' own `Progress` never leaves the assignment loop) and emitted by a
-/// ticker that is aborted AND JOINED before the terminal 100 % event, so the
-/// series can only go forwards and can only end at the announced total. The
-/// providers are paced so the fetch outlives a few ticker intervals; without
-/// that, a localhost fetch would emit the terminal event alone and the
-/// monotonicity claim would be vacuous.
-#[tokio::test]
-async fn assigned_fetch_batch_progress_is_monotonic_and_ends_at_the_total() {
-    let da = tempdir().unwrap();
-    let db = tempdir().unwrap();
-    let dc = tempdir().unwrap();
-    let src = tempdir().unwrap();
-
-    let a = bind_disabled(da.path()).await;
-    let b = bind_disabled(db.path()).await;
-    let c = bind_disabled(dc.path()).await;
-
-    let a_out = a.handle(Role::Out);
-    let b_out = b.handle(Role::Out);
-    let c_recv = c.handle(Role::Recv);
-    let a_info = a_out.start().await.unwrap();
-    let b_info = b_out.start().await.unwrap();
-    let c_info = c_recv.start().await.unwrap();
-    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
-    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
-    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
-
-    const FILES: usize = 12;
-    let (pkg_dir, announce) =
-        build_many_file_package(&src.path().join("src"), "batch", FILES, 256 * 1024);
-    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    let root = a
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider A recorded a served collection hash");
-
-    // ~3 MiB at 2 MB/s per provider ⇒ the fetch spans several 300 ms ticks.
-    a.set_upload_limit(2_000_000);
-    b.set_upload_limit(2_000_000);
-
-    let (sink, events) = recording_sink();
-    let (telemetry, _) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    // 120 s harness timeout (Wave 1 final review item 3): this test had none.
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        c.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            vec![a_info.node_id, b_info.node_id],
-            &root.to_string(),
-            announce.byte_size,
-            dest.path(),
-            sink,
-            telemetry,
-            SwarmFetchMode::Assigned,
-            super::assign::STALL_HARD_LIMIT,
-            true,
-        ),
-    )
-    .await
-    .expect("the fetch must not hang")
-    .expect("the fetch must complete")
-    .expect("the assigned loop always reports");
-    assert_package_landed(&pkg_dir, dest.path(), FILES);
-
-    let batches: Vec<(u64, u64)> = events
-        .lock()
-        .expect("sink mutex poisoned")
-        .iter()
-        .filter_map(|e| match e {
-            FetchEvent::Batch {
-                bytes_done,
-                bytes_total,
-            } => Some((*bytes_done, *bytes_total)),
-            _ => None,
-        })
-        .collect();
-
-    assert!(
-        !batches.is_empty(),
-        "the Assigned path must emit aggregate progress, not only per-file events"
-    );
-    for pair in batches.windows(2) {
-        assert!(
-            pair[1].0 >= pair[0].0,
-            "the batch series must never go backwards: {} then {} in {batches:?}",
-            pair[0].0,
-            pair[1].0
-        );
-    }
-    assert!(
-        batches.iter().all(|(done, _)| *done <= announce.byte_size),
-        "no tick may exceed the announced total: {batches:?}"
-    );
-    assert!(
-        batches
-            .iter()
-            .all(|(_, total)| *total == announce.byte_size),
-        "every tick must quote the same announced total: {batches:?}"
-    );
-    assert_eq!(
-        batches.last().expect("non-empty").0,
-        announce.byte_size,
-        "the LAST event must be the terminal 100 % one — a ticker tick landing \
-         after it would mean the abort was never joined: {batches:?}"
-    );
-
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
-}
-
-// ---------------------------------------------------------------------------
-// A2b Task 8 — hedging (D4 §4.5 T4).
-//
-// Every one of these uses THREE providers, two healthy and one useless. That is
-// not decoration: the hedge budget's cap is 5 % of the COLLECTION, and tokens
-// only refill as children complete, so a swarm split evenly between one fast
-// and one slow provider parks `tokens` at exactly `cap / 2` — the strict `>`
-// in the half rule then refuses every hedge, for arithmetic reasons rather than
-// policy ones. A third provider puts two thirds of the children on healthy
-// peers and takes the decision off that knife edge. It is reported as a design
-// observation, not worked around in the code.
-// ---------------------------------------------------------------------------
-
-/// Bind three nodes, pair them, serve `files × size` from the two healthy ones
-/// and return everything the hedge tests need.
-struct HedgeRig {
-    fast_a: Arc<SharedIrohNode>,
-    fast_b: Arc<SharedIrohNode>,
-    slow: Arc<SharedIrohNode>,
-    puller: Arc<SharedIrohNode>,
-    providers: Vec<NodeId>,
-    slow_id: NodeId,
-    root: Hash,
-    announce: PackageAnnounce,
-    pkg_dir: PathBuf,
-    _dirs: Vec<tempfile::TempDir>,
-}
-
-async fn hedge_rig(prefix: &str, files: usize, size: usize, slow_rate: u64) -> HedgeRig {
-    let da = tempdir().unwrap();
-    let db = tempdir().unwrap();
-    let ds = tempdir().unwrap();
-    let dp = tempdir().unwrap();
-    let src = tempdir().unwrap();
-
-    let a = bind_disabled(da.path()).await;
-    let b = bind_disabled(db.path()).await;
-    let s = bind_disabled(ds.path()).await;
-    let p = bind_disabled(dp.path()).await;
-
-    let a_out = a.handle(Role::Out);
-    let b_out = b.handle(Role::Out);
-    let s_out = s.handle(Role::Out);
-    let p_recv = p.handle(Role::Recv);
-    let a_info = a_out.start().await.unwrap();
-    let b_info = b_out.start().await.unwrap();
-    let s_info = s_out.start().await.unwrap();
-    let p_info = p_recv.start().await.unwrap();
-
-    for t in [
-        &a_info.pairing_ticket,
-        &b_info.pairing_ticket,
-        &s_info.pairing_ticket,
-    ] {
-        p.add_peer_ticket(t).unwrap();
-    }
-    for provider in [&a, &b, &s] {
-        provider.add_peer_ticket(&p_info.pairing_ticket).unwrap();
-    }
-
-    let (pkg_dir, announce) = build_many_file_package(&src.path().join("src"), prefix, files, size);
-    for out in [&a_out, &b_out, &s_out] {
-        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
-    }
-    let root = a
-        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
-        .expect("provider A recorded a served collection hash");
-
-    // The useless-but-alive peer of D4 §1(б): it accepts, and then dribbles.
-    // Below the product's 100 KB/s floor on purpose — that floor is a Settings
-    // validation rule (`api::sync::validate_upload_limit`), not a transport
-    // clamp, and a peer that is merely slow cannot test a deadline.
-    s.set_upload_limit(slow_rate);
-
-    HedgeRig {
-        providers: vec![a_info.node_id, b_info.node_id, s_info.node_id],
-        slow_id: s_info.node_id,
-        fast_a: a,
-        fast_b: b,
-        slow: s,
-        puller: p,
-        root,
-        announce,
-        pkg_dir,
-        _dirs: vec![da, db, ds, dp, src],
-    }
-}
-
-impl HedgeRig {
-    async fn shutdown(self) {
-        self.fast_a.shutdown().await;
-        self.fast_b.shutdown().await;
-        self.slow.shutdown().await;
-        self.puller.shutdown().await;
-    }
-}
-
-/// A provider that goes slow MID-TRANSFER triggers a hedge well before the
-/// stall ceiling, and the fetch finishes on the healthy peers.
-///
-/// **This is D4 §1(б)'s scenario, and it is the only one the trigger can see.**
-/// The rule is `max(p95, HEDGE_EXPECTED_MULTIPLIER × expected)` with
-/// `expected = missing / ewma_goodput(THIS provider)`, so a peer that is
-/// UNIFORMLY slow is never late by its own standard — an instrumented run of a
-/// constantly-throttled peer refused 388 hedges on exactly that branch, because
-/// the peer had completed the tiny `manifest.ndjson` child and thereby measured
-/// itself at its own crawl. The design's own example is the laptop that "woke
-/// up but is sitting on a mobile uplink": fast history, slow now. So this test
-/// builds that — every provider paced the same to begin with, and the victim
-/// dropped to 1 KB/s once the transfer is under way, which makes `expected`
-/// tiny against what it has already proved it can do and the hedge immediate.
-///
-/// The discriminator is `report.stalls == 0`: the 60 s ceiling never fired, so
-/// whatever rescued the children was the hedge.
-///
-/// Timing margin (reviewer item 10, noted not tightened): the assertion is 45 s
-/// against a measured ~8 s, under a 120 s harness timeout, and the ceiling it
-/// must beat is 60 s. The claim is therefore still "hedging got there before
-/// the deadline could" — reinforced by `stalls == 0`, which is the assertion
-/// that does not depend on a clock at all — while leaving room for a runner
-/// under load, where a 30 s bound failed at load 20+.
-#[tokio::test]
-async fn hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
-    // FORTY children, not twelve, and that is the budget's arithmetic talking:
-    // the cap is 5 % of the COLLECTION while one hedge costs half of what a
-    // child still needs, so a package must hold about `10 x the number of
-    // children stranded at once` before every one of them can be hedged. At
-    // twelve the bucket refused one of the stranded four — and a refused child
-    // is stuck for good here, because a peer dribbling 1 KB/s still delivers a
-    // 16 KiB chunk every 16 s and so never trips the 60 s progress deadline
-    // either. Forty children of 256 KiB give the bucket room for two hedges at
-    // once, and a winning hedge refunds in full, so the stranded set clears in
-    // a couple of seconds.
-    const FILES: usize = 40;
-    const FILE_SIZE: usize = 256 * 1024;
-    // 400 KB/s each to start. The rate is deliberately low: the collapse fires
-    // on a 600 ms timer, so the transfer must still be well under way at that
-    // point NO MATTER how contended the machine is — `cargo test` runs this
-    // beside ~140 other tests, several of which also bind iroh nodes, and at
-    // 1.5 MB/s the fetch could outrun its own collapse there and strand
-    // nobody. ~10.5 MB over an aggregate ~1.2 MB/s leaves ~93 % to go at 600 ms.
-    // The victim still measures a healthy goodput for itself first, which is
-    // what makes it "fast history, slow now" rather than uniformly slow.
-    let rig = hedge_rig("hedge-slow", FILES, FILE_SIZE, 400_000).await;
-    rig.fast_a.set_upload_limit(400_000);
-    rig.fast_b.set_upload_limit(400_000);
-
-    let (telemetry, _) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    let started = Instant::now();
-    // The uplink collapses mid-transfer. The COLLAPSE rides a timer task, not
-    // the fetch: awaiting the fetch inline means a timeout DROPS it, which
-    // cancels it cleanly, where a spawned fetch would keep running under a
-    // panicking test and can block the runtime's own shutdown.
-    let collapse = {
-        let slow = Arc::clone(&rig.slow);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            slow.set_upload_limit(1_000);
-        })
-    };
-    let report = tokio::time::timeout(
-        // 120 s of patience for a 45 s claim: the harness bound must not be
-        // what fails on a loaded runner, or a timing-margin failure reads as a
-        // hedging failure.
-        Duration::from_secs(120),
-        rig.puller.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            rig.providers.clone(),
-            &rig.root.to_string(),
-            rig.announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-            SwarmFetchMode::Assigned,
-            // The brief's ceiling: long enough that it cannot be what rescues
-            // the fetch.
-            Duration::from_secs(60),
-            true,
-        ),
-    )
-    .await
-    .expect("a hedged fetch must not wait out the stall ceiling")
-    .expect("the fetch must complete")
-    .expect("the assigned loop always reports");
-    let elapsed = started.elapsed();
-    collapse.await.ok();
-
-    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
-    assert!(
-        elapsed < Duration::from_secs(45),
-        "hedging must finish the package before the 60 s ceiling could — it took \
-         {elapsed:?} (report {report:?})"
-    );
-    assert!(
-        report.hedges >= 1,
-        "at least one assignment must have been hedged: {report:?}"
-    );
-    assert_eq!(
-        report.stalls, 0,
-        "the 60 s ceiling must not be what rescued this fetch — hedging must \
-         have got there first: {report:?}"
-    );
-
-    rig.shutdown().await;
-}
-
-/// The loser is REALLY cancelled: the slow provider's own socket send counter
-/// stays under one child's worth, where an uncancelled primary would have gone
-/// on streaming every child it was assigned.
-///
-/// The oracle is the loser's own socket counter. The bound is four children
-/// plus the handshake floor rather than the brief's one — see the body for the
-/// property of the assignment loop that makes one wrong — and the body also
-/// records a measured reason not to reach for a ratio against `rate x time`.
-///
-/// Timing margin (reviewer item 10, noted not tightened): the absolute bound is
-/// 1 114 112 B, measured at ~200 KB with the cancel working and 3 121 080 B
-/// with it mutated out (both at 50 KB/s). The ratio bound beside it is 3x and
-/// does not move with the clock at all.
-#[tokio::test]
-async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
-    // FORTY 256 KiB children, like the storm tests, and for the same budget
-    // arithmetic: the cap is 5 % of the collection while one hedge costs half
-    // of what a child still needs, so a package must hold about `10 x the
-    // number of children stranded at once` before all of them can be hedged.
-    // At twelve 1 MiB children the bucket afforded ONE hedge at a time, the
-    // rest of the slow peer's children queued behind it, and at 5 KB/s a queued
-    // 1 MiB child needs 210 s — the fetch blew its own harness timeout
-    // (observed twice, at 128 s). Forty small children give the bucket room for
-    // four concurrent hedges, so the stranded set clears in seconds.
-    const FILES: usize = 40;
-    const FILE_SIZE: usize = 256 * 1024;
-    // 5 KB/s, and the rate is low for ONE structural reason: at 25 KB/s the
-    // peer finished a 1 MiB child in ~42 s, and a fetch running 108 s under the
-    // suite's parallelism gave it time to — at which point it had MEASURED ITS
-    // OWN GOODPUT, was thereafter "on time" by its own standard, was never
-    // hedged again, and streamed for the rest of the run (2 829 577 B observed
-    // against a 1.1 MB bound). The premise is a peer with a fast history that
-    // is slow NOW, and it holds only while the peer completes nothing: at
-    // 5 KB/s a 256 KiB child needs ~52 s, far longer than this fetch takes.
-    const SLOW_RATE: u64 = 5_000;
-    let rig = hedge_rig("hedge-cancel", FILES, FILE_SIZE, SLOW_RATE).await;
-
-    let (telemetry, _) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    let slow_before = sent_bytes(&rig.slow);
-    let started = Instant::now();
-    let report = tokio::time::timeout(
-        // This test asserts a byte budget, not a clock, so a loaded runner must
-        // not fail it — and at 120 s one did, twice, timing out at 127 s and
-        // 128 s while the machine carried an unrelated load (the same tree
-        // finished in 75 s once it was quiet). 240 s is patience for that,
-        // chosen so it still cannot mask the defect this test exists for: a
-        // primary that is never cancelled has to deliver all thirteen children
-        // it is handed at 5 KB/s, which is about eleven minutes and blows any
-        // timeout in this range. The slow peer also contributes a real term of
-        // its own — a child that misses its hedge grinds at 5 KB/s for ~52 s —
-        // so the margin is deliberately several multiples of the observed run.
-        Duration::from_secs(240),
-        rig.puller.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            rig.providers.clone(),
-            &rig.root.to_string(),
-            rig.announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-            SwarmFetchMode::Assigned,
-            Duration::from_secs(60),
-            true,
-        ),
-    )
-    .await
-    .expect("the fetch must not hang")
-    .expect("the fetch must complete")
-    .expect("the assigned loop always reports");
-    let elapsed = started.elapsed();
-    let slow_sent = sent_bytes(&rig.slow).saturating_sub(slow_before);
-
-    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
-    assert!(
-        report.hedges >= 1,
-        "the test needs a hedge to have fired: {report:?}"
-    );
-    // Ruling R3, and the reason this assertion lives in the HEDGING test rather
-    // than only in `assigned_fetch_report_matches_provider_send_counters`: this
-    // is the run where a hedge's back half can be the last of its child. When
-    // it is, the round that would otherwise do the crediting returns through
-    // the top-of-loop `is_complete` early return and records nothing, so before
-    // R3 such a child was counted for NOBODY and this sum came up short. The
-    // collection is FILES payload entries plus `manifest.ndjson`.
-    assert_eq!(
-        report.total_children() as usize,
-        FILES + 1,
-        "every child must be credited exactly once, hedge-won ones included: \
-         {report:?}"
-    );
-
-    // THE cancel oracle: the loser's own socket counter, never our telemetry.
-    //
-    // The bound is FOUR children, not the brief's one, and the difference is a
-    // fact about the loop rather than slack: every time a hedge frees the slow
-    // peer's assignment slot it becomes the least-loaded provider again and is
-    // handed a FRESH child, so across forty children it is assigned roughly a
-    // third of them and its cumulative egress scales with assignments, not with
-    // one transfer. The brief's figure assumed a package small enough for a
-    // peer to hold a fixed share. What the bound still says is the thing that
-    // matters: cancelled after a few seconds each time, the peer never moved
-    // more than four children's worth despite being handed thirteen — where an
-    // uncancelled peer must deliver all thirteen at 5 KB/s, which is 11 minutes
-    // and blows the harness timeout long before this line is reached.
-    const CANCEL_BOUND: u64 = 4 * (FILE_SIZE as u64) + SERVED_PAYLOAD_FLOOR;
-    assert!(
-        slow_sent < CANCEL_BOUND,
-        "a cancelled primary must stop sending — the slow provider put \
-         {slow_sent} B on the wire in {elapsed:?}, over the {CANCEL_BOUND} B a \
-         peer cancelled out of every assignment it was given can account for"
-    );
-    // A note for anyone tempted to replace that with a ratio against
-    // `SLOW_RATE x elapsed`: I tried, and it is wrong. `sent_bytes` is the
-    // ENDPOINT's total egress — QUIC handshake, ACKs, retransmits and this
-    // peer's share of phase 1 — while `UploadPacer` caps only blob payload
-    // writes. Measured: 236 349 B across 23.1 s from a peer capped at
-    // 5 000 B/s, i.e. 10.2 KB/s on the socket against a 5 KB/s payload cap.
-    // Any assertion of the form "less than rate x time" is therefore false on a
-    // perfectly well-behaved run. The absolute bound above is the honest one,
-    // and it is meaningful because the rate is now low enough that the peer
-    // cannot complete a child and go un-hedged (see the rig comment).
-
-    // And hedging did not double the package.
-    let total = rig.announce.byte_size;
-    assert!(
-        report.hedge_bytes <= (total as f64 * 0.6) as u64,
-        "hedge deliveries must stay a minority of the package: {} B of {total} B",
-        report.hedge_bytes
-    );
-
-    rig.shutdown().await;
-}
-
-/// The bucket keeps a storm bounded: a peer that strands four or five children
-/// at once does NOT produce one hedge per stranded child.
-///
-/// **On the brief's `hedges <= 1`: measured, and it is not a property of this
-/// design.** Stranding all twelve children at once produces twelve hedges, and
-/// that is correct — a hedge that WINS is refunded in full, because the primary
-/// it cancelled was still below the split and duplicated nothing, so it costs
-/// the bucket nothing and legitimately re-opens the gate for the next child.
-/// The budget does not meter how OFTEN a useful hedge is taken; it meters the
-/// extra BYTES, which is what gRPC's 5 % rule is about. So this test asserts
-/// the byte bound, and asserting it end to end is also what pins the refund
-/// rule: without refunds, twelve hedges of half a megabyte each would be six
-/// megabytes of duplication against a 630 KB cap. The admission arithmetic
-/// itself — `tokens > cap / 2 && tokens >= charge`, the cap, the refund — is
-/// pinned exactly and deterministically by `assign.rs`'s own unit tests.
-///
-/// **A regime note worth keeping.** "The budget refuses every hedge AND the run
-/// still finishes quickly" is not reachable: the three rules interlock. A peer
-/// slow enough for the budget's charge to stay above the cap is a peer whose
-/// missing range never shrinks, which means it is barely moving, which means
-/// the store never learns the blob's size — and then the hedge is not refused
-/// by the budget, it is never evaluated, and the STALL CEILING is what rescues
-/// the child. That is the division of labour, not a gap.
-#[tokio::test]
-async fn hedge_budget_stops_a_storm() {
-    // Sized like `hedge_fires_before_the_stall_ceiling_on_a_slow_provider` —
-    // see its comment for why forty small children rather than twelve large
-    // ones.
-    const FILES: usize = 40;
-    const FILE_SIZE: usize = 256 * 1024;
-    let rig = hedge_rig("hedge-budget", FILES, FILE_SIZE, 400_000).await;
-    rig.fast_a.set_upload_limit(400_000);
-    rig.fast_b.set_upload_limit(400_000);
-
-    let (telemetry, _) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    // The storm: every child the slow peer holds is stranded at the same
-    // instant, so every one of them reaches its hedge deadline together. The
-    // collapse rides a timer task so the fetch can be awaited inline — see the
-    // sibling test for why that matters on a timeout.
-    let collapse = {
-        let slow = Arc::clone(&rig.slow);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            slow.set_upload_limit(1_000);
-        })
-    };
-    let report = tokio::time::timeout(
-        // 120 s, matching the identically shaped
-        // `hedge_fires_before_the_stall_ceiling_on_a_slow_provider`. At 60 s
-        // this test's patience EQUALLED the stall ceiling it configures, so a
-        // run in which the loop legitimately spent the ceiling on a provider
-        // had nothing left for the rest of the fetch: observed hanging once in
-        // six runs on a loaded machine. The claim here is a byte budget, not a
-        // duration.
-        Duration::from_secs(120),
-        rig.puller.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            rig.providers.clone(),
-            &rig.root.to_string(),
-            rig.announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-            SwarmFetchMode::Assigned,
-            Duration::from_secs(60),
-            true,
-        ),
-    )
-    .await
-    .expect("the fetch must not hang")
-    .expect("the fetch must complete")
-    .expect("the assigned loop always reports");
-    collapse.await.ok();
-
-    let report_cap_basis = rig.announce.byte_size;
-    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
-    assert!(
-        report.hedges >= 1,
-        "the test is only meaningful if hedging engaged at all: {report:?}"
-    );
-    // THE guarantee. `hedge_bytes` is what hedging DUPLICATED — every charge
-    // the bucket did not get back — and the budget's whole job is to keep that
-    // near `HEDGE_BUDGET_RATIO` of the package. The cumulative figure may reach
-    // roughly twice the cap over a long run, because completed children refill
-    // the bucket as they go; anything beyond that means charges are not being
-    // refunded, i.e. hedges are duplicating whole ranges.
-    //
-    // MEASURED on this package (reviewer item 11, RE-measured after the
-    // `armed_at` fix): three runs gave 22/20/22 hedges duplicating
-    // 65 536 / 65 536 / 114 688 B against a cap of 524 288 B — 0.12-0.22 x the
-    // cap, and 0.6-1.1 % of the ~10.5 MB payload, comfortably inside what a 5 %
-    // budget promises.
-    //
-    // The earlier figure recorded here, 425 984 B over 11 hedges, was not a
-    // measurement of this mechanism at all: duplication was computed against
-    // `split_rel` alone, an offset into the missing set as it stood at ARM
-    // time, while the primary's progress counts from the request it was given
-    // at ROUND START. Everything the primary moved in between was charged as
-    // duplicate. That inflated the reported cost ~4 x AND starved the bucket of
-    // refunds, which is why the hedge count doubled once it was fixed: the
-    // budget had been refusing hedges it could always have afforded.
-    //
-    // It is still not asserted exactly, because it moves with how much of each
-    // stranded child the collapsed peer had already fetched when its hedge
-    // fired — a timing fact, not a contract — and it rides the
-    // `"assignment loop finished"` debug as `hedge_bytes` on every run.
-    let cap = (report_cap_basis as f64 * 0.05) as u64;
-    // Ruling R3 again, in the run that arms the most hedges (20-22 of them
-    // across 41 children), so a hedge finishing the last of its own child is
-    // near-certain here rather than incidental.
-    assert_eq!(
-        report.total_children() as usize,
-        FILES + 1,
-        "every child must be credited exactly once, hedge-won ones included: \
-         {report:?}"
-    );
-    assert!(
-        report.hedge_bytes <= 2 * cap,
-        "hedging must stay inside its byte budget — it duplicated {} B against \
-         a {cap} B cap (2x allowed for refills) over {} hedges: {report:?}",
-        report.hedge_bytes,
-        report.hedges
-    );
-
-    rig.shutdown().await;
-}
-
-/// The stall ceiling and the hedge budget are independent rules: whatever the
-/// budget decides, the progress deadline fires on its own schedule and
-/// reassigns the child.
-///
-/// The peer dribbles at 1 KB/s, so a 16 KiB chunk takes 16 s and the 1500 ms
-/// deadline is unambiguous — and at that rate the store never learns the blob's
-/// size in time either, so the hedge mostly cannot even be evaluated. What is
-/// asserted is only the ceiling's own behaviour; see the body for why the hedge
-/// COUNT is deliberately not part of the claim.
-#[tokio::test]
-async fn stall_ceiling_is_independent_of_the_hedge_budget() {
-    const FILES: usize = 6;
-    const FILE_SIZE: usize = 512 * 1024;
-    // 1 KB/s, not 50: at 50 KB/s a 16 KiB chunk lands every 0.33 s, so a
-    // 1500 ms progress deadline correctly never fires — that peer is slow, not
-    // stuck. The ceiling's case is a peer that moves NOTHING for the window,
-    // and at 1 KB/s one chunk takes 16 s.
-    let rig = hedge_rig("hedge-ceiling", FILES, FILE_SIZE, 1_000).await;
-
-    let (telemetry, _) = recording_telemetry();
-    let dest = tempdir().unwrap();
-    let report = tokio::time::timeout(
-        Duration::from_secs(90),
-        rig.puller.fetch_collection_multi_tuned_for_test(
-            Role::Recv,
-            rig.providers.clone(),
-            &rig.root.to_string(),
-            rig.announce.byte_size,
-            dest.path(),
-            noop_fetch_sink(),
-            telemetry,
-            SwarmFetchMode::Assigned,
-            Duration::from_millis(1500),
-            true,
-        ),
-    )
-    .await
-    .expect("the fetch must not hang")
-    .expect("the fetch must complete")
-    .expect("the assigned loop always reports");
-
-    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
-    // Hedging is ON throughout. The test deliberately does NOT assert
-    // `hedges == 0`: a hedge's charge is half of what is still MISSING, and the
-    // missing range shrinks every time the ceiling reassigns a child, so late
-    // in the run a hedge does become affordable even on a package this small.
-    // That is correct behaviour and it is beside the point here — this test's
-    // claim is that the progress deadline fires on its own schedule, whatever
-    // the budget is doing.
-    let slow = report
-        .per_provider
-        .get(&endpoint_id(rig.slow_id))
-        .cloned()
-        .expect("the slow provider appears in the report");
-    assert!(
-        slow.failures >= 1,
-        "the 1500 ms progress deadline must fail the trickling provider out \
-         while hedging is enabled: {slow:?}"
-    );
-    assert!(
-        report.stalls >= 1,
-        "and that failure must be attributed to the deadline: {report:?}"
-    );
-
-    rig.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
 // A2b Task 8 Step 1 — the HARD GATE for hedging.
 //
 // A hedge is a second transfer of part of a blob another transfer is already
-// fetching. Everything above it is pointless unless the store tolerates two
+// fetching. Hedging is pointless unless the store tolerates two
 // concurrent `import_bao` writers on ONE hash. iroh-blobs routes both through
 // the same per-hash entity (`HashContext`), writes leaves at their own offsets
 // and ORs the bitfield — so this SHOULD hold, but "should" is not a gate.
@@ -4621,32 +3259,12 @@ async fn re_export_into_the_same_staging_target_does_not_truncate_it() {
     assert_eq!(std::fs::read(&t2).unwrap(), bytes);
 }
 
-// ─── collab v3 wave 2, Task 4: the assignment engine over independent blobs ───
+// ─── the assignment engine over independent blobs ─────────────────────────
 //
-// `fetch_items_assigned` carries each item's own `GetRequest`, hash and
-// provider list, and reports per item. These tests run real relay-disabled
-// nodes with mounted collab stores, served on `COLLAB_BLOBS_ALPN`.
+// These tests run real relay-disabled nodes with mounted collab stores, served
+// on `COLLAB_BLOBS_ALPN`.
 
-use super::assign::{FailMode, FetchItem};
-use super::COLLAB_BLOBS_ALPN;
-
-/// Engine knobs for a raw-item test run: collab ALPN, no hedging, a short
-/// stall ceiling so a wedged provider cannot outlast a test's patience.
-fn raw_item_opts(
-    fail_mode: FailMode,
-    total_bytes: u64,
-    telemetry: ProviderTelemetrySink,
-) -> super::assign::AssignmentOptions {
-    super::assign::AssignmentOptions {
-        stall_hard_limit: Duration::from_millis(1500),
-        hedging: false,
-        total_bytes,
-        telemetry,
-        alpn: COLLAB_BLOBS_ALPN,
-        fail_mode,
-        delivered: None,
-    }
-}
+use super::assign::FetchItem;
 
 /// A provider node (started `Out`, collab store mounted at `collab_root`)
 /// paired both ways with `receiver`.
@@ -4684,346 +3302,14 @@ async fn seed_raw(store: &Store, bytes: Vec<u8>, tag: &str) -> Hash {
     hash
 }
 
-/// Two providers each hold a DIFFERENT blob; one call fetches both, each from
-/// its own provider list, and both succeed. (Driven through the engine's
-/// raw-item entry point since its wave-2 collab caller retired, Task 15.)
-#[tokio::test]
-async fn raw_items_fetch_from_per_item_providers() {
-    let (dr, dp1, dp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
-    let (rr, rp1, rp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
-
-    let r = bind_disabled(dr.path()).await;
-    let r_info = r.handle(Role::Recv).start().await.unwrap();
-    r.set_collab_root(Some(rr.path())).await.unwrap();
-    let (p1, p1_id) = collab_provider(dp1.path(), rp1.path(), &r, &r_info.pairing_ticket).await;
-    let (p2, p2_id) = collab_provider(dp2.path(), rp2.path(), &r, &r_info.pairing_ticket).await;
-
-    const SIZE: usize = 96 * 1024;
-    let h1 = seed_raw(
-        &p1.collab_store().unwrap(),
-        raw_blob_bytes(1, SIZE),
-        "project/p/f1/1",
-    )
-    .await;
-    let h2 = seed_raw(
-        &p2.collab_store().unwrap(),
-        raw_blob_bytes(2, SIZE),
-        "project/p/f2/1",
-    )
-    .await;
-
-    let r_store = r.collab_store().unwrap();
-    let items = vec![
-        FetchItem {
-            key: "f1".to_string(),
-            request: iroh_blobs::protocol::GetRequest::blob(h1),
-            hash: h1,
-            size: SIZE as u64,
-            providers: Arc::new(vec![endpoint_id(p1_id)]),
-        },
-        FetchItem {
-            key: "f2".to_string(),
-            request: iroh_blobs::protocol::GetRequest::blob(h2),
-            hash: h2,
-            size: SIZE as u64,
-            providers: Arc::new(vec![endpoint_id(p2_id)]),
-        },
-    ];
-    let (telemetry, _seen) = recording_telemetry();
-    let (_report, results) = tokio::time::timeout(
-        Duration::from_secs(60),
-        super::assign::fetch_items_assigned(
-            &r_store,
-            &r.endpoint(),
-            items,
-            raw_item_opts(FailMode::Isolate, 2 * SIZE as u64, telemetry),
-        ),
-    )
-    .await
-    .expect("two small blobs must not take a minute")
-    .expect("the batch call itself succeeds");
-
-    assert_eq!(results.len(), 2, "one result per item");
-    assert_eq!(results[0].0, "f1", "keys are echoed in input order");
-    assert_eq!(results[1].0, "f2");
-    for (key, res) in &results {
-        assert!(
-            res.is_ok(),
-            "{key} must be fetched from its own provider: {res:?}"
-        );
-    }
-    for h in [h1, h2] {
-        assert!(
-            r_store.blobs().has(h).await.unwrap(),
-            "the receiver's collab store holds {h} complete"
-        );
-    }
-
-    p1.shutdown().await;
-    p2.shutdown().await;
-    r.shutdown().await;
-}
-
-/// `FailMode::Isolate`: an item whose only provider does not hold its hash
-/// fails ALONE — its sibling on another provider still lands.
-#[tokio::test]
-async fn isolate_mode_keeps_siblings_alive() {
-    let (dr, dp1, dp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
-    let (rr, rp1, rp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
-
-    let r = bind_disabled(dr.path()).await;
-    let r_info = r.handle(Role::Recv).start().await.unwrap();
-    r.set_collab_root(Some(rr.path())).await.unwrap();
-    let (p1, p1_id) = collab_provider(dp1.path(), rp1.path(), &r, &r_info.pairing_ticket).await;
-    let (p2, p2_id) = collab_provider(dp2.path(), rp2.path(), &r, &r_info.pairing_ticket).await;
-
-    const SIZE: usize = 64 * 1024;
-    let absent = Hash::new(raw_blob_bytes(7, SIZE));
-    let present = seed_raw(
-        &p2.collab_store().unwrap(),
-        raw_blob_bytes(8, SIZE),
-        "project/p/f2/1",
-    )
-    .await;
-
-    let items = vec![
-        FetchItem {
-            key: "missing".to_string(),
-            request: GetRequest::blob(absent),
-            hash: absent,
-            size: SIZE as u64,
-            providers: Arc::new(vec![endpoint_id(p1_id)]),
-        },
-        FetchItem {
-            key: "present".to_string(),
-            request: GetRequest::blob(present),
-            hash: present,
-            size: SIZE as u64,
-            providers: Arc::new(vec![endpoint_id(p2_id)]),
-        },
-    ];
-    let r_store = r.collab_store().unwrap();
-    let (telemetry, _seen) = recording_telemetry();
-    let (_report, results) = tokio::time::timeout(
-        // The missing item walks the whole backoff ladder (≈ 32 s) before it
-        // gives up; see `assigned_fetch_fails_fast_when_every_provider_is_dead`.
-        Duration::from_secs(120),
-        super::assign::fetch_items_assigned(
-            &r_store,
-            &r.endpoint(),
-            items,
-            raw_item_opts(FailMode::Isolate, 2 * SIZE as u64, telemetry),
-        ),
-    )
-    .await
-    .expect("an isolated failure must end inside the ladder")
-    .expect("isolate mode never fails the whole call");
-
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].0, "missing");
-    assert!(
-        results[0].1.is_err(),
-        "an item whose only provider lacks the hash fails: {:?}",
-        results[0].1
-    );
-    assert_eq!(results[1].0, "present");
-    assert!(
-        results[1].1.is_ok(),
-        "its sibling must not be aborted by that failure: {:?}",
-        results[1].1
-    );
-    assert!(r_store.blobs().has(present).await.unwrap());
-    assert!(!r_store.blobs().has(absent).await.unwrap());
-
-    p1.shutdown().await;
-    p2.shutdown().await;
-    r.shutdown().await;
-}
-
-/// Hedging on RAW items, over the network (collab v3 wave 2, Task 9 — the
-/// Task 4 unit tests covered the raw-item back half only in isolation).
-///
-/// The collab replication batch runs with `hedging: true`, and a raw item's
-/// hedge is `GetRequest::blob_ranges` over the back half of what is still
-/// missing. This is `hedge_fires_before_the_stall_ceiling_on_a_slow_provider`
-/// rebuilt on raw blobs served from three collab stores: every provider
-/// paced the same, then one collapses to 1 KB/s mid-transfer. The items it
-/// was serving must be rescued by hedges, not by the 60 s stall ceiling —
-/// and every item lands intact.
-#[tokio::test]
-async fn hedge_fires_on_raw_items_before_the_stall_ceiling() {
-    // Same budget arithmetic as the collection test: forty 256 KiB items.
-    const ITEMS: usize = 40;
-    const SIZE: usize = 256 * 1024;
-    let dirs: Vec<_> = (0..7).map(|_| tempdir().unwrap()).collect();
-    let r = bind_disabled(dirs[0].path()).await;
-    let r_info = r.handle(Role::Recv).start().await.unwrap();
-    r.set_collab_root(Some(dirs[1].path())).await.unwrap();
-    let (a, a_id) =
-        collab_provider(dirs[2].path(), dirs[3].path(), &r, &r_info.pairing_ticket).await;
-    let (b, b_id) =
-        collab_provider(dirs[4].path(), dirs[5].path(), &r, &r_info.pairing_ticket).await;
-    let slow_root = dirs[6].path().join("collab");
-    std::fs::create_dir_all(&slow_root).unwrap();
-    let (s, s_id) = collab_provider(
-        &dirs[6].path().join("node"),
-        &slow_root,
-        &r,
-        &r_info.pairing_ticket,
-    )
-    .await;
-
-    let mut hashes = Vec::with_capacity(ITEMS);
-    for i in 0..ITEMS {
-        let bytes = raw_blob_bytes(100 + i, SIZE);
-        let mut h = None;
-        for p in [&a, &b, &s] {
-            h = Some(
-                seed_raw(
-                    &p.collab_store().unwrap(),
-                    bytes.clone(),
-                    &format!("project/p/f{i}/1"),
-                )
-                .await,
-            );
-        }
-        hashes.push(h.unwrap());
-    }
-    for p in [&a, &b, &s] {
-        p.set_upload_limit(400_000);
-    }
-    let providers = Arc::new(vec![
-        endpoint_id(a_id),
-        endpoint_id(b_id),
-        endpoint_id(s_id),
-    ]);
-    let items: Vec<FetchItem> = hashes
-        .iter()
-        .enumerate()
-        .map(|(i, h)| FetchItem {
-            key: format!("f{i}"),
-            request: GetRequest::blob(*h),
-            hash: *h,
-            size: SIZE as u64,
-            providers: Arc::clone(&providers),
-        })
-        .collect();
-    let (telemetry, _) = recording_telemetry();
-    let opts = super::assign::AssignmentOptions {
-        stall_hard_limit: Duration::from_secs(60),
-        hedging: true,
-        total_bytes: (ITEMS * SIZE) as u64,
-        telemetry,
-        alpn: COLLAB_BLOBS_ALPN,
-        fail_mode: FailMode::Isolate,
-        delivered: None,
-    };
-    let collapse = {
-        let slow = Arc::clone(&s);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            slow.set_upload_limit(1_000);
-        })
-    };
-    let r_store = r.collab_store().unwrap();
-    let started = Instant::now();
-    let (report, results) = tokio::time::timeout(
-        Duration::from_secs(120),
-        super::assign::fetch_items_assigned(&r_store, &r.endpoint(), items, opts),
-    )
-    .await
-    .expect("a hedged raw fetch must not wait out the stall ceiling")
-    .expect("the assigned loop always reports");
-    let elapsed = started.elapsed();
-    collapse.await.ok();
-
-    for (key, res) in &results {
-        assert!(res.is_ok(), "{key}: {res:?}");
-    }
-    for h in &hashes {
-        assert!(
-            r_store.blobs().has(*h).await.unwrap(),
-            "{h} landed complete"
-        );
-    }
-    assert!(
-        elapsed < Duration::from_secs(45),
-        "hedging must finish before the 60 s ceiling could — took {elapsed:?} ({report:?})"
-    );
-    assert!(
-        report.hedges >= 1,
-        "a raw item must have been hedged: {report:?}"
-    );
-    assert_eq!(
-        report.stalls, 0,
-        "the ceiling must not be what rescued it: {report:?}"
-    );
-
-    for n in [a, b, s, r] {
-        n.shutdown().await;
-    }
-}
-
-/// The collection caller keeps `FailMode::FailFast`: one child the provider
-/// cannot serve fails the WHOLE call, exactly as before the generalization.
-#[tokio::test]
-async fn fail_fast_still_applies_to_collections() {
-    let (dp, dr) = (tempdir().unwrap(), tempdir().unwrap());
-    let p = bind_disabled(dp.path()).await;
-    let r = bind_disabled(dr.path()).await;
-    let p_info = p.handle(Role::Out).start().await.unwrap();
-    let r_info = r.handle(Role::Recv).start().await.unwrap();
-    r.add_peer_ticket(&p_info.pairing_ticket).unwrap();
-    p.add_peer_ticket(&r_info.pairing_ticket).unwrap();
-
-    // A hash sequence [held, missing] on the provider's personal store, which
-    // `iroh_blobs::ALPN` serves. The receiver needs the sequence itself
-    // locally to address children through it (phase 1's job in production).
-    let held = seed_raw(p.store(), raw_blob_bytes(3, 64 * 1024), "t/held").await;
-    let missing = Hash::new(raw_blob_bytes(4, 64 * 1024));
-    let seq: iroh_blobs::hashseq::HashSeq = [held, missing].into_iter().collect();
-    let seq_bytes = seq.into_inner();
-    let root = seed_raw(p.store(), seq_bytes.to_vec(), "t/root").await;
-    assert_eq!(
-        seed_raw(r.store(), seq_bytes.to_vec(), "t/root").await,
-        root
-    );
-
-    let (telemetry, _seen) = recording_telemetry();
-    let res = tokio::time::timeout(
-        Duration::from_secs(120),
-        super::assign::fetch_children_assigned(
-            r.store(),
-            &r.endpoint(),
-            vec![endpoint_id(p_info.node_id)],
-            root,
-            vec![(0, held), (1, missing)],
-            // The wrapper forces the personal ALPN and fail-fast whatever
-            // these say.
-            raw_item_opts(FailMode::Isolate, 128 * 1024, telemetry),
-        ),
-    )
-    .await
-    .expect("a missing child must fail inside the ladder, never hang");
-    assert!(
-        res.is_err(),
-        "a collection with one unservable child fails as a whole: {res:?}"
-    );
-
-    p.shutdown().await;
-    r.shutdown().await;
-}
-
-/// The hedge's back-half request: a raw item asks for `blob_ranges` of its own
-/// hash; a collection child keeps the old `child(i).build(root)` shape.
+/// The hedge's back-half request for a collection-child request keeps the
+/// `child(i).build(root)` shape (the raw-blob shape is pinned by
+/// `live_raw_item_hedge_uses_blob_ranges`).
 #[test]
-fn raw_item_hedge_uses_blob_ranges() {
+fn hedge_back_half_of_a_child_request_keeps_the_child_shape() {
     let h = Hash::new(b"raw frame");
     let root = Hash::new(b"hash seq root");
     let back = ChunkRanges::chunks(32u64..);
-
-    let raw = super::assign::hedge_back_half_request(&GetRequest::blob(h), h, back.clone());
-    assert_eq!(raw, Some(GetRequest::blob_ranges(h, back.clone())));
 
     for index in [0u64, 1, 7] {
         let child = GetRequest::builder()
@@ -5038,66 +3324,879 @@ fn raw_item_hedge_uses_blob_ranges() {
     }
 }
 
-/// One `fetch_items_assigned` call opens ONE connection pool, however many
-/// items it carries.
-#[tokio::test]
-async fn one_pool_per_call() {
-    let (dr, dp, rr, rp) = (
-        tempdir().unwrap(),
-        tempdir().unwrap(),
-        tempdir().unwrap(),
-        tempdir().unwrap(),
-    );
-    let r = bind_disabled(dr.path()).await;
-    let r_info = r.handle(Role::Recv).start().await.unwrap();
-    r.set_collab_root(Some(rr.path())).await.unwrap();
-    let (p, p_id) = collab_provider(dp.path(), rp.path(), &r, &r_info.pairing_ticket).await;
+// ─── the shared fetch engine, entered through the live run ────────────────
+//
+// `run_live` is the one entry point production uses. These tests pin the
+// engine's behaviours — hedging, the stall ceiling, provider failover and
+// attribution, per-item provider lists, isolation — by feeding raw blobs on
+// collab providers through it.
 
-    const ITEMS: usize = 20;
-    const SIZE: usize = 8 * 1024;
-    let p_store = p.collab_store().unwrap();
-    let providers = Arc::new(vec![endpoint_id(p_id)]);
-    let mut items = Vec::with_capacity(ITEMS);
-    for i in 0..ITEMS {
-        let hash = seed_raw(
-            &p_store,
-            raw_blob_bytes(100 + i, SIZE),
-            &format!("project/p/{i}/1"),
-        )
-        .await;
-        items.push(FetchItem {
-            key: format!("frame-{i:02}"),
+use super::assign::{
+    run_live, Dialer, ItemOutcome, LiveItem, LiveRunOptions, LiveVerdict, ProviderSet,
+};
+
+/// A collab-pool dialer from `me` whose address book is `providers`. The pool's
+/// connect timeout is the stock pool's 1 s, so a dead provider does not wait out
+/// the production 10 s per rung of the backoff ladder.
+fn live_collab_dialer(me: &SharedIrohNode, providers: &[&Arc<SharedIrohNode>]) -> Dialer {
+    let book: HashMap<EndpointId, iroh::EndpointAddr> = providers
+        .iter()
+        .map(|p| {
+            let addr = p.endpoint_addr();
+            (addr.id, addr)
+        })
+        .collect();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    Dialer::Collab {
+        pool: super::collab_pool::CollabPool::with_connect_timeout(
+            me.endpoint(),
+            events,
+            Duration::from_secs(1),
+        ),
+        addrs: Arc::new(move |id| book.get(id).cloned()),
+    }
+}
+
+/// Live-run knobs: the given stall ceiling and hedging, `max_in_flight` items at
+/// once, no yield cap.
+fn live_run_opts(
+    stall_hard_limit: Duration,
+    hedging: bool,
+    max_in_flight: usize,
+    telemetry: ProviderTelemetrySink,
+) -> LiveRunOptions {
+    LiveRunOptions {
+        stall_hard_limit,
+        hedging,
+        telemetry,
+        max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(max_in_flight)),
+        limit_changed: None,
+        unit_cap_bytes: u64::MAX,
+        delivered: None,
+    }
+}
+
+/// One raw-blob live item on a fixed provider list. Its cancel switch is never
+/// flipped (the sender is dropped, which never fires it).
+fn live_blob_item(key: &str, hash: Hash, size: u64, providers: &[EndpointId]) -> LiveItem {
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    LiveItem {
+        item: FetchItem {
+            key: key.to_string(),
             request: GetRequest::blob(hash),
             hash,
-            size: SIZE as u64,
-            providers: Arc::clone(&providers),
-        });
+            size,
+            providers: ProviderSet::Fixed(Arc::new(providers.to_vec())),
+        },
+        cancel,
+    }
+}
+
+/// What one `run_live` produced: every outcome (in completion order), every
+/// verdict, and the engine's report.
+struct LiveOut {
+    outcomes: Vec<(String, ItemOutcome)>,
+    verdicts: Vec<LiveVerdict>,
+    report: AssignmentReport,
+}
+
+impl LiveOut {
+    fn outcome(&self, key: &str) -> &ItemOutcome {
+        &self
+            .outcomes
+            .iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("no outcome for {key}: {:?}", self.outcomes))
+            .1
     }
 
-    let before = super::assign::pools_opened_on_this_thread();
-    let (telemetry, _seen) = recording_telemetry();
-    let (_report, results) = tokio::time::timeout(
-        Duration::from_secs(60),
-        super::assign::fetch_items_assigned(
-            &r.collab_store().unwrap(),
-            &r.endpoint(),
-            items,
-            raw_item_opts(FailMode::Isolate, (ITEMS * SIZE) as u64, telemetry),
-        ),
-    )
-    .await
-    .expect("twenty small blobs must not take a minute")
-    .expect("the batch call succeeds");
-    assert_eq!(
-        super::assign::pools_opened_on_this_thread() - before,
-        1,
-        "one call opens exactly one pool"
-    );
-    assert_eq!(results.len(), ITEMS);
-    assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+    /// One outcome per item, every one `Done`.
+    fn assert_all_done(&self, items: usize) {
+        assert_eq!(self.outcomes.len(), items, "one outcome per item");
+        for (key, out) in &self.outcomes {
+            assert!(matches!(out, ItemOutcome::Done), "{key}: {out:?}");
+        }
+    }
+}
 
-    p.shutdown().await;
-    r.shutdown().await;
+/// Feed `items` into `run_live` (the item channel closed behind them) and
+/// collect everything it reports, within `patience`. Dropping the run on a
+/// timeout cancels it cleanly.
+async fn run_live_items(
+    store: &Store,
+    dialer: Dialer,
+    items: Vec<LiveItem>,
+    opts: LiveRunOptions,
+    patience: Duration,
+) -> LiveOut {
+    run_live_items_ballasted(store, dialer, items, opts, patience, 0).await
+}
+
+/// As [`run_live_items`], with `ballast_bytes` of extra budget: a run-long item
+/// of that size that waits on an empty provider set, holding a stream slot and
+/// its 5 % share of the hedge budget until every real item has ended. `0`: no
+/// ballast. (A live run's hedge budget is 5 % of the bytes of the items IN
+/// FLIGHT, so it shrinks as a run drains; the ballast stands in for the items
+/// that would still be in flight beside a long tail.) The ballast's own outcome
+/// is not reported.
+async fn run_live_items_ballasted(
+    store: &Store,
+    dialer: Dialer,
+    items: Vec<LiveItem>,
+    opts: LiveRunOptions,
+    patience: Duration,
+    ballast_bytes: u64,
+) -> LiveOut {
+    let real = items.len();
+    let mut queue = Vec::with_capacity(real + 1);
+    // Held until the run ends: dropping the sender never fires the switch, and
+    // the empty provider set never changes.
+    let (_empty_tx, empty_rx) = tokio::sync::watch::channel(Arc::new(Vec::<EndpointId>::new()));
+    let (ballast_cancel_tx, ballast_cancel) = tokio::sync::watch::channel(false);
+    if ballast_bytes > 0 {
+        let hash = Hash::new(b"hedge budget ballast");
+        queue.push(LiveItem {
+            item: FetchItem {
+                key: LIVE_BALLAST_KEY.to_string(),
+                request: GetRequest::blob(hash),
+                hash,
+                size: ballast_bytes,
+                providers: ProviderSet::Live(empty_rx),
+            },
+            cancel: ballast_cancel,
+        });
+    }
+    queue.extend(items);
+    let (item_tx, item_rx) = tokio::sync::mpsc::channel(queue.len().max(1));
+    for item in queue {
+        item_tx.send(item).await.unwrap();
+    }
+    drop(item_tx);
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (verdict_tx, mut verdict_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_yield_tx, yield_rx) = tokio::sync::watch::channel(false);
+    let run = run_live(store, dialer, item_rx, opts, done_tx, verdict_tx, yield_rx);
+    // Outcomes arrive as items end; the channel closes when the run returns.
+    let collect = async {
+        let mut outcomes = Vec::new();
+        while let Some((key, out)) = done_rx.recv().await {
+            if key == LIVE_BALLAST_KEY {
+                continue;
+            }
+            outcomes.push((key, out));
+            if outcomes.len() == real {
+                ballast_cancel_tx.send_replace(true);
+            }
+        }
+        outcomes
+    };
+    let (report, outcomes) = tokio::time::timeout(patience, async { tokio::join!(run, collect) })
+        .await
+        .expect("the live run must end inside the test's patience");
+    let mut verdicts = Vec::new();
+    while let Ok(v) = verdict_rx.try_recv() {
+        verdicts.push(v);
+    }
+    LiveOut {
+        outcomes,
+        verdicts,
+        report,
+    }
+}
+
+const LIVE_BALLAST_KEY: &str = "ballast";
+
+/// A receiver and N collab providers, paired, each provider holding the same
+/// `items` raw blobs of `size` bytes (`f0` .. `f{items-1}`).
+struct LiveSwarm {
+    recv: Arc<SharedIrohNode>,
+    nodes: Vec<Arc<SharedIrohNode>>,
+    ids: Vec<EndpointId>,
+    hashes: Vec<Hash>,
+    size: usize,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+async fn live_swarm(providers: usize, items: usize, size: usize) -> LiveSwarm {
+    let (recv_dir, recv_root) = (tempdir().unwrap(), tempdir().unwrap());
+    let recv = bind_disabled(recv_dir.path()).await;
+    let info = recv.handle(Role::Recv).start().await.unwrap();
+    recv.set_collab_root(Some(recv_root.path())).await.unwrap();
+    let mut dirs = vec![recv_dir, recv_root];
+    let (mut nodes, mut ids) = (Vec::new(), Vec::new());
+    for _ in 0..providers {
+        let d = tempdir().unwrap();
+        let root = d.path().join("collab");
+        std::fs::create_dir_all(&root).unwrap();
+        let (node, id) =
+            collab_provider(&d.path().join("node"), &root, &recv, &info.pairing_ticket).await;
+        dirs.push(d);
+        nodes.push(node);
+        ids.push(endpoint_id(id));
+    }
+    let mut hashes = Vec::with_capacity(items);
+    for i in 0..items {
+        let bytes = raw_blob_bytes(100 + i, size);
+        let mut h = None;
+        for n in &nodes {
+            h = Some(
+                seed_raw(
+                    &n.collab_store().unwrap(),
+                    bytes.clone(),
+                    &format!("project/p/f{i}/1"),
+                )
+                .await,
+            );
+        }
+        hashes.push(h.unwrap());
+    }
+    LiveSwarm {
+        recv,
+        nodes,
+        ids,
+        hashes,
+        size,
+        _dirs: dirs,
+    }
+}
+
+impl LiveSwarm {
+    /// Every blob as a live item over every provider.
+    fn items(&self) -> Vec<LiveItem> {
+        self.hashes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| live_blob_item(&format!("f{i}"), *h, self.size as u64, &self.ids))
+            .collect()
+    }
+
+    fn dialer(&self) -> Dialer {
+        let nodes: Vec<&Arc<SharedIrohNode>> = self.nodes.iter().collect();
+        live_collab_dialer(&self.recv, &nodes)
+    }
+
+    fn store(&self) -> Store {
+        self.recv.collab_store().unwrap()
+    }
+
+    fn total(&self) -> u64 {
+        (self.hashes.len() * self.size) as u64
+    }
+
+    async fn assert_landed(&self) {
+        let store = self.store();
+        for h in &self.hashes {
+            assert!(store.blobs().has(*h).await.unwrap(), "{h} landed complete");
+        }
+    }
+
+    async fn shutdown(self) {
+        for n in self.nodes {
+            n.shutdown().await;
+        }
+        self.recv.shutdown().await;
+    }
+}
+
+/// A provider's stats, or the empty default: a live run keeps state only for
+/// providers it actually claimed, so a never-tried one is absent from the report.
+fn live_stats(report: &AssignmentReport, id: EndpointId) -> ProviderStats {
+    report.per_provider.get(&id).cloned().unwrap_or_default()
+}
+
+/// Two providers each hold a DIFFERENT blob; one run fetches both, each from its
+/// own provider list. The live
+/// run reports in completion order, so outcomes are looked up by key rather than
+/// asserted in input order.
+#[tokio::test]
+async fn live_items_fetch_from_per_item_providers() {
+    const SIZE: usize = 96 * 1024;
+    let swarm = live_swarm(2, 0, SIZE).await;
+    let h1 = seed_raw(
+        &swarm.nodes[0].collab_store().unwrap(),
+        raw_blob_bytes(1, SIZE),
+        "project/p/f1/1",
+    )
+    .await;
+    let h2 = seed_raw(
+        &swarm.nodes[1].collab_store().unwrap(),
+        raw_blob_bytes(2, SIZE),
+        "project/p/f2/1",
+    )
+    .await;
+    let items = vec![
+        live_blob_item("f1", h1, SIZE as u64, &swarm.ids[..1]),
+        live_blob_item("f2", h2, SIZE as u64, &swarm.ids[1..]),
+    ];
+    let (telemetry, _seen) = recording_telemetry();
+    let out = run_live_items(
+        &swarm.store(),
+        swarm.dialer(),
+        items,
+        live_run_opts(Duration::from_millis(1500), false, 8, telemetry),
+        Duration::from_secs(60),
+    )
+    .await;
+    out.assert_all_done(2);
+    for h in [h1, h2] {
+        assert!(
+            swarm.store().blobs().has(h).await.unwrap(),
+            "the receiver's collab store holds {h} complete"
+        );
+    }
+    // Each blob came from the one provider that holds it.
+    assert!(live_stats(&out.report, swarm.ids[0]).bytes >= SIZE as u64);
+    assert!(live_stats(&out.report, swarm.ids[1]).bytes >= SIZE as u64);
+    swarm.shutdown().await;
+}
+
+/// An item whose only provider does not hold its hash fails ALONE; its sibling
+/// on another provider still lands (a live run is always isolated).
+#[tokio::test]
+async fn live_one_failed_item_keeps_its_siblings_alive() {
+    const SIZE: usize = 64 * 1024;
+    let swarm = live_swarm(2, 0, SIZE).await;
+    let absent = Hash::new(raw_blob_bytes(7, SIZE));
+    let present = seed_raw(
+        &swarm.nodes[1].collab_store().unwrap(),
+        raw_blob_bytes(8, SIZE),
+        "project/p/f2/1",
+    )
+    .await;
+    let items = vec![
+        live_blob_item("missing", absent, SIZE as u64, &swarm.ids[..1]),
+        live_blob_item("present", present, SIZE as u64, &swarm.ids[1..]),
+    ];
+    let (telemetry, _seen) = recording_telemetry();
+    let out = run_live_items(
+        &swarm.store(),
+        swarm.dialer(),
+        items,
+        live_run_opts(Duration::from_millis(1500), false, 8, telemetry),
+        // The missing item may walk the whole backoff ladder (about 32 s)
+        // before it gives up.
+        Duration::from_secs(120),
+    )
+    .await;
+    assert_eq!(out.outcomes.len(), 2);
+    assert!(
+        matches!(out.outcome("missing"), ItemOutcome::Failed(_)),
+        "an item whose only provider lacks the hash fails: {:?}",
+        out.outcomes
+    );
+    assert!(
+        matches!(out.outcome("present"), ItemOutcome::Done),
+        "its sibling must not be aborted by that failure: {:?}",
+        out.outcomes
+    );
+    assert!(swarm.store().blobs().has(present).await.unwrap());
+    assert!(!swarm.store().blobs().has(absent).await.unwrap());
+    swarm.shutdown().await;
+}
+
+/// The hedge's back-half request is a blob-range of the raw item's own hash
+/// (the only shape the live run builds).
+#[test]
+fn live_raw_item_hedge_uses_blob_ranges() {
+    let h = Hash::new(b"raw frame");
+    let back = ChunkRanges::chunks(32u64..);
+    let raw = super::assign::hedge_back_half_request(&GetRequest::blob(h), h, back.clone());
+    assert_eq!(raw, Some(GetRequest::blob_ranges(h, back)));
+}
+
+/// A run opens ONE collab connection per provider, however many items it carries
+/// (the caller owns the pool, so the count to pin is its dials).
+#[tokio::test]
+async fn live_one_connection_per_provider_for_many_items() {
+    const ITEMS: usize = 20;
+    const SIZE: usize = 8 * 1024;
+    let swarm = live_swarm(1, ITEMS, SIZE).await;
+    let dialer = swarm.dialer();
+    let Dialer::Collab { pool, .. } = &dialer;
+    let pool = Arc::clone(pool);
+    let (telemetry, _seen) = recording_telemetry();
+    let out = run_live_items(
+        &swarm.store(),
+        dialer,
+        swarm.items(),
+        live_run_opts(Duration::from_millis(1500), false, 32, telemetry),
+        Duration::from_secs(60),
+    )
+    .await;
+    out.assert_all_done(ITEMS);
+    assert_eq!(pool.dials(), 1, "one provider, one dial, for twenty items");
+    swarm.shutdown().await;
+}
+
+/// Items spread over BOTH providers: the least-loaded pick puts payload on each, by the providers' own socket
+/// counters.
+#[tokio::test]
+async fn live_items_spread_over_both_providers() {
+    const ITEMS: usize = 14;
+    let swarm = live_swarm(2, ITEMS, 96 * 1024).await;
+    let (a, b) = (&swarm.nodes[0], &swarm.nodes[1]);
+    let (a_before, b_before) = (sent_bytes(a), sent_bytes(b));
+    let (telemetry, seen) = recording_telemetry();
+    let out = run_live_items(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        live_run_opts(Duration::from_secs(5), true, 32, telemetry),
+        Duration::from_secs(60),
+    )
+    .await;
+    out.assert_all_done(ITEMS);
+    swarm.assert_landed().await;
+    let a_sent = sent_bytes(a).saturating_sub(a_before);
+    let b_sent = sent_bytes(b).saturating_sub(b_before);
+    assert!(
+        a_sent > SERVED_PAYLOAD_FLOOR && b_sent > SERVED_PAYLOAD_FLOOR,
+        "the items must spread over BOTH providers — a sent {a_sent} B, b sent {b_sent} B \
+         (floor {SERVED_PAYLOAD_FLOOR} B)"
+    );
+    assert!(
+        !tried_providers(&seen).is_empty(),
+        "the provider telemetry sink must receive at least one event"
+    );
+    swarm.shutdown().await;
+}
+
+/// A provider killed mid-transfer costs its in-flight items a provider switch,
+/// not the run: the survivor finishes everything.
+#[tokio::test]
+async fn live_fetch_survives_a_provider_dying_mid_transfer() {
+    const ITEMS: usize = 16;
+    let swarm = live_swarm(2, ITEMS, 512 * 1024).await;
+    let (a, b) = (&swarm.nodes[0], &swarm.nodes[1]);
+    // 8 MiB paced at 2 MB/s PER PROVIDER puts the transfer in the multi-second
+    // range, so the 150 ms kill lands mid-run on any machine; the assertion
+    // right before the kill makes "mid-transfer" a fact, not a hope.
+    a.set_upload_limit(2_000_000);
+    b.set_upload_limit(2_000_000);
+    let (a_before, b_before) = (sent_bytes(a), sent_bytes(b));
+    let (telemetry, seen) = recording_telemetry();
+    let finished = Arc::new(AtomicBool::new(false));
+    let dialer = swarm.dialer();
+    let run = async {
+        let out = run_live_items(
+            &swarm.store(),
+            dialer,
+            swarm.items(),
+            live_run_opts(Duration::from_secs(5), true, 32, telemetry),
+            Duration::from_secs(120),
+        )
+        .await;
+        finished.store(true, Ordering::SeqCst);
+        out
+    };
+    let kill = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the run finished before the provider could be killed — the kill would \
+             prove nothing; lower the upload limit or grow the items"
+        );
+        // Read A's contribution BEFORE killing it: this is the number that says
+        // the victim was genuinely serving when it died.
+        let a_sent = sent_bytes(a).saturating_sub(a_before);
+        a.shutdown().await;
+        a_sent
+    };
+    let (out, a_sent) = tokio::join!(run, kill);
+    out.assert_all_done(ITEMS);
+    swarm.assert_landed().await;
+    let b_sent = sent_bytes(b).saturating_sub(b_before);
+    assert!(
+        a_sent > SERVED_PAYLOAD_FLOOR,
+        "the provider we killed must have been serving payload when it died — \
+         it sent only {a_sent} B (floor {SERVED_PAYLOAD_FLOOR} B)"
+    );
+    assert!(
+        b_sent > SERVED_PAYLOAD_FLOOR,
+        "the surviving provider must have served the rest — it sent only {b_sent} B \
+         (floor {SERVED_PAYLOAD_FLOOR} B)"
+    );
+    assert!(
+        !tried_providers(&seen).is_empty(),
+        "the provider telemetry sink must receive at least one event"
+    );
+    swarm.nodes[1].shutdown().await;
+    swarm.recv.shutdown().await;
+}
+
+/// A provider that ACCEPTS and then trickles must not pin the run: the stall
+/// ceiling reassigns its items and the run finishes on the healthy provider
+/// B is paced at 1 KB/s,
+/// so a 16 KiB chunk needs 16 s and "no growth for 1500 ms" is unambiguous.
+#[tokio::test]
+async fn live_trickling_provider_is_reassigned() {
+    const ITEMS: usize = 8;
+    const SIZE: usize = 256 * 1024;
+    let swarm = live_swarm(2, ITEMS, SIZE).await;
+    swarm.nodes[1].set_upload_limit(1_000);
+    let (telemetry, seen) = recording_telemetry();
+    let started = Instant::now();
+    let out = run_live_items(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        live_run_opts(Duration::from_millis(1500), true, 32, telemetry),
+        Duration::from_secs(120),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    out.assert_all_done(ITEMS);
+    swarm.assert_landed().await;
+    let a_stats = live_stats(&out.report, swarm.ids[0]);
+    let b_stats = live_stats(&out.report, swarm.ids[1]);
+    // B cannot have completed a single item: one 256 KiB item needs 262 s at
+    // 1 KB/s and the ceiling cuts it at 1.5 s, so the bulk is A's.
+    assert!(
+        a_stats.bytes > 6 * SIZE as u64,
+        "the healthy provider must have served the bulk — a delivered {} B of {} B, \
+         b delivered {} B (elapsed {elapsed:?})",
+        a_stats.bytes,
+        (ITEMS * SIZE) as u64,
+        b_stats.bytes
+    );
+    assert!(
+        b_stats.failures >= 1,
+        "the trickling provider must have been failed out by the stall ceiling, \
+         not waited for — its stats are {b_stats:?}"
+    );
+    assert!(
+        out.report.stalls >= 1,
+        "the failure must be attributed to the progress deadline (a stall): {:?}",
+        out.report
+    );
+    assert!(
+        tried_providers(&seen).contains(swarm.ids[1].as_bytes()),
+        "the engine must report the attempts it made on the trickling provider"
+    );
+    swarm.shutdown().await;
+}
+
+/// Every provider dead ⇒ the item exhausts its backoff ladder and fails inside a
+/// bounded time instead of spinning. A live item keeps its verified bytes in
+/// the store untagged.
+#[tokio::test]
+async fn live_item_fails_after_the_ladder_when_every_provider_is_dead() {
+    let swarm = live_swarm(1, 0, 0).await;
+    let dialer = swarm.dialer();
+    // The address book keeps the corpse's address; nobody answers there.
+    swarm.nodes[0].shutdown().await;
+    let nobody_serves = Hash::new(b"a blob nobody serves");
+    let (telemetry, _seen) = recording_telemetry();
+    let started = Instant::now();
+    let out = run_live_items(
+        &swarm.store(),
+        dialer,
+        vec![live_blob_item("dead", nobody_serves, 64 * 1024, &swarm.ids)],
+        // The ladder, not the stall watchdog, is what bounds this test.
+        live_run_opts(super::assign::STALL_HARD_LIMIT, true, 8, telemetry),
+        Duration::from_secs(120),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(out.outcome("dead"), ItemOutcome::Failed(_)),
+        "an item whose every provider is unreachable must fail: {:?}",
+        out.outcomes
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "the engine must walk its backoff ladder before giving up, not fail on the \
+         first dial — it gave up after {elapsed:?}"
+    );
+    assert!(
+        out.verdicts
+            .iter()
+            .any(|v| matches!(v, LiveVerdict::DialFailed { .. })),
+        "the dial failures are reported: {:?}",
+        out.verdicts
+    );
+    swarm.recv.shutdown().await;
+}
+
+/// The report accounts every byte the providers' socket counters saw, and every
+/// item is attributed to exactly one provider. Hedging is OFF here: once a hedge
+/// can fire, a provider's `bytes` and its egress stop being the same quantity.
+#[tokio::test]
+async fn live_report_matches_provider_send_counters() {
+    const ITEMS: usize = 14;
+    let swarm = live_swarm(2, ITEMS, 256 * 1024).await;
+    let (a, b) = (&swarm.nodes[0], &swarm.nodes[1]);
+    let (a_before, b_before) = (sent_bytes(a), sent_bytes(b));
+    let (telemetry, _) = recording_telemetry();
+    let out = run_live_items(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        live_run_opts(Duration::from_secs(5), false, 32, telemetry),
+        Duration::from_secs(120),
+    )
+    .await;
+    let a_sent = sent_bytes(a).saturating_sub(a_before);
+    let b_sent = sent_bytes(b).saturating_sub(b_before);
+    out.assert_all_done(ITEMS);
+    swarm.assert_landed().await;
+    for (name, id, sent) in [("a", swarm.ids[0], a_sent), ("b", swarm.ids[1], b_sent)] {
+        let stats = live_stats(&out.report, id);
+        assert!(
+            stats.bytes <= sent,
+            "provider {name} cannot have delivered more payload than its socket sent: \
+             report {} B vs sent {sent} B",
+            stats.bytes
+        );
+        assert!(
+            stats.bytes * 10 >= sent * 9,
+            "provider {name}'s reported payload must account for its egress bar framing: \
+             report {} B vs sent {sent} B ({:.1} %)",
+            stats.bytes,
+            stats.bytes as f64 * 100.0 / sent.max(1) as f64
+        );
+    }
+    assert_eq!(
+        out.report.total_children() as usize,
+        ITEMS,
+        "every item must be accounted for exactly once: {:?}",
+        out.report
+    );
+    swarm.shutdown().await;
+}
+
+/// The hedge swarm: forty 256 KiB items on three providers. The budget is 5 % of
+/// the items in flight and one hedge costs half of what an item still needs, so
+/// forty items in flight give the bucket room for several hedges at once.
+const LIVE_HEDGE_ITEMS: usize = 40;
+const LIVE_HEDGE_SIZE: usize = 256 * 1024;
+
+/// A provider that goes slow MID-TRANSFER triggers a hedge well before the stall
+/// ceiling, and the run finishes on the healthy peers. Every provider is paced
+/// the same, then one collapses to 1 KB/s: fast history, slow now.
+///
+/// The budget is held up by a run-long ballast item (see
+/// [`run_live_items_ballasted`]). Without it the stranded tail cannot afford a
+/// hedge: a live run's budget is 5 % of the bytes in flight and shrinks as items
+/// end, so the tail waits out the stall ceiling instead (`docs/transfers/README.md`,
+/// "Live hedge budget"). This test pins the hedge mechanics, not that budget rule.
+#[tokio::test]
+async fn live_hedge_fires_with_the_budget_held_up() {
+    live_hedge_fires_scenario((LIVE_HEDGE_ITEMS * LIVE_HEDGE_SIZE) as u64).await;
+}
+
+async fn live_hedge_fires_scenario(ballast_bytes: u64) {
+    let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
+    for n in &swarm.nodes {
+        n.set_upload_limit(400_000);
+    }
+    let (telemetry, _) = recording_telemetry();
+    let collapse = {
+        let slow = Arc::clone(&swarm.nodes[2]);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            slow.set_upload_limit(1_000);
+        })
+    };
+    let started = Instant::now();
+    let out = run_live_items_ballasted(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        // The 60 s ceiling is long enough that it cannot be what rescues the run.
+        live_run_opts(
+            Duration::from_secs(60),
+            true,
+            LIVE_HEDGE_ITEMS + 1,
+            telemetry,
+        ),
+        Duration::from_secs(120),
+        ballast_bytes,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    collapse.await.ok();
+    out.assert_all_done(LIVE_HEDGE_ITEMS);
+    swarm.assert_landed().await;
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "hedging must finish before the 60 s ceiling could — took {elapsed:?} ({:?})",
+        out.report
+    );
+    assert!(
+        out.report.hedges >= 1,
+        "at least one assignment must have been hedged: {:?}",
+        out.report
+    );
+    assert_eq!(
+        out.report.stalls, 0,
+        "the ceiling must not be what rescued it — hedging must have got there first: {:?}",
+        out.report
+    );
+    swarm.shutdown().await;
+}
+
+/// The loser is REALLY cancelled: the slow provider's own socket send counter
+/// stays under four items' worth though it was handed many more, and hedging
+/// does not double the payload. At 5 KB/s a 256 KiB item needs ~52 s, so the
+/// peer never completes one and never measures itself into hedge immunity. The
+/// budget is held up by a ballast item, as in
+/// [`live_hedge_fires_with_the_budget_held_up`].
+#[tokio::test]
+async fn live_hedge_cancels_the_loser_with_the_budget_held_up() {
+    live_hedge_cancels_scenario((LIVE_HEDGE_ITEMS * LIVE_HEDGE_SIZE) as u64).await;
+}
+
+async fn live_hedge_cancels_scenario(ballast_bytes: u64) {
+    let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
+    let slow = &swarm.nodes[2];
+    slow.set_upload_limit(5_000);
+    let (telemetry, _) = recording_telemetry();
+    let slow_before = sent_bytes(slow);
+    let started = Instant::now();
+    let out = run_live_items_ballasted(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        live_run_opts(
+            Duration::from_secs(60),
+            true,
+            LIVE_HEDGE_ITEMS + 1,
+            telemetry,
+        ),
+        // A byte budget, not a clock: a loaded runner must not fail it. An
+        // uncancelled primary would need about eleven minutes.
+        Duration::from_secs(240),
+        ballast_bytes,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let slow_sent = sent_bytes(slow).saturating_sub(slow_before);
+    out.assert_all_done(LIVE_HEDGE_ITEMS);
+    swarm.assert_landed().await;
+    assert!(
+        out.report.hedges >= 1,
+        "the test needs a hedge to have fired: {:?}",
+        out.report
+    );
+    // A hedge's back half can be the last of its item; it must still be credited.
+    assert_eq!(
+        out.report.total_children() as usize,
+        LIVE_HEDGE_ITEMS,
+        "every item must be credited exactly once, hedge-won ones included: {:?}",
+        out.report
+    );
+    const CANCEL_BOUND: u64 = 4 * (LIVE_HEDGE_SIZE as u64) + SERVED_PAYLOAD_FLOOR;
+    assert!(
+        slow_sent < CANCEL_BOUND,
+        "a cancelled primary must stop sending — the slow provider put {slow_sent} B on the \
+         wire in {elapsed:?}, over the {CANCEL_BOUND} B a peer cancelled out of every \
+         assignment it was given can account for"
+    );
+    let total = swarm.total();
+    assert!(
+        out.report.hedge_bytes <= (total as f64 * 0.6) as u64,
+        "hedge deliveries must stay a minority of the payload: {} B of {total} B",
+        out.report.hedge_bytes
+    );
+    swarm.shutdown().await;
+}
+
+/// The bucket keeps a storm bounded: a peer that strands many items at once does
+/// NOT duplicate whole ranges. The byte
+/// bound end to end is also what pins the refund rule.
+#[tokio::test]
+async fn live_hedge_budget_stops_a_storm() {
+    // The budget is held up by a ballast item, as in the two scenarios above:
+    // without it the tail is unhedged (so few hedges that the byte bound passes
+    // vacuously) and the run grinds on to the 60 s stall ceiling, ~95 s.
+    let ballast_bytes = (LIVE_HEDGE_ITEMS * LIVE_HEDGE_SIZE) as u64;
+    let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
+    for n in &swarm.nodes {
+        n.set_upload_limit(400_000);
+    }
+    let (telemetry, _) = recording_telemetry();
+    // Every item the slow peer holds is stranded at the same instant.
+    let collapse = {
+        let slow = Arc::clone(&swarm.nodes[2]);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            slow.set_upload_limit(1_000);
+        })
+    };
+    let out = run_live_items_ballasted(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        live_run_opts(
+            Duration::from_secs(60),
+            true,
+            LIVE_HEDGE_ITEMS + 1,
+            telemetry,
+        ),
+        Duration::from_secs(120),
+        ballast_bytes,
+    )
+    .await;
+    collapse.await.ok();
+    out.assert_all_done(LIVE_HEDGE_ITEMS);
+    swarm.assert_landed().await;
+    assert!(
+        out.report.hedges >= 1,
+        "the test is only meaningful if hedging engaged at all: {:?}",
+        out.report
+    );
+    let cap = (swarm.total() as f64 * 0.05) as u64;
+    assert_eq!(
+        out.report.total_children() as usize,
+        LIVE_HEDGE_ITEMS,
+        "every item must be credited exactly once, hedge-won ones included: {:?}",
+        out.report
+    );
+    assert!(
+        out.report.hedge_bytes <= 2 * cap,
+        "hedging must stay inside its byte budget — it duplicated {} B against a {cap} B cap \
+         (2x allowed for refills) over {} hedges: {:?}",
+        out.report.hedge_bytes,
+        out.report.hedges,
+        out.report
+    );
+    swarm.shutdown().await;
+}
+
+/// The stall ceiling and the hedge budget are independent rules: whatever the
+/// budget decides, the progress deadline fires on its own schedule and reassigns
+/// the item. The slow
+/// peer dribbles at 1 KB/s from the start, so a 1500 ms deadline is unambiguous.
+#[tokio::test]
+async fn live_stall_ceiling_is_independent_of_the_hedge_budget() {
+    const ITEMS: usize = 6;
+    let swarm = live_swarm(3, ITEMS, 512 * 1024).await;
+    swarm.nodes[2].set_upload_limit(1_000);
+    let (telemetry, _) = recording_telemetry();
+    let out = run_live_items(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        // Hedging is ON throughout; the hedge count is deliberately not asserted.
+        live_run_opts(Duration::from_millis(1500), true, ITEMS, telemetry),
+        Duration::from_secs(90),
+    )
+    .await;
+    out.assert_all_done(ITEMS);
+    swarm.assert_landed().await;
+    let slow = live_stats(&out.report, swarm.ids[2]);
+    assert!(
+        slow.failures >= 1,
+        "the 1500 ms progress deadline must fail the trickling provider out while hedging \
+         is enabled: {slow:?}"
+    );
+    assert!(
+        out.report.stalls >= 1,
+        "and that failure must be attributed to the deadline: {:?}",
+        out.report
+    );
+    swarm.shutdown().await;
 }
 
 // ─── collab v3 wave 3, Task 12: the live assignment run ───────────────────

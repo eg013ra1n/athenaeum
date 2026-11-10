@@ -68,6 +68,9 @@ use super::types::{
 use super::{FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::DedupResponder;
 
+// The live collab fetch engine; its one production caller (`api::collab_live`)
+// needs `render` + `solver`, so a headless build compiles it for tests only.
+#[cfg(any(test, all(feature = "render", feature = "solver")))]
 pub(crate) mod assign;
 pub mod blobs;
 pub mod collab_pool;
@@ -1971,59 +1974,6 @@ impl SharingTransport for IrohTransport {
         )
         .await?;
         tracing::debug!(to = %hex32(&to), package_id = %package_id.0, ?reason, "iroh revoke sent");
-        Ok(())
-    }
-
-    async fn announce_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-        a: &PackageAnnounce,
-    ) -> Result<()> {
-        // Same served-collection-hash substitution as `announce`: swap in the
-        // collection hash `serve` registered so the receiver can download by it,
-        // keeping the engine-minted `announce.package_id` (ack correlation).
-        let mut wire = a.clone();
-        {
-            let served = self.served.lock().expect("served mutex poisoned");
-            match served.get(&a.package_id.0) {
-                Some(hash) => wire.root_hash = hash.to_string(),
-                None => tracing::warn!(
-                    package_id = %a.package_id.0,
-                    "project announce without a served collection; forwarding placeholder root_hash"
-                ),
-            }
-        }
-        self.send_control(
-            to,
-            Msg::ProjectAnnounce {
-                project_id: project_id.to_string(),
-                package_id: package_id.to_string(),
-                announce: wire,
-            },
-        )
-        .await?;
-        tracing::debug!(
-            to = %hex32(&to),
-            project_id,
-            package_id,
-            wire_package_id = %a.package_id.0,
-            "iroh project announce sent"
-        );
-        Ok(())
-    }
-
-    async fn request_project(&self, to: NodeId, project_id: &str, package_id: &str) -> Result<()> {
-        self.send_control(
-            to,
-            Msg::ProjectRequest {
-                project_id: project_id.to_string(),
-                package_id: package_id.to_string(),
-            },
-        )
-        .await?;
-        tracing::debug!(to = %hex32(&to), project_id, package_id, "iroh project request sent");
         Ok(())
     }
 

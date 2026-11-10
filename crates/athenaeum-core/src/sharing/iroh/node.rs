@@ -2,9 +2,9 @@
 //!
 //! [`SharedIrohNode`] owns **one** iroh [`Endpoint`], **one** [`Router`] with
 //! every ALPN mounted once, and **one** personal [`FsStore`] — and hands out
-//! per-role [`SharingTransport`] handles ([`Role::Recv`]/[`Role::Out`]/
-//! [`Role::Collab`]). A second, optional store — the collab store under the
-//! Collaboration root — is swapped in a slot behind the collab-blobs ALPN
+//! per-role [`SharingTransport`] handles ([`Role::Recv`]/[`Role::Out`]). A
+//! second, optional store — the collab store under the Collaboration root — is
+//! swapped in a slot behind the collab-blobs ALPN
 //! ([`set_collab_root`](SharedIrohNode::set_collab_root)); the router never
 //! changes.
 //! Before this, production bound up to three endpoints from the SAME device key
@@ -64,11 +64,10 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
     PackageId, PackageLayout, RevokeReason, StartInfo, TransportEvent,
 };
-use crate::sharing::{FetchSink, ImportProgressSink, ProviderTelemetrySink, SharingTransport};
+use crate::sharing::{FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
-use super::assign::{self, AssignmentReport, SwarmFetchMode};
 use super::pacer::UploadPacer;
 use super::proto::{self, Msg, OfferEntry};
 use super::telemetry::{peer_conn_path, TransportCounters};
@@ -182,17 +181,15 @@ impl RelayHealth {
 }
 
 /// Which multiplexed role a [`SharedIrohNode`] handle plays. The variant selects
-/// the blob-tag prefix (Д3) — `recv/pkg/…`, `out/pkg/…`, `collab/pkg/…` — so the
-/// three roles coexist on the node's single [`FsStore`] without clobbering each
-/// other's tags, and each role's startup sweep is scoped to its own prefix.
+/// the blob-tag prefix (Д3) — `recv/pkg/…`, `out/pkg/…` — so the roles coexist
+/// on the node's single [`FsStore`] without clobbering each other's tags, and
+/// each role's startup sweep is scoped to its own prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// The personal-sync / collab receiver (inbound announces, blob pulls).
+    /// The personal-sync receiver (inbound announces, blob pulls).
     Recv,
     /// The personal-sync sender (outbound package announces + serves).
     Out,
-    /// The collaboration exchange sender (project announces + serves).
-    Collab,
 }
 
 impl Role {
@@ -201,7 +198,6 @@ impl Role {
         match self {
             Role::Recv => "recv",
             Role::Out => "out",
-            Role::Collab => "collab",
         }
     }
 }
@@ -1560,10 +1556,9 @@ impl SharedIrohNode {
     /// actually moved.
     ///
     /// The provider-side byte delta is the only SOUND oracle for "did this
-    /// holder really serve part of the collection?". The blob downloader's
-    /// per-provider progress items are best-effort and lossy on this iroh-blobs
-    /// version (see [`blobs::fetch_collection_multi`]), so a swarm test that
-    /// asserts on telemetry alone is asserting on a sample, not on reality.
+    /// holder really serve part of the transfer?". Per-provider telemetry is a
+    /// sample, so a swarm test that asserts on telemetry alone is asserting on
+    /// a sample, not on reality.
     #[cfg(test)]
     pub(crate) fn counters_snapshot_for_test(&self) -> TransportCounters {
         TransportCounters::snapshot(&self.endpoint())
@@ -2529,63 +2524,6 @@ impl SharedIrohNode {
         Ok(())
     }
 
-    async fn role_announce_project(
-        &self,
-        role: Role,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-        a: &PackageAnnounce,
-    ) -> Result<()> {
-        let tag = role_package_tag(role.prefix(), &a.package_id);
-        let mut wire = a.clone();
-        {
-            let served = self.served.lock().expect("served mutex poisoned");
-            match served.get(&tag) {
-                Some(entry) => wire.root_hash = entry.hash.to_string(),
-                None => tracing::warn!(
-                    package_id = %a.package_id.0,
-                    "project announce without a served collection; forwarding placeholder root_hash"
-                ),
-            }
-        }
-        self.send_control(
-            to,
-            Msg::ProjectAnnounce {
-                project_id: project_id.to_string(),
-                package_id: package_id.to_string(),
-                announce: wire,
-            },
-        )
-        .await?;
-        tracing::debug!(
-            to = %hex32(&to),
-            project_id,
-            package_id,
-            wire_package_id = %a.package_id.0,
-            "iroh project announce sent"
-        );
-        Ok(())
-    }
-
-    async fn role_request_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-    ) -> Result<()> {
-        self.send_control(
-            to,
-            Msg::ProjectRequest {
-                project_id: project_id.to_string(),
-                package_id: package_id.to_string(),
-            },
-        )
-        .await?;
-        tracing::debug!(to = %hex32(&to), project_id, package_id, "iroh project request sent");
-        Ok(())
-    }
-
     async fn role_fetch(
         &self,
         role: Role,
@@ -2631,167 +2569,6 @@ impl SharedIrohNode {
             "iroh fetch complete"
         );
         Ok(())
-    }
-
-    /// The swarm counterpart of [`role_fetch`](Self::role_fetch) (D3 Task 1):
-    /// one collection, the whole holder set, split per child blob.
-    ///
-    /// **Tag derivation.** `role_fetch` names its tag after the announce's
-    /// package id; a swarm fetch has no announce — the hub's `root_hash` IS the
-    /// subject — so the tag is the same `<role>/pkg/<id>` shape keyed by the
-    /// collection hash's canonical lowercase hex: `<role>/pkg/<root_hash>`. A hex
-    /// hash is a single path segment, exactly like a package uuid, so every
-    /// existing namespace rule keeps working unchanged: the role-prefixed startup
-    /// sweep still scopes the permanent tag, and
-    /// [`role_release`](Self::role_release) reclaims BOTH it and its
-    /// `in-flight/` derivative when called with `PackageId(root_hash_hex)`. It is
-    /// also idempotent under content addressing: two members fetching the same
-    /// collection reuse one tag name, and a re-fetch overwrites rather than
-    /// leaking a second.
-    ///
-    /// **B7 sweep interaction (role-dependent).** The swarm fetch's caller is the
-    /// collab exchange, i.e. [`Role::Collab`], so its in-flight tag is
-    /// `in-flight/collab/pkg/<root_hash>` — outside the `in-flight/recv/pkg/`
-    /// prefix the receiver's orphan sweep enumerates, so the contract holds by
-    /// exclusion. Were a `Role::Recv` caller ever added, its in-flight tag WOULD
-    /// fall inside that prefix and the sweep would reclaim it as an orphan (no
-    /// `sync_inbound` row is ever keyed by a collection hash). That costs a
-    /// resume, never integrity — but it is the reason to keep swarm fetches on
-    /// the Collab handle.
-    async fn role_fetch_multi(
-        &self,
-        role: Role,
-        providers: Vec<NodeId>,
-        root_hash: &str,
-        byte_size: u64,
-        dest_dir: &Path,
-        sink: FetchSink,
-        telemetry: ProviderTelemetrySink,
-    ) -> Result<()> {
-        // A2a: the assignment loop is the default and the stock `Split` fan-out
-        // stays one environment variable away (`ATHENAEUM_SWARM_FETCH=stock`),
-        // resolved once per process. Production never shortens the stall
-        // ceiling — only a test does, through
-        // [`Self::fetch_collection_multi_tuned_for_test`].
-        self.role_fetch_multi_inner(
-            role,
-            providers,
-            root_hash,
-            byte_size,
-            dest_dir,
-            sink,
-            telemetry,
-            assign::swarm_fetch_mode(),
-            assign::STALL_HARD_LIMIT,
-            true,
-        )
-        .await
-        .map(|_report| ())
-    }
-
-    /// Test seam (A2a): the same swarm fetch, with the phase-2 mode and the
-    /// assignment loop's progress deadline chosen by the caller, returning the
-    /// [`AssignmentReport`] production discards.
-    ///
-    /// A test needs all three: a deliberately trickling peer only trips a stall
-    /// ceiling shortened to its own patience, the report is the only place
-    /// per-provider bytes are visible at all, and `hedging` has to be
-    /// switchable because a provider's reported bytes and its socket egress are
-    /// the same quantity only while it is off.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn fetch_collection_multi_tuned_for_test(
-        &self,
-        role: Role,
-        providers: Vec<NodeId>,
-        root_hash: &str,
-        byte_size: u64,
-        dest_dir: &Path,
-        sink: FetchSink,
-        telemetry: ProviderTelemetrySink,
-        mode: SwarmFetchMode,
-        stall_hard_limit: std::time::Duration,
-        hedging: bool,
-    ) -> Result<Option<AssignmentReport>> {
-        self.role_fetch_multi_inner(
-            role,
-            providers,
-            root_hash,
-            byte_size,
-            dest_dir,
-            sink,
-            telemetry,
-            mode,
-            stall_hard_limit,
-            hedging,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn role_fetch_multi_inner(
-        &self,
-        role: Role,
-        providers: Vec<NodeId>,
-        root_hash: &str,
-        byte_size: u64,
-        dest_dir: &Path,
-        sink: FetchSink,
-        telemetry: ProviderTelemetrySink,
-        mode: SwarmFetchMode,
-        stall_hard_limit: std::time::Duration,
-        hedging: bool,
-    ) -> Result<Option<AssignmentReport>> {
-        let hash: Hash = root_hash
-            .parse()
-            .with_context(|| format!("parse collection hash {root_hash:?}"))?;
-        if providers.is_empty() {
-            anyhow::bail!("multi-source fetch of {hash} has no providers");
-        }
-        let ids = providers
-            .iter()
-            .map(|p| {
-                EndpointId::from_bytes(p).map_err(|e| anyhow!("invalid provider node id: {e}"))
-            })
-            .collect::<Result<Vec<EndpointId>>>()?;
-        let tag = role_package_tag(role.prefix(), &PackageId(hash.to_hex()));
-        // Clone the endpoint out of the `net` lock so it is not held across the
-        // download awaits below (same discipline as `role_fetch`).
-        let endpoint = self.endpoint();
-        let count = ids.len();
-        let report = blobs::fetch_collection_multi(
-            &self.store,
-            &endpoint,
-            ids,
-            hash,
-            &tag,
-            dest_dir,
-            byte_size,
-            sink,
-            telemetry,
-            mode,
-            stall_hard_limit,
-            hedging,
-        )
-        .await?;
-
-        // `stalls` is the assignment loop's figure; the stock fan-out has no
-        // such notion, so it is reported as absent rather than as a `0` a log
-        // reader would take for "nothing stalled".
-        match report.as_ref() {
-            Some(r) => tracing::info!(
-                providers = count,
-                root_hash = %hash,
-                stalls = r.stalls,
-                "iroh multi-source fetch complete"
-            ),
-            None => tracing::info!(
-                providers = count,
-                root_hash = %hash,
-                "iroh multi-source fetch complete"
-            ),
-        }
-        Ok(report)
     }
 
     async fn role_fetch_manifest(
@@ -3771,22 +3548,6 @@ impl SharingTransport for RoleHandle {
             .await
     }
 
-    async fn fetch_collection_multi(
-        &self,
-        providers: Vec<NodeId>,
-        root_hash: &str,
-        byte_size: u64,
-        dest_dir: &Path,
-        sink: FetchSink,
-        telemetry: ProviderTelemetrySink,
-    ) -> Result<()> {
-        self.node
-            .role_fetch_multi(
-                self.role, providers, root_hash, byte_size, dest_dir, sink, telemetry,
-            )
-            .await
-    }
-
     async fn fetch_manifest(
         &self,
         from: NodeId,
@@ -3826,33 +3587,6 @@ impl SharingTransport for RoleHandle {
     ) -> Result<HashSet<String>> {
         self.node
             .negotiate_want_inner(to, package_id, offer, full_by_rel)
-            .await
-    }
-
-    async fn announce_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-        announce: &PackageAnnounce,
-    ) -> Result<()> {
-        // The wire announce's package_id is the ack-correlation id — claim on it.
-        self.claim_ack(to, &announce.package_id);
-        let res = self
-            .node
-            .role_announce_project(self.role, to, project_id, package_id, announce)
-            .await;
-        if res.is_err() {
-            self.node
-                .demux
-                .release_claim(&(to, announce.package_id.clone()));
-        }
-        res
-    }
-
-    async fn request_project(&self, to: NodeId, project_id: &str, package_id: &str) -> Result<()> {
-        self.node
-            .role_request_project(to, project_id, package_id)
             .await
     }
 
