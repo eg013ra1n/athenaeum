@@ -11,6 +11,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 r2d2 = "0.8"
+# r2d2's worker pool, built here so its threads end with the catalog pool (db/mod.rs).
+scheduled-thread-pool = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 walkdir = "2"

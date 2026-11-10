@@ -49,7 +49,7 @@ pub use runtime::{
     sync_now,
 };
 #[cfg(all(test, feature = "render", feature = "solver"))]
-pub(crate) use runtime::{spawn_with, GateSource, LiveConfig};
+pub(crate) use runtime::{disarm_for_test, spawn_with, GateSource, LiveConfig};
 // Two live instances end to end on the fake hub (Task 15).
 #[cfg(all(test, feature = "render", feature = "solver"))]
 mod live_tests;

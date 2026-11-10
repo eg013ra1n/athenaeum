@@ -147,7 +147,22 @@ impl Database {
     fn with_pool(path: PathBuf, builder: r2d2::Builder<SqliteConnectionManager>) -> Result<Self> {
         let manager = SqliteConnectionManager::new(&path);
 
+        // The pool's own worker threads, as r2d2 would build them, except
+        // that they end with the pool. r2d2's default pool keeps its three
+        // threads until the pending connection-reaper tick comes due, up to
+        // 30 s after the catalog closed. The app has one catalog and closes
+        // it at exit; the test suites open thousands, and those idle threads
+        // were a fifth of what took the core test binary to the per-process
+        // thread limit.
+        use scheduled_thread_pool::{OnPoolDropBehavior, ScheduledThreadPool};
+        let workers = ScheduledThreadPool::builder()
+            .num_threads(3)
+            .thread_name_pattern("r2d2-worker-{}")
+            .on_drop_behavior(OnPoolDropBehavior::DiscardPendingScheduled)
+            .build();
+
         let pool = builder
+            .thread_pool(std::sync::Arc::new(workers))
             .build(manager)
             .map_err(|e| rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
