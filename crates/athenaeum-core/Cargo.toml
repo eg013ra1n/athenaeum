@@ -186,6 +186,8 @@ solver = ["dep:solvemyastro"]
 # Debug-only Moffat LM solve counters (rustafits `lm-counters`), printed by the star_probe example as one `lmCounters` line;
 # zero numeric effect, never in default (fast-measurement S2b-1).
 lm-counters = ["render", "rustafits/lm-counters"]
+# Test doubles and test-only transports for this crate's and dependants' tests (`LoopbackTransport`, `IrohTransport`); never in default.
+test-support = []
 
 [[example]]
 name = "band_profile"
@@ -232,6 +234,8 @@ name = "drizzle_probe"
 required-features = ["render", "solver"]
 
 [dev-dependencies]
+# Self dev-dependency: turns on this crate's own `test-support` feature for its integration tests and examples (they have no `cfg(test)` on the lib).
+athenaeum-core = { path = ".", features = ["test-support"] }
 # `test-support`: `StarFit::test_at` and `PlanePrep::for_pin`, the fixtures the tests build fits and pins with.
 rustafits = { path = "../../rustafits", default-features = false, features = ["serde", "test-support"] }
 tempfile = "3"

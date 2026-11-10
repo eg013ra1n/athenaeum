@@ -2,7 +2,7 @@
 //!
 //! These are the payloads a [`SharingTransport`](crate::sharing::SharingTransport)
 //! moves between peers. They are transport-agnostic: the same types flow over
-//! the in-process [`LoopbackTransport`](crate::sharing::loopback::LoopbackTransport)
+//! the in-process `LoopbackTransport`
 //! mock and (later) a real iroh transport. No catalog/DB/engine concepts leak
 //! in here — this layer only knows about announcements, blobs, and receipts.
 

@@ -88,7 +88,7 @@ pub fn allow_all_peers() -> PeerAuthorizer {
 #[derive(Clone, Default)]
 pub struct ReceiverHooks {
     /// Connection-level authorization predicate installed on the iroh transport
-    /// via [`set_connect_gate`](crate::sharing::iroh::IrohTransport::set_connect_gate):
+    /// via `IrohTransport::set_connect_gate`:
     /// the composite account-allow-list ∪ project-member gate. Absent ⇒ the
     /// transport admits every connection (today's behavior).
     pub connect_gate: Option<crate::sharing::iroh::ConnectGate>,

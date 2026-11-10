@@ -14,7 +14,7 @@
 //! 2026-07-12 field incident). Collapsing them onto one endpoint removes that
 //! self-collision.
 //!
-//! The node is a refactor of [`IrohTransport`](super::IrohTransport) — it reuses
+//! The node is a refactor of `IrohTransport` — it reuses
 //! that module's construction shape, protocol handlers
 //! ([`SyncControlProtocol`](super::SyncControlProtocol),
 //! [`GatedBlobs`](super::GatedBlobs)) — mounted via the shared
@@ -204,7 +204,7 @@ impl Role {
 
 /// The role-scoped, deterministic blob-store tag for a package collection —
 /// `<prefix>/pkg/<package_id>`. The node's single namer (Д3), replacing the
-/// role-agnostic [`package_tag`](super::package_tag): every role prefixes its
+/// role-agnostic `package_tag`: every role prefixes its
 /// tags so a sibling role's startup sweep can never delete them.
 fn role_package_tag(prefix: &str, package_id: &PackageId) -> String {
     format!("{prefix}/pkg/{}", package_id.0)

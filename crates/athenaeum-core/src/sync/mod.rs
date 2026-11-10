@@ -8,7 +8,7 @@
 //! - [`crate::sharing::SharingTransport`] (task A2) moves announcements, blobs,
 //!   and acks between peers. The engine is transport-agnostic — it is tested end
 //!   to end against the in-process
-//!   [`LoopbackTransport`](crate::sharing::loopback::LoopbackTransport) and runs
+//!   `LoopbackTransport` and runs
 //!   unchanged over the real iroh transport (task A5).
 //! - [`crate::package`] (task A3) is the on-disk bundle format the engine serves
 //!   and whose manifest it reads to build audit history.
