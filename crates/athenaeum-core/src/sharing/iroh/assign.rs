@@ -41,7 +41,7 @@
 //! A hedge is paid from the [`HedgeBudget`], whose cap follows the items in
 //! flight: the larger of [`HEDGE_BUDGET_RATIO`] of their bytes and half the
 //! largest one. A hedge's charge stays outstanding until it settles and what it
-//! duplicated is owed back at 5 % of completed bytes, so a budget with nothing
+//! duplicated is owed back at 5 % of the bytes of completing rounds, so a budget with nothing
 //! outstanding and no debt pays for one hedge of the largest item, and no more
 //! than the cap is ever spent on top of the 5 % that completed bytes repay.
 //! Whichever side finishes first wins the round and the loser is cancelled (see
@@ -263,13 +263,16 @@ impl CompletionWindow {
 /// The cap is the larger of [`HEDGE_BUDGET_RATIO`] × the bytes in flight and
 /// half of the largest item in flight — one hedge of it — and `0` when nothing
 /// is. A hedge's charge stays `outstanding` until it settles, and what it
-/// duplicated becomes `debt`, repaid at [`HEDGE_BUDGET_RATIO`] of every completed
-/// byte. Only `available = cap - outstanding - debt` is ever spent, and neither
-/// the cap rising nor falling adds to it. So: at every admission
+/// duplicated becomes `debt`, repaid at [`HEDGE_BUDGET_RATIO`] of the bytes of
+/// each round that completes an item. Only `available = cap - outstanding - debt`
+/// is ever spent; it is a function of those three alone, so a cap that falls and
+/// rises again gives back nothing that is outstanding or owed. So: at every admission
 /// `outstanding + debt <= cap`; with nothing outstanding and no debt one hedge
 /// of the largest item is always payable; over a run the duplicated bytes stay
 /// within 5 % of the completed bytes plus one cap; hedges that duplicate
-/// nothing cost nothing. The floor uses an item's ANNOUNCED size and a charge
+/// nothing cost nothing. A hedge dropped unsettled (its item cancelled, the run
+/// cut) is counted as duplicating nothing: what it and its primary both moved
+/// is not measured there. The floor uses an item's ANNOUNCED size and a charge
 /// the real one, so an item announced smaller than it is (or `0`, unknown) may
 /// not be hedgeable.
 #[derive(Debug)]
@@ -345,9 +348,9 @@ impl HedgeBudget {
     /// cannot ride it to zero one hedge at a time.
     ///
     /// The comparison is `>=`, not `>`: `available` lands on EXACTLY `cap / 2`
-    /// in an ordinary case (one hedge of the largest item outstanding against a
-    /// floor cap, a debt that repaid to the half), and a strict `>` refused
-    /// every hedge there for arithmetic reasons.
+    /// in ordinary cases (a hedge of a quarter of the largest item outstanding
+    /// against a floor cap, a debt repaid down to the half), and a strict `>`
+    /// refused every hedge there for arithmetic reasons.
     fn try_charge(&mut self, bytes: u64) -> bool {
         let available = self.available();
         if available >= self.cap() / 2.0 && available >= bytes as f64 {
@@ -1418,15 +1421,6 @@ async fn run_child(
                                 hedge_elapsed,
                                 completed_child,
                             );
-                            if completed_child {
-                                // The hedge finished the child outright (ruling
-                                // R3's "the last of the child" case above) — it
-                                // is a completed assignment exactly like the
-                                // unhedged success path below, so it feeds the
-                                // same p95 window and earns the same budget
-                                // refill.
-                                note_completion(&ledger, hedge_elapsed, stats.payload_bytes_read);
-                            }
                             let moved = primary_progress.load(Ordering::Relaxed);
                             // `moved` counts payload bytes inside the PRIMARY's
                             // request, which began at ROUND START; the hedged
@@ -1438,6 +1432,15 @@ async fn run_child(
                                 .saturating_sub(h.armed_at.saturating_add(h.split_rel))
                                 .min(h.charge.bytes);
                             settle_hedge_loser(&mut h, duplicated);
+                            if completed_child {
+                                // The hedge finished the child outright (ruling
+                                // R3's "the last of the child" case above) — it
+                                // is a completed assignment exactly like the
+                                // unhedged success path below, so it feeds the
+                                // same p95 window and repays debt the same way
+                                // (after the settlement, as on that path).
+                                note_completion(&ledger, hedge_elapsed, stats.payload_bytes_read);
+                            }
                             if !primary_gone {
                                 // Cancelling the primary IS dropping it; the
                                 // `continue` below ends its scope.
@@ -1466,7 +1469,19 @@ async fn run_child(
                                 &fault,
                                 h.started.elapsed(),
                             );
-                            let moved = fault.bytes().min(h.charge.bytes);
+                            // With the primary still running, it fetches the
+                            // hedge's bytes again: all of them were moved twice.
+                            // With the primary gone, nothing does — only what
+                            // the primary had already moved past the split was.
+                            let moved = if primary_gone {
+                                primary_progress
+                                    .load(Ordering::Relaxed)
+                                    .saturating_sub(h.armed_at.saturating_add(h.split_rel))
+                                    .min(fault.bytes())
+                            } else {
+                                fault.bytes()
+                            }
+                            .min(h.charge.bytes);
                             settle_hedge_loser(&mut h, moved);
                             if primary_gone {
                                 // Nothing is left running. Both failures are
@@ -1871,7 +1886,7 @@ async fn poll_slot(slot: Option<&mut BoxedTransfer>) -> TransferResult {
     }
 }
 
-/// A completed assignment: refill the budget and widen the p95 sample.
+/// A completed assignment: repay hedge debt and widen the p95 sample.
 fn note_completion(ledger: &Ledger, elapsed: Duration, bytes: u64) {
     let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
     l.completions.record(elapsed);
@@ -1881,9 +1896,10 @@ fn note_completion(ledger: &Ledger, elapsed: Duration, bytes: u64) {
 /// Settle a hedge that ran to an end: its charge stops being outstanding and
 /// the part of it the loser actually moved becomes debt.
 ///
-/// `duplicated` is how much of the CHARGED range the loser actually moved —
-/// the hedge's own progress when the primary won, or the primary's progress
-/// past the split point when the hedge won. A hedge that wins outright against
+/// `duplicated` is how much of the CHARGED range was moved twice — the hedge's
+/// own progress when the primary won or the hedge failed beside a live primary
+/// (the primary fetches those bytes again), or the primary's progress past the
+/// split point when the hedge won or failed after the primary was gone. A hedge that wins outright against
 /// a primary still below the split therefore costs nothing, which is the honest
 /// answer: nothing was fetched twice. A hedge that ends any other way is
 /// settled by its [`HedgeCharge`] with nothing duplicated.
@@ -2648,8 +2664,8 @@ mod tests {
     }
 
     /// A hedge is admitted at EXACTLY half the cap (ruling R1): `available`
-    /// lands there when one hedge of half the largest item is outstanding, and a
-    /// strict `>` refused every hedge there.
+    /// lands there when a hedge of a quarter of the largest item is outstanding
+    /// against a floor cap, and a strict `>` refused every hedge there.
     #[test]
     fn hedge_budget_admits_at_exactly_half_the_cap() {
         let mut b = budget_with(1, 2_000_000);
@@ -3109,17 +3125,24 @@ mod tests {
             assert_eq!(l.hedge_bytes, 0);
         }
 
-        // Settled with debt, then dropped: the drop settles nothing more.
-        assert!(ledger.lock().unwrap().budget.try_charge(500_000));
+        // Settled with debt, then dropped: the drop settles nothing more. A
+        // second charge stays outstanding beside it, so a drop that settled
+        // again would take that one's bytes and show here.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.budget.extend(1_000_000);
+            assert!(l.budget.try_charge(200_000));
+            assert!(l.budget.try_charge(200_000));
+        }
         let mut guard = HedgeCharge {
             ledger: Arc::clone(&ledger),
-            bytes: 500_000,
+            bytes: 200_000,
             settled: false,
         };
         guard.settle(123);
         drop(guard);
         let l = ledger.lock().unwrap();
-        assert_eq!(l.budget.outstanding, 0);
+        assert_eq!(l.budget.outstanding, 200_000, "the other charge is untouched");
         assert!(close(l.budget.debt, 123.0), "{}", l.budget.debt);
         assert_eq!(l.hedge_bytes, 123);
     }

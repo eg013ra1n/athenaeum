@@ -3938,15 +3938,17 @@ async fn live_hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
 }
 
 /// The same scenario with the production receive-stream limit (8) and eight
-/// items, all in flight from the start: 5 % of their 2 MiB could never pay for
-/// one hedge of a stranded item, the half-item floor does. (More items than
+/// items, all in flight from the start. When the trigger fires only the two or
+/// three stranded items are still in flight, and 5 % of those cannot pay for a
+/// hedge of one of them; the half-item floor does. (More items than
 /// streams would hand the collapsed peer NEW items, which have no size for
 /// ~16 s and so cannot be hedged — the stall ceiling's case, not the budget's.)
 #[tokio::test]
 async fn live_hedge_fires_with_the_default_stream_limit() {
     const ITEMS: usize = 8;
     let report = live_hedge_fires_scenario(ITEMS, 8).await;
-    // A storm would hedge every round of every item; two per item is generous.
+    // Not a byte bound (the budget bounds bytes, and these hedges duplicate
+    // nothing): a sanity bound against a re-arm loop on the same item.
     assert!(
         report.hedges as usize <= 2 * ITEMS,
         "a hedge storm: {report:?}"
