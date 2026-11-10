@@ -331,13 +331,13 @@ struct Pending {
     /// the sender's `sync-finished` `{new, duplicate}` outcome.
     new_count: u32,
     duplicate_count: u32,
-    /// Collab exchange (slice 4): the project id / HUB package uuid read from the
-    /// manifest's [`ProjectStamp`](crate::package::ProjectStamp) on the first
-    /// build. `Some` marks this as a PROJECT package — the announce goes out via
-    /// [`announce_project`](SharingTransport::announce_project) and the Offer/Want
-    /// dedup negotiation is skipped (full send). Both `None` for personal sync.
+    /// The project id read from the manifest's
+    /// [`ProjectStamp`](crate::package::ProjectStamp) on the first build, kept only
+    /// to tag this package's `sync-progress` / `sync-finished` events (the UI's
+    /// project-branch notification). The package itself is sent as an ordinary
+    /// personal-sync package; `None` for every package no stamp was ever written
+    /// into.
     project_id: Option<String>,
-    hub_package_id: Option<String>,
     /// Snapshot of the manifest records read on the first successful build,
     /// cached so a terminal-fail epilogue (`fail_package`) can still name every
     /// frame in the `failed` history outcome even when the package dir has since
@@ -1299,7 +1299,6 @@ impl Worker {
                 new_count: 0,
                 duplicate_count: 0,
                 project_id: None,
-                hub_package_id: None,
                 manifest_records: None,
                 last_attempt_class: None,
                 file_states: HashMap::new(),
@@ -1386,18 +1385,6 @@ impl Worker {
                 Negotiated::Send { announce, want } => (announce, want),
             },
         };
-
-        // Collab exchange (slice 4): read the project routing captured by
-        // `negotiate_and_build` (set on the first build, persisted across
-        // retries). `Some((project_id, hub_package_id))` ⇒ the announce goes out
-        // as a project advertisement; `None` ⇒ the personal-sync announce.
-        let project =
-            self.pending
-                .get(&id)
-                .and_then(|p| match (&p.project_id, &p.hub_package_id) {
-                    (Some(pid), Some(hub)) => Some((pid.clone(), hub.clone())),
-                    _ => None,
-                });
 
         // The personal-sync announce carries a batch name + file manifest; the
         // transport picks the wire version off `layout` below (v3 for Batch, v4
@@ -1515,25 +1502,17 @@ impl Worker {
                 .serve(&announce, &dir, want.as_ref(), import_progress)
                 .await
                 .context("serve package")?;
-            match &project {
-                Some((pid, hub)) => self
-                    .transport
-                    .announce_project(self.peer, pid, hub, &announce)
-                    .await
-                    .context("announce project package"),
-                None => self
-                    .transport
-                    .announce(
-                        self.peer,
-                        &announce,
-                        &batch_name,
-                        &batch_uuid,
-                        &announce_files,
-                        layout,
-                    )
-                    .await
-                    .context("announce package"),
-            }
+            self.transport
+                .announce(
+                    self.peer,
+                    &announce,
+                    &batch_name,
+                    &batch_uuid,
+                    &announce_files,
+                    layout,
+                )
+                .await
+                .context("announce package")
         }
         .await;
         if let Err(e) = serve_announce {
@@ -1711,29 +1690,18 @@ impl Worker {
             }
         }
 
-        // Collab exchange (slice 4): a manifest carrying a project stamp marks a
-        // PROJECT package. Record `(project_id, hub_package_id)` on the slot so
-        // the announce site routes through `announce_project`, and skip the
-        // Offer/Want dedup negotiation entirely (Д2/audit B2 — project packages
-        // always full-send). Persisted on the slot so retries keep the routing.
-        let stamp = records.iter().find_map(|r| r.project.clone());
-        if let Some(s) = &stamp {
+        // A manifest carrying a (retired) project stamp is still read, only to tag
+        // this package's events on the slot (see `Pending::project_id`); the
+        // package is sent and deduplicated like any personal-sync package.
+        if let Some(s) = records.iter().find_map(|r| r.project.as_ref()) {
             if let Some(p) = self.pending.get_mut(&id) {
                 p.project_id = Some(s.project_id.clone());
-                p.hub_package_id = Some(s.package_id.clone());
             }
         }
 
         // Build the offer (sampling hashes). ANY hashing error abandons the
-        // handshake for the whole package → full send (`want = None`). A project
-        // package skips the handshake entirely and full-sends.
-        let want: Option<HashSet<String>> = if stamp.is_some() {
-            tracing::debug!(
-                package_id = id,
-                "project package; skipping dedup negotiation (full send)"
-            );
-            None
-        } else {
+        // handshake for the whole package → full send (`want = None`).
+        let want: Option<HashSet<String>> = {
             match build_offer(dir, &records) {
                 Err(e) => {
                     tracing::debug!(package_id = id, error = %format!("{e:#}"), "dedup offer hashing failed; full send");

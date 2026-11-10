@@ -3541,8 +3541,8 @@ async fn handle_revoke(
 
 /// One started-transport bundle held by [`SyncRuntime`]. `transport` is the
 /// live receive-side transport — read back by [`SyncRuntime::transport`] so the
-/// collab download loop can issue an outbound `request_project` over the SAME
-/// endpoint the receiver listens on. `inbound_control` is the cancel signal the
+/// blob-tag sweeps can reach the SAME endpoint the receiver listens on.
+/// `inbound_control` is the cancel signal the
 /// running receiver loop watches (Task 12), handed back by
 /// [`SyncRuntime::inbound_control`] to the command layer. `_receiver` is a
 /// lifetime anchor — kept so the endpoint's event loop lives for the runtime's
@@ -3615,9 +3615,8 @@ impl SyncRuntime {
         self.inner.lock().await.as_ref().map(|s| s.ticket.clone())
     }
 
-    /// The live receive-side transport, if started — the collab download loop
-    /// issues `request_project` over it (the receiver listens on the same
-    /// endpoint, and `request_project` is an outbound send that never touches the
+    /// The live receive-side transport, if started — the blob-tag sweeps use it
+    /// (the receiver listens on the same endpoint; reaching it never touches the
     /// receiver's single-consumer event stream).
     pub async fn transport(&self) -> Option<Arc<dyn SharingTransport>> {
         self.inner
@@ -4115,11 +4114,11 @@ mod tests {
             frame_count: 1,
         };
         sender
-            .announce_project(receiver_node, "proj-1", "hub-pkg-1", &announce)
+            .inject_project_announce(receiver_node, "proj-1", "hub-pkg-1", &announce)
             .await
             .expect("deliver a project announce");
         sender
-            .request_project(receiver_node, "proj-1", "hub-pkg-1")
+            .inject_project_request(receiver_node, "proj-1", "hub-pkg-1")
             .await
             .expect("deliver a project request");
 

@@ -2,9 +2,9 @@
 //!
 //! [`SharedIrohNode`] owns **one** iroh [`Endpoint`], **one** [`Router`] with
 //! every ALPN mounted once, and **one** personal [`FsStore`] — and hands out
-//! per-role [`SharingTransport`] handles ([`Role::Recv`]/[`Role::Out`]/
-//! [`Role::Collab`]). A second, optional store — the collab store under the
-//! Collaboration root — is swapped in a slot behind the collab-blobs ALPN
+//! per-role [`SharingTransport`] handles ([`Role::Recv`]/[`Role::Out`]). A
+//! second, optional store — the collab store under the Collaboration root — is
+//! swapped in a slot behind the collab-blobs ALPN
 //! ([`set_collab_root`](SharedIrohNode::set_collab_root)); the router never
 //! changes.
 //! Before this, production bound up to three endpoints from the SAME device key
@@ -181,17 +181,15 @@ impl RelayHealth {
 }
 
 /// Which multiplexed role a [`SharedIrohNode`] handle plays. The variant selects
-/// the blob-tag prefix (Д3) — `recv/pkg/…`, `out/pkg/…`, `collab/pkg/…` — so the
-/// three roles coexist on the node's single [`FsStore`] without clobbering each
-/// other's tags, and each role's startup sweep is scoped to its own prefix.
+/// the blob-tag prefix (Д3) — `recv/pkg/…`, `out/pkg/…` — so the roles coexist
+/// on the node's single [`FsStore`] without clobbering each other's tags, and
+/// each role's startup sweep is scoped to its own prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// The personal-sync / collab receiver (inbound announces, blob pulls).
+    /// The personal-sync receiver (inbound announces, blob pulls).
     Recv,
     /// The personal-sync sender (outbound package announces + serves).
     Out,
-    /// The collaboration exchange sender (project announces + serves).
-    Collab,
 }
 
 impl Role {
@@ -200,7 +198,6 @@ impl Role {
         match self {
             Role::Recv => "recv",
             Role::Out => "out",
-            Role::Collab => "collab",
         }
     }
 }
@@ -2527,63 +2524,6 @@ impl SharedIrohNode {
         Ok(())
     }
 
-    async fn role_announce_project(
-        &self,
-        role: Role,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-        a: &PackageAnnounce,
-    ) -> Result<()> {
-        let tag = role_package_tag(role.prefix(), &a.package_id);
-        let mut wire = a.clone();
-        {
-            let served = self.served.lock().expect("served mutex poisoned");
-            match served.get(&tag) {
-                Some(entry) => wire.root_hash = entry.hash.to_string(),
-                None => tracing::warn!(
-                    package_id = %a.package_id.0,
-                    "project announce without a served collection; forwarding placeholder root_hash"
-                ),
-            }
-        }
-        self.send_control(
-            to,
-            Msg::ProjectAnnounce {
-                project_id: project_id.to_string(),
-                package_id: package_id.to_string(),
-                announce: wire,
-            },
-        )
-        .await?;
-        tracing::debug!(
-            to = %hex32(&to),
-            project_id,
-            package_id,
-            wire_package_id = %a.package_id.0,
-            "iroh project announce sent"
-        );
-        Ok(())
-    }
-
-    async fn role_request_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-    ) -> Result<()> {
-        self.send_control(
-            to,
-            Msg::ProjectRequest {
-                project_id: project_id.to_string(),
-                package_id: package_id.to_string(),
-            },
-        )
-        .await?;
-        tracing::debug!(to = %hex32(&to), project_id, package_id, "iroh project request sent");
-        Ok(())
-    }
-
     async fn role_fetch(
         &self,
         role: Role,
@@ -3647,33 +3587,6 @@ impl SharingTransport for RoleHandle {
     ) -> Result<HashSet<String>> {
         self.node
             .negotiate_want_inner(to, package_id, offer, full_by_rel)
-            .await
-    }
-
-    async fn announce_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-        announce: &PackageAnnounce,
-    ) -> Result<()> {
-        // The wire announce's package_id is the ack-correlation id — claim on it.
-        self.claim_ack(to, &announce.package_id);
-        let res = self
-            .node
-            .role_announce_project(self.role, to, project_id, package_id, announce)
-            .await;
-        if res.is_err() {
-            self.node
-                .demux
-                .release_claim(&(to, announce.package_id.clone()));
-        }
-        res
-    }
-
-    async fn request_project(&self, to: NodeId, project_id: &str, package_id: &str) -> Result<()> {
-        self.node
-            .role_request_project(to, project_id, package_id)
             .await
     }
 
