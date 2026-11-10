@@ -363,12 +363,6 @@ pub struct OutboundRow {
     /// path fills it. The raw UUIDs appear only in the Details tab.
     #[serde(default)]
     pub display_name: Option<String>,
-    /// Collab forward-compat key (Transfers Batch Model, §D6): the `project_id`
-    /// this transfer moves for, distinguishing a collab-swarm transfer from a
-    /// personal one and giving the future planner its key. `None` for a personal
-    /// sync; the collab send path (a later wave) fills it.
-    #[serde(default)]
-    pub project_id: Option<String>,
     /// User-facing transfer generation counter (Transfers Batch Model §D5): the
     /// "attempt N" the UI shows. Starts at `1` at enqueue and is bumped ONLY by
     /// [`reset_outbound_for_resend`](super::store::reset_outbound_for_resend) (a

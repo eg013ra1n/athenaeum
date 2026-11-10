@@ -6007,7 +6007,6 @@ mod tests {
             next_retry_at: None,
             wire_package_id: None,
             display_name: None,
-            project_id: None,
             generation: 1,
             layout: athenaeum_core::sharing::types::PackageLayout::Batch,
         }
@@ -7046,7 +7045,6 @@ mod tests {
             next_retry_at: None,
             wire_package_id: None,
             display_name: None,
-            project_id: None,
             generation: 1,
             layout: athenaeum_core::sharing::types::PackageLayout::Batch,
         }

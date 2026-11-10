@@ -125,11 +125,6 @@ pub struct SyncProgressEvent {
     /// destination peer for a send tick.
     pub peer_device: String,
     pub frame_count: u32,
-    /// Collab exchange (slice 4): the project id when this package is a project
-    /// exchange, else `None` for personal sync. Additive — the Transfers UI reads
-    /// it in Task 11 to route project transfers to the project view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
     /// Cumulative fetched bytes at this tick (Task 11). Present only on the
     /// `fetching`-stage ticks driven by the transport's batch progress; `None` on
     /// the coarse stage ticks (`received`/`ingesting`/sender stages) that carry no
@@ -182,11 +177,6 @@ pub struct SyncFinishedEvent {
     /// frame in [`ok_count`](Self::ok_count) / its receipts, not this split.
     pub new_count: u32,
     pub duplicate_count: u32,
-    /// Collab exchange (slice 4): the project id when this package is a project
-    /// exchange, else `None` for personal sync. Additive — Task 11 wires it to
-    /// the project-transfer UI/notification.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
 }
 
 /// Shipped cap on simultaneous incoming transfers (W2). Two, not more: the
@@ -1786,7 +1776,6 @@ fn build_fetch_sink(
                     stage: "fetching".to_string(),
                     peer_device: peer_device.clone(),
                     frame_count,
-                    project_id: None,
                     bytes_done: Some(bytes_done),
                     bytes_total: Some(bytes_total),
                 },
@@ -1902,7 +1891,6 @@ fn terminalize_inbound_failed(
             failed: Vec::new(),
             new_count: 0,
             duplicate_count: 0,
-            project_id: None,
         },
     );
 }
@@ -2096,7 +2084,6 @@ async fn handle_announce(
                 failed: Vec::new(),
                 new_count: 0,
                 duplicate_count: 0,
-                project_id: None,
             },
         );
         return Ok(());
@@ -2247,7 +2234,6 @@ async fn handle_announce(
             stage: "received".to_string(),
             peer_device: peer_device.clone(),
             frame_count: announce.frame_count,
-            project_id: None,
             bytes_done: None,
             bytes_total: None,
         },
@@ -2486,7 +2472,6 @@ async fn handle_announce(
             stage: "fetching".to_string(),
             peer_device: peer_device.clone(),
             frame_count: announce.frame_count,
-            project_id: None,
             bytes_done: None,
             bytes_total: None,
         },
@@ -2651,7 +2636,6 @@ async fn handle_announce(
             stage: "ingesting".to_string(),
             peer_device: peer_device.clone(),
             frame_count: announce.frame_count,
-            project_id: None,
             bytes_done: None,
             bytes_total: None,
         },
@@ -2816,7 +2800,6 @@ async fn handle_announce(
             failed,
             new_count: 0,
             duplicate_count: 0,
-            project_id: None,
         },
     );
     Ok(())
@@ -3030,7 +3013,6 @@ async fn replay_ack_from_log(
             failed: Vec::new(),
             new_count: 0,
             duplicate_count: 0,
-            project_id: None,
         },
     );
     Ok(())
@@ -3241,7 +3223,6 @@ async fn cancel_epilogue(
             failed: Vec::new(),
             new_count: 0,
             duplicate_count: 0,
-            project_id: None,
         },
     );
     Ok(())
@@ -3532,7 +3513,6 @@ async fn handle_revoke(
             failed: Vec::new(),
             new_count: 0,
             duplicate_count: 0,
-            project_id: None,
         },
     );
 }
