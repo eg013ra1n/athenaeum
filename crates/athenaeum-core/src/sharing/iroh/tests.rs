@@ -3921,21 +3921,40 @@ async fn live_report_matches_provider_send_counters() {
 }
 
 /// The hedge swarm: forty 256 KiB items on three providers. A live run's hedge
-/// budget is never smaller than one hedge of the largest item in flight, so the
-/// stranded tail can afford a hedge however few items are left.
+/// cap is never smaller than one hedge of the largest item in flight, so an
+/// idle budget pays for the hedge of a stranded item however few items are left.
 const LIVE_HEDGE_ITEMS: usize = 40;
 const LIVE_HEDGE_SIZE: usize = 256 * 1024;
 
 /// A provider that goes slow MID-TRANSFER triggers a hedge well before the stall
 /// ceiling, and the run finishes on the healthy peers. Every provider is paced
-/// the same, then one collapses to 1 KB/s: fast history, slow now.
+/// the same, then one collapses to 1 KB/s: fast history, slow now. This pins the
+/// trigger and the cap floor (an idle budget pays for one hedge), not a byte
+/// bound: the hedge goes to a healthy peer and the collapsed primary moves ~0
+/// bytes past the split, so nothing is duplicated.
 #[tokio::test]
 async fn live_hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
-    live_hedge_fires_scenario().await;
+    live_hedge_fires_scenario(LIVE_HEDGE_ITEMS, LIVE_HEDGE_ITEMS).await;
 }
 
-async fn live_hedge_fires_scenario() {
-    let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
+/// The same scenario with the production receive-stream limit (8) and eight
+/// items, all in flight from the start: 5 % of their 2 MiB could never pay for
+/// one hedge of a stranded item, the half-item floor does. (More items than
+/// streams would hand the collapsed peer NEW items, which have no size for
+/// ~16 s and so cannot be hedged — the stall ceiling's case, not the budget's.)
+#[tokio::test]
+async fn live_hedge_fires_with_the_default_stream_limit() {
+    const ITEMS: usize = 8;
+    let report = live_hedge_fires_scenario(ITEMS, 8).await;
+    // A storm would hedge every round of every item; two per item is generous.
+    assert!(
+        report.hedges as usize <= 2 * ITEMS,
+        "a hedge storm: {report:?}"
+    );
+}
+
+async fn live_hedge_fires_scenario(items: usize, max_in_flight: usize) -> AssignmentReport {
+    let swarm = live_swarm(3, items, LIVE_HEDGE_SIZE).await;
     for n in &swarm.nodes {
         n.set_upload_limit(400_000);
     }
@@ -3953,18 +3972,13 @@ async fn live_hedge_fires_scenario() {
         swarm.dialer(),
         swarm.items(),
         // The 60 s ceiling is long enough that it cannot be what rescues the run.
-        live_run_opts(
-            Duration::from_secs(60),
-            true,
-            LIVE_HEDGE_ITEMS,
-            telemetry,
-        ),
+        live_run_opts(Duration::from_secs(60), true, max_in_flight, telemetry),
         Duration::from_secs(120),
     )
     .await;
     let elapsed = started.elapsed();
     collapse.await.ok();
-    out.assert_all_done(LIVE_HEDGE_ITEMS);
+    out.assert_all_done(items);
     swarm.assert_landed().await;
     assert!(
         elapsed < Duration::from_secs(45),
@@ -3982,12 +3996,14 @@ async fn live_hedge_fires_scenario() {
         out.report
     );
     swarm.shutdown().await;
+    out.report
 }
 
 /// The loser is REALLY cancelled: the slow provider's own socket send counter
-/// stays under four items' worth though it was handed many more, and hedging
-/// does not double the payload. At 5 KB/s a 256 KiB item needs ~52 s, so the
-/// peer never completes one and never measures itself into hedge immunity.
+/// stays under four items' worth though it was handed many more. The byte bound
+/// on `hedge_bytes` is only a gross sanity check (the loser is the slow peer
+/// and moves ~0 bytes past the split). At 5 KB/s a 256 KiB item needs ~52 s, so
+/// the peer never completes one and never measures itself into hedge immunity.
 #[tokio::test]
 async fn live_hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
     live_hedge_cancels_scenario().await;
@@ -4047,9 +4063,12 @@ async fn live_hedge_cancels_scenario() {
     swarm.shutdown().await;
 }
 
-/// The bucket keeps a storm bounded: a peer that strands many items at once does
-/// NOT duplicate whole ranges. The byte
-/// bound end to end is also what pins the refund rule.
+/// Many items stranded on a peer at once: hedging engages, every item lands
+/// and is credited once, and `hedge_bytes` stays under twice the run's 5 %.
+/// This is a gross end-to-end bound, not a pin of the budget's rule — the
+/// hedges go to healthy peers and the collapsed primary moves ~0 bytes past the
+/// split, so little is duplicated whatever the budget; the rule itself is
+/// pinned by the `HedgeBudget` unit tests in `assign.rs`.
 #[tokio::test]
 async fn live_hedge_budget_stops_a_storm() {
     let swarm = live_swarm(3, LIVE_HEDGE_ITEMS, LIVE_HEDGE_SIZE).await;
@@ -4096,7 +4115,7 @@ async fn live_hedge_budget_stops_a_storm() {
     assert!(
         out.report.hedge_bytes <= 2 * cap,
         "hedging must stay inside its byte budget — it duplicated {} B against a {cap} B cap \
-         (2x allowed for refills) over {} hedges: {:?}",
+         (2x allowed) over {} hedges: {:?}",
         out.report.hedge_bytes,
         out.report.hedges,
         out.report

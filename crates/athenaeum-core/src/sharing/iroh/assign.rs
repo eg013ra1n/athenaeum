@@ -40,7 +40,10 @@
 //! still-missing range, split at the midpoint ([`split_missing_at_midpoint`]).
 //! A hedge is paid from the [`HedgeBudget`], whose cap follows the items in
 //! flight: the larger of [`HEDGE_BUDGET_RATIO`] of their bytes and half the
-//! largest one, so a run can always afford one hedge of its largest item.
+//! largest one. A hedge's charge stays outstanding until it settles and what it
+//! duplicated is owed back at 5 % of completed bytes, so a budget with nothing
+//! outstanding and no debt pays for one hedge of the largest item, and no more
+//! than the cap is ever spent on top of the 5 % that completed bytes repay.
 //! Whichever side finishes first wins the round and the loser is cancelled (see
 //! Cancellation below). A primary that fails while its hedge is still live does
 //! not cancel the hedge: it is a real transfer, so it is promoted and carries
@@ -197,7 +200,7 @@ pub(crate) struct AssignmentReport {
     /// Hedges ARMED during the run.
     pub hedges: u32,
     /// DUPLICATE bytes hedging actually cost: the part of each hedge's charge
-    /// that was not refunded, i.e. bytes some peer sent that another peer had
+    /// that became debt, i.e. bytes some peer sent that another peer had
     /// already sent. This is the quantity [`HEDGE_BUDGET_RATIO`] is a budget
     /// FOR, and it is deliberately not "bytes a hedge delivered" — a hedge that
     /// wins delivers the half its primary never would have and duplicates
@@ -253,61 +256,48 @@ impl CompletionWindow {
     }
 }
 
-/// The gRPC-shaped token bucket that keeps hedging from turning a degraded
-/// network into a byte storm (D4 §4.5).
+/// What keeps hedging from turning a degraded network into a byte storm
+/// (D4 §4.5): a cap that follows the items in flight, the charges of the hedges
+/// in flight, and the duplicated bytes not yet repaid.
 ///
-/// **It starts FULL.** The design says what the bucket EARNS
-/// ([`HEDGE_BUDGET_RATIO`] × the bytes of every completed item) and what it is
-/// capped at, but not where it starts; a bucket that starts empty can never pay
-/// for the very first hedge, which is the one that matters on a run whose
-/// first assignment lands on a useless peer. Starting full is also what a token
-/// bucket means everywhere else, and the cap still bounds the total spend.
-///
-/// **A live run's cap** follows the items IN FLIGHT: the larger of
-/// [`HEDGE_BUDGET_RATIO`] × their bytes and half of the largest one — the cost
-/// of one hedge of it — and `0` when nothing is in flight. Tokens only come back
-/// as a refund of bytes that were never duplicated or as a share of completed
-/// bytes, so the duplicate bytes outstanding stay bounded by the cap, at most
-/// half the largest item. A full bucket can always pay for one hedge, so the
-/// stranded tail of a run is hedged one item at a time instead of waiting out
-/// the stall ceiling.
+/// The cap is the larger of [`HEDGE_BUDGET_RATIO`] × the bytes in flight and
+/// half of the largest item in flight — one hedge of it — and `0` when nothing
+/// is. A hedge's charge stays `outstanding` until it settles, and what it
+/// duplicated becomes `debt`, repaid at [`HEDGE_BUDGET_RATIO`] of every completed
+/// byte. Only `available = cap - outstanding - debt` is ever spent, and neither
+/// the cap rising nor falling adds to it. So: at every admission
+/// `outstanding + debt <= cap`; with nothing outstanding and no debt one hedge
+/// of the largest item is always payable; over a run the duplicated bytes stay
+/// within 5 % of the completed bytes plus one cap; hedges that duplicate
+/// nothing cost nothing. The floor uses an item's ANNOUNCED size and a charge
+/// the real one, so an item announced smaller than it is (or `0`, unknown) may
+/// not be hedgeable.
 #[derive(Debug)]
 pub(crate) struct HedgeBudget {
-    tokens: f64,
-    cap: f64,
     /// The sizes of the items in flight, with how many of each (a multiset:
     /// equal sizes retire one at a time).
     in_flight: BTreeMap<u64, usize>,
     /// The sum of `in_flight`, counting every item.
     in_flight_bytes: u64,
+    /// The sum of the charges of the hedges admitted and not yet settled.
+    outstanding: u64,
+    /// Duplicated bytes not yet repaid by completed ones.
+    debt: f64,
 }
 
 impl HedgeBudget {
     /// An empty live budget: no item in flight, so no cap.
     fn live() -> Self {
         Self {
-            tokens: 0.0,
-            cap: 0.0,
             in_flight: BTreeMap::new(),
             in_flight_bytes: 0,
+            outstanding: 0,
+            debt: 0.0,
         }
     }
 
-    /// A budget with a fixed cap of [`HEDGE_BUDGET_RATIO`] × `total_bytes`, for
-    /// the arithmetic tests; `extend`/`retire` replace the fixed cap with the
-    /// live one.
-    #[cfg(test)]
-    fn new(total_bytes: u64) -> Self {
-        let cap = HEDGE_BUDGET_RATIO * total_bytes as f64;
-        Self {
-            tokens: cap,
-            cap,
-            ..Self::live()
-        }
-    }
-
-    /// The cap the items in flight call for.
-    fn live_cap(&self) -> f64 {
+    /// What the items in flight call for.
+    fn cap(&self) -> f64 {
         match self.in_flight.keys().next_back() {
             None => 0.0,
             Some(&largest) => {
@@ -316,18 +306,19 @@ impl HedgeBudget {
         }
     }
 
-    /// A live run's item joins the run: the cap grows to what the items in
-    /// flight call for, and the tokens grow by the same amount.
+    /// What a hedge may still be charged: the cap less the charges outstanding
+    /// and the debt, never below zero.
+    fn available(&self) -> f64 {
+        (self.cap() - self.outstanding as f64 - self.debt).max(0.0)
+    }
+
+    /// A live run's item joins the run.
     fn extend(&mut self, bytes: u64) {
         *self.in_flight.entry(bytes).or_insert(0) += 1;
         self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes);
-        let cap = self.live_cap();
-        self.tokens += (cap - self.cap).max(0.0);
-        self.cap = cap;
     }
 
-    /// A live run's item has ended: the cap falls to what the items still in
-    /// flight call for, and the tokens follow it down.
+    /// A live run's item has ended.
     fn retire(&mut self, bytes: u64) {
         match self.in_flight.get_mut(&bytes) {
             Some(n) if *n > 1 => *n -= 1,
@@ -341,38 +332,48 @@ impl HedgeBudget {
             }
         }
         self.in_flight_bytes = self.in_flight_bytes.saturating_sub(bytes);
-        self.cap = self.live_cap();
-        self.tokens = self.tokens.min(self.cap);
     }
 
-    /// A completed child refills the bucket, never past the cap.
+    /// Completed bytes repay duplicated ones at [`HEDGE_BUDGET_RATIO`].
     fn earn(&mut self, bytes: u64) {
-        self.tokens = (self.tokens + HEDGE_BUDGET_RATIO * bytes as f64).min(self.cap);
+        self.debt = (self.debt - HEDGE_BUDGET_RATIO * bytes as f64).max(0.0);
     }
 
-    /// D4 §4.5: hedge only while the bucket is at least half full AND can pay
-    /// for this hedge's whole range. The half rule is the storm brake — it
-    /// stops hedging long before the budget is actually exhausted, so a
-    /// degraded run cannot ride the bucket to zero one hedge at a time.
+    /// D4 §4.5: hedge only while at least half the cap is available AND this
+    /// hedge's whole range fits. The half rule is the storm brake — it stops
+    /// hedging long before the budget is actually exhausted, so a degraded run
+    /// cannot ride it to zero one hedge at a time.
     ///
-    /// The comparison is `>=`, not `>`, and that is load-bearing rather than
-    /// cosmetic: tokens land on EXACTLY `cap / 2` in an ordinary case — two
-    /// providers splitting the items evenly, where completed bytes are half
-    /// the run's bytes and the cap is 5 % of them — and a strict `>` refused every
-    /// hedge there for pure arithmetic reasons. Controller ruling R1.
+    /// The comparison is `>=`, not `>`: `available` lands on EXACTLY `cap / 2`
+    /// in an ordinary case (one hedge of the largest item outstanding against a
+    /// floor cap, a debt that repaid to the half), and a strict `>` refused
+    /// every hedge there for arithmetic reasons.
     fn try_charge(&mut self, bytes: u64) -> bool {
-        let want = bytes as f64;
-        if self.tokens >= self.cap / 2.0 && self.tokens >= want {
-            self.tokens -= want;
+        let available = self.available();
+        if available >= self.cap() / 2.0 && available >= bytes as f64 {
+            self.outstanding = self.outstanding.saturating_add(bytes);
             true
         } else {
             false
         }
     }
 
-    /// Give back the part of a charge that never became a duplicate byte.
-    fn refund(&mut self, bytes: u64) {
-        self.tokens = (self.tokens + bytes as f64).min(self.cap);
+    /// A hedge ends: its charge stops being outstanding and what it duplicated
+    /// becomes debt. Settling a charge that is not outstanding is a bug, not a
+    /// refill.
+    fn settle(&mut self, charge: u64, duplicated: u64) {
+        if charge > self.outstanding {
+            debug_assert!(false, "a hedge was settled twice");
+            tracing::error!(
+                charge,
+                outstanding = self.outstanding,
+                "hedge budget settled a charge it never took"
+            );
+            self.outstanding = 0;
+        } else {
+            self.outstanding -= charge;
+        }
+        self.debt += duplicated.min(charge) as f64;
     }
 }
 
@@ -1340,17 +1341,17 @@ async fn run_child(
             };
             match step {
                 Step::Primary(Ok(stats)) => {
-                    if let Some(h) = hedge.take() {
+                    if let Some(mut h) = hedge.take() {
                         // The primary finished the WHOLE missing range, so every
                         // byte the hedge moved was fetched twice. Its own
                         // progress is already request-relative to the hedged
                         // range, so it needs no offsetting.
-                        let duplicated = h.progress.load(Ordering::Relaxed).min(h.charge);
-                        settle_hedge_loser(&ledger, &h, duplicated);
+                        let duplicated = h.progress.load(Ordering::Relaxed).min(h.charge.bytes);
+                        settle_hedge_loser(&mut h, duplicated);
                         tracing::debug!(
                             child = index,
                             loser = %h.provider.fmt_short(),
-                            refunded_bytes = h.charge - duplicated,
+                            refunded_bytes = h.charge.bytes - duplicated,
                             "swarm hedge loser cancelled"
                         );
                     }
@@ -1383,7 +1384,7 @@ async fn run_child(
                     primary = Box::pin(std::future::pending());
                 }
                 Step::Hedge(r) => {
-                    let h = hedge.take().expect("the hedge branch only runs when armed");
+                    let mut h = hedge.take().expect("the hedge branch only runs when armed");
                     match r {
                         Ok(stats) => {
                             // Sampled before the completeness query below, so
@@ -1435,8 +1436,8 @@ async fn run_child(
                             // fetched twice.
                             let duplicated = moved
                                 .saturating_sub(h.armed_at.saturating_add(h.split_rel))
-                                .min(h.charge);
-                            settle_hedge_loser(&ledger, &h, duplicated);
+                                .min(h.charge.bytes);
+                            settle_hedge_loser(&mut h, duplicated);
                             if !primary_gone {
                                 // Cancelling the primary IS dropping it; the
                                 // `continue` below ends its scope.
@@ -1444,7 +1445,7 @@ async fn run_child(
                                 tracing::debug!(
                                     child = index,
                                     loser = %provider.fmt_short(),
-                                    refunded_bytes = h.charge - duplicated,
+                                    refunded_bytes = h.charge.bytes - duplicated,
                                     "swarm hedge loser cancelled"
                                 );
                             }
@@ -1465,7 +1466,8 @@ async fn run_child(
                                 &fault,
                                 h.started.elapsed(),
                             );
-                            settle_hedge_loser(&ledger, &h, fault.bytes().min(h.charge));
+                            let moved = fault.bytes().min(h.charge.bytes);
+                            settle_hedge_loser(&mut h, moved);
                             if primary_gone {
                                 // Nothing is left running. Both failures are
                                 // already recorded against their OWN providers,
@@ -1776,9 +1778,9 @@ struct HedgeRun {
     provider: EndpointId,
     fut: BoxedTransfer,
     progress: Arc<AtomicU64>,
-    /// Bytes charged to the budget when this hedge was armed — the size of the
-    /// back range it asked for.
-    charge: u64,
+    /// The bytes charged to the budget when this hedge was armed — the size of
+    /// the back range it asked for — and the duty to settle them.
+    charge: HedgeCharge,
     /// How many bytes of the primary's OWN request come before the hedged
     /// range, so its progress counter can be turned into "how much of the
     /// charged range did it duplicate". Request-relative, never a blob offset
@@ -1803,6 +1805,46 @@ struct HedgeRun {
     /// Keeps the hedge provider's assignment slot claimed for as long as the
     /// hedge runs; released structurally when this struct drops.
     _claim: InflightGuard,
+}
+
+/// A hedge's charge, settled exactly once: by [`HedgeCharge::settle`] when the
+/// hedge ends in a race, or by `Drop` with nothing duplicated when it is dropped
+/// unsettled (its item was cancelled, the run was cut, the future was dropped).
+///
+/// The ledger mutex is only ever taken for a moment and no future is dropped
+/// while it is held, so `Drop` cannot run under the lock it takes.
+struct HedgeCharge {
+    ledger: Ledger,
+    bytes: u64,
+    settled: bool,
+}
+
+impl HedgeCharge {
+    /// Settle with `duplicated` bytes of the range moved twice (at most the
+    /// charge); a second call does nothing.
+    fn settle(&mut self, duplicated: u64) {
+        if std::mem::replace(&mut self.settled, true) {
+            debug_assert!(false, "a hedge charge was settled twice");
+            tracing::error!(bytes = self.bytes, "hedge charge settled twice");
+            return;
+        }
+        let duplicated = duplicated.min(self.bytes);
+        let mut l = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        l.budget.settle(self.bytes, duplicated);
+        // What was moved twice is what hedging actually cost.
+        l.hedge_bytes = l.hedge_bytes.saturating_add(duplicated);
+    }
+}
+
+impl Drop for HedgeCharge {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            // Poisoning is tolerated: this may run while a panic unwinds.
+            let mut l = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            l.budget.settle(self.bytes, 0);
+        }
+    }
 }
 
 type BoxedTransfer =
@@ -1836,21 +1878,17 @@ fn note_completion(ledger: &Ledger, elapsed: Duration, bytes: u64) {
     l.budget.earn(bytes);
 }
 
-/// Settle a hedge: give back the part of its charge that never became a
-/// duplicate byte.
+/// Settle a hedge that ran to an end: its charge stops being outstanding and
+/// the part of it the loser actually moved becomes debt.
 ///
 /// `duplicated` is how much of the CHARGED range the loser actually moved —
 /// the hedge's own progress when the primary won, or the primary's progress
 /// past the split point when the hedge won. A hedge that wins outright against
 /// a primary still below the split therefore costs nothing, which is the honest
-/// answer: nothing was fetched twice.
-fn settle_hedge_loser(ledger: &Ledger, hedge: &HedgeRun, duplicated: u64) {
-    let duplicated = duplicated.min(hedge.charge);
-    let refund = hedge.charge - duplicated;
-    let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
-    l.budget.refund(refund);
-    // What the bucket did NOT get back is what hedging actually cost.
-    l.hedge_bytes = l.hedge_bytes.saturating_add(duplicated);
+/// answer: nothing was fetched twice. A hedge that ends any other way is
+/// settled by its [`HedgeCharge`] with nothing duplicated.
+fn settle_hedge_loser(hedge: &mut HedgeRun, duplicated: u64) {
+    hedge.charge.settle(duplicated);
 }
 
 /// Decide whether to hedge this assignment, and start one if so.
@@ -1910,8 +1948,9 @@ async fn try_arm_hedge(
     // own standard. A 50 KB/s peer with 256 KiB left gets a 10.5 s deadline. An
     // instrumented run of 21 children showed 388 refusals on this branch
     // against 6 hedges armed. That is D4 §4.5 as written, not a defect: hedging
-    // is for the TAIL, and a uniformly slow peer is the stall ceiling's and
-    // A4's ranking problem, not the hedge's.
+    // is for the TAIL. A uniformly slow peer that keeps moving is never cut by
+    // the stall ceiling (it fires only on no progress at all), so its item
+    // simply crawls at that peer's rate: that is A4's ranking problem.
     let goodput = ewma_goodput(states, primary)?;
     let expected = Duration::from_secs_f64((missing_bytes as f64 / goodput.max(1.0)).min(86_400.0));
     let p95 = ledger
@@ -1955,6 +1994,13 @@ async fn try_arm_hedge(
     {
         return None;
     }
+    // From here the charge is outstanding, and this guard owes its settlement
+    // however the hedge ends.
+    let charge_guard = HedgeCharge {
+        ledger: Arc::clone(ledger),
+        bytes: charge,
+        settled: false,
+    };
 
     let hedge_provider = claim.provider();
     let progress = Arc::new(AtomicU64::new(0));
@@ -1993,7 +2039,7 @@ async fn try_arm_hedge(
         provider: hedge_provider,
         fut,
         progress,
-        charge,
+        charge: charge_guard,
         split_rel: split.split_rel,
         armed_at,
         started: Instant::now(),
@@ -2533,62 +2579,27 @@ mod tests {
         assert_eq!(g[&a].stats.children, 1);
     }
 
-    /// The bucket starts FULL, refuses below half, refuses a charge it cannot
-    /// cover, refunds, and never earns past the cap.
-    #[test]
-    fn hedge_budget_starts_full_refuses_below_half_and_refunds() {
-        // 1 MiB collection ⇒ cap = 52 428.8 tokens (5 %).
-        let total = 1024 * 1024u64;
-        let cap = HEDGE_BUDGET_RATIO * total as f64;
-        let mut b = HedgeBudget::new(total);
-        assert_eq!(b.tokens, cap, "a token bucket starts full");
-
-        // A charge just under half the cap leaves it above half ⇒ admitted.
-        assert!(
-            b.try_charge((cap * 0.4) as u64),
-            "the first hedge is payable"
-        );
-        assert!(b.tokens > cap / 2.0);
-
-        // The next one would take it below half — the half rule is checked
-        // BEFORE the charge, so this is admitted and lands under half...
-        assert!(b.try_charge((cap * 0.4) as u64));
-        assert!(b.tokens < cap / 2.0);
-        // ...and now nothing more is admitted, however small.
-        assert!(
-            !b.try_charge(1),
-            "below half the cap the bucket refuses even a one-byte hedge — that \
-             is the storm brake, not the exhaustion check"
-        );
-
-        // A refund puts it back over half and reopens hedging.
-        b.refund((cap * 0.4) as u64);
-        assert!(b.tokens > cap / 2.0);
-        assert!(b.try_charge(1), "a refund reopens the gate");
-
-        // Earning never exceeds the cap.
-        b.earn(u64::MAX / 2);
-        assert_eq!(b.tokens, cap, "the bucket cannot earn past its cap");
-
-        // And a charge bigger than the whole bucket is refused outright.
-        assert!(
-            !b.try_charge((cap * 2.0) as u64),
-            "a hedge the budget cannot cover is refused even with a full bucket"
-        );
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
     }
 
-    /// A package too small for its own hedge can never hedge: the cap is a
-    /// fraction of the COLLECTION, so one child's half-range can exceed it.
-    #[test]
-    fn hedge_budget_refuses_when_one_hedge_exceeds_the_whole_cap() {
-        // 6 children of 512 KiB ⇒ cap = 157 286; half a child = 262 144.
-        let total = 6 * 512 * 1024u64;
-        let mut b = HedgeBudget::new(total);
-        assert!(
-            !b.try_charge(256 * 1024),
-            "half a 512 KiB child is 262 144 bytes against a 157 286 cap — no \
-             hedge on this package is ever affordable"
-        );
+    /// A live budget with `n` items of `size` bytes in flight.
+    fn budget_with(n: usize, size: u64) -> HedgeBudget {
+        let mut b = HedgeBudget::live();
+        for _ in 0..n {
+            b.extend(size);
+        }
+        b
+    }
+
+    /// A ledger around `budget`, for the charge guard.
+    fn ledger_of(budget: HedgeBudget) -> Ledger {
+        Arc::new(Mutex::new(HedgeLedger {
+            budget,
+            completions: CompletionWindow::default(),
+            hedges: 0,
+            hedge_bytes: 0,
+        }))
     }
 
     /// The midpoint cut works on the RANGES, not on the blob's end, and the
@@ -2636,18 +2647,18 @@ mod tests {
         );
     }
 
-    /// The bucket admits at EXACTLY half the cap (ruling R1): that is where two
-    /// providers splitting a collection evenly land, and a strict `>` refused
-    /// every hedge there.
+    /// A hedge is admitted at EXACTLY half the cap (ruling R1): `available`
+    /// lands there when one hedge of half the largest item is outstanding, and a
+    /// strict `>` refused every hedge there.
     #[test]
     fn hedge_budget_admits_at_exactly_half_the_cap() {
-        let total = 1024 * 1024u64;
-        let cap = HEDGE_BUDGET_RATIO * total as f64;
-        let mut b = HedgeBudget::new(total);
-        b.tokens = cap / 2.0;
+        let mut b = budget_with(1, 2_000_000);
+        assert!(close(b.cap(), 1_000_000.0));
+        assert!(b.try_charge(500_000));
+        assert!(close(b.available(), b.cap() / 2.0), "{}", b.available());
         assert!(
             b.try_charge(1),
-            "tokens sitting exactly on cap/2 must still admit a hedge"
+            "available sitting exactly on cap/2 must still admit a hedge"
         );
     }
 
@@ -2850,44 +2861,159 @@ mod tests {
         assert!(!waiting_on_busy(&states, &[a]));
     }
 
-    fn close(a: f64, b: f64) -> bool {
-        (a - b).abs() < 1e-6
-    }
-
     /// A live run's cap follows the items in flight — the larger of 5 % of their
     /// bytes and half the largest — growing with each item taken and shrinking
-    /// as each ends; the tokens never exceed it.
+    /// as each ends, and `available` never exceeds it.
     #[test]
     fn a_live_budget_follows_the_items_in_flight() {
         let mut b = HedgeBudget::live();
-        assert!(close(b.cap, 0.0) && close(b.tokens, 0.0), "empty at the start");
+        assert!(close(b.cap(), 0.0) && close(b.available(), 0.0), "empty at the start");
         b.extend(1_000_000);
-        assert!(close(b.cap, 500_000.0), "one hedge of the item: {}", b.cap);
-        assert!(close(b.tokens, 500_000.0), "an item brings its share");
+        assert!(close(b.cap(), 500_000.0), "one hedge of the item: {}", b.cap());
+        assert!(close(b.available(), 500_000.0), "an item brings its share");
         b.extend(3_000_000);
         // 5 % of 4 MB is 200 kB; half of the 3 MB item is 1.5 MB.
-        assert!(close(b.cap, 1_500_000.0), "{}", b.cap);
-        assert!(close(b.tokens, 1_500_000.0), "the cap's increase joins: {}", b.tokens);
+        assert!(close(b.cap(), 1_500_000.0), "{}", b.cap());
+        assert!(close(b.available(), 1_500_000.0), "{}", b.available());
         assert!(b.try_charge(60_000));
         b.retire(3_000_000);
-        assert!(close(b.cap, 500_000.0), "the floor drops to the 1 MB item: {}", b.cap);
-        assert!(b.tokens <= b.cap, "the tokens follow the cap down");
+        assert!(close(b.cap(), 500_000.0), "the floor drops to the 1 MB item: {}", b.cap());
+        assert!(b.available() <= b.cap(), "available follows the cap down");
         b.retire(1_000_000);
-        assert!(close(b.cap, 0.0), "nothing in flight, no budget: {}", b.cap);
-        assert!(b.tokens <= b.cap);
+        assert!(close(b.cap(), 0.0), "nothing in flight, no budget: {}", b.cap());
+        assert!(close(b.available(), 0.0));
     }
 
-    /// One item in flight: a full bucket pays for one hedge of half that item, a
-    /// second identical one waits for a refund.
+    /// One item in flight: one hedge of half that item is admitted, a second is
+    /// refused while the first is outstanding, and the settlement of the first
+    /// (nothing duplicated) pays for it again.
     #[test]
     fn a_live_budget_admits_one_hedge_of_a_lone_item() {
-        let mut b = HedgeBudget::live();
-        b.extend(1_000_000);
-        assert!(b.try_charge(500_000), "half the item, from a full bucket");
-        assert!(!b.try_charge(500_000), "a second one is refused");
-        b.refund(500_000);
-        assert!(b.try_charge(500_000), "the refund pays for it again");
+        let mut b = budget_with(1, 1_000_000);
+        assert!(b.try_charge(500_000), "half the item, from an idle budget");
+        assert!(!b.try_charge(500_000), "a second one is refused while the first is out");
+        b.settle(500_000, 0);
+        assert!(b.try_charge(500_000), "the settlement pays for it again");
+        b.settle(500_000, 0);
         assert!(!b.try_charge(500_001), "more than half the item is never payable");
+    }
+
+    /// `settle` turns what was duplicated into debt and takes the charge off the
+    /// outstanding sum; completed bytes repay the debt at 5 %, never below zero.
+    #[test]
+    fn a_settlement_leaves_debt_that_completed_bytes_repay() {
+        let mut b = budget_with(1, 2_000_000);
+        assert!(b.try_charge(400_000));
+        assert_eq!(b.outstanding, 400_000);
+        assert!(close(b.available(), 600_000.0));
+        b.settle(400_000, 150_000);
+        assert_eq!(b.outstanding, 0);
+        assert!(close(b.debt, 150_000.0), "{}", b.debt);
+        assert!(close(b.available(), 850_000.0), "debt reduces what is available");
+        // 5 % of 1 MB repays 50 kB.
+        b.earn(1_000_000);
+        assert!(close(b.debt, 100_000.0), "{}", b.debt);
+        b.earn(u64::MAX / 2);
+        assert!(close(b.debt, 0.0), "repaying never goes below zero: {}", b.debt);
+        assert!(close(b.available(), 1_000_000.0));
+        // A loser cannot have duplicated more than its charge.
+        assert!(b.try_charge(10_000));
+        b.settle(10_000, 99_999);
+        assert!(close(b.debt, 10_000.0), "{}", b.debt);
+    }
+
+    /// The half rule: with a hedge outstanding that takes `available` below
+    /// half the cap nothing is admitted, however small; its settlement reopens
+    /// hedging.
+    #[test]
+    fn a_live_budget_refuses_below_half_the_cap_and_a_hedge_larger_than_available() {
+        // 100 items of 100 kB: cap = 5 % of 10 MB = 500 kB, the floor is 50 kB.
+        let mut b = budget_with(100, 100_000);
+        assert!(close(b.cap(), 500_000.0));
+        assert!(b.try_charge(200_000));
+        assert!(b.try_charge(60_000), "300 kB available is above half the cap");
+        assert!(close(b.available(), 240_000.0));
+        assert!(
+            !b.try_charge(1),
+            "below half the cap the budget refuses even a one-byte hedge — that is \
+             the storm brake, not the exhaustion check"
+        );
+        b.settle(60_000, 0);
+        assert!(b.try_charge(1), "a settlement reopens the gate");
+        b.settle(1, 0);
+        assert!(!b.try_charge(300_001), "a hedge larger than what is available is refused");
+    }
+
+    /// The review's sequence: the cap falls when the large item completes and
+    /// rises when the next one joins, while a hedge on the small item is still
+    /// out. The cap moving must not refill the budget: the hedge's charge is
+    /// still outstanding. (Token arithmetic gave 50 available here and admitted
+    /// a second hedge of 50.)
+    #[test]
+    fn the_cap_falling_and_rising_does_not_refill_the_budget() {
+        const MB: u64 = 1_000_000;
+        let mut b = HedgeBudget::live();
+        b.extend(100 * MB);
+        assert!(close(b.cap(), 50.0 * MB as f64));
+        b.extend(20 * MB);
+        assert!(close(b.cap(), 50.0 * MB as f64), "the floor still rules: {}", b.cap());
+        assert!(b.try_charge(10 * MB), "a hedge on the 20 MB item");
+        // The 100 MB item completes: it earns, then retires.
+        b.earn(100 * MB);
+        b.retire(100 * MB);
+        assert!(close(b.cap(), 10.0 * MB as f64), "{}", b.cap());
+        assert!(close(b.available(), 0.0), "{}", b.available());
+        b.extend(100 * MB);
+        assert!(close(b.cap(), 50.0 * MB as f64), "{}", b.cap());
+        assert!(
+            close(b.available(), b.cap() - (10 * MB) as f64),
+            "the 10 MB still outstanding is not given back: {}",
+            b.available()
+        );
+        assert!(!b.try_charge(50 * MB), "a hedge of half the new item is refused");
+        assert!(b.try_charge(40 * MB), "what is really left still pays");
+    }
+
+    /// One receive stream, frames one at a time: every frame's hedge duplicates
+    /// its whole charge. A frame that completes does not hand the next one a
+    /// fresh budget; the duplicated bytes admitted stay within 5 % of the
+    /// completed bytes plus one cap, and hedging does come back as the debt is
+    /// repaid.
+    #[test]
+    fn one_stream_frames_one_at_a_time_cannot_outspend_the_ratio() {
+        const FRAME: u64 = 100_000;
+        let mut b = HedgeBudget::live();
+        let (mut completed, mut duplicated, mut hedges) = (0u64, 0u64, 0u32);
+        let mut frame_two_admitted = None;
+        for i in 1..=200u32 {
+            b.extend(FRAME);
+            let admitted = b.try_charge(FRAME / 2);
+            if admitted {
+                hedges += 1;
+                duplicated += FRAME / 2;
+                b.settle(FRAME / 2, FRAME / 2);
+            }
+            if i == 2 {
+                frame_two_admitted = Some(admitted);
+            }
+            b.earn(FRAME);
+            b.retire(FRAME);
+            completed += FRAME;
+            let bound = HEDGE_BUDGET_RATIO * completed as f64 + (FRAME / 2) as f64;
+            assert!(
+                duplicated as f64 <= bound,
+                "frame {i}: {duplicated} duplicated against {bound}"
+            );
+        }
+        assert_eq!(
+            frame_two_admitted,
+            Some(false),
+            "frame 2 starts in debt for frame 1's whole hedge"
+        );
+        assert!(
+            hedges >= 10,
+            "the debt is repaid, so hedging comes back: {hedges}"
+        );
     }
 
     /// The cap is the larger of the ratio term and the floor, and the crossover
@@ -2897,55 +3023,54 @@ mod tests {
         let mut b = HedgeBudget::live();
         for _ in 0..10 {
             b.extend(1_000_000);
-            assert!(close(b.cap, 500_000.0), "the floor holds up to ten items: {}", b.cap);
-            assert!(close(b.tokens, 500_000.0), "no increase, no new tokens");
+            assert!(close(b.cap(), 500_000.0), "the floor holds up to ten items: {}", b.cap());
         }
         // The eleventh item takes the ratio term (550 kB) past the floor.
         b.extend(1_000_000);
-        assert!(close(b.cap, 550_000.0), "{}", b.cap);
-        assert!(close(b.tokens, 550_000.0), "{}", b.tokens);
+        assert!(close(b.cap(), 550_000.0), "{}", b.cap());
+        assert!(close(b.available(), 550_000.0), "{}", b.available());
 
-        // Many small items and one large: the floor wins, then the ratio again.
-        let mut b = HedgeBudget::live();
-        for _ in 0..100 {
-            b.extend(100_000);
-        }
-        assert!(close(b.cap, 500_000.0), "ratio term, 5 % of 10 MB: {}", b.cap);
+        // Many small items and one large: the ratio wins, then the floor, then
+        // the ratio again.
+        let mut b = budget_with(100, 100_000);
+        assert!(close(b.cap(), 500_000.0), "ratio term, 5 % of 10 MB: {}", b.cap());
         b.extend(10_000_000);
-        assert!(close(b.cap, 5_000_000.0), "floor term, half of 10 MB: {}", b.cap);
+        assert!(close(b.cap(), 5_000_000.0), "floor term, half of 10 MB: {}", b.cap());
         b.retire(10_000_000);
-        assert!(close(b.cap, 500_000.0), "back to the ratio term: {}", b.cap);
-        assert!(b.tokens <= b.cap);
+        assert!(close(b.cap(), 500_000.0), "back to the ratio term: {}", b.cap());
+        assert!(b.available() <= b.cap());
     }
 
-    /// Retiring the largest item drops the floor to the next largest and clamps
-    /// the tokens to the new cap.
+    /// Retiring the largest item drops the floor to the next largest; what is
+    /// outstanding stays outstanding.
     #[test]
     fn a_live_budget_retiring_the_largest_item_lowers_the_floor() {
         let mut b = HedgeBudget::live();
         b.extend(4_000_000);
         b.extend(1_000_000);
         b.extend(1_000_000);
-        assert!(close(b.cap, 2_000_000.0), "{}", b.cap);
+        assert!(close(b.cap(), 2_000_000.0), "{}", b.cap());
         assert!(b.try_charge(1_000_000));
-        assert!(close(b.tokens, 1_000_000.0), "{}", b.tokens);
+        assert!(close(b.available(), 1_000_000.0), "{}", b.available());
         b.retire(4_000_000);
-        assert!(close(b.cap, 500_000.0), "half of the next largest: {}", b.cap);
-        assert!(close(b.tokens, 500_000.0), "clamped to the new cap: {}", b.tokens);
+        assert!(close(b.cap(), 500_000.0), "half of the next largest: {}", b.cap());
+        assert!(close(b.available(), 0.0), "the outstanding charge exceeds the new cap");
+        b.settle(1_000_000, 0);
+        assert!(close(b.available(), 500_000.0), "{}", b.available());
     }
 
-    /// With nothing in flight there is no budget and nothing is admitted.
+    /// With nothing in flight there is no budget and nothing is admitted, and
+    /// nothing earned or repaid changes that.
     #[test]
     fn a_live_budget_with_nothing_in_flight_admits_nothing() {
         let mut b = HedgeBudget::live();
         assert!(!b.try_charge(1), "an empty budget admits nothing");
         b.extend(2_000_000);
         b.retire(2_000_000);
-        assert!(close(b.cap, 0.0) && close(b.tokens, 0.0));
+        assert!(close(b.cap(), 0.0) && close(b.available(), 0.0));
         assert!(!b.try_charge(1), "a drained run admits nothing");
-        b.refund(1_000);
         b.earn(1_000_000);
-        assert!(close(b.tokens, 0.0), "nothing can be earned past a zero cap");
+        assert!(close(b.available(), 0.0), "nothing can be earned past a zero cap");
     }
 
     /// Items of equal size retire one at a time.
@@ -2955,11 +3080,47 @@ mod tests {
         b.extend(1_000_000);
         b.extend(1_000_000);
         b.extend(100_000);
-        assert!(close(b.cap, 500_000.0), "{}", b.cap);
+        assert!(close(b.cap(), 500_000.0), "{}", b.cap());
         b.retire(1_000_000);
-        assert!(close(b.cap, 500_000.0), "one 1 MB item is still in flight: {}", b.cap);
+        assert!(close(b.cap(), 500_000.0), "one 1 MB item is still in flight: {}", b.cap());
         b.retire(1_000_000);
-        assert!(close(b.cap, 50_000.0), "only the 100 kB item is left: {}", b.cap);
-        assert!(b.tokens <= b.cap);
+        assert!(close(b.cap(), 50_000.0), "only the 100 kB item is left: {}", b.cap());
+        assert!(b.available() <= b.cap());
+    }
+
+    /// A hedge charge that is dropped unsettled gives its bytes back and adds no
+    /// debt; one that was settled does not settle again on drop.
+    #[test]
+    fn a_dropped_hedge_charge_returns_its_bytes_and_a_settled_one_does_not_settle_twice() {
+        let mut b = budget_with(1, 1_000_000);
+        assert!(b.try_charge(500_000));
+        let ledger = ledger_of(b);
+        let guard = HedgeCharge {
+            ledger: Arc::clone(&ledger),
+            bytes: 500_000,
+            settled: false,
+        };
+        assert_eq!(ledger.lock().unwrap().budget.outstanding, 500_000);
+        drop(guard);
+        {
+            let l = ledger.lock().unwrap();
+            assert_eq!(l.budget.outstanding, 0, "the charge came back");
+            assert!(close(l.budget.debt, 0.0), "and a dropped hedge duplicated nothing");
+            assert_eq!(l.hedge_bytes, 0);
+        }
+
+        // Settled with debt, then dropped: the drop settles nothing more.
+        assert!(ledger.lock().unwrap().budget.try_charge(500_000));
+        let mut guard = HedgeCharge {
+            ledger: Arc::clone(&ledger),
+            bytes: 500_000,
+            settled: false,
+        };
+        guard.settle(123);
+        drop(guard);
+        let l = ledger.lock().unwrap();
+        assert_eq!(l.budget.outstanding, 0);
+        assert!(close(l.budget.debt, 123.0), "{}", l.budget.debt);
+        assert_eq!(l.hedge_bytes, 123);
     }
 }
