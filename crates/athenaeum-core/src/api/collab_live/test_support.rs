@@ -20,6 +20,106 @@ use crate::sharing::iroh::node::SharedIrohNode;
 /// coordinating, `send_receive` member.
 pub(crate) const PID: &str = "p1";
 
+/// Ends what a rig's node would otherwise leave running, when the rig drops
+/// at the end of its test.
+///
+/// A test ends without the app's shutdown, and then nothing stops the node's
+/// blob stores: each runs its own multi-thread runtime (ten OS threads on a
+/// ten-core machine) until its last handle goes, and several things keep a
+/// handle past the test — the process-wide live exchange registry (it holds
+/// the context), the node's serve oracle (built over the context, stored in
+/// the node the context holds), the context's own `iroh_node` slot, and,
+/// once two nodes have talked, the stores themselves. Left this way a rig
+/// cost about 26 threads for the rest of the run, and the suite ran out of
+/// the 4 096 a macOS process may have. So the rig lets go of all three and
+/// shuts the stores, as `SharedIrohNode::shutdown` does.
+///
+/// A field, not a `Drop` on the rig, so a test can still move the rig's
+/// fields out.
+pub(crate) struct RigTeardown {
+    ctx: Option<Arc<ServiceContext>>,
+    node: Arc<SharedIrohNode>,
+}
+
+impl RigTeardown {
+    pub(crate) fn new(ctx: &Arc<ServiceContext>, node: &Arc<SharedIrohNode>) -> Self {
+        Self {
+            ctx: Some(Arc::clone(ctx)),
+            node: Arc::clone(node),
+        }
+    }
+
+    /// For a node with no catalog behind it.
+    pub(crate) fn node_only(node: &Arc<SharedIrohNode>) -> Self {
+        Self {
+            ctx: None,
+            node: Arc::clone(node),
+        }
+    }
+}
+
+impl Drop for RigTeardown {
+    fn drop(&mut self) {
+        if let Some(ctx) = &self.ctx {
+            crate::api::collab_live::disarm_for_test(ctx);
+            // Held only across the first bind; a test is past that when it ends.
+            if let Ok(mut slot) = ctx.iroh_node.try_lock() {
+                slot.take();
+            }
+        }
+        self.node.set_collab_serve_oracle(None);
+        shut_stores_blocking(&self.node);
+    }
+}
+
+/// Shut `node`'s blob stores from a `Drop`, where nothing can be awaited.
+///
+/// A store answers on its own runtime, so a helper thread with a runtime of
+/// its own can wait for it while the test's thread waits for the helper.
+/// Never panics: it also runs while a failed test unwinds, where a second
+/// panic would abort the whole test binary.
+fn shut_stores_blocking(node: &SharedIrohNode) {
+    let mut stores = vec![node.store().clone()];
+    stores.extend(node.collab_store());
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("rig-teardown".into())
+            .spawn_scoped(scope, || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "rig teardown: no runtime, blob stores left open");
+                        return;
+                    }
+                };
+                rt.block_on(async {
+                    for store in &stores {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            store.shutdown(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::debug!(error = %e, "rig teardown: blob store already shut")
+                            }
+                            Err(_) => {
+                                tracing::warn!("rig teardown: blob store shutdown timed out")
+                            }
+                        }
+                    }
+                });
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "rig teardown: no helper thread, blob stores left open");
+        }
+    });
+}
+
 /// A signed-in `ServiceContext` + `FakeHub` + a real relay-disabled iroh node
 /// with the Collaboration root (`<tmp>/Collab`) mounted, and project [`PID`]
 /// seeded both on the hub and in the local cache. The returned `TempDir`
@@ -206,6 +306,7 @@ pub(crate) async fn seed_replica_file(
 /// outbox `add`). Until Task 11's landing exists the files are placed
 /// directly.
 pub(crate) struct LandedRig {
+    _teardown: RigTeardown,
     pub _tmp: tempfile::TempDir,
     pub ctx: Arc<ServiceContext>,
     pub hub: FakeHub,
@@ -333,6 +434,7 @@ async fn landed_rig_on(
         crate::api::collab_live::serve_oracle::DbServeOracle::new(Arc::clone(&ctx), guard, tx),
     )));
     LandedRig {
+        _teardown: RigTeardown::new(&ctx, &node),
         _tmp: tmp,
         ctx,
         hub,
@@ -718,6 +820,7 @@ pub(crate) async fn run_many_live(
 /// A relay-disabled node with no catalog behind it (a fetcher in the
 /// two-node tests), in its own temp dir.
 pub(crate) struct BareNode {
+    _teardown: RigTeardown,
     pub node: Arc<SharedIrohNode>,
     _tmp: tempfile::TempDir,
 }
@@ -739,7 +842,11 @@ pub(crate) async fn bare_node() -> BareNode {
     )
     .await
     .expect("bind relay-disabled node");
-    BareNode { node, _tmp: tmp }
+    BareNode {
+        _teardown: RigTeardown::node_only(&node),
+        node,
+        _tmp: tmp,
+    }
 }
 
 /// Relay-disabled nodes have no discovery: exchange addresses.
@@ -837,6 +944,7 @@ pub(crate) const FETCH_FRAME_BYTES: usize = 64 * 1024;
 /// receiver's collab store, under the frame's in-flight tag; it remembers
 /// the row as it stood then — the row a landing carries.
 pub(crate) struct FetchRig {
+    _teardown: RigTeardown,
     pub _tmp: tempfile::TempDir,
     pub ctx: Arc<ServiceContext>,
     pub hub: FakeHub,
@@ -880,9 +988,11 @@ pub(crate) async fn fetch_rig_sized(n: usize, size: usize) -> FetchRig {
         "the designated root is available"
     );
     let uuids: Vec<String> = (0..n).map(|i| format!("f{i:02}")).collect();
+    let ctx = Arc::new(ctx);
     let rig = FetchRig {
+        _teardown: RigTeardown::new(&ctx, &node),
         _tmp: tmp,
-        ctx: Arc::new(ctx),
+        ctx,
         hub,
         node,
         root,
@@ -1183,6 +1293,7 @@ pub(crate) fn live_config() -> crate::api::collab_live::LiveConfig {
 /// relay-disabled node, its Collaboration root, and a receive gate it owns
 /// (the sync receiver is never started here).
 pub(crate) struct Instance {
+    _teardown: RigTeardown,
     _tmp: tempfile::TempDir,
     pub ctx: Arc<ServiceContext>,
     pub node: Arc<SharedIrohNode>,
@@ -1255,9 +1366,11 @@ async fn live_instance(
     .await
     .expect("designate the Collaboration root");
     let root = collab_root(&ctx);
+    let ctx = Arc::new(ctx);
     Instance {
+        _teardown: RigTeardown::new(&ctx, &node),
         _tmp: tmp,
-        ctx: Arc::new(ctx),
+        ctx,
         node,
         root,
         control: Arc::new(InboundControl::new()),
@@ -2328,6 +2441,7 @@ pub(crate) async fn relay_pair(relay_url: &str, n: usize, size: usize) -> RelayP
     .await
     .expect("bind the fetcher on the relay");
     let fetcher = BareNode {
+        _teardown: RigTeardown::node_only(&fetcher),
         node: fetcher,
         _tmp: tmp,
     };

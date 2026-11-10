@@ -704,6 +704,22 @@ pub(crate) async fn crash_for_test(ctx: &ServiceContext) {
     handle.abort.abort();
 }
 
+/// Test only: forget this catalog's live exchange without the stop
+/// handshake — all a test rig's `Drop` can do (nothing can be awaited
+/// there). The registry is process-wide and its handle holds the
+/// `ServiceContext`, so a test that armed a live exchange and ended without
+/// [`shutdown`] kept its catalog, its node and both blob stores — about 26
+/// OS threads — until the test binary exited.
+#[cfg(test)]
+pub(crate) fn disarm_for_test(ctx: &ServiceContext) {
+    let Some(key) = scope(ctx) else {
+        return;
+    };
+    if let Some(handle) = registry().remove(&key) {
+        handle.abort.abort();
+    }
+}
+
 /// Test only (final fix A-I3): how many runtimes this catalog's handle has
 /// started.
 #[cfg(test)]

@@ -415,6 +415,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rustafits",
+ "scheduled-thread-pool",
  "semver",
  "serde",
  "serde_json",
