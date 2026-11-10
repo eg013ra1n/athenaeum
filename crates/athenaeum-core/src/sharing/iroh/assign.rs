@@ -1,7 +1,8 @@
 //! A2a — our own swarm assignment loop over `store.remote()` (D4 §4.5, T4).
 //!
-//! This module replaces iroh-blobs' `SplitStrategy::Split` fan-out for the
-//! multi-source project fetch. The stock loop
+//! This module is the live collab fetch engine ([`run_live`]); it replaced
+//! iroh-blobs' `SplitStrategy::Split` fan-out (the package-era batch swarm
+//! fetch, removed 2026-11-10). The stock loop
 //! (`iroh_blobs::api::downloader::execute_get`) is a strictly sequential
 //! first-fit walk of the provider list per child: dial, `local_for_request`,
 //! `execute_get_sink`, and on an `Err` `continue` to the next provider, asking
@@ -21,22 +22,18 @@
 //!   stock downloader discards, and the input A4's ranking will need.
 //!
 //! Everything else is deliberately the same as upstream, because it already
-//! works: one `GetRequest` per collection child, the missing-range recomputed
+//! works: one `GetRequest` per item, the missing-range recomputed
 //! from the local store before every attempt (so a reassignment resumes at the
 //! byte, never restarts the frame), and the full provider set available to
-//! every child.
+//! every item.
 //!
 //! ## Independent items
 //!
 //! The engine runs over [`FetchItem`]s — each with its own `GetRequest`, hash
-//! and provider list — through [`fetch_items_assigned`]. A collection is the
-//! special case [`fetch_children_assigned`] builds: every child addressed
-//! through its root, one shared provider list, the personal ALPN, and
-//! [`FailMode::FailFast`]. A batch of collab frames is raw blob items with
-//! per-frame holders on the collab ALPN under [`FailMode::Isolate`], where one
-//! item's failure is its own result and never aborts a sibling. Per-provider
-//! state stays run-wide either way: one pool, one ledger, one backoff ladder
-//! per provider, whichever items it serves.
+//! and provider list. Collab frames are raw blob items with per-frame holders
+//! on the collab ALPN, where one item's failure is its own result and never
+//! aborts a sibling. Per-provider state is run-wide: one pool, one ledger, one
+//! backoff ladder per provider, whichever items it serves.
 //!
 //! ## Hedging
 //!
@@ -68,16 +65,13 @@
 //! item waits) and through the dedicated collab pool ([`Dialer::Collab`]).
 //! Every path now reads the provider's refusal: `ERR_LIMIT` is a busy
 //! provider retried after [`LIMIT_RETRY`] with no strike, `ERR_PERMISSION`
-//! excludes the provider for that item only. The batch entry points build
-//! [`ProviderSet::Fixed`] and [`Dialer::Stock`] and behave as before.
+//! excludes the provider for that item only.
 //!
 //! ## Progress truth
 //!
 //! Nothing here emits UI progress. D4 T7 fixed `store.observe()` as the single
 //! progress oracle — the get streams are consumed here only to watch for
-//! movement, and the `Progress(u64)` values never leave this module. The batch
-//! figure the caller emits is summed from the per-file observers, which are
-//! unaffected by which fan-out ran.
+//! movement, and the `Progress(u64)` values never leave this module.
 //!
 //! ## Cancellation
 //!
@@ -104,18 +98,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointId};
+use iroh::EndpointId;
 use iroh_blobs::api::blobs::Blobs;
 use iroh_blobs::api::remote::{GetProgressItem, Remote};
 use iroh_blobs::api::Store;
 use iroh_blobs::get::Stats;
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
-use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef, Options as PoolOptions};
 use iroh_blobs::Hash;
 use n0_future::StreamExt as _;
 use tokio::sync::{mpsc, watch};
@@ -123,11 +115,6 @@ use tokio::sync::{mpsc, watch};
 use super::collab_pool::{CollabPool, PooledConn};
 
 use crate::sharing::{ProviderEvent, ProviderTelemetrySink};
-
-/// Child requests in flight at once — the same figure the stock split fan-out
-/// uses (`handle_download_split_impl`'s `buffered_unordered(32)`), so switching
-/// modes does not change how hard we lean on the swarm.
-pub(crate) const MAX_IN_FLIGHT: usize = 32;
 
 /// D4 §6: an assignment whose `bytes_read` has not grown for this long is a
 /// provider failure, error or no error. Upper bound borrowed from libtorrent's
@@ -205,53 +192,6 @@ const GOODPUT_ALPHA: f64 = 0.25;
 /// bound if it ever went to disk on a cold cache.
 const HEDGE_REEVALUATE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Environment override for [`swarm_fetch_mode`].
-const SWARM_FETCH_ENV: &str = "ATHENAEUM_SWARM_FETCH";
-
-/// Which fan-out phase 2 of a multi-source collection fetch runs.
-///
-/// `Stock` is iroh-blobs' `SplitStrategy::Split` — kept reachable on purpose
-/// (D4 §9: "switching between them is one flag"), because this module takes on
-/// resume, cancellation and accounting that upstream otherwise owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SwarmFetchMode {
-    /// iroh-blobs `SplitStrategy::Split` — the fallback.
-    Stock,
-    /// This module's assignment loop — the default.
-    Assigned,
-}
-
-/// The mode this process runs in, resolved ONCE from the environment.
-///
-/// `ATHENAEUM_SWARM_FETCH=stock` forces the upstream fan-out without a rebuild;
-/// anything else (unset, or set empty, included) is
-/// [`SwarmFetchMode::Assigned`], and an unrecognised value warns rather than
-/// silently picking one. Read through
-/// a `OnceLock` so a mid-run environment edit cannot make two fetches of the
-/// same session disagree, and so the decision is logged exactly once.
-pub(crate) fn swarm_fetch_mode() -> SwarmFetchMode {
-    static MODE: OnceLock<SwarmFetchMode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var(SWARM_FETCH_ENV) {
-        Ok(v) if v.eq_ignore_ascii_case("stock") => {
-            tracing::info!(mode = "stock", "swarm fetch mode overridden by environment");
-            SwarmFetchMode::Stock
-        }
-        // An empty value is how a shell spells "unset"; it is not an unknown
-        // mode and must not warn.
-        Ok(v) if v.trim().is_empty() || v.eq_ignore_ascii_case("assigned") => {
-            SwarmFetchMode::Assigned
-        }
-        Ok(v) => {
-            tracing::warn!(
-                mode = %v,
-                "unknown swarm fetch mode in the environment — using the assigned loop"
-            );
-            SwarmFetchMode::Assigned
-        }
-        Err(_) => SwarmFetchMode::Assigned,
-    })
-}
-
 /// Per-provider transfer facts — the ground truth the stock downloader throws
 /// away (`Ok(_stats)`).
 ///
@@ -269,8 +209,7 @@ pub(crate) struct ProviderStats {
     pub elapsed: Duration,
 }
 
-/// What one [`fetch_children_assigned`] call did, per provider plus the
-/// swarm-wide counters.
+/// What one assignment run did, per provider plus the swarm-wide counters.
 ///
 /// `hedges` / `hedge_bytes` are Task 8's; they are reported as `0` here rather
 /// than omitted so the shape does not move when hedging lands.
@@ -295,13 +234,14 @@ impl AssignmentReport {
         self.per_provider.values().map(|s| s.bytes).sum()
     }
 
-    /// Total children some provider carried to completion.
+    /// Total children some provider carried to completion (test oracle).
     ///
     /// Report-only: a child already complete at its first round (a resumed
     /// fetch finding it already local) or a duplicate-hash entry never runs
     /// `record_success`, so it is credited to nobody and this sum undercounts
     /// the collection's own child count by exactly that many. Nothing here
     /// re-derives that figure from the collection to true it up.
+    #[cfg(test)]
     pub(crate) fn total_children(&self) -> u32 {
         self.per_provider.values().map(|s| s.children).sum()
     }
@@ -434,35 +374,11 @@ pub(crate) struct AssignmentOptions {
     /// A2b: race a second assignment for the back half of a slow child's
     /// missing range, under [`HedgeBudget`].
     pub hedging: bool,
-    /// The collection's announced payload size — the base of the hedge
-    /// budget's cap ([`HEDGE_BUDGET_RATIO`] × this). Zero disables hedging by
-    /// arithmetic: a zero cap can never admit a charge.
-    pub total_bytes: u64,
-    /// Per-provider attempt telemetry, the same sink the stock path feeds from
-    /// the download stream's `TryProvider`/`ProviderFailed` items.
+    /// Per-provider attempt telemetry (advisory).
     pub telemetry: ProviderTelemetrySink,
-    /// The ALPN the run's one connection pool dials — `iroh_blobs::ALPN` for
-    /// the personal store, [`COLLAB_BLOBS_ALPN`](super::COLLAB_BLOBS_ALPN) for
-    /// the collab store. [`fetch_children_assigned`] forces the former.
-    pub alpn: &'static [u8],
-    /// What one item's failure does to the rest of the call.
-    /// [`fetch_children_assigned`] forces [`FailMode::FailFast`].
-    pub fail_mode: FailMode,
     /// Fed the exact bytes a transfer just moved, per (item key, provider) —
     /// `None` for every caller that has no receive-feed UI to keep (Task 10).
     pub delivered: Option<DeliveredSink>,
-}
-
-/// What one item exhausting its ladder does to the rest of the call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FailMode {
-    /// The first failed item fails the whole call and aborts its siblings —
-    /// the collection contract: a package missing one child is worthless.
-    FailFast,
-    /// A failed item records its error and the call goes on; every item gets
-    /// its own result. Independent frames (P11): one frame failing never
-    /// aborts its siblings.
-    Isolate,
 }
 
 /// One independently fetched blob: its own request, its own provider list,
@@ -474,39 +390,22 @@ pub(crate) enum FailMode {
 /// narrows this one's ranges for a hedge ([`hedge_back_half_request`]).
 /// `hash` is the blob the request lands (the child's own hash for a child
 /// request), which the hedge observes. `size` is the caller's announced size,
-/// informational only (`0` when unknown): the hedge budget's base is
-/// [`AssignmentOptions::total_bytes`].
+/// informational only (`0` when unknown); the live run extends its hedge
+/// budget by it ([`HedgeBudget::extend`]).
 ///
-/// `P` is how the item names its providers. The batch entry points take the
-/// default, a fixed list (`Arc<Vec<EndpointId>>`), and wrap it as
-/// [`ProviderSet::Fixed`]; the engine itself and the live run
-/// ([`run_live`]) work over a [`ProviderSet`], which may be live.
-pub(crate) struct FetchItem<P = Arc<Vec<EndpointId>>> {
-    /// The caller's id for the item (a frame uuid; a child index for the
-    /// collection wrapper), echoed in the results.
+/// `providers` is a [`ProviderSet`], which may be live ([`run_live`]).
+pub(crate) struct FetchItem {
+    /// The caller's id for the item (a frame uuid), echoed in the results.
     pub key: String,
     pub request: GetRequest,
     pub hash: Hash,
     pub size: u64,
     /// The providers this item may be assigned to. Per-provider state
     /// (backoff, load, goodput) is shared across every item of the call.
-    pub providers: P,
+    pub providers: ProviderSet,
 }
 
 impl FetchItem {
-    /// The batch item as the engine runs it: its list, fixed.
-    fn into_set(self) -> FetchItem<ProviderSet> {
-        FetchItem {
-            key: self.key,
-            request: self.request,
-            hash: self.hash,
-            size: self.size,
-            providers: ProviderSet::Fixed(self.providers),
-        }
-    }
-}
-
-impl<P> FetchItem<P> {
     /// How error messages name the item. A child keeps the exact wording the
     /// collection path always used (`child {index} of {root}`).
     fn describe(&self) -> String {
@@ -518,23 +417,21 @@ impl<P> FetchItem<P> {
     }
 }
 
-/// Per-item results of one call, in input order.
-pub(crate) type ItemResults = Vec<(String, Result<()>)>;
-
 /// An item's providers (spec §7.2 "live providers").
 ///
-/// `Fixed` is the list a batch caller hands over, frozen for the call — the
-/// personal path and the wave-2 collab batch. `Live` is a watch channel the
+/// `Live` is a watch channel the
 /// collab scheduler feeds from holder and presence events: a provider that
 /// appears is picked up at the item's next round, and an item whose set is
 /// empty sleeps until one appears (it never fails for waiting). A provider
 /// that leaves the set is not assigned new work for the item; a transfer
 /// already running on it goes on (I5 — only a closed connection or a failed
 /// dial takes a provider out of an in-flight fetch).
+///
+/// `Fixed` (tests only) is a list frozen for the call.
 #[derive(Clone)]
 pub(crate) enum ProviderSet {
+    #[cfg(test)]
     Fixed(Arc<Vec<EndpointId>>),
-    #[allow(dead_code)] // fed by the live scheduler (Tasks 13-15) and the tests
     Live(watch::Receiver<Arc<Vec<EndpointId>>>),
 }
 
@@ -542,6 +439,7 @@ impl ProviderSet {
     /// The providers right now.
     pub(crate) fn current(&self) -> Arc<Vec<EndpointId>> {
         match self {
+            #[cfg(test)]
             Self::Fixed(list) => Arc::clone(list),
             Self::Live(rx) => Arc::clone(&rx.borrow()),
         }
@@ -551,6 +449,7 @@ impl ProviderSet {
     /// [`changed`](Self::changed) waits for the NEXT one.
     fn current_seen(&mut self) -> Arc<Vec<EndpointId>> {
         match self {
+            #[cfg(test)]
             Self::Fixed(list) => Arc::clone(list),
             Self::Live(rx) => Arc::clone(&rx.borrow_and_update()),
         }
@@ -560,6 +459,7 @@ impl ProviderSet {
     /// or a live set whose sender is gone.
     async fn changed(&mut self) -> bool {
         match self {
+            #[cfg(test)]
             Self::Fixed(_) => false,
             Self::Live(rx) => rx.changed().await.is_ok(),
         }
@@ -569,6 +469,7 @@ impl ProviderSet {
     /// the timer ran out, `false` when a set change woke it early.
     async fn sleep_or_change(&mut self, wait: Duration) -> bool {
         match self {
+            #[cfg(test)]
             Self::Fixed(_) => {
                 tokio::time::sleep(wait).await;
                 true
@@ -616,7 +517,6 @@ impl std::fmt::Display for RefusedByEveryProvider {
 impl std::error::Error for RefusedByEveryProvider {}
 
 /// Whether a live item failed because every provider refused it.
-#[allow(dead_code)] // read by the live scheduler (Tasks 14-15) and the tests
 pub(crate) fn is_refused_by_every_provider(e: &anyhow::Error) -> bool {
     e.downcast_ref::<RefusedByEveryProvider>().is_some()
 }
@@ -635,48 +535,27 @@ fn set_transferring(flag: &Option<Arc<AtomicBool>>, on: bool) {
 
 /// How the live run finds a provider's dial address (the scheduler's holder
 /// map and presence); `None` means no address is known.
-#[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
 pub(crate) type ProviderAddrs =
     Arc<dyn Fn(&EndpointId) -> Option<iroh::EndpointAddr> + Send + Sync>;
 
 /// How transfers get their connection.
 ///
-/// `Stock` is the stock `iroh_blobs` pool on one ALPN — the personal path and
-/// the wave-2 collab batch, exactly as before. `Collab` is the dedicated
-/// collab pool (spec §7.3): one kept-open connection per provider, dialled
-/// with its own transport config at the address `addrs` gives.
+/// `Collab` is the dedicated collab pool (spec §7.3): one kept-open connection
+/// per provider, dialled with its own transport config at the address `addrs`
+/// gives.
 #[derive(Clone)]
 pub(crate) enum Dialer {
-    Stock(ConnectionPool),
-    #[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
     Collab {
         pool: Arc<CollabPool>,
         addrs: ProviderAddrs,
     },
 }
 
-/// A connection held for one transfer: the stock pool's permit, or a
-/// collab-pool borrow that keeps the connection from idling out.
-enum DialedConn {
-    Stock(ConnectionRef),
-    Collab(PooledConn),
-}
-
-impl DialedConn {
-    fn connection(&self) -> Connection {
-        match self {
-            Self::Stock(c) => (**c).clone(),
-            Self::Collab(c) => c.conn.clone(),
-        }
-    }
-}
-
 /// One frame handed to [`run_live`], with its own cancel switch: `true`
 /// stops that item alone (a new version, an exclusion, a lost project —
 /// spec §7.4), keeping its verified bytes in the store.
-#[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
 pub(crate) struct LiveItem {
-    pub item: FetchItem<ProviderSet>,
+    pub item: FetchItem,
     pub cancel: watch::Receiver<bool>,
 }
 
@@ -715,7 +594,6 @@ pub(crate) enum LiveVerdict {
 type VerdictSink = mpsc::UnboundedSender<LiveVerdict>;
 
 /// Knobs for one [`run_live`].
-#[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
 pub(crate) struct LiveRunOptions {
     /// The progress deadline ([`STALL_HARD_LIMIT`] in production).
     pub stall_hard_limit: Duration,
@@ -736,31 +614,6 @@ pub(crate) struct LiveRunOptions {
     /// forwarded into every child [`AssignmentOptions`] this run builds
     /// (Task 10). `None` when nothing downstream wants the receive feed.
     pub delivered: Option<DeliveredSink>,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Connection pools opened by [`run_items`] on this thread.
-    ///
-    /// Thread-local rather than a process-wide atomic on purpose: the lib's
-    /// tests run in parallel, and several of them open pools, so a global
-    /// counter's delta would be another test's noise. `#[tokio::test]` drives
-    /// its future with `block_on` on the test's own thread, and the pool is
-    /// opened in the call's synchronous prelude, so the thread IS the call.
-    static POOLS_OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Test hook: pools opened on the calling thread so far.
-#[cfg(test)]
-pub(crate) fn pools_opened_on_this_thread() -> usize {
-    POOLS_OPENED.with(|c| c.get())
-}
-
-/// The run's one connection pool on `alpn`.
-fn open_pool(endpoint: &Endpoint, alpn: &'static [u8]) -> ConnectionPool {
-    #[cfg(test)]
-    POOLS_OPENED.with(|c| c.set(c.get() + 1));
-    ConnectionPool::new(endpoint.clone(), alpn, PoolOptions::default())
 }
 
 /// Why one assignment ended without the child's bytes.
@@ -949,233 +802,6 @@ impl Drop for InflightGuard {
     }
 }
 
-/// Fetch every `children` entry of the hash-sequence rooted at `root` from
-/// `providers`, one assignment at a time per child, with a progress deadline.
-///
-/// `children` are hash-sequence child INDICES — for an iroh-blobs
-/// [`Collection`](iroh_blobs::format::collection::Collection) the sequence is
-/// `[meta, file0, file1, …]`, so file *i* is child `i + 1` (and
-/// `GetRequest::builder().child(c, …)` is itself offset `c + 1`, the root
-/// hash-seq blob being offset 0). The hash beside each index is carried for
-/// logging only — the request addresses the child through `root`, exactly as
-/// upstream's `split_request` does, so verification stays anchored on the
-/// sequence we already hold.
-///
-/// Returns once every child is complete locally. The FIRST child that exhausts
-/// its ladder fails the whole call and aborts its siblings; partial bytes stay
-/// in the store (the caller's in-flight tag protects them), so a retry — even
-/// against an entirely different provider set — resumes.
-///
-/// A thin wrapper over the item engine ([`fetch_items_assigned`]): each child
-/// becomes a [`FetchItem`] keyed by its index and sharing ONE provider list,
-/// on `iroh_blobs::ALPN` under [`FailMode::FailFast`] — both forced here,
-/// whatever `opts` carries, so a collection can never be fetched isolated or
-/// from the collab store by accident.
-pub(crate) async fn fetch_children_assigned(
-    store: &Store,
-    endpoint: &Endpoint,
-    providers: Vec<EndpointId>,
-    root: Hash,
-    children: Vec<(u64, Hash)>,
-    opts: AssignmentOptions,
-) -> Result<AssignmentReport> {
-    anyhow::ensure!(
-        !providers.is_empty(),
-        "assignment loop needs at least one provider"
-    );
-    let providers = Arc::new(providers);
-    let items = children
-        .into_iter()
-        .map(|(index, hash)| FetchItem {
-            key: index.to_string(),
-            request: GetRequest::builder()
-                .child(index, ChunkRanges::all())
-                .build(root),
-            hash,
-            // A collection child's size is not known here; the budget's base
-            // is `opts.total_bytes`, the collection's announced size.
-            size: 0,
-            providers: Arc::clone(&providers),
-        })
-        .collect();
-    let opts = AssignmentOptions {
-        alpn: iroh_blobs::ALPN,
-        fail_mode: FailMode::FailFast,
-        ..opts
-    };
-    let (report, _results) = run_items(store, endpoint, items, opts, Some(root)).await?;
-    Ok(report)
-}
-
-/// Fetch a set of INDEPENDENT items, each from its own provider list, in one
-/// assignment run: one connection pool on `opts.alpn`, one hedge ledger, one
-/// per-provider state shared by every item.
-///
-/// Per item, the behaviour is exactly the collection child's: a progress
-/// deadline, the backoff ladder, hedging of the back half, and byte-level
-/// resume from `local_for_request(item.request)`. `opts.fail_mode` decides
-/// what a failed item does to the others; under [`FailMode::Isolate`] the call
-/// itself only fails for a reason no item owns, and every item's outcome is in
-/// the returned results, in input order.
-#[cfg_attr(not(test), allow(dead_code))] // its production caller (the wave-2 collab batch) is retired (wave 3 Task 15); the raw-item engine tests drive it
-pub(crate) async fn fetch_items_assigned(
-    store: &Store,
-    endpoint: &Endpoint,
-    items: Vec<FetchItem>,
-    opts: AssignmentOptions,
-) -> Result<(AssignmentReport, ItemResults)> {
-    run_items(store, endpoint, items, opts, None).await
-}
-
-/// The engine behind both entry points. `batch_root` is the collection root
-/// the collection wrapper logs its run under; `None` for a set of raw items.
-async fn run_items(
-    store: &Store,
-    endpoint: &Endpoint,
-    items: Vec<FetchItem>,
-    opts: AssignmentOptions,
-    batch_root: Option<Hash>,
-) -> Result<(AssignmentReport, ItemResults)> {
-    // Our own pool, not the downloader's: `Downloader` owns its pool privately
-    // and hands out no handle. Same defaults (1 s connect timeout, 5 s idle) —
-    // a connection stays warm across the items assigned to one provider, which
-    // is the whole reason to pool at all. ONE pool per call, whatever the item
-    // count.
-    let dialer = Dialer::Stock(open_pool(endpoint, opts.alpn));
-    let items: Vec<FetchItem<ProviderSet>> = items.into_iter().map(FetchItem::into_set).collect();
-    let remote: Remote = store.remote().clone();
-    let blobs: Blobs = store.blobs().clone();
-
-    // One hedge ledger for the run: the budget, the p95 window and the report
-    // counters. `total_bytes` is the batch's announced payload size, so the
-    // cap is 5 % of what this fetch is worth — not of what one item is.
-    let ledger: Ledger = Arc::new(Mutex::new(HedgeLedger {
-        budget: HedgeBudget::new(opts.total_bytes),
-        completions: CompletionWindow::default(),
-        hedges: 0,
-        hedge_bytes: 0,
-    }));
-
-    // Per-provider state is GLOBAL to the run — the union of every item's
-    // providers — so a provider's backoff, load and goodput follow it across
-    // items; each item only chooses among its own list.
-    let states: States = Arc::new(Mutex::new(
-        items
-            .iter()
-            .flat_map(|item| item.providers.current().iter().copied().collect::<Vec<_>>())
-            .map(|p| (p, ProviderState::default()))
-            .collect(),
-    ));
-
-    let item_count = items.len();
-    let labels: Vec<ItemLabel> = items
-        .iter()
-        .map(|i| ItemLabel {
-            key: i.key.clone(),
-            bytes: i.size,
-            providers: i.providers.clone(),
-        })
-        .collect();
-    let mut results: Vec<Option<Result<()>>> = (0..item_count).map(|_| None).collect();
-    let mut slot_of: HashMap<tokio::task::Id, usize> = HashMap::new();
-    let mut pending = items.into_iter().enumerate();
-    let mut set = tokio::task::JoinSet::new();
-
-    // Spawn and drain in the SAME loop rather than spawning all items behind a
-    // semaphore: a permit taken before `spawn` bounds concurrency just as well,
-    // but it leaves every not-yet-spawned item queued behind a swarm that is
-    // already failing, so a dead swarm would walk the backoff ladder once per
-    // item instead of once. Draining here also means the first item's error
-    // reaches us immediately, and under `FailFast` dropping the `JoinSet` on
-    // the way out aborts every sibling.
-    loop {
-        while set.len() < MAX_IN_FLIGHT {
-            let Some((slot, item)) = pending.next() else {
-                break;
-            };
-            if item.providers.current().is_empty() {
-                let e = anyhow::anyhow!("{}: no provider to assign it to", item.describe());
-                match opts.fail_mode {
-                    FailMode::FailFast => return Err(fail_with_report(&states, batch_root, e)),
-                    FailMode::Isolate => {
-                        results[slot] = Some(Err(isolated_failure(&states, &labels[slot], e)));
-                        continue;
-                    }
-                }
-            }
-            let handle = set.spawn(run_child(
-                dialer.clone(),
-                remote.clone(),
-                blobs.clone(),
-                Arc::clone(&states),
-                Arc::clone(&ledger),
-                item,
-                opts.clone(),
-                None,
-                None,
-            ));
-            slot_of.insert(handle.id(), slot);
-        }
-        let (id, outcome) = match set.join_next_with_id().await {
-            Some(Ok((id, outcome))) => (id, outcome),
-            Some(Err(join)) => (
-                join.id(),
-                Err(anyhow::Error::new(join).context("assignment task panicked")),
-            ),
-            None => break,
-        };
-        let slot = slot_of
-            .remove(&id)
-            .expect("every spawned assignment task is registered under its id");
-        match outcome {
-            Ok(()) => {
-                if opts.fail_mode == FailMode::Isolate {
-                    let label = &labels[slot];
-                    tracing::debug!(
-                        frame_uuid = %label.key,
-                        bytes = label.bytes,
-                        outcome = "ok",
-                        "blob fetch finished"
-                    );
-                }
-                results[slot] = Some(Ok(()));
-            }
-            Err(e) => match opts.fail_mode {
-                FailMode::FailFast => return Err(fail_with_report(&states, batch_root, e)),
-                FailMode::Isolate => {
-                    results[slot] = Some(Err(isolated_failure(&states, &labels[slot], e)));
-                }
-            },
-        }
-    }
-
-    let report = report_from_with_ledger(&states, &ledger);
-    tracing::debug!(
-        root_hash = batch_root.map(tracing::field::display),
-        count = item_count,
-        providers = report.per_provider.len(),
-        stalls = report.stalls,
-        hedges = report.hedges,
-        bytes = report.total_bytes(),
-        "assignment loop finished"
-    );
-    let results = labels
-        .into_iter()
-        .zip(results)
-        .map(|(label, r)| {
-            let r = r.unwrap_or_else(|| {
-                // Unreachable: every item is either spawned (and joined) or
-                // failed before spawning. Loud if that ever stops being true.
-                debug_assert!(false, "assignment item {} produced no result", label.key);
-                tracing::error!(frame_uuid = %label.key, "assignment item produced no result");
-                Err(anyhow::anyhow!("assignment item produced no result"))
-            });
-            (label.key, r)
-        })
-        .collect();
-    Ok((report, results))
-}
-
 /// What the result loop keeps of an item once the item itself has moved into
 /// its task.
 struct ItemLabel {
@@ -1184,10 +810,8 @@ struct ItemLabel {
     providers: ProviderSet,
 }
 
-/// Log one item's failure under [`FailMode::Isolate`] and hand the error back
-/// for its result slot — carrying the last provider fault among the ITEM's own
-/// providers, the per-item counterpart of what [`fail_with_report`] attaches
-/// to a fail-fast error.
+/// Log one live item's failure and hand the error back for its outcome —
+/// carrying the last provider fault among the ITEM's own providers.
 fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> anyhow::Error {
     // A live item every provider refused keeps that cause outermost, so the
     // scheduler reads it as such (its message starts with it).
@@ -1208,30 +832,6 @@ fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> any
         "blob fetch finished"
     );
     e
-}
-
-/// Log the per-provider picture the run ended on, and give the caller's error
-/// the provider fault that most recently explained it.
-///
-/// A bare "every provider exhausted" says nothing a user or a log reader can
-/// act on; the swarm's own last real cause (a refused dial, a reset stream)
-/// does, and it is already on the state we are about to drop.
-fn fail_with_report(states: &States, root: Option<Hash>, err: anyhow::Error) -> anyhow::Error {
-    let report = report_from(states);
-    let cause = last_failure_cause(states, None);
-    tracing::error!(
-        root_hash = root.map(tracing::field::display),
-        providers = report.per_provider.len(),
-        stalls = report.stalls,
-        bytes = report.total_bytes(),
-        count = report.total_children(),
-        error = %cause.as_deref().unwrap_or("no provider reported an error (every failure was a stall)"),
-        "assignment loop failed"
-    );
-    match cause {
-        Some(c) => err.context(format!("last provider fault: {c}")),
-        None => err,
-    }
 }
 
 /// The most recently recorded `TransferFault::Failed` cause across providers
@@ -1257,7 +857,7 @@ fn last_failure_cause(states: &States, among: Option<&[EndpointId]>) -> Option<S
 ///   `opts.max_in_flight` are in flight and no yield is requested.
 /// - **Results** go out on `done` the moment each item ends, so the caller
 ///   lands a frame at once rather than at the end of a batch. Items are
-///   always isolated: one item's failure is its own ([`FailMode::Isolate`]).
+///   always isolated: one item's failure is its own.
 /// - **Verdicts** — refusals, busy providers, corrupt bytes, failed dials —
 ///   go out on `verdicts` for the scheduler's per-provider health.
 /// - **Cancel.** An item's switch set to `true` stops that item alone; its
@@ -1276,7 +876,6 @@ fn last_failure_cause(states: &States, among: Option<&[EndpointId]>) -> Option<S
 /// Items still queued in the channel when a yield returns are dropped with
 /// the receiver and get NO outcome on `done`: the caller re-derives them
 /// from its need set (T15).
-#[allow(dead_code)] // driven by the live scheduler (Tasks 13-15) and the tests
 pub(crate) async fn run_live(
     store: &Store,
     dialer: Dialer,
@@ -1300,10 +899,7 @@ pub(crate) async fn run_live(
     let child_opts = AssignmentOptions {
         stall_hard_limit: opts.stall_hard_limit,
         hedging: opts.hedging,
-        total_bytes: 0,
         telemetry: Arc::clone(&opts.telemetry),
-        alpn: super::COLLAB_BLOBS_ALPN,
-        fail_mode: FailMode::Isolate,
         delivered: opts.delivered.clone(),
     };
     let mut set: tokio::task::JoinSet<ItemOutcome> = tokio::task::JoinSet::new();
@@ -1549,7 +1145,7 @@ async fn run_child(
     blobs: Blobs,
     states: States,
     ledger: Ledger,
-    item: FetchItem<ProviderSet>,
+    item: FetchItem,
     opts: AssignmentOptions,
     verdicts: Option<VerdictSink>,
     transferring: Option<Arc<AtomicBool>>,
@@ -2261,7 +1857,7 @@ async fn try_arm_hedge(
     states: &States,
     ledger: &Ledger,
     opts: &AssignmentOptions,
-    item: &FetchItem<ProviderSet>,
+    item: &FetchItem,
     candidates: &[EndpointId],
     primary: EndpointId,
     started: Instant,
@@ -2421,10 +2017,10 @@ async fn transfer_once(
 ) -> std::result::Result<Stats, TransferFault> {
     let conn = dial(&dialer, provider).await?;
 
-    // The stock `ConnectionRef` holds the pool's permit, a `PooledConn` keeps
-    // the collab connection from idling out; either stays alive for the whole
-    // transfer and is dropped with this function, leaving the connection warm.
-    let get = remote.execute_get(conn.connection(), request);
+    // The `PooledConn` keeps the collab connection from idling out; it stays
+    // alive for the whole transfer and is dropped with this function, leaving
+    // the connection warm.
+    let get = remote.execute_get(conn.conn.clone(), request);
     let mut stream = std::pin::pin!(get.stream());
 
     let mut last_bytes = 0u64;
@@ -2482,15 +2078,8 @@ async fn transfer_once(
 async fn dial(
     dialer: &Dialer,
     provider: EndpointId,
-) -> std::result::Result<DialedConn, TransferFault> {
+) -> std::result::Result<PooledConn, TransferFault> {
     match dialer {
-        Dialer::Stock(pool) => pool
-            .get_or_connect(provider)
-            .await
-            .map(DialedConn::Stock)
-            .map_err(|e| TransferFault::DialFailed {
-                error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
-            }),
         Dialer::Collab { pool, addrs } => {
             let Some(addr) = addrs(&provider) else {
                 return Err(TransferFault::DialFailed {
@@ -2498,12 +2087,9 @@ async fn dial(
                 });
             };
             // The pool logs the failure itself (`collab dial failed`).
-            pool.get(addr)
-                .await
-                .map(DialedConn::Collab)
-                .map_err(|e| TransferFault::DialFailed {
-                    error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
-                })
+            pool.get(addr).await.map_err(|e| TransferFault::DialFailed {
+                error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
+            })
         }
     }
 }

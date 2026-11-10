@@ -64,20 +64,18 @@ pub fn noop_fetch_sink() -> FetchSink {
     Arc::new(|_| {})
 }
 
-/// A per-provider telemetry event from a multi-source (swarm) fetch —
-/// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi), D3 §3.1.3.
+/// A per-provider telemetry event from a multi-source (swarm) fetch — the live
+/// collab fetch engine (`sharing::iroh::assign::run_live`).
 ///
-/// A swarm fetch runs one request per collection child across the whole provider
-/// set, and the downloader's progress stream is the ONLY place that says which
-/// provider a given child is being pulled from. The scalar [`fetch`] drops those
-/// items on the floor; the swarm fetch routes them here, so a caller can journal
-/// per-provider transitions and drive a live "downloading from N sources" figure.
+/// A swarm fetch runs one request per item across the whole provider set; this
+/// stream says which provider an item is being pulled from, so a caller can
+/// journal per-provider transitions and drive a live "downloading from N
+/// sources" figure.
 ///
 /// Advisory telemetry, never control flow: a provider reported [`Failed`] is
-/// retried against the next provider by the downloader's own failover, and a
+/// retried against the next provider by the engine's own failover, and a
 /// caller that discards every event changes nothing about the transfer.
 ///
-/// [`fetch`]: SharingTransport::fetch
 /// [`Failed`]: ProviderEvent::Failed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderEvent {
@@ -99,17 +97,9 @@ pub enum ProviderEvent {
 /// channel meanwhile, so a callback avoids the backpressure a shared channel
 /// would risk).
 ///
-/// **This stream is a SAMPLE, not a ledger.** The underlying blob downloader
-/// buffers each child's events in its own small channel and drops whatever it
-/// has not drained by the time the last child finishes, so an arbitrary share of
-/// the events never arrives — the faster the transfer, the bigger the share
-/// (a localhost fetch can surface a fraction of its children; a slow
-/// real-network one surfaces most). The consumer's contract follows from that:
-/// drive advisory UI and journal lines, never a correctness decision. A provider
-/// that never appears here may well have served half the collection, so do not
-/// derive a provider count, a "this holder is dead" verdict, or a
-/// retry/fallback trigger from it. Details and the upstream mechanism are in
-/// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi)'s doc.
+/// **This stream is advisory.** Drive UI and journal lines from it, never a
+/// correctness decision: a provider's byte counters are the ground truth about
+/// who served what, and the transfer's own `Result` is the outcome.
 pub type ProviderTelemetrySink = Arc<dyn Fn(ProviderEvent) + Send + Sync>;
 
 /// A [`ProviderTelemetrySink`] that discards every event — for call sites that
@@ -190,39 +180,6 @@ pub trait SharingTransport: Send + Sync {
         dest_dir: &Path,
         sink: FetchSink,
     ) -> anyhow::Result<()>;
-
-    /// Pull one collection, identified by its `root_hash`, from MANY `providers`
-    /// at once into `dest_dir` — the swarm fetch (D3 §3.1).
-    ///
-    /// Unlike [`fetch`](Self::fetch), which pulls a package announced by ONE
-    /// peer, this takes the holder set as given (the hub's holder list, minus
-    /// self) and lets the blob layer split the collection across it: one request
-    /// per child blob, each with the full provider set behind it, so a holder
-    /// that dies mid-transfer costs its children a provider switch with
-    /// byte-level resume instead of costing the fetch. `providers` is a
-    /// snapshot: no live re-discovery mid-fetch.
-    ///
-    /// `sink` receives the same per-file/batch [`FetchEvent`]s as `fetch`;
-    /// `telemetry` receives the per-provider [`ProviderEvent`]s only a
-    /// multi-source fetch can produce (pass [`noop_provider_telemetry`] when
-    /// they are not consumed).
-    ///
-    /// The default bails: the in-process loopback mock and Perseus have no
-    /// swarm to fetch from, and a transport without multi-source support must
-    /// fail loudly rather than silently degrade to a single provider — the
-    /// caller's fallback is an explicit code path, not an accident.
-    async fn fetch_collection_multi(
-        &self,
-        providers: Vec<NodeId>,
-        root_hash: &str,
-        byte_size: u64,
-        dest_dir: &Path,
-        sink: FetchSink,
-        telemetry: ProviderTelemetrySink,
-    ) -> anyhow::Result<()> {
-        let _ = (providers, root_hash, byte_size, dest_dir, sink, telemetry);
-        anyhow::bail!("transport does not support multi-source fetch")
-    }
 
     /// Pull ONLY the package manifest (`manifest.ndjson`) from `from` into
     /// `dest_dir`, returning its path. The real transport fetches just the

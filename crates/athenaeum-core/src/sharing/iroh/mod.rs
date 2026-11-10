@@ -68,6 +68,9 @@ use super::types::{
 use super::{FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::DedupResponder;
 
+// The live collab fetch engine; its one production caller (`api::collab_live`)
+// needs `render` + `solver`, so a headless build compiles it for tests only.
+#[cfg(any(test, all(feature = "render", feature = "solver")))]
 pub(crate) mod assign;
 pub mod blobs;
 pub mod collab_pool;
