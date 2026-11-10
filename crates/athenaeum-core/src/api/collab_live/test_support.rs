@@ -374,7 +374,7 @@ pub(crate) fn live_dialer(me: &SharedIrohNode, providers: &[&SharedIrohNode]) ->
     // Pool events are the scheduler's business; the run itself does not
     // need them, so the receiver is simply dropped.
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
-    Dialer::Collab {
+    Dialer {
         pool: crate::sharing::iroh::collab_pool::CollabPool::new(me.endpoint(), events),
         addrs: Arc::new(move |id| book.get(id).cloned()),
     }
@@ -2359,7 +2359,7 @@ impl RelayPair {
         let id = self.provider_addr.id;
         let book = self.provider_addr.clone();
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
-        let dialer = Dialer::Collab {
+        let dialer = Dialer {
             pool: crate::sharing::iroh::collab_pool::CollabPool::new(
                 self.fetcher.endpoint(),
                 events,

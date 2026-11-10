@@ -1,77 +1,57 @@
-//! A2a — our own swarm assignment loop over `store.remote()` (D4 §4.5, T4).
+//! The live collab fetch engine: [`run_live`] over `store.remote()`.
 //!
-//! This module is the live collab fetch engine ([`run_live`]); it replaced
-//! iroh-blobs' `SplitStrategy::Split` fan-out (the package-era batch swarm
-//! fetch, removed 2026-11-10). The stock loop
-//! (`iroh_blobs::api::downloader::execute_get`) is a strictly sequential
-//! first-fit walk of the provider list per child: dial, `local_for_request`,
-//! `execute_get_sink`, and on an `Err` `continue` to the next provider, asking
-//! it only for `local.missing()`. That is sound and its byte-level resume is
-//! free — but it switches providers **only on an error**, never on
-//! uselessness, and it throws away the `get::Stats` every transfer produces.
+//! Frames arrive on a channel as [`LiveItem`]s. Each is one raw blob with its
+//! own `GetRequest`, hash, [`ProviderSet`] and cancel switch; the run assigns it
+//! to a provider, moves the bytes still missing, and sends its [`ItemOutcome`]
+//! the moment it ends. One item's failure is its own result and never aborts a
+//! sibling. Every round recomputes the missing range from the local store, so a
+//! reassignment resumes at the byte and never restarts the frame.
 //!
-//! D4 §1(б) calls that the correctness defect: a peer that accepts the
-//! connection and then dribbles 20 KB/s never errors, so the child request
-//! never moves, and if it is the last child of a package the whole package
-//! waits for it. This loop adds the two things the stock one cannot have:
+//! ## Providers and back-off
 //!
-//! - a **progress deadline** per assignment — no growth in the request's
-//!   `bytes_read` for [`STALL_HARD_LIMIT`] is a provider failure, whatever QUIC
-//!   thinks (D4 §6, the `piece_timeout = 20 s` precedent);
-//! - **per-provider accounting** ([`ProviderStats`]) — the ground truth the
-//!   stock downloader discards, and the input A4's ranking will need.
+//! Per-provider state is run-wide: one ledger ([`ProviderStats`]), one back-off
+//! ladder and one in-flight count per provider, whichever items it serves.
+//! [`pick_provider`] is a deliberately dumb least-loaded pick, kept as ONE
+//! function so a ranking is one edit. A [`ProviderSet`] may be live: a provider
+//! that appears is picked up at the item's next round, and an item with no
+//! provider sleeps until one appears.
 //!
-//! Everything else is deliberately the same as upstream, because it already
-//! works: one `GetRequest` per item, the missing-range recomputed
-//! from the local store before every attempt (so a reassignment resumes at the
-//! byte, never restarts the frame), and the full provider set available to
-//! every item.
+//! [`EVICT_AFTER_FAILURES`] consecutive failures put a provider in back-off
+//! (`BACKOFF_BASE`, doubling per further failure up to `BACKOFF_MAX_RUNGS`
+//! rungs). An item that finds every provider parked waits for the earliest and
+//! tries again, at most `MAX_BACKOFF_ROUNDS` times. A refusal is read, not
+//! struck: `ERR_LIMIT` parks the provider for [`LIMIT_RETRY`], `ERR_PERMISSION`
+//! excludes it for that item only, and bytes that fail verification exclude it
+//! for the item and strike it like any failure.
 //!
-//! ## Independent items
+//! ## The stall ceiling
 //!
-//! The engine runs over [`FetchItem`]s — each with its own `GetRequest`, hash
-//! and provider list. Collab frames are raw blob items with per-frame holders
-//! on the collab ALPN, where one item's failure is its own result and never
-//! aborts a sibling. Per-provider state is run-wide: one pool, one ledger, one
-//! backoff ladder per provider, whichever items it serves.
+//! An assignment whose `bytes_read` has not grown for [`STALL_HARD_LIMIT`] is a
+//! provider failure, whatever QUIC thinks: a peer that accepts the connection
+//! and then dribbles 20 KB/s never errors, so without this deadline the item
+//! would never move off it.
 //!
 //! ## Hedging
 //!
-//! Task 8 added the second, racing assignment: while a child's primary
-//! transfer runs unhedged, it is re-evaluated every
+//! While an item's primary transfer runs unhedged it is re-evaluated every
 //! [`HEDGE_REEVALUATE_INTERVAL`] against the trigger `max(p95 of recent
-//! completions, [`HEDGE_EXPECTED_MULTIPLIER`] × expected)` — late by either
-//! measure arms a hedge on a different provider for the BACK HALF of the
-//! child's still-missing range, split at the midpoint
-//! ([`split_missing_at_midpoint`]), under a gRPC-shaped [`HedgeBudget`] that
-//! caps total spend at [`HEDGE_BUDGET_RATIO`] of the collection. Whichever
-//! side finishes first wins the round; the loser is cancelled by dropping its
-//! `GetProgress` stream (see Cancellation above), which is enough — no pooled
-//! connection needs closing. A primary that fails while its hedge is still
-//! live does not cancel the hedge: the hedge is a real transfer, not a
-//! speculative copy, so it is promoted and carries the round alone
-//! (`primary_gone`). See [`try_arm_hedge`] for the trigger and the budget
-//! check, and [`HedgeBudget`] for the accounting.
-//!
-//! No persistence, no ranking: [`pick_provider`] is a deliberately dumb
-//! least-loaded pick, kept as ONE function so A4's `RankedProviders` is one
-//! edit.
-//!
-//! ## The live run
-//!
-//! Collab v3 wave 3 (spec §7.2, §7.3, §8) adds [`run_live`]: the same child
-//! loop fed from a channel of [`LiveItem`]s, each result sent the moment it
-//! lands, over a [`ProviderSet`] that may be live (providers appear while an
-//! item waits) and through the dedicated collab pool ([`Dialer::Collab`]).
-//! Every path now reads the provider's refusal: `ERR_LIMIT` is a busy
-//! provider retried after [`LIMIT_RETRY`] with no strike, `ERR_PERMISSION`
-//! excludes the provider for that item only.
+//! completions, [`HEDGE_EXPECTED_MULTIPLIER`] × expected)`. Late by either
+//! measure arms a hedge on a different provider for the BACK HALF of the item's
+//! still-missing range, split at the midpoint ([`split_missing_at_midpoint`]).
+//! A hedge is paid from the [`HedgeBudget`], whose cap follows the items in
+//! flight: the larger of [`HEDGE_BUDGET_RATIO`] of their bytes and half the
+//! largest one, so a run can always afford one hedge of its largest item.
+//! Whichever side finishes first wins the round and the loser is cancelled (see
+//! Cancellation below). A primary that fails while its hedge is still live does
+//! not cancel the hedge: it is a real transfer, so it is promoted and carries
+//! the round alone (`primary_gone`). See [`try_arm_hedge`] for the trigger and
+//! the budget check.
 //!
 //! ## Progress truth
 //!
-//! Nothing here emits UI progress. D4 T7 fixed `store.observe()` as the single
-//! progress oracle — the get streams are consumed here only to watch for
-//! movement, and the `Progress(u64)` values never leave this module.
+//! Nothing here emits UI progress. `store.observe()` is the single progress
+//! oracle: the get streams are consumed here only to watch for movement, and
+//! the `Progress(u64)` values never leave this module.
 //!
 //! ## Cancellation
 //!
@@ -92,7 +72,7 @@
 //!    promptly.
 //!
 //! The pooled `ConnectionRef` is dropped with it, releasing the pool permit
-//! while leaving the connection warm for the next child — which is what we
+//! while leaving the connection warm for the next item — which is what we
 //! want: a stalled peer is not necessarily a dead one, and closing its
 //! connection would make the next attempt pay a fresh handshake.
 
@@ -192,8 +172,8 @@ const GOODPUT_ALPHA: f64 = 0.25;
 /// bound if it ever went to disk on a cold cache.
 const HEDGE_REEVALUATE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Per-provider transfer facts — the ground truth the stock downloader throws
-/// away (`Ok(_stats)`).
+/// Per-provider transfer facts — what each provider actually moved, for the
+/// run's report.
 ///
 /// `bytes` is payload bytes THIS provider delivered: `Stats.payload_bytes_read`
 /// on a completed assignment, and the last observed progress value on one that
@@ -210,9 +190,6 @@ pub(crate) struct ProviderStats {
 }
 
 /// What one assignment run did, per provider plus the swarm-wide counters.
-///
-/// `hedges` / `hedge_bytes` are Task 8's; they are reported as `0` here rather
-/// than omitted so the shape does not move when hedging lands.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AssignmentReport {
     pub per_provider: HashMap<EndpointId, ProviderStats>,
@@ -234,13 +211,12 @@ impl AssignmentReport {
         self.per_provider.values().map(|s| s.bytes).sum()
     }
 
-    /// Total children some provider carried to completion (test oracle).
+    /// Total items some provider carried to completion (test oracle).
     ///
-    /// Report-only: a child already complete at its first round (a resumed
-    /// fetch finding it already local) or a duplicate-hash entry never runs
-    /// `record_success`, so it is credited to nobody and this sum undercounts
-    /// the collection's own child count by exactly that many. Nothing here
-    /// re-derives that figure from the collection to true it up.
+    /// Report-only: an item already complete at its first round (a resumed
+    /// fetch finding it already local) never runs `record_success`, so it is
+    /// credited to nobody and this sum undercounts the run's items by exactly
+    /// that many.
     #[cfg(test)]
     pub(crate) fn total_children(&self) -> u32 {
         self.per_provider.values().map(|s| s.children).sum()
@@ -281,9 +257,9 @@ impl CompletionWindow {
 /// network into a byte storm (D4 §4.5).
 ///
 /// **It starts FULL.** The design says what the bucket EARNS
-/// ([`HEDGE_BUDGET_RATIO`] × the bytes of every completed child) and what it is
+/// ([`HEDGE_BUDGET_RATIO`] × the bytes of every completed item) and what it is
 /// capped at, but not where it starts; a bucket that starts empty can never pay
-/// for the very first hedge, which is the one that matters on a package whose
+/// for the very first hedge, which is the one that matters on a run whose
 /// first assignment lands on a useless peer. Starting full is also what a token
 /// bucket means everywhere else, and the cap still bounds the total spend.
 ///
@@ -341,8 +317,7 @@ impl HedgeBudget {
     }
 
     /// A live run's item joins the run: the cap grows to what the items in
-    /// flight call for, and the tokens grow by the same amount, as if the item
-    /// had been part of the batch from the start.
+    /// flight call for, and the tokens grow by the same amount.
     fn extend(&mut self, bytes: u64) {
         *self.in_flight.entry(bytes).or_insert(0) += 1;
         self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes);
@@ -382,8 +357,8 @@ impl HedgeBudget {
     ///
     /// The comparison is `>=`, not `>`, and that is load-bearing rather than
     /// cosmetic: tokens land on EXACTLY `cap / 2` in an ordinary case — two
-    /// providers splitting the children evenly, where completed bytes are half
-    /// the collection and the cap is 5 % of it — and a strict `>` refused every
+    /// providers splitting the items evenly, where completed bytes are half
+    /// the run's bytes and the cap is 5 % of them — and a strict `>` refused every
     /// hedge there for pure arithmetic reasons. Controller ruling R1.
     fn try_charge(&mut self, bytes: u64) -> bool {
         let want = bytes as f64;
@@ -425,27 +400,25 @@ pub(crate) struct AssignmentOptions {
     /// [`STALL_HARD_LIMIT`]; tests shorten it so a deliberately trickling peer
     /// trips it inside a test's patience.
     pub stall_hard_limit: Duration,
-    /// A2b: race a second assignment for the back half of a slow child's
-    /// missing range, under [`HedgeBudget`].
+    /// Race a second assignment for the back half of a slow item's missing
+    /// range, under [`HedgeBudget`].
     pub hedging: bool,
     /// Per-provider attempt telemetry (advisory).
     pub telemetry: ProviderTelemetrySink,
     /// Fed the exact bytes a transfer just moved, per (item key, provider) —
-    /// `None` for every caller that has no receive-feed UI to keep (Task 10).
+    /// `None` for every caller that has no receive-feed UI to keep.
     pub delivered: Option<DeliveredSink>,
 }
 
 /// One independently fetched blob: its own request, its own provider list,
 /// its own result.
 ///
-/// `request` is `GetRequest::blob(hash)` for a raw blob, or
-/// `GetRequest::builder().child(i, ChunkRanges::all()).build(root)` for a
-/// collection child — the engine never builds a request itself, it only
-/// narrows this one's ranges for a hedge ([`hedge_back_half_request`]).
-/// `hash` is the blob the request lands (the child's own hash for a child
-/// request), which the hedge observes. `size` is the caller's announced size,
-/// informational only (`0` when unknown); the live run extends its hedge
-/// budget by it ([`HedgeBudget::extend`]).
+/// `request` is `GetRequest::blob(hash)` for a raw blob — the engine never
+/// builds a request itself, it only narrows this one's ranges for a hedge
+/// ([`hedge_back_half_request`]). `hash` is the blob the request lands, which
+/// the hedge observes. `size` is the caller's announced size, informational
+/// only (`0` when unknown); the live run extends its hedge budget by it
+/// ([`HedgeBudget::extend`]).
 ///
 /// `providers` is a [`ProviderSet`], which may be live ([`run_live`]).
 pub(crate) struct FetchItem {
@@ -460,8 +433,8 @@ pub(crate) struct FetchItem {
 }
 
 impl FetchItem {
-    /// How error messages name the item. A child keeps the exact wording the
-    /// collection path always used (`child {index} of {root}`).
+    /// How error messages name the item. A request that is not a raw blob is
+    /// named `child {index} of {root}`.
     fn describe(&self) -> String {
         if self.request.ranges.is_blob() {
             format!("blob {} ({})", self.key, self.hash)
@@ -581,10 +554,8 @@ pub(crate) fn is_refused_by_every_provider(e: &anyhow::Error) -> bool {
 /// minor). A round that ends in a hedge win or a fault and goes straight
 /// into the next round stays "transferring", so a yield never cuts an item
 /// whose blob is about to be complete (the hedge-win window).
-fn set_transferring(flag: &Option<Arc<AtomicBool>>, on: bool) {
-    if let Some(f) = flag {
-        f.store(on, Ordering::Release);
-    }
+fn set_transferring(flag: &AtomicBool, on: bool) {
+    flag.store(on, Ordering::Release);
 }
 
 /// How the live run finds a provider's dial address (the scheduler's holder
@@ -594,15 +565,13 @@ pub(crate) type ProviderAddrs =
 
 /// How transfers get their connection.
 ///
-/// `Collab` is the dedicated collab pool (spec §7.3): one kept-open connection
-/// per provider, dialled with its own transport config at the address `addrs`
+/// The dedicated collab pool (spec §7.3): one kept-open connection per
+/// provider, dialled with its own transport config at the address `addrs`
 /// gives.
 #[derive(Clone)]
-pub(crate) enum Dialer {
-    Collab {
-        pool: Arc<CollabPool>,
-        addrs: ProviderAddrs,
-    },
+pub(crate) struct Dialer {
+    pub(crate) pool: Arc<CollabPool>,
+    pub(crate) addrs: ProviderAddrs,
 }
 
 /// One frame handed to [`run_live`], with its own cancel switch: `true`
@@ -665,27 +634,25 @@ pub(crate) struct LiveRunOptions {
     /// has moved this many bytes since the yield.
     pub unit_cap_bytes: u64,
     /// Fed the exact bytes a transfer just moved, per (item key, provider) —
-    /// forwarded into every child [`AssignmentOptions`] this run builds
-    /// (Task 10). `None` when nothing downstream wants the receive feed.
+    /// forwarded into every item's [`AssignmentOptions`] this run builds.
+    /// `None` when nothing downstream wants the receive feed.
     pub delivered: Option<DeliveredSink>,
 }
 
-/// Why one assignment ended without the child's bytes.
+/// Why one assignment ended without the item's bytes.
 ///
 /// Every variant carries the bytes the attempt did move, because that is what
-/// the provider is credited with and — Task 8 — what tells a hedge whether the
-/// loser was worth anything.
+/// the provider is credited with and what tells a hedge whether the loser was
+/// worth anything.
 ///
 /// `Refused`, `Busy` and `Corrupt` read the provider's answer (spec §7.2,
-/// T12 ruling R2). The personal provider never refuses a get with a code, so
-/// on the personal path only `Corrupt` can occur, and it is struck exactly
-/// like the `Failed` it used to be.
+/// T12 ruling R2).
 #[derive(Debug)]
 enum TransferFault {
     /// No growth in `bytes_read` for `stall_hard_limit`. No error was raised;
-    /// this is the judgement the stock loop cannot make.
+    /// this is a judgement the transport cannot make.
     Stalled { bytes: u64 },
-    /// The transfer errored — the stock loop's own trigger.
+    /// The transfer errored.
     Failed { bytes: u64, error: anyhow::Error },
     /// The dial failed. Struck exactly like `Failed`; told apart only so the
     /// live run can report it ([`LiveVerdict::DialFailed`]).
@@ -872,7 +839,7 @@ fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> any
     let cause = if is_refused_by_every_provider(&e) {
         None
     } else {
-        last_failure_cause(states, Some(&label.providers.current()))
+        last_failure_cause(states, &label.providers.current())
     };
     let e = match cause {
         Some(c) => e.context(format!("last provider fault: {c}")),
@@ -888,30 +855,27 @@ fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> any
     e
 }
 
-/// The most recently recorded `TransferFault::Failed` cause across providers
-/// — every provider of the run (`None`), or only `among`.
-fn last_failure_cause(states: &States, among: Option<&[EndpointId]>) -> Option<String> {
+/// The most recently recorded `TransferFault::Failed` cause among the
+/// providers `among`.
+fn last_failure_cause(states: &States, among: &[EndpointId]) -> Option<String> {
     let guard = states.lock().expect("assignment states mutex poisoned");
-    let scoped: Vec<&ProviderState> = match among {
-        None => guard.values().collect(),
-        Some(ids) => ids.iter().filter_map(|p| guard.get(p)).collect(),
-    };
-    scoped
-        .into_iter()
+    among
+        .iter()
+        .filter_map(|p| guard.get(p))
         .filter_map(|st| Some((st.last_error_at?, st.last_error.clone()?)))
         .max_by_key(|(at, _)| *at)
         .map(|(_, cause)| cause)
 }
 
 /// The live assignment run (spec §7.2, §8 receive side): the item engine fed
-/// from a channel instead of a batch.
+/// from a channel.
 ///
 /// - **Items** arrive on `items`, each with a [`ProviderSet`] (usually live)
 ///   and its own cancel switch. One is taken only while fewer than
 ///   `opts.max_in_flight` are in flight and no yield is requested.
 /// - **Results** go out on `done` the moment each item ends, so the caller
-///   lands a frame at once rather than at the end of a batch. Items are
-///   always isolated: one item's failure is its own.
+///   lands a frame at once. Items are isolated: one item's failure is its
+///   own.
 /// - **Verdicts** — refusals, busy providers, corrupt bytes, failed dials —
 ///   go out on `verdicts` for the scheduler's per-provider health.
 /// - **Cancel.** An item's switch set to `true` stops that item alone; its
@@ -942,7 +906,7 @@ pub(crate) async fn run_live(
     let remote: Remote = store.remote().clone();
     let blobs: Blobs = store.blobs().clone();
     // The hedge budget follows the items in flight (`HedgeBudget::extend` /
-    // `retire`): a live run has no batch size to take 5 % of.
+    // `retire`), so there is no fixed total to take 5 % of.
     let ledger: Ledger = Arc::new(Mutex::new(HedgeLedger {
         budget: HedgeBudget::live(),
         completions: CompletionWindow::default(),
@@ -1041,8 +1005,8 @@ pub(crate) async fn run_live(
                         Arc::clone(&ledger),
                         item,
                         child_opts.clone(),
-                        Some(verdicts.clone()),
-                        Some(Arc::clone(&transferring)),
+                        verdicts.clone(),
+                        Arc::clone(&transferring),
                     );
                     let cut = cut_at_yield(
                         yield_now.clone(),
@@ -1190,8 +1154,8 @@ async fn local_bytes(blobs: &Blobs, hash: Hash) -> u64 {
 /// One child: pick a provider, transfer what is still missing, repeat until the
 /// child is complete locally or the ladder runs out.
 ///
-/// `verdicts` is the live run's channel ([`run_live`]); `None` on the batch
-/// paths, which then behave exactly as before the live run existed.
+/// `verdicts` is the live run's channel ([`run_live`]); `transferring` is the
+/// item's flag for [`cut_at_yield`].
 #[allow(clippy::too_many_arguments)]
 async fn run_child(
     dialer: Dialer,
@@ -1201,25 +1165,23 @@ async fn run_child(
     ledger: Ledger,
     item: FetchItem,
     opts: AssignmentOptions,
-    verdicts: Option<VerdictSink>,
-    transferring: Option<Arc<AtomicBool>>,
+    verdicts: VerdictSink,
+    transferring: Arc<AtomicBool>,
 ) -> Result<()> {
     let request = item.request.clone();
-    // Log fields keep the collection path's names: `root_hash` is the hash the
-    // request addresses (the collection root, or the raw blob itself), `child`
-    // is the item's key (the child index for a collection).
+    // Log field names are a spec: `root_hash` is the hash the request
+    // addresses (the raw blob itself), `child` is the item's key.
     let root = item.request.hash;
     let index = item.key.as_str();
     let hash = item.hash;
     let mut providers = item.providers.clone();
-    // Providers this item will not ask again: a refusal (`ERR_PERMISSION`)
-    // on the live and batch paths alike, and on the live path also a
-    // provider whose bytes failed verification (spec §7.2, §7.3).
+    // Providers this item will not ask again: one that refused it
+    // (`ERR_PERMISSION`) or whose bytes failed verification (spec §7.2, §7.3).
     let mut excluded: HashSet<EndpointId> = HashSet::new();
     let faults = FaultScope {
         states: &states,
         opts: &opts,
-        verdicts: verdicts.as_ref(),
+        verdicts: &verdicts,
         key: index,
         hash,
     };
@@ -1229,8 +1191,7 @@ async fn run_child(
     let mut forced: Option<EndpointId> = None;
     'child: loop {
         // Recomputed EVERY round, so a reassignment asks the next provider only
-        // for the bytes still missing — the byte-level resume upstream gets for
-        // free and we must not lose.
+        // for the bytes still missing, resuming at the byte.
         let local = remote
             .local_for_request(request.clone())
             .await
@@ -1605,21 +1566,19 @@ async fn run_child(
 struct FaultScope<'a> {
     states: &'a States,
     opts: &'a AssignmentOptions,
-    verdicts: Option<&'a VerdictSink>,
-    /// The item's key (a frame uuid on the collab paths).
+    verdicts: &'a VerdictSink,
+    /// The item's key (a frame uuid).
     key: &'a str,
     hash: Hash,
 }
 
 impl FaultScope<'_> {
     fn verdict(&self, v: LiveVerdict) {
-        if let Some(tx) = self.verdicts {
-            if tx.send(v).is_err() {
-                tracing::debug!(
-                    frame_uuid = self.key,
-                    "live verdict dropped: nobody is listening"
-                );
-            }
+        if self.verdicts.send(v).is_err() {
+            tracing::debug!(
+                frame_uuid = self.key,
+                "live verdict dropped: nobody is listening"
+            );
         }
     }
 }
@@ -1627,15 +1586,14 @@ impl FaultScope<'_> {
 /// Book one provider's fault against it (spec §7.2, §7.3, T12 ruling R2).
 ///
 /// - `Stalled`, `Failed`, `DialFailed`: the backoff ladder
-///   ([`record_failure`]) and a `Failed` telemetry event — unchanged.
+///   ([`record_failure`]) and a `Failed` telemetry event.
 /// - `Busy` (`ERR_LIMIT`): the provider is skipped for [`LIMIT_RETRY`] for
 ///   every hash; no strike, no fault telemetry.
 /// - `Refused` (`ERR_PERMISSION`): excluded for this item only; no strike,
 ///   no fault telemetry. On a live set the exclusion ends when the provider
 ///   leaves the set and comes back.
-/// - `Corrupt` (verification failed): struck like any failure; on the live
-///   path also excluded for this item. The batch paths keep retrying it on
-///   the ladder exactly as they always did.
+/// - `Corrupt` (verification failed): struck like any failure and excluded
+///   for this item.
 fn note_fault(
     scope: &FaultScope<'_>,
     excluded: &mut HashSet<EndpointId>,
@@ -1685,9 +1643,7 @@ fn note_fault(
                 error = %format!("{error:#}"),
                 "provider served bytes that failed verification"
             );
-            if scope.verdicts.is_some() {
-                excluded.insert(provider);
-            }
+            excluded.insert(provider);
             scope.verdict(LiveVerdict::Corrupt {
                 provider,
                 hash: scope.hash,
@@ -1798,11 +1754,10 @@ fn split_missing_at_midpoint(missing: &ChunkRanges, size: u64) -> Option<Missing
 /// lands.
 ///
 /// A raw blob request (`GetRequest::blob`) becomes
-/// `GetRequest::blob_ranges(hash, back)`; a collection child
-/// (`child(i).build(root)`, i.e. one non-empty range at offset `i + 1`) keeps
-/// the builder shape the collection path always sent,
-/// `child(i, back).build(root)`. Any other shape is not an item this engine
-/// builds, and gets no hedge (`None`) rather than a guessed request.
+/// `GetRequest::blob_ranges(hash, back)`; a request for one child of a
+/// collection (`child(i).build(root)`, i.e. one non-empty range at offset
+/// `i + 1`) is narrowed to `child(i, back).build(root)`. Any other shape gets
+/// no hedge (`None`) rather than a guessed request.
 pub(crate) fn hedge_back_half_request(
     request: &GetRequest,
     hash: Hash,
@@ -2058,8 +2013,8 @@ async fn try_arm_hedge(
 ///
 /// `on_bytes`, when set, is fed each round's exact byte delta as it is
 /// observed, plus the tail on `Done` — the sum equals `payload_bytes_read`
-/// (Task 10's [`DeliveredSink`] plumbing; `None` for every caller with no
-/// receive feed to keep).
+/// (the [`DeliveredSink`] plumbing; `None` for every caller with no receive
+/// feed to keep).
 async fn transfer_once(
     dialer: Dialer,
     remote: Remote,
@@ -2133,19 +2088,16 @@ async fn dial(
     dialer: &Dialer,
     provider: EndpointId,
 ) -> std::result::Result<PooledConn, TransferFault> {
-    match dialer {
-        Dialer::Collab { pool, addrs } => {
-            let Some(addr) = addrs(&provider) else {
-                return Err(TransferFault::DialFailed {
-                    error: anyhow::anyhow!("no dial address for {}", provider.fmt_short()),
-                });
-            };
-            // The pool logs the failure itself (`collab dial failed`).
-            pool.get(addr).await.map_err(|e| TransferFault::DialFailed {
-                error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
-            })
-        }
-    }
+    let Dialer { pool, addrs } = dialer;
+    let Some(addr) = addrs(&provider) else {
+        return Err(TransferFault::DialFailed {
+            error: anyhow::anyhow!("no dial address for {}", provider.fmt_short()),
+        });
+    };
+    // The pool logs the failure itself (`collab dial failed`).
+    pool.get(addr).await.map_err(|e| TransferFault::DialFailed {
+        error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
+    })
 }
 
 /// Pick a provider and reserve a slot on it, under ONE lock.
@@ -2213,9 +2165,7 @@ fn pick_provider(
 /// Scoped to the ITEM's own providers, never the run-wide union: under
 /// per-item provider lists a sibling's provider whose backoff has already
 /// elapsed would otherwise read as "wait 0", and an item whose only holder is
-/// parked would burn every round of its ladder in a few milliseconds. For a
-/// collection every child shares the full list, so this is the same minimum it
-/// always took.
+/// parked would burn every round of its ladder in a few milliseconds.
 fn earliest_wait(states: &States, providers: &[EndpointId]) -> Duration {
     let now = Instant::now();
     let guard = states.lock().expect("assignment states mutex poisoned");

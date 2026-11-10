@@ -915,7 +915,7 @@ impl Executor {
             let id = self.run_seq;
             let (tx, rx) = mpsc::channel(RUN_QUEUE);
             let book = Arc::clone(&self.book);
-            let dialer = Dialer::Collab {
+            let dialer = Dialer {
                 pool: Arc::clone(&self.pool),
                 addrs: Arc::new(move |id: &EndpointId| {
                     book.read().ok().and_then(|b| b.get(id).cloned())

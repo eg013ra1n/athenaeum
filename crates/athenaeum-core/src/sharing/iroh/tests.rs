@@ -3347,7 +3347,7 @@ fn live_collab_dialer(me: &SharedIrohNode, providers: &[&Arc<SharedIrohNode>]) -
         })
         .collect();
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
-    Dialer::Collab {
+    Dialer {
         pool: super::collab_pool::CollabPool::with_connect_timeout(
             me.endpoint(),
             events,
@@ -3667,7 +3667,7 @@ async fn live_one_connection_per_provider_for_many_items() {
     const SIZE: usize = 8 * 1024;
     let swarm = live_swarm(1, ITEMS, SIZE).await;
     let dialer = swarm.dialer();
-    let Dialer::Collab { pool, .. } = &dialer;
+    let Dialer { pool, .. } = &dialer;
     let pool = Arc::clone(pool);
     let (telemetry, _seen) = recording_telemetry();
     let out = run_live_items(
@@ -4569,7 +4569,7 @@ mod live_run {
         let dialer = {
             let book = Arc::clone(&book);
             let (events, _) = tokio::sync::mpsc::unbounded_channel();
-            Dialer::Collab {
+            Dialer {
                 pool: crate::sharing::iroh::collab_pool::CollabPool::new(me.endpoint(), events),
                 addrs: Arc::new(move |_| book.lock().unwrap().clone()),
             }
