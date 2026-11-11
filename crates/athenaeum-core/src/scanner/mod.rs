@@ -2979,12 +2979,10 @@ mod inplace_tests {
         )
         .unwrap();
 
-        // Touch the file: write the same bytes back, which advances mtime
-        // by at least one filesystem tick. Sleep first so the new mtime is
-        // strictly greater than the old one (avoids same-second collision).
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Touch the file: write the same bytes back and stamp a later mtime.
         let bytes = std::fs::read(&f).unwrap();
         std::fs::write(&f, bytes).unwrap();
+        stamp_later_mtime(&f);
 
         // Rescan via the serial path (the path Task 4 fixes).
         let scan2 = scan_directory(scan.path(), &conn, None, false, 1);
@@ -3047,10 +3045,10 @@ mod inplace_tests {
         .unwrap();
 
         // Touch file so the scanner classifies it as "modified" (not
-        // "unchanged"). Sleep first so the new mtime is strictly greater.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // "unchanged").
         let bytes = std::fs::read(&f).unwrap();
         std::fs::write(&f, bytes).unwrap();
+        stamp_later_mtime(&f);
 
         // Rescan via the serial path that Task 4 fixed.
         let result = scan_directory(scan.path(), &conn, None, false, 1);
@@ -3066,6 +3064,20 @@ mod inplace_tests {
             )
             .unwrap();
         assert_eq!(frame_count, 1, "orphaned files row must get a fresh frames row");
+    }
+
+    /// Stamps `path` with a modification time five seconds past the one it has now. Called right after a test
+    /// rewrites a file, it makes the rewrite a later time than the first scan recorded on any file system, so the
+    /// test does not wait out a one-second file-time step.
+    fn stamp_later_mtime(path: &Path) {
+        let later = std::fs::metadata(path).unwrap().modified().unwrap()
+            + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
     }
 
     /// Write a one-block FITS header with the shared minimal cards plus the
@@ -3137,7 +3149,6 @@ mod inplace_tests {
 
         // Re-write the same file with the offsets present; mtime advances, so
         // the scanner re-parses and UPDATEs the existing rows in place.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         write_fits_with_extra_cards(
             &f,
             &[
@@ -3147,6 +3158,7 @@ mod inplace_tests {
                 "ROWORDER= 'TOP-DOWN'",
             ],
         );
+        stamp_later_mtime(&f);
 
         let scan2 = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
@@ -3208,8 +3220,8 @@ mod inplace_tests {
 
         // The camera driver now reports a different CFA phase — same file,
         // new header bytes, advanced mtime.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         write_fits_with_extra_cards(&f, &["BAYERPAT= 'GRBG    '"]);
+        stamp_later_mtime(&f);
 
         let scan2 = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
@@ -3282,10 +3294,10 @@ mod inplace_tests {
         conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)",
             params![frame_id]).unwrap();
 
-        // Touch — advance mtime by at least one filesystem tick.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Touch — same bytes, a later mtime.
         let bytes = std::fs::read(&f).unwrap();
         std::fs::write(&f, bytes).unwrap();
+        stamp_later_mtime(&f);
 
         // Rescan via the parallel path.
         let cancel2 = Arc::new(AtomicBool::new(false));
@@ -3352,10 +3364,10 @@ mod inplace_tests {
             [f.to_str().unwrap()],
         ).unwrap();
 
-        // Touch — advance mtime by at least one filesystem tick.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Touch — same bytes, a later mtime.
         let bytes = std::fs::read(&f).unwrap();
         std::fs::write(&f, bytes).unwrap();
+        stamp_later_mtime(&f);
 
         let cancel2 = Arc::new(AtomicBool::new(false));
         let scan2 = scan_directory_parallel(
