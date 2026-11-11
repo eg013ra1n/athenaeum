@@ -22,22 +22,7 @@ fn no_db() -> (StatusCode, String) {
 
 // ── Response DTOs ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct MissingFileRecord {
-    pub id: i64,
-    pub file_id: i64,
-    pub scan_root_id: i64,
-    pub detected_at: String,
-    pub last_checked_at: String,
-    pub status: String,
-    pub path: String,
-    pub filename: String,
-    pub size: i64,
-    pub modified_at: String,
-    pub has_frame: bool,
-    pub object: Option<String>,
-    pub date_obs: Option<String>,
-}
+pub use athenaeum_core::api::missing_files::MissingFileRecord;
 
 // ── Request body types ────────────────────────────────────────────────────────
 
@@ -111,10 +96,9 @@ pub async fn get_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<RootIdArgs>,
 ) -> Result<Json<Vec<MissingFileRecord>>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    get_missing_files_internal(&conn, args.root_id)
+    athenaeum_core::api::missing_files::get_missing_files(&state.ctx, args.root_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/recheck_missing_files
@@ -126,67 +110,9 @@ pub async fn recheck_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<RootIdArgs>,
 ) -> Result<Json<Vec<MissingFileRecord>>, (StatusCode, String)> {
-    let root_id = args.root_id;
-
-    {
-        let db = state.ctx.db.get().ok_or_else(no_db)?;
-        let conn = db.conn();
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // Pull the zip columns alongside the path: a row inside a zip is found
-        // when its zip lists the entry, otherwise when its file is on disk.
-        let mut stmt = conn
-            .prepare(
-                "SELECT mf.id, mf.file_id, f.path, f.archive_zip_path, f.archive_path_in_zip
-                 FROM missing_files mf
-                 JOIN files f ON f.id = mf.file_id
-                 WHERE mf.scan_root_id = ?1",
-            )
-            .map_err(db_err)?;
-
-        let files: Vec<(i64, i64, String, Option<String>, Option<String>)> = stmt
-            .query_map([root_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-            })
-            .map_err(db_err)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db_err)?;
-
-        let present =
-            athenaeum_core::zip_store::presence::present_flags(&files, |(_, _, path, zip, entry)| {
-                (path.as_str(), zip.as_deref(), entry.as_deref())
-            });
-        let found_mf_ids: Vec<i64> = files
-            .iter()
-            .zip(present)
-            .filter(|(_, present)| *present)
-            .map(|((mf_id, ..), _)| *mf_id)
-            .collect();
-
-        if !found_mf_ids.is_empty() {
-            let placeholders: Vec<String> = found_mf_ids.iter().map(|_| "?".to_string()).collect();
-            let delete_sql = format!(
-                "DELETE FROM missing_files WHERE id IN ({})",
-                placeholders.join(",")
-            );
-            conn.execute(
-                &delete_sql,
-                rusqlite::params_from_iter(found_mf_ids.iter()),
-            )
-            .map_err(db_err)?;
-        }
-
-        conn.execute(
-            "UPDATE missing_files SET last_checked_at = ?1 WHERE scan_root_id = ?2",
-            rusqlite::params![&now, root_id],
-        )
-        .map_err(db_err)?;
-    }
-
-    // Return updated list
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-    get_missing_files_internal(&conn, root_id)
+    athenaeum_core::api::missing_files::recheck_missing_files(&state.ctx, args.root_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/ignore_missing_file
@@ -248,53 +174,6 @@ pub async fn delete_missing_files(
     athenaeum_core::relinking::delete_orphaned_files(&conn, &args.file_ids).map_err(db_err)?;
 
     Ok(Json(()))
-}
-
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-fn get_missing_files_internal(
-    conn: &rusqlite::Connection,
-    root_id: i64,
-) -> Result<Json<Vec<MissingFileRecord>>, (StatusCode, String)> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT
-                mf.id, mf.file_id, mf.scan_root_id,
-                mf.detected_at, mf.last_checked_at, mf.status,
-                f.path, f.filename, f.size, f.modified_at,
-                CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
-                fr.object, fr.date_obs
-             FROM missing_files mf
-             JOIN files f ON f.id = mf.file_id
-             LEFT JOIN frames fr ON fr.file_id = f.id
-             WHERE mf.scan_root_id = ?1
-             ORDER BY mf.detected_at DESC",
-        )
-        .map_err(db_err)?;
-
-    let records = stmt
-        .query_map([root_id], |row| {
-            Ok(MissingFileRecord {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                scan_root_id: row.get(2)?,
-                detected_at: row.get(3)?,
-                last_checked_at: row.get(4)?,
-                status: row.get(5)?,
-                path: row.get(6)?,
-                filename: row.get(7)?,
-                size: row.get(8)?,
-                modified_at: row.get(9)?,
-                has_frame: row.get::<_, i32>(10)? == 1,
-                object: row.get(11)?,
-                date_obs: row.get(12)?,
-            })
-        })
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)?;
-
-    Ok(Json(records))
 }
 
 #[cfg(test)]

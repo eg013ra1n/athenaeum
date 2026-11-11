@@ -65,47 +65,9 @@ pub async fn set_setting(
     State(state): State<WebAppState>,
     Json(args): Json<SetSettingArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Database not initialized".to_string(),
-    ))?;
-    let conn = db.conn();
-
-    state
-        .ctx
-        .settings
-        .persist_setting(&conn, &args.key, &args.value)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Update in-memory cache settings when they change
-    if args.key == settings::keys::BLINK_MEMORY_CACHE_SIZE {
-        let size: usize = args.value.parse().unwrap_or(200);
-        state.ctx.memory_cache.lock().unwrap().set_max_entries(size);
-    } else if args.key == settings::keys::BLINK_MEMORY_CACHE_MAX_MB {
-        let mb = settings::resolve_blink_memory_cache_max_mb(Some(&args.value));
-        state
-            .ctx
-            .memory_cache
-            .lock()
-            .unwrap()
-            .set_max_bytes(mb * 1024 * 1024);
-    } else if args.key == settings::keys::BLINK_MEMORY_RETENTION_MINUTES {
-        let minutes: u64 = args.value.parse().unwrap_or(30);
-        state
-            .ctx
-            .memory_cache
-            .lock()
-            .unwrap()
-            .set_retention(minutes);
-    } else if args.key == settings::keys::MONITORING_INTERVAL_MINUTES
-        || args.key == settings::keys::MONITORING_ENABLED_GLOBAL
-    {
-        // Wake the monitor loop so the new interval / enabled flag takes
-        // effect now instead of after the current sleep expires.
-        state.monitor.kick();
-    }
-
-    Ok(Json(()))
+    athenaeum_core::api::settings::set_setting(&state.ctx, &args.key, &args.value, &state.monitor)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/delete_setting
