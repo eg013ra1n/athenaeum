@@ -708,8 +708,8 @@ mod tests {
         assert_eq!(cfa_geometry_of_file(&mono).unwrap(), None);
     }
 
-    /// Plan 6b-2 C8: no function in the production half of `run.rs` or
-    /// `plan.rs` names a `StackSubject` or `FrameOrigin` variant outside the
+    /// Plan 6b-2 C8: no function in the production files of `run/` or the
+    /// production half of `plan.rs` names a `StackSubject` or `FrameOrigin` variant outside the
     /// named funnels and the allowlist — so a third subject, or a later
     /// trait extraction, touches exactly these functions.
     #[test]
@@ -747,10 +747,28 @@ mod tests {
                 "#[cfg(test)] constructor of a project run",
             ),
         ];
-        for (file, text) in [
-            ("run.rs", include_str!("run.rs")),
-            ("plan.rs", include_str!("plan.rs")),
-        ] {
+        // `plan.rs`, and every production file of the run: `run/*.rs` but its test files (`tests.rs`,
+        // `<stage>_tests.rs`). The folder is read here, so a file added to it later is scanned too.
+        let mut sources = vec![("plan.rs".to_string(), include_str!("plan.rs").to_string())];
+        let run_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stacking/run");
+        for entry in std::fs::read_dir(&run_dir).expect("the run module's folder") {
+            let path = entry.expect("a folder entry").path();
+            let name = path
+                .file_name()
+                .expect("a file name")
+                .to_string_lossy()
+                .into_owned();
+            if name.ends_with(".rs") && !name.ends_with("tests.rs") {
+                let text = std::fs::read_to_string(&path).expect("a source file of the run");
+                sources.push((format!("run/{name}"), text));
+            }
+        }
+        assert!(
+            sources.len() > 1,
+            "no production file of the run in {}",
+            run_dir.display()
+        );
+        for (file, text) in &sources {
             let production = text
                 .split("\nmod tests {")
                 .next()

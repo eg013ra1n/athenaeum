@@ -107,7 +107,7 @@ pub struct LnReference {
 ///
 /// `io` is the run's own [`IoPolicy`] — the same one `integrate_group`
 /// takes, resolved once per run from the user's `integration.band_budget_mb`
-/// setting and the frames' storage class (`run.rs`'s
+/// setting and the frames' storage class (`run/`'s
 /// `integration::io_policy::resolve` call, over the same calibrated files
 /// this reference reads) — never minted locally, so a network-classified
 /// group still gets its `Network` read-concurrency clamp and the user's

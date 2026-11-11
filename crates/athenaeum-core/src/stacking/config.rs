@@ -1037,7 +1037,7 @@ fn measurement_subtree_with_measure_version(
     cfg: &StackingConfig,
     measure_version: u32,
 ) -> serde_json::Value {
-    // Spec 2026-11-08 §5.4: the weights are computed in every run from the stored measurements (`run.rs`
+    // Spec 2026-11-08 §5.4: the weights are computed in every run from the stored measurements (`run/`
     // `stage_measure_with`, `compute_weights`) and no fit reads `weightMode`, `formula` or `keyword`, so they are
     // written as the shipped defaults: changing the weighting must not re-measure. A set with default weights keeps
     // its hash byte for byte.

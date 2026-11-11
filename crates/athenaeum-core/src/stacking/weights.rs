@@ -1387,7 +1387,7 @@ mod tests {
     /// master dark), the order is a valid, honest empty `Vec` — this
     /// function never fails; the caller (`stacking::run::
     /// process_group_output`'s `pick_reference_idx`) is the one that must
-    /// fall back to `best_by_weight`, see the composite test in `run.rs`.
+    /// fall back to `best_by_weight`, see the composite test in `run/`.
     #[test]
     fn sky_penalized_order_returns_empty_when_every_candidate_has_no_usable_background() {
         let weights = vec![fw(1.0), fw(0.9), fw(0.5)];

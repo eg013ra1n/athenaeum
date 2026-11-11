@@ -816,7 +816,7 @@ mod common {
     }
 
     impl Member {
-        /// Plane `p` of the member as the module reads it. `planes` is the GROUP's plane count (`run.rs`'s `nch`: the weight's
+        /// Plane `p` of the member as the module reads it. `planes` is the GROUP's plane count (`run/`'s `nch`: the weight's
         /// rule and the candidates' flux fit follow it, PD-32), not this member's: a member that lacks a plane is the dump's
         /// gap, and the module is told the count the run would tell it (D2d review m2).
         fn plane(&self, p: usize, planes: usize) -> MemberPlane<'_> {

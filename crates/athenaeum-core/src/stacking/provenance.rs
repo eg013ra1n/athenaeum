@@ -1,7 +1,7 @@
 //! The stacking run's provenance document (spec §9.1's `summary_json` /
 //! `runs/run-<id>.json` — the SAME document: one copy is written to the
 //! `stacking_runs.summary_json` column, the other to disk under the working
-//! layout's `runs/` subtree; see `run.rs::run_thread`, the single place that
+//! layout's `runs/` subtree; see `run/mod.rs::run_thread`, the single place that
 //! writes both). Every field a completed (or failed/cancelled) run is
 //! willing to answer about itself: what it was asked to do
 //! (`config`/`config_hash`), what it resolved (`reference`/`measurement`),
@@ -12,7 +12,7 @@
 //! Plan 5a Task 6 only runs stage 1 (calibrate): `groups` stays empty and
 //! `reference`/`measurement` carry only what the plan gate already knew
 //! (`Auto` mode's actual frame, every per-frame metric) until Tasks 7-8 land
-//! stages 3-9 and fill the rest in on the SAME [`RunSummary`] `run.rs`'s
+//! stages 3-9 and fill the rest in on the SAME [`RunSummary`] `run/`'s
 //! `RunContext` builds up over the pipeline's lifetime.
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use crate::stacking::integrate::GroupStats;
 use crate::stacking::plan::{MasterWork, Stage};
 
 /// One stage's wall-clock cost, in the order it ran
-/// (`run.rs`'s `RunContext::timings`).
+/// (`run/`'s `RunContext::timings`).
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct StageTiming {
@@ -277,7 +277,7 @@ pub struct SummaryGroup {
 
 /// The whole run, as `stacking_runs.summary_json` AND `runs/run-<id>.json` —
 /// deliberately the same Rust type for both, so there is only ever one shape
-/// to keep in sync. Built up progressively on `run.rs`'s
+/// to keep in sync. Built up progressively on `run/`'s
 /// `RunContext::summary` over the pipeline's lifetime; `status`/
 /// `finished_at`/`warnings`/`stages`/`error` are finalized by
 /// `run_thread` right before this is serialized to both destinations.

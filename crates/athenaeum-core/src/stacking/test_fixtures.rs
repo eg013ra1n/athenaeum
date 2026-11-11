@@ -1535,7 +1535,7 @@ pub(crate) const EAST_PAIR_STAR_SEED: u64 = 9;
 
 // ── End-to-end run helpers ───────────────────────────────────────────────
 //
-// Shared by `run.rs`'s tests and any test that drives a real run (`start_stacking`
+// Shared by `run/`'s tests and any test that drives a real run (`start_stacking`
 // on a seeded star-field set, then waits for it): the star field, the seeder, the
 // light spec at the star field's size, and the wait.
 
@@ -1626,7 +1626,7 @@ pub(crate) fn seed_star_group(
     (fixture, light_ids, working, output)
 }
 
-/// As `run.rs`'s `light_spec`, but at the star-field fixtures' own canvas size
+/// As `run/tests.rs`'s `light_spec`, but at the star-field fixtures' own canvas size
 /// ([`STAR_FIELD_WIDTH`]x[`STAR_FIELD_HEIGHT`], above) — every frame in one of those tests' groups,
 /// including an extra low-weight/flat-field frame added alongside the
 /// star frames, must share this same size to land in the same
