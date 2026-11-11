@@ -199,14 +199,8 @@ pub fn get_distinct_instrumes(ctx: &ServiceContext) -> Result<Vec<String>, ApiEr
 }
 
 /// Duplicate file groups (from cache when warm, computed on the fly
-/// otherwise).
-///
-/// NOT wired to the web wrapper: the web equivalent lives in
-/// `routes/duplicates.rs`, not `routes/files.rs` — out of this task's
-/// declared scope (same gap pattern as Task 9's `check_missing_files_in_scan_root`
-/// / `set_scan_root_unique_camera_flag`). That file already carries a nearly
-/// identical, independently-written implementation; only the Tauri wrapper
-/// calls this handler for now.
+/// otherwise). Both hosts call it; the web route lives in
+/// `routes/duplicates.rs`.
 pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();

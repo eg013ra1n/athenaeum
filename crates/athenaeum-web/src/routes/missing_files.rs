@@ -2,6 +2,8 @@
 
 use axum::{extract::State, http::StatusCode, Json};
 
+use crate::events::SseProgressEmitter;
+use crate::routes::api_err;
 use crate::WebAppState;
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -28,18 +30,6 @@ pub struct MissingFileRecord {
     pub detected_at: String,
     pub last_checked_at: String,
     pub status: String,
-    pub path: String,
-    pub filename: String,
-    pub size: i64,
-    pub modified_at: String,
-    pub has_frame: bool,
-    pub object: Option<String>,
-    pub date_obs: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-pub struct OrphanedFile {
-    pub id: i64,
     pub path: String,
     pub filename: String,
     pub size: i64,
@@ -81,83 +71,21 @@ pub struct DeleteMissingFilesArgs {
 /// POST /api/check_missing_files_in_scan_root
 ///
 /// Check for files in the DB under this root that no longer exist on disk.
-/// Emits SSE progress events during the filesystem check.
+/// Emits `verifying` SSE progress before and after the filesystem check
+/// (the shared core handler does both).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn check_missing_files_in_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<RootIdArgs>,
-) -> Result<Json<Vec<OrphanedFile>>, (StatusCode, String)> {
-    let root_id = args.root_id;
-
-    // Collect files from database
-    let files = {
-        let db = state.ctx.db.get().ok_or_else(no_db)?;
-        let conn = db.conn();
-
-        let path: String = conn
-            .query_row(
-                "SELECT path FROM scan_roots WHERE id = ?1",
-                rusqlite::params![root_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| db_err(format!("Failed to get scan root: {}", e)))?;
-
-        // A row inside a zip is checked through its zip (present when the zip
-        // exists and lists the entry), not by its virtual path.
-        // Scoped separator-strict via the shared core predicate (mirrors
-        // `api::scan_roots::check_missing_files_in_scan_root`): `LIKE '<root>%'`
-        // had no separator boundary and treated `_`/`%` in an ordinary folder
-        // name as wildcards, so a sibling root's rows landed in this root's
-        // missing list.
-        let (pred, values) =
-            athenaeum_core::db::scan_root_prefix_predicate("f.path", &[path.clone()]);
-        let sql = format!(
-            "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
-                        CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
-                        fr.object, fr.date_obs,
-                        f.archive_zip_path, f.archive_path_in_zip
-                 FROM files f
-                 LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE ({pred})"
-        );
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
-                Ok((
-                    OrphanedFile {
-                        id: row.get(0)?,
-                        path: row.get(1)?,
-                        filename: row.get(2)?,
-                        size: row.get(3)?,
-                        modified_at: row.get(4)?,
-                        has_frame: row.get::<_, i64>(5)? != 0,
-                        object: row.get(6).ok(),
-                        date_obs: row.get(7).ok(),
-                    },
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })
-            .map_err(db_err)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db_err)?;
-        rows
-    };
-
-    // Filter to the rows that are not present — outside the lock; disk rows in
-    // parallel, each zip's directory read once.
-    let present = athenaeum_core::zip_store::presence::present_flags(&files, |(f, zip, entry)| {
-        (f.path.as_str(), zip.as_deref(), entry.as_deref())
-    });
-    let missing_files: Vec<OrphanedFile> = files
-        .into_iter()
-        .zip(present)
-        .filter(|(_, present)| !present)
-        .map(|((f, _, _), _)| f)
-        .collect();
-
-    Ok(Json(missing_files))
+) -> Result<Json<Vec<athenaeum_core::models::OrphanedFile>>, (StatusCode, String)> {
+    let emitter = SseProgressEmitter::new(state.event_tx.clone());
+    athenaeum_core::api::scan_roots::check_missing_files_in_scan_root(
+        &state.ctx,
+        args.root_id,
+        &emitter,
+    )
+    .map(Json)
+    .map_err(api_err)
 }
 
 /// POST /api/sync_missing_files
