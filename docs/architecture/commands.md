@@ -61,16 +61,14 @@ Both hosts carried their own copy of these; each now has one in core.
 
 | Core module | Functions |
 | ---- | ---- |
-| `api/frame_sets.rs` | `split_frame_set`, `create_frame_set_from_selection`, `auto_merge_new_frames_for_set` |
+| `api/frame_sets.rs` | `split_frame_set`, `create_frame_set_from_selection`, `auto_merge_new_frames_for_set`, `find_new_frames_for_set` (`scan_when_idle`: the desktop passes an emitter and scans the monitored roots when no scan runs, the web passes `None` and does not; the 5-minute wait timeout is `ApiError::Timeout`, HTTP 504) |
 | `api/missing_files.rs` (new) | `get_missing_files`, `recheck_missing_files`, `MissingFileRecord` |
 | `api/settings.rs` | `set_setting` (the monitor is a parameter, as in `set_scan_root_monitor_enabled`) |
-| `api/archive.rs` (new) | `list_archived_frame_sets`, `list_archive_zips`, `get_restore_suggestions`, `delete_archive`, `start_restore_operation` |
+| `api/archive.rs` (new) | `list_archived_frame_sets`, `list_archive_zips`, `get_restore_suggestions`, `delete_archive`, `start_restore_operation`, `start_archive_operation` (`refuse_when_busy`: the web passes `true` and answers 409 while an archive, file operation or master build runs; the desktop passes `false` and queues; the owner has not ruled which side wins) |
 | `api/export.rs` | `export_to_wbpp` (the web's export directory is the `allowed_export_dir` parameter), the WBPP config commands |
 | `api/plate_solve.rs` | `download_catalog_layers`, `CatalogDownloadProgress`; `prepare_plate_solve_batch` + `run_plate_solve_batch`, `prepare_autofind_objects` + `run_autofind_objects` (the host resolves the star-catalog layers, index packs and DSO catalog from its own state and keeps its own waiting: the desktop awaits the run, the web starts it and returns) |
 | `api/scan_roots.rs`, `api/files.rs` | already there; the web routes `check_missing_files_in_scan_root`, `set_scan_root_unique_camera_flag`, `get_duplicates` now call them |
 
-Still copied in both hosts, because the copies differ in behaviour and the owner has not ruled which side wins:
-`find_new_frames_for_set`, `start_archive_operation`. Also
-still copied, same behaviour, not yet moved: the archive root commands, `resume_archive_operation`,
+Still copied in both hosts, same behaviour, not yet moved: the archive root commands, `resume_archive_operation`,
 `rollback_archive_operation`, `plan_archive_operation`, the frame-set detail loader, the export preview and summary
 commands, and the rest of `missing_files`.

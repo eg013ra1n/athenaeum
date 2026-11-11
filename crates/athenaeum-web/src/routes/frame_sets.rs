@@ -482,54 +482,15 @@ pub async fn find_new_frames_for_set(
     State(state): State<WebAppState>,
     Json(args): Json<FindNewFramesArgs>,
 ) -> Result<Json<athenaeum_core::models::FindNewFramesResult>, (StatusCode, String)> {
-    let mut scan_was_awaited = false;
-
-    if args.scan_first {
-        let active_initially = {
-            let scans = state.ctx.active_scans.lock().unwrap();
-            !scans.is_empty()
-        };
-
-        if active_initially {
-            scan_was_awaited = true;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
-            loop {
-                let still_active = {
-                    let scans = state.ctx.active_scans.lock().unwrap();
-                    !scans.is_empty()
-                };
-                if !still_active {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err((
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "Timed out waiting for active scan to finish".to_string(),
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-    }
-
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-    let threshold_deg = state
-        .ctx
-        .settings
-        .get_grouping_threshold_deg(&conn)
-        .map_err(db_err)?;
-    let candidates = athenaeum_core::auto_merge::find_candidates_for_set(
-        &conn,
+    athenaeum_core::api::frame_sets::find_new_frames_for_set(
+        state.ctx.clone(),
         args.frames_set_id,
-        threshold_deg,
+        args.scan_first,
+        None,
     )
-    .map_err(db_err)?;
-
-    Ok(Json(athenaeum_core::models::FindNewFramesResult {
-        candidates,
-        scan_was_awaited,
-    }))
+    .await
+    .map(Json)
+    .map_err(api_err)
 }
 
 #[derive(Deserialize)]

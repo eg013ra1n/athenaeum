@@ -6,7 +6,7 @@
 use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
-use athenaeum_core::archive::{executor, planner, resume, rollback, models::*};
+use athenaeum_core::archive::{planner, resume, rollback, models::*};
 use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
 use athenaeum_core::services::ArchiveHandle;
 use athenaeum_core::settings::keys;
@@ -197,67 +197,20 @@ pub async fn start_archive_operation(
     State(state): State<WebAppState>,
     Json(req): Json<StartRequest>,
 ) -> Result<Json<i64>, (StatusCode, String)> {
-    {
-        let map = state.ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err((
-                StatusCode::CONFLICT,
-                "another archive operation is already in progress".into(),
-            ));
-        }
-    }
-    let ctx = state.ctx.clone();
-    let db = ctx
-        .db
-        .get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
-    let conn = db.conn();
-    let root = resolve_archive_root(&conn, &ctx.settings, req.archive_root_path.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-
-    let plan = planner::build_plan(
-        &conn,
+    // The web refuses a second archive while one is active (409); the desktop
+    // queues it. The difference is the `refuse_when_busy` argument.
+    athenaeum_core::api::archive::start_archive_operation(
+        state.ctx.clone(),
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone())),
         req.frames_set_id,
-        Path::new(&root),
         &req.dispositions,
         req.compression,
+        req.conflict_resolution,
+        req.archive_root_path.as_deref(),
+        true,
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", e)))?;
-    let op_id = planner::commit_plan(&conn, &plan, req.conflict_resolution)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", e)))?;
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    ctx.active_archives.lock().unwrap().insert(
-        op_id,
-        ArchiveHandle {
-            operation_id: op_id,
-            cancel_flag: cancel_flag.clone(),
-        },
-    );
-
-    let event_tx = state.event_tx.clone();
-    let ctx_for_worker = ctx.clone();
-    ctx.operation_queue.enqueue(QueuedJob {
-        kind: OperationKind::ZipArchive,
-        operation_id: op_id,
-        run: Box::new(move || {
-            let emitter = SseProgressEmitter::new(event_tx);
-            let db = ctx_for_worker.db.get().expect("db");
-            let conn = db.conn();
-            // Outcome bookkeeping + terminal `archive-finished` live in core
-            // (`run_operation_standalone`) — this worker used to hand-roll the
-            // failure path and forgot the emit, so the web progress widget
-            // never auto-dismissed. Errors are logged (and rolled back) inside.
-            let _ = executor::run_operation_standalone(&conn, op_id, &cancel_flag, &emitter);
-            ctx_for_worker
-                .active_archives
-                .lock()
-                .unwrap()
-                .remove(&op_id);
-        }),
-    });
-
-    Ok(Json(op_id))
+    .map(Json)
+    .map_err(api_err)
 }
 
 #[tracing::instrument(skip_all, err(Debug))]

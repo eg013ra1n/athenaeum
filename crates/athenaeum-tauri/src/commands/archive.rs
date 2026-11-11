@@ -1,7 +1,7 @@
 //! Archive feature Tauri commands.
 
 use super::AppState;
-use athenaeum_core::archive::{executor, planner, resume, rollback, models::*};
+use athenaeum_core::archive::{planner, resume, rollback, models::*};
 use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
 use athenaeum_core::services::ArchiveHandle;
 use athenaeum_core::settings::keys;
@@ -204,48 +204,17 @@ pub async fn start_archive_operation(
     conflict_resolution: ConflictResolution,
     archive_root_path: Option<String>,
 ) -> Result<i64, String> {
-    let ctx = state.ctx.clone();
-    let db = ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    let root = resolve_archive_root(&conn, &ctx.settings, archive_root_path.as_deref())?;
-
-    // Build + commit the plan synchronously.
-    let plan = planner::build_plan(
-        &conn, frames_set_id, Path::new(&root), &dispositions, compression,
-    ).map_err(|e| format!("{:#}", e))?;
-    let op_id = planner::commit_plan(&conn, &plan, conflict_resolution)
-        .map_err(|e| format!("{:#}", e))?;
-
-    // Register the cancel flag so cancel_archive_operation can find it.
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
-    }
-
-    // Enqueue. Single global worker (shared with file ops) drives execution
-    // serially. DB connection is obtained inside the closure since rusqlite
-    // connections are not Send across thread boundaries.
-    let ctx_for_worker = ctx.clone();
-    let app_for_emitter = app.clone();
-    ctx.operation_queue.enqueue(QueuedJob {
-        kind: OperationKind::ZipArchive,
-        operation_id: op_id,
-        run: Box::new(move || {
-            let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
-            let db = ctx_for_worker.db.get().expect("db");
-            let conn = db.conn();
-            // Outcome bookkeeping + terminal `archive-finished` live in core
-            // (`run_operation_standalone`) — shared with the web worker so the
-            // two backends can't drift again. Errors are logged (and rolled
-            // back) inside; nothing to add here.
-            let _ = executor::run_operation_standalone(&conn, op_id, &cancel_flag, &emitter);
-            let mut map = ctx_for_worker.active_archives.lock().unwrap();
-            map.remove(&op_id);
-        }),
-    });
-
-    Ok(op_id)
+    athenaeum_core::api::archive::start_archive_operation(
+        state.ctx.clone(),
+        Arc::new(crate::tauri_events::TauriProgressEmitter(app)),
+        frames_set_id,
+        &dispositions,
+        compression,
+        conflict_resolution,
+        archive_root_path.as_deref(),
+        false,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

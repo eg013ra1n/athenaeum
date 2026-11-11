@@ -371,90 +371,16 @@ pub async fn find_new_frames_for_set(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<FindNewFramesResult, String> {
-    let mut scan_was_awaited = false;
-
-    if scan_first {
-        // Check whether any active scan is running. If so, await completion
-        // instead of firing another scan on the same root.
-        let active_initially = {
-            let scans = state.ctx.active_scans.lock().unwrap();
-            !scans.is_empty()
-        };
-
-        if active_initially {
-            scan_was_awaited = true;
-            // Poll until no active scans remain. Cap at 5 minutes.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
-            loop {
-                let still_active = {
-                    let scans = state.ctx.active_scans.lock().unwrap();
-                    !scans.is_empty()
-                };
-                if !still_active {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err("Timed out waiting for active scan to finish".to_string());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        } else {
-            // No scan running — kick off a scan on each monitor-enabled root.
-            // The scanner is idempotent, so this is cheap on unchanged dirs.
-            let roots: Vec<i64> = {
-                let db = state.ctx.db.get().ok_or("Database not initialized")?;
-                let conn = db.conn();
-                db::get_scan_roots(&conn)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .filter(|r| r.enabled && r.monitor_enabled)
-                    .filter_map(|r| r.id)
-                    .collect()
-            };
-
-            let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
-            // One scan over all the roots: every root's frame files are walked before any zip is read.
-            for (root_id, outcome) in crate::scanner::run_registered_scans(&state.ctx, &emitter, &roots) {
-                if let Err(e) = outcome {
-                    if !e.contains("already in progress") {
-                        tracing::warn!(root_id, error = %e, "find_new_frames: scan of root failed");
-                    }
-                }
-            }
-            // Third path that ingests files on desktop, so it re-arms the
-            // content index like the other two. Once, after the loop — the job
-            // re-derives its own work from the catalog and is single-flight, so
-            // a per-root call would just be a redundant no-op. (The web mirror
-            // never starts a scan here, so it has nothing to re-arm.)
-            {
-                let ctx = Arc::clone(&state.ctx);
-                let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> = Arc::new(
-                    crate::tauri_events::TauriProgressEmitter(app_handle.clone()),
-                );
-                std::thread::spawn(move || {
-                    athenaeum_core::api::content_index::autostart_after_user_scan(&ctx, emitter);
-                });
-            }
-        }
-    }
-
-    // Match pass: unclustered lights within the configured threshold.
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    let threshold_deg = state
-        .ctx
-        .settings
-        .get_grouping_threshold_deg(&conn)
-        .map_err(|e| format!("Failed to read threshold: {}", e))?;
-
-    let candidates =
-        crate::auto_merge::find_candidates_for_set(&conn, frames_set_id, threshold_deg)
-            .map_err(|e| format!("Failed to find candidates: {}", e))?;
-
-    Ok(FindNewFramesResult {
-        candidates,
-        scan_was_awaited,
-    })
+    let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+        Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle));
+    athenaeum_core::api::frame_sets::find_new_frames_for_set(
+        state.ctx.clone(),
+        frames_set_id,
+        scan_first,
+        Some(emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Attach the given frames to the frame set (via session detection + append)

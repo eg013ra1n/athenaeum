@@ -461,6 +461,7 @@ pub(crate) fn api_err(e: athenaeum_core::api::ApiError) -> (StatusCode, String) 
         E::Forbidden(_) => S::FORBIDDEN,
         E::Internal(_) => S::INTERNAL_SERVER_ERROR,
         E::SignedOut(_) => S::UNAUTHORIZED,
+        E::Timeout(_) => S::GATEWAY_TIMEOUT,
     };
     (code, e.to_string())
 }
