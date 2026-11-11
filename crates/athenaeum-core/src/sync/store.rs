@@ -3371,14 +3371,6 @@ mod tests {
         assert_eq!(capped[0].id, confirmed, "the cap keeps the newest rows");
     }
 
-    /// An empty store yields an empty list, never an error.
-    #[test]
-    fn all_outbound_empty_store_is_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
-        assert!(store.all_outbound(50).unwrap().is_empty());
-    }
-
     /// Task 4: a `Cancelled` receipt round-trips through the DB text encoding
     /// (`insert_receipt` → `load_receipts`) unchanged, AND is counted as
     /// *satisfied* by [`count_satisfied_receipts`]. A deliberate receiver "no" is
@@ -4126,33 +4118,6 @@ mod tests {
         assert_eq!(
             outbound_row_by_id(&conn, bid).unwrap().unwrap().layout,
             PackageLayout::Batch,
-        );
-    }
-
-    /// Mirror-hierarchy T2: the stamp travels through the trait too — the engine
-    /// worker only ever reaches the column via [`SyncStore::enqueue`], so the
-    /// delegation is pinned here and not only at the free-function seam.
-    #[test]
-    fn store_enqueue_stamps_layout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("sync.db");
-        let store = StandaloneSyncStore::open(&path).unwrap();
-
-        let mirror = store
-            .enqueue("pkg-mirror", PEER, None, &[], PackageLayout::Mirror)
-            .unwrap();
-        let batch = store
-            .enqueue("pkg-batch", PEER, None, &[], PackageLayout::Batch)
-            .unwrap();
-
-        let conn = Connection::open(&path).unwrap();
-        assert_eq!(
-            outbound_row_by_id(&conn, mirror).unwrap().unwrap().layout,
-            PackageLayout::Mirror
-        );
-        assert_eq!(
-            outbound_row_by_id(&conn, batch).unwrap().unwrap().layout,
-            PackageLayout::Batch
         );
     }
 

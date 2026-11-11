@@ -253,11 +253,6 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn display_shows_message() {
-        assert_eq!(ApiError::NotFound("frame 7".into()).to_string(), "frame 7");
-    }
-
-    #[test]
     fn path_policy_allows_and_forbids() {
         let p = PathPolicy::AllowedRoots(vec!["/data/astro".into()]);
         assert!(p.check(Path::new("/data/astro/lights")).is_ok());

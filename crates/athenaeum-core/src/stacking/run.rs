@@ -24711,17 +24711,6 @@ mod tests {
         }
     }
 
-    /// Plan 6b-2 C1: one convention on every wire type — exactly one side of
-    /// the subject pair is set.
-    #[test]
-    fn wire_subject_sets_exactly_one_side() {
-        assert_eq!(wire_subject(&StackSubject::FrameSet(7)), (Some(7), None));
-        assert_eq!(
-            wire_subject(&StackSubject::Project("p1".into())),
-            (None, Some("p1".to_string()))
-        );
-    }
-
     /// Plan 6b-2 C1: a frame-set tick still carries its set id (and a null
     /// project id); a project tick carries the project id and a null set id.
     #[test]

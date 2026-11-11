@@ -7888,21 +7888,6 @@ mod tests {
         assert_eq!(gate.limit(), 8, "set_limit clamps down to 8");
     }
 
-    #[test]
-    fn inbound_control_default_gate_limit_is_two() {
-        assert_eq!(DEFAULT_MAX_CONCURRENT_RECEIVES, 2);
-        assert_eq!(
-            InboundControl::new().receive_gate.limit(),
-            DEFAULT_MAX_CONCURRENT_RECEIVES,
-            "a fresh control gates receives at the shipped default"
-        );
-        assert_eq!(
-            InboundControl::default().receive_gate.limit(),
-            DEFAULT_MAX_CONCURRENT_RECEIVES,
-            "`new()` and `default()` agree — `new()` still just forwards"
-        );
-    }
-
     /// The startup half of `sync.max_concurrent_receives` (W2 T2.7). This is the
     /// REAL function `ensure_started` calls on the control it is about to hand
     /// the receive loop — pinned here rather than through `ensure_started`

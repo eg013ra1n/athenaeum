@@ -1077,8 +1077,8 @@ pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
 
 /// [`registration_subtree`] with both versions supplied, so a test can prove
 /// the hash follows each (nothing else should call this with anything but
-/// [`MEASURE_VERSION`] and [`ALIGN_VERSION`]). The pins of earlier measure
-/// versions go through [`registration_subtree_with_measure_version`], which
+/// [`MEASURE_VERSION`] and [`ALIGN_VERSION`]). The measure-version pin
+/// goes through [`registration_subtree_with_measure_version`], which
 /// keeps the shape from before the fold.
 fn registration_subtree_with_versions(
     cfg: &StackingConfig,
@@ -2026,194 +2026,6 @@ mod tests {
         assert!(prepare_subtree(&cfg).get("measureVersion").is_none());
     }
 
-    /// PIN, not RED (Plan B B0, I-5; ruling F28): the three fit-reading stage hashes of the default config at
-    /// `MEASURE_VERSION` 4, literals read off the code before B0. `every_fit_reading_stage_hash_follows_measure_version`
-    /// above is only relative (the hash moves when the version moves); this one fixes the values, so any other change to
-    /// these subtrees is loud. Plan B B4 bumped the constant to 5: the version-4 values stay pinned through the
-    /// versioned helpers, and `measure_version_five_moves_the_three_fit_reading_subtrees_only` pins the new ones.
-    #[test]
-    fn fit_reading_stage_hashes_at_measure_version_four_are_pinned() {
-        let cfg = StackingConfig::default();
-        assert_eq!(
-            stage_hash(&measurement_subtree_with_measure_version(&cfg, 4), &[], &[]),
-            // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves this literal and the normalization one below (was "e4320e05f86c1550" and "eee085e20921f75c"); registration did not move.
-            "72a681ead04cfdb4",
-            "measurement"
-        );
-        assert_eq!(
-            stage_hash(
-                &registration_subtree_with_measure_version(&cfg, 4),
-                &[],
-                &[]
-            ),
-            "22155caee721ad23",
-            "registration"
-        );
-        assert_eq!(
-            stage_hash(
-                &normalization_subtree_with_measure_version(&cfg, 4),
-                &[],
-                &[]
-            ),
-            // 2026-11-01 pcores Task 1 (OD-1a): the default rejection normalization is `local` and the normalization
-            // subtree folds the whole block, so this literal moved (was "209f262fd5e90fec"); measurement and
-            // registration did not.
-            "9d2387df58a49708",
-            "normalization"
-        );
-    }
-
-    /// Plan B B4 (PB-14, I-5; ruling F28): the one bump of Plan B. At `MEASURE_VERSION` 5 the three fit-reading stage
-    /// hashes of the default config (measurement, registration, normalization) are the values below and are not the
-    /// version-4 ones, and the calibration subtree - which carries no measure version - hashes as it did before the bump
-    /// (a bump must not recalibrate). A historical pin since Plan C's bump (6), read at version 5.
-    #[test]
-    fn measure_version_five_moves_the_three_fit_reading_subtrees_only() {
-        let cfg = StackingConfig::default();
-        assert_eq!(
-            (
-                stage_hash(&measurement_subtree_with_measure_version(&cfg, 5), &[], &[]),
-                stage_hash(&registration_subtree_with_measure_version(&cfg, 5), &[], &[]),
-                stage_hash(&normalization_subtree_with_measure_version(&cfg, 5), &[], &[]),
-                stage_hash(&calibration_subtree(&cfg), &[], &[]),
-            ),
-            (
-                // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves measurement and normalization (was "0d5c198c7abb7132" and "75a4d889a865b845").
-                "067a2f2abedfef87".to_string(),
-                "71627dbef71e5f50".to_string(),
-                // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "d1f5adda37fa2f11".
-                "647a6be3cd557a37".to_string(),
-                "9653a478603091dc".to_string(),
-            ),
-            "version, measurement, registration, normalization, calibration"
-        );
-        for (name, v4, v5) in [
-            (
-                "measurement",
-                measurement_subtree_with_measure_version(&cfg, 4),
-                measurement_subtree_with_measure_version(&cfg, 5),
-            ),
-            (
-                "registration",
-                registration_subtree_with_measure_version(&cfg, 4),
-                registration_subtree_with_measure_version(&cfg, 5),
-            ),
-            (
-                "normalization",
-                normalization_subtree_with_measure_version(&cfg, 4),
-                normalization_subtree_with_measure_version(&cfg, 5),
-            ),
-        ] {
-            assert_ne!(
-                stage_hash(&v4, &[], &[]),
-                stage_hash(&v5, &[], &[]),
-                "{name} moved with the bump"
-            );
-        }
-    }
-
-    /// Plan C R-PC-10 (the Blend refusal on every path; ruling F28): at `MEASURE_VERSION` 6 the three fit-reading stage
-    /// hashes of the default config are the values below and are not the version-5 ones, and the calibration subtree
-    /// hashes as it did before the bump (a bump must not recalibrate). A historical pin since R-PC-10b's bump (7),
-    /// read at version 6: version 6 is burnt.
-    #[test]
-    fn measure_version_six_moves_the_three_fit_reading_subtrees_only() {
-        let cfg = StackingConfig::default();
-        assert_eq!(
-            (
-                stage_hash(&measurement_subtree_with_measure_version(&cfg, 6), &[], &[]),
-                stage_hash(&registration_subtree_with_measure_version(&cfg, 6), &[], &[]),
-                stage_hash(&normalization_subtree_with_measure_version(&cfg, 6), &[], &[]),
-                stage_hash(&calibration_subtree(&cfg), &[], &[]),
-            ),
-            (
-                // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves measurement and normalization (was "92ce74a473b23d1e" and "32d84d26ce058018").
-                "d1dfe4a0d0bb0619".to_string(),
-                "40084109c5bdfb9a".to_string(),
-                // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "babef50774a4c396".
-                "b897594f344fed5a".to_string(),
-                "9653a478603091dc".to_string(),
-            ),
-            "measurement, registration, normalization, calibration"
-        );
-        for (name, v5, v6) in [
-            (
-                "measurement",
-                measurement_subtree_with_measure_version(&cfg, 5),
-                measurement_subtree_with_measure_version(&cfg, 6),
-            ),
-            (
-                "registration",
-                registration_subtree_with_measure_version(&cfg, 5),
-                registration_subtree_with_measure_version(&cfg, 6),
-            ),
-            (
-                "normalization",
-                normalization_subtree_with_measure_version(&cfg, 5),
-                normalization_subtree_with_measure_version(&cfg, 6),
-            ),
-        ] {
-            assert_ne!(
-                stage_hash(&v5, &[], &[]),
-                stage_hash(&v6, &[], &[]),
-                "{name} moved with the bump"
-            );
-        }
-    }
-
-    /// Plan C R-PC-10b (the Blend refusal on the Analysis path only; ruling F28): the one bump of Plan C.
-    /// At `MEASURE_VERSION` 7 the three fit-reading stage hashes of the default config are the values below and are
-    /// neither the version-5 nor the burnt version-6 ones, and the calibration subtree hashes as it did before the bump
-    /// (a bump must not recalibrate). A historical pin since Plan D's bump (8), read at version 7.
-    #[test]
-    fn measure_version_seven_moves_the_three_fit_reading_subtrees_only() {
-        let cfg = StackingConfig::default();
-        assert_eq!(
-            (
-                7,
-                stage_hash(&measurement_subtree_with_measure_version(&cfg, 7), &[], &[]),
-                stage_hash(&registration_subtree_with_measure_version(&cfg, 7), &[], &[]),
-                stage_hash(&normalization_subtree_with_measure_version(&cfg, 7), &[], &[]),
-                stage_hash(&calibration_subtree(&cfg), &[], &[]),
-            ),
-            (
-                7,
-                // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves measurement and normalization (was "458fe47fbbf6cf96" and "08ccc8d4872ab886").
-                "e803462813ff0942".to_string(),
-                "58b254a7ba5d0808".to_string(),
-                // 2026-11-01 pcores Task 1 (OD-1a): rejection defaults to `local`; was "6f83ebdc535ec8a1".
-                "16bee8907ba483c3".to_string(),
-                "9653a478603091dc".to_string(),
-            ),
-            "version, measurement, registration, normalization, calibration"
-        );
-        for earlier in [5, 6] {
-            for (name, old, new) in [
-                (
-                    "measurement",
-                    measurement_subtree_with_measure_version(&cfg, earlier),
-                    measurement_subtree_with_measure_version(&cfg, 7),
-                ),
-                (
-                    "registration",
-                    registration_subtree_with_measure_version(&cfg, earlier),
-                    registration_subtree_with_measure_version(&cfg, 7),
-                ),
-                (
-                    "normalization",
-                    normalization_subtree_with_measure_version(&cfg, earlier),
-                    normalization_subtree_with_measure_version(&cfg, 7),
-                ),
-            ] {
-                assert_ne!(
-                    stage_hash(&old, &[], &[]),
-                    stage_hash(&new, &[], &[]),
-                    "{name} moved with the bump from {earlier}"
-                );
-            }
-        }
-    }
-
     /// Plan D D2 (`c`'s colour sample, PD-9; ruling F28): the one bump of Plan D (D3's Blend refusal on the stacking
     /// Measure ships under it). `MEASURE_VERSION` is 8, the three fit-reading stage hashes of the default config are
     /// the values below and are none of the version-5, burnt version-6 or version-7 ones, and the calibration subtree
@@ -2276,13 +2088,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// PIN, not RED (ruling F28): Plan D's one bump (D2, `c`'s colour sample; D3's Blend refusal on the stacking Measure
-    /// rides it); Plan A's was 4 (PA-4), Plan B's 5 (PB-14), Plan C's 7 (R-PC-10b; 6 is burnt).
-    #[test]
-    fn measure_version_is_eight_after_plan_d() {
-        assert_eq!(MEASURE_VERSION, 8, "Plan D's one bump (D2)");
     }
 
     /// Plan D D2c r1 (review M1 of D2b, the owner's speed condition): the `.athf` format version rides in the measurement

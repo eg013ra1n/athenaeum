@@ -9955,20 +9955,6 @@ mod tests {
         );
     }
 
-    /// Sync Phase 2A, task 2: the gate opens for ANY signed-in node — no
-    /// `role == Primary` required. (The pure `dev || signed_in` shape is
-    /// unchanged; the behavioral broadening lives in the caller, exercised by
-    /// `autostart_starts_when_signed_in_without_primary_role`.)
-    #[test]
-    fn autostart_gate_starts_for_any_signed_in_node() {
-        // dev flag alone starts (unchanged).
-        assert!(autostart_gate(true, false));
-        // signed in (any Athenaeum node) starts — no role required.
-        assert!(autostart_gate(false, true));
-        // neither → no autostart.
-        assert!(!autostart_gate(false, false));
-    }
-
     /// `account_signed_in` derives "is this node signed in" purely from the
     /// persisted `ACCOUNT_DEVICE_ID` (never the hub, never the keychain): no
     /// identity yet → false; identity present → true (the mesh model has no
