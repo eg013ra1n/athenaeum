@@ -76,7 +76,7 @@ fn the_solve_sub_step_never_writes_plate_solves_or_frames() {
         "plate_solves and frames are never written"
     );
     let solves =
-        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve")).unwrap();
+        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Solve)).unwrap();
     assert_eq!(solves.len(), 3);
     assert!(solves
         .iter()
@@ -233,7 +233,7 @@ fn a_missing_project_row_is_logged_and_nothing_is_cached() {
         "{result:?}"
     );
     assert!(
-        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Solve))
             .unwrap()
             .is_empty()
     );
@@ -267,14 +267,14 @@ fn an_unavailable_solve_is_not_cached_and_the_run_continues() {
     solve_project_frames(&mut rc).unwrap();
     let r1 = handle_of(&rc, "c_r1.fits");
     assert!(
-        crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(r1))
+        crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Solve, Some(r1))
             .unwrap()
             .is_none()
     );
     for n in ["c_r2.fits", "c_r3.fits"] {
         let h = handle_of(&rc, n);
         assert!(
-            crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(h))
+            crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Solve, Some(h))
                 .unwrap()
                 .is_some()
         );
@@ -323,7 +323,7 @@ fn a_scratch_folder_that_cannot_be_created_skips_solving_uncached() {
     for n in ["c_r1.fits", "c_r2.fits", "c_r3.fits"] {
         let h = handle_of(&rc, n);
         assert!(
-            crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(h))
+            crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Solve, Some(h))
                 .unwrap()
                 .is_none()
         );
@@ -423,7 +423,7 @@ fn the_solve_sub_step_excludes_a_frame_whose_landed_file_changed() {
         Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
     );
     assert!(
-        crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(r2))
+        crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Solve, Some(r2))
             .unwrap()
             .is_none()
     );
@@ -455,7 +455,7 @@ fn without_a_solver_nothing_is_solved_and_the_run_says_why() {
     solve_project_frames(&mut rc).unwrap();
     assert_eq!(fake.calls(), 0);
     assert!(
-        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Solve))
             .unwrap()
             .is_empty()
     );
@@ -544,7 +544,7 @@ fn a_cached_outcome_under_another_hash_is_solved_again() {
     .unwrap();
     solve_project_frames(&mut rc).unwrap();
     assert_eq!(fake.calls(), 1);
-    let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(h))
+    let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Solve, Some(h))
         .unwrap()
         .unwrap();
     assert_eq!(row.config_hash, solve_hash(&blake3, "fake:1"));
@@ -575,7 +575,7 @@ fn a_cancel_during_a_solve_caches_nothing() {
     assert!(matches!(err, RunError::Cancelled), "{err:?}");
     assert_eq!(fake.calls(), 1);
     assert!(
-        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Solve))
             .unwrap()
             .is_empty()
     );
@@ -693,7 +693,7 @@ fn a_catalog_that_does_not_open_is_never_cached_and_a_cached_run_never_opens_it(
     assert_eq!(broken.ready_calls(), 1);
     assert_eq!(broken.calls(), 0);
     assert!(
-        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Solve))
             .unwrap()
             .is_empty()
     );

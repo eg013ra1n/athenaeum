@@ -1304,13 +1304,13 @@ fn bayer_drizzle_keeps_a_mosaic_per_frame_and_deposits_from_it() {
     let calibrated = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated"),
+        Some(ArtifactKind::Calibrated),
     )
     .unwrap();
     let mosaics = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated_mosaic"),
+        Some(ArtifactKind::CalibratedMosaic),
     )
     .unwrap();
     assert_eq!(
@@ -1392,7 +1392,7 @@ fn bayer_drizzle_keeps_a_mosaic_per_frame_and_deposits_from_it() {
     }
 
     // `deleteIntermediates` takes the mosaic rows with the calibrated
-    // ones (`INTERMEDIATE_ARTIFACT_KINDS`).
+    // ones (`is_intermediate_kind`).
     let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
     cleanup_work(
         &fixture.conn,
@@ -1405,7 +1405,7 @@ fn bayer_drizzle_keeps_a_mosaic_per_frame_and_deposits_from_it() {
         crate::db::stacking::list_artifacts(
             &fixture.conn,
             &StackSubject::FrameSet(fixture.set_id),
-            Some("calibrated_mosaic")
+            Some(ArtifactKind::CalibratedMosaic)
         )
         .unwrap()
         .is_empty(),
@@ -3374,7 +3374,7 @@ fn coverage_gate_skips_a_top_score_member_with_a_mismatched_native_extent() {
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
         &group_key,
-        "ln_reference",
+        ArtifactKind::LnReference,
         None,
     )
     .unwrap()

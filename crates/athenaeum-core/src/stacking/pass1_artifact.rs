@@ -30,9 +30,6 @@ use serde::{Deserialize, Serialize};
 use crate::stacking::measure::{FramePass1, MeasureOptions, Pass1Body, Pass1BodyRef};
 use crate::star_measure::MEASURE_VERSION;
 
-/// The `stacking_artifacts.kind` of a frame's first-pass artifact.
-pub const PASS1_ARTIFACT_KIND: &str = "measured";
-
 /// Bumped whenever the bytes of a serialised pass-1 type change (the golden pin names this constant).
 pub const PASS1_ARTIFACT_VERSION: u16 = 1;
 

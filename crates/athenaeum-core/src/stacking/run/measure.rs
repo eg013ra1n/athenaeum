@@ -480,8 +480,8 @@ fn measure_group_prepare(
             crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                artifact_group_key("calibrated", &group.key),
-                "calibrated",
+                &group.key,
+                ArtifactKind::Calibrated,
                 Some(frame.frame_id),
             )?
             .and_then(|a| a.path)
@@ -679,8 +679,8 @@ fn measure_group_finish(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    artifact_group_key("metrics", &group.key),
-                    "metrics",
+                    &group.key,
+                    ArtifactKind::Metrics,
                     Some(frame.frame_id),
                 )?
             };
@@ -1341,15 +1341,15 @@ fn measure_two_pass_prepare(
                     crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        artifact_group_key("metrics", &group.key),
-                        "metrics",
+                        &group.key,
+                        ArtifactKind::Metrics,
                         Some(member.frame.frame_id),
                     )?,
                     crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        artifact_group_key(PASS1_ARTIFACT_KIND, &group.key),
-                        PASS1_ARTIFACT_KIND,
+                        &group.key,
+                        ArtifactKind::Measured,
                         Some(member.frame.frame_id),
                     )?,
                 )
@@ -1837,8 +1837,8 @@ fn upsert_pass1_row(
     let old = crate::db::stacking::find_artifact(
         &conn,
         &rc.subject,
-        artifact_group_key(PASS1_ARTIFACT_KIND, ""),
-        PASS1_ARTIFACT_KIND,
+        "",
+        ArtifactKind::Measured,
         Some(frame.frame_id),
     )?;
     upsert_artifact(
@@ -1846,8 +1846,8 @@ fn upsert_pass1_row(
         &NewArtifact {
             subject: &rc.subject,
             frame_id: Some(frame.frame_id),
-            group_key: artifact_group_key(PASS1_ARTIFACT_KIND, ""),
-            kind: PASS1_ARTIFACT_KIND,
+            group_key: "",
+            kind: ArtifactKind::Measured,
             path: spill.to_str(),
             config_hash: key,
             size: Some(size),
@@ -1897,8 +1897,8 @@ fn persist_measurement(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(frame.frame_id),
-                group_key: artifact_group_key("metrics", &group.key),
-                kind: "metrics",
+                group_key: &group.key,
+                kind: ArtifactKind::Metrics,
                 path: None,
                 config_hash: expected_hash,
                 size: None,
@@ -1985,14 +1985,14 @@ fn persist_measurement(
             continue;
         }
         let (size, modified_at) = file_identity(&fits_path)?;
-        let kind = fits_artifact::artifact_kind(plane);
+        let kind = ArtifactKind::Fits(plane);
         let conn = db(&rc.ctx)?.conn();
         // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
         let old = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            artifact_group_key(&kind, &group.key),
-            &kind,
+            &group.key,
+            kind,
             Some(frame.frame_id),
         )?;
         upsert_artifact(
@@ -2000,8 +2000,8 @@ fn persist_measurement(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(frame.frame_id),
-                group_key: artifact_group_key(&kind, &group.key),
-                kind: &kind,
+                group_key: &group.key,
+                kind: kind,
                 path: fits_path.to_str(),
                 config_hash: expected_hash,
                 size: Some(size),

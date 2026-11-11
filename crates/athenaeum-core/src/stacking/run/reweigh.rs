@@ -84,14 +84,14 @@ fn read_member_fits(
     member: &ReweighMember,
     plane: usize,
 ) -> Result<Option<Vec<psf_signal::StarFit>>, RunError> {
-    let kind = fits_artifact::artifact_kind(plane);
+    let kind = ArtifactKind::Fits(plane);
     let row = {
         let conn = db(&rc.ctx)?.conn();
         crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            artifact_group_key(&kind, ""),
-            &kind,
+            "",
+            kind,
             Some(member.frame_id),
         )?
     };

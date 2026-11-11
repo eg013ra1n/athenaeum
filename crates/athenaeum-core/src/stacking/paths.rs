@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::sync::OverlapRule;
 use crate::api::{ApiError, PathPolicy};
-use crate::db::stacking::StackSubject;
+use crate::db::stacking::{ArtifactKind, StackSubject};
 use crate::settings::{keys, SettingsManager};
 use crate::stacking::groups::{ColorMode, IntegrationGroup};
 
@@ -157,35 +157,6 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
         out.push(name);
     }
     out
-}
-
-/// The artifact kinds that belong to a FRAME, not to a group (frame-level cache spec §5.1): their rows carry
-/// `group_key = ""`, so a regroup (another tolerance, another split, a merge) finds them again. `fits.<plane>` kinds
-/// are frame-level too ([`is_frame_level_kind`]). Prepare writes `calibrated` / `calibrated_mosaic` as well; there is
-/// no `prepared` kind.
-pub const FRAME_LEVEL_KINDS: &[&str] = &[
-    "calibrated",
-    "calibrated_mosaic",
-    "measured",
-    "metrics",
-    "registered",
-    "registration",
-    "solve",
-];
-
-/// Whether `kind` is frame-level: one of [`FRAME_LEVEL_KINDS`] or a `fits.<plane>` kind.
-pub fn is_frame_level_kind(kind: &str) -> bool {
-    FRAME_LEVEL_KINDS.contains(&kind) || kind.starts_with("fits.")
-}
-
-/// The `group_key` a `stacking_artifacts` row of `kind` is stored and looked up under: `""` for a frame-level kind,
-/// the group's key otherwise. The one rule every `find_artifact` / `upsert_artifact` call site goes through.
-pub fn artifact_group_key<'a>(kind: &str, group_key: &'a str) -> &'a str {
-    if is_frame_level_kind(kind) {
-        ""
-    } else {
-        group_key
-    }
 }
 
 impl WorkingLayout {
@@ -1019,11 +990,11 @@ pub enum CleanupWhat {
 
 /// `stacking_artifacts.kind` values covered by [`CleanupWhat::Intermediates`]
 /// — every kind this task's `calibrated/`/`registered/`/`ln/` subtrees can
-/// hold. NOT used by [`CleanupWhat::All`]: `kind` is free-form TEXT, not an
-/// enum this crate can enumerate exhaustively, so `All` clears every row via
-/// [`crate::db::stacking::delete_all_artifacts`] instead — a future kind
-/// this list doesn't yet name must not survive "delete everything" and keep
-/// pointing at files cleanup just removed.
+/// hold. NOT used by [`CleanupWhat::All`]: the column is TEXT and can hold a
+/// kind another build wrote that [`ArtifactKind`] here does not name, so `All`
+/// clears every row via [`crate::db::stacking::delete_all_artifacts`] instead —
+/// such a kind must not survive "delete everything" and keep pointing at files
+/// cleanup just removed.
 ///
 /// `metrics` is deliberately NOT here (v0.6.3): a frame's measurement is a
 /// payload row with no file behind it — deleting it frees no disk and
@@ -1058,27 +1029,44 @@ pub enum CleanupWhat {
 /// it and its row, like `metrics` and `fits`; only `All` drops it. `Intermediates` still sweeps `measured/` (`.athm`)
 /// and `fits/` (`.athf`) of the writer-named files no `stacking_artifacts` row names ([`sweep_unreferenced`]).
 ///
-/// `two_pass` (`run::TWO_PASS_ARTIFACT_KIND`, the two-pass dry pass's decision, frame-level cache spec §5.6) is the
+/// `two_pass` ([`ArtifactKind::TwoPass`], the two-pass dry pass's decision, frame-level cache spec §5.6) is the
 /// group-level counterpart of `metrics` here: a payload row with no file, keyed on the group's membership
-/// ([`artifact_group_key`] returns the group key for it), it costs a dry pass (101 s for 551 frames) to rebuild and
+/// ([`ArtifactKind::group_key`] returns the group key for it), it costs a dry pass (101 s for 551 frames) to rebuild and
 /// nothing in an `Intermediates` cleanup changes what it reads. Only `All` drops it.
 ///
-/// `registration` (`plan::REGISTRATION_ARTIFACT_KIND`, a project's star-map
+/// `registration` ([`ArtifactKind::Registration`], a project's star-map
 /// cache) is deliberately absent too: it is a payload row that only `All`
 /// drops.
-const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
-    "registered",
-    "calibrated",
-    // M4d Task 1: the calibrated CFA mosaic lives IN `calibrated/` beside
-    // its debayered sibling, so the directory removal above already takes
-    // the file — this is its row.
-    "calibrated_mosaic",
-    "ln",
-    "ln_reference",
-    // Plan 6b-3 D7: the payload-only marker of a member that keeps global
-    // normalization goes with the `.athln` sidecars it stands in for.
-    "ln_global",
-];
+///
+/// A match, not a list: a new [`ArtifactKind`] does not compile until it has an answer here.
+fn is_intermediate_kind(kind: ArtifactKind) -> bool {
+    match kind {
+        ArtifactKind::Registered
+        | ArtifactKind::Calibrated
+        // M4d Task 1: the calibrated CFA mosaic lives IN `calibrated/` beside
+        // its debayered sibling, so the directory removal above already takes
+        // the file — this is its row.
+        | ArtifactKind::CalibratedMosaic
+        | ArtifactKind::Ln
+        | ArtifactKind::LnReference
+        // Plan 6b-3 D7: the payload-only marker of a member that keeps global
+        // normalization goes with the `.athln` sidecars it stands in for.
+        | ArtifactKind::LnGlobal => true,
+        ArtifactKind::Measured
+        | ArtifactKind::Metrics
+        | ArtifactKind::Fits(_)
+        | ArtifactKind::Registration
+        | ArtifactKind::Solve
+        | ArtifactKind::LnCalibration
+        | ArtifactKind::TwoPass => false,
+    }
+}
+
+/// The kinds "Delete intermediates" drops the rows of: every [`is_intermediate_kind`] of [`ArtifactKind::FIXED`]
+/// (`Fits` is per plane and not in that list; it survives, see above).
+fn intermediate_artifact_kinds() -> Vec<ArtifactKind> {
+    ArtifactKind::FIXED.into_iter().filter(|k| is_intermediate_kind(*k)).collect()
+}
 
 /// Whether `name` is a crop run's scratch folder (`run-<id>-uncropped`,
 /// [`WorkingLayout::uncropped_dir`]).
@@ -1278,7 +1266,7 @@ fn sweep_dir(dir: &Path, ext: &str, keep: &KeepSet, freed: &mut u64) -> bool {
 /// `rej/` holds no `stacking_artifacts` rows (bitmaps are per-run
 /// temporaries, not cached artifacts — see `stacking::rej`'s own doc), so it
 /// is added to the removed DIRECTORIES on the same levels as `calibrated`/
-/// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
+/// `ln` without touching `is_intermediate_kind` or the DB delete
 /// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
 /// pointing at a file used in place loses its row, never its file. `Intermediates` keeps `measured/` and `fits/`
 /// with their rows and removes from them only the `.athm` / `.athf` files (and crashed-write temporaries) no row of
@@ -1333,7 +1321,7 @@ pub fn cleanup_work_with(
             // Results cards' thumbnails away.
             dirs.push(layout.previews_root());
             // Tier C Task 1: `fits/` follows `metrics` — see
-            // `INTERMEDIATE_ARTIFACT_KINDS`'s own doc for why both survive
+            // `is_intermediate_kind`'s own doc for why both survive
             // `Intermediates` and drop only here. `measured/` (pass 1) joins
             // them since the frame-level cache (spec §5.3).
             dirs.push(layout.fits_root());
@@ -1357,10 +1345,10 @@ pub fn cleanup_work_with(
 
     match what {
         CleanupWhat::Registered => {
-            crate::db::stacking::delete_artifacts(conn, subject, &["registered"])?;
+            crate::db::stacking::delete_artifacts(conn, subject, &[ArtifactKind::Registered])?;
         }
         CleanupWhat::Intermediates => {
-            crate::db::stacking::delete_artifacts(conn, subject, INTERMEDIATE_ARTIFACT_KINDS)?;
+            crate::db::stacking::delete_artifacts(conn, subject, &intermediate_artifact_kinds())?;
             // `measured/` and `fits/` survive with their rows; the writer-named files no row of any subject names
             // go (a migrated file of a deleted duplicate, a leftover of a crashed write). After the row deletion
             // above, so the rows consulted are the ones that remain.
@@ -1416,52 +1404,6 @@ pub fn subject_output_dir(output_root: &Path, subject: &StackSubject, label: &st
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn frame_level_kinds_use_the_empty_group_key() {
-        assert_eq!(artifact_group_key("calibrated", "osc__x__bin1__180s"), "");
-        assert_eq!(artifact_group_key("calibrated_mosaic", "k"), "");
-        assert_eq!(artifact_group_key("solve", "k"), "");
-        assert_eq!(artifact_group_key("registration", "k"), "");
-        assert_eq!(artifact_group_key("fits.2", "k"), "");
-        assert_eq!(artifact_group_key("ln", "k"), "k");
-        assert_eq!(artifact_group_key("ln_reference", "k"), "k");
-        assert_eq!(artifact_group_key("two_pass", "k"), "k");
-        for kind in FRAME_LEVEL_KINDS {
-            assert!(is_frame_level_kind(kind), "{kind}");
-        }
-        assert!(!is_frame_level_kind("ln"));
-    }
-
-    /// The bridge to `ArtifactKind` (removed with the string rule): the enum stores the strings and applies the key
-    /// rule this file's string functions and the stages' constants did.
-    #[test]
-    fn artifact_kind_agrees_with_the_string_rule() {
-        use crate::db::stacking::ArtifactKind;
-        let planes = [ArtifactKind::Fits(0), ArtifactKind::Fits(1), ArtifactKind::Fits(2)];
-        for kind in ArtifactKind::FIXED.into_iter().chain(planes) {
-            let stored = kind.as_db_str();
-            assert_eq!(kind.is_frame_level(), is_frame_level_kind(&stored), "{stored}");
-            assert_eq!(kind.group_key("k"), artifact_group_key(&stored, "k"), "{stored}");
-        }
-        let frame_level: Vec<String> = ArtifactKind::FIXED
-            .iter()
-            .filter(|k| k.is_frame_level())
-            .map(|k| k.as_db_str().into_owned())
-            .collect();
-        assert_eq!(frame_level, FRAME_LEVEL_KINDS);
-        assert_eq!(ArtifactKind::Measured.as_db_str(), crate::stacking::pass1_artifact::PASS1_ARTIFACT_KIND);
-        assert_eq!(ArtifactKind::Registration.as_db_str(), crate::stacking::plan::REGISTRATION_ARTIFACT_KIND);
-        assert_eq!(ArtifactKind::TwoPass.as_db_str(), crate::stacking::run::TWO_PASS_ARTIFACT_KIND);
-        assert_eq!(ArtifactKind::LnGlobal.as_db_str(), crate::stacking::run::LN_GLOBAL_ARTIFACT_KIND);
-        for plane in 0..4 {
-            assert_eq!(ArtifactKind::Fits(plane).as_db_str(), crate::stacking::fits_artifact::artifact_kind(plane));
-        }
-        assert_eq!(
-            INTERMEDIATE_ARTIFACT_KINDS,
-            ["registered", "calibrated", "calibrated_mosaic", "ln", "ln_reference", "ln_global"]
-        );
-    }
-
     use super::*;
 
     use crate::db::schema::init_db;
@@ -2272,7 +2214,18 @@ mod tests {
         assert!(layout.root.exists());
     }
 
-    fn seed_artifact(c: &Connection, frames_set_id: i64, kind: &str, path: &str, size: i64) {
+    /// The rows "Delete intermediates" drops, as stored strings: the list this file kept by hand before
+    /// [`is_intermediate_kind`], and no plane's `fits` kind.
+    #[test]
+    fn delete_intermediates_drops_exactly_these_kinds() {
+        let mut dropped: Vec<String> =
+            intermediate_artifact_kinds().iter().map(|k| k.as_db_str().into_owned()).collect();
+        dropped.sort();
+        assert_eq!(dropped, ["calibrated", "calibrated_mosaic", "ln", "ln_global", "ln_reference", "registered"]);
+        assert!(!is_intermediate_kind(ArtifactKind::Fits(0)));
+    }
+
+    fn seed_artifact(c: &Connection, frames_set_id: i64, kind: ArtifactKind, path: &str, size: i64) {
         crate::db::stacking::upsert_artifact(
             c,
             &NewArtifact {
@@ -2308,14 +2261,14 @@ mod tests {
         seed_artifact(
             &c,
             set_id,
-            "calibrated",
+            ArtifactKind::Calibrated,
             calibrated_file.to_str().unwrap(),
             100,
         );
         seed_artifact(
             &c,
             set_id,
-            "registered",
+            ArtifactKind::Registered,
             registered_file.to_str().unwrap(),
             200,
         );
@@ -2339,12 +2292,12 @@ mod tests {
         assert!(!layout.registered_dir().exists());
         assert!(calibrated_file.exists(), "calibrated/ untouched");
         assert_eq!(
-            delete_artifacts(&c, &StackSubject::FrameSet(set_id), &["registered"]).unwrap(),
+            delete_artifacts(&c, &StackSubject::FrameSet(set_id), &[ArtifactKind::Registered]).unwrap(),
             0,
             "the registered row is already gone"
         );
         assert_eq!(
-            delete_artifacts(&c, &StackSubject::FrameSet(set_id), &["calibrated"]).unwrap(),
+            delete_artifacts(&c, &StackSubject::FrameSet(set_id), &[ArtifactKind::Calibrated]).unwrap(),
             1,
             "the calibrated row is still there"
         );
@@ -2353,7 +2306,7 @@ mod tests {
         seed_artifact(
             &c,
             set_id,
-            "calibrated",
+            ArtifactKind::Calibrated,
             calibrated_file.to_str().unwrap(),
             100,
         );
@@ -2361,7 +2314,7 @@ mod tests {
         seed_artifact(
             &c,
             set_id,
-            "registered",
+            ArtifactKind::Registered,
             registered_file.to_str().unwrap(),
             200,
         );
@@ -2370,10 +2323,16 @@ mod tests {
         // free-form TEXT, so nothing stops one existing before the code that
         // understands it does. `Intermediates` (a fixed kind list) must
         // leave it alone; only `All` may sweep it.
-        seed_artifact(&c, set_id, "future", "/nowhere", 0);
+        // Written in SQL: no `ArtifactKind` names it, which is the point.
+        c.execute(
+            "INSERT INTO stacking_artifacts (frames_set_id, group_key, kind, path, config_hash, size, created_at)
+             VALUES (?1, 'g', 'future', '/nowhere', 'h', 0, '2026-09-09T00:00:00Z')",
+            rusqlite::params![set_id],
+        )
+        .unwrap();
         // A measurement row: no file, no bytes — a cache the next run can
         // still hit after its calibrated frame is regenerated (v0.6.3).
-        seed_artifact(&c, set_id, "metrics", "/nowhere", 0);
+        seed_artifact(&c, set_id, ArtifactKind::Metrics, "/nowhere", 0);
 
         // Intermediates: also removes calibrated/, but not the unknown kind
         // and not the file-less measurement row.
@@ -2567,13 +2526,13 @@ mod tests {
         );
         let file = layout.measured_path("f1");
         write_bytes(&file, 96);
-        seed_artifact(&c, 4, "measured", file.to_str().unwrap(), 96);
+        seed_artifact(&c, 4, ArtifactKind::Measured, file.to_str().unwrap(), 96);
 
         let usage = work_usage(&layout);
         assert_eq!(usage.measured_bytes, 96);
         assert_eq!(usage.total_bytes, 96, "the only bytes on disk are under measured/");
         let row_count = |c: &Connection| {
-            crate::db::stacking::list_artifacts(c, &StackSubject::FrameSet(4), Some("measured"))
+            crate::db::stacking::list_artifacts(c, &StackSubject::FrameSet(4), Some(ArtifactKind::Measured))
                 .unwrap()
                 .len()
         };
@@ -2605,7 +2564,7 @@ mod tests {
     }
 
     /// A frame-level row (group key `''`) of the given kind, as the frame-level writers leave it.
-    fn seed_frame_row(c: &Connection, set_id: i64, frame_id: i64, kind: &str, path: &Path) {
+    fn seed_frame_row(c: &Connection, set_id: i64, frame_id: i64, kind: ArtifactKind, path: &Path) {
         // The foreign key wants the frame; a second row of the same frame finds it already there.
         c.execute(
             "INSERT OR IGNORE INTO files (id, path, filename, size, modified_at, format)
@@ -2663,10 +2622,10 @@ mod tests {
         ] {
             write_bytes(path, n);
         }
-        seed_frame_row(&c, 6, 1, "measured", &m1);
-        seed_frame_row(&c, 6, 2, "measured", &m2);
-        seed_frame_row(&c, 6, 1, "fits.0", &f1);
-        seed_frame_row(&c, 6, 1, "calibrated", &calibrated);
+        seed_frame_row(&c, 6, 1, ArtifactKind::Measured, &m1);
+        seed_frame_row(&c, 6, 2, ArtifactKind::Measured, &m2);
+        seed_frame_row(&c, 6, 1, ArtifactKind::Fits(0), &f1);
+        seed_frame_row(&c, 6, 1, ArtifactKind::Calibrated, &calibrated);
 
         let freed = cleanup_work(
             &c,
@@ -2689,12 +2648,12 @@ mod tests {
             "a sub-folder left empty goes"
         );
         assert!(layout.measured_root().join("old_key").exists(), "…one with a kept file stays");
-        let count = |kind: &str| {
+        let count = |kind: ArtifactKind| {
             crate::db::stacking::list_artifacts(&c, &StackSubject::FrameSet(6), Some(kind))
                 .unwrap()
                 .len()
         };
-        assert_eq!((count("measured"), count("fits.0"), count("calibrated")), (2, 1, 0));
+        assert_eq!((count(ArtifactKind::Measured), count(ArtifactKind::Fits(0)), count(ArtifactKind::Calibrated)), (2, 1, 0));
 
         // A second pass changes nothing, and a layout that never wrote `fits/` is not an error.
         std::fs::remove_dir_all(layout.fits_root()).unwrap();
@@ -2801,8 +2760,8 @@ mod tests {
         write_bytes(&pass1, 10);
         write_bytes(&fits, 20);
         write_bytes(&stray, 3);
-        seed_frame_row(&c, 10, 1, "measured", &pass1);
-        seed_frame_row(&c, 10, 1, "fits.0", &fits);
+        seed_frame_row(&c, 10, 1, ArtifactKind::Measured, &pass1);
+        seed_frame_row(&c, 10, 1, ArtifactKind::Fits(0), &fits);
 
         let freed = cleanup_work(
             &c,
@@ -2857,7 +2816,7 @@ mod tests {
         let orphan = layout.measured_path("o_f6");
         write_bytes(&theirs, 8);
         write_bytes(&orphan, 3);
-        seed_frame_row(&c, 8, 5, "measured", &theirs);
+        seed_frame_row(&c, 8, 5, ArtifactKind::Measured, &theirs);
 
         let freed = cleanup_work(
             &c,
@@ -2870,7 +2829,7 @@ mod tests {
         assert!(theirs.exists(), "set 8's pass-1 file survives set 7's cleanup");
         assert!(!orphan.exists());
         assert_eq!(
-            crate::db::stacking::list_artifacts(&c, &StackSubject::FrameSet(8), Some("measured"))
+            crate::db::stacking::list_artifacts(&c, &StackSubject::FrameSet(8), Some(ArtifactKind::Measured))
                 .unwrap()
                 .len(),
             1

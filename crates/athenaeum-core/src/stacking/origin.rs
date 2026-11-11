@@ -17,7 +17,7 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use crate::api::ApiError;
-use crate::db::stacking::StackSubject;
+use crate::db::stacking::{ArtifactKind, StackSubject};
 use crate::collab::frame_meta::ProjectFrameMeta;
 use crate::integration::cfa::CfaGeometry;
 use crate::plate_solve::storage::PlateSolveRecord;
@@ -410,8 +410,8 @@ pub(crate) fn wcs_outlook(
         crate::db::stacking::find_artifact(
             conn,
             &subject,
-            crate::stacking::paths::artifact_group_key("solve", ""),
-            "solve",
+            "",
+            ArtifactKind::Solve,
             Some(frame_id),
         )?
     else {

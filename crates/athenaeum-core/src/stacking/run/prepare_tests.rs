@@ -46,7 +46,7 @@ fn re_preparing_reproduces_the_prepared_planes_bit_for_bit() {
                     &conn,
                     &rc.subject,
                     "",
-                    "calibrated",
+                    ArtifactKind::Calibrated,
                     Some(f.frame_id),
                 )
                 .unwrap()
@@ -73,7 +73,7 @@ fn re_preparing_reproduces_the_prepared_planes_bit_for_bit() {
     for (_, path, _) in &before {
         std::fs::remove_file(path).unwrap();
     }
-    crate::db::stacking::delete_artifacts(&conn, &rc.subject, &["calibrated"]).unwrap();
+    crate::db::stacking::delete_artifacts(&conn, &rc.subject, &[ArtifactKind::Calibrated]).unwrap();
 
     let mut rc2 = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &working, &out);
     let (res, logs) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc2));
@@ -146,7 +146,7 @@ fn prepare_uses_a_float_replica_in_place_and_never_touches_it() {
         rc.runtime_exclusions
     );
     let artifacts =
-        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("calibrated")).unwrap();
+        crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Calibrated)).unwrap();
     assert_eq!(artifacts.len(), 6);
     for a in &artifacts {
         let path = PathBuf::from(a.path.as_deref().unwrap());
@@ -221,7 +221,7 @@ fn prepare_debayers_a_mosaic_and_keeps_the_landed_mosaic_for_bayer_drizzle() {
     );
     let key = "";
     for f in rc.plan_groups[0].frames.clone() {
-        let row = |kind: &str| {
+        let row = |kind: ArtifactKind| {
             crate::db::stacking::find_artifact(&conn, &rc.subject, key, kind, Some(f.frame_id))
                 .unwrap()
                 .and_then(|a| a.path)
@@ -233,14 +233,14 @@ fn prepare_debayers_a_mosaic_and_keeps_the_landed_mosaic_for_bayer_drizzle() {
             .to_str()
             .unwrap()
             .to_string();
-        let calibrated = PathBuf::from(row("calibrated"));
+        let calibrated = PathBuf::from(row(ArtifactKind::Calibrated));
         assert_eq!(
             calibrated,
             rc.layout
                 .prepared_dir()
                 .join(format!("p_{stem}_f{}_d.fits", f.frame_id))
         );
-        assert_eq!(row("calibrated_mosaic"), f.path, "the landed mosaic itself");
+        assert_eq!(row(ArtifactKind::CalibratedMosaic), f.path, "the landed mosaic itself");
         let h = FitsHeader::from_path(&calibrated).unwrap();
         assert_eq!(h.get_i32("NAXIS3"), Some(3));
         assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("debayered"));
@@ -267,7 +267,7 @@ fn prepare_debayers_a_mosaic_and_keeps_the_landed_mosaic_for_bayer_drizzle() {
             &conn,
             &rc.subject,
             "",
-            "calibrated",
+            ArtifactKind::Calibrated,
             Some(f.frame_id),
         )
         .unwrap()
@@ -310,7 +310,7 @@ fn converting_an_in_place_frame_keeps_its_landed_file_inside_the_working_folder(
     let frames = rc.plan_groups[0].frames.clone();
     assert_eq!(frames.len(), 2);
     for f in &frames {
-        let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(f.frame_id))
+        let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Calibrated, Some(f.frame_id))
             .unwrap()
             .unwrap();
         assert_eq!(row.path.as_deref(), Some(f.path.as_str()), "used in place");
@@ -322,7 +322,7 @@ fn converting_an_in_place_frame_keeps_its_landed_file_inside_the_working_folder(
     stage_calibrate(&mut rc).unwrap();
     assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
     for f in &frames {
-        let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(f.frame_id))
+        let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Calibrated, Some(f.frame_id))
             .unwrap()
             .unwrap();
         let now = PathBuf::from(row.path.unwrap());
@@ -385,7 +385,7 @@ fn prepare_converts_xisf_and_integer_files_into_the_unit_domain() {
                 &conn,
                 &rc.subject,
                 "",
-                "calibrated",
+                ArtifactKind::Calibrated,
                 Some(handle_of(uuid)),
             )
             .unwrap()
@@ -568,7 +568,7 @@ fn prepare_excludes_a_project_frame_whose_landed_file_changed() {
         &conn,
         &rc.subject,
         "",
-        "calibrated",
+        ArtifactKind::Calibrated,
         Some(b)
     )
     .unwrap()
@@ -629,7 +629,7 @@ fn prepare_never_reads_the_catalog_for_a_project() {
             &conn,
             &rc.subject,
             "",
-            "calibrated",
+            ArtifactKind::Calibrated,
             Some(f.frame_id),
         )
         .unwrap()
@@ -740,7 +740,7 @@ fn an_attested_set_stacks_without_masters() {
         crate::stacking::paths::subject_layout(&fixture.conn, working.path(), &subject)
             .unwrap();
     let calibrated =
-        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("calibrated"))
+        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some(ArtifactKind::Calibrated))
             .unwrap();
     assert_eq!(calibrated.len(), light_ids.len());
     for a in &calibrated {
@@ -855,7 +855,7 @@ fn attested_three_plane_case(debayer_osc: bool) {
         .unwrap();
     assert_eq!(run_row.status, "done", "{run_row:?}");
     let calibrated =
-        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("calibrated"))
+        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some(ArtifactKind::Calibrated))
             .unwrap();
     assert_eq!(
         calibrated.len(),
@@ -944,7 +944,7 @@ fn an_attested_zip_resident_set_stacks_with_its_artifacts_off_the_cache() {
         crate::stacking::paths::subject_layout(&fixture.conn, working.path(), &subject)
             .unwrap();
     let calibrated =
-        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("calibrated"))
+        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some(ArtifactKind::Calibrated))
             .unwrap();
     assert_eq!(calibrated.len(), light_ids.len(), "Prepare excluded nothing");
     for a in &calibrated {
@@ -1161,7 +1161,7 @@ fn prepare_uses_a_three_plane_replica_without_a_manifest_bayerpat_in_an_osc_grou
             rc.runtime_exclusions
         );
         let artifacts =
-            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("calibrated"))
+            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Calibrated))
                 .unwrap();
         assert_eq!(artifacts.len(), 3);
         for a in &artifacts {

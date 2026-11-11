@@ -447,8 +447,8 @@ impl TwoPassRig {
         crate::db::stacking::find_artifact(
             &self.fixture.conn,
             &StackSubject::FrameSet(self.fixture.set_id),
-            artifact_group_key(TWO_PASS_ARTIFACT_KIND, key),
-            TWO_PASS_ARTIFACT_KIND,
+            key,
+            ArtifactKind::TwoPass,
             None,
         )
         .unwrap()

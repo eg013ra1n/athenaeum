@@ -13,7 +13,7 @@ use base64::Engine;
 use crate::api::collab_exchange::test_support::{test_ctx, wire_hub};
 use crate::api::PathPolicy;
 use crate::collab::fake_hub::FakeHub;
-use crate::db::stacking::{StackSubject, StackingRunRow};
+use crate::db::stacking::{ArtifactKind, StackSubject, StackingRunRow};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 use crate::stacking::plan::Stage;
@@ -389,7 +389,7 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
     let globals = crate::db::stacking::list_artifacts(
         &db_conn(&ctx),
         &StackSubject::Project("p1".into()),
-        Some(crate::stacking::run::LN_GLOBAL_ARTIFACT_KIND),
+        Some(ArtifactKind::LnGlobal),
     )
     .unwrap();
     assert_eq!(globals.len(), 2, "one ln_global artifact per east frame");

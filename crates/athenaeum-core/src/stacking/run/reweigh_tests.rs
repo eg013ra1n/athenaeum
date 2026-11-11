@@ -370,7 +370,7 @@ impl Harness {
         crate::db::stacking::list_artifacts(
             &self.fixture.conn,
             &StackSubject::FrameSet(self.fixture.set_id),
-            Some("metrics"),
+            Some(ArtifactKind::Metrics),
         )
         .unwrap()
         .into_iter()
@@ -559,7 +559,7 @@ fn a_member_without_a_fresh_fits_artifact_sends_the_plane_back_to_its_measure_ti
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
         "",
-        "fits.0",
+        ArtifactKind::Fits(0),
         Some(h.ids[2]),
     )
     .unwrap()
@@ -592,7 +592,7 @@ fn a_group_that_fell_back_reaches_the_output_stage_as_a_fallback() {
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
         "",
-        "fits.0",
+        ArtifactKind::Fits(0),
         Some(h.ids[2]),
     )
     .unwrap()
@@ -908,7 +908,7 @@ fn a_fallback_outside_the_psf_family_warns_of_the_gain_not_the_weights() {
             &h.fixture.conn,
             &StackSubject::FrameSet(h.fixture.set_id),
             "",
-            "fits.0",
+            ArtifactKind::Fits(0),
             Some(h.ids[2]),
         )
         .unwrap()
@@ -1314,7 +1314,7 @@ fn a_plane_that_falls_back_leaves_its_siblings_reweighed() {
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
         "",
-        "fits.1",
+        ArtifactKind::Fits(1),
         Some(h.ids[3]),
     )
     .unwrap()
@@ -1349,7 +1349,7 @@ fn halve_s(h: &Harness, i: usize, plane: usize) {
         &h.fixture.conn,
         &StackSubject::FrameSet(h.fixture.set_id),
         "",
-        &crate::stacking::fits_artifact::artifact_kind(plane),
+        ArtifactKind::Fits(plane),
         Some(h.ids[i]),
     )
     .unwrap()

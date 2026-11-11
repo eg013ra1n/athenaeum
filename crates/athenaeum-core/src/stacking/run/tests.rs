@@ -523,7 +523,7 @@ pub(super) fn metrics_by_frame(
     conn: &rusqlite::Connection,
     set_id: i64,
 ) -> HashMap<i64, (String, FrameMeasurement, String)> {
-    crate::db::stacking::list_artifacts(conn, &StackSubject::FrameSet(set_id), Some("metrics"))
+    crate::db::stacking::list_artifacts(conn, &StackSubject::FrameSet(set_id), Some(ArtifactKind::Metrics))
         .unwrap()
         .into_iter()
         .map(|a| {
@@ -550,7 +550,7 @@ pub(super) fn pass1_logged_under(root: &Path) -> Vec<PathBuf> {
 pub(super) fn rows_of_kind(
     conn: &rusqlite::Connection,
     set_id: i64,
-    kind: &str,
+    kind: ArtifactKind,
 ) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
     crate::db::stacking::list_artifacts(conn, &StackSubject::FrameSet(set_id), Some(kind))
         .unwrap()
@@ -722,7 +722,7 @@ impl Pass1Rig {
         }
     }
 
-    pub(super) fn rows(&self, kind: &str) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
+    pub(super) fn rows(&self, kind: ArtifactKind) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
         rows_of_kind(&self.fixture.conn, self.fixture.set_id, kind)
     }
 
@@ -731,7 +731,7 @@ impl Pass1Rig {
             &self.fixture.conn,
             &self.subject,
             "",
-            "calibrated",
+            ArtifactKind::Calibrated,
             Some(frame_id),
         )
         .unwrap()
@@ -744,7 +744,7 @@ impl Pass1Rig {
         self.layout.calibrated_root().parent().unwrap().join("measured")
     }
 
-    pub(super) fn delete_rows(&self, kinds: &[&str]) {
+    pub(super) fn delete_rows(&self, kinds: &[ArtifactKind]) {
         crate::db::stacking::delete_artifacts(&self.fixture.conn, &self.subject, kinds)
             .unwrap();
     }
@@ -763,7 +763,7 @@ impl Pass1Rig {
                     subject: &self.subject,
                     frame_id: Some(frame_id),
                     group_key: "",
-                    kind: "metrics",
+                    kind: ArtifactKind::Metrics,
                     path: None,
                     config_hash: &hash,
                     size: None,
@@ -776,7 +776,7 @@ impl Pass1Rig {
     }
 
     pub(super) fn sorted_ids(&self) -> Vec<i64> {
-        let mut ids: Vec<i64> = self.rows("metrics").keys().copied().collect();
+        let mut ids: Vec<i64> = self.rows(ArtifactKind::Metrics).keys().copied().collect();
         ids.sort_unstable();
         ids
     }
@@ -1626,7 +1626,7 @@ fn delete_intermediates_cleans_the_working_folder() {
     );
 
     // v0.6.3: the cleanup keeps the `metrics` rows (file-less, keyed on
-    // the calibration CONFIG hash — `paths::INTERMEDIATE_ARTIFACT_KINDS`),
+    // the calibration CONFIG hash — `paths::is_intermediate_kind`),
     // so a second run re-calibrates and re-registers but does NOT
     // re-measure. Pinned end to end on the second run's own summary,
     // not on the kind list: a regression in `measurement_hash_for`'s
@@ -1946,7 +1946,7 @@ fn work_usage_and_cleanup_of_a_frame_set_ignore_project_rows() {
             subject: &project_subject,
             frame_id: None,
             group_key: "g",
-            kind: "calibrated",
+            kind: ArtifactKind::Calibrated,
             path: None,
             config_hash: "h",
             size: None,
@@ -2073,8 +2073,8 @@ pub(super) fn seed_in_place_calibrated(conn: &rusqlite::Connection, rc: &mut Run
                 &NewArtifact {
                     subject: &rc.subject,
                     frame_id: Some(f.frame_id),
-                    group_key: artifact_group_key("calibrated", &g.key),
-                    kind: "calibrated",
+                    group_key: &g.key,
+                    kind: ArtifactKind::Calibrated,
                     path: Some(&f.path),
                     config_hash: &hash,
                     size: Some(size),

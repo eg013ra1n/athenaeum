@@ -20,9 +20,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{db, ApiError};
-use crate::db::stacking::{find_artifact, get_run, StackSubject, StackingRunRow};
+use crate::db::stacking::{find_artifact, get_run, ArtifactKind, StackSubject, StackingRunRow};
 use crate::services::ServiceContext;
-use crate::stacking::paths::artifact_group_key;
 use crate::stacking::plan::{file_matches_identity, registered_status};
 
 /// Whether a run's aligned frame can be shown for one frame, and why not when it cannot.
@@ -208,8 +207,8 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
         let artifact = find_artifact(
             conn,
             &subject,
-            artifact_group_key("registered", &row.group_key),
-            "registered",
+            &row.group_key,
+            ArtifactKind::Registered,
             Some(frame_id),
         )?;
         // Both timestamps are RFC 3339 UTC with milliseconds from one `now()`, so they compare as strings. A run still
@@ -458,8 +457,8 @@ mod tests {
         find_artifact(
             &s.fixture.conn,
             &StackSubject::FrameSet(s.fixture.set_id),
-            artifact_group_key("registered", &group_key),
-            "registered",
+            &group_key,
+            ArtifactKind::Registered,
             Some(frame_id),
         )
         .unwrap()
@@ -846,7 +845,7 @@ mod tests {
                     subject: &subject,
                     frame_id: Some(frame),
                     group_key: "",
-                    kind: "registered",
+                    kind: ArtifactKind::Registered,
                     path: path.to_str(),
                     config_hash: "h",
                     size: Some(6),

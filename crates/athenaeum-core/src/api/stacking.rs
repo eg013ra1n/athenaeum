@@ -1452,6 +1452,7 @@ fn write_preview_cache(cache: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::stacking::ArtifactKind;
     use crate::events::NullEmitter;
     use crate::stacking::config::CleanupPolicy;
     use crate::stacking::groups::set_slug;
@@ -1863,7 +1864,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, [0u8; 16]).unwrap();
         }
-        for (kind, path) in [("measured", &pass1), ("fits.0", &fits)] {
+        for (kind, path) in [(ArtifactKind::Measured, &pass1), (ArtifactKind::Fits(0), &fits)] {
             crate::db::stacking::upsert_artifact(
                 conn,
                 &crate::db::stacking::NewArtifact {
@@ -3166,7 +3167,7 @@ mod tests {
                     subject: &subject,
                     frame_id: Some(h["gone"]),
                     group_key: "",
-                    kind: "solve",
+                    kind: ArtifactKind::Solve,
                     path: None,
                     config_hash: "h",
                     size: None,
@@ -3186,7 +3187,7 @@ mod tests {
                 &db(&ctx).unwrap().conn(),
                 &subject,
                 "",
-                "solve",
+                ArtifactKind::Solve,
                 Some(gone)
             )
             .unwrap()
@@ -3249,7 +3250,7 @@ mod tests {
                     subject: &subject,
                     frame_id: Some(h["late"]),
                     group_key: "",
-                    kind: "solve",
+                    kind: ArtifactKind::Solve,
                     path: None,
                     config_hash: "h",
                     size: None,
@@ -3274,7 +3275,7 @@ mod tests {
                 &db(&ctx).unwrap().conn(),
                 &subject,
                 "",
-                "solve",
+                ArtifactKind::Solve,
                 Some(late)
             )
             .unwrap()
@@ -3353,7 +3354,7 @@ mod tests {
                     subject: &subject,
                     frame_id: Some(h["gone"]),
                     group_key: "",
-                    kind: "solve",
+                    kind: ArtifactKind::Solve,
                     path: None,
                     config_hash: "h",
                     size: None,
@@ -3375,7 +3376,7 @@ mod tests {
                 &db(&ctx).unwrap().conn(),
                 &subject,
                 "",
-                "solve",
+                ArtifactKind::Solve,
                 Some(gone)
             )
             .unwrap()

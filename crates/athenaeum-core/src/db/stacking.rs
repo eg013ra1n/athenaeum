@@ -359,7 +359,8 @@ impl ArtifactKind {
         ArtifactKind::TwoPass,
     ];
 
-    /// The prefix of every [`ArtifactKind::Fits`] string, for SQL that selects all planes at once.
+    /// The prefix of every [`ArtifactKind::Fits`] string. The two SQL predicates that select every plane at once (the
+    /// frame-level keys migration, the cleanup's sweep) spell it out.
     pub const FITS_PREFIX: &'static str = "fits.";
 
     /// The string stored in `stacking_artifacts.kind`.
@@ -510,8 +511,10 @@ const MASTER_LIGHT_COLUMNS: &str =
 pub struct NewArtifact<'a> {
     pub subject: &'a StackSubject,
     pub frame_id: Option<i64>,
+    /// The key of the group the artifact was made for. A frame-level kind is stored under `''` whatever is given
+    /// here ([`ArtifactKind::group_key`]); a writer with no group at hand passes `""`.
     pub group_key: &'a str,
-    pub kind: &'a str,
+    pub kind: ArtifactKind,
     pub path: Option<&'a str>,
     pub config_hash: &'a str,
     pub size: Option<i64>,
@@ -914,11 +917,21 @@ pub fn list_frame_rows(conn: &Connection, run_id: i64) -> Result<Vec<StackingRun
 /// COALESCE(project_frame, 0))` — so a NULL frame collapses onto the same row
 /// (a set-level artifact) rather than creating a new one on every rebuild.
 ///
-/// Caller contract (frame-level cache spec §5.1): `a.group_key` is
-/// `stacking::paths::artifact_group_key(kind, group_key)` — `""` for a frame-level kind, the group's key otherwise.
-/// This function stores what it is given; the one rule lives in `paths.rs`, and [`find_artifact`] is called the same
-/// way.
+/// The frame / group rule (frame-level cache spec §5.1) is applied HERE: the row is stored under
+/// [`ArtifactKind::group_key`] of `a.group_key`, `''` for a frame-level kind and the group's key otherwise, and
+/// [`find_artifact`] looks it up the same way. A caller names the kind and the group; it does not choose the key.
 pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
+    upsert_artifact_row(conn, a, a.kind.group_key(a.group_key))
+}
+
+/// Test-only: store the row under `a.group_key` AS GIVEN, past the frame / group rule. The shape of a row written
+/// before the frame-level keys migration, or of a stray one; no production code can write it.
+#[cfg(test)]
+pub(crate) fn upsert_artifact_under_key(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
+    upsert_artifact_row(conn, a, a.group_key)
+}
+
+fn upsert_artifact_row(conn: &Connection, a: &NewArtifact<'_>, group_key: &str) -> Result<i64> {
     let created_at = now();
     let (fid, pf) = a.subject.frame_columns(a.frame_id);
     conn.query_row(
@@ -940,8 +953,8 @@ pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
             a.subject.project_id(),
             fid,
             pf,
-            a.group_key,
-            a.kind,
+            group_key,
+            a.kind.as_db_str(),
             a.path,
             a.config_hash,
             a.size,
@@ -969,11 +982,14 @@ fn find_artifact_sql() -> String {
     )
 }
 
+/// The artifact of `kind` for a frame (or the group's own, `frame_id = None`). `group_key` is the key of the group
+/// the caller is working on; a frame-level kind is looked up under `''` whatever is given
+/// ([`ArtifactKind::group_key`], the rule [`upsert_artifact`] stores by).
 pub fn find_artifact(
     conn: &Connection,
     subject: &StackSubject,
     group_key: &str,
-    kind: &str,
+    kind: ArtifactKind,
     frame_id: Option<i64>,
 ) -> Result<Option<StackingArtifactRow>> {
     let (fid, pf) = subject.frame_columns(frame_id);
@@ -984,8 +1000,8 @@ pub fn find_artifact(
             params![
                 subject.frame_set_id().unwrap_or(0),
                 subject.project_id().unwrap_or(""),
-                group_key,
-                kind,
+                kind.group_key(group_key),
+                kind.as_db_str(),
                 fid.unwrap_or(0),
                 pf.unwrap_or(0),
             ],
@@ -997,7 +1013,7 @@ pub fn find_artifact(
 pub fn list_artifacts(
     conn: &Connection,
     subject: &StackSubject,
-    kind: Option<&str>,
+    kind: Option<ArtifactKind>,
 ) -> Result<Vec<StackingArtifactRow>> {
     match kind {
         Some(k) => {
@@ -1008,7 +1024,7 @@ pub fn list_artifacts(
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(
-                    params![subject.frame_set_id(), subject.project_id(), k],
+                    params![subject.frame_set_id(), subject.project_id(), k.as_db_str()],
                     row_to_artifact,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1054,18 +1070,19 @@ const DELETE_ALL_ARTIFACTS_SQL: &str = "DELETE FROM stacking_artifacts
 pub fn delete_artifacts(
     conn: &Connection,
     subject: &StackSubject,
-    kinds: &[&str],
+    kinds: &[ArtifactKind],
 ) -> Result<usize> {
     if kinds.is_empty() {
         return Ok(0);
     }
+    let kinds: Vec<std::borrow::Cow<'static, str>> = kinds.iter().map(|k| k.as_db_str()).collect();
     let sql = delete_artifacts_sql(kinds.len());
     let set_id = subject.frame_set_id().unwrap_or(0);
     let project_id = subject.project_id().unwrap_or("");
     let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 2);
     vals.push(&set_id);
     vals.push(&project_id);
-    for k in kinds {
+    for k in &kinds {
         vals.push(k);
     }
     let n = conn.execute(&sql, vals.as_slice())?;
@@ -1680,7 +1697,7 @@ mod tests {
         let fixed: Vec<ArtifactKind> =
             pinned.iter().map(|(k, _, _)| *k).filter(|k| !matches!(k, ArtifactKind::Fits(_))).collect();
         assert_eq!(fixed, ArtifactKind::FIXED);
-        // The list `stacking::paths::FRAME_LEVEL_KINDS` held before the enum, in its order.
+        // The frame-level list `stacking::paths` kept by hand before the enum, in its order.
         let frame_level: Vec<String> = ArtifactKind::FIXED
             .iter()
             .filter(|k| k.is_frame_level())
@@ -1689,6 +1706,83 @@ mod tests {
         assert_eq!(
             frame_level,
             ["calibrated", "calibrated_mosaic", "measured", "metrics", "registered", "registration", "solve"]
+        );
+    }
+
+    /// The frame / group rule is applied by this layer, not by its callers: whatever key comes with a frame-level
+    /// kind, the row is stored and found under `''`; a group-level kind keeps the key it was given.
+    #[test]
+    fn a_frame_level_artifact_is_keyed_on_the_frame_whatever_key_the_caller_gives() {
+        let c = conn();
+        let set = seed_set(&c);
+        seed_frame(&c, 5);
+        let subject = StackSubject::FrameSet(set);
+        let new = |kind: ArtifactKind, group_key: &'static str, frame_id: Option<i64>, hash: &'static str| {
+            let a = NewArtifact {
+                subject: &StackSubject::FrameSet(set),
+                frame_id,
+                group_key,
+                kind,
+                path: None,
+                config_hash: hash,
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            };
+            upsert_artifact(&c, &a).unwrap()
+        };
+        let stored_key = |id: i64| -> String {
+            c.query_row("SELECT group_key FROM stacking_artifacts WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+
+        // A frame-level kind written for one group, then for another: one row, under `''`.
+        let first = new(ArtifactKind::Calibrated, "osc__x__bin1__180s", Some(5), "h1");
+        let second = new(ArtifactKind::Calibrated, "osc__x__bin1__300s", Some(5), "h2");
+        assert_eq!(first, second, "a regroup must not make a second row of a frame's own artifact");
+        assert_eq!(stored_key(first), "");
+        for key in ["", "osc__x__bin1__180s", "any other key"] {
+            let row = find_artifact(&c, &subject, key, ArtifactKind::Calibrated, Some(5)).unwrap().unwrap();
+            assert_eq!((row.id, row.group_key.as_str(), row.config_hash.as_str()), (first, "", "h2"), "{key}");
+        }
+        let plane = new(ArtifactKind::Fits(1), "osc__x__bin1__180s", Some(5), "h");
+        assert_eq!(stored_key(plane), "");
+
+        // A group-level kind: one row per group key, found only under its own.
+        let a = new(ArtifactKind::Ln, "osc__x__bin1__180s", Some(5), "h");
+        let b = new(ArtifactKind::Ln, "osc__x__bin1__300s", Some(5), "h");
+        assert_ne!(a, b);
+        assert_eq!(stored_key(a), "osc__x__bin1__180s");
+        assert_eq!(
+            find_artifact(&c, &subject, "osc__x__bin1__300s", ArtifactKind::Ln, Some(5)).unwrap().unwrap().id,
+            b
+        );
+        assert!(find_artifact(&c, &subject, "", ArtifactKind::Ln, Some(5)).unwrap().is_none());
+
+        // The test door stores the key as given: the shape of a row from before the frame-level keys migration.
+        // The rule does not find it, and it does not collide with the frame's own row.
+        let legacy = upsert_artifact_under_key(
+            &c,
+            &NewArtifact {
+                subject: &subject,
+                frame_id: Some(5),
+                group_key: "osc__x__bin1__180s",
+                kind: ArtifactKind::Calibrated,
+                path: None,
+                config_hash: "old",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+        assert_ne!(legacy, first);
+        assert_eq!(stored_key(legacy), "osc__x__bin1__180s");
+        assert_eq!(
+            find_artifact(&c, &subject, "osc__x__bin1__180s", ArtifactKind::Calibrated, Some(5))
+                .unwrap()
+                .unwrap()
+                .id,
+            first
         );
     }
 
@@ -1701,7 +1795,7 @@ mod tests {
             subject: &StackSubject::FrameSet(set),
             frame_id: None,
             group_key: "g",
-            kind: "ln_reference",
+            kind: ArtifactKind::LnReference,
             path: Some("/w/a"),
             config_hash: "h1",
             size: Some(1),
@@ -1719,7 +1813,7 @@ mod tests {
         .unwrap();
         assert_eq!(id1, id2, "NULL frame_id must not create a second row");
         assert_eq!(
-            find_artifact(&c, &StackSubject::FrameSet(set), "g", "ln_reference", None)
+            find_artifact(&c, &StackSubject::FrameSet(set), "g", ArtifactKind::LnReference, None)
                 .unwrap()
                 .unwrap()
                 .config_hash,
@@ -1729,7 +1823,7 @@ mod tests {
             &c,
             &NewArtifact {
                 frame_id: Some(5),
-                kind: "calibrated",
+                kind: ArtifactKind::Calibrated,
                 ..a
             },
         )
@@ -1741,7 +1835,7 @@ mod tests {
             2
         );
         assert_eq!(
-            delete_artifacts(&c, &StackSubject::FrameSet(set), &["calibrated"]).unwrap(),
+            delete_artifacts(&c, &StackSubject::FrameSet(set), &[ArtifactKind::Calibrated]).unwrap(),
             1
         );
         assert_eq!(
@@ -2038,7 +2132,7 @@ mod tests {
                         subject,
                         frame_id: Some(f),
                         group_key: "g",
-                        kind: "calibrated",
+                        kind: ArtifactKind::Calibrated,
                         path: Some(path),
                         config_hash: "h",
                         size: None,
@@ -2055,14 +2149,14 @@ mod tests {
             "an upsert refreshes in place"
         );
         assert_eq!(list_artifacts(&c, &pr, None).unwrap().len(), 1);
-        let a = find_artifact(&c, &pr, "g", "calibrated", Some(handle))
+        let a = find_artifact(&c, &pr, "g", ArtifactKind::Calibrated, Some(handle))
             .unwrap()
             .unwrap();
         assert_eq!(
             (a.subject.clone(), a.frame_id, a.path.as_deref()),
             (pr.clone(), Some(handle), Some("/b"))
         );
-        let b = find_artifact(&c, &fs, "g", "calibrated", Some(frame))
+        let b = find_artifact(&c, &fs, "g", ArtifactKind::Calibrated, Some(frame))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2072,10 +2166,10 @@ mod tests {
         // The first minted handle is 1, the catalog frame is 501: a frame id of
         // one namespace never finds the other subject's row.
         assert_ne!(handle, frame);
-        assert!(find_artifact(&c, &fs, "g", "calibrated", Some(handle))
+        assert!(find_artifact(&c, &fs, "g", ArtifactKind::Calibrated, Some(handle))
             .unwrap()
             .is_none());
-        assert!(find_artifact(&c, &pr, "g", "calibrated", Some(frame))
+        assert!(find_artifact(&c, &pr, "g", ArtifactKind::Calibrated, Some(frame))
             .unwrap()
             .is_none());
         assert_eq!(delete_all_artifacts(&c, &pr).unwrap(), 1);
@@ -2192,17 +2286,18 @@ mod tests {
         c.execute(
             "INSERT INTO stacking_artifacts (frames_set_id, frame_id, group_key, kind,
                config_hash, created_at)
-             VALUES (?1, 101, 'g', 'calibrated', 'c1', 't')",
+             VALUES (?1, 101, 'g', 'ln', 'c1', 't')",
             [set],
         )
         .unwrap();
         let legacy_id = c.last_insert_rowid();
         init_db(&c).unwrap();
+        // A group-level kind: its row stays under the group's key, where the lookup goes.
         let row = find_artifact(
             &c,
             &StackSubject::FrameSet(set),
             "g",
-            "calibrated",
+            ArtifactKind::Ln,
             Some(101),
         )
         .unwrap()
@@ -2358,7 +2453,7 @@ mod tests {
         }
         let p1 = StackSubject::Project("p1".into());
         let p2 = StackSubject::Project("p2".into());
-        let row = |subject: &StackSubject, frame: Option<i64>, group: &str, kind: &str| {
+        let row = |subject: &StackSubject, frame: Option<i64>, group: &str, kind: ArtifactKind| {
             upsert_artifact(
                 &c,
                 &NewArtifact {
@@ -2376,38 +2471,38 @@ mod tests {
             .unwrap();
         };
         for uuid in ["kept", "excluded", "gone"] {
-            row(&p1, Some(h[uuid]), "", "solve");
-            row(&p1, Some(h[uuid]), "g", "registered");
+            row(&p1, Some(h[uuid]), "", ArtifactKind::Solve);
+            row(&p1, Some(h[uuid]), "g", ArtifactKind::Registered);
         }
-        row(&p1, None, "g", "ln_reference");
-        row(&p2, Some(other["gone"]), "g", "registered");
+        row(&p1, None, "g", ArtifactKind::LnReference);
+        row(&p2, Some(other["gone"]), "g", ArtifactKind::Registered);
 
         assert_eq!(sweep_departed_project_artifacts(&c, "p1").unwrap(), 2);
-        assert!(find_artifact(&c, &p1, "", "solve", Some(h["gone"]))
+        assert!(find_artifact(&c, &p1, "", ArtifactKind::Solve, Some(h["gone"]))
             .unwrap()
             .is_none());
-        assert!(find_artifact(&c, &p1, "g", "registered", Some(h["gone"]))
+        assert!(find_artifact(&c, &p1, "g", ArtifactKind::Registered, Some(h["gone"]))
             .unwrap()
             .is_none());
         for uuid in ["kept", "excluded"] {
             assert!(
-                find_artifact(&c, &p1, "", "solve", Some(h[uuid]))
+                find_artifact(&c, &p1, "", ArtifactKind::Solve, Some(h[uuid]))
                     .unwrap()
                     .is_some(),
                 "{uuid}"
             );
             assert!(
-                find_artifact(&c, &p1, "g", "registered", Some(h[uuid]))
+                find_artifact(&c, &p1, "g", ArtifactKind::Registered, Some(h[uuid]))
                     .unwrap()
                     .is_some(),
                 "{uuid} registered"
             );
         }
-        assert!(find_artifact(&c, &p1, "g", "ln_reference", None)
+        assert!(find_artifact(&c, &p1, "g", ArtifactKind::LnReference, None)
             .unwrap()
             .is_some());
         assert!(
-            find_artifact(&c, &p2, "g", "registered", Some(other["gone"]))
+            find_artifact(&c, &p2, "g", ArtifactKind::Registered, Some(other["gone"]))
                 .unwrap()
                 .is_some()
         );

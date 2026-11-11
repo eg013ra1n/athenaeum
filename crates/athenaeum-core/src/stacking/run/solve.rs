@@ -125,8 +125,8 @@ pub(super) fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> 
             crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                artifact_group_key("solve", &key),
-                "solve",
+                &key,
+                ArtifactKind::Solve,
                 Some(frame_id),
             )?
             .is_some_and(|row| crate::stacking::solve::cached_outcome_holds(&row, &hash));
@@ -136,8 +136,8 @@ pub(super) fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> 
         let calibrated = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            artifact_group_key("calibrated", &key),
-            "calibrated",
+            &key,
+            ArtifactKind::Calibrated,
             Some(frame_id),
         )?
         .and_then(|a| a.path);

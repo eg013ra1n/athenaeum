@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::collab::frame_meta::ProjectFrameMeta;
 use crate::db::stacking::{
-    find_artifact, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
+    ArtifactKind, find_artifact, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
 };
 use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
 use crate::integration::plane_reader::PlaneReader;
@@ -33,7 +33,6 @@ use crate::plate_solve::storage::PlateSolveRecord;
 use crate::plate_solve::SolveHints;
 use crate::services::ServiceContext;
 use crate::stacking::config::stage_hash;
-use crate::stacking::paths::artifact_group_key;
 
 /// One solve the run asks for.
 #[derive(Debug, Clone)]
@@ -189,8 +188,8 @@ pub(crate) fn stored_outcome(
     let Some(row) = find_artifact(
         conn,
         &subject,
-        artifact_group_key("solve", ""),
-        "solve",
+        "",
+        ArtifactKind::Solve,
         Some(frame_id),
     )?
     else {
@@ -255,8 +254,8 @@ pub(crate) fn write_artifact(
         &NewArtifact {
             subject: &subject,
             frame_id: Some(frame_id),
-            group_key: artifact_group_key("solve", ""),
-            kind: "solve",
+            group_key: "",
+            kind: ArtifactKind::Solve,
             path: None,
             config_hash: hash,
             size: None,

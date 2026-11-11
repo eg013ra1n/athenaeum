@@ -3556,11 +3556,11 @@ const FRAME_LEVEL_KEYS_MARKER: &str = "stacking.migration.frame_level_keys";
 /// Why: a frame's calibrated file, star measurement, registered file and the like depend on
 /// the frame and the settings, not on how the frames were grouped. Rows keyed by the group
 /// (`…180s`) were lost whenever a regroup changed the key; the writers now store them under
-/// `''` ([`crate::stacking::paths::artifact_group_key`]), and this moves the rows written
+/// `''` ([`crate::db::stacking::ArtifactKind::group_key`]), and this moves the rows written
 /// before that.
 ///
-/// The kinds are [`crate::stacking::paths::FRAME_LEVEL_KINDS`] plus every `fits.<plane>`
-/// kind - the same predicate the writers use, never a second list. A frame that has rows of
+/// The kinds are every [`crate::db::stacking::ArtifactKind`] that `is_frame_level`: the fixed ones by name and every
+/// `fits.<plane>` by its prefix - the same predicate the writers use, never a second list. A frame that has rows of
 /// one kind under several group keys keeps the NEWEST (`created_at` DESC, then `id` DESC)
 /// and the others are deleted BEFORE the `UPDATE`, which would otherwise hit the unique
 /// index `stacking_artifacts_subject_key`. The ranking runs per subject (frame set or
@@ -3599,7 +3599,11 @@ fn migrate_frame_level_artifact_keys(conn: &Connection) -> Result<()> {
     if marked(&tx)? {
         return Ok(());
     }
-    let kinds = crate::stacking::paths::FRAME_LEVEL_KINDS;
+    let kinds: Vec<std::borrow::Cow<'static, str>> = crate::db::stacking::ArtifactKind::FIXED
+        .into_iter()
+        .filter(|k| k.is_frame_level())
+        .map(|k| k.as_db_str())
+        .collect();
     let placeholders = vec!["?"; kinds.len()].join(", ");
     // `substr` is `starts_with("fits.")` exactly; `LIKE` would ignore case.
     let frame_level = format!(

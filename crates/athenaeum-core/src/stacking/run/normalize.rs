@@ -38,13 +38,6 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
 /// three planes counted here are half a plane of masks plus headroom.
 pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
 
-/// The payload-only marker of a member that keeps global normalization
-/// because it overlaps the LN reference on under `ln::LN_MIN_OVERLAP` of
-/// its footprint (spec §5.6, plan 6b-3 D7): `config_hash` is the member's LN
-/// hash, so the run and the plan count it as cached while nothing upstream
-/// moves; payload `{"overlap": <fraction>}`.
-pub(crate) const LN_GLOBAL_ARTIFACT_KIND: &str = "ln_global";
-
 /// The group's LN field on a project's grid (plan 6b-3 D8, review I6), over
 /// the frames the plan counts in scope — not manually excluded, not
 /// unsupported (Prepare's `"unsupported file: …"` exclusion) — so the plan
@@ -510,7 +503,7 @@ pub(super) fn run_group_normalization(
 
     let existing_reference_artifact = {
         let conn = db(&rc.ctx)?.conn();
-        crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, "ln_reference", None)?
+        crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, ArtifactKind::LnReference, None)?
     };
     let cached_reference_path: Option<PathBuf> = if force_fresh {
         None
@@ -744,14 +737,14 @@ pub(super) fn run_group_normalization(
         for plane in 0..channels {
             let resolved = match &expected_hash {
                 Some(hash) => {
-                    let kind = fits_artifact::artifact_kind(plane);
+                    let kind = ArtifactKind::Fits(plane);
                     let row = {
                         let conn = db(&rc.ctx)?.conn();
                         crate::db::stacking::find_artifact(
                             &conn,
                             &rc.subject,
-                            artifact_group_key(&kind, &group.key),
-                            &kind,
+                            &group.key,
+                            kind,
                             Some(m.frame_id),
                         )?
                     };
@@ -795,7 +788,7 @@ pub(super) fn run_group_normalization(
                 &conn,
                 &rc.subject,
                 &group.key,
-                "ln",
+                ArtifactKind::Ln,
                 Some(m.frame_id),
             )?
         };
@@ -808,7 +801,7 @@ pub(super) fn run_group_normalization(
                 &conn,
                 &rc.subject,
                 &group.key,
-                LN_GLOBAL_ARTIFACT_KIND,
+                ArtifactKind::LnGlobal,
                 Some(m.frame_id),
             )?
         };
@@ -854,7 +847,7 @@ pub(super) fn run_group_normalization(
         None
     } else {
         let conn = db(&rc.ctx)?.conn();
-        crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, "ln_calibration", None)?
+        crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, ArtifactKind::LnCalibration, None)?
             .filter(|row| row.config_hash == calibration_input_hash)
             .and_then(|row| row.payload_json)
             .and_then(|s| serde_json::from_str::<ln::SeedsCalibration>(&s).ok())
@@ -934,7 +927,7 @@ pub(super) fn run_group_normalization(
                     subject: &rc.subject,
                     frame_id: None,
                     group_key: &group.key,
-                    kind: "ln_calibration",
+                    kind: ArtifactKind::LnCalibration,
                     path: None,
                     config_hash: &calibration_input_hash,
                     size: None,
@@ -1297,7 +1290,7 @@ pub(super) fn run_group_normalization(
                             subject: &rc.subject,
                             frame_id: Some(frame_id),
                             group_key: &group.key,
-                            kind: "ln",
+                            kind: ArtifactKind::Ln,
                             path: Some(&outcome.sidecar.to_string_lossy()),
                             config_hash: &per_member_hash[member_idx],
                             size: Some(size),
@@ -1374,7 +1367,7 @@ pub(super) fn run_group_normalization(
                             subject: &rc.subject,
                             frame_id: Some(frame_id),
                             group_key: &group.key,
-                            kind: LN_GLOBAL_ARTIFACT_KIND,
+                            kind: ArtifactKind::LnGlobal,
                             path: None,
                             config_hash: &per_member_hash[member_idx],
                             size: None,
@@ -1865,7 +1858,7 @@ fn build_and_write_ln_reference(
                 subject: &rc.subject,
                 frame_id: None,
                 group_key: &group.key,
-                kind: "ln_reference",
+                kind: ArtifactKind::LnReference,
                 path: Some(&reference_path.to_string_lossy()),
                 config_hash: reference_hash,
                 size: Some(size),

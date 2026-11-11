@@ -396,7 +396,7 @@ pub(super) fn resolve_register_fits(
         return None;
     }
     let expected_hash = group_measurement_hash(rc, &rc.config, group_key, calibrated_hash);
-    let kind = fits_artifact::artifact_kind(0);
+    let kind = ArtifactKind::Fits(0);
 
     // Ruling C-18, item 8: the SAME per-plane freshness rule the plan gate
     // applies (`plan::fits_artifact_fresh`/`fits_artifact_fresh_for_planes`)
@@ -446,8 +446,8 @@ pub(super) fn resolve_register_fits(
         Ok(crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            artifact_group_key(&kind, group_key),
-            &kind,
+            group_key,
+            kind,
             Some(frame_id),
         )?)
     })();
@@ -2154,16 +2154,15 @@ fn record_registered_artifact(
 ) -> anyhow::Result<()> {
     let (size, modified_at) = file_identity(out)?;
     let conn = db(&rc.ctx)?.conn();
-    let group_key = artifact_group_key("registered", group_key);
     // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
-    let old = crate::db::stacking::find_artifact(&conn, &rc.subject, group_key, "registered", Some(frame_id))?;
+    let old = crate::db::stacking::find_artifact(&conn, &rc.subject, group_key, ArtifactKind::Registered, Some(frame_id))?;
     upsert_artifact(
         &conn,
         &NewArtifact {
             subject: &rc.subject,
             frame_id: Some(frame_id),
             group_key,
-            kind: "registered",
+            kind: ArtifactKind::Registered,
             path: out.to_str(),
             config_hash: registered_hash,
             size: Some(size),
@@ -2191,8 +2190,8 @@ fn registered_artifact_is_fresh(
     Ok(crate::db::stacking::find_artifact(
         &conn,
         &rc.subject,
-        artifact_group_key("registered", group_key),
-        "registered",
+        group_key,
+        ArtifactKind::Registered,
         Some(frame_id),
     )?
     .is_some_and(|row| is_fresh(&row, hash)))

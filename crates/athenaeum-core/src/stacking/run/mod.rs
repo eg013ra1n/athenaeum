@@ -41,7 +41,7 @@ use crate::api::{db, ApiError, PathPolicy};
 use crate::calibration_library::cosmetic::{hot_pixel_map_from_dark, HotPixelMapOutcome};
 use crate::calibration_library::light_cal::{preload_master_plane, PreloadedMasters};
 use crate::db::stacking::{
-    finish_run, get_run, insert_group, insert_master_light, insert_run,
+    ArtifactKind, finish_run, get_run, insert_group, insert_master_light, insert_run,
     set_frame_rejected_fraction, set_run_reference, set_run_status, update_group, upsert_artifact,
     upsert_frame_row, GroupUpdate, NewArtifact, NewFrameRow, NewGroup, NewMasterLight, NewRun,
     StackSubject,
@@ -101,11 +101,11 @@ use crate::stacking::measure::{
     measure_frame_with_fits, FrameMeasurement, FramePass1, MeasureOptions,
 };
 use crate::stacking::pass1_artifact::{
-    read_pass1, read_pass1_head, write_pass1, Pass1ArtifactError, Pass1Head, PASS1_ARTIFACT_KIND,
+    read_pass1, read_pass1_head, write_pass1, Pass1ArtifactError, Pass1Head,
 };
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{
-    artifact_group_key, cleanup_work, cleanup_work_with, subject_layout, CleanupWhat, WorkingLayout,
+    cleanup_work, cleanup_work_with, subject_layout, CleanupWhat, WorkingLayout,
     LN_REFERENCE_SATURATION_FILE,
 };
 use crate::stacking::plan::{

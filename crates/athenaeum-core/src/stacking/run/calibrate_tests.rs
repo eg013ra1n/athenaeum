@@ -605,7 +605,7 @@ fn calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones() {
     let artifacts_after_1 = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated"),
+        Some(ArtifactKind::Calibrated),
     )
     .unwrap();
     assert_eq!(artifacts_after_1.len(), 3);
@@ -628,7 +628,7 @@ fn calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones() {
     let artifacts_after_2 = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated"),
+        Some(ArtifactKind::Calibrated),
     )
     .unwrap();
     assert_eq!(artifacts_after_2.len(), 3);
@@ -654,7 +654,7 @@ fn calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones() {
     let artifacts_after_3 = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated"),
+        Some(ArtifactKind::Calibrated),
     )
     .unwrap();
     let after_touch = snapshot(&artifacts_after_3);
@@ -679,7 +679,7 @@ fn calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones() {
     let artifacts_after_4 = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated"),
+        Some(ArtifactKind::Calibrated),
     )
     .unwrap();
     let after_rerun = snapshot(&artifacts_after_4);
@@ -731,7 +731,7 @@ fn calibrated_artifact_is_reused_across_a_regroup() {
         crate::db::stacking::list_artifacts(
             &fixture.conn,
             &StackSubject::FrameSet(fixture.set_id),
-            Some("calibrated"),
+            Some(ArtifactKind::Calibrated),
         )
         .unwrap()
     };
@@ -801,7 +801,7 @@ fn rewriting_a_frame_removes_its_old_file_once_unreferenced() {
     std::fs::create_dir_all(&old_dir).unwrap();
     let mut old_paths = Vec::new();
     for &id in &light_ids[..2] {
-        let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", "calibrated", Some(id))
+        let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", ArtifactKind::Calibrated, Some(id))
             .unwrap()
             .unwrap();
         let old = old_dir.join(format!("c_old_{id}.fits"));
@@ -822,7 +822,7 @@ fn rewriting_a_frame_removes_its_old_file_once_unreferenced() {
             subject: &subject,
             frame_id: Some(light_ids[1]),
             group_key: "",
-            kind: "solve",
+            kind: ArtifactKind::Solve,
             path: old_paths[1].to_str(),
             config_hash: "h",
             size: None,
@@ -837,7 +837,7 @@ fn rewriting_a_frame_removes_its_old_file_once_unreferenced() {
     stage_calibrate(&mut rc2).unwrap();
 
     for (n, &id) in light_ids[..2].iter().enumerate() {
-        let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", "calibrated", Some(id))
+        let row = crate::db::stacking::find_artifact(&fixture.conn, &subject, "", ArtifactKind::Calibrated, Some(id))
             .unwrap()
             .unwrap();
         let new = PathBuf::from(row.path.unwrap());
@@ -882,13 +882,13 @@ fn a_project_frame_uses_the_frame_level_key() {
     );
     stage_calibrate(&mut rc).unwrap();
     assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
-    let rows = crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("calibrated")).unwrap();
+    let rows = crate::db::stacking::list_artifacts(&conn, &rc.subject, Some(ArtifactKind::Calibrated)).unwrap();
     assert_eq!(rows.len(), 2, "{rows:?}");
     for row in &rows {
         assert_eq!(row.group_key, "", "{row:?}");
         assert!(matches!(row.subject, StackSubject::Project(_)), "{row:?}");
         let handle = row.frame_id.expect("a project frame handle");
-        let found = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "calibrated", Some(handle))
+        let found = crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Calibrated, Some(handle))
             .unwrap();
         assert_eq!(found.map(|r| r.id), Some(row.id));
     }
@@ -1006,7 +1006,7 @@ fn calibrate_outputs_disambiguate_same_basename_within_a_group() {
     let artifacts = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated"),
+        Some(ArtifactKind::Calibrated),
     )
     .unwrap();
     assert_eq!(artifacts.len(), 3, "{artifacts:?}");
@@ -1073,7 +1073,7 @@ fn assert_recalibration_is_bit_identical(rig: &Pass1Rig, planes: usize, parallel
         calibrated_files.iter().all(|f| f.starts_with(rig.layout.calibrated_root())),
         "written under calibrated/: {calibrated_files:?}"
     );
-    rig.delete_rows(&["calibrated"]);
+    rig.delete_rows(&[ArtifactKind::Calibrated]);
     for file in &calibrated_files {
         std::fs::remove_file(file).unwrap();
     }
@@ -1167,7 +1167,7 @@ fn calibrate_one_queue_across_groups_matches_per_group_queues() {
         } else {
             stage_calibrate_with(&mut rc, Some(mode == 1)).unwrap();
         }
-        let rows: Rows = crate::db::stacking::list_artifacts(&fixture.conn, &rc.subject, Some("calibrated"))
+        let rows: Rows = crate::db::stacking::list_artifacts(&fixture.conn, &rc.subject, Some(ArtifactKind::Calibrated))
             .unwrap()
             .into_iter()
             .map(|r| (r.group_key, r.frame_id, r.config_hash, r.size))
@@ -1445,7 +1445,7 @@ fn turning_bayer_on_regenerates_the_mosaic_of_an_already_calibrated_frame() {
         let mut rows = crate::db::stacking::list_artifacts(
             &fixture.conn,
             &StackSubject::FrameSet(fixture.set_id),
-            Some("calibrated"),
+            Some(ArtifactKind::Calibrated),
         )
         .unwrap()
         .into_iter()
@@ -1462,7 +1462,7 @@ fn turning_bayer_on_regenerates_the_mosaic_of_an_already_calibrated_frame() {
         crate::db::stacking::list_artifacts(
             &fixture.conn,
             &StackSubject::FrameSet(fixture.set_id),
-            Some("calibrated_mosaic")
+            Some(ArtifactKind::CalibratedMosaic)
         )
         .unwrap()
         .is_empty(),
@@ -1473,7 +1473,7 @@ fn turning_bayer_on_regenerates_the_mosaic_of_an_already_calibrated_frame() {
     let mosaics = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("calibrated_mosaic"),
+        Some(ArtifactKind::CalibratedMosaic),
     )
     .unwrap();
     assert_eq!(
@@ -1564,7 +1564,7 @@ fn bayer_with_the_debayer_off_says_so_once_and_stays_cached() {
         crate::db::stacking::list_artifacts(
             &fixture.conn,
             &StackSubject::FrameSet(fixture.set_id),
-            Some("calibrated_mosaic")
+            Some(ArtifactKind::CalibratedMosaic)
         )
         .unwrap()
         .is_empty(),
