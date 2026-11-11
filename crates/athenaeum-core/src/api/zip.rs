@@ -1406,7 +1406,7 @@ mod tests {
     #[test]
     fn a_deleted_copy_comes_back_when_the_zip_changed_too() {
         let tmp = TempDir::new().unwrap();
-        let (conn, zip, ids) = two_light_zip(tmp.path());
+        let (conn, _, ids) = two_light_zip(tmp.path());
         let out = TempDir::new().unwrap();
         run(&conn, &ids, out.path());
         std::fs::remove_file(out.path().join("Lights").join("L_002.fits")).unwrap();
@@ -1957,8 +1957,8 @@ mod tests {
             count(&conn, &format!("SELECT COUNT(*) FROM files WHERE archive_zip_path = '{}'", zip.to_str().unwrap())),
             2
         );
+        // The pooled connection goes back before the test ends; `database` is only a borrow of `ctx`.
         drop(conn);
-        drop(database);
         let _ = tmp;
     }
 

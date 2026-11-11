@@ -364,7 +364,6 @@ fn prepare_converts_xisf_and_integer_files_into_the_unit_domain() {
         &tmp.path().join("work"),
         &tmp.path().join("out"),
     );
-    let key = "mono__L__300s";
     stage_calibrate(&mut rc).unwrap();
     assert!(
         rc.runtime_exclusions.is_empty(),
