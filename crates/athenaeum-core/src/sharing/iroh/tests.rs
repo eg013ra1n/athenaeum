@@ -3940,13 +3940,11 @@ async fn live_hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
 /// The same scenario with the production receive-stream limit (8) and eight
 /// items, all in flight from the start. When the trigger fires only the two or
 /// three stranded items are still in flight, and 5 % of those cannot pay for a
-/// hedge of one of them; the half-item floor does. (More items than
-/// streams would hand the collapsed peer NEW items, which have no size for
-/// ~16 s and so cannot be hedged — the stall ceiling's case, not the budget's.)
+/// hedge of one of them; the half-item floor does.
 #[tokio::test]
 async fn live_hedge_fires_with_the_default_stream_limit() {
     const ITEMS: usize = 8;
-    let report = live_hedge_fires_scenario(ITEMS, 8).await;
+    let (report, _) = live_hedge_fires_scenario(ITEMS, 8).await;
     // Not a byte bound (the budget bounds bytes, and these hedges duplicate
     // nothing): a sanity bound against a re-arm loop on the same item.
     assert!(
@@ -3955,12 +3953,84 @@ async fn live_hedge_fires_with_the_default_stream_limit() {
     );
 }
 
-async fn live_hedge_fires_scenario(items: usize, max_in_flight: usize) -> AssignmentReport {
+/// More items than streams: forty at the production limit of 8. The uplink
+/// meter reads the collapsed provider slow within a window, so its stranded
+/// items are hedged away and NO new item is handed to it. A new item there
+/// would have no size for ~16 s (one 16 KiB leaf at 1 KB/s), could not be
+/// hedged, and would sit until the ceiling: with the least-loaded pick this
+/// run took 100 to 110 s with 1 to 3 stalls.
+#[tokio::test]
+async fn live_new_items_do_not_land_on_a_provider_that_went_slow() {
+    let (report, tries_on_collapsed) = live_hedge_fires_scenario(LIVE_HEDGE_ITEMS, 8).await;
+    // Its share of the first round is 2 or 3 of the 8 streams, handed out
+    // before it collapsed. Nothing completes inside the meter's first window
+    // (an item needs ~2 s), so no pick falls in the gap before it is read.
+    assert!(
+        (1..=3).contains(&tries_on_collapsed),
+        "the collapsed provider must get its first-round items and no more — it was \
+         handed {tries_on_collapsed} of {LIVE_HEDGE_ITEMS} ({report:?})"
+    );
+    assert!(
+        report.hedges as usize <= 2 * LIVE_HEDGE_ITEMS,
+        "a hedge storm: {report:?}"
+    );
+}
+
+/// A provider that is slow from the start (20 KB/s beside two at 400) is tried,
+/// read, and left alone: it gets the items the first round spreads over an
+/// unread swarm and no more. Its first window on the uplink meter reads it
+/// slow, so when a hedge rescues one of its items the slot goes to a fast
+/// provider. With a least-loaded pick every rescue freed a slot there for a
+/// new item to strand: it was handed 6 of the 40.
+#[tokio::test]
+async fn live_a_slow_provider_is_read_once_and_left_alone() {
+    const ITEMS: usize = 40;
+    let swarm = live_swarm(3, ITEMS, LIVE_HEDGE_SIZE).await;
+    for n in &swarm.nodes {
+        n.set_upload_limit(400_000);
+    }
+    swarm.nodes[2].set_upload_limit(20_000);
+    let slow = *swarm.ids[2].as_bytes();
+    let (telemetry, seen) = recording_telemetry();
+    let out = run_live_items(
+        &swarm.store(),
+        swarm.dialer(),
+        swarm.items(),
+        live_run_opts(super::assign::STALL_HARD_LIMIT, true, 8, telemetry),
+        Duration::from_secs(120),
+    )
+    .await;
+    out.assert_all_done(ITEMS);
+    swarm.assert_landed().await;
+    let tries_on_slow = seen
+        .lock()
+        .expect("telemetry mutex poisoned")
+        .iter()
+        .filter(|e| matches!(e, ProviderEvent::Trying(id) if *id == slow))
+        .count();
+    // The first round hands it 2 or 3 of the 8 streams; one more is slack for
+    // an item taken before the first reading lands.
+    assert!(
+        (1..=4).contains(&tries_on_slow),
+        "the slow provider must be tried, then left alone — it was handed {tries_on_slow} \
+         of {ITEMS} items ({:?})",
+        out.report
+    );
+    swarm.shutdown().await;
+}
+
+/// Returns the run's report and how many times the collapsing provider was
+/// tried (as a primary or as a hedge's provider).
+async fn live_hedge_fires_scenario(
+    items: usize,
+    max_in_flight: usize,
+) -> (AssignmentReport, usize) {
     let swarm = live_swarm(3, items, LIVE_HEDGE_SIZE).await;
     for n in &swarm.nodes {
         n.set_upload_limit(400_000);
     }
-    let (telemetry, _) = recording_telemetry();
+    let collapsing = *swarm.ids[2].as_bytes();
+    let (telemetry, seen) = recording_telemetry();
     let collapse = {
         let slow = Arc::clone(&swarm.nodes[2]);
         tokio::spawn(async move {
@@ -3998,7 +4068,13 @@ async fn live_hedge_fires_scenario(items: usize, max_in_flight: usize) -> Assign
         out.report
     );
     swarm.shutdown().await;
-    out.report
+    let tries = seen
+        .lock()
+        .expect("telemetry mutex poisoned")
+        .iter()
+        .filter(|e| matches!(e, ProviderEvent::Trying(id) if *id == collapsing))
+        .count();
+    (out.report, tries)
 }
 
 /// The loser is REALLY cancelled: the slow provider's own socket send counter
