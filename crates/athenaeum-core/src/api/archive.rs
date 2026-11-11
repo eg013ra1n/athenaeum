@@ -171,11 +171,11 @@ pub fn get_restore_suggestions(
 /// bookkeeping and the terminal `archive-finished` event live in
 /// `executor::run_operation_standalone`) and drops the handle.
 ///
-/// `refuse_when_busy`: the two hosts differ today. The web passes `true` and is
-/// refused (`Conflict`) while `ctx.active_archives` is not empty; the desktop
-/// passes `false` and the job queues behind the running one. `active_archives`
-/// also holds file operations and master builds, so the guard refuses during
-/// those too. Whether the desktop should refuse is the owner's open decision.
+/// `refuse_when_busy`: the two hosts differ on purpose (owner, 2026-11-11). The
+/// web passes `true` and is refused (`Conflict`) while `ctx.active_archives` is
+/// not empty; the desktop passes `false` and the job queues behind the running
+/// one. `active_archives` also holds file operations and master builds, so the
+/// guard refuses during those too.
 #[allow(clippy::too_many_arguments)]
 pub fn start_archive_operation(
     ctx: Arc<ServiceContext>,
