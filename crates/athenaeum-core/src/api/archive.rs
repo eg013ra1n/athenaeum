@@ -4,7 +4,8 @@
 //! JSON with the keys the frontend reads, so the wire shape does not change.
 
 use crate::api::{db, ApiError};
-use crate::archive::{db as adb, restore};
+use crate::archive::models::{ArchiveCompression, ConflictResolution, Dispositions};
+use crate::archive::{db as adb, executor, planner, restore};
 use crate::events::ProgressEmitter;
 use crate::services::operation_queue::{OperationKind, QueuedJob};
 use crate::services::{ArchiveHandle, ServiceContext};
@@ -162,6 +163,86 @@ pub fn get_restore_suggestions(
         "suggested_original_exists": suggested_exists,
         "scan_roots": scan_roots,
     }))
+}
+
+/// Plan and commit an archive of one frame set, then queue it on the shared
+/// disk worker. The plan is built and committed synchronously; returns the
+/// operation id once the job is queued. The worker runs the operation (outcome
+/// bookkeeping and the terminal `archive-finished` event live in
+/// `executor::run_operation_standalone`) and drops the handle.
+///
+/// `refuse_when_busy`: the two hosts differ today. The web passes `true` and is
+/// refused (`Conflict`) while `ctx.active_archives` is not empty; the desktop
+/// passes `false` and the job queues behind the running one. `active_archives`
+/// also holds file operations and master builds, so the guard refuses during
+/// those too. Whether the desktop should refuse is the owner's open decision.
+#[allow(clippy::too_many_arguments)]
+pub fn start_archive_operation(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    frames_set_id: i64,
+    dispositions: &Dispositions,
+    compression: ArchiveCompression,
+    conflict_resolution: ConflictResolution,
+    archive_root_path: Option<&str>,
+    refuse_when_busy: bool,
+) -> Result<i64, ApiError> {
+    if refuse_when_busy {
+        let map = ctx.active_archives.lock().unwrap();
+        if !map.is_empty() {
+            return Err(ApiError::Conflict(
+                "another archive operation is already in progress".into(),
+            ));
+        }
+    }
+    let op_id = {
+        let db = db(&ctx)?;
+        let conn = db.conn();
+        let root = crate::archive::resolve_archive_root(&conn, &ctx.settings, archive_root_path)
+            .map_err(|e| ApiError::Invalid(format!("{:#}", e)))?;
+
+        // Build + commit the plan synchronously.
+        let plan = planner::build_plan(
+            &conn,
+            frames_set_id,
+            Path::new(&root),
+            dispositions,
+            compression,
+        )
+        .map_err(|e| ApiError::Internal(format!("{:#}", e)))?;
+        planner::commit_plan(&conn, &plan, conflict_resolution)
+            .map_err(|e| ApiError::Internal(format!("{:#}", e)))?
+    };
+
+    // Register the cancel flag so cancel_archive_operation can find it.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    ctx.active_archives.lock().unwrap().insert(
+        op_id,
+        ArchiveHandle {
+            operation_id: op_id,
+            cancel_flag: cancel_flag.clone(),
+        },
+    );
+
+    // Enqueue. Single global worker (shared with file ops) drives execution
+    // serially. The DB connection is obtained inside the closure since
+    // rusqlite connections are not Send across thread boundaries.
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            // Outcome bookkeeping + terminal `archive-finished` live in core
+            // (`run_operation_standalone`). Errors are logged (and rolled
+            // back) inside; nothing to add here.
+            let _ = executor::run_operation_standalone(&conn, op_id, &cancel_flag, emitter.as_ref());
+            ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
+        }),
+    });
+
+    Ok(op_id)
 }
 
 /// Queue a restore of an archive operation on the shared disk worker. Refuses
@@ -385,5 +466,40 @@ mod tests {
         assert!(matches!(err, ApiError::Conflict(_)));
         assert_eq!(err.to_string(), "another archive operation is already in progress");
         assert_eq!(ctx.active_archives.lock().unwrap().len(), 1);
+    }
+
+    /// `refuse_when_busy` refuses while any archive operation holds a handle;
+    /// the same call without it is not stopped by the guard.
+    #[test]
+    fn start_archive_operation_guard_follows_refuse_when_busy() {
+        let (_tmp, ctx) = test_ctx();
+        ctx.active_archives.lock().unwrap().insert(
+            7,
+            ArchiveHandle {
+                operation_id: 7,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let start = |refuse| {
+            start_archive_operation(
+                ctx.clone(),
+                Arc::new(NullEmitter),
+                1,
+                &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+                ArchiveCompression::Store,
+                ConflictResolution::AddSuffix,
+                Some("/archive"),
+                refuse,
+            )
+        };
+
+        let err = start(true).expect_err("busy");
+        assert!(matches!(err, ApiError::Conflict(_)));
+        assert_eq!(err.to_string(), "another archive operation is already in progress");
+
+        if let Err(e) = start(false) {
+            assert_ne!(e.to_string(), "another archive operation is already in progress");
+        }
+        assert!(ctx.active_archives.lock().unwrap().contains_key(&7));
     }
 }

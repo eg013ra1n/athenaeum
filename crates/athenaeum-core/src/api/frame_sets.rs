@@ -12,10 +12,11 @@ use anyhow::{anyhow, Result};
 use crate::api::ApiError;
 use crate::db::{self};
 use crate::events::ProgressEmitter;
-use crate::models::{MergeReport, SplitSelection};
+use crate::models::{FindNewFramesResult, MergeReport, SplitSelection};
 use crate::services::ServiceContext;
 use crate::sessions::{ReconcileOutcome, RederiveSummary};
 use rusqlite::{Connection, OptionalExtension};
+use std::sync::Arc;
 
 /// A frame set's own center in degrees, parsed from its stored
 /// `objctra`/`objctdec` — the derivation `auto_generate_frame_sets` uses for
@@ -883,6 +884,123 @@ pub fn create_frame_set_from_selection(
     }
 
     Ok(set_id)
+}
+
+/// Hands an `Arc<dyn ProgressEmitter>` to the scanner, which takes a sized emitter.
+struct SharedEmitter(Arc<dyn ProgressEmitter>);
+
+impl ProgressEmitter for SharedEmitter {
+    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+        self.0.emit_json(event_name, payload);
+    }
+}
+
+/// Find LIGHT frames in the catalog that would match this frame set by
+/// coordinate proximity but aren't currently in any set.
+///
+/// When `scan_first` is true, the caller wants disks re-scanned before
+/// matching. To avoid duplicate scan work:
+///  - if any scan is already running, wait for all active scans to finish
+///    (polling `active_scans` every 500 ms, 5 min cap; `Timeout` past it)
+///  - otherwise, when `scan_when_idle` is `Some`, run one scan cycle across all
+///    monitor-enabled roots (progress through that emitter) and re-arm the
+///    content index, then do the match; when it is `None` nothing is scanned
+///
+/// `scan_when_idle` is the one place the two hosts differ: the desktop passes
+/// `Some` (it scans), the web passes `None` (a fresh scan over many NAS roots
+/// would tie up a request for minutes; callers start one explicitly).
+/// The returned `scan_was_awaited` flag tells the UI whether it waited vs.
+/// triggered a fresh scan, so the "Waiting for running scan…" banner can be
+/// shown accurately.
+pub async fn find_new_frames_for_set(
+    ctx: Arc<ServiceContext>,
+    frames_set_id: i64,
+    scan_first: bool,
+    scan_when_idle: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<FindNewFramesResult, ApiError> {
+    let mut scan_was_awaited = false;
+
+    if scan_first {
+        // Check whether any active scan is running. If so, await completion
+        // instead of firing another scan on the same root.
+        let active_initially = {
+            let scans = ctx.active_scans.lock().unwrap();
+            !scans.is_empty()
+        };
+
+        if active_initially {
+            scan_was_awaited = true;
+            // Poll until no active scans remain. Cap at 5 minutes.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+            loop {
+                let still_active = {
+                    let scans = ctx.active_scans.lock().unwrap();
+                    !scans.is_empty()
+                };
+                if !still_active {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(ApiError::Timeout(
+                        "Timed out waiting for active scan to finish".to_string(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        } else if let Some(emitter) = scan_when_idle {
+            // No scan running — kick off a scan on each monitor-enabled root.
+            // The scanner is idempotent, so this is cheap on unchanged dirs.
+            let roots: Vec<i64> = {
+                let db = crate::api::db(&ctx)?;
+                let conn = db.conn();
+                db::get_scan_roots(&conn)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?
+                    .into_iter()
+                    .filter(|r| r.enabled && r.monitor_enabled)
+                    .filter_map(|r| r.id)
+                    .collect()
+            };
+
+            // One scan over all the roots: every root's frame files are walked before any zip is read.
+            for (root_id, outcome) in
+                crate::scanner::run_registered_scans(&ctx, &SharedEmitter(emitter.clone()), &roots)
+            {
+                if let Err(e) = outcome {
+                    if !e.contains("already in progress") {
+                        tracing::warn!(root_id, error = %e, "find_new_frames: scan of root failed");
+                    }
+                }
+            }
+            // Third path that ingests files on desktop, so it re-arms the
+            // content index like the other two. Once, after the loop — the job
+            // re-derives its own work from the catalog and is single-flight, so
+            // a per-root call would just be a redundant no-op. (A caller that
+            // passes no emitter never starts a scan here, so it has nothing to
+            // re-arm.)
+            {
+                let ctx_for_index = Arc::clone(&ctx);
+                std::thread::spawn(move || {
+                    crate::api::content_index::autostart_after_user_scan(&ctx_for_index, emitter);
+                });
+            }
+        }
+    }
+
+    // Match pass: unclustered lights within the configured threshold.
+    let db = crate::api::db(&ctx)?;
+    let conn = db.conn();
+    let threshold_deg = ctx
+        .settings
+        .get_grouping_threshold_deg(&conn)
+        .map_err(|e| ApiError::Internal(format!("Failed to read threshold: {}", e)))?;
+
+    let candidates = crate::auto_merge::find_candidates_for_set(&conn, frames_set_id, threshold_deg)
+        .map_err(|e| ApiError::Internal(format!("Failed to find candidates: {}", e)))?;
+
+    Ok(FindNewFramesResult {
+        candidates,
+        scan_was_awaited,
+    })
 }
 
 /// Attach the given frames to the frame set (via session detection + append)

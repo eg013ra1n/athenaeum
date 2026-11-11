@@ -160,6 +160,9 @@ pub enum ApiError {
     /// No local account session (no device token, or the hub revoked it). Maps
     /// to HTTP 401 at the web boundary; the frontend re-shows the sign-in flow.
     SignedOut(String),
+    /// A wait on background work ran past its cap. Maps to HTTP 504 at the web
+    /// boundary.
+    Timeout(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -170,7 +173,8 @@ impl std::fmt::Display for ApiError {
             | ApiError::Conflict(m)
             | ApiError::Forbidden(m)
             | ApiError::Internal(m)
-            | ApiError::SignedOut(m) => f.write_str(m),
+            | ApiError::SignedOut(m)
+            | ApiError::Timeout(m) => f.write_str(m),
         }
     }
 }
