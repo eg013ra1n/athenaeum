@@ -294,6 +294,130 @@ const FRAME_COLUMNS: &str =
     reg_inlier_ratio, reg_flipped, rejected_fraction, \
     (SELECT h.frame_uuid FROM stack_project_frames h WHERE h.id = stacking_run_frames.project_frame)";
 
+/// The kind of a `stacking_artifacts` row, and with it WHOSE result the row is (frame-level cache spec §5.1). A
+/// frame-level kind is a function of one frame: its rows carry `group_key = ''`, so a regroup (another tolerance,
+/// another split, a merge) finds them again. A group-level kind is a function of the group's membership: its rows
+/// carry the group's key. [`find_artifact`] and [`upsert_artifact`] apply that rule themselves
+/// ([`ArtifactKind::group_key`]), so no caller chooses the key of a frame's own artifact.
+///
+/// The stored strings ([`ArtifactKind::as_db_str`]) are frozen: a row an older build wrote is found by its string,
+/// and a renamed kind orphans every row of it. `artifact_kind_strings_are_pinned` holds them. A new kind is a new
+/// variant, a line in [`ArtifactKind::FIXED`], and an answer in [`ArtifactKind::is_frame_level`] and in
+/// `stacking::paths`' cleanup rule; the compiler asks for the last two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArtifactKind {
+    /// A calibrated light. Prepare writes this kind too: there is no `prepared` kind.
+    Calibrated,
+    /// The calibrated CFA mosaic of an OSC frame, beside its debayered [`ArtifactKind::Calibrated`] sibling.
+    CalibratedMosaic,
+    /// A frame's first-pass measurement, the `.athm` file of Measure's pass 1.
+    Measured,
+    /// A frame's metrics, the payload row Measure's pass 2 writes.
+    Metrics,
+    /// One plane's fits file of Measure's pass 2 (`.athf`), stored as `fits.<plane>` with a 0-based plane: one row
+    /// per (frame, plane), since each plane owns its own file. Never bare `fits`: the kind is part of the table's
+    /// unique key, so an OSC frame's three planes need three kind strings to get a row each.
+    Fits(usize),
+    /// A registered (aligned) frame.
+    Registered,
+    /// The payload row a project run caches a frame's star map in: keyed on the frame's registration hash, the
+    /// `RegistrationRecord` as JSON with `frames_set_id = 0`. A project never writes `registration_results`
+    /// (catalog-keyed).
+    Registration,
+    /// A frame's plate solution, the payload row of the run's solve sub-step.
+    Solve,
+    /// A member's local-normalization sidecar (`.athln`).
+    Ln,
+    /// The group's local-normalization reference.
+    LnReference,
+    /// The group's seeds calibration, a payload row with no file.
+    LnCalibration,
+    /// The payload-only marker of a member that keeps global normalization because it overlaps the LN reference on
+    /// too little of its footprint: `config_hash` is the member's LN hash, so the run and the plan count it as
+    /// cached while nothing upstream moves; payload `{"overlap": <fraction>}`.
+    LnGlobal,
+    /// The decision of a two-pass dry pass, a payload row `{"switchTo": <frame id> | null}` whose `config_hash` is
+    /// the two-pass key.
+    TwoPass,
+}
+
+impl ArtifactKind {
+    /// Every kind but the per-plane [`ArtifactKind::Fits`], for code that walks the kinds: the pin test, the
+    /// migration's list, the cleanup's list.
+    pub const FIXED: [ArtifactKind; 12] = [
+        ArtifactKind::Calibrated,
+        ArtifactKind::CalibratedMosaic,
+        ArtifactKind::Measured,
+        ArtifactKind::Metrics,
+        ArtifactKind::Registered,
+        ArtifactKind::Registration,
+        ArtifactKind::Solve,
+        ArtifactKind::Ln,
+        ArtifactKind::LnReference,
+        ArtifactKind::LnCalibration,
+        ArtifactKind::LnGlobal,
+        ArtifactKind::TwoPass,
+    ];
+
+    /// The prefix of every [`ArtifactKind::Fits`] string, for SQL that selects all planes at once.
+    pub const FITS_PREFIX: &'static str = "fits.";
+
+    /// The string stored in `stacking_artifacts.kind`.
+    pub fn as_db_str(self) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow::{Borrowed, Owned};
+        match self {
+            ArtifactKind::Calibrated => Borrowed("calibrated"),
+            ArtifactKind::CalibratedMosaic => Borrowed("calibrated_mosaic"),
+            ArtifactKind::Measured => Borrowed("measured"),
+            ArtifactKind::Metrics => Borrowed("metrics"),
+            ArtifactKind::Fits(plane) => Owned(format!("{}{plane}", Self::FITS_PREFIX)),
+            ArtifactKind::Registered => Borrowed("registered"),
+            ArtifactKind::Registration => Borrowed("registration"),
+            ArtifactKind::Solve => Borrowed("solve"),
+            ArtifactKind::Ln => Borrowed("ln"),
+            ArtifactKind::LnReference => Borrowed("ln_reference"),
+            ArtifactKind::LnCalibration => Borrowed("ln_calibration"),
+            ArtifactKind::LnGlobal => Borrowed("ln_global"),
+            ArtifactKind::TwoPass => Borrowed("two_pass"),
+        }
+    }
+
+    /// Whether the kind belongs to a FRAME, not to a group.
+    pub fn is_frame_level(self) -> bool {
+        match self {
+            ArtifactKind::Calibrated
+            | ArtifactKind::CalibratedMosaic
+            | ArtifactKind::Measured
+            | ArtifactKind::Metrics
+            | ArtifactKind::Fits(_)
+            | ArtifactKind::Registered
+            | ArtifactKind::Registration
+            | ArtifactKind::Solve => true,
+            ArtifactKind::Ln
+            | ArtifactKind::LnReference
+            | ArtifactKind::LnCalibration
+            | ArtifactKind::LnGlobal
+            | ArtifactKind::TwoPass => false,
+        }
+    }
+
+    /// The `group_key` a row of this kind is stored and looked up under: `""` for a frame-level kind, the group's
+    /// key otherwise. The one rule; [`find_artifact`] and [`upsert_artifact`] call it, nothing else needs to.
+    pub fn group_key(self, group_key: &str) -> &str {
+        if self.is_frame_level() {
+            ""
+        } else {
+            group_key
+        }
+    }
+}
+
+impl std::fmt::Display for ArtifactKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_db_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StackingArtifactRow {
@@ -1522,6 +1646,50 @@ mod tests {
         assert_eq!(unfinished, vec![planning_run, running_run]);
         assert!(!unfinished.contains(&done_run));
         assert!(!unfinished.contains(&failed_run));
+    }
+
+    /// The stored kind strings, byte for byte. A row an older build wrote is found by its string; no kind is ever
+    /// renamed. The frame / group split is pinned beside it: it decides the key a row is stored under.
+    #[test]
+    fn artifact_kind_strings_are_pinned() {
+        let pinned: [(ArtifactKind, &str, bool); 14] = [
+            (ArtifactKind::Calibrated, "calibrated", true),
+            (ArtifactKind::CalibratedMosaic, "calibrated_mosaic", true),
+            (ArtifactKind::Measured, "measured", true),
+            (ArtifactKind::Metrics, "metrics", true),
+            (ArtifactKind::Fits(0), "fits.0", true),
+            (ArtifactKind::Fits(2), "fits.2", true),
+            (ArtifactKind::Registered, "registered", true),
+            (ArtifactKind::Registration, "registration", true),
+            (ArtifactKind::Solve, "solve", true),
+            (ArtifactKind::Ln, "ln", false),
+            (ArtifactKind::LnReference, "ln_reference", false),
+            (ArtifactKind::LnCalibration, "ln_calibration", false),
+            (ArtifactKind::LnGlobal, "ln_global", false),
+            (ArtifactKind::TwoPass, "two_pass", false),
+        ];
+        for (kind, stored, frame_level) in pinned {
+            assert_eq!(kind.as_db_str(), stored);
+            assert_eq!(kind.to_string(), stored);
+            assert_eq!(kind.is_frame_level(), frame_level, "{stored}");
+            assert_eq!(kind.group_key("osc__x__bin1__180s"), if frame_level { "" } else { "osc__x__bin1__180s" }, "{stored}");
+        }
+        assert_eq!(ArtifactKind::Fits(10).as_db_str(), "fits.10");
+        assert_eq!(ArtifactKind::FITS_PREFIX, "fits.");
+        // `FIXED` is every variant but `Fits`, once: the pinned table names the same kinds.
+        let fixed: Vec<ArtifactKind> =
+            pinned.iter().map(|(k, _, _)| *k).filter(|k| !matches!(k, ArtifactKind::Fits(_))).collect();
+        assert_eq!(fixed, ArtifactKind::FIXED);
+        // The list `stacking::paths::FRAME_LEVEL_KINDS` held before the enum, in its order.
+        let frame_level: Vec<String> = ArtifactKind::FIXED
+            .iter()
+            .filter(|k| k.is_frame_level())
+            .map(|k| k.as_db_str().into_owned())
+            .collect();
+        assert_eq!(
+            frame_level,
+            ["calibrated", "calibrated_mosaic", "measured", "metrics", "registered", "registration", "solve"]
+        );
     }
 
     #[test]

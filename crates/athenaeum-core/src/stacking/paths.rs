@@ -1432,6 +1432,36 @@ mod tests {
         assert!(!is_frame_level_kind("ln"));
     }
 
+    /// The bridge to `ArtifactKind` (removed with the string rule): the enum stores the strings and applies the key
+    /// rule this file's string functions and the stages' constants did.
+    #[test]
+    fn artifact_kind_agrees_with_the_string_rule() {
+        use crate::db::stacking::ArtifactKind;
+        let planes = [ArtifactKind::Fits(0), ArtifactKind::Fits(1), ArtifactKind::Fits(2)];
+        for kind in ArtifactKind::FIXED.into_iter().chain(planes) {
+            let stored = kind.as_db_str();
+            assert_eq!(kind.is_frame_level(), is_frame_level_kind(&stored), "{stored}");
+            assert_eq!(kind.group_key("k"), artifact_group_key(&stored, "k"), "{stored}");
+        }
+        let frame_level: Vec<String> = ArtifactKind::FIXED
+            .iter()
+            .filter(|k| k.is_frame_level())
+            .map(|k| k.as_db_str().into_owned())
+            .collect();
+        assert_eq!(frame_level, FRAME_LEVEL_KINDS);
+        assert_eq!(ArtifactKind::Measured.as_db_str(), crate::stacking::pass1_artifact::PASS1_ARTIFACT_KIND);
+        assert_eq!(ArtifactKind::Registration.as_db_str(), crate::stacking::plan::REGISTRATION_ARTIFACT_KIND);
+        assert_eq!(ArtifactKind::TwoPass.as_db_str(), crate::stacking::run::TWO_PASS_ARTIFACT_KIND);
+        assert_eq!(ArtifactKind::LnGlobal.as_db_str(), crate::stacking::run::LN_GLOBAL_ARTIFACT_KIND);
+        for plane in 0..4 {
+            assert_eq!(ArtifactKind::Fits(plane).as_db_str(), crate::stacking::fits_artifact::artifact_kind(plane));
+        }
+        assert_eq!(
+            INTERMEDIATE_ARTIFACT_KINDS,
+            ["registered", "calibrated", "calibrated_mosaic", "ln", "ln_reference", "ln_global"]
+        );
+    }
+
     use super::*;
 
     use crate::db::schema::init_db;
