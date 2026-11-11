@@ -79,7 +79,7 @@ fn replace_frame_level_file_removes_only_under_the_owned_root_and_only_if_unrefe
             subject: &StackSubject::Project("p2".to_string()),
             frame_id: None,
             group_key: "g",
-            kind: "solve",
+            kind: ArtifactKind::Solve,
             path: shared.to_str(),
             config_hash: "h",
             size: None,

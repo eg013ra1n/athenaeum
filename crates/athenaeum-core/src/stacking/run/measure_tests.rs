@@ -59,7 +59,7 @@ fn measure_reuses_metrics_artifacts() {
     let metrics1 = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("metrics"),
+        Some(ArtifactKind::Metrics),
     )
     .unwrap();
     assert_eq!(metrics1.len(), 4, "{metrics1:?}");
@@ -81,7 +81,7 @@ fn measure_reuses_metrics_artifacts() {
     let metrics2 = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("metrics"),
+        Some(ArtifactKind::Metrics),
     )
     .unwrap();
     assert_eq!(metrics2.len(), 4, "{metrics2:?}");
@@ -164,7 +164,7 @@ fn measure_folds_a_floored_member_to_the_group_channel_median_c_before_the_weigh
                 subject: &subject,
                 frame_id: Some(frame_id),
                 group_key: "",
-                kind: "metrics",
+                kind: ArtifactKind::Metrics,
                 path: None,
                 config_hash: &hash,
                 size: None,
@@ -293,7 +293,7 @@ fn measure_reruns_pass_two_for_the_group_when_the_group_beta_moves() {
             &fixture.conn,
             &subject,
             "",
-            "calibrated",
+            ArtifactKind::Calibrated,
             Some(frame_id),
         )
         .unwrap()
@@ -303,7 +303,7 @@ fn measure_reruns_pass_two_for_the_group_when_the_group_beta_moves() {
 
     let beta1 = run("run 1").expect("a group beta");
     let logged = || pass1_logged_under(working.path()).len();
-    let measured1 = rows_of_kind(&fixture.conn, fixture.set_id, "measured");
+    let measured1 = rows_of_kind(&fixture.conn, fixture.set_id, ArtifactKind::Measured);
     assert_eq!(logged(), 4, "run 1 ran pass 1 for every member, once");
     assert_eq!(measured1.len(), 4, "run 1 stored every member's first pass");
     for (frame_id, row) in &measured1 {
@@ -353,7 +353,7 @@ fn measure_reruns_pass_two_for_the_group_when_the_group_beta_moves() {
                 subject: &subject,
                 frame_id: Some(frame_id),
                 group_key: "",
-                kind: "metrics",
+                kind: ArtifactKind::Metrics,
                 path: None,
                 config_hash: &hash,
                 size: None,
@@ -374,7 +374,7 @@ fn measure_reruns_pass_two_for_the_group_when_the_group_beta_moves() {
         4,
         "the group-beta move re-ran pass 2 only: no pass 1 on a valid artifact"
     );
-    for (frame_id, row) in rows_of_kind(&fixture.conn, fixture.set_id, "measured") {
+    for (frame_id, row) in rows_of_kind(&fixture.conn, fixture.set_id, ArtifactKind::Measured) {
         assert_eq!(
             row.created_at, measured1[&frame_id].created_at,
             "frame {frame_id}: the artifact is written once and reused"
@@ -405,7 +405,7 @@ fn measure_rows_snapshot(
     rig: &Pass1Rig,
 ) -> Vec<(String, i64, String, String, String, Option<String>)> {
     let mut out = Vec::new();
-    for kind in ["metrics", "measured", "fits.0"] {
+    for kind in [ArtifactKind::Metrics, ArtifactKind::Measured, ArtifactKind::Fits(0)] {
         for (frame_id, row) in rig.rows(kind) {
             out.push((
                 kind.to_string(),
@@ -588,7 +588,7 @@ fn the_spill_is_read_from_the_row_path() {
     let old_dir = rig.measured_root().join("old_group_key");
     std::fs::create_dir_all(&old_dir).unwrap();
     let mut moved = Vec::new();
-    for (frame_id, row) in rig.rows("measured") {
+    for (frame_id, row) in rig.rows(ArtifactKind::Measured) {
         let old = old_dir.join(format!("legacy_{frame_id}.athm"));
         std::fs::rename(row.path.as_ref().unwrap(), &old).unwrap();
         rig.fixture
@@ -602,7 +602,7 @@ fn the_spill_is_read_from_the_row_path() {
     }
     assert_eq!(moved.len(), 4);
     // Pass 2 is lost; the first passes are only on disk under their old names.
-    rig.delete_rows(&["metrics", "fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Metrics, ArtifactKind::Fits(0)]);
 
     let (second, logs) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
     assert_eq!(fan_out_items(&logs, "measure", "pass1"), 0, "pass 1 re-ran: {logs}");
@@ -612,7 +612,7 @@ fn the_spill_is_read_from_the_row_path() {
         !logs.contains("first-pass artifact"),
         "no refusal or stale line for a spill read from its row: {logs}"
     );
-    let rows = rig.rows("measured");
+    let rows = rig.rows(ArtifactKind::Measured);
     assert_eq!(rows.len(), 4);
     for row in rows.values() {
         let path = PathBuf::from(row.path.as_ref().unwrap());
@@ -631,7 +631,7 @@ fn the_spill_is_read_from_the_row_path() {
 /// migration (spec §5.7) leaves. Returns the new path by frame id.
 fn move_rows_to_legacy_folder(
     rig: &Pass1Rig,
-    kind: &str,
+    kind: ArtifactKind,
     root: &Path,
     suffix: &str,
 ) -> HashMap<i64, PathBuf> {
@@ -674,7 +674,7 @@ fn a_refused_spill_is_rewritten_at_the_layout_path() {
     rig.run("run 1", None);
     let ids = rig.sorted_ids();
     assert_eq!(ids.len(), 4);
-    let moved = move_rows_to_legacy_folder(&rig, "measured", &rig.measured_root(), ".athm");
+    let moved = move_rows_to_legacy_folder(&rig, ArtifactKind::Measured, &rig.measured_root(), ".athm");
     let flip = |path: &Path, at: usize| {
         let mut bytes = std::fs::read(path).unwrap();
         let at = if at == usize::MAX { bytes.len() / 2 } else { at };
@@ -693,7 +693,7 @@ fn a_refused_spill_is_rewritten_at_the_layout_path() {
         )
         .unwrap();
     // Pass 2 is owed for all four: their `fits.0` rows are gone.
-    rig.delete_rows(&["fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Fits(0)]);
 
     let second = rig.run("run 2", None);
     let mut rerun = second.logged.clone();
@@ -706,7 +706,7 @@ fn a_refused_spill_is_rewritten_at_the_layout_path() {
     assert_eq!(rerun, expected, "exactly the three refused artifacts re-ran pass 1");
     assert_eq!(second.excluded, 0);
 
-    let rows = rig.rows("measured");
+    let rows = rig.rows(ArtifactKind::Measured);
     assert_eq!(rows.len(), 4);
     for &id in &[ids[0], ids[1], ids[3]] {
         let path = PathBuf::from(rows[&id].path.clone().unwrap());
@@ -726,8 +726,8 @@ fn a_refused_spill_is_rewritten_at_the_layout_path() {
 fn a_forced_measure_replaces_files_in_old_group_folders() {
     let rig = Pass1Rig::new();
     rig.run("run 1", None);
-    let old_measured = move_rows_to_legacy_folder(&rig, "measured", &rig.measured_root(), ".athm");
-    let old_fits = move_rows_to_legacy_folder(&rig, "fits.0", &rig.layout.fits_root(), ".p0.athf");
+    let old_measured = move_rows_to_legacy_folder(&rig, ArtifactKind::Measured, &rig.measured_root(), ".athm");
+    let old_fits = move_rows_to_legacy_folder(&rig, ArtifactKind::Fits(0), &rig.layout.fits_root(), ".p0.athf");
     assert_eq!((old_measured.len(), old_fits.len()), (4, 4));
 
     rig.run("run 2", Some(Stage::Measure));
@@ -736,10 +736,10 @@ fn a_forced_measure_replaces_files_in_old_group_folders() {
         let stem = frame_file_stem(group_frame);
         assert!(!old_measured[&id].exists(), "frame {id}: the old pass-1 file is gone");
         assert!(!old_fits[&id].exists(), "frame {id}: the old fits file is gone");
-        let measured = rig.rows("measured")[&id].path.clone().unwrap();
+        let measured = rig.rows(ArtifactKind::Measured)[&id].path.clone().unwrap();
         assert_eq!(PathBuf::from(&measured), rig.layout.measured_path(&stem));
         assert!(Path::new(&measured).is_file());
-        let fits = rig.rows("fits.0")[&id].path.clone().unwrap();
+        let fits = rig.rows(ArtifactKind::Fits(0))[&id].path.clone().unwrap();
         assert_eq!(PathBuf::from(&fits), rig.layout.fits_path(&stem, 0));
         assert!(Path::new(&fits).is_file());
     }
@@ -775,15 +775,15 @@ fn measure_pass1_from_the_artifact_after_a_lost_pass_two() {
     let rig = Pass1Rig::new();
     let first = rig.run("run 1", None);
     assert_eq!(first.logged.len(), 4);
-    rig.delete_rows(&["metrics", "fits.0"]);
-    assert!(rig.rows("metrics").is_empty());
+    rig.delete_rows(&[ArtifactKind::Metrics, ArtifactKind::Fits(0)]);
+    assert!(rig.rows(ArtifactKind::Metrics).is_empty());
     let second = rig.run("run 2", None);
     assert!(
         second.logged.is_empty(),
         "pass 1 re-ran for {:?}",
         second.logged
     );
-    assert_eq!(rig.rows("metrics").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
     assert_eq!(
         second.beta.map(f64::to_bits),
         first.beta.map(f64::to_bits),
@@ -807,11 +807,11 @@ fn measure_pass1_artifact_survives_a_touched_source() {
     file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
         .unwrap();
     drop(file);
-    rig.delete_rows(&["fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Fits(0)]);
     let second = rig.run("run 2", None);
     assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
     assert_eq!(second.excluded, 0);
-    assert_eq!(rig.rows("metrics").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
 }
 
 /// Ruling R12 (a): a file Athenaeum never rewrites (an attested light used in place) keeps its modification time in
@@ -854,11 +854,11 @@ fn measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one() {
             rusqlite::params![size, modified_at, edited.to_str().unwrap()],
         )
         .unwrap();
-    rig.delete_rows(&["metrics", "fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Metrics, ArtifactKind::Fits(0)]);
     let second = rig.run("run 2", None);
     assert_eq!(second.logged, vec![edited], "only the edited file re-ran pass 1");
     assert_eq!(second.excluded, 0);
-    assert_eq!(rig.rows("metrics").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
 }
 
 /// Plan A Task 11c (R11c-4), amended (spec §5.3): a calibrated file of another SIZE than the one pass 1 read, whose
@@ -879,7 +879,7 @@ fn measure_pass1_artifact_of_a_source_of_another_size_reruns_pass_one() {
         &rig.fixture.conn,
         &rig.subject,
         "",
-        "calibrated",
+        ArtifactKind::Calibrated,
         Some(ids[2]),
     )
     .unwrap()
@@ -891,7 +891,7 @@ fn measure_pass1_artifact_of_a_source_of_another_size_reruns_pass_one() {
             subject: &rig.subject,
             frame_id: Some(ids[2]),
             group_key: "",
-            kind: "calibrated",
+            kind: ArtifactKind::Calibrated,
             path: row.path.as_deref(),
             config_hash: &row.config_hash,
             size: Some(size),
@@ -900,11 +900,11 @@ fn measure_pass1_artifact_of_a_source_of_another_size_reruns_pass_one() {
         },
     )
     .unwrap();
-    rig.delete_rows(&["fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Fits(0)]);
     let second = rig.run("run 2", None);
     assert_eq!(second.logged, vec![resized], "only the resized file re-ran pass 1");
     assert_eq!(second.excluded, 0);
-    assert_eq!(rig.rows("metrics").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
 }
 
 /// Frame-level cache spec §5.3 (Task 8): "Delete intermediates" removes `calibrated/` and keeps `measured/`. The
@@ -923,7 +923,7 @@ fn pass1_survives_a_byte_identical_recalibration() {
         .map(|id| rig.calibrated_path(id))
         .collect();
     let measured_before: Vec<(i64, String, std::time::SystemTime)> = rig
-        .rows("measured")
+        .rows(ArtifactKind::Measured)
         .into_iter()
         .map(|(id, row)| {
             let path = row.path.unwrap();
@@ -945,7 +945,7 @@ fn pass1_survives_a_byte_identical_recalibration() {
         measured_before.iter().all(|(_, p, _)| Path::new(p).is_file()),
         "measured/ stayed"
     );
-    rig.delete_rows(&["metrics", "fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Metrics, ArtifactKind::Fits(0)]);
 
     let (second, logs2) = crate::stacking::telemetry::capture_logs(|| rig.run("run 2", None));
     assert!(
@@ -968,7 +968,7 @@ fn pass1_survives_a_byte_identical_recalibration() {
             "frame {id}: the first-pass file was rewritten"
         );
     }
-    assert_eq!(rig.rows("metrics").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
 }
 
 /// Ruling R10 M3: a first pass re-run inside a pass-2 worker (its stored artifact fails the whole-file checksum
@@ -980,7 +980,7 @@ fn pass1_survives_a_byte_identical_recalibration() {
 fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
     let rig = Pass1Rig::new();
     rig.run("run 1", None);
-    for row in rig.rows("measured").into_values() {
+    for row in rig.rows(ArtifactKind::Measured).into_values() {
         let artifact = PathBuf::from(row.path.unwrap());
         let mut bytes = std::fs::read(&artifact).unwrap();
         let mid = bytes.len() / 2;
@@ -995,7 +995,7 @@ fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
             .set_modified(modified)
             .unwrap();
     }
-    rig.delete_rows(&["metrics", "fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Metrics, ArtifactKind::Fits(0)]);
 
     crate::stacking::measure::PASS1_TOUCH_AFTER
         .lock()
@@ -1008,7 +1008,7 @@ fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
         .retain(|(dir, _)| dir != rig.working.path());
     assert_eq!(second.logged.len(), 4, "every artifact was refused after its head passed");
     assert_eq!(second.excluded, 1, "the touched frame's pass 2 was refused: {logs2}");
-    let rows = rig.rows("measured");
+    let rows = rig.rows(ArtifactKind::Measured);
     assert_eq!(rows.len(), 4);
     for (id, row) in &rows {
         assert!(
@@ -1036,7 +1036,7 @@ fn measure_pass1_corrupt_artifact_is_recomputed() {
     rig.run("run 1", None);
     let ids = rig.sorted_ids();
     let row = rig
-        .rows("measured")
+        .rows(ArtifactKind::Measured)
         .remove(&ids[1])
         .expect("run 1 wrote a measured row for every member");
     let artifact = PathBuf::from(row.path.unwrap());
@@ -1044,7 +1044,7 @@ fn measure_pass1_corrupt_artifact_is_recomputed() {
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0x5a;
     std::fs::write(&artifact, &bytes).unwrap();
-    rig.delete_rows(&["fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Fits(0)]);
     let second = rig.run("run 2", None);
     assert_eq!(
         second.logged,
@@ -1066,7 +1066,7 @@ fn measure_pass1_cancelled_run_keeps_the_rows_of_the_files_it_wrote() {
         "the run honoured the cancel"
     );
     let written: Vec<PathBuf> = rig
-        .rows("measured")
+        .rows(ArtifactKind::Measured)
         .values()
         .map(|row| PathBuf::from(row.path.clone().unwrap()))
         .collect();
@@ -1074,7 +1074,7 @@ fn measure_pass1_cancelled_run_keeps_the_rows_of_the_files_it_wrote() {
         !written.is_empty() && written.iter().all(|p| p.is_file()),
         "the cancelled run left rows for files that exist"
     );
-    let kept = rig.rows("measured").len();
+    let kept = rig.rows(ArtifactKind::Measured).len();
     assert!(kept < 4, "the cancel landed mid-phase-1 ({kept} of 4 written)");
     let second = rig.run("run 2", None);
     assert_eq!(
@@ -1082,7 +1082,7 @@ fn measure_pass1_cancelled_run_keeps_the_rows_of_the_files_it_wrote() {
         4 - kept,
         "the next run runs pass 1 only for the frames the cancelled run did not finish"
     );
-    assert_eq!(rig.rows("metrics").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
 }
 
 /// Plan A Task 11c review M1 (R11c-5 (3)): a member whose own beta is on its `metrics` row is a cache hit and its
@@ -1109,7 +1109,7 @@ fn measure_pass1_cache_hit_member_does_not_validate_its_artifact() {
     let rig = Pass1Rig::new();
     rig.run("run 1", None);
     let ids = rig.sorted_ids();
-    let artifact = PathBuf::from(rig.rows("measured")[&ids[1]].path.clone().unwrap());
+    let artifact = PathBuf::from(rig.rows(ArtifactKind::Measured)[&ids[1]].path.clone().unwrap());
     let mut bytes = std::fs::read(&artifact).unwrap();
     // A HEAD byte: a head read (step 0's validation) refuses it, so the test fails if a cache hit validates.
     bytes[crate::stacking::pass1_artifact::PREFIX_LEN] ^= 0x5a;
@@ -1138,8 +1138,8 @@ fn measure_pass1_write_failure_recomputes_in_pass_two() {
     std::fs::create_dir_all(rig.measured_root().parent().unwrap()).unwrap();
     std::fs::write(rig.measured_root(), b"not a directory").unwrap();
     let out = rig.run("run 1", None);
-    assert!(rig.rows("measured").is_empty(), "no row for a file that is not there");
-    assert_eq!(rig.rows("metrics").len(), 4);
+    assert!(rig.rows(ArtifactKind::Measured).is_empty(), "no row for a file that is not there");
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
     assert_eq!(out.excluded, 0);
     assert_eq!(out.logged.len(), 8, "pass 1 ran twice per member");
     assert_eq!(
@@ -1156,7 +1156,7 @@ fn measure_pass1_rerun_from_measure_recomputes_it() {
     rig.run("run 1", None);
     let second = rig.run("run 2", Some(Stage::Measure));
     assert_eq!(second.logged.len(), 4, "a forced Measure re-runs every first pass");
-    assert_eq!(rig.rows("measured").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Measured).len(), 4);
 }
 
 /// Plan A Task 11c (upgrade path): a member with a `metrics` row but no artifact (a catalog from before the
@@ -1165,14 +1165,14 @@ fn measure_pass1_rerun_from_measure_recomputes_it() {
 fn measure_pass1_upgrade_runs_it_inside_pass_two_once() {
     let rig = Pass1Rig::new();
     rig.run("run 1", None);
-    rig.delete_rows(&["measured"]);
+    rig.delete_rows(&[ArtifactKind::Measured]);
     let _ = std::fs::remove_dir_all(rig.measured_root());
     let ids = rig.sorted_ids();
     rig.lower_own_betas(&[(ids[0], 1.6), (ids[1], 1.7)]);
     let second = rig.run("run 2", None);
     assert_eq!(second.beta, Some(1.7));
     assert_eq!(second.logged.len(), 4, "the upgrade ripple: pass 1 inside pass 2, once");
-    assert_eq!(rig.rows("measured").len(), 4);
+    assert_eq!(rig.rows(ArtifactKind::Measured).len(), 4);
     rig.lower_own_betas(&[(ids[2], 1.2), (ids[3], 1.3)]);
     let third = rig.run("run 3", None);
     assert_eq!(third.beta, Some(1.3), "the group beta moved again");
@@ -1200,8 +1200,8 @@ fn measure_pass1_spill_is_byte_identical_fresh_and_from_the_artifact() {
     };
     // Per frame: (metrics key, fits.0 key, payload minus its timing, the .athf bytes).
     let snapshot = || {
-        let metrics = rig.rows("metrics");
-        let fits = rig.rows("fits.0");
+        let metrics = rig.rows(ArtifactKind::Metrics);
+        let fits = rig.rows(ArtifactKind::Fits(0));
         assert_eq!((metrics.len(), fits.len()), (4, 4));
         metrics
             .into_iter()
@@ -1246,7 +1246,7 @@ fn measure_pass1_spill_is_byte_identical_fresh_and_from_the_artifact() {
         );
     }
 
-    rig.delete_rows(&["fits.0"]);
+    rig.delete_rows(&[ArtifactKind::Fits(0)]);
     let again = rig.run("from the artifact", None);
     assert!(again.logged.is_empty(), "pass 1 re-ran for {:?}", again.logged);
     assert_eq!(
@@ -1306,7 +1306,7 @@ fn moffat4_measure_is_one_pass_and_unchanged() {
         .measurement
         .measure_options(cfg.normalization.scale_estimator);
     let rows =
-        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("metrics")).unwrap();
+        crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some(ArtifactKind::Metrics)).unwrap();
     assert_eq!(rows.len(), 3);
     for row in rows {
         let frame_id = row.frame_id.unwrap();
@@ -1314,7 +1314,7 @@ fn moffat4_measure_is_one_pass_and_unchanged() {
             &fixture.conn,
             &subject,
             "",
-            "calibrated",
+            ArtifactKind::Calibrated,
             Some(frame_id),
         )
         .unwrap()
@@ -1351,7 +1351,7 @@ fn moffat4_measure_is_one_pass_and_unchanged() {
     );
     // Plan A Task 11c: the single pass spills nothing.
     assert!(
-        rows_of_kind(&fixture.conn, fixture.set_id, "measured").is_empty(),
+        rows_of_kind(&fixture.conn, fixture.set_id, ArtifactKind::Measured).is_empty(),
         "no measured row under Moffat4"
     );
     assert!(
@@ -1476,14 +1476,14 @@ fn measure_writes_fits_artifacts_and_the_group_beta() {
     let metrics = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("metrics"),
+        Some(ArtifactKind::Metrics),
     )
     .unwrap();
     assert_eq!(metrics.len(), 4, "{metrics:?}");
     let fits_rows = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("fits.0"),
+        Some(ArtifactKind::Fits(0)),
     )
     .unwrap();
     assert_eq!(
@@ -1576,7 +1576,7 @@ fn measure_writes_fits_artifacts_and_the_group_beta() {
     let fits_rows2 = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("fits.0"),
+        Some(ArtifactKind::Fits(0)),
     )
     .unwrap();
     assert_eq!(
@@ -1663,14 +1663,14 @@ fn measure_heals_a_missing_fits_sidecar_on_a_plain_rerun() {
     let metrics_before = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("metrics"),
+        Some(ArtifactKind::Metrics),
     )
     .unwrap();
     assert_eq!(metrics_before.len(), 4, "{metrics_before:?}");
     let fits_before = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("fits.0"),
+        Some(ArtifactKind::Fits(0)),
     )
     .unwrap();
     assert_eq!(fits_before.len(), 4, "{fits_before:?}");
@@ -1729,7 +1729,7 @@ fn measure_heals_a_missing_fits_sidecar_on_a_plain_rerun() {
     let metrics_after = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("metrics"),
+        Some(ArtifactKind::Metrics),
     )
     .unwrap();
     assert_eq!(metrics_after.len(), 4, "{metrics_after:?}");
@@ -1752,7 +1752,7 @@ fn measure_heals_a_missing_fits_sidecar_on_a_plain_rerun() {
     let fits_after = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("fits.0"),
+        Some(ArtifactKind::Fits(0)),
     )
     .unwrap();
     assert_eq!(fits_after.len(), 4, "{fits_after:?}");
@@ -1843,7 +1843,7 @@ fn a_fits_artifact_write_failure_degrades_to_detection() {
     let fits_before = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("fits.0"),
+        Some(ArtifactKind::Fits(0)),
     )
     .unwrap();
     assert_eq!(fits_before.len(), 4, "{fits_before:?}");
@@ -1910,7 +1910,7 @@ fn a_fits_artifact_write_failure_degrades_to_detection() {
     let metrics_after = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("metrics"),
+        Some(ArtifactKind::Metrics),
     )
     .unwrap();
     assert_eq!(metrics_after.len(), 4, "{metrics_after:?}");
@@ -1924,7 +1924,7 @@ fn a_fits_artifact_write_failure_degrades_to_detection() {
     let fits_after = crate::db::stacking::list_artifacts(
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
-        Some("fits.0"),
+        Some(ArtifactKind::Fits(0)),
     )
     .unwrap();
     assert_eq!(
@@ -2271,10 +2271,10 @@ fn measure_one_pass1_queue_across_groups_matches_per_group_queues() {
             format!("{:?}", stage_measure_with(&mut rc, Some(mode == 1)).map_err(|e| format!("{e:?}")))
         };
         let mut rows: Rows = Vec::new();
-        for kind in ["metrics", "measured"] {
+        for kind in [ArtifactKind::Metrics, ArtifactKind::Measured] {
             for r in crate::db::stacking::list_artifacts(&fixture.conn, &rc.subject, Some(kind)).unwrap() {
                 // A first-pass artifact's bytes carry its wall-clock timings: its size differs run to run.
-                let size = if kind == "measured" { None } else { r.size };
+                let size = if kind == ArtifactKind::Measured { None } else { r.size };
                 rows.push((r.group_key, r.frame_id, r.kind, r.config_hash, size));
             }
         }

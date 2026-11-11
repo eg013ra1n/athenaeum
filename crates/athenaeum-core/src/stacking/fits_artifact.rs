@@ -20,7 +20,7 @@
 //! counts (an OSC frame's R/G/B fits independently), and the fixed header
 //! below has no per-plane sub-count to express more than one plane in a
 //! single file — `stacking::run` writes `<stem>.p<plane>.athf` per plane
-//! and one `stacking_artifacts` row per plane ([`artifact_kind`]), keyed on
+//! and one `stacking_artifacts` row per plane ([`crate::db::stacking::ArtifactKind::Fits`]), keyed on
 //! the same measurement hash as the frame's `metrics` row.
 
 use std::io::{Read, Write};
@@ -239,16 +239,6 @@ pub fn read_fits(path: &Path) -> Result<Vec<StarFit>, FitsArtifactError> {
         )));
     }
     Ok(rest.chunks_exact(RECORD_LEN).map(decode_fit).collect())
-}
-
-/// The `stacking_artifacts.kind` for one plane's fits file — `"fits.<plane>"`
-/// (`plane` 0-based, the same index [`crate::integration::plane_reader::PlaneReader`]
-/// uses): one row per (frame, plane), since each plane owns its own `.athf`
-/// file. Never bare `"fits"` — the table's unique index is keyed on
-/// `(frames_set_id, group_key, kind, frame_id)`, so an OSC frame's three
-/// planes need three distinct kind strings to each get a row.
-pub fn artifact_kind(plane: usize) -> String {
-    format!("fits.{plane}")
 }
 
 #[cfg(test)]
@@ -520,11 +510,14 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap()[4..6], 3u16.to_le_bytes());
     }
 
+    /// A plane's fits file has its own `stacking_artifacts` kind (`plane` 0-based, the index
+    /// [`crate::integration::plane_reader::PlaneReader`] uses): each plane owns its own `.athf` file and its own row.
     #[test]
     fn artifact_kind_is_distinct_per_plane() {
-        assert_eq!(artifact_kind(0), "fits.0");
-        assert_eq!(artifact_kind(1), "fits.1");
-        assert_ne!(artifact_kind(0), artifact_kind(1));
+        use crate::db::stacking::ArtifactKind;
+        assert_eq!(ArtifactKind::Fits(0).as_db_str(), "fits.0");
+        assert_eq!(ArtifactKind::Fits(1).as_db_str(), "fits.1");
+        assert_ne!(ArtifactKind::Fits(0), ArtifactKind::Fits(1));
     }
 
     /// Not one of the brief's required tests — a quick empirical check of

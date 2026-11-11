@@ -542,7 +542,7 @@ impl RegisterRig {
     }
 
     fn registered_rows(&self) -> HashMap<i64, crate::db::stacking::StackingArtifactRow> {
-        rows_of_kind(&self.fixture.conn, self.fixture.set_id, "registered")
+        rows_of_kind(&self.fixture.conn, self.fixture.set_id, ArtifactKind::Registered)
     }
 
     /// Every registered row's `(frame, row id, group key, created_at, hash, path, file mtime)`: what a regroup must
@@ -764,15 +764,16 @@ fn re_registering_a_migrated_row_removes_the_old_file_unless_another_row_points_
         legacy.insert(frame_id, old);
     }
     assert_eq!(legacy.len(), 4);
-    // Another row, of another group key, still points at one of the old files.
+    // Another row, of another group key, still points at one of the old files. No writer leaves a `registered` row
+    // under a group key since the frame-level keys; the test door stores it as given.
     let kept_frame = rig.light_ids[3];
-    upsert_artifact(
+    crate::db::stacking::upsert_artifact_under_key(
         &rig.fixture.conn,
         &NewArtifact {
             subject: &StackSubject::FrameSet(rig.fixture.set_id),
             frame_id: Some(kept_frame),
             group_key: "stray",
-            kind: "registered",
+            kind: ArtifactKind::Registered,
             path: legacy[&kept_frame].to_str(),
             config_hash: "h",
             size: None,
@@ -793,7 +794,7 @@ fn re_registering_a_migrated_row_removes_the_old_file_unless_another_row_points_
             &rig.fixture.conn,
             &StackSubject::FrameSet(rig.fixture.set_id),
             "",
-            "registered",
+            ArtifactKind::Registered,
             Some(frame_id),
         )
         .unwrap()
@@ -1734,7 +1735,7 @@ fn resolve_register_fits_floors_below_min_inliers_and_admits_at_it() {
                 subject: &StackSubject::FrameSet(fixture.set_id),
                 frame_id: Some(frame_id),
                 group_key: "",
-                kind: &fits_artifact::artifact_kind(0),
+                kind: ArtifactKind::Fits(0),
                 path: Some(path.to_str().unwrap()),
                 config_hash: &expected_hash,
                 size: Some(size),
@@ -1875,7 +1876,7 @@ fn resolve_register_fits_is_none_for_a_group_that_does_not_read_fits() {
             subject: &StackSubject::FrameSet(fixture.set_id),
             frame_id: Some(frame_id),
             group_key: "",
-            kind: &fits_artifact::artifact_kind(0),
+            kind: ArtifactKind::Fits(0),
             path: Some(path.to_str().unwrap()),
             config_hash: &expected_hash,
             size: Some(size),
@@ -2590,8 +2591,8 @@ fn a_project_frame_registers_onto_the_grid() {
         let row = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            crate::stacking::paths::artifact_group_key("registered", &group),
-            "registered",
+            &group,
+            ArtifactKind::Registered,
             Some(e.frame.frame_id),
         )
         .unwrap()
@@ -2694,8 +2695,8 @@ fn a_grid_change_recomposes_without_star_detection() {
             let row = crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                crate::stacking::paths::artifact_group_key("registered", &group),
-                "registered",
+                &group,
+                ArtifactKind::Registered,
                 Some(e.frame.frame_id),
             )
             .unwrap()
@@ -2733,8 +2734,8 @@ fn a_grid_change_recomposes_without_star_detection() {
         let row = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            crate::stacking::paths::artifact_group_key("registered", &group),
-            "registered",
+            &group,
+            ArtifactKind::Registered,
             Some(e.frame.frame_id),
         )
         .unwrap()

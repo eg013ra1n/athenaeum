@@ -918,8 +918,8 @@ fn process_group_output(
                 crate::db::stacking::find_artifact(
                     &conn,
                     &rc.subject,
-                    artifact_group_key("registered", &group.key),
-                    "registered",
+                    &group.key,
+                    ArtifactKind::Registered,
                     Some(e.frame.frame_id),
                 )?
                 .filter(|row| row.config_hash == registration_hash)
@@ -2146,8 +2146,8 @@ fn process_group_output(
                     let path = crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
-                        artifact_group_key("calibrated_mosaic", &group.key),
-                        "calibrated_mosaic",
+                        &group.key,
+                        ArtifactKind::CalibratedMosaic,
                         Some(frame_id),
                     )?
                     .and_then(|a| a.path)

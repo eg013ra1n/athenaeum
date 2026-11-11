@@ -22,7 +22,7 @@ use crate::api::lights::{compute_export_readiness_for_frames, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
 use crate::db::stacking::{
     active_run_for_subject, find_artifact, get_set_config, list_artifacts, list_frame_rows,
-    list_runs, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
+    list_runs, upsert_artifact, ArtifactKind, NewArtifact, StackSubject, StackingArtifactRow,
 };
 use crate::export::{applied_master_paths, DivisorCache};
 use crate::integration::stats::RejectionNormalization;
@@ -36,14 +36,13 @@ use crate::stacking::config::{
     registration_subtree, resolve_config, stage_hash, CleanupPolicy, ReferenceMode, SourceIdentity,
     StackingConfig,
 };
-use crate::stacking::fits_artifact;
 use crate::stacking::groups::{
     frame_source, median_f64, ColorMode, GroupFrame, IntegrationGroup, ScaleSource,
 };
 use crate::stacking::ln::SeedsCalibration;
 use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::origin::{origin_of, FrameOrigin, FrameOrigins};
-use crate::stacking::paths::{self, artifact_group_key, EstimateInputs};
+use crate::stacking::paths::{self, EstimateInputs};
 use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
@@ -748,8 +747,8 @@ fn gate_measure_betas(
             let Some(row) = find_artifact(
                 conn,
                 subject,
-                artifact_group_key("metrics", &g.key),
-                "metrics",
+                &g.key,
+                ArtifactKind::Metrics,
                 Some(f.frame_id),
             )?
             else {
@@ -1169,13 +1168,13 @@ pub(crate) fn fits_artifact_fresh_for_planes(
         return Ok(false);
     }
     for plane in 0..planes {
-        let kind = fits_artifact::artifact_kind(plane);
+        let kind = ArtifactKind::Fits(plane);
         // A frame-level kind: its rows sit under the empty key, whatever group the frame is in now.
         let plane_fresh = find_artifact(
             conn,
             subject,
-            artifact_group_key(&kind, ""),
-            &kind,
+            "",
+            kind,
             Some(frame_id),
         )?
         .is_some_and(|row| is_fresh(&row, expected_hash));
@@ -1348,15 +1347,6 @@ pub(crate) fn stored_reference_frame(
     }
 }
 
-/// The payload-only artifact a project run caches each frame's star map in
-/// (spec §4.2, plan 6b-3 D2): one row per handle, `group_key = ""`, keyed
-/// on the frame's registration hash, the `RegistrationRecord` as JSON with
-/// `frames_set_id = 0`. Not in `paths::INTERMEDIATE_ARTIFACT_KINDS`, so only
-/// `CleanupWhat::All` drops it: a cleanup that removes the registered
-/// frames keeps the star matching. A project never writes
-/// `registration_results` (catalog-keyed).
-pub(crate) const REGISTRATION_ARTIFACT_KIND: &str = "registration";
-
 /// The subject's stored registration rows: `registration_results` for a
 /// frame set, the `registration` artifacts for a project. A project row
 /// whose payload does not parse is skipped with a warning, and the frame
@@ -1369,7 +1359,7 @@ pub(crate) fn stored_registrations(
         StackSubject::FrameSet(id) => get_registration_for_frame_set(conn, *id),
         StackSubject::Project(project_id) => {
             let mut out = Vec::new();
-            for row in list_artifacts(conn, subject, Some(REGISTRATION_ARTIFACT_KIND))? {
+            for row in list_artifacts(conn, subject, Some(ArtifactKind::Registration))? {
                 match row
                     .payload_json
                     .as_deref()
@@ -1411,8 +1401,8 @@ pub(crate) fn store_registration(
                 &NewArtifact {
                     subject,
                     frame_id: Some(record.frame_id),
-                    group_key: artifact_group_key(REGISTRATION_ARTIFACT_KIND, ""),
-                    kind: REGISTRATION_ARTIFACT_KIND,
+                    group_key: "",
+                    kind: ArtifactKind::Registration,
                     path: None,
                     config_hash: record.config_hash.as_deref().unwrap_or_default(),
                     size: None,
@@ -1821,7 +1811,7 @@ pub(crate) fn registered_status(status: &str) -> bool {
 /// stage rows already show as `Stale` without needing a story.
 ///
 /// `metrics` rows survive `deleteIntermediates` since v0.6.3
-/// (`paths::INTERMEDIATE_ARTIFACT_KINDS`), so the line says whether the
+/// (`paths::is_intermediate_kind`), so the line says whether the
 /// measurements are still cached — read off the plan's own counters, not
 /// assumed, because a set cleaned by v0.6.2 lost them too.
 fn cleanup_stale_note(
@@ -2093,8 +2083,8 @@ fn compute_register_stale(
         let artifact = find_artifact(
             conn,
             subject,
-            artifact_group_key("registered", &group.key),
-            "registered",
+            &group.key,
+            ArtifactKind::Registered,
             Some(frame_id),
         )?;
         if !artifact.is_some_and(|row| is_fresh(&row, &artifact_hash)) {
@@ -3698,7 +3688,7 @@ pub fn build_plan(
         let ln_reference_info: Option<LnReferencePayload> = if local_normalization_active {
             // Ruling R10 M4: the run reuses the reference only while its file is the one its row recorded
             // (`is_fresh` on the payload's own hash); a deleted or replaced file reads as no reference.
-            find_artifact(conn, subject, &g.key, "ln_reference", None)?
+            find_artifact(conn, subject, &g.key, ArtifactKind::LnReference, None)?
                 .and_then(|row| {
                     let payload = serde_json::from_str::<LnReferencePayload>(
                         row.payload_json.as_deref()?,
@@ -3744,7 +3734,7 @@ pub fn build_plan(
         // under, which is the question this gate is asking.
         let ln_calibration: Option<SeedsCalibration> = if local_normalization_active {
             let ln_channels = stage_one_planes(&cfg, g, project.is_some() || readiness.attested);
-            find_artifact(conn, subject, &g.key, "ln_calibration", None)?
+            find_artifact(conn, subject, &g.key, ArtifactKind::LnCalibration, None)?
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<SeedsCalibration>(&s).ok())
                 // C-17: the same shape filter the run applies
@@ -3793,15 +3783,15 @@ pub fn build_plan(
             let calib_artifact = find_artifact(
                 conn,
                 subject,
-                artifact_group_key("calibrated", &g.key),
-                "calibrated",
+                &g.key,
+                ArtifactKind::Calibrated,
                 Some(f.frame_id),
             )?;
             let metrics_artifact = find_artifact(
                 conn,
                 subject,
-                artifact_group_key("metrics", &g.key),
-                "metrics",
+                &g.key,
+                ArtifactKind::Metrics,
                 Some(f.frame_id),
             )?;
 
@@ -3829,8 +3819,8 @@ pub fn build_plan(
                 let mosaic_artifact = find_artifact(
                     conn,
                     subject,
-                    artifact_group_key("calibrated_mosaic", &g.key),
-                    "calibrated_mosaic",
+                    &g.key,
+                    ArtifactKind::CalibratedMosaic,
                     Some(f.frame_id),
                 )?;
                 match (&mosaic_artifact, &current_calib_hash) {
@@ -3947,7 +3937,7 @@ pub fn build_plan(
                 let ln_fresh = match &expected_ln {
                     None => false,
                     Some(expected) => {
-                        find_artifact(conn, subject, &g.key, "ln", Some(f.frame_id))?
+                        find_artifact(conn, subject, &g.key, ArtifactKind::Ln, Some(f.frame_id))?
                             .is_some_and(|row| is_fresh(&row, expected))
                             // Plan 6b-3 D7: a member that keeps global
                             // normalization (under 25 % overlap) is cached
@@ -3956,7 +3946,7 @@ pub fn build_plan(
                                 conn,
                                 subject,
                                 &g.key,
-                                crate::stacking::run::LN_GLOBAL_ARTIFACT_KIND,
+                                ArtifactKind::LnGlobal,
                                 Some(f.frame_id),
                             )?
                             .is_some_and(|row| row.config_hash == *expected)
@@ -4164,6 +4154,7 @@ pub fn build_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stacking::fits_artifact;
     use crate::api::lights::compute_export_readiness;
     use crate::db::stacking::set_set_config;
     use crate::registration::db::set_frame_set_reference;
@@ -4288,7 +4279,7 @@ mod tests {
             &conn,
             &subject,
             "",
-            REGISTRATION_ARTIFACT_KIND,
+            ArtifactKind::Registration,
             Some(handle),
         )
         .unwrap()
@@ -4506,8 +4497,8 @@ mod tests {
                     &crate::db::stacking::NewArtifact {
                         subject: &subject,
                         frame_id: Some(frame_id),
-                        group_key: artifact_group_key("registered", &group.key),
-                        kind: "registered",
+                        group_key: &group.key,
+                        kind: ArtifactKind::Registered,
                         path: Some(path.to_str().unwrap()),
                         config_hash: &artifact_hash,
                         size: Some(1),
@@ -6797,7 +6788,7 @@ mod tests {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
                 group_key: "",
-                kind: "calibrated",
+                kind: ArtifactKind::Calibrated,
                 path: None,
                 config_hash: &hash,
                 size: None,
@@ -6832,7 +6823,7 @@ mod tests {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
                 group_key: "",
-                kind: "calibrated",
+                kind: ArtifactKind::Calibrated,
                 path: Some(path.to_str().unwrap()),
                 config_hash: &hash,
                 size: Some(999),
@@ -6889,8 +6880,8 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
-                    group_key: artifact_group_key("calibrated", &groups_seconds[0].key),
-                    kind: "calibrated",
+                    group_key: &groups_seconds[0].key,
+                    kind: ArtifactKind::Calibrated,
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(1),
@@ -7036,8 +7027,8 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key: artifact_group_key("registered", group_key),
-                kind: "registered",
+                group_key,
+                kind: ArtifactKind::Registered,
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
                 size: Some(size),
@@ -7166,8 +7157,8 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key: artifact_group_key(&fits_artifact::artifact_kind(plane), group_key),
-                kind: &fits_artifact::artifact_kind(plane),
+                group_key,
+                kind: ArtifactKind::Fits(plane),
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
                 size: Some(size),
@@ -7326,7 +7317,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: "",
-                    kind: "calibrated",
+                    kind: ArtifactKind::Calibrated,
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(size),
@@ -7344,7 +7335,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: "",
-                    kind: "metrics",
+                    kind: ArtifactKind::Metrics,
                     path: None,
                     config_hash: &metrics_hash,
                     size: None,
@@ -7835,7 +7826,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: "",
-                    kind: "calibrated",
+                    kind: ArtifactKind::Calibrated,
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(size),
@@ -7853,7 +7844,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: "",
-                    kind: "metrics",
+                    kind: ArtifactKind::Metrics,
                     path: None,
                     config_hash: &metrics_hash,
                     size: None,
@@ -7938,7 +7929,7 @@ mod tests {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: None,
                 group_key: &group_key,
-                kind: "ln_reference",
+                kind: ArtifactKind::LnReference,
                 path: Some(reference_path.to_str().unwrap()),
                 config_hash: &reference_hash,
                 size: Some(reference_size),
@@ -7975,7 +7966,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
-                    kind: "ln",
+                    kind: ArtifactKind::Ln,
                     path: Some(sidecar_path.to_str().unwrap()),
                     config_hash: &frame_hash,
                     size: Some(size),
@@ -8124,7 +8115,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: "",
-                    kind: "calibrated",
+                    kind: ArtifactKind::Calibrated,
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(size),
@@ -8142,7 +8133,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: "",
-                    kind: "metrics",
+                    kind: ArtifactKind::Metrics,
                     path: None,
                     config_hash: &metrics_hash,
                     size: None,
@@ -8291,7 +8282,7 @@ mod tests {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: None,
                 group_key: &group_key,
-                kind: "ln_reference",
+                kind: ArtifactKind::LnReference,
                 path: Some(reference_path.to_str().unwrap()),
                 config_hash: &reference_hash,
                 size: Some(reference_size),
@@ -8327,7 +8318,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(frame_id),
                     group_key: &group_key,
-                    kind: "ln",
+                    kind: ArtifactKind::Ln,
                     path: Some(sidecar_path.to_str().unwrap()),
                     config_hash: &frame_hash,
                     size: Some(size),
@@ -8529,7 +8520,7 @@ mod tests {
                     subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: "",
-                    kind: "metrics",
+                    kind: ArtifactKind::Metrics,
                     path: None,
                     config_hash: &measurement_hash_for(&cfg, &calib_hash, None),
                     size: None,
@@ -8561,7 +8552,7 @@ mod tests {
         crate::db::stacking::delete_artifacts(
             &f.conn,
             &StackSubject::FrameSet(f.set_id),
-            &["metrics"],
+            &[ArtifactKind::Metrics],
         )
         .unwrap();
 
@@ -11546,7 +11537,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         let group_key = groups[0].key.clone();
         assert!(group_key.starts_with("osc__"), "{group_key}");
-        let up = |kind: &str,
+        let up = |kind: ArtifactKind,
                   frame_id: Option<i64>,
                   hash: &str,
                   path: Option<&str>,
@@ -11557,7 +11548,7 @@ mod tests {
                 &crate::db::stacking::NewArtifact {
                     subject: &subject,
                     frame_id,
-                    group_key: artifact_group_key(kind, &group_key),
+                    group_key: &group_key,
                     kind,
                     path,
                     config_hash: hash,
@@ -11573,7 +11564,7 @@ mod tests {
         for gf in &groups[0].frames {
             let c = prepare_hash_for_catalog(&cfg, gf);
             let m = measurement_hash_for(&cfg, &c, None);
-            up("metrics", Some(gf.frame_id), &m, None, Some("{}"));
+            up(ArtifactKind::Metrics, Some(gf.frame_id), &m, None, Some("{}"));
             calib.insert(gf.frame_id, c);
             metrics.insert(gf.frame_id, m);
         }
@@ -11625,7 +11616,7 @@ mod tests {
         let ref_path = f.dir.path().join("reference.fits");
         std::fs::write(&ref_path, [0u8]).unwrap();
         up(
-            "ln_reference",
+            ArtifactKind::LnReference,
             None,
             &reference_hash,
             ref_path.to_str(),
@@ -11636,7 +11627,7 @@ mod tests {
             k: vec![0.99, 0.98, 0.97],
         };
         let calibration_json = serde_json::to_string(&calibration).unwrap();
-        up("ln_calibration", None, "x", None, Some(&calibration_json));
+        up(ArtifactKind::LnCalibration, None, "x", None, Some(&calibration_json));
         let ln_scale = crate::stacking::ln::resolve_scale(
             &cfg.normalization.local,
             groups[0].frames[0].width as usize,
@@ -11655,7 +11646,7 @@ mod tests {
             );
             let p = f.dir.path().join(format!("f{}.athln", gf.frame_id));
             std::fs::write(&p, [0u8]).unwrap();
-            up("ln", Some(gf.frame_id), &h, p.to_str(), None);
+            up(ArtifactKind::Ln, Some(gf.frame_id), &h, p.to_str(), None);
         }
         let plan = build_plan(
             &f.conn,
@@ -11673,7 +11664,7 @@ mod tests {
             k: vec![0.99],
         })
         .unwrap();
-        up("ln_calibration", None, "x", None, Some(&one));
+        up(ArtifactKind::LnCalibration, None, "x", None, Some(&one));
         let plan = build_plan(
             &f.conn,
             &SettingsManager::new(),

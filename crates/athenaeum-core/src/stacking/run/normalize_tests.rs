@@ -365,7 +365,7 @@ impl LnRig {
     }
 
     /// The set's `stacking_artifacts` rows of one kind.
-    fn artifacts(&self, kind: &str) -> Vec<crate::db::stacking::StackingArtifactRow> {
+    fn artifacts(&self, kind: ArtifactKind) -> Vec<crate::db::stacking::StackingArtifactRow> {
         crate::db::stacking::list_artifacts(
             &self.fixture.conn,
             &StackSubject::FrameSet(self.fixture.set_id),
@@ -474,9 +474,9 @@ fn a_local_normalization_run_writes_its_sidecars_payloads_grids_and_stage_timing
             assert!(!f.cached_ln, "first run must not be cached: {f:?}");
         }
 
-        let ln_artifacts = rig.artifacts("ln");
+        let ln_artifacts = rig.artifacts(ArtifactKind::Ln);
         assert_eq!(ln_artifacts.len(), 4, "{ln_artifacts:?}");
-        let ln_ref_artifacts = rig.artifacts("ln_reference");
+        let ln_ref_artifacts = rig.artifacts(ArtifactKind::LnReference);
         assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
     }
 
@@ -484,7 +484,7 @@ fn a_local_normalization_run_writes_its_sidecars_payloads_grids_and_stage_timing
     // Spec 2026-10-04 §10: every `ln` row records the background model's
     // sample counters, and the retired `cells_rejected` is gone.
     {
-        let ln_rows = rig.artifacts("ln");
+        let ln_rows = rig.artifacts(ArtifactKind::Ln);
         assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
         for row in &ln_rows {
             let json = row
@@ -611,7 +611,7 @@ fn local_normalization_falls_back_to_detection_when_a_fits_artifact_is_missing()
     // The pin itself: PER FRAME, from each one's own `ln` artifact
     // payload. f0 (the victim) must record `"detected"`; every sibling,
     // whose `fits` artifacts were never touched, must record `"seeds"`.
-    let ln_rows = rig.artifacts("ln");
+    let ln_rows = rig.artifacts(ArtifactKind::Ln);
     assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
     let mut seen_victim = false;
     for row in &ln_rows {
@@ -692,9 +692,9 @@ fn local_normalization_sidecars_are_cached_on_the_second_run() {
         assert!(f.cached_ln, "{f:?}");
     }
 
-    let ln_artifacts = rig.artifacts("ln");
+    let ln_artifacts = rig.artifacts(ArtifactKind::Ln);
     assert_eq!(ln_artifacts.len(), 4, "{ln_artifacts:?}");
-    let ln_ref_artifacts = rig.artifacts("ln_reference");
+    let ln_ref_artifacts = rig.artifacts(ArtifactKind::LnReference);
     assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
 
     // M1: the round trip below is only meaningful while there IS a
@@ -869,7 +869,7 @@ fn regroup_reuses_every_frame_level_stage() {
     assert_eq!(reference1, Some(light_ids[0]), "the pinned reference");
     assert_eq!(fan_out_items(&logs1, "register", "align"), 6, "{logs1}");
     let registered_rows = || {
-        let mut rows: Vec<_> = rows_of_kind(&fixture.conn, fixture.set_id, "registered")
+        let mut rows: Vec<_> = rows_of_kind(&fixture.conn, fixture.set_id, ArtifactKind::Registered)
             .into_values()
             .map(|r| (r.frame_id, r.id, r.created_at, r.config_hash, r.path))
             .collect();
@@ -926,7 +926,7 @@ fn regroup_reuses_every_frame_level_stage() {
     }
 
     // Every frame-level row still sits under the empty key and names one file.
-    for kind in ["calibrated", "measured", "registered"] {
+    for kind in [ArtifactKind::Calibrated, ArtifactKind::Measured, ArtifactKind::Registered] {
         let rows = rows_of_kind(&fixture.conn, fixture.set_id, kind);
         assert_eq!(rows.len(), 6, "{kind}: {rows:?}");
         assert!(rows.values().all(|r| r.group_key.is_empty()), "{kind}: {rows:?}");
@@ -1186,7 +1186,7 @@ fn the_plan_reads_normalize_cached_after_a_run_with_a_derived_scale() {
         Some(crate::stacking::integrate::LnFluxEstimator::PsfSignal)
     );
     assert_eq!(group_summary.ln_aperture, None);
-    let ref_rows = rig.artifacts("ln_reference");
+    let ref_rows = rig.artifacts(ArtifactKind::LnReference);
     assert_eq!(ref_rows.len(), 1, "{ref_rows:?}");
     let payload: crate::stacking::plan::LnReferencePayload =
         serde_json::from_str(ref_rows[0].payload_json.as_deref().unwrap()).unwrap();
@@ -1569,9 +1569,9 @@ fn local_normalization_off_leaves_no_ln_files() {
         assert!(!f.cached_ln, "{f:?}");
     }
 
-    let ln_artifacts = rig.artifacts("ln");
+    let ln_artifacts = rig.artifacts(ArtifactKind::Ln);
     assert!(ln_artifacts.is_empty(), "{ln_artifacts:?}");
-    let ln_ref_artifacts = rig.artifacts("ln_reference");
+    let ln_ref_artifacts = rig.artifacts(ArtifactKind::LnReference);
     assert!(ln_ref_artifacts.is_empty(), "{ln_ref_artifacts:?}");
 }
 
@@ -2143,7 +2143,7 @@ fn ln_reference_members_are_sky_penalized_not_weight_only() {
         &fixture.conn,
         &StackSubject::FrameSet(fixture.set_id),
         &group_key,
-        "ln_reference",
+        ArtifactKind::LnReference,
         None,
     )
     .unwrap()
@@ -2180,7 +2180,7 @@ fn a_project_ln_reference_leaves_uncovered_pixels_nan() {
                 &conn,
                 &rc.subject,
                 &group,
-                "ln",
+                ArtifactKind::Ln,
                 Some(f.frame_id)
             )
             .unwrap()
@@ -2357,7 +2357,7 @@ fn a_member_under_a_quarter_overlap_keeps_global_normalization() {
             &conn,
             &rc.subject,
             &group,
-            "ln",
+            ArtifactKind::Ln,
             Some(e.frame.frame_id),
         )
         .unwrap();
@@ -2365,7 +2365,7 @@ fn a_member_under_a_quarter_overlap_keeps_global_normalization() {
             &conn,
             &rc.subject,
             &group,
-            LN_GLOBAL_ARTIFACT_KIND,
+            ArtifactKind::LnGlobal,
             Some(e.frame.frame_id),
         )
         .unwrap();
@@ -2429,7 +2429,7 @@ fn a_member_under_a_quarter_overlap_keeps_global_normalization() {
     let deleted = conn
         .execute(
             "DELETE FROM stacking_artifacts WHERE kind = ?1 AND project_frame = ?2",
-            rusqlite::params![LN_GLOBAL_ARTIFACT_KIND, b0],
+            rusqlite::params![ArtifactKind::LnGlobal.as_db_str(), b0],
         )
         .unwrap();
     assert_eq!(deleted, 1, "the marker row of {b0} existed");
@@ -2448,7 +2448,7 @@ fn a_member_under_a_quarter_overlap_keeps_global_normalization() {
             &conn,
             &third.subject,
             &group,
-            LN_GLOBAL_ARTIFACT_KIND,
+            ArtifactKind::LnGlobal,
             Some(b0)
         )
         .unwrap()
@@ -2539,7 +2539,7 @@ fn a_member_under_a_quarter_overlap_rejection_only_warns_in_rejection_words() {
             &conn,
             &rc.subject,
             &group,
-            LN_GLOBAL_ARTIFACT_KIND,
+            ArtifactKind::LnGlobal,
             Some(e.frame.frame_id),
         )
         .unwrap();

@@ -55,11 +55,6 @@ pub(super) fn two_pass_candidates(
         .collect()
 }
 
-/// The group-level payload row of a two-pass dry pass's decision (frame-level cache spec §5.6): `config_hash` is
-/// [`two_pass_key`], payload `{"switchTo": <frame id> | null}`. Group-level ([`artifact_group_key`]), outside
-/// `paths::INTERMEDIATE_ARTIFACT_KINDS` (survives "Delete intermediates"), dropped by "All".
-pub(crate) const TWO_PASS_ARTIFACT_KIND: &str = "two_pass";
-
 /// The decision a `two_pass` row holds.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -269,8 +264,8 @@ fn two_pass_lookup(
         crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            artifact_group_key(TWO_PASS_ARTIFACT_KIND, &group.key),
-            TWO_PASS_ARTIFACT_KIND,
+            &group.key,
+            ArtifactKind::TwoPass,
             None,
         )?
     };
@@ -354,8 +349,8 @@ fn store_two_pass_decision(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: None,
-                group_key: artifact_group_key(TWO_PASS_ARTIFACT_KIND, &group.key),
-                kind: TWO_PASS_ARTIFACT_KIND,
+                group_key: &group.key,
+                kind: ArtifactKind::TwoPass,
                 path: None,
                 config_hash: &lookup.key,
                 size: None,

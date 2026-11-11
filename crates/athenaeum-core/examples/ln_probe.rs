@@ -28,7 +28,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
-use athenaeum_core::db::stacking::{find_artifact, list_frame_rows, list_runs, StackSubject};
+use athenaeum_core::db::stacking::{find_artifact, list_frame_rows, list_runs, ArtifactKind, StackSubject};
 use athenaeum_core::db::Database;
 use athenaeum_core::geometry::{Linear, PixelMap};
 use athenaeum_core::integration::banded::BandPlanes;
@@ -51,7 +51,6 @@ use athenaeum_core::stacking::ln::{
     LnScaleSeeds, ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
-use athenaeum_core::stacking::paths::artifact_group_key;
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
 use athenaeum_core::stacking::weights::FrameWeight;
 
@@ -345,8 +344,8 @@ fn main() {
         let calibrated = match find_artifact(
             &conn,
             &StackSubject::FrameSet(args.set_id),
-            artifact_group_key("calibrated", &group.key),
-            "calibrated",
+            &group.key,
+            ArtifactKind::Calibrated,
             Some(gf.frame_id),
         ) {
             Ok(Some(row)) => match row.path {
@@ -362,8 +361,8 @@ fn main() {
         let measurement = match find_artifact(
             &conn,
             &StackSubject::FrameSet(args.set_id),
-            artifact_group_key("metrics", &group.key),
-            "metrics",
+            &group.key,
+            ArtifactKind::Metrics,
             Some(gf.frame_id),
         ) {
             Ok(Some(row)) => match row

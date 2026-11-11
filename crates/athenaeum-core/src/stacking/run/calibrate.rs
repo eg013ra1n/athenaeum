@@ -265,16 +265,16 @@ fn resolve_calibrate_job(
         let existing = crate::db::stacking::find_artifact(
             &conn,
             &rc.subject,
-            artifact_group_key("calibrated", group_key),
-            "calibrated",
+            group_key,
+            ArtifactKind::Calibrated,
             Some(frame.frame_id),
         )?;
         let mosaic_row = if want_mosaic {
             crate::db::stacking::find_artifact(
                 &conn,
                 &rc.subject,
-                artifact_group_key("calibrated_mosaic", group_key),
-                "calibrated_mosaic",
+                group_key,
+                ArtifactKind::CalibratedMosaic,
                 Some(frame.frame_id),
             )?
         } else {
@@ -687,8 +687,8 @@ fn commit_calibrated(
             &NewArtifact {
                 subject: &rc.subject,
                 frame_id: Some(job.frame_id),
-                group_key: artifact_group_key("calibrated", ""),
-                kind: "calibrated",
+                group_key: "",
+                kind: ArtifactKind::Calibrated,
                 path: job.out.to_str(),
                 config_hash: &job.hash,
                 size: Some(size),
@@ -702,8 +702,8 @@ fn commit_calibrated(
                 &NewArtifact {
                     subject: &rc.subject,
                     frame_id: Some(job.frame_id),
-                    group_key: artifact_group_key("calibrated_mosaic", ""),
-                    kind: "calibrated_mosaic",
+                    group_key: "",
+                    kind: ArtifactKind::CalibratedMosaic,
                     path: path.to_str(),
                     config_hash: &job.hash,
                     size: Some(*mosaic_size),
