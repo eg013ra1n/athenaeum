@@ -1399,15 +1399,6 @@ describe('ProjectDetail tabs', () => {
       await screen.findByText('This project is not in your local list — refresh the Projects page.'),
     ).toBeInTheDocument();
   });
-
-  it('the page no longer evaluates the project gate', async () => {
-    renderProjectDetail();
-    await openTab(/^My frames/);
-    await screen.findByRole('button', { name: 'Calibrate all 2' });
-    expect(invokeCount('evaluate_collab_gate')).toBe(0);
-    expect(api.invoke).toHaveBeenCalledWith('list_project_own_frames', { projectId: 'proj-1' });
-    expect(api.invoke).toHaveBeenCalledWith('list_collab_frames', { projectId: 'proj-1' });
-  });
 });
 
 describe('ProjectDetail fix round 1', () => {

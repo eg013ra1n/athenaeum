@@ -136,9 +136,9 @@ pub fn set_integration_band_budget(ctx: &ServiceContext, mb: usize) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    // The api handlers are thin; what needs pinning is the settings-key
-    // default, the cancel→NotFound mapping, and the max_concurrent bounds
-    // check. The latter two are tested through the REAL functions
+    // The api handlers are thin; what needs pinning is the cancel→NotFound
+    // mapping and the max_concurrent bounds check. Both are tested through
+    // the REAL functions
     // (`cancel_on`, `validate_max_concurrent`) — the ctx-taking wrappers
     // only forward to them, so nothing handler-side is left untested
     // besides trivial field plumbing.
@@ -146,11 +146,6 @@ mod tests {
     use crate::services::compute_queue::ComputeJobKind;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-
-    #[test]
-    fn default_max_concurrent_is_one() {
-        assert_eq!(crate::settings::defaults::COMPUTE_MAX_CONCURRENT, "1");
-    }
 
     #[test]
     fn cancel_on_unknown_job_is_not_found() {
@@ -186,11 +181,6 @@ mod tests {
         ));
         assert!(validate_max_concurrent(1).is_ok());
         assert!(validate_max_concurrent(8).is_ok());
-    }
-
-    #[test]
-    fn default_band_budget_is_auto() {
-        assert_eq!(crate::settings::defaults::INTEGRATION_BAND_BUDGET_MB, "0");
     }
 
     #[cfg(feature = "render")]

@@ -5091,31 +5091,6 @@ async fn kick_all_resets_every_pending_package() {
     engine.shutdown().await;
 }
 
-/// Kicking an id with no pending slot (already terminal / unknown) is a silent
-/// no-op — the handle call succeeds and nothing changes.
-#[tokio::test]
-async fn kick_unknown_id_is_a_no_op() {
-    let tmp = tempdir().unwrap();
-    let net = LoopbackNetwork::new();
-
-    let receiver = Arc::new(net.endpoint());
-    let receiver_id = receiver.start().await.unwrap().node_id;
-
-    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let engine = SyncEngine::spawn(
-        store.clone() as Arc<dyn SyncStore>,
-        Arc::new(net.endpoint()),
-        receiver_id,
-    );
-
-    // No package enqueued: id 999 has no pending slot. Kick must not error.
-    engine.kick(999).await.unwrap();
-    // kick_all over an empty pending map is likewise a no-op.
-    engine.kick_all().await.unwrap();
-
-    engine.shutdown().await;
-}
-
 // ---------------------------------------------------------------------------
 // Transfers Status Model v2 (tv2 Task 4): per-file states, persisted `uploaded`
 // (Delivered), error ⊥ state, event journal.

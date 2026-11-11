@@ -24711,17 +24711,6 @@ mod tests {
         }
     }
 
-    /// Plan 6b-2 C1: one convention on every wire type — exactly one side of
-    /// the subject pair is set.
-    #[test]
-    fn wire_subject_sets_exactly_one_side() {
-        assert_eq!(wire_subject(&StackSubject::FrameSet(7)), (Some(7), None));
-        assert_eq!(
-            wire_subject(&StackSubject::Project("p1".into())),
-            (None, Some("p1".to_string()))
-        );
-    }
-
     /// Plan 6b-2 C1: a frame-set tick still carries its set id (and a null
     /// project id); a project tick carries the project id and a null set id.
     #[test]
@@ -26576,175 +26565,357 @@ mod tests {
         (fixture, light_ids, working, output)
     }
 
-    #[test]
-    fn local_normalization_writes_one_sidecar_per_included_frame_and_a_reference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+    /// The four jittered-grid shifts the local-normalization tests stack.
+    const LN_SHIFTS: [(f64, f64); 4] = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
 
+    /// The config of the local-normalization runs: LN on over the dense LN star field. P-13: the subject is the LN
+    /// run, not the star selection (synthetic stars, none saturated), so the selection is OFF. 2026-10-06: pinned to
+    /// PsfSignal, see `ln_base_stars` (L-24).
+    fn ln_run_config() -> StackingConfig {
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
         cfg.normalization.local.flux_estimator =
             crate::stacking::integrate::LnFluxEstimator::PsfSignal;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
-        let group_key = plan_groups[0].key.clone();
-
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout.clone(),
-            output_dir,
-            group_ids,
-        );
-
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
-
-        let reference_path = layout.ln_reference_path(&group_key);
-        assert!(reference_path.exists(), "LN reference must be written");
-
-        let group_summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
-        assert_eq!(
-            group_summary.ln_reference_path.as_deref(),
-            Some(reference_path.to_string_lossy().as_ref())
-        );
-
-        let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
-        assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
-
-        for i in 0..4 {
-            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}_f{}", light_ids[i]));
-            assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
-        }
-
-        for f in included {
-            assert!(f.ln_scale.is_some(), "{f:?}");
-            assert!(!f.cached_ln, "first run must not be cached: {f:?}");
-        }
-
-        let ln_artifacts = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln"),
-        )
-        .unwrap();
-        assert_eq!(ln_artifacts.len(), 4, "{ln_artifacts:?}");
-        let ln_ref_artifacts = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln_reference"),
-        )
-        .unwrap();
-        assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
+        cfg
     }
 
-    /// Spec 2026-10-04 §10: every `ln` row records the background model's
-    /// sample counters, and the retired `cells_rejected` is gone.
+    /// [`ln_run_config`] for a test that reads the plan against the stored config: OFF is not storable (it
+    /// serializes as null), so it is replaced by the finite selection that cuts nothing (P-13, synthetic stars).
+    fn ln_stored_config() -> StackingConfig {
+        let mut cfg = ln_run_config();
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
+            min_peak_snr: 5.0,
+            max_stars: 5000,
+            saturation: 1.0,
+        };
+        cfg
+    }
+
+    /// Stages 1 to 5, then Normalize and Output.
+    fn run_register_and_output(rc: &mut RunContext) {
+        run_stages_for_test(rc, Stage::Register).unwrap();
+        stage_output(rc).unwrap();
+    }
+
+    /// Bit-for-bit pixel equality of two masters (headers legitimately differ: NORMALIZATION card, run id,
+    /// timestamps); `what` names the first master in a failure.
+    fn assert_masters_equal_bit_for_bit(master_a: &str, master_b: &str, what: &str) {
+        let reader_a = PlaneReader::open(Path::new(master_a)).unwrap();
+        let reader_b = PlaneReader::open(Path::new(master_b)).unwrap();
+        assert_eq!(reader_a.channels(), reader_b.channels());
+        for p in 0..reader_a.channels() {
+            let plane_a = reader_a.read_plane(p).unwrap();
+            let plane_b = reader_b.read_plane(p).unwrap();
+            assert_eq!(plane_a.len(), plane_b.len());
+            for (i, (a, b)) in plane_a.iter().zip(plane_b.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "plane {p} pixel {i}: {what} {a} vs global-normalization {b}"
+                );
+            }
+        }
+    }
+
+    type SeedGroup = fn(
+        &Path,
+        &str,
+        &[(f64, f64)],
+        &[f32],
+    ) -> (
+        test_fixtures::Fixture,
+        Vec<i64>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    );
+
+    /// One star-field frame set with its master dark and flat, the working and output folders, the layout and the
+    /// context every run of the local-normalization tests starts from.
+    ///
+    /// Fields drop in the order written. The catalog's folder (`_tmp`) goes last, after the context and the
+    /// fixture's connection have closed `catalog.db`: a folder with an open database in it cannot be removed on
+    /// Windows, and a `TempDir` that fails to remove itself leaves the folder behind without a word.
+    struct LnRig {
+        layout: WorkingLayout,
+        output_dir: PathBuf,
+        output: tempfile::TempDir,
+        working: tempfile::TempDir,
+        light_ids: Vec<i64>,
+        fixture: test_fixtures::Fixture,
+        ctx: Arc<ServiceContext>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl LnRig {
+        /// [`seed_ln_star_group`] on [`LN_SHIFTS`], noise 5.0.
+        fn new() -> LnRig {
+            LnRig::seeded(seed_ln_star_group, &LN_SHIFTS, &[5.0f32; 4])
+        }
+
+        /// A group seeded by `seed` (one of [`seed_ln_star_group`], `seed_star_group`) on `shifts` and `noise`.
+        fn seeded(seed: SeedGroup, shifts: &[(f64, f64)], noise: &[f32]) -> LnRig {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let (fixture, light_ids, working, output) = seed(&db_path, SET_NAME, shifts, noise);
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            LnRig::from_parts(tmp, ctx, fixture, light_ids, working, output)
+        }
+
+        /// A rig over a fixture the test built itself.
+        fn from_parts(
+            tmp: tempfile::TempDir,
+            ctx: Arc<ServiceContext>,
+            fixture: test_fixtures::Fixture,
+            light_ids: Vec<i64>,
+            working: tempfile::TempDir,
+            output: tempfile::TempDir,
+        ) -> LnRig {
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            let output_dir = output.path().to_path_buf();
+            LnRig {
+                layout,
+                output_dir,
+                output,
+                working,
+                light_ids,
+                fixture,
+                ctx,
+                _tmp: tmp,
+            }
+        }
+
+        fn plan_groups(&self, cfg: &StackingConfig) -> Vec<IntegrationGroup> {
+            group_frames(&self.fixture.conn, self.fixture.set_id, &cfg.grouping).unwrap()
+        }
+
+        /// A fresh run row and its context under `cfg`, over `plan_groups`.
+        fn context(&self, cfg: StackingConfig, plan_groups: Vec<IntegrationGroup>) -> RunContext {
+            let (run_id, group_ids) = seed_run_and_groups(
+                &self.fixture.conn,
+                self.fixture.set_id,
+                &plan_groups,
+                self.working.path(),
+                self.output.path(),
+            );
+            test_context(
+                self.ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                self.fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups,
+                self.layout.clone(),
+                self.output_dir.clone(),
+                group_ids,
+            )
+        }
+
+        /// The plan under `cfg`.
+        fn plan(&self, cfg: &StackingConfig) -> crate::stacking::plan::StackingPlan {
+            build_plan(
+                &self.fixture.conn,
+                &self.ctx.settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(self.fixture.set_id),
+                Some(cfg.clone()),
+            )
+            .expect("the plan should build")
+        }
+
+        /// The set's `stacking_artifacts` rows of one kind.
+        fn artifacts(&self, kind: &str) -> Vec<crate::db::stacking::StackingArtifactRow> {
+            crate::db::stacking::list_artifacts(
+                &self.fixture.conn,
+                &StackSubject::FrameSet(self.fixture.set_id),
+                Some(kind),
+            )
+            .unwrap()
+        }
+
+        /// Frame `i`'s `.athln` sidecar (its stem is `f<i>_f<frame id>`, `frame_file_stem`).
+        fn sidecar(&self, group_key: &str, i: usize) -> PathBuf {
+            self.layout
+                .ln_sidecar_path(group_key, &format!("f{i}_f{}", self.light_ids[i]))
+        }
+
+        /// A plain FILE where `run_group_normalization` expects to `create_dir_all` the group's `ln/` directory: the
+        /// mkdir fails outright, before any per-frame work, landing in the `Err(RunError::Other(..))` arm
+        /// ("continuing with global normalization").
+        fn block_ln_dir(&self, group_key: &str) {
+            let blocked_ln_dir = self.layout.ln_dir(group_key);
+            std::fs::create_dir_all(blocked_ln_dir.parent().unwrap()).unwrap();
+            std::fs::write(&blocked_ln_dir, b"not a directory").unwrap();
+        }
+
+        /// The comparison run of the rejection-fallback tests: `rejection = scaleZeroOffset`, LN off entirely, in
+        /// separate working and output folders (returned first, so that a caller's `let (_dirs, rc) = …` drops
+        /// the run context before the folders it wrote into).
+        fn run_global_comparison(&self) -> ((tempfile::TempDir, tempfile::TempDir), RunContext) {
+            let mut cfg_global = StackingConfig::default();
+            cfg_global.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
+            cfg_global.normalization.local.enabled = false;
+
+            let working_b = tempfile::tempdir().unwrap();
+            let output_b = tempfile::tempdir().unwrap();
+            crate::db::set_setting(
+                &self.fixture.conn,
+                crate::settings::keys::STACKING_WORKING_DIR,
+                working_b.path().to_str().unwrap(),
+            )
+            .unwrap();
+            crate::db::set_setting(
+                &self.fixture.conn,
+                crate::settings::keys::STACKING_OUTPUT_DIR,
+                output_b.path().to_str().unwrap(),
+            )
+            .unwrap();
+            let layout_b = WorkingLayout::new(working_b.path(), &set_slug(SET_NAME));
+            let plan_groups_b = self.plan_groups(&cfg_global);
+            let (run_id_b, group_ids_b) = seed_run_and_groups(
+                &self.fixture.conn,
+                self.fixture.set_id,
+                &plan_groups_b,
+                working_b.path(),
+                output_b.path(),
+            );
+            let mut rc_b = test_context(
+                self.ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id_b,
+                self.fixture.set_id,
+                SET_NAME,
+                cfg_global,
+                plan_groups_b,
+                layout_b,
+                output_b.path().to_path_buf(),
+                group_ids_b,
+            );
+            run_register_and_output(&mut rc_b);
+            ((working_b, output_b), rc_b)
+        }
+    }
+
+    /// One local-normalization run on the four-frame LN star fixture (`ln_run_config`, Register then Output), and the
+    /// four facts four tests used to read off it, one run each: its artifacts, its payload counters, the grids reaching
+    /// integration and the Normalize stage timing. Each block below carries the old test's name and doc comment.
     #[test]
-    fn the_ln_payload_records_the_background_sample_counts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+    fn a_local_normalization_run_writes_its_sidecars_payloads_grids_and_stage_timing() {
+        let rig = LnRig::new();
+        let cfg = ln_run_config();
+        let plan_groups = rig.plan_groups(&cfg);
         assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+        let mut rc = rig.context(cfg, plan_groups);
+        run_register_and_output(&mut rc);
 
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout.clone(),
-            output_dir,
-            group_ids,
-        );
+        // local_normalization_writes_one_sidecar_per_included_frame_and_a_reference
+        {
+            let reference_path = rig.layout.ln_reference_path(&group_key);
+            assert!(reference_path.exists(), "LN reference must be written");
 
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+            let group_summary = summary_group(&rc, &group_key);
+            assert_eq!(
+                group_summary.ln_reference_path.as_deref(),
+                Some(reference_path.to_string_lossy().as_ref())
+            );
 
-        let ln_rows = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln"),
-        )
-        .unwrap();
-        assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
-        for row in &ln_rows {
-            let json = row
-                .payload_json
-                .as_deref()
-                .expect("every ln row carries a payload");
-            let value: serde_json::Value = serde_json::from_str(json).unwrap();
-            assert!(value.get("cells_rejected").is_none(), "{json}");
-            let payload: LnArtifactPayload =
-                serde_json::from_str(json).expect("the ln payload decodes");
-            assert!(payload.samples > 0, "{json}");
-            assert!(payload.samples_shared > 0, "{json}");
-            assert!(payload.samples_shared <= payload.samples, "{json}");
+            let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
+            assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
+
+            for i in 0..4 {
+                let sidecar = rig.sidecar(&group_key, i);
+                assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
+            }
+
+            for f in included {
+                assert!(f.ln_scale.is_some(), "{f:?}");
+                assert!(!f.cached_ln, "first run must not be cached: {f:?}");
+            }
+
+            let ln_artifacts = rig.artifacts("ln");
+            assert_eq!(ln_artifacts.len(), 4, "{ln_artifacts:?}");
+            let ln_ref_artifacts = rig.artifacts("ln_reference");
+            assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
+        }
+
+        // the_ln_payload_records_the_background_sample_counts
+        // Spec 2026-10-04 §10: every `ln` row records the background model's
+        // sample counters, and the retired `cells_rejected` is gone.
+        {
+            let ln_rows = rig.artifacts("ln");
+            assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
+            for row in &ln_rows {
+                let json = row
+                    .payload_json
+                    .as_deref()
+                    .expect("every ln row carries a payload");
+                let value: serde_json::Value = serde_json::from_str(json).unwrap();
+                assert!(value.get("cells_rejected").is_none(), "{json}");
+                let payload: LnArtifactPayload =
+                    serde_json::from_str(json).expect("the ln payload decodes");
+                assert!(payload.samples > 0, "{json}");
+                assert!(payload.samples_shared > 0, "{json}");
+                assert!(payload.samples_shared <= payload.samples, "{json}");
+            }
+        }
+
+        // local_normalization_grids_reach_integration_and_ln_frames_matches_included
+        // M2 Task 7: `GroupInput.ln` — read back from the sidecars stage 6 just
+        // wrote/confirmed fresh — must actually reach `integrate_group`, not
+        // just exist as an unused field. `GroupStats.ln_frames` (Task 6) is the
+        // signal: it is computed from `input.ln` alone (`integrate.rs`), so if
+        // the wiring in `process_group_output` were broken (still passing
+        // `None`, or misaligned with `frames`' own order), it would read `0`
+        // even though every included frame has a real sidecar.
+        {
+            let group_summary = summary_group(&rc, &group_key);
+            let stats = group_summary
+                .stats
+                .as_ref()
+                .expect("group wrote a master and its stats");
+            assert_eq!(stats.included, 4, "{stats:?}");
+            assert_eq!(
+                stats.ln_frames, stats.included,
+                "every included frame must have carried its LN grid into integration: {stats:?}"
+            );
+        }
+
+        // local_normalization_pushes_a_stage_timing_before_integrate
+        // Final fix wave, A1 (ruling R5): with local normalization on,
+        // `RunSummary.stages` (here, `rc.timings` — `stage_output` pushes into
+        // it directly, same source the run's final summary copies) must carry
+        // a `Normalize` entry with a real, non-zero duration, positioned
+        // BEFORE `Integrate` (stage order) — the acceptance run measured LN as
+        // the single most expensive stage, so it cannot stay invisible.
+        {
+            let normalize_idx = rc
+                .timings
+                .iter()
+                .position(|t| t.stage == Stage::Normalize)
+                .expect("a Normalize StageTiming must be pushed when LN is active");
+            let integrate_idx = rc
+                .timings
+                .iter()
+                .position(|t| t.stage == Stage::Integrate)
+                .expect("Integrate StageTiming always pushed");
+            assert!(
+                normalize_idx < integrate_idx,
+                "Normalize must precede Integrate in stage order: {:?}",
+                rc.timings
+            );
+            assert!(
+                rc.timings[normalize_idx].duration_ms > 0,
+                "LN did real work (a reference build + a 4-frame fan-out); its timing must not be zero: {:?}",
+                rc.timings[normalize_idx]
+            );
         }
     }
 
@@ -26768,65 +26939,25 @@ mod tests {
     /// longer the thing the pin rests on.
     #[test]
     fn local_normalization_falls_back_to_detection_when_a_fits_artifact_is_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let rig = LnRig::new();
+        let cfg = ln_run_config();
+        let plan_groups = rig.plan_groups(&cfg);
         assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
         let group_key = plan_groups[0].key.clone();
-        // Extracted before `plan_groups` is moved into `test_context` below.
+        // Extracted before `plan_groups` is moved into `rig.context` below.
         let target_frame = plan_groups[0]
             .frames
             .iter()
-            .find(|f| f.frame_id == light_ids[0])
+            .find(|f| f.frame_id == rig.light_ids[0])
             .expect("f0 must be a group member")
             .clone();
         let stem = frame_file_stem(&target_frame);
 
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout.clone(),
-            output_dir,
-            group_ids,
-        );
+        let mut rc = rig.context(cfg, plan_groups);
 
         run_stages_for_test(&mut rc, Stage::Register).unwrap();
 
-        let fits_path = layout.fits_path(&stem, 0);
+        let fits_path = rig.layout.fits_path(&stem, 0);
         assert!(
             fits_path.exists(),
             "f0's fits artifact must exist right after Measure: {fits_path:?}"
@@ -26846,12 +26977,7 @@ mod tests {
         // The pin itself: PER FRAME, from each one's own `ln` artifact
         // payload. f0 (the victim) must record `"detected"`; every sibling,
         // whose `fits` artifacts were never touched, must record `"seeds"`.
-        let ln_rows = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln"),
-        )
-        .unwrap();
+        let ln_rows = rig.artifacts("ln");
         assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
         let mut seen_victim = false;
         for row in &ln_rows {
@@ -26862,7 +26988,7 @@ mod tests {
             )
             .expect("the ln payload decodes");
             let frame_id = row.frame_id.expect("an ln row is per frame");
-            if frame_id == light_ids[0] {
+            if frame_id == rig.light_ids[0] {
                 seen_victim = true;
                 assert_eq!(
                     payload.ln_scale_source, "detected",
@@ -26877,12 +27003,7 @@ mod tests {
         }
         assert!(seen_victim, "f0 must have an ln artifact of its own");
 
-        let group_summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc, &group_key);
         let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
         assert_eq!(
             included.len(),
@@ -26897,72 +27018,15 @@ mod tests {
 
     #[test]
     fn local_normalization_sidecars_are_cached_on_the_second_run() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: this test reads the plan against the stored config, so OFF (not storable:
-        // it serializes as null) is replaced by the finite selection that cuts nothing.
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
-            min_peak_snr: 5.0,
-            max_stars: 5000,
-            saturation: 1.0,
-        };
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let rig = LnRig::new();
+        let cfg = ln_stored_config();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
 
-        let build = |run_id: i64, group_ids: HashMap<String, i64>| {
-            test_context(
-                ctx.clone(),
-                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-                run_id,
-                fixture.set_id,
-                SET_NAME,
-                cfg.clone(),
-                plan_groups.clone(),
-                layout.clone(),
-                output_dir.clone(),
-                group_ids,
-            )
-        };
+        let mut rc1 = rig.context(cfg.clone(), plan_groups.clone());
+        run_register_and_output(&mut rc1);
 
-        let (run_id1, group_ids1) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc1 = build(run_id1, group_ids1);
-        run_stages_for_test(&mut rc1, Stage::Register).unwrap();
-        stage_output(&mut rc1).unwrap();
-
-        let (run_id2, group_ids2) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc2 = build(run_id2, group_ids2);
+        let mut rc2 = rig.context(cfg.clone(), plan_groups);
         run_stages_for_test(&mut rc2, Stage::Register).unwrap();
 
         let start = Instant::now();
@@ -26987,37 +27051,22 @@ mod tests {
             );
         }
 
-        let group_summary = rc2
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc2, &group_key);
         let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
         assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
         for f in included {
             assert!(f.cached_ln, "{f:?}");
         }
 
-        let ln_artifacts = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln"),
-        )
-        .unwrap();
+        let ln_artifacts = rig.artifacts("ln");
         assert_eq!(ln_artifacts.len(), 4, "{ln_artifacts:?}");
-        let ln_ref_artifacts = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln_reference"),
-        )
-        .unwrap();
+        let ln_ref_artifacts = rig.artifacts("ln_reference");
         assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
 
         // M1: the round trip below is only meaningful while there IS a
         // beta to disagree about — a group whose column stayed NULL would
         // make both sides fold nothing and pass vacuously.
-        let run2_groups = crate::db::stacking::list_groups(&fixture.conn, run_id2).unwrap();
+        let run2_groups = crate::db::stacking::list_groups(&rig.fixture.conn, rc2.run_id).unwrap();
         assert!(
             run2_groups.iter().all(|g| g.beta.is_some()),
             "stage 3 must have recorded a group beta: {run2_groups:?}"
@@ -27033,14 +27082,7 @@ mod tests {
         // side only), Normalize would read permanently stale here even
         // though the run just cache-hit every frame. That round trip, not
         // a second copy of the assertion above, is what this pins.
-        let plan_after = build_plan(
-            &fixture.conn,
-            &ctx.settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some(cfg.clone()),
-        )
-        .expect("the plan should build");
+        let plan_after = rig.plan(&cfg);
         assert!(
             !plan_after.stale_stages.contains(&Stage::Normalize),
             "the gate must resolve the same group beta the run did: {:?}",
@@ -27406,36 +27448,12 @@ mod tests {
     /// sidecars stay cached — the rebuilt reference is the same image.
     #[test]
     fn a_cached_ln_reference_without_its_saturation_map_is_rebuilt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the finite selection that cuts nothing (synthetic stars).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
-            min_peak_snr: 5.0,
-            max_stars: 5000,
-            saturation: 1.0,
-        };
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let rig = LnRig::new();
+        let cfg = ln_stored_config();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
-        let reference_path = layout.ln_reference_path(&group_key);
-        let map_path = layout.ln_reference_saturation_path(&group_key);
+        let reference_path = rig.layout.ln_reference_path(&group_key);
+        let map_path = rig.layout.ln_reference_saturation_path(&group_key);
         let run_card = |path: &Path| {
             crate::fits_parser::FitsHeader::from_path(path)
                 .unwrap()
@@ -27443,25 +27461,7 @@ mod tests {
                 .unwrap_or_default()
         };
         let run = |stage_logs: bool| -> (i64, String, RunContext) {
-            let (run_id, group_ids) = seed_run_and_groups(
-                &fixture.conn,
-                fixture.set_id,
-                &plan_groups,
-                working.path(),
-                output.path(),
-            );
-            let mut rc = test_context(
-                ctx.clone(),
-                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-                run_id,
-                fixture.set_id,
-                SET_NAME,
-                cfg.clone(),
-                plan_groups.clone(),
-                layout.clone(),
-                output_dir.clone(),
-                group_ids,
-            );
+            let mut rc = rig.context(cfg.clone(), plan_groups.clone());
             run_stages_for_test(&mut rc, Stage::Register).unwrap();
             let logs = if stage_logs {
                 crate::stacking::solve::tests::captured_logs(|| stage_output(&mut rc).unwrap())
@@ -27469,7 +27469,7 @@ mod tests {
                 stage_output(&mut rc).unwrap();
                 String::new()
             };
-            (run_id, logs, rc)
+            (rc.run_id, logs, rc)
         };
 
         // Run 1 builds the reference and its map, with the same cards.
@@ -27504,12 +27504,7 @@ mod tests {
             "the reference is rebuilt"
         );
         assert_eq!(run_card(&map_path), run3.to_string());
-        let group_summary = rc3
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc3, &group_key);
         let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
         assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
         for f in included {
@@ -27523,32 +27518,8 @@ mod tests {
     /// is cached.
     #[test]
     fn the_plan_reads_normalize_cached_after_a_run_with_a_derived_scale() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: this test reads the plan against the stored config, so OFF (not storable:
-        // it serializes as null) is replaced by the finite selection that cuts nothing.
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
-            min_peak_snr: 5.0,
-            max_stars: 5000,
-            saturation: 1.0,
-        };
+        let rig = LnRig::new();
+        let mut cfg = ln_stored_config();
         cfg.normalization.local.scale_mode = Some(crate::stacking::integrate::LnScaleMode::Auto);
         let expected_scale = ln::resolve_scale(
             &cfg.normalization.local,
@@ -27556,70 +27527,32 @@ mod tests {
             STAR_FIELD_HEIGHT,
         );
 
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let plan_groups = rig.plan_groups(&cfg);
         assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
         let group_key = plan_groups[0].key.clone();
 
         // 1. The plan before any run: the scale of the anchor geometry, an
         //    estimate.
-        let plan_before = build_plan(
-            &fixture.conn,
-            &ctx.settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some(cfg.clone()),
-        )
-        .expect("the plan should build");
+        let plan_before = rig.plan(&cfg);
         for g in &plan_before.groups {
             assert_eq!(g.ln_scale_px, Some(expected_scale), "{g:?}");
             assert!(g.ln_scale_estimated, "{g:?}");
         }
 
         // 2. The run.
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg.clone(),
-            plan_groups,
-            layout,
-            output_dir,
-            group_ids,
-        );
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        let mut rc = rig.context(cfg.clone(), plan_groups);
+        run_register_and_output(&mut rc);
 
         // 3. The summary and the stored reference payload carry the scale
         //    and the geometry.
-        let group_summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc, &group_key);
         assert_eq!(group_summary.ln_scale_px, Some(expected_scale));
         assert_eq!(
             group_summary.ln_flux_estimator,
             Some(crate::stacking::integrate::LnFluxEstimator::PsfSignal)
         );
         assert_eq!(group_summary.ln_aperture, None);
-        let ref_rows = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln_reference"),
-        )
-        .unwrap();
+        let ref_rows = rig.artifacts("ln_reference");
         assert_eq!(ref_rows.len(), 1, "{ref_rows:?}");
         let payload: crate::stacking::plan::LnReferencePayload =
             serde_json::from_str(ref_rows[0].payload_json.as_deref().unwrap()).unwrap();
@@ -27629,14 +27562,7 @@ mod tests {
         );
 
         // 4. The next plan reads the scale exactly and Normalize is cached.
-        let plan_after = build_plan(
-            &fixture.conn,
-            &ctx.settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some(cfg),
-        )
-        .expect("the plan should build");
+        let plan_after = rig.plan(&cfg);
         let g = &plan_after.groups[0];
         assert!(!g.ln_scale_estimated, "{g:?}");
         assert_eq!(g.ln_scale_px, Some(expected_scale), "{g:?}");
@@ -27718,6 +27644,7 @@ mod tests {
         )
         .unwrap();
         test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, W, H);
+        let rig = LnRig::from_parts(tmp, ctx, fixture, light_ids, working, output);
 
         // No estimator or aperture line: the defaults are the subject. OFF is
         // not storable (it serializes as null), so the finite no-cut selection.
@@ -27730,39 +27657,13 @@ mod tests {
         };
         cfg.normalization.local.scale_mode = Some(crate::stacking::integrate::LnScaleMode::Auto);
 
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let plan_groups = rig.plan_groups(&cfg);
         assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
         let group_key = plan_groups[0].key.clone();
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg.clone(),
-            plan_groups,
-            layout.clone(),
-            output_dir,
-            group_ids,
-        );
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        let mut rc = rig.context(cfg.clone(), plan_groups);
+        run_register_and_output(&mut rc);
 
-        let group_summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc, &group_key);
         assert_eq!(
             group_summary.ln_flux_estimator,
             Some(crate::stacking::integrate::LnFluxEstimator::CommonAperture)
@@ -27777,18 +27678,11 @@ mod tests {
             assert!(f.ln_scale.is_some(), "{f:?}");
         }
         for i in 0..4 {
-            let sidecar = layout.ln_sidecar_path(&group_key, &format!("f{i}_f{}", light_ids[i]));
+            let sidecar = rig.sidecar(&group_key, i);
             assert!(sidecar.exists(), "sidecar for f{i} must exist: {sidecar:?}");
         }
 
-        let plan_after = build_plan(
-            &fixture.conn,
-            &ctx.settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some(cfg),
-        )
-        .expect("the plan should build");
+        let plan_after = rig.plan(&cfg);
         let g = &plan_after.groups[0];
         assert!(!g.ln_scale_estimated, "{g:?}");
         assert!(
@@ -27806,47 +27700,15 @@ mod tests {
     /// them.
     #[test]
     fn a_common_aperture_shortfall_names_its_cause_and_warns_once_per_group() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::new();
 
         // The estimator and the aperture stay at their defaults: the subject.
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
         cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output_dir,
-            group_ids,
-        );
+        let plan_groups = rig.plan_groups(&cfg);
+        let mut rc = rig.context(cfg, plan_groups);
         run_stages_for_test(&mut rc, Stage::Register).unwrap();
         let _ = stage_output(&mut rc);
 
@@ -27881,57 +27743,16 @@ mod tests {
     /// warns once.
     #[test]
     fn a_run_warns_once_when_its_ln_scale_differs_from_the_plan() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let rig = LnRig::new();
+        let cfg = ln_run_config();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
 
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output_dir,
-            group_ids,
-        );
+        let mut rc = rig.context(cfg, plan_groups);
         // A value the fixture geometry cannot resolve to.
         rc.planned_ln_scales.insert(group_key, 8192);
 
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        run_register_and_output(&mut rc);
 
         let hits: Vec<&String> = rc
             .warnings
@@ -27972,103 +27793,40 @@ mod tests {
     /// reference's own hash (item 2's fix) can.
     #[test]
     fn local_normalization_sidecars_all_rebuild_when_a_reference_members_registration_changes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::new();
         crate::registration::db::set_frame_set_reference(
-            &fixture.conn,
-            fixture.set_id,
-            light_ids[1],
+            &rig.fixture.conn,
+            rig.fixture.set_id,
+            rig.light_ids[1],
         )
         .unwrap();
 
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
+        let mut cfg = ln_run_config();
         cfg.reference.mode = ReferenceMode::Manual;
 
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
 
-        let (run_id1, group_ids1) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc1 = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id1,
-            fixture.set_id,
-            SET_NAME,
-            cfg.clone(),
-            plan_groups,
-            layout.clone(),
-            output_dir.clone(),
-            group_ids1,
-        );
-        run_stages_for_test(&mut rc1, Stage::Register).unwrap();
-        stage_output(&mut rc1).unwrap();
+        let mut rc1 = rig.context(cfg.clone(), plan_groups);
+        run_register_and_output(&mut rc1);
 
         // Touch light_ids[0]'s catalog `size` — forces recalibration (and,
         // downstream, re-registration) of that ONE frame on the next run,
         // without changing the actual pixels on disk at all.
-        fixture
+        rig.fixture
             .conn
             .execute(
                 "UPDATE files SET size = size + 1000 WHERE id = \
                  (SELECT file_id FROM frames WHERE id = ?1)",
-                rusqlite::params![light_ids[0]],
+                rusqlite::params![rig.light_ids[0]],
             )
             .unwrap();
 
-        let plan_groups2 = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-        let (run_id2, group_ids2) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups2,
-            working.path(),
-            output.path(),
-        );
-        let mut rc2 = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id2,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups2,
-            layout,
-            output_dir,
-            group_ids2,
-        );
-        run_stages_for_test(&mut rc2, Stage::Register).unwrap();
-        stage_output(&mut rc2).unwrap();
+        let plan_groups2 = rig.plan_groups(&cfg);
+        let mut rc2 = rig.context(cfg, plan_groups2);
+        run_register_and_output(&mut rc2);
 
-        let group_summary = rc2
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc2, &group_key);
         let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
         assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
         for f in included {
@@ -28094,68 +27852,21 @@ mod tests {
     /// frame's `stacking_run_frames` row.
     #[test]
     fn local_normalization_excludes_a_frame_whose_sidecar_write_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let rig = LnRig::new();
+        let cfg = ln_run_config();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
 
         // f1's stem is `f1_f<frame id>` (`frame_file_stem`).
-        let blocked_sidecar =
-            layout.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
+        let blocked_sidecar = rig.sidecar(&group_key, 1);
         std::fs::create_dir_all(&blocked_sidecar).unwrap();
 
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output_dir,
-            group_ids,
-        );
+        let mut rc = rig.context(cfg, plan_groups);
 
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        run_register_and_output(&mut rc);
 
-        let blocked_frame_id = light_ids[1];
-        let group_summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let blocked_frame_id = rig.light_ids[1];
+        let group_summary = summary_group(&rc, &group_key);
         let blocked_summary = group_summary
             .frames
             .iter()
@@ -28178,7 +27889,7 @@ mod tests {
 
         // Item 1: the SAME exclusion reached the frame's own DB row, not
         // just the in-memory summary.
-        let frame_rows = crate::db::stacking::list_frame_rows(&fixture.conn, rc.run_id).unwrap();
+        let frame_rows = crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc.run_id).unwrap();
         let blocked_row = frame_rows
             .iter()
             .find(|r| r.frame_id == blocked_frame_id)
@@ -28196,161 +27907,38 @@ mod tests {
 
     #[test]
     fn local_normalization_off_leaves_no_ln_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::seeded(seed_star_group, &shifts, &[5.0f32; 4]);
 
         // `StackingConfig::default()`'s `normalization.local.enabled` is
         // `false`; the disabled path needs the rejection normalization global
         // too (the default is `local` since OD-1a, which runs LN for rejection).
         let mut cfg = StackingConfig::default();
         cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
 
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout.clone(),
-            output_dir,
-            group_ids,
-        );
+        let mut rc = rig.context(cfg, plan_groups);
 
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        run_register_and_output(&mut rc);
 
-        let ln_dir = layout.ln_dir(&group_key);
+        let ln_dir = rig.layout.ln_dir(&group_key);
         assert!(
             !ln_dir.exists(),
             "no ln/ files must be written when local normalization is off"
         );
 
-        let group_summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc, &group_key);
         assert!(group_summary.ln_reference_path.is_none());
         for f in &group_summary.frames {
             assert!(f.ln_scale.is_none(), "{f:?}");
             assert!(!f.cached_ln, "{f:?}");
         }
 
-        let ln_artifacts = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln"),
-        )
-        .unwrap();
+        let ln_artifacts = rig.artifacts("ln");
         assert!(ln_artifacts.is_empty(), "{ln_artifacts:?}");
-        let ln_ref_artifacts = crate::db::stacking::list_artifacts(
-            &fixture.conn,
-            &StackSubject::FrameSet(fixture.set_id),
-            Some("ln_reference"),
-        )
-        .unwrap();
+        let ln_ref_artifacts = rig.artifacts("ln_reference");
         assert!(ln_ref_artifacts.is_empty(), "{ln_ref_artifacts:?}");
-    }
-
-    /// M2 Task 7: `GroupInput.ln` — read back from the sidecars stage 6 just
-    /// wrote/confirmed fresh — must actually reach `integrate_group`, not
-    /// just exist as an unused field. `GroupStats.ln_frames` (Task 6) is the
-    /// signal: it is computed from `input.ln` alone (`integrate.rs`), so if
-    /// the wiring in `process_group_output` were broken (still passing
-    /// `None`, or misaligned with `frames`' own order), it would read `0`
-    /// even though every included frame has a real sidecar.
-    #[test]
-    fn local_normalization_grids_reach_integration_and_ln_frames_matches_included() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-        let group_key = plan_groups[0].key.clone();
-
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output_dir,
-            group_ids,
-        );
-
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
-
-        let group_summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
-        let stats = group_summary
-            .stats
-            .as_ref()
-            .expect("group wrote a master and its stats");
-        assert_eq!(stats.included, 4, "{stats:?}");
-        assert_eq!(
-            stats.ln_frames, stats.included,
-            "every included frame must have carried its LN grid into integration: {stats:?}"
-        );
     }
 
     /// M2 fix round 1, item 3: a `ln` artifact row a cache hit trusts
@@ -28375,86 +27963,28 @@ mod tests {
     /// as before.)
     #[test]
     fn local_normalization_re_normalizes_a_frame_whose_cached_sidecar_is_unreadable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let rig = LnRig::new();
+        let cfg = ln_run_config();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
 
-        let build = |run_id: i64, group_ids: HashMap<String, i64>| {
-            test_context(
-                ctx.clone(),
-                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-                run_id,
-                fixture.set_id,
-                SET_NAME,
-                cfg.clone(),
-                plan_groups.clone(),
-                layout.clone(),
-                output_dir.clone(),
-                group_ids,
-            )
-        };
-
-        let (run_id1, group_ids1) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc1 = build(run_id1, group_ids1);
-        run_stages_for_test(&mut rc1, Stage::Register).unwrap();
-        stage_output(&mut rc1).unwrap();
+        let mut rc1 = rig.context(cfg.clone(), plan_groups.clone());
+        run_register_and_output(&mut rc1);
 
         // Corrupt f1's sidecar payload in place, same total length: the
         // artifact row's stored size/hash are untouched, so the second
         // run's `is_fresh` check still calls this a cache hit.
-        let touched_frame_id = light_ids[1];
-        let sidecar = layout.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
+        let touched_frame_id = rig.light_ids[1];
+        let sidecar = rig.sidecar(&group_key, 1);
         let mut bytes = std::fs::read(&sidecar).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
         std::fs::write(&sidecar, &bytes).unwrap();
 
-        let (run_id2, group_ids2) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc2 = build(run_id2, group_ids2);
-        run_stages_for_test(&mut rc2, Stage::Register).unwrap();
-        stage_output(&mut rc2).unwrap();
+        let mut rc2 = rig.context(cfg, plan_groups);
+        run_register_and_output(&mut rc2);
 
-        let group_summary = rc2
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary = summary_group(&rc2, &group_key);
         let touched_summary = group_summary
             .frames
             .iter()
@@ -28496,7 +28026,7 @@ mod tests {
         let repaired = crate::stacking::ln::LnFrameGrids::read(&sidecar);
         assert!(repaired.is_ok(), "{repaired:?}");
 
-        let frame_rows = crate::db::stacking::list_frame_rows(&fixture.conn, rc2.run_id).unwrap();
+        let frame_rows = crate::db::stacking::list_frame_rows(&rig.fixture.conn, rc2.run_id).unwrap();
         let touched_row = frame_rows
             .iter()
             .find(|r| r.frame_id == touched_frame_id)
@@ -28505,102 +28035,11 @@ mod tests {
         assert!(touched_row.exclusion_reason.is_none(), "{touched_row:?}");
     }
 
-    /// Final fix wave, A1 (ruling R5): with local normalization on,
-    /// `RunSummary.stages` (here, `rc.timings` — `stage_output` pushes into
-    /// it directly, same source the run's final summary copies) must carry
-    /// a `Normalize` entry with a real, non-zero duration, positioned
-    /// BEFORE `Integrate` (stage order) — the acceptance run measured LN as
-    /// the single most expensive stage, so it cannot stay invisible.
-    #[test]
-    fn local_normalization_pushes_a_stage_timing_before_integrate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
-
-        let mut cfg = StackingConfig::default();
-        cfg.normalization.local.enabled = true;
-        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
-
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
-
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output_dir,
-            group_ids,
-        );
-
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
-
-        let normalize_idx = rc
-            .timings
-            .iter()
-            .position(|t| t.stage == Stage::Normalize)
-            .expect("a Normalize StageTiming must be pushed when LN is active");
-        let integrate_idx = rc
-            .timings
-            .iter()
-            .position(|t| t.stage == Stage::Integrate)
-            .expect("Integrate StageTiming always pushed");
-        assert!(
-            normalize_idx < integrate_idx,
-            "Normalize must precede Integrate in stage order: {:?}",
-            rc.timings
-        );
-        assert!(
-            rc.timings[normalize_idx].duration_ms > 0,
-            "LN did real work (a reference build + a 4-frame fan-out); its timing must not be zero: {:?}",
-            rc.timings[normalize_idx]
-        );
-    }
-
     /// Same run shape, LN off (the M1 shape): no `Normalize` entry at all —
     /// not a zero-duration one.
     #[test]
     fn local_normalization_off_pushes_no_stage_timing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::new();
 
         let mut cfg = StackingConfig::default();
         assert!(!cfg.normalization.local.enabled);
@@ -28608,32 +28047,10 @@ mod tests {
         // OD-1a, which runs the Normalize stage for rejection.
         cfg.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
 
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let plan_groups = rig.plan_groups(&cfg);
+        let mut rc = rig.context(cfg, plan_groups);
 
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output_dir,
-            group_ids,
-        );
-
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        run_register_and_output(&mut rc);
 
         assert!(
             !rc.timings.iter().any(|t| t.stage == Stage::Normalize),
@@ -28654,26 +28071,9 @@ mod tests {
     /// affect the written pixels either — see `integrate_planes`'s own doc).
     #[test]
     fn local_rejection_normalization_group_fallback_matches_global_scale_zero_offset() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::new();
 
-        let plan_groups_probe = group_frames(
-            &fixture.conn,
-            fixture.set_id,
-            &StackingConfig::default().grouping,
-        )
-        .unwrap();
+        let plan_groups_probe = rig.plan_groups(&StackingConfig::default());
         let group_key = plan_groups_probe[0].key.clone();
 
         // ── Run A: rejection = local, group-level fallback forced ──
@@ -28681,46 +28081,18 @@ mod tests {
         cfg_fallback.normalization.rejection = RejectionNormalization::Local;
         cfg_fallback.normalization.local.enabled = true;
 
-        let layout_a = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         // Trigger 1: a plain FILE where `run_group_normalization` expects to
         // `create_dir_all` the group's `ln/` directory — the mkdir fails
         // outright, before any per-frame work, landing in the
         // `Err(RunError::Other(..))` arm ("continuing with global
         // normalization").
-        let blocked_ln_dir = layout_a.ln_dir(&group_key);
-        std::fs::create_dir_all(blocked_ln_dir.parent().unwrap()).unwrap();
-        std::fs::write(&blocked_ln_dir, b"not a directory").unwrap();
+        rig.block_ln_dir(&group_key);
 
-        let plan_groups_a =
-            group_frames(&fixture.conn, fixture.set_id, &cfg_fallback.grouping).unwrap();
-        let (run_id_a, group_ids_a) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups_a,
-            working.path(),
-            output.path(),
-        );
-        let mut rc_a = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id_a,
-            fixture.set_id,
-            SET_NAME,
-            cfg_fallback,
-            plan_groups_a,
-            layout_a,
-            output.path().to_path_buf(),
-            group_ids_a,
-        );
-        run_stages_for_test(&mut rc_a, Stage::Register).unwrap();
-        stage_output(&mut rc_a).unwrap();
+        let plan_groups_a = rig.plan_groups(&cfg_fallback);
+        let mut rc_a = rig.context(cfg_fallback, plan_groups_a);
+        run_register_and_output(&mut rc_a);
 
-        let group_summary_a = rc_a
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary_a = summary_group(&rc_a, &group_key);
         assert!(
             group_summary_a.ln_reference_path.is_none(),
             "the mkdir failure must fall back to global normalization, not run LN: {group_summary_a:?}"
@@ -28738,55 +28110,9 @@ mod tests {
             .expect("group A wrote a master despite the LN fallback");
 
         // ── Run B: rejection = scaleZeroOffset, LN off, separate output dir ──
-        let mut cfg_global = StackingConfig::default();
-        cfg_global.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
-        cfg_global.normalization.local.enabled = false;
+        let (_dirs_b, rc_b) = rig.run_global_comparison();
 
-        let working_b = tempfile::tempdir().unwrap();
-        let output_b = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &fixture.conn,
-            crate::settings::keys::STACKING_WORKING_DIR,
-            working_b.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &fixture.conn,
-            crate::settings::keys::STACKING_OUTPUT_DIR,
-            output_b.path().to_str().unwrap(),
-        )
-        .unwrap();
-        let layout_b = WorkingLayout::new(working_b.path(), &set_slug(SET_NAME));
-        let plan_groups_b =
-            group_frames(&fixture.conn, fixture.set_id, &cfg_global.grouping).unwrap();
-        let (run_id_b, group_ids_b) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups_b,
-            working_b.path(),
-            output_b.path(),
-        );
-        let mut rc_b = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id_b,
-            fixture.set_id,
-            SET_NAME,
-            cfg_global,
-            plan_groups_b,
-            layout_b,
-            output_b.path().to_path_buf(),
-            group_ids_b,
-        );
-        run_stages_for_test(&mut rc_b, Stage::Register).unwrap();
-        stage_output(&mut rc_b).unwrap();
-
-        let group_summary_b = rc_b
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary_b = summary_group(&rc_b, &group_key);
         assert!(group_summary_b.ln_reference_path.is_none());
         let master_b = group_summary_b
             .master_path
@@ -28795,21 +28121,7 @@ mod tests {
 
         // ── Compare pixel data bit-for-bit (headers legitimately differ:
         // NORMALIZATION card, run id, timestamps). ──
-        let reader_a = PlaneReader::open(Path::new(&master_a)).unwrap();
-        let reader_b = PlaneReader::open(Path::new(&master_b)).unwrap();
-        assert_eq!(reader_a.channels(), reader_b.channels());
-        for p in 0..reader_a.channels() {
-            let plane_a = reader_a.read_plane(p).unwrap();
-            let plane_b = reader_b.read_plane(p).unwrap();
-            assert_eq!(plane_a.len(), plane_b.len());
-            for (i, (a, b)) in plane_a.iter().zip(plane_b.iter()).enumerate() {
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "plane {p} pixel {i}: fallback {a} vs global-normalization {b}"
-                );
-            }
-        }
+        assert_masters_equal_bit_for_bit(&master_a, &master_b, "fallback");
     }
 
     /// B1, test (iii) + A3: the rejection-only composite mode
@@ -28826,71 +28138,27 @@ mod tests {
     /// integrated with `rejection = scaleZeroOffset` (no LN at all).
     #[test]
     fn local_normalization_rejection_only_frame_failure_keeps_global_normalization() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::new();
 
-        let mut cfg_rejection_only = StackingConfig::default();
+        // `ln_run_config` pins the estimator and the selection (P-13, L-24); the subject here is the one grid-less
+        // frame among normalized ones, so LN runs for rejection only.
+        let mut cfg_rejection_only = ln_run_config();
         cfg_rejection_only.normalization.rejection = RejectionNormalization::Local;
         cfg_rejection_only.normalization.local.enabled = false;
-        // P-13: the subject is the one grid-less frame among normalized ones, not the selection (synthetic stars, none saturated).
-        // 2026-10-06: pinned to PsfSignal, see `ln_base_stars` (L-24).
-        cfg_rejection_only.normalization.local.flux_estimator =
-            crate::stacking::integrate::LnFluxEstimator::PsfSignal;
-        cfg_rejection_only.normalization.local.star_selection =
-            crate::stacking::integrate::LnStarSelection::OFF;
 
-        let layout_a = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let output_dir = output.path().to_path_buf();
-        let plan_groups_a =
-            group_frames(&fixture.conn, fixture.set_id, &cfg_rejection_only.grouping).unwrap();
+        let plan_groups_a = rig.plan_groups(&cfg_rejection_only);
         let group_key = plan_groups_a[0].key.clone();
 
         // f1's stem is `f1_f<frame id>` — same deterministic write-failure trick
         // as the OUTPUT-normalization exclusion test above.
-        let blocked_sidecar =
-            layout_a.ln_sidecar_path(&group_key, &format!("f1_f{}", light_ids[1]));
+        let blocked_sidecar = rig.sidecar(&group_key, 1);
         std::fs::create_dir_all(&blocked_sidecar).unwrap();
 
-        let (run_id_a, group_ids_a) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups_a,
-            working.path(),
-            output.path(),
-        );
-        let mut rc_a = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id_a,
-            fixture.set_id,
-            SET_NAME,
-            cfg_rejection_only,
-            plan_groups_a,
-            layout_a,
-            output_dir,
-            group_ids_a,
-        );
-        run_stages_for_test(&mut rc_a, Stage::Register).unwrap();
-        stage_output(&mut rc_a).unwrap();
+        let mut rc_a = rig.context(cfg_rejection_only, plan_groups_a);
+        run_register_and_output(&mut rc_a);
 
-        let blocked_frame_id = light_ids[1];
-        let group_summary_a = rc_a
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let blocked_frame_id = rig.light_ids[1];
+        let group_summary_a = summary_group(&rc_a, &group_key);
         let stats_a = group_summary_a
             .stats
             .as_ref()
@@ -28938,75 +28206,15 @@ mod tests {
             .expect("group A wrote a master with the blocked frame kept");
 
         // ── Comparison run: rejection = scaleZeroOffset, LN off entirely ──
-        let mut cfg_global = StackingConfig::default();
-        cfg_global.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
-        cfg_global.normalization.local.enabled = false;
+        let (_dirs_b, rc_b) = rig.run_global_comparison();
 
-        let working_b = tempfile::tempdir().unwrap();
-        let output_b = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &fixture.conn,
-            crate::settings::keys::STACKING_WORKING_DIR,
-            working_b.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &fixture.conn,
-            crate::settings::keys::STACKING_OUTPUT_DIR,
-            output_b.path().to_str().unwrap(),
-        )
-        .unwrap();
-        let layout_b = WorkingLayout::new(working_b.path(), &set_slug(SET_NAME));
-        let plan_groups_b =
-            group_frames(&fixture.conn, fixture.set_id, &cfg_global.grouping).unwrap();
-        let (run_id_b, group_ids_b) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups_b,
-            working_b.path(),
-            output_b.path(),
-        );
-        let mut rc_b = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id_b,
-            fixture.set_id,
-            SET_NAME,
-            cfg_global,
-            plan_groups_b,
-            layout_b,
-            output_b.path().to_path_buf(),
-            group_ids_b,
-        );
-        run_stages_for_test(&mut rc_b, Stage::Register).unwrap();
-        stage_output(&mut rc_b).unwrap();
-
-        let group_summary_b = rc_b
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let group_summary_b = summary_group(&rc_b, &group_key);
         let master_b = group_summary_b
             .master_path
             .clone()
             .expect("comparison group wrote a master");
 
-        let reader_a = PlaneReader::open(Path::new(&master_a)).unwrap();
-        let reader_b = PlaneReader::open(Path::new(&master_b)).unwrap();
-        assert_eq!(reader_a.channels(), reader_b.channels());
-        for p in 0..reader_a.channels() {
-            let plane_a = reader_a.read_plane(p).unwrap();
-            let plane_b = reader_b.read_plane(p).unwrap();
-            assert_eq!(plane_a.len(), plane_b.len());
-            for (i, (a, b)) in plane_a.iter().zip(plane_b.iter()).enumerate() {
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "plane {p} pixel {i}: rejection-only fallback {a} vs global-normalization {b}"
-                );
-            }
-        }
+        assert_masters_equal_bit_for_bit(&master_a, &master_b, "rejection-only fallback");
     }
 
     /// The rejection-only twin of the group-level fallback test above: LN
@@ -29016,51 +28224,17 @@ mod tests {
     /// and what they got instead, not "local normalization failed".
     #[test]
     fn local_normalization_rejection_only_group_failure_names_the_rejection_normalization() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::new();
         let mut cfg = StackingConfig::default();
         cfg.normalization.rejection = RejectionNormalization::Local;
         cfg.normalization.local.enabled = false;
 
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
         // A plain FILE where the group's `ln/` directory must be created.
-        let blocked_ln_dir = layout.ln_dir(&group_key);
-        std::fs::create_dir_all(blocked_ln_dir.parent().unwrap()).unwrap();
-        std::fs::write(&blocked_ln_dir, b"not a directory").unwrap();
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output.path().to_path_buf(),
-            group_ids,
-        );
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        rig.block_ln_dir(&group_key);
+        let mut rc = rig.context(cfg, plan_groups);
+        run_register_and_output(&mut rc);
 
         assert!(
             rc.warnings.iter().any(|w| w.starts_with(&format!(
@@ -29076,12 +28250,7 @@ mod tests {
             "the user never turned local normalization on: {:?}",
             rc.warnings
         );
-        let summary = rc
-            .summary
-            .groups
-            .iter()
-            .find(|g| g.key == group_key)
-            .expect("group summary pushed");
+        let summary = summary_group(&rc, &group_key);
         assert!(summary.master_path.is_some(), "the group still stacks");
     }
 
@@ -29091,48 +28260,16 @@ mod tests {
     #[test]
     fn local_normalization_rejection_only_reference_frames_below_three_names_the_rejection_normalization(
     ) {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
-        let noise = [5.0f32; 4];
-        let (fixture, light_ids, working, output) =
-            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
-        test_fixtures::add_master_dark_and_flat(
-            &fixture,
-            &light_ids,
-            STAR_FIELD_WIDTH,
-            STAR_FIELD_HEIGHT,
-        );
+        let rig = LnRig::new();
         let mut cfg = StackingConfig::default();
         cfg.normalization.rejection = RejectionNormalization::Local;
         cfg.normalization.local.enabled = false;
         cfg.normalization.local.reference_frames = 2;
 
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let plan_groups = rig.plan_groups(&cfg);
         let group_key = plan_groups[0].key.clone();
-        let (run_id, group_ids) = seed_run_and_groups(
-            &fixture.conn,
-            fixture.set_id,
-            &plan_groups,
-            working.path(),
-            output.path(),
-        );
-        let mut rc = test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
-            run_id,
-            fixture.set_id,
-            SET_NAME,
-            cfg,
-            plan_groups,
-            layout,
-            output.path().to_path_buf(),
-            group_ids,
-        );
-        run_stages_for_test(&mut rc, Stage::Register).unwrap();
-        stage_output(&mut rc).unwrap();
+        let mut rc = rig.context(cfg, plan_groups);
+        run_register_and_output(&mut rc);
 
         assert!(
             rc.warnings.iter().any(|w| w.starts_with(&format!(

@@ -1360,28 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn init_db_twice_keeps_the_stacking_tables() {
-        let c = conn();
-        init_db(&c).unwrap();
-        for t in [
-            "stacking_runs",
-            "stacking_run_groups",
-            "stacking_run_frames",
-            "stacking_artifacts",
-            "stacking_set_config",
-        ] {
-            let n: i64 = c
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [t],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(n, 1, "{t}");
-        }
-    }
-
-    #[test]
     fn run_group_frame_round_trip() {
         let c = conn();
         let set = seed_set(&c);

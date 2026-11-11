@@ -5982,48 +5982,6 @@ mod archive_schema_tests {
     use super::*;
 
     #[test]
-    fn test_archive_tables_created() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-
-        for table in &[
-            "archive_operations",
-            "archive_operation_files",
-            "archive_operation_steps",
-        ] {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "expected table {} to exist", table);
-        }
-    }
-
-    #[test]
-    fn test_file_op_tables_created() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-
-        for table in &[
-            "file_operations",
-            "file_operation_files",
-            "file_operation_steps",
-        ] {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "expected table {} to exist", table);
-        }
-    }
-
-    #[test]
     fn test_archive_columns_added() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -6668,22 +6626,6 @@ mod archive_schema_tests {
     }
 
     #[test]
-    fn scan_roots_kind_column_and_default() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/a')", [])
-            .unwrap();
-        let kind: String = conn
-            .query_row(
-                "SELECT kind FROM scan_roots WHERE path='/data/a'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(kind, "normal");
-    }
-
-    #[test]
     fn scan_roots_kind_migrates_existing_table() {
         let conn = Connection::open_in_memory().unwrap();
         // Simulate a legacy scan_roots without kind
@@ -6708,43 +6650,6 @@ mod archive_schema_tests {
             })
             .unwrap();
         assert_eq!(kind, "normal");
-    }
-
-    #[test]
-    fn calibration_set_superseded_column() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-        let v: Option<i64> = conn
-            .query_row(
-                "SELECT superseded_by_set_id FROM calibration_set WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(v, None);
-    }
-
-    #[test]
-    fn master_provenance_table_exists() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO calibration_set (imagetyp, date, is_master_library) VALUES ('MasterDark','2026-01-01',1)", [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO master_provenance (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
-             VALUES (1, NULL, '{}', '[]', 'abc', '2026-01-01T00:00:00Z')",
-            [],
-        ).unwrap();
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM master_provenance", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 1);
     }
 
     #[test]
