@@ -36,6 +36,12 @@ one file per stage, each with its tests beside it in `<file>_tests.rs` (a child 
 A type whose private fields several stages read stays in `mod.rs`; an item one stage owns and another calls is
 `pub(super)`. The funnel test in `origin.rs` scans every production file of the folder, so a new file needs no entry.
 
+One thing a reader of the logs sees: a line logged from a stage's file carries that file's module as its `target`
+(`athenaeum_core::stacking::run::measure`, `…::run::output`, …), where every line of the run carried
+`athenaeum_core::stacking::run`. A filter or a level directive on the `athenaeum_core::stacking::run` prefix still
+takes them all; a tool that compares `target` for equality has to compare the prefix. Messages and fields are
+unchanged.
+
 **Pipeline stages** (`stacking::plan::Stage`, spec §2): `Masters` (0.5 —
 build/rebuild whatever the export-readiness gate found missing, including the
 pre-calibration master a missing flat master's rebuild reads, dependency
