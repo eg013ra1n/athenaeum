@@ -46,11 +46,15 @@ fn tauri_commands() -> BTreeSet<String> {
         .find("generate_handler![")
         .expect("generate_handler![ in athenaeum-tauri/src/lib.rs");
     let list = &src[start + "generate_handler![".len()..];
-    let end = list.find(']').expect("end of the generate_handler! list");
+    // The list closes with `])` (the macro's bracket, then `invoke_handler`'s
+    // parenthesis); an attribute on an entry (`#[cfg(…)]`) ends with `)]`.
+    let end = list.find("])").expect("end of the generate_handler! list");
     list[..end]
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
+        // An attribute stays glued to its entry: `#[cfg(x)] commands::name`.
+        .map(|item| item.rsplit(']').next().unwrap_or(item).trim())
         .map(|item| item.rsplit("::").next().unwrap_or(item).to_string())
         .collect()
 }

@@ -1131,10 +1131,11 @@ mod tests {
         ));
     }
 
-    /// A custom set built from a frame selection holds exactly those frames in
-    /// detected nights; an empty selection is refused.
+    /// A custom set built from a frame selection is custom and holds exactly
+    /// those frames, reachable through its nights and sessions; an empty
+    /// selection is refused.
     #[test]
-    fn create_frame_set_from_selection_builds_a_custom_set_with_nights() {
+    fn create_frame_set_from_selection_builds_a_custom_set_holding_the_frames() {
         let (_tmp, ctx) = test_ctx();
         {
             let conn = ctx.db.get().unwrap().conn();

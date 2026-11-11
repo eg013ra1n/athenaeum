@@ -88,47 +88,10 @@ pub fn set_setting(
 mod tests {
     use super::*;
 
-    /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no
-    /// keychain involved anywhere). Copied verbatim from
-    /// `api::frame_sets::tests::test_ctx` (itself copied from `api::collab` /
-    /// `api::sync`): a TEMPDIR-FILE-backed `Database` (not `:memory:`) so the
-    /// pool can hand out multiple connections that all see one database.
+    /// A real-`Database` [`ServiceContext`] over a tempdir catalog.
     fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
-        use crate::cache::MemoryImageCache;
-        use crate::services::compute_queue::ComputeQueue;
-        use crate::services::operation_queue::OperationQueue;
-        use crate::settings::SettingsManager;
-        use std::collections::HashMap;
-        use std::sync::RwLock;
-        use std::sync::{Arc, Mutex, OnceLock};
-
         let tmp = tempfile::tempdir().unwrap();
-        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
-        let db_cell = OnceLock::new();
-        let _ = db_cell.set(database);
-        let ctx = ServiceContext {
-            db: db_cell,
-            settings: Arc::new(SettingsManager::new()),
-            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
-            active_scans: Arc::new(Mutex::new(HashMap::new())),
-            active_exports: Arc::new(Mutex::new(HashMap::new())),
-            active_analyses: Arc::new(Mutex::new(HashMap::new())),
-            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
-            active_archives: Arc::new(Mutex::new(HashMap::new())),
-            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_stacks: Arc::new(Mutex::new(HashMap::new())),
-            dso_catalog: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .build()
-                    .unwrap(),
-            ),
-            operation_queue: OperationQueue::start(),
-            compute_queue: ComputeQueue::new(),
-            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
-        };
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         (tmp, ctx)
     }
 
@@ -162,7 +125,9 @@ mod tests {
     }
 
     /// A set value persists and reads back through the same precedence the
-    /// frontend uses; a monitoring key goes through the kick branch.
+    /// frontend uses. The two keys also run the cache-resize and the
+    /// monitor-kick branches, but only that they do not fail: neither the
+    /// cache nor the monitor exposes what they were set to.
     #[test]
     fn set_setting_persists_and_reads_back() {
         let (_tmp, ctx) = test_ctx();
