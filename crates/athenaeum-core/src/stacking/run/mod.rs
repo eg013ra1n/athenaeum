@@ -37812,5 +37812,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "run_reweigh_tests.rs"]
 mod reweigh_tests;
