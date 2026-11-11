@@ -448,8 +448,6 @@ pub(super) fn fan_out_items(logs: &str, stage: &str, pass: &str) -> usize {
         .sum()
 }
 
-// ── stages 3-5 (Task 7): measure & select, reference, register ─────────
-
 /// A real `stacking_runs` row plus one `stacking_run_groups` row per
 /// `plan_groups` entry, all FK-linked to that same run — everything
 /// [`test_context`]'s `group_ids` and stages 3/5's own DB writes need

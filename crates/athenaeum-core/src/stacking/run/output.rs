@@ -1,5 +1,5 @@
-//! Stages 7 and 9, integrate and output (`stage_output`): per group, the integration, drizzle, the run summary and
-//! the written masters.
+//! Stages 7 to 9, integrate, drizzle and output (`stage_output`): per group, the integration, the drizzle, the run
+//! summary and the written masters.
 
 use super::*;
 

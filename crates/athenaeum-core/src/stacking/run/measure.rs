@@ -61,7 +61,7 @@ pub(crate) static FITS_WRITE_FAILURE_LOG: std::sync::Mutex<Vec<PathBuf>> =
 /// 4168 × 4) = 6.77`, rounds up to 7 — the max across both measured frames
 /// is kept (8), the same conservative rule the original measurement used,
 /// since under-provisioning risks the swap-thrash regression
-/// `LN_PLANES_RESIDENT`'s own comment below describes.
+/// `LN_PLANES_RESIDENT`'s own comment (`normalize.rs`) describes.
 ///
 /// Per-sub-stage `getrusage(RUSAGE_SELF).ru_maxrss` checkpoints (a
 /// temporary, uncommitted instrumentation of `measure_plane_with_seeds` and
@@ -1942,7 +1942,7 @@ fn persist_measurement(
         // it stays reusable; if it is gone or wrong,
         // `is_fresh`'s own size-on-disk check reports it
         // stale, which is exactly the fallback above.
-        let timed = tracing::enabled!(target: "athenaeum_core::stacking::run", tracing::Level::DEBUG);
+        let timed = tracing::enabled!(tracing::Level::DEBUG);
         let (write_t, write_cpu0) = (
             std::time::Instant::now(),
             if timed {

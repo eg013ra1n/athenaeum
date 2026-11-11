@@ -23,7 +23,7 @@
 //!
 //! The stages are this folder's files, each with its tests beside it in `<file>_tests.rs`: `masters` (stage 0.5),
 //! `calibrate` and `prepare` (stage 1), `solve` and `measure` (stage 3), `reference` (stage 4), `register`,
-//! `two_pass` and `reweigh` (stage 5), `normalize` (stage 6), `output` (stages 7 and 9) and `crop`. `fan_out` is the
+//! `two_pass` and `reweigh` (stage 5), `normalize` (stage 6), `output` (stages 7 to 9) and `crop`. `fan_out` is the
 //! worker pool and the memory admission the stages share; `frames` is the frame rows and the frame-level file
 //! names. This file keeps the run thread, [`RunContext`], the in-memory frame entries and the events; `tests.rs`
 //! keeps the rig every stage's tests use and the tests of a run as a whole.

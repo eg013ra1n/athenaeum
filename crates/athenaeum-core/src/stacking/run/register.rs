@@ -417,7 +417,7 @@ pub(super) fn resolve_register_fits(
         Ok(fresh) => fresh,
         Err(e) => {
             // `RunError` carries no `Display`, only `Debug` — the same
-            // convention every other `RunError`-typed warn in this file
+            // convention every other `RunError`-typed warn in the run
             // already follows (`error = ?e`).
             tracing::warn!(
                 run_id = rc.run_id,

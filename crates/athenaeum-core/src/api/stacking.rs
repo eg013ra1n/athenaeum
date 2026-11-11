@@ -2126,7 +2126,7 @@ mod tests {
 
         // Let the freshly started run finish (whatever its outcome) so its
         // background thread does not outlive the test — same 30s-capped
-        // poll `run/`'s own `wait_for_run` test helper uses.
+        // poll the `wait_for_run` test helper (`test_fixtures`) uses.
         let wait_start = std::time::Instant::now();
         loop {
             if !ctx

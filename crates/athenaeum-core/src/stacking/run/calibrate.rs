@@ -749,7 +749,7 @@ pub(crate) const CALIBRATE_PLANES_RESIDENT_OSC: u64 = 5;
 
 /// Stage-1-worker cancellation marker (perf tier 1 Task 4): a fan-out
 /// worker cannot return `RunError` (the closure's error type is `String`,
-/// same as every other fan-out in this file), so `execute_generation`
+/// same as every other fan-out in the run), so `execute_generation`
 /// reporting `IntegrationError::Cancelled` is encoded as this sentinel
 /// string instead of the ordinary "calibration failed: …" text; the
 /// results loop right after `fan_out` returns maps it (and a plain
