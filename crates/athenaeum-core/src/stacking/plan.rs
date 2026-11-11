@@ -5038,6 +5038,124 @@ mod tests {
             .contains(&plan.readiness.calibration_warnings[0]));
     }
 
+    /// One group of lights for the scale-warning tests: `scales.len()` lights named `{stem}{i}`, five minutes
+    /// apart from `hour`:00, each with a seeded plate-solve scale. A `filter` makes it a group of its own;
+    /// `written` puts a real FITS on disk (`Manual` mode's `resolve_reference` checks `reference.on_disk`).
+    struct ScaleGroup<'a> {
+        stem: &'a str,
+        filter: Option<&'a str>,
+        hour: u32,
+        written: bool,
+        scales: Vec<f64>,
+    }
+
+    fn add_scale_group(f: &test_fixtures::Fixture, g: &ScaleGroup<'_>) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for (i, scale) in g.scales.iter().enumerate() {
+            let t = format!("2025-01-01T{:02}:{:02}:00", g.hour, i * 5);
+            let stem = format!("{}{i}", g.stem);
+            let mut spec = if g.written {
+                light_spec_written(&stem, &t)
+            } else {
+                light_spec(&stem, &t)
+            };
+            spec.filter = g.filter;
+            let (id, _path) = test_fixtures::add_light(f, &spec);
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, *scale);
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// A frame set of two scale groups with the master dark and flat linked to every light and the working and
+    /// output folders set: the plan is ready except for what a test is about.
+    struct ScaleFixture {
+        f: test_fixtures::Fixture,
+        /// The light ids of the first and the second group.
+        ids: [Vec<i64>; 2],
+        all_ids: Vec<i64>,
+        _folders: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    fn scale_fixture(first: &ScaleGroup<'_>, second: &ScaleGroup<'_>) -> ScaleFixture {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let first_ids = add_scale_group(&f, first);
+        let second_ids = add_scale_group(&f, second);
+        let mut all_ids = first_ids.clone();
+        all_ids.extend(&second_ids);
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+        let folders = set_stacking_folders(&f.conn);
+        ScaleFixture {
+            f,
+            ids: [first_ids, second_ids],
+            all_ids,
+            _folders: folders,
+        }
+    }
+
+    /// Three lights at 0.78 "/px with a real file on disk (`ids[0]`, the reference group), and three Ha lights
+    /// at 1.55 "/px (`ids[1]`, the far group).
+    fn reference_and_far_scale_fixture() -> ScaleFixture {
+        scale_fixture(
+            &ScaleGroup {
+                stem: "ref",
+                filter: None,
+                hour: 0,
+                written: true,
+                scales: vec![0.78; 3],
+            },
+            &ScaleGroup {
+                stem: "other",
+                filter: Some("Ha"),
+                hour: 0,
+                written: false,
+                scales: vec![1.55; 3],
+            },
+        )
+    }
+
+    /// Four lights at 0.78 "/px (`ids[0]`, the largest group) and three Ha lights at 1.55 "/px (`ids[1]`).
+    fn big_and_small_scale_fixture() -> ScaleFixture {
+        scale_fixture(
+            &ScaleGroup {
+                stem: "big",
+                filter: None,
+                hour: 0,
+                written: false,
+                scales: vec![0.78; 4],
+            },
+            &ScaleGroup {
+                stem: "small",
+                filter: Some("Ha"),
+                hour: 1,
+                written: false,
+                scales: vec![1.55; 3],
+            },
+        )
+    }
+
+    /// The plan group holding `frames` frames; `what` is the failure text.
+    #[track_caller]
+    fn group_of_size<'p>(plan: &'p StackingPlan, frames: usize, what: &str) -> &'p PlanGroup {
+        plan.groups
+            .iter()
+            .find(|g| g.frame_count == frames)
+            .expect(what)
+    }
+
+    /// Exactly one warning carries `factor` (the "\u{d7}N" text of a far-from-reference warning) and it names
+    /// `group_key`.
+    #[track_caller]
+    fn assert_one_far_warning(plan: &StackingPlan, factor: &str, group_key: &str) {
+        let far_warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.contains(factor))
+            .collect();
+        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(far_warnings[0].contains(group_key), "{:?}", far_warnings);
+    }
+
     /// M4b (rulings R-M4b-1/7): a group whose pixel scale sits far from the
     /// resolved reference's own gets a warning naming it — never a blocker.
     /// The reference's own group (ratio ~1.0) gets no such warning, and
@@ -5045,57 +5163,13 @@ mod tests {
     /// come back populated.
     #[test]
     fn scale_warning_group_far_from_reference() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut ref_ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let stem = format!("ref{i}");
-            // Real file on disk: `Manual` mode's `resolve_reference` checks
-            // `reference.on_disk` for the chosen frame.
-            let (id, _path) = test_fixtures::add_light(&f, &light_spec_written(&stem, t));
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
-            ref_ids.push(id);
-        }
-        let mut other_ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let stem = format!("other{i}");
-            let mut spec = light_spec(&stem, t);
-            spec.filter = Some("Ha");
-            let (id, _path) = test_fixtures::add_light(&f, &spec);
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
-            other_ids.push(id);
-        }
-        let mut all_ids = ref_ids.clone();
-        all_ids.extend(&other_ids);
-        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
-
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
-
+        let fx = reference_and_far_scale_fixture();
+        let f = &fx.f;
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
-        set_frame_set_reference(&f.conn, f.set_id, ref_ids[0]).unwrap();
+        set_frame_set_reference(&f.conn, f.set_id, fx.ids[0][0]).unwrap();
 
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(cfg),
-        )
-        .unwrap();
+        let plan = set_plan_with(f, Some(cfg));
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
@@ -5105,17 +5179,7 @@ mod tests {
             .iter()
             .find(|g| g.key.contains("Ha"))
             .expect("the Ha group exists");
-        let far_warnings: Vec<&String> = plan
-            .warnings
-            .iter()
-            .filter(|w| w.contains("\u{d7}2.0"))
-            .collect();
-        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(
-            far_warnings[0].contains(&other_group.key),
-            "{:?}",
-            far_warnings
-        );
+        assert_one_far_warning(&plan, "\u{d7}2.0", &other_group.key);
         assert_eq!(other_group.pixel_scale_arcsec, Some(1.55));
         assert_eq!(other_group.scale_source, Some(ScaleSource::Solve));
         let ratio = other_group.scale_ratio_to_reference.unwrap();
@@ -5143,56 +5207,14 @@ mod tests {
     /// will never read.
     #[test]
     fn scale_warning_skips_a_fully_excluded_group() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut ref_ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let stem = format!("ref{i}");
-            let (id, _path) = test_fixtures::add_light(&f, &light_spec_written(&stem, t));
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
-            ref_ids.push(id);
-        }
-        let mut other_ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let stem = format!("other{i}");
-            let mut spec = light_spec(&stem, t);
-            spec.filter = Some("Ha");
-            let (id, _path) = test_fixtures::add_light(&f, &spec);
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
-            other_ids.push(id);
-        }
-        let mut all_ids = ref_ids.clone();
-        all_ids.extend(&other_ids);
-        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
-
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
-
+        let fx = reference_and_far_scale_fixture();
+        let f = &fx.f;
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
-        set_frame_set_reference(&f.conn, f.set_id, ref_ids[0]).unwrap();
-        let settings = SettingsManager::new();
+        set_frame_set_reference(&f.conn, f.set_id, fx.ids[0][0]).unwrap();
 
         // Premise: with the Ha group included, the warning fires.
-        let plan_all = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(cfg.clone()),
-        )
-        .unwrap();
+        let plan_all = set_plan_with(f, Some(cfg.clone()));
         assert!(
             plan_all.warnings.iter().any(|w| w.contains("\u{d7}2.0")),
             "sanity: an INCLUDED group at 2x must warn: {:?}",
@@ -5200,15 +5222,8 @@ mod tests {
         );
 
         // Now exclude every member of it.
-        set_set_config(&f.conn, f.set_id, "{}", &other_ids).unwrap();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(cfg),
-        )
-        .unwrap();
+        set_set_config(&f.conn, f.set_id, "{}", &fx.ids[1]).unwrap();
+        let plan = set_plan_with(f, Some(cfg));
 
         assert!(
             !plan.warnings.iter().any(|w| w.contains("\u{d7}2.0")),
@@ -5309,84 +5324,23 @@ mod tests {
     /// point; ≈1.99 for the other).
     #[test]
     fn scale_warning_auto_mode_falls_back_to_largest_group() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut big_ids = Vec::new();
-        for i in 0..4 {
-            let t = format!("2025-01-01T00:{:02}:00", i * 5);
-            let stem = format!("big{i}");
-            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&stem, &t));
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
-            big_ids.push(id);
-        }
-        let mut small_ids = Vec::new();
-        for i in 0..3 {
-            let t = format!("2025-01-01T01:{:02}:00", i * 5);
-            let stem = format!("small{i}");
-            let mut spec = light_spec(&stem, &t);
-            spec.filter = Some("Ha");
-            let (id, _path) = test_fixtures::add_light(&f, &spec);
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
-            small_ids.push(id);
-        }
-        let mut all_ids = big_ids.clone();
-        all_ids.extend(&small_ids);
-        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
-
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let fx = big_and_small_scale_fixture();
+        let f = &fx.f;
 
         // Default config: `ReferenceMode::Auto`, no `set_frame_set_reference`
         // call and no previous run — the largest-group fallback is the
         // only source `reference_scale` can come from.
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan = set_plan_of(f);
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
 
-        let big_group = plan
-            .groups
-            .iter()
-            .find(|g| g.frame_count == 4)
-            .expect("largest group exists");
-        let small_group = plan
-            .groups
-            .iter()
-            .find(|g| g.frame_count == 3)
-            .expect("smaller group exists");
+        let big_group = group_of_size(&plan, 4, "largest group exists");
+        let small_group = group_of_size(&plan, 3, "smaller group exists");
         assert_eq!(big_group.pixel_scale_arcsec, Some(0.78));
         assert_eq!(small_group.pixel_scale_arcsec, Some(1.55));
 
-        let far_warnings: Vec<&String> = plan
-            .warnings
-            .iter()
-            .filter(|w| w.contains("\u{d7}2.0"))
-            .collect();
-        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(
-            far_warnings[0].contains(&small_group.key),
-            "{:?}",
-            far_warnings
-        );
+        assert_one_far_warning(&plan, "\u{d7}2.0", &small_group.key);
 
         let big_ratio = big_group
             .scale_ratio_to_reference
@@ -5405,70 +5359,19 @@ mod tests {
     /// the warning now names the LARGER group instead (×0.5, not ×2.0).
     #[test]
     fn scale_warning_auto_mode_prefers_last_run_reference_over_largest_group() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut big_ids = Vec::new();
-        for i in 0..4 {
-            let t = format!("2025-01-01T00:{:02}:00", i * 5);
-            let stem = format!("big{i}");
-            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&stem, &t));
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
-            big_ids.push(id);
-        }
-        let mut small_ids = Vec::new();
-        for i in 0..3 {
-            let t = format!("2025-01-01T01:{:02}:00", i * 5);
-            let stem = format!("small{i}");
-            let mut spec = light_spec(&stem, &t);
-            spec.filter = Some("Ha");
-            let (id, _path) = test_fixtures::add_light(&f, &spec);
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
-            small_ids.push(id);
-        }
-        let mut all_ids = big_ids.clone();
-        all_ids.extend(&small_ids);
-        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
-
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let fx = big_and_small_scale_fixture();
+        let f = &fx.f;
 
         // A previous run recorded its reference in the SMALLER group.
-        seed_run_frame_rows(&f.conn, f.set_id, Some(small_ids[0]), "auto", &all_ids);
+        seed_run_frame_rows(&f.conn, f.set_id, Some(fx.ids[1][0]), "auto", &fx.all_ids);
 
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan = set_plan_of(f);
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
 
-        let big_group = plan
-            .groups
-            .iter()
-            .find(|g| g.frame_count == 4)
-            .expect("largest group exists");
-        let small_group = plan
-            .groups
-            .iter()
-            .find(|g| g.frame_count == 3)
-            .expect("smaller group exists");
+        let big_group = group_of_size(&plan, 4, "largest group exists");
+        let small_group = group_of_size(&plan, 3, "smaller group exists");
 
         assert!(
             !plan.warnings.iter().any(|w| w.contains("\u{d7}2.0")),
@@ -5476,17 +5379,7 @@ mod tests {
              group (×2.0) — the last run's reference must win instead: {:?}",
             plan.warnings
         );
-        let far_warnings: Vec<&String> = plan
-            .warnings
-            .iter()
-            .filter(|w| w.contains("\u{d7}0.5"))
-            .collect();
-        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(
-            far_warnings[0].contains(&big_group.key),
-            "{:?}",
-            far_warnings
-        );
+        assert_one_far_warning(&plan, "\u{d7}0.5", &big_group.key);
 
         let small_ratio = small_group.scale_ratio_to_reference.unwrap();
         assert!(
@@ -5508,77 +5401,38 @@ mod tests {
     /// never corrupted by its excluded majority.
     #[test]
     fn scale_warning_auto_mode_largest_group_ranks_by_included_count() {
-        let f = test_fixtures::frame_set("LDN 1272");
-
-        // The "big" group: 8 total members, only 3 survive exclusion.
-        let mut big_ids = Vec::new();
-        for i in 0..8 {
-            let t = format!("2025-01-01T00:{:02}:00", i * 5);
-            let stem = format!("big{i}");
-            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&stem, &t));
-            let scale = if i < 5 { 0.78 } else { 1.55 };
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, scale);
-            big_ids.push(id);
-        }
-        let excluded_from_big: Vec<i64> = big_ids[..5].to_vec();
-
-        // The "small" group: 4 total members, all of them included — fewer
-        // frames overall, but MORE included frames than the big group's 3.
-        let mut small_ids = Vec::new();
-        for i in 0..4 {
-            let t = format!("2025-01-01T02:{:02}:00", i * 5);
-            let stem = format!("small{i}");
-            let mut spec = light_spec(&stem, &t);
-            spec.filter = Some("Ha");
-            let (id, _path) = test_fixtures::add_light(&f, &spec);
-            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
-            small_ids.push(id);
-        }
-
-        let mut all_ids = big_ids.clone();
-        all_ids.extend(&small_ids);
-        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
-
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        // The "big" group: 8 total members, only 3 survive exclusion (the
+        // first 5, at 0.78, are excluded). The "small" group: 4 total
+        // members, all of them included — fewer frames overall, but MORE
+        // included frames than the big group's 3.
+        let fx = scale_fixture(
+            &ScaleGroup {
+                stem: "big",
+                filter: None,
+                hour: 0,
+                written: false,
+                scales: vec![0.78, 0.78, 0.78, 0.78, 0.78, 1.55, 1.55, 1.55],
+            },
+            &ScaleGroup {
+                stem: "small",
+                filter: Some("Ha"),
+                hour: 2,
+                written: false,
+                scales: vec![0.78; 4],
+            },
+        );
+        let f = &fx.f;
+        let excluded_from_big: Vec<i64> = fx.ids[0][..5].to_vec();
 
         set_set_config(&f.conn, f.set_id, "{}", &excluded_from_big).unwrap();
 
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan = set_plan_of(f);
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
 
-        let big_group = plan
-            .groups
-            .iter()
-            .find(|g| g.frame_count == 8)
-            .expect("the 8-member group exists");
-        let small_group = plan
-            .groups
-            .iter()
-            .find(|g| g.frame_count == 4)
-            .expect("the 4-member group exists");
+        let big_group = group_of_size(&plan, 8, "the 8-member group exists");
+        let small_group = group_of_size(&plan, 4, "the 4-member group exists");
         assert_eq!(big_group.included_count, 3);
         assert_eq!(small_group.included_count, 4);
 
@@ -5591,17 +5445,7 @@ mod tests {
         // Point 2: the SMALL group (4 included > the big group's 3) wins
         // the largest-group-scale ranking, so the warning names the BIG
         // group (far from 0.78), never the small one.
-        let far_warnings: Vec<&String> = plan
-            .warnings
-            .iter()
-            .filter(|w| w.contains("\u{d7}2.0"))
-            .collect();
-        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(
-            far_warnings[0].contains(&big_group.key),
-            "{:?}",
-            far_warnings
-        );
+        assert_one_far_warning(&plan, "\u{d7}2.0", &big_group.key);
 
         assert!(
             (small_group.scale_ratio_to_reference.unwrap() - 1.0).abs() < 1e-9,
@@ -5647,31 +5491,9 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let _folders = set_stacking_folders(&f.conn);
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
-
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan = set_plan_of(&f);
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
@@ -5707,15 +5529,7 @@ mod tests {
         test_fixtures::seed_plate_solve_scale(&f.conn, outlier_id, 1.55);
         ids.push(outlier_id);
 
-        let settings = SettingsManager::new();
-        let plan_all = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan_all = set_plan_of(&f);
         assert!(
             plan_all
                 .warnings
@@ -5726,14 +5540,7 @@ mod tests {
         );
 
         set_set_config(&f.conn, f.set_id, "{}", &[outlier_id]).unwrap();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan = set_plan_of(&f);
         assert!(
             !plan
                 .warnings
@@ -5757,31 +5564,9 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let _folders = set_stacking_folders(&f.conn);
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
-
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan = set_plan_of(&f);
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups[0].pixel_scale_arcsec, None);
@@ -7147,6 +6932,26 @@ mod tests {
         reference_mode: &str,
         frame_ids: &[i64],
     ) -> i64 {
+        seed_run_frame_rows_excluding(
+            conn,
+            frames_set_id,
+            reference_frame_id,
+            reference_mode,
+            frame_ids,
+            &[],
+        )
+    }
+
+    /// [`seed_run_frame_rows`], but the frames in `excluded` (frame id, reason) are rows the RUN itself left out
+    /// (`included = false`, the reason recorded) and do not count in the group's `included_count`.
+    fn seed_run_frame_rows_excluding(
+        conn: &Connection,
+        frames_set_id: i64,
+        reference_frame_id: Option<i64>,
+        reference_mode: &str,
+        frame_ids: &[i64],
+        excluded: &[(i64, &str)],
+    ) -> i64 {
         let run_id = crate::db::stacking::insert_run(
             conn,
             &crate::db::stacking::NewRun {
@@ -7174,11 +6979,15 @@ mod tests {
                 exposure: None,
                 exposure_class: None,
                 frame_count: frame_ids.len() as i64,
-                included_count: frame_ids.len() as i64,
+                included_count: (frame_ids.len() - excluded.len()) as i64,
             },
         )
         .unwrap();
         for &frame_id in frame_ids {
+            let reason = excluded
+                .iter()
+                .find(|(id, _)| *id == frame_id)
+                .map(|(_, reason)| *reason);
             crate::db::stacking::upsert_frame_row(
                 conn,
                 &StackSubject::FrameSet(frames_set_id),
@@ -7186,8 +6995,8 @@ mod tests {
                     run_id,
                     group_id,
                     frame_id,
-                    included: true,
-                    exclusion_reason: None,
+                    included: reason.is_none(),
+                    exclusion_reason: reason,
                     weight: None,
                     weight_channels_json: None,
                     metrics_json: None,
@@ -7237,6 +7046,78 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// Three on-disk lights of one group with the master dark and flat linked: the fixture the single-group
+    /// `register_stale_*` tests share. Returns the set and the light ids in time order.
+    fn written_lights_with_masters() -> (test_fixtures::Fixture, Vec<i64>) {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        (f, ids)
+    }
+
+    /// The key of the set's one group under `cfg`, and the calibration hash of each of its frames.
+    #[track_caller]
+    fn one_group_calibration_hashes(
+        f: &test_fixtures::Fixture,
+        cfg: &StackingConfig,
+    ) -> (String, HashMap<i64, String>) {
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+        (groups[0].key.clone(), calib_hashes)
+    }
+
+    /// One registration row and one registered artifact for each of `frame_ids`, all registered onto
+    /// `reference_id` and keyed under `cfg` the way a run keys them.
+    fn seed_registration_rows(
+        f: &test_fixtures::Fixture,
+        cfg: &StackingConfig,
+        group_key: &str,
+        calib_hashes: &HashMap<i64, String>,
+        reference_id: i64,
+        frame_ids: &[i64],
+    ) {
+        let reference_hash = calib_hashes.get(&reference_id).unwrap().clone();
+        for &frame_id in frame_ids {
+            let frame_hash = calib_hashes.get(&frame_id).unwrap();
+            let frame_measurement_hash = measurement_hash_for(cfg, frame_hash, None);
+            let expected = registration_hash_for(
+                cfg,
+                reference_id,
+                &reference_hash,
+                frame_hash,
+                &frame_measurement_hash,
+                "",
+            );
+            let is_reference = frame_id == reference_id;
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id,
+                reference_frame_id: reference_id,
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            seed_registered_artifact(f, group_key, frame_id, rec.config_hash.as_deref().unwrap());
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
     }
 
     /// A minimal, genuinely-parseable `metrics` artifact payload (Tier C
@@ -8708,136 +8589,30 @@ mod tests {
     /// Register not stale — only the frames the run actually kept matter.
     #[test]
     fn register_stale_ignores_a_frame_the_run_excluded() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let (id, _path) =
-                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
-            ids.push(id);
-        }
-        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let (f, ids) = written_lights_with_masters();
 
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
         set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
 
-        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
-        assert_eq!(groups.len(), 1, "one group expected for this fixture");
-
-        let mut divisors = DivisorCache::new();
-        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
-        for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
-            calib_hashes.insert(gf.frame_id, hash);
-        }
+        let (group_key, calib_hashes) = one_group_calibration_hashes(&f, &cfg);
 
         // Run: ids[0]/ids[1] included, ids[2] excluded by the run itself
         // (e.g. dropped below the weight floor at stage 3).
-        let run_id = crate::db::stacking::insert_run(
+        seed_run_frame_rows_excluding(
             &f.conn,
-            &crate::db::stacking::NewRun {
-                subject: &StackSubject::FrameSet(f.set_id),
-                config_json: "{}",
-                config_hash: "h",
-                reference_frame_id: Some(ids[0]),
-                reference_mode: "manual",
-                working_dir: "/w",
-                output_dir: "/o",
-            },
-        )
-        .unwrap();
-        let group_id = crate::db::stacking::insert_group(
-            &f.conn,
-            &crate::db::stacking::NewGroup {
-                run_id,
-                group_key: "g",
-                instrume: None,
-                color_mode: "mono",
-                filter: None,
-                binning: Some(1),
-                width: Some(1),
-                height: Some(1),
-                exposure: None,
-                exposure_class: None,
-                frame_count: 3,
-                included_count: 2,
-            },
-        )
-        .unwrap();
-        for (i, &frame_id) in ids.iter().enumerate() {
-            crate::db::stacking::upsert_frame_row(
-                &f.conn,
-                &StackSubject::FrameSet(f.set_id),
-                &crate::db::stacking::NewFrameRow {
-                    run_id,
-                    group_id,
-                    frame_id,
-                    included: i != 2,
-                    exclusion_reason: if i == 2 {
-                        Some("below the weight floor")
-                    } else {
-                        None
-                    },
-                    weight: None,
-                    weight_channels_json: None,
-                    metrics_json: None,
-                    reg_status: None,
-                    reg_model: None,
-                    reg_rms_px: None,
-                    reg_inliers: None,
-                    reg_inlier_ratio: None,
-                    reg_flipped: None,
-                    rejected_fraction: None,
-                },
-            )
-            .unwrap();
-        }
+            f.set_id,
+            Some(ids[0]),
+            "manual",
+            &ids,
+            &[(ids[2], "below the weight floor")],
+        );
 
         // Registration rows for the two INCLUDED frames only — none at all
         // for ids[2], the run-excluded one.
-        let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
-        for &frame_id in &ids[..2] {
-            let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
-            let expected = registration_hash_for(
-                &cfg,
-                ids[0],
-                &reference_hash,
-                frame_hash,
-                &frame_measurement_hash,
-                "",
-            );
-            let is_reference = frame_id == ids[0];
-            let rec = RegistrationRecord {
-                frames_set_id: f.set_id,
-                frame_id,
-                reference_frame_id: ids[0],
-                is_reference,
-                status: if is_reference { "reference" } else { "aligned" }.to_string(),
-                compute_time_ms: 0,
-                registered_at: "2025-01-01T00:00:00Z".to_string(),
-                config_hash: Some(expected),
-                source_kind: Some("calibrated".to_string()),
-                ..RegistrationRecord::default()
-            };
-            seed_registered_artifact(
-                &f,
-                &groups[0].key,
-                frame_id,
-                rec.config_hash.as_deref().unwrap(),
-            );
-            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
-        }
+        seed_registration_rows(&f, &cfg, &group_key, &calib_hashes, ids[0], &ids[..2]);
 
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(cfg),
-        )
-        .unwrap();
+        let plan = set_plan_with(&f, Some(cfg));
         assert!(
             !plan.stale_stages.contains(&Stage::Register),
             "a frame the run itself excluded must not force Register stale: {:?}",
@@ -8854,14 +8629,7 @@ mod tests {
     /// wrong) `reference_frame_id`.
     #[test]
     fn register_stale_auto_mode_follows_the_runs_own_reference() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let (id, _path) =
-                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
-            ids.push(id);
-        }
-        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let (f, ids) = written_lights_with_masters();
 
         let cfg = StackingConfig::default();
         assert_eq!(
@@ -8870,61 +8638,13 @@ mod tests {
             "the default is Auto"
         );
 
-        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
-        assert_eq!(groups.len(), 1, "one group expected for this fixture");
-
-        let mut divisors = DivisorCache::new();
-        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
-        for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
-            calib_hashes.insert(gf.frame_id, hash);
-        }
+        let (group_key, calib_hashes) = one_group_calibration_hashes(&f, &cfg);
 
         seed_run_frame_rows(&f.conn, f.set_id, Some(ids[0]), "auto", &ids);
 
-        let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
-        for &frame_id in &ids {
-            let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
-            let expected = registration_hash_for(
-                &cfg,
-                ids[0],
-                &reference_hash,
-                frame_hash,
-                &frame_measurement_hash,
-                "",
-            );
-            let is_reference = frame_id == ids[0];
-            let rec = RegistrationRecord {
-                frames_set_id: f.set_id,
-                frame_id,
-                reference_frame_id: ids[0],
-                is_reference,
-                status: if is_reference { "reference" } else { "aligned" }.to_string(),
-                compute_time_ms: 0,
-                registered_at: "2025-01-01T00:00:00Z".to_string(),
-                config_hash: Some(expected),
-                source_kind: Some("calibrated".to_string()),
-                ..RegistrationRecord::default()
-            };
-            seed_registered_artifact(
-                &f,
-                &groups[0].key,
-                frame_id,
-                rec.config_hash.as_deref().unwrap(),
-            );
-            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
-        }
+        seed_registration_rows(&f, &cfg, &group_key, &calib_hashes, ids[0], &ids);
 
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(cfg.clone()),
-        )
-        .unwrap();
+        let plan = set_plan_with(&f, Some(cfg.clone()));
         assert!(
             !plan.stale_stages.contains(&Stage::Register),
             "{:?}",
@@ -8935,14 +8655,7 @@ mod tests {
         // rows still point at the OLD one.
         seed_run_frame_rows(&f.conn, f.set_id, Some(ids[1]), "auto", &ids);
 
-        let plan2 = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(cfg),
-        )
-        .unwrap();
+        let plan2 = set_plan_with(&f, Some(cfg));
         assert!(
             plan2.stale_stages.contains(&Stage::Register),
             "a reference change the registration rows don't reflect must be stale: {:?}",
@@ -8959,68 +8672,19 @@ mod tests {
     /// group.
     #[test]
     fn register_stale_native_mode_follows_each_groups_own_reference() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let (id, _path) =
-                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
-            ids.push(id);
-        }
-        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let (f, ids) = written_lights_with_masters();
 
         let mut cfg = StackingConfig::default();
         cfg.registration.geometry = RegistrationGeometry::Native;
 
-        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
-        assert_eq!(groups.len(), 1, "one group expected for this fixture");
-        let group_key = groups[0].key.clone();
-
-        let mut divisors = DivisorCache::new();
-        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
-        for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
-            calib_hashes.insert(gf.frame_id, hash);
-        }
+        let (group_key, calib_hashes) = one_group_calibration_hashes(&f, &cfg);
 
         // Every row registered onto `ids[1]` — deliberately NOT the run
         // row's own `reference_frame_id`, so only the per-group summary can
         // explain them.
         let group_reference = ids[1];
-        let reference_hash = calib_hashes.get(&group_reference).unwrap().clone();
-        for &frame_id in &ids {
-            let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
-            let expected = registration_hash_for(
-                &cfg,
-                group_reference,
-                &reference_hash,
-                frame_hash,
-                &frame_measurement_hash,
-                "",
-            );
-            let is_reference = frame_id == group_reference;
-            let rec = RegistrationRecord {
-                frames_set_id: f.set_id,
-                frame_id,
-                reference_frame_id: group_reference,
-                is_reference,
-                status: if is_reference { "reference" } else { "aligned" }.to_string(),
-                compute_time_ms: 0,
-                registered_at: "2025-01-01T00:00:00Z".to_string(),
-                config_hash: Some(expected),
-                source_kind: Some("calibrated".to_string()),
-                ..RegistrationRecord::default()
-            };
-            seed_registered_artifact(
-                &f,
-                &group_key,
-                frame_id,
-                rec.config_hash.as_deref().unwrap(),
-            );
-            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
-        }
+        seed_registration_rows(&f, &cfg, &group_key, &calib_hashes, group_reference, &ids);
 
-        let settings = SettingsManager::new();
         let plan_with_summary = |summary_reference: i64| -> Vec<Stage> {
             let run_id = seed_run_frame_rows(&f.conn, f.set_id, Some(ids[0]), "auto", &ids);
             let summary = serde_json::json!({
@@ -9028,15 +8692,7 @@ mod tests {
             })
             .to_string();
             crate::db::stacking::finish_run(&f.conn, run_id, "done", Some(&summary), None).unwrap();
-            build_plan(
-                &f.conn,
-                &settings,
-                &PathPolicy::AllowAll,
-                &StackSubject::FrameSet(f.set_id),
-                Some(cfg.clone()),
-            )
-            .unwrap()
-            .stale_stages
+            set_plan_with(&f, Some(cfg.clone())).stale_stages
         };
 
         let fresh = plan_with_summary(group_reference);
@@ -9077,28 +8733,13 @@ mod tests {
     /// `register_stale_auto_mode_follows_the_runs_own_reference`.)
     #[test]
     fn register_stale_accepts_a_two_pass_switched_reference() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        let mut ids = Vec::new();
-        for (i, t) in THREE_TIMES.iter().enumerate() {
-            let (id, _path) =
-                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
-            ids.push(id);
-        }
-        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let (f, ids) = written_lights_with_masters();
 
         let cfg = StackingConfig::default();
         assert_eq!(cfg.reference.mode, ReferenceMode::Auto);
         assert!(cfg.reference.two_pass, "the default is on");
 
-        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
-        assert_eq!(groups.len(), 1, "one group expected for this fixture");
-
-        let mut divisors = DivisorCache::new();
-        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
-        for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
-            calib_hashes.insert(gf.frame_id, hash);
-        }
+        let (group_key, calib_hashes) = one_group_calibration_hashes(&f, &cfg);
 
         // The run STARTED on ids[0] (best weight) and the two-pass pick
         // switched it to ids[1]; `set_run_reference` left the row naming
@@ -9106,49 +8747,9 @@ mod tests {
         let switched_to = ids[1];
         seed_run_frame_rows(&f.conn, f.set_id, Some(switched_to), "auto", &ids);
 
-        let reference_hash = calib_hashes.get(&switched_to).unwrap().clone();
-        for &frame_id in &ids {
-            let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash, None);
-            let expected = registration_hash_for(
-                &cfg,
-                switched_to,
-                &reference_hash,
-                frame_hash,
-                &frame_measurement_hash,
-                "",
-            );
-            let is_reference = frame_id == switched_to;
-            let rec = RegistrationRecord {
-                frames_set_id: f.set_id,
-                frame_id,
-                reference_frame_id: switched_to,
-                is_reference,
-                status: if is_reference { "reference" } else { "aligned" }.to_string(),
-                compute_time_ms: 0,
-                registered_at: "2025-01-01T00:00:00Z".to_string(),
-                config_hash: Some(expected),
-                source_kind: Some("calibrated".to_string()),
-                ..RegistrationRecord::default()
-            };
-            seed_registered_artifact(
-                &f,
-                &groups[0].key,
-                frame_id,
-                rec.config_hash.as_deref().unwrap(),
-            );
-            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
-        }
+        seed_registration_rows(&f, &cfg, &group_key, &calib_hashes, switched_to, &ids);
 
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(cfg.clone()),
-        )
-        .unwrap();
+        let plan = set_plan_with(&f, Some(cfg.clone()));
         assert!(
             !plan.stale_stages.contains(&Stage::Register),
             "a switched reference the rows already name must not be stale: {:?}",
@@ -9157,14 +8758,7 @@ mod tests {
 
         let mut off = cfg.clone();
         off.reference.two_pass = false;
-        let plan_off = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            Some(off),
-        )
-        .unwrap();
+        let plan_off = set_plan_with(&f, Some(off));
         assert!(
             !plan_off.stale_stages.contains(&Stage::Register),
             "reference.twoPass is not part of the registration stage hash: {:?}",
@@ -9182,15 +8776,7 @@ mod tests {
             test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
         }
 
-        let settings = SettingsManager::new();
-        let plan = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(f.set_id),
-            None,
-        )
-        .unwrap();
+        let plan = set_plan_of(&f);
         assert!(
             plan.stale_stages.contains(&Stage::Register),
             "{:?}",
@@ -10527,14 +10113,39 @@ mod tests {
     }
 
     fn set_plan_of(f: &test_fixtures::Fixture) -> StackingPlan {
+        set_plan_with(f, None)
+    }
+
+    /// [`set_plan_of`] under `cfg` (`None`: the set's own stored config, else the default).
+    fn set_plan_with(f: &test_fixtures::Fixture, cfg: Option<StackingConfig>) -> StackingPlan {
         build_plan(
             &f.conn,
             &SettingsManager::new(),
             &PathPolicy::AllowAll,
             &StackSubject::FrameSet(f.set_id),
-            None,
+            cfg,
         )
         .unwrap()
+    }
+
+    /// Points the working and output folders at fresh temporary directories, so the plan carries no folder
+    /// blocker. The directories live as long as the returned guards: bind them (`let _folders = ...`).
+    fn set_stacking_folders(conn: &Connection) -> (tempfile::TempDir, tempfile::TempDir) {
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+        (working, output)
     }
 
     /// Plan 6c Task 1: an attested set is prepared like a project, so its plan counts the same way.
