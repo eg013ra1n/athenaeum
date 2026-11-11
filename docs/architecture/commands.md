@@ -41,3 +41,36 @@ pub async fn get_my_setting(State(state): State<AppState>) -> impl IntoResponse 
 }
 ```
 
+
+## The two command lists are held together by a test (2026-11-11)
+
+`crates/athenaeum-web/src/routes/parity_tests.rs` reads the desktop's `generate_handler![…]` list and the
+`.route("/api/…")` calls of `build_router` as text and fails when a command is registered in one host only. A
+route the web host has on purpose goes into the test's `WEB_ONLY` list with its reason (five today: `events`,
+`browse_directories`, `get_export_dir`, `get_cache_stats`, `stacking/master-preview`). A desktop-only command still
+gets a route, one that answers "not available in web mode".
+
+The test compares names, not behaviour. What keeps behaviour the same is rule 1 above: one function in
+`athenaeum-core/src/api/`, two wrappers that unpack arguments, call it and map the error (`.map_err(|e|
+e.to_string())` on the desktop, `routes::api_err` on the web, which turns the `ApiError` variant into the HTTP
+status).
+
+### Logic moved out of the hosts on 2026-11-11
+
+Both hosts carried their own copy of these; each now has one in core.
+
+| Core module | Functions |
+| ---- | ---- |
+| `api/frame_sets.rs` | `split_frame_set`, `create_frame_set_from_selection`, `auto_merge_new_frames_for_set` |
+| `api/missing_files.rs` (new) | `get_missing_files`, `recheck_missing_files`, `MissingFileRecord` |
+| `api/settings.rs` | `set_setting` (the monitor is a parameter, as in `set_scan_root_monitor_enabled`) |
+| `api/archive.rs` (new) | `list_archived_frame_sets`, `list_archive_zips`, `get_restore_suggestions`, `delete_archive`, `start_restore_operation` |
+| `api/export.rs` | `export_to_wbpp` (the web's export directory is the `allowed_export_dir` parameter), the WBPP config commands |
+| `api/plate_solve.rs` | `download_catalog_layers`, `CatalogDownloadProgress` |
+| `api/scan_roots.rs`, `api/files.rs` | already there; the web routes `check_missing_files_in_scan_root`, `set_scan_root_unique_camera_flag`, `get_duplicates` now call them |
+
+Still copied in both hosts, because the copies differ in behaviour and the owner has not ruled which side wins:
+`plate_solve_batch`, `autofind_objects_from_coordinates`, `find_new_frames_for_set`, `start_archive_operation`. Also
+still copied, same behaviour, not yet moved: the archive root commands, `resume_archive_operation`,
+`rollback_archive_operation`, `plan_archive_operation`, the frame-set detail loader, the export preview and summary
+commands, and the rest of `missing_files`.

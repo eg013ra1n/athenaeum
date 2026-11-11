@@ -530,6 +530,9 @@ async fn read_fits_image_rustafits_stub(
     (StatusCode::NOT_IMPLEMENTED, "read_fits_image_rustafits is not available in web mode".to_string())
 }
 
+#[cfg(test)]
+mod parity_tests;
+
 // `pub(crate)` (Plan 5a Task 9): `routes::stacking`'s own router-level test
 // reuses this real-`WebAppState` builder rather than hand-rolling a second
 // one — same reasoning as the doc comment on `test_state` itself.

@@ -1586,11 +1586,8 @@ pub fn check_all_scan_roots_availability(
 }
 
 /// Check for missing files within a scan root. Emits `verifying`-phase
-/// progress before/after the (parallel) filesystem check.
-///
-/// Web-side counterpart lives in `routes/missing_files.rs` (not
-/// `routes/scan_roots.rs`) and was NOT converted in Task 9 — out of that
-/// file's declared scope; see Task 9 report for the gap.
+/// progress before/after the (parallel) filesystem check. Both hosts call
+/// it; the web route lives in `routes/missing_files.rs`.
 pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
     ctx: &ServiceContext,
     root_id: i64,
@@ -1679,11 +1676,8 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
     Ok(missing_files)
 }
 
-/// Toggle unique_camera flag (flag-only, cascade happens on re-scan).
-///
-/// Web-side counterpart lives in `routes/duplicates.rs` (not
-/// `routes/scan_roots.rs`) and was NOT converted in Task 9 — out of that
-/// file's declared scope; see Task 9 report for the gap.
+/// Toggle unique_camera flag (flag-only, cascade happens on re-scan). Both
+/// hosts call it; the web route lives in `routes/duplicates.rs`.
 pub fn set_scan_root_unique_camera_flag(
     ctx: &ServiceContext,
     id: i64,

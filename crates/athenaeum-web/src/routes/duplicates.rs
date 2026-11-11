@@ -77,42 +77,9 @@ pub async fn get_duplicates(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<Vec<athenaeum_core::models::DuplicateGroup>>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    // Content mode is a single explicit key over every file. Otherwise the
-    // view is Header (raw sub-frames, decided by their stored header) plus
-    // Master (everything else, decided by a full-file hash) — the two
-    // eligibility clauses are complements over the CLASSIFIED files, so no
-    // file is decided twice (an unclassified `imagetyp IS NULL` frame is
-    // deliberately in neither — see `DuplicateKey::eligibility`).
-    let keys: &[athenaeum_core::db::DuplicateKey] = if state
-        .ctx
-        .settings
-        .get_duplicates_use_content_hash(&conn)
-        .unwrap_or(false)
-    {
-        &[athenaeum_core::db::DuplicateKey::Content]
-    } else {
-        &[
-            athenaeum_core::db::DuplicateKey::Header,
-            athenaeum_core::db::DuplicateKey::Master,
-        ]
-    };
-
-    let mut all = Vec::new();
-    for &key in keys {
-        let groups = if athenaeum_core::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
-            // Fast path: warm cache.
-            athenaeum_core::db::get_cached_duplicates(&conn, key).map_err(db_err)?
-        } else {
-            // Slow path: compute now.
-            athenaeum_core::db::find_duplicate_groups(&conn, key).map_err(db_err)?
-        };
-        all.extend(groups);
-    }
-    all.sort_by(|a, b| b.file_count.cmp(&a.file_count).then(b.size.cmp(&a.size)));
-    Ok(Json(all))
+    athenaeum_core::api::files::get_duplicates(&state.ctx)
+        .map(Json)
+        .map_err(crate::routes::api_err)
 }
 
 /// Soft-delete a file by adding it to the black hole.
@@ -417,14 +384,13 @@ pub async fn set_scan_root_unique_camera_flag(
     State(state): State<WebAppState>,
     Json(args): Json<SetScanRootUniqueCameraFlagArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    athenaeum_core::db::set_unique_camera_flag(&conn, args.id, args.enabled)
-        .map_err(db_err)?;
-
-    tracing::info!(root_id = args.id, enabled = args.enabled, "unique_camera flag set");
-    Ok(Json(()))
+    athenaeum_core::api::scan_roots::set_scan_root_unique_camera_flag(
+        &state.ctx,
+        args.id,
+        args.enabled,
+    )
+    .map(Json)
+    .map_err(crate::routes::api_err)
 }
 
 /// Deep-verify two CATALOG files, banking the read (mirror of the Tauri

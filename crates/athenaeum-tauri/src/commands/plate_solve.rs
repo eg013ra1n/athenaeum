@@ -783,18 +783,6 @@ pub async fn get_frame_fov_summary(
 
 // ========== Catalog Download ==========
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CatalogDownloadProgress {
-    phase: String,
-    current: usize,
-    total: usize,
-    percent: f64,
-    tier_density: u32,
-    tier_index: usize,
-    n_tiers: usize,
-}
-
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn download_catalog_layers(
@@ -802,59 +790,10 @@ pub async fn download_catalog_layers(
     state: State<'_, AppState>,
     target_density: u32,
 ) -> Result<String, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let app_data_dir = db.path().to_path_buf().parent()
-        .ok_or("Cannot determine app data directory")?.to_path_buf();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let app_clone = app.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
-        let cur = std::sync::Mutex::new((0u32, 0usize, 0usize)); // (density, index, n_tiers)
-        athenaeum_core::catalog::gaia_prebuilt::download_catalog_layers(
-            &app_data_dir,
-            target_density,
-            cancel_flag,
-            &|progress| {
-                let (td, ti, nt) = *cur.lock().unwrap();
-                let event = match progress {
-                    P::Tier { density, index, n_tiers } => {
-                        *cur.lock().unwrap() = (density, index, n_tiers);
-                        CatalogDownloadProgress {
-                            phase: "tier".into(), current: index, total: n_tiers,
-                            percent: 0.0, tier_density: density, tier_index: index, n_tiers,
-                        }
-                    }
-                    P::Downloading { received, total } => CatalogDownloadProgress {
-                        phase: "downloading".into(), current: received as usize, total: total as usize,
-                        percent: if total > 0 { received as f64 / total as f64 * 100.0 } else { 0.0 },
-                        tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Verifying => CatalogDownloadProgress {
-                        phase: "verifying".into(), current: 0, total: 0,
-                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Extracting { done, total } => CatalogDownloadProgress {
-                        phase: "extracting".into(), current: done, total,
-                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Complete { files } => CatalogDownloadProgress {
-                        phase: "complete".into(), current: files, total: files,
-                        percent: 100.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Error(_) => CatalogDownloadProgress {
-                        phase: "error".into(), current: 0, total: 0,
-                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                };
-                let _ = app_clone.emit("catalog-download-progress", event);
-            },
-        )
-    })
-    .await
-    .map_err(|e| format!("download task panicked: {e}"))?;
-
-    result.map(|p| p.display().to_string()).map_err(|e| e.to_string())
+    let emitter = Arc::new(crate::tauri_events::TauriProgressEmitter(app));
+    athenaeum_core::api::plate_solve::download_catalog_layers(&state.ctx, emitter, target_density)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ========== Quad Index Packs ==========

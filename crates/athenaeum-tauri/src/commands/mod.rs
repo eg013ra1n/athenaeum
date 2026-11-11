@@ -6,7 +6,7 @@
 use std::sync::{Arc, RwLock};
 
 // Re-export core service types so commands can use them directly
-pub use athenaeum_core::services::{ServiceContext, ExportHandle};
+pub use athenaeum_core::services::ServiceContext;
 
 /// Tauri-specific app state wrapping the shared ServiceContext.
 ///

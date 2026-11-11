@@ -140,94 +140,6 @@ fn load_frame_set_detail(
     Ok(athenaeum_core::models::FrameSetDetail { frames_set, nights })
 }
 
-/// Shared inner logic for creating a custom frame set from a list of frame IDs.
-/// Returns the new frame set ID.
-fn create_frame_set_inner(
-    conn: &rusqlite::Connection,
-    name: &str,
-    frame_ids: &[i64],
-    settings: &std::sync::Arc<athenaeum_core::settings::SettingsManager>,
-) -> Result<i64, String> {
-    use athenaeum_core::db;
-
-    if frame_ids.is_empty() {
-        return Err("Cannot create frame set with no frames".to_string());
-    }
-
-    let metadata =
-        athenaeum_core::frames_set_metadata::calculate_metadata_from_frame_ids(frame_ids, conn)
-            .map_err(|e| format!("Failed to calculate metadata: {}", e))?;
-
-    let set_id = db::create_frames_set(
-        conn,
-        Some(name),
-        true, // is_custom
-        metadata.date_obs_start.as_deref(),
-        metadata.date_obs_end.as_deref(),
-        metadata.objctra.as_deref(),
-        metadata.objctdec.as_deref(),
-        metadata.total_exp_time,
-        metadata.avg_rotation,
-        metadata.min_rotation,
-        metadata.max_rotation,
-    )
-    .map_err(|e| format!("Failed to create frames_set: {}", e))?;
-
-    let frames = db::get_frames_with_files_by_ids(conn, frame_ids)
-        .map_err(|e| format!("Failed to get frames: {}", e))?;
-
-    let gap_threshold_hours: f64 = settings
-        .get_session_gap_threshold_hours(conn)
-        .unwrap_or(6.0);
-
-    let detected_nights = athenaeum_core::sessions::detect_sessions(frames, gap_threshold_hours)
-        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
-
-    if detected_nights.is_empty() {
-        let now = chrono::Utc::now();
-        let night_start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let night_end =
-            (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        let night_id = db::create_imaging_night(conn, set_id, &night_start, &night_end)
-            .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
-
-        let session_id = db::create_session(
-            conn,
-            night_id,
-            "Unknown",
-            frame_ids.len() as i32,
-            metadata.total_exp_time,
-        )
-        .map_err(|e| format!("Failed to create session: {}", e))?;
-
-        db::insert_session_members(conn, session_id, frame_ids)
-            .map_err(|e| format!("Failed to add frames to session: {}", e))?;
-    } else {
-        for night in &detected_nights {
-            let night_id =
-                db::create_imaging_night(conn, set_id, &night.start_time, &night.end_time)
-                    .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
-
-            for session in &night.sessions {
-                let session_id = db::create_session(
-                    conn,
-                    night_id,
-                    &session.instrume,
-                    session.frame_ids.len() as i32,
-                    session.total_exp_time,
-                )
-                .map_err(|e| format!("Failed to create session: {}", e))?;
-
-                db::insert_session_members(conn, session_id, &session.frame_ids)
-                    .map_err(|e| format!("Failed to add frames to session: {}", e))?;
-            }
-        }
-    }
-
-    Ok(set_id)
-}
-
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// Auto-generate frame sets by clustering light frames on sky coordinates.
@@ -454,198 +366,13 @@ pub async fn split_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<SplitFrameSetArgs>,
 ) -> Result<Json<athenaeum_core::models::FrameSetDetail>, (StatusCode, String)> {
-    use athenaeum_core::db;
-    use athenaeum_core::models::SplitSelection;
-
-    let new_set_id = {
-        let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-        let conn = db_ref.conn();
-
-        // Validate: split must not leave the source empty.
-        let all_nights =
-            db::get_imaging_nights_for_set(&conn, args.source_set_id).map_err(db_err)?;
-
-        let can_split = match &args.selection {
-            SplitSelection::Nights { ids } => ids.len() < all_nights.len(),
-            SplitSelection::Sessions { ids } => {
-                let mut total = 0;
-                for night in &all_nights {
-                    if let Some(night_id) = night.id {
-                        let sessions =
-                            db::get_sessions_for_night(&conn, night_id).map_err(db_err)?;
-                        total += sessions.len();
-                    }
-                }
-                ids.len() < total
-            }
-            SplitSelection::Frames { ids } => {
-                let total: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(DISTINCT sm.frame_id)
-                         FROM session_members sm
-                         JOIN sessions s ON sm.session_id = s.id
-                         JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
-                         WHERE in_tbl.frames_set_id = ?1",
-                        [args.source_set_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(db_err)?;
-                ids.len() < total as usize
-            }
-        };
-
-        if !can_split {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Cannot split: operation would leave the source frame set empty".to_string(),
-            ));
-        }
-
-        // Collect frame IDs from the selection.
-        let frame_ids: Vec<i64> = match &args.selection {
-            SplitSelection::Nights { ids } => {
-                let mut frames = Vec::new();
-                for night_id in ids {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT DISTINCT sm.frame_id
-                             FROM session_members sm
-                             JOIN sessions s ON sm.session_id = s.id
-                             WHERE s.imaging_night_id = ?1",
-                        )
-                        .map_err(db_err)?;
-                    let night_frames: Vec<i64> = stmt
-                        .query_map([night_id], |row| row.get(0))
-                        .map_err(db_err)?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(db_err)?;
-                    frames.extend(night_frames);
-                }
-                frames
-            }
-            SplitSelection::Sessions { ids } => {
-                let mut frames = Vec::new();
-                for &session_id in ids {
-                    let session_frames =
-                        db::get_frame_ids_for_session(&conn, session_id).map_err(db_err)?;
-                    frames.extend(session_frames);
-                }
-                frames
-            }
-            SplitSelection::Frames { ids } => ids.clone(),
-        };
-
-        if frame_ids.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "No frames to split".to_string()));
-        }
-
-        let gap_threshold_hours: f64 = state
-            .ctx
-            .settings
-            .get_session_gap_threshold_hours(&conn)
-            .unwrap_or(6.0);
-
-        let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_from_frame_ids(
-            &frame_ids, &conn,
-        )
-        .map_err(db_err)?;
-
-        let new_set_id = db::create_frames_set(
-            &conn,
-            Some(&args.new_name),
-            true, // always custom after split
-            metadata.date_obs_start.as_deref(),
-            metadata.date_obs_end.as_deref(),
-            metadata.objctra.as_deref(),
-            metadata.objctdec.as_deref(),
-            metadata.total_exp_time,
-            metadata.avg_rotation,
-            metadata.min_rotation,
-            metadata.max_rotation,
-        )
-        .map_err(db_err)?;
-
-        let frames_data = db::get_frames_with_files_by_ids(&conn, &frame_ids).map_err(db_err)?;
-        let detected_nights =
-            athenaeum_core::sessions::detect_sessions(frames_data, gap_threshold_hours)
-                .map_err(db_err)?;
-
-        for night in &detected_nights {
-            let night_id =
-                db::create_imaging_night(&conn, new_set_id, &night.start_time, &night.end_time)
-                    .map_err(db_err)?;
-
-            for session in &night.sessions {
-                let session_id = db::create_session(
-                    &conn,
-                    night_id,
-                    &session.instrume,
-                    session.frame_ids.len() as i32,
-                    session.total_exp_time,
-                )
-                .map_err(db_err)?;
-
-                db::insert_session_members(&conn, session_id, &session.frame_ids)
-                    .map_err(db_err)?;
-            }
-        }
-
-        // Remove the split frames from the source.
-        match &args.selection {
-            SplitSelection::Nights { ids } => {
-                for night_id in ids {
-                    conn.execute("DELETE FROM imaging_nights WHERE id = ?1", [night_id])
-                        .map_err(db_err)?;
-                }
-            }
-            SplitSelection::Sessions { ids } => {
-                for session_id in ids {
-                    conn.execute("DELETE FROM sessions WHERE id = ?1", [session_id])
-                        .map_err(db_err)?;
-                }
-            }
-            SplitSelection::Frames { ids } => {
-                for frame_id in ids {
-                    conn.execute(
-                        "DELETE FROM session_members
-                         WHERE frame_id = ?1
-                         AND session_id IN (
-                             SELECT s.id FROM sessions s
-                             JOIN imaging_nights n ON s.imaging_night_id = n.id
-                             WHERE n.frames_set_id = ?2
-                         )",
-                        rusqlite::params![frame_id, args.source_set_id],
-                    )
-                    .map_err(db_err)?;
-                }
-            }
-        }
-
-        // Recalculate and persist metadata for the now-smaller source.
-        let source_metadata =
-            athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
-                args.source_set_id,
-                &conn,
-            )
-            .map_err(db_err)?;
-
-        db::update_frames_set_metadata(
-            &conn,
-            args.source_set_id,
-            source_metadata.date_obs_start.as_deref(),
-            source_metadata.date_obs_end.as_deref(),
-            source_metadata.objctra.as_deref(),
-            source_metadata.objctdec.as_deref(),
-            source_metadata.total_exp_time,
-            true,
-            source_metadata.avg_rotation,
-            source_metadata.min_rotation,
-            source_metadata.max_rotation,
-        )
-        .map_err(db_err)?;
-
-        new_set_id
-    };
+    let new_set_id = athenaeum_core::api::frame_sets::split_frame_set(
+        &state.ctx,
+        args.source_set_id,
+        args.selection,
+        &args.new_name,
+    )
+    .map_err(api_err)?;
 
     // Return detail of the newly created set.
     let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
@@ -660,11 +387,12 @@ pub async fn create_frame_set_from_selection(
     State(state): State<WebAppState>,
     Json(args): Json<CreateFrameSetFromSelectionArgs>,
 ) -> Result<Json<i64>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let set_id = create_frame_set_inner(&conn, &args.name, &args.frame_ids, &state.ctx.settings)
-        .map_err(db_err)?;
+    let set_id = athenaeum_core::api::frame_sets::create_frame_set_from_selection(
+        &state.ctx,
+        &args.name,
+        &args.frame_ids,
+    )
+    .map_err(api_err)?;
 
     Ok(Json(set_id))
 }
@@ -817,80 +545,15 @@ pub async fn auto_merge_new_frames_for_set(
     State(state): State<WebAppState>,
     Json(args): Json<AutoMergeArgs>,
 ) -> Result<Json<athenaeum_core::models::MergeReport>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-
-    let candidates = {
-        let conn = db_ref.conn();
-        let threshold_deg = state
-            .ctx
-            .settings
-            .get_grouping_threshold_deg(&conn)
-            .map_err(db_err)?;
-        let all = athenaeum_core::auto_merge::find_candidates_for_set(
-            &conn,
-            args.frames_set_id,
-            threshold_deg,
-        )
-        .map_err(db_err)?;
-        let wanted: std::collections::HashSet<i64> = args.frame_ids.iter().copied().collect();
-        all.into_iter()
-            .filter(|c| wanted.contains(&c.frame_id))
-            .collect::<Vec<_>>()
-    };
-
-    let threshold_arcmin = {
-        let conn = db_ref.conn();
-        state
-            .ctx
-            .settings
-            .get_grouping_threshold_arcsec(&conn)
-            .map_err(db_err)?
-            / 60.0
-    };
-    let gap_hours = {
-        let conn = db_ref.conn();
-        state
-            .ctx
-            .settings
-            .get_session_gap_threshold_hours(&conn)
-            .unwrap_or(6.0)
-    };
-
-    let frames_set_name: Option<String> = {
-        let conn = db_ref.conn();
-        conn.query_row(
-            "SELECT name FROM frames_set WHERE id = ?1",
-            rusqlite::params![args.frames_set_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-    };
-
-    let mut conn = db_ref.conn();
-    let report = athenaeum_core::auto_merge::merge_candidates(
-        &mut conn,
+    let emitter = crate::events::SseProgressEmitter::new(state.event_tx.clone());
+    let report = athenaeum_core::api::frame_sets::auto_merge_new_frames_for_set(
+        &state.ctx,
         args.frames_set_id,
-        candidates,
+        &args.frame_ids,
         &args.source,
-        threshold_arcmin,
-        gap_hours,
+        &emitter,
     )
-    .map_err(db_err)?;
-
-    if report.added_count > 0 {
-        let payload = athenaeum_core::monitor::orchestrator::AutoMergeCompleteEvent {
-            frames_set_id: args.frames_set_id,
-            frames_set_name,
-            source: report.source.clone(),
-            added_count: report.added_count,
-            skipped_count: report.skipped_count,
-            threshold_arcmin,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
-        let emitter = crate::events::SseProgressEmitter::new(state.event_tx.clone());
-        athenaeum_core::events::emit_event(&emitter, "auto-merge-complete", &payload);
-    }
+    .map_err(api_err)?;
 
     Ok(Json(report))
 }

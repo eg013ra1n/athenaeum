@@ -5,13 +5,10 @@
 // conversion — see .superpowers/sdd/p1-task-9-report.md).
 //
 // NOTE: two commands whose Tauri counterpart lives in
-// `commands/scan_roots.rs` have their web counterpart in OTHER route
-// modules, not here: `check_missing_files_in_scan_root` is in
-// `routes/missing_files.rs`, and `set_scan_root_unique_camera_flag` is in
-// `routes/duplicates.rs`. Both were left un-converted in Task 9 — out of
-// this file's declared scope; the shared `api::scan_roots` handlers for them
-// exist (used by the Tauri side) but these two web routes still carry their
-// own (pre-conversion, unmodified) inline logic. See the Task 9 report.
+// `commands/scan_roots.rs` have their web route in OTHER modules:
+// `check_missing_files_in_scan_root` in `routes/missing_files.rs` and
+// `set_scan_root_unique_camera_flag` in `routes/duplicates.rs`. Both call the
+// shared `api::scan_roots` handlers.
 
 use athenaeum_core::api::scan_roots as api;
 use athenaeum_core::api::PathPolicy;

@@ -1,0 +1,203 @@
+//! Missing-files commands that read or reconcile the `missing_files` table:
+//! the per-root listing and the recheck against the disk (and the zips). Both
+//! hosts wrap these; the table itself is kept by `db::sync_missing_files`.
+
+use crate::api::{db, ApiError};
+use crate::services::ServiceContext;
+
+/// Missing file record with status from the database
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MissingFileRecord {
+    pub id: i64,
+    pub file_id: i64,
+    pub scan_root_id: i64,
+    pub detected_at: String,
+    pub last_checked_at: String,
+    pub status: String, // "missing" or "ignored"
+    // File info
+    pub path: String,
+    pub filename: String,
+    pub size: i64,
+    pub modified_at: String,
+    // Frame info (if exists)
+    pub has_frame: bool,
+    pub object: Option<String>,
+    pub date_obs: Option<String>,
+}
+
+/// Get missing files for a specific scan root with full details.
+pub fn get_missing_files(
+    ctx: &ServiceContext,
+    root_id: i64,
+) -> Result<Vec<MissingFileRecord>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                mf.id,
+                mf.file_id,
+                mf.scan_root_id,
+                mf.detected_at,
+                mf.last_checked_at,
+                mf.status,
+                f.path,
+                f.filename,
+                f.size,
+                f.modified_at,
+                CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
+                fr.object,
+                fr.date_obs
+             FROM missing_files mf
+             JOIN files f ON f.id = mf.file_id
+             LEFT JOIN frames fr ON fr.file_id = f.id
+             WHERE mf.scan_root_id = ?1
+             ORDER BY mf.detected_at DESC",
+        )
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let records = stmt
+        .query_map([root_id], |row| {
+            Ok(MissingFileRecord {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                scan_root_id: row.get(2)?,
+                detected_at: row.get(3)?,
+                last_checked_at: row.get(4)?,
+                status: row.get(5)?,
+                path: row.get(6)?,
+                filename: row.get(7)?,
+                size: row.get(8)?,
+                modified_at: row.get(9)?,
+                has_frame: row.get::<_, i32>(10)? == 1,
+                object: row.get(11)?,
+                date_obs: row.get(12)?,
+            })
+        })
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(records)
+}
+
+/// Recheck missing files for a scan root and update their status.
+/// Returns the list of files that are still missing. No transaction: the
+/// DELETE and the UPDATE run one by one on the catalog connection.
+pub fn recheck_missing_files(
+    ctx: &ServiceContext,
+    root_id: i64,
+) -> Result<Vec<MissingFileRecord>, ApiError> {
+    // First phase: update the database
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Get all missing files for this root. Also pull the zip columns: a row
+        // inside a zip is found when its zip lists the entry, otherwise when
+        // its file is on disk.
+        let mut stmt = conn
+            .prepare(
+                "SELECT mf.id, mf.file_id, f.path, f.archive_zip_path, f.archive_path_in_zip
+                 FROM missing_files mf
+                 JOIN files f ON f.id = mf.file_id
+                 WHERE mf.scan_root_id = ?1",
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        let files: Vec<(i64, i64, String, Option<String>, Option<String>)> = stmt
+            .query_map([root_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        // The same presence rule the scan-root check uses.
+        let present =
+            crate::zip_store::presence::present_flags(&files, |(_, _, path, zip, entry)| {
+                (path.as_str(), zip.as_deref(), entry.as_deref())
+            });
+        let found_file_ids: Vec<i64> = files
+            .iter()
+            .zip(present)
+            .filter(|(_, present)| *present)
+            .map(|((mf_id, ..), _)| *mf_id)
+            .collect();
+
+        // Remove files that now exist
+        if !found_file_ids.is_empty() {
+            let placeholders: Vec<String> = found_file_ids.iter().map(|_| "?".to_string()).collect();
+            let placeholders_str = placeholders.join(",");
+            let delete_sql = format!(
+                "DELETE FROM missing_files WHERE id IN ({})",
+                placeholders_str
+            );
+            conn.execute(
+                &delete_sql,
+                rusqlite::params_from_iter(found_file_ids.iter()),
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        }
+
+        // Update last_checked_at for remaining files
+        conn.execute(
+            "UPDATE missing_files SET last_checked_at = ?1 WHERE scan_root_id = ?2",
+            rusqlite::params![&now, root_id],
+        )
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+
+    // Second phase: return the updated list
+    get_missing_files(ctx, root_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real-`Database` [`ServiceContext`] over a tempdir catalog.
+    fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        (tmp, ctx)
+    }
+
+    /// A file that is back on disk is dropped from `missing_files`; one that is
+    /// still absent stays, with `last_checked_at` refreshed.
+    #[test]
+    fn recheck_drops_files_back_on_disk_and_keeps_absent_ones() {
+        let (tmp, ctx) = test_ctx();
+        let back = tmp.path().join("back.fits");
+        std::fs::write(&back, b"x").unwrap();
+        let gone = tmp.path().join("gone.fits");
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [tmp.path().to_str().unwrap()])
+                .unwrap();
+            for (id, p, name) in [(1, &back, "back.fits"), (2, &gone, "gone.fits")] {
+                conn.execute(
+                    "INSERT INTO files (id, path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, ?3, 1, '2025-01-01T00:00:00Z', 'FITS')",
+                    rusqlite::params![id, p.to_str().unwrap(), name],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO missing_files (file_id, scan_root_id, detected_at, last_checked_at)
+                     VALUES (?1, 1, '2025-01-02T00:00:00Z', '2025-01-02T00:00:00Z')",
+                    [id],
+                )
+                .unwrap();
+            }
+        }
+
+        let still_missing = recheck_missing_files(&ctx, 1).expect("recheck");
+
+        assert_eq!(still_missing.len(), 1);
+        assert_eq!(still_missing[0].file_id, 2);
+        assert_eq!(still_missing[0].status, "missing");
+        assert_ne!(still_missing[0].last_checked_at, "2025-01-02T00:00:00Z");
+    }
+}
