@@ -15,10 +15,11 @@
 //! provider is `(in flight + 1) / uplink`, its streams over what it delivers
 //! across all of them. The uplink is METERED, not sampled ([`UplinkMeter`]):
 //! the bytes of every attempt on the provider, finished or still running, over
-//! the time it had work, read in windows of [`UPLINK_WINDOW`]. So a provider
-//! that has just gone slow stops getting items within a window, before any of
-//! its attempts ends, and one whose items are always rescued by a hedge is
-//! measured like any other. An idle provider's old reading recovers toward the
+//! the time it had work, read in windows of [`UPLINK_WINDOW`] that the run
+//! closes on a tick. So a provider that has just gone slow stops getting items
+//! within about a window, before any of its attempts ends, and one whose items
+//! are always rescued by a hedge is measured like any other. A hedge's provider
+//! is picked the same way. An idle provider's old reading recovers toward the
 //! best known one over [`UPLINK_RECOVERY`], which hands a slow provider one
 //! probe item now and then. With nobody measured the pick is the least-loaded
 //! one. It is ONE function, so the ranking is one edit. A [`ProviderSet`] may
@@ -166,17 +167,21 @@ const HEDGE_COMPLETION_WINDOW: usize = 32;
 /// "настроечное", a tuning value with no authority behind it).
 const GOODPUT_ALPHA: f64 = 0.25;
 
-/// The window an [`UplinkMeter`] reads over, in time the provider had work. A
-/// provider that goes slow keeps its old reading for at most this long, and an
-/// item picked inside that gap can still land on it; a shorter window closes
-/// the gap and reads noisier (one 16 KiB leaf is a whole window at 16 KB/s).
-/// A tuning value, like [`GOODPUT_ALPHA`].
+/// The window an [`UplinkMeter`] reads over, in time the provider had work,
+/// and how often [`run_live`] closes the windows that are due. A provider that
+/// goes slow is read slower at once (the open window counts, see
+/// [`UplinkMeter::read`]) and at its new rate a window later; an item picked
+/// inside that gap can still land on it. A shorter window closes the gap and
+/// reads noisier (one 16 KiB leaf is a whole window at 16 KB/s). A tuning
+/// value, like [`GOODPUT_ALPHA`].
 const UPLINK_WINDOW: Duration = Duration::from_secs(1);
 
 /// How long an idle provider's uplink reading takes to recover to the best
 /// known one. An old reading counts for less with time, linearly, so a provider
-/// that was slow is asked again: once, because the item it then holds stops the
-/// recovery. With two fast providers at four streams each the first probe of a
+/// that was slow is asked again: one item at a time, because the item it then
+/// holds stops the recovery. (A probe that ends inside one window, a refused
+/// or failed one, closes none, so another may follow at once; the back-off
+/// ladder bounds those as it always did.) With two fast providers at four streams each the first probe of a
 /// dead-slow one comes after about a fifth of this, a minute; the busier the
 /// others, the sooner. A tuning value: shorter finds a recovered provider
 /// sooner and spends more probes on one that stays slow.
@@ -822,9 +827,11 @@ struct ProviderState {
 /// much work the provider happened to get.
 ///
 /// The reading is taken in windows of [`UPLINK_WINDOW`] of busy time. A window
-/// is closed when a pick looks at the meter ([`UplinkMeter::read`]) and it is
-/// due, so no timer runs; between picks the open window simply grows, and a
-/// pick that finds it not yet due reads it together with the last closed one.
+/// that is due is closed by whoever looks at the meter next: the run's tick
+/// ([`close_due_uplink_windows`]), a pick, or the end of the provider's last
+/// attempt. A pick that finds the window not yet due reads it together with
+/// the last closed one. Busy time includes a dial and a transfer that moves
+/// nothing: a provider that accepts and sends no byte reads zero.
 #[derive(Debug, Default)]
 struct UplinkMeter {
     /// The byte counters of the attempts in flight, one per claim
@@ -863,6 +870,10 @@ impl UplinkMeter {
                 self.busy += now.saturating_duration_since(since);
             }
         }
+        // A window that is due is closed here, so that it carries the time the
+        // work ended and not the time of whichever pick looks next: the
+        // recovery of an idle provider counts from it.
+        let _ = self.read(now);
     }
 
     /// The reading at `now`, in bytes per second of busy time, and when the
@@ -917,13 +928,14 @@ impl ProviderState {
         }
     }
 
-    /// The uplink this provider counts for at `now`. `top` is the best reading
-    /// among the candidates of this pick, and what a provider never read is
-    /// assumed to do. An idle provider's reading recovers linearly toward
+    /// The uplink this provider counts for at `now`, given its meter's
+    /// `reading` ([`UplinkMeter::read`], taken once per pick). `top` is the
+    /// best reading among the candidates of this pick, and what a provider
+    /// never read is assumed to do. An idle provider's reading recovers linearly toward
     /// `top` over [`UPLINK_RECOVERY`]; one with an item in flight keeps its
     /// reading, so a probe is one item and not a stream of them.
-    fn uplink_now(&self, top: f64, now: Instant) -> f64 {
-        match self.uplink.read(now) {
+    fn uplink_now(&self, reading: Option<(f64, Instant)>, top: f64, now: Instant) -> f64 {
+        match reading {
             None => top,
             Some((rate, _)) if self.inflight > 0 || rate >= top => rate,
             Some((rate, read_at)) => {
@@ -959,6 +971,20 @@ impl InflightGuard {
     /// The attempt's byte counter: hand it to [`transfer_once`].
     fn progress(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.progress)
+    }
+
+    /// The attempt is over though the claim is still held (a primary that
+    /// failed while its hedge carries the round on): take its counter off the
+    /// meter, so the provider is not read as busy and delivering nothing for
+    /// as long as the hedge runs. The slot stays claimed until the drop.
+    fn end_attempt(&self) {
+        let mut guard = self
+            .states
+            .lock()
+            .expect("assignment states mutex poisoned");
+        if let Some(st) = guard.get_mut(&self.provider) {
+            st.uplink.end(&self.progress, Instant::now());
+        }
     }
 }
 
@@ -1078,6 +1104,8 @@ pub(crate) async fn run_live(
     let mut yield_open = true;
     let mut taken = 0usize;
     let mut limit_changed = opts.limit_changed.clone();
+    let mut meter_tick = tokio::time::interval(UPLINK_WINDOW);
+    meter_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let yielding = *yield_now.borrow_and_update();
@@ -1187,6 +1215,9 @@ pub(crate) async fn run_live(
                     // The sender is gone: its last value stands.
                     yield_open = false;
                 }
+            }
+            _ = meter_tick.tick(), if !set.is_empty() => {
+                close_due_uplink_windows(&states, Instant::now());
             }
             changed = async {
                 match limit_changed.as_mut() {
@@ -1533,6 +1564,8 @@ async fn run_child(
                     debug_assert!(hedge.is_some(), "primary_gone set with no hedge live");
                     primary_gone = true;
                     primary = Box::pin(std::future::pending());
+                    // Its transfer is gone; its claim lives to the round's end.
+                    claim.end_attempt();
                 }
                 Step::Hedge(r) => {
                     let mut h = hedge.take().expect("the hedge branch only runs when armed");
@@ -2368,30 +2401,46 @@ fn pick_provider(
     providers: &[EndpointId],
     now: Instant,
 ) -> Option<EndpointId> {
-    let candidates: Vec<(usize, EndpointId, Option<&ProviderState>)> = providers
+    // Each meter is read ONCE: a second read a moment later would see counters
+    // that have moved, and could break a near-tie between two providers.
+    struct Candidate<'a> {
+        order: usize,
+        id: EndpointId,
+        state: Option<&'a ProviderState>,
+        reading: Option<(f64, Instant)>,
+    }
+    let candidates: Vec<Candidate<'_>> = providers
         .iter()
         .enumerate()
         .filter_map(|(order, id)| match states.get(id) {
             Some(st) if !st.available(now) => None,
             // A provider with no state yet (a live one that just appeared) is
             // idle and unread.
-            st => Some((order, *id, st)),
+            state => Some(Candidate {
+                order,
+                id: *id,
+                state,
+                reading: state.and_then(|st| st.uplink.read(now)),
+            }),
         })
         .collect();
     let top = candidates
         .iter()
-        .filter_map(|(_, _, st)| st.and_then(|st| st.uplink.read(now)))
+        .filter_map(|c| c.reading)
         .map(|(rate, _)| rate)
         .reduce(f64::max);
     candidates
         .into_iter()
-        .map(|(order, id, st)| {
-            let (inflight, failures) = st.map_or((0, 0), |st| (st.inflight, st.failures));
+        .map(|c| {
+            let (inflight, failures) = c.state.map_or((0, 0), |st| (st.inflight, st.failures));
             let uplink = match top {
                 None => 1.0,
-                Some(top) => st.map_or(top, |st| st.uplink_now(top, now)).max(UPLINK_FLOOR),
+                Some(top) => c
+                    .state
+                    .map_or(top, |st| st.uplink_now(c.reading, top, now))
+                    .max(UPLINK_FLOOR),
             };
-            (f64::from(inflight + 1) / uplink, failures, order, id)
+            (f64::from(inflight + 1) / uplink, failures, c.order, c.id)
         })
         .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)))
         .map(|(_, _, _, id)| id)
@@ -2564,6 +2613,18 @@ fn record_failure_at(
     if st.failures >= EVICT_AFTER_FAILURES {
         let rung = (st.failures - EVICT_AFTER_FAILURES).min(BACKOFF_MAX_RUNGS - 1);
         st.next_try = Some(now + BACKOFF_BASE * 2u32.pow(rung));
+    }
+}
+
+/// Close every provider's uplink window that is due. [`run_live`] calls it
+/// every [`UPLINK_WINDOW`] while anything is in flight: a pick reads a meter
+/// over its last window, and with large items picks are many seconds apart, so
+/// without this a window would be as long as the gap between two picks and a
+/// provider that went slow just before the second would read almost as before.
+fn close_due_uplink_windows(states: &States, now: Instant) {
+    let guard = states.lock().expect("assignment states mutex poisoned");
+    for st in guard.values() {
+        let _ = st.uplink.read(now);
     }
 }
 
@@ -3174,6 +3235,84 @@ mod tests {
         // the half second of nothing counts against the 25 KB/s before it.
         meter.end(&third, at(61_000));
         assert_eq!(meter.read(at(90_000)), Some((12_500.0, at(60_500))));
+
+        // The end of the last attempt closes a window that is due, at the time
+        // the work ended: 30 000 bytes over the 2 s of busy time since the
+        // last close (the idle half second before, and these 1.5 s).
+        let fourth = counter(0);
+        meter.begin(Arc::clone(&fourth), at(100_000));
+        fourth.store(30_000, Ordering::Relaxed);
+        meter.end(&fourth, at(101_500));
+        assert_eq!(meter.read(at(200_000)), Some((15_000.0, at(101_500))));
+    }
+
+    /// The run's tick closes the windows that are due, whoever picks next and
+    /// whenever: a provider that stopped is read at zero a window later, not
+    /// averaged over the whole gap between two picks.
+    #[test]
+    fn the_run_tick_closes_due_windows_between_picks() {
+        let (a, b) = (distinct_id(), distinct_id());
+        let began = Instant::now();
+        let at = |ms: u64| began + Duration::from_millis(ms);
+        let (moving, stopped) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let mut on_a = UplinkMeter::default();
+        on_a.begin(Arc::clone(&moving), began);
+        let mut on_b = UplinkMeter::default();
+        on_b.begin(Arc::clone(&stopped), began);
+        let provider = |inflight, uplink| ProviderState {
+            inflight,
+            uplink,
+            ..Default::default()
+        };
+        let states: States = Arc::new(Mutex::new(states_of(vec![
+            (a, provider(7, on_a)),
+            (b, provider(1, on_b)),
+        ])));
+        let last = |id: EndpointId| states.lock().unwrap().get(&id).unwrap().uplink.last.get();
+
+        // Both move 500 000 bytes in five seconds; then `b` stops.
+        moving.store(500_000, Ordering::Relaxed);
+        stopped.store(500_000, Ordering::Relaxed);
+        close_due_uplink_windows(&states, at(5_000));
+        assert_eq!(last(a), Some((100_000.0, at(5_000))));
+        assert_eq!(last(b), Some((100_000.0, at(5_000))));
+        moving.store(600_000, Ordering::Relaxed);
+        close_due_uplink_windows(&states, at(5_500));
+        assert_eq!(last(b), Some((100_000.0, at(5_000))), "not due yet");
+        close_due_uplink_windows(&states, at(6_000));
+        assert_eq!(last(a), Some((100_000.0, at(6_000))));
+        assert_eq!(last(b), Some((0.0, at(6_000))));
+        // A pick ten seconds later, `a` still at 100 KB/s with seven streams:
+        // eight on that is 12.5 KB/s for the item, and the stopped one gives
+        // nothing. Had no window been closed since the start, `b` would read
+        // 500 000 bytes over 16 s, 31 KB/s, 15.6 for the item, and win.
+        moving.store(1_600_000, Ordering::Relaxed);
+        let guard = states.lock().unwrap();
+        assert_eq!(pick_provider(&guard, &[b, a], at(16_000)), Some(a));
+    }
+
+    /// A primary that failed while its hedge runs on keeps its claim to the
+    /// round's end, but its counter leaves the meter at once: the provider is
+    /// not read as busy with nothing moving, and the drop counts nothing twice.
+    #[test]
+    fn an_attempt_ended_early_leaves_the_meter_and_keeps_the_slot() {
+        let a = distinct_id();
+        let states: States = Arc::new(Mutex::new(HashMap::new()));
+        let claim = claim_provider(&states, &[a], None).expect("an idle provider is claimed");
+        claim.progress().store(9, Ordering::Relaxed);
+        claim.end_attempt();
+        {
+            let guard = states.lock().unwrap();
+            let st = guard.get(&a).unwrap();
+            assert_eq!((st.inflight, st.uplink.attempts.len()), (1, 0));
+            assert_eq!(st.uplink.ended_bytes, 9);
+            assert!(st.uplink.busy_since.is_none());
+        }
+        drop(claim);
+        let guard = states.lock().unwrap();
+        let st = guard.get(&a).unwrap();
+        assert_eq!((st.inflight, st.uplink.attempts.len()), (0, 0));
+        assert_eq!(st.uplink.ended_bytes, 9);
     }
 
     /// A provider whose streams have stopped moving loses the pick within a

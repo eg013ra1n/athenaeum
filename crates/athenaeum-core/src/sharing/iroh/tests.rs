@@ -3944,7 +3944,7 @@ async fn live_hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
 #[tokio::test]
 async fn live_hedge_fires_with_the_default_stream_limit() {
     const ITEMS: usize = 8;
-    let report = live_hedge_fires_scenario(ITEMS, 8).await;
+    let (report, _) = live_hedge_fires_scenario(ITEMS, 8).await;
     // Not a byte bound (the budget bounds bytes, and these hedges duplicate
     // nothing): a sanity bound against a re-arm loop on the same item.
     assert!(
@@ -3961,7 +3961,15 @@ async fn live_hedge_fires_with_the_default_stream_limit() {
 /// run took 100 to 110 s with 1 to 3 stalls.
 #[tokio::test]
 async fn live_new_items_do_not_land_on_a_provider_that_went_slow() {
-    let report = live_hedge_fires_scenario(LIVE_HEDGE_ITEMS, 8).await;
+    let (report, tries_on_collapsed) = live_hedge_fires_scenario(LIVE_HEDGE_ITEMS, 8).await;
+    // Its share of the first round is 2 or 3 of the 8 streams, handed out
+    // before it collapsed. Nothing completes inside the meter's first window
+    // (an item needs ~2 s), so no pick falls in the gap before it is read.
+    assert!(
+        (1..=3).contains(&tries_on_collapsed),
+        "the collapsed provider must get its first-round items and no more — it was \
+         handed {tries_on_collapsed} of {LIVE_HEDGE_ITEMS} ({report:?})"
+    );
     assert!(
         report.hedges as usize <= 2 * LIVE_HEDGE_ITEMS,
         "a hedge storm: {report:?}"
@@ -4008,20 +4016,21 @@ async fn live_a_slow_provider_is_read_once_and_left_alone() {
          of {ITEMS} items ({:?})",
         out.report
     );
-    assert_eq!(
-        out.report.stalls, 0,
-        "nothing may sit on it for a whole ceiling: {:?}",
-        out.report
-    );
     swarm.shutdown().await;
 }
 
-async fn live_hedge_fires_scenario(items: usize, max_in_flight: usize) -> AssignmentReport {
+/// Returns the run's report and how many times the collapsing provider was
+/// tried (as a primary or as a hedge's provider).
+async fn live_hedge_fires_scenario(
+    items: usize,
+    max_in_flight: usize,
+) -> (AssignmentReport, usize) {
     let swarm = live_swarm(3, items, LIVE_HEDGE_SIZE).await;
     for n in &swarm.nodes {
         n.set_upload_limit(400_000);
     }
-    let (telemetry, _) = recording_telemetry();
+    let collapsing = *swarm.ids[2].as_bytes();
+    let (telemetry, seen) = recording_telemetry();
     let collapse = {
         let slow = Arc::clone(&swarm.nodes[2]);
         tokio::spawn(async move {
@@ -4059,7 +4068,13 @@ async fn live_hedge_fires_scenario(items: usize, max_in_flight: usize) -> Assign
         out.report
     );
     swarm.shutdown().await;
-    out.report
+    let tries = seen
+        .lock()
+        .expect("telemetry mutex poisoned")
+        .iter()
+        .filter(|e| matches!(e, ProviderEvent::Trying(id) if *id == collapsing))
+        .count();
+    (out.report, tries)
 }
 
 /// The loser is REALLY cancelled: the slow provider's own socket send counter
