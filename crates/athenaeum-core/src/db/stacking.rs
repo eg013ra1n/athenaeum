@@ -1673,30 +1673,18 @@ mod tests {
         let c = conn();
         let set = seed_set(&c);
 
-        let new_run = |status: &str| {
-            let run = insert_run(
-                &c,
-                &NewRun {
-                    subject: &StackSubject::FrameSet(set),
-                    config_json: "{}",
-                    config_hash: "h",
-                    reference_frame_id: None,
-                    reference_mode: "auto",
-                    working_dir: "/w",
-                    output_dir: "/o",
-                },
-            )
-            .unwrap();
+        let run_with_status = |status: &str| {
+            let run = insert_run(&c, &new_run(&StackSubject::FrameSet(set))).unwrap();
             if status != "planning" {
                 set_run_status(&c, run, status).unwrap();
             }
             run
         };
 
-        let planning_run = new_run("planning");
-        let running_run = new_run("running");
-        let done_run = new_run("done");
-        let failed_run = new_run("failed");
+        let planning_run = run_with_status("planning");
+        let running_run = run_with_status("running");
+        let done_run = run_with_status("done");
+        let failed_run = run_with_status("failed");
 
         let unfinished: Vec<i64> = list_unfinished_runs(&c)
             .unwrap()

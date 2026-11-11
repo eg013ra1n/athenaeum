@@ -4442,23 +4442,7 @@ mod tests {
                 crate::db::stacking::upsert_frame_row(
                     &f.conn,
                     &subject,
-                    &crate::db::stacking::NewFrameRow {
-                        run_id,
-                        group_id,
-                        frame_id,
-                        included: true,
-                        exclusion_reason: None,
-                        weight: None,
-                        weight_channels_json: None,
-                        metrics_json: None,
-                        reg_status: None,
-                        reg_model: None,
-                        reg_rms_px: None,
-                        reg_inliers: None,
-                        reg_inlier_ratio: None,
-                        reg_flipped: None,
-                        rejected_fraction: None,
-                    },
+                    &plain_frame_row(run_id, group_id, frame_id, true, None),
                 )
                 .unwrap();
                 let (group, gf) = find_group_of(&groups, frame_id).unwrap();
@@ -4884,20 +4868,7 @@ mod tests {
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
 
         let settings = SettingsManager::new();
         let plan = build_plan(
@@ -4965,20 +4936,7 @@ mod tests {
                 .unwrap();
         }
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
         // One of A's four lights is manually excluded: m = 3, n = 3.
         set_set_config(&f.conn, f.set_id, "{}", &[a_ids[3]]).unwrap();
 
@@ -5587,22 +5545,9 @@ mod tests {
         }
         let raw_dark = test_fixtures::add_raw_linked_dark(&f, &ids, 64, 48);
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
         let library_dir = f.dir.path().join("library");
         std::fs::create_dir_all(&library_dir).unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
         crate::db::set_setting(
             &f.conn,
             crate::settings::keys::CALIBRATION_LIBRARY_DIR,
@@ -5669,22 +5614,9 @@ mod tests {
             1,
         );
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
         let library_dir = f.dir.path().join("library");
         std::fs::create_dir_all(&library_dir).unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
         crate::db::set_setting(
             &f.conn,
             crate::settings::keys::CALIBRATION_LIBRARY_DIR,
@@ -5756,20 +5688,7 @@ mod tests {
         test_fixtures::add_raw_linked_dark(&f, &ids, 64, 48);
         // Deliberately no `CALIBRATION_LIBRARY_DIR` setting.
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
 
         let settings = SettingsManager::new();
         let plan = build_plan(
@@ -5869,20 +5788,7 @@ mod tests {
             .unwrap();
         std::fs::remove_file(&dark_path).unwrap();
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
 
         let settings = SettingsManager::new();
         let plan = build_plan(
@@ -6165,20 +6071,7 @@ mod tests {
             )
             .unwrap();
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
 
         let settings = SettingsManager::new();
         let plan = build_plan(
@@ -6911,6 +6804,34 @@ mod tests {
         }
     }
 
+    /// A `stacking_run_frames` row with nothing but the membership recorded: no weight, metrics or registration
+    /// outcome, only whether the run kept the frame and, if not, why.
+    fn plain_frame_row(
+        run_id: i64,
+        group_id: i64,
+        frame_id: i64,
+        included: bool,
+        exclusion_reason: Option<&str>,
+    ) -> crate::db::stacking::NewFrameRow<'_> {
+        crate::db::stacking::NewFrameRow {
+            run_id,
+            group_id,
+            frame_id,
+            included,
+            exclusion_reason,
+            weight: None,
+            weight_channels_json: None,
+            metrics_json: None,
+            reg_status: None,
+            reg_model: None,
+            reg_rms_px: None,
+            reg_inliers: None,
+            reg_inlier_ratio: None,
+            reg_flipped: None,
+            rejected_fraction: None,
+        }
+    }
+
     /// Seed a `stacking_runs` row (a stand-in for "a previous run already
     /// happened") plus one `stacking_run_groups` row and one
     /// `stacking_run_frames` row per `frame_ids` entry, ALL `included =
@@ -6982,23 +6903,7 @@ mod tests {
             crate::db::stacking::upsert_frame_row(
                 conn,
                 &StackSubject::FrameSet(frames_set_id),
-                &crate::db::stacking::NewFrameRow {
-                    run_id,
-                    group_id,
-                    frame_id,
-                    included: reason.is_none(),
-                    exclusion_reason: reason,
-                    weight: None,
-                    weight_channels_json: None,
-                    metrics_json: None,
-                    reg_status: None,
-                    reg_model: None,
-                    reg_rms_px: None,
-                    reg_inliers: None,
-                    reg_inlier_ratio: None,
-                    reg_flipped: None,
-                    rejected_fraction: None,
-                },
+                &plain_frame_row(run_id, group_id, frame_id, reason.is_none(), reason),
             )
             .unwrap();
         }
@@ -7268,20 +7173,7 @@ mod tests {
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
 
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
@@ -7778,20 +7670,7 @@ mod tests {
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
 
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
@@ -8059,20 +7938,7 @@ mod tests {
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
 
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_WORKING_DIR,
-            working.path().to_str().unwrap(),
-        )
-        .unwrap();
-        crate::db::set_setting(
-            &f.conn,
-            keys::STACKING_OUTPUT_DIR,
-            output.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let _folders = set_stacking_folders(&f.conn);
 
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
@@ -8182,23 +8048,7 @@ mod tests {
             crate::db::stacking::upsert_frame_row(
                 &f.conn,
                 &StackSubject::FrameSet(f.set_id),
-                &crate::db::stacking::NewFrameRow {
-                    run_id,
-                    group_id,
-                    frame_id,
-                    included,
-                    exclusion_reason: reason,
-                    weight: None,
-                    weight_channels_json: None,
-                    metrics_json: None,
-                    reg_status: None,
-                    reg_model: None,
-                    reg_rms_px: None,
-                    reg_inliers: None,
-                    reg_inlier_ratio: None,
-                    reg_flipped: None,
-                    rejected_fraction: None,
-                },
+                &plain_frame_row(run_id, group_id, frame_id, included, reason),
             )
             .unwrap();
         };
@@ -11298,23 +11148,7 @@ mod tests {
                 crate::db::stacking::upsert_frame_row(
                     &f.conn,
                     &subject,
-                    &crate::db::stacking::NewFrameRow {
-                        run_id,
-                        group_id,
-                        frame_id: gf.frame_id,
-                        included: true,
-                        exclusion_reason: None,
-                        weight: None,
-                        weight_channels_json: None,
-                        metrics_json: None,
-                        reg_status: None,
-                        reg_model: None,
-                        reg_rms_px: None,
-                        reg_inliers: None,
-                        reg_inlier_ratio: None,
-                        reg_flipped: None,
-                        rejected_fraction: None,
-                    },
+                    &plain_frame_row(run_id, group_id, gf.frame_id, true, None),
                 )
                 .unwrap();
             }
@@ -11519,14 +11353,7 @@ mod tests {
                 [f.set_id],
             )
             .unwrap();
-        let working = tempfile::tempdir().unwrap();
-        let output = tempfile::tempdir().unwrap();
-        for (key, dir) in [
-            (keys::STACKING_WORKING_DIR, working.path()),
-            (keys::STACKING_OUTPUT_DIR, output.path()),
-        ] {
-            crate::db::set_setting(&f.conn, key, dir.to_str().unwrap()).unwrap();
-        }
+        let _folders = set_stacking_folders(&f.conn);
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
         cfg.normalization.local.enabled = true;

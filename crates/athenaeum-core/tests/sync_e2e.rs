@@ -157,17 +157,29 @@ fn insert_capture_frame(
 
 /// Poll `pred` every 25ms until true, panicking after `timeout`. Async so
 /// spawned background tasks (receiver loop, engine worker) make progress between
-/// polls.
-async fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if pred() {
-            return;
+/// polls. A timeout names the line of the wait that missed (`#[track_caller]`), not this helper.
+#[track_caller]
+fn wait_until<F: FnMut() -> bool>(
+    mut pred: F,
+    timeout: Duration,
+) -> impl std::future::Future<Output = ()> {
+    // Captured here, in the synchronous part, where `#[track_caller]` still names the test's own line.
+    let waiting_at = std::panic::Location::caller();
+    async move {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "wait_until timed out after {timeout:?} (waiting at {}:{})",
+                    waiting_at.file(),
+                    waiting_at.line()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        if Instant::now() >= deadline {
-            panic!("wait_until timed out after {timeout:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
