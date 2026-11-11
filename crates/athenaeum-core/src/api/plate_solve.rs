@@ -853,6 +853,10 @@ mod tests {
     /// still ends: the complete event is emitted and cancel handle 0 is removed.
     #[test]
     fn plate_solve_batch_over_missing_frames_ends_with_every_frame_failed() {
+        // The run ends with `on_batch_finished`, which sets the process-global
+        // auto-publish dirty flag: hold the lock its own tests hold, and leave
+        // the flag as it was found.
+        let _guard = crate::api::collab_autopublish::test_lock();
         let (_tmp, ctx) = test_ctx();
         let emitter = Arc::new(CapturingEmitter::default());
 
@@ -862,6 +866,7 @@ mod tests {
         assert!(ctx.active_plate_solves.lock().unwrap().contains_key(&0));
 
         run_plate_solve_batch(ctx.clone(), emitter.clone(), prepared).expect("run");
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
 
         let complete = emitter.named("plate-solve-complete");
         assert_eq!(complete.len(), 1);
