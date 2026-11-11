@@ -51,13 +51,13 @@ use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::models::{File, FileFormat, Frame, ImageType};
 use athenaeum_core::services::ServiceContext;
 use athenaeum_core::sharing::iroh::proto::{FullHashEntry, OfferEntry};
-use athenaeum_core::sharing::loopback::{FaultPlan, LoopbackNetwork};
+use athenaeum_core::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use athenaeum_core::sharing::types::NodeId;
-use athenaeum_core::sharing::SharingTransport;
+use athenaeum_core::sharing::{SharingTransport, StartInfo};
 use athenaeum_core::sync::{
     allow_all_peers, node_id_hex, CatalogDedupResponder, CatalogSyncStore, DedupResponder,
     Direction, InboundControl, StartedSender, SyncConfig, SyncEngine, SyncEngineHandle,
-    SyncReceiver, SyncRuntime, SyncSenderRuntime, SyncStore,
+    SyncReceiver, SyncReceiverHandle, SyncRuntime, SyncSenderRuntime, SyncStore,
 };
 use chrono::Utc;
 
@@ -377,26 +377,38 @@ fn incoming_resolver_for(
     })
 }
 
-/// Build a loopback sender engine targeting `peer` with a short `ack_timeout`
-/// (so the retry backoff schedule is ms-scale, per the engine_tests pattern),
-/// then inject it into a fresh [`SyncSenderRuntime`] exactly as
-/// `ensure_sender_engine` would — so the real `enqueue_sync_selection` /
-/// `retry_sync_package` paths run unchanged, minus the iroh/hub build. Returns
-/// the pieces those api fns consume.
-async fn inject_sender_engine(
+/// Build a loopback sender engine targeting `peer` with `config` (a short
+/// `ack_timeout` makes the retry backoff schedule ms-scale, per the engine_tests
+/// pattern) and an optional host `emitter`, then inject it into a fresh
+/// [`SyncSenderRuntime`] exactly as `ensure_sender_engine` would — so the real
+/// `enqueue_sync_selection` / `retry_sync_package` paths run unchanged, minus the
+/// iroh/hub build. Returns the pieces those api fns consume, plus the sender
+/// endpoint's node id (the `origin_device` the receiver sees).
+///
+/// The `SyncRuntime` is only touched when `ensure_sender_engine` has to build an
+/// engine; here the engine is pre-injected, so the peers-refresh-timer install is
+/// short-circuited and a fresh unstarted runtime satisfies the signature (T7).
+async fn inject_sender(
     net: &LoopbackNetwork,
     capture_db: &Path,
     peer: NodeId,
-    ack_timeout: Duration,
-) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, SyncRuntime) {
+    config: SyncConfig,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> (
+    Arc<SyncEngineHandle>,
+    Arc<SyncSenderRuntime>,
+    SyncRuntime,
+    NodeId,
+) {
     let sender_ep = net.endpoint();
     let sender_node = sender_ep.node_id();
     let engine_store = Arc::new(CatalogSyncStore::open(capture_db).unwrap());
-    let engine = Arc::new(SyncEngine::spawn_with_config(
+    let engine = Arc::new(SyncEngine::spawn_with_config_and_emitter(
         engine_store as Arc<dyn SyncStore>,
         Arc::new(sender_ep) as Arc<dyn SharingTransport>,
         peer,
-        SyncConfig { ack_timeout },
+        config,
+        emitter,
     ));
     let sender = Arc::new(SyncSenderRuntime::new());
     let sync = SyncRuntime::new();
@@ -411,7 +423,219 @@ async fn inject_sender_engine(
             },
         );
     }
+    (engine, sender, sync, sender_node)
+}
+
+/// [`inject_sender`] with a short `ack_timeout` and no emitter.
+async fn inject_sender_engine(
+    net: &LoopbackNetwork,
+    capture_db: &Path,
+    peer: NodeId,
+    ack_timeout: Duration,
+) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, SyncRuntime) {
+    let (engine, sender, sync, _) =
+        inject_sender(net, capture_db, peer, SyncConfig { ack_timeout }, None).await;
     (engine, sender, sync)
+}
+
+/// Like [`inject_sender_engine`] but spawns the engine with a host
+/// [`ProgressEmitter`] (so a test can read each package's `{new, duplicate}` dedup
+/// split off the send-side `sync-finished`) alongside the short `ack_timeout`.
+async fn inject_sender_engine_with_emitter(
+    net: &LoopbackNetwork,
+    capture_db: &Path,
+    peer: NodeId,
+    ack_timeout: Duration,
+    emitter: Arc<dyn ProgressEmitter>,
+) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, SyncRuntime) {
+    let (engine, sender, sync, _) = inject_sender(
+        net,
+        capture_db,
+        peer,
+        SyncConfig { ack_timeout },
+        Some(emitter),
+    )
+    .await;
+    (engine, sender, sync)
+}
+
+/// Spawn the receiver on one instance's endpoint, as the host does: its landing
+/// folder is the live `sync_incoming` resolver over that instance's catalog
+/// (falling back to `<dir>/incoming` when none is designated), its staging root
+/// is `dir`, and every peer is authorized.
+async fn spawn_receiver(
+    store: &Arc<CatalogSyncStore>,
+    dir: &Path,
+    ctx: &ServiceContext,
+    ep: &Arc<LoopbackTransport>,
+    control: Arc<InboundControl>,
+    emitter: Arc<dyn ProgressEmitter>,
+) -> anyhow::Result<(StartInfo, SyncReceiverHandle)> {
+    let incoming = incoming_resolver_for(ctx, dir.join("incoming"));
+    SyncReceiver::spawn(
+        Arc::clone(store),
+        dir.to_path_buf(),
+        incoming,
+        allow_all_peers(),
+        control,
+        Arc::clone(ep) as Arc<dyn SharingTransport>,
+        emitter,
+    )
+    .await
+}
+
+/// The verdict the primary's loopback endpoint gives a sender's pre-announce
+/// offer.
+enum RigResponder {
+    /// No responder: the endpoint answers want-all.
+    None,
+    /// A [`CatalogDedupResponder`] over the primary's catalog, so a frame the
+    /// primary already holds is recognised as a duplicate and never transferred.
+    Catalog,
+    /// A test double.
+    Custom(Arc<dyn DedupResponder>),
+}
+
+/// What differs between scenarios of the capture/primary rig; everything else
+/// is built the same way. `Default` is a plain rig: want-all, no fault, a fresh
+/// [`InboundControl`], a [`NullEmitter`].
+struct RigOptions {
+    responder: RigResponder,
+    /// Armed on the primary's endpoint before its receiver starts.
+    fault: Option<FaultPlan>,
+    /// The receiver's cancel signal, when the scenario drives it directly.
+    control: Option<Arc<InboundControl>>,
+    /// The receiver's emitter, when the scenario reads its event trail.
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+}
+
+impl Default for RigOptions {
+    fn default() -> Self {
+        Self {
+            responder: RigResponder::None,
+            fault: None,
+            control: None,
+            emitter: None,
+        }
+    }
+}
+
+/// The two-instance rig every capture -> primary scenario stands on: a *capture*
+/// node (its `files` dir and catalog) and a *primary* node (its catalog, a sync
+/// store, a loopback endpoint with a minted node id, and a designated
+/// `sync_incoming` root). The sender engine is not part of it — scenarios inject
+/// theirs with [`inject_sender_engine`] / [`inject_sender`], at the point in the
+/// run where the scenario needs it.
+///
+/// A scenario takes the rig apart straight after building it:
+/// `let Rig { capture_ctx, net, .. } = rig;` — it names the fields it reads, in
+/// this order, and the rest stays in `rig`, which outlives every local declared
+/// after it.
+///
+/// Drop order: fields drop in declaration order, so the endpoint and store go
+/// first and the temp dir last; the catalogs and everything on disk outlive
+/// whatever uses them.
+struct Rig {
+    receiver_ep: Arc<LoopbackTransport>,
+    primary_store: Arc<CatalogSyncStore>,
+    net: LoopbackNetwork,
+    // Owned `Arc` so `enqueue_sync_selection` (which builds a `'static` retry
+    // address-refresher, T8) accepts `&capture_ctx`; `&Arc` still coerces to
+    // `&ServiceContext` for every other helper here. The primary is never handed
+    // to the sender path, so it stays a plain value.
+    primary_ctx: ServiceContext,
+    capture_ctx: Arc<ServiceContext>,
+    receiver_node: NodeId,
+    designated: PathBuf,
+    capture_files: PathBuf,
+    capture_db: PathBuf,
+    primary_dir: PathBuf,
+    // Last: the temp dir outlives everything above.
+    _tmp: tempfile::TempDir,
+}
+
+impl Rig {
+    /// Build the rig with the primary's receiver NOT started: its endpoint is
+    /// minted (so its node id can be addressed) but offline until the scenario
+    /// calls [`spawn_receiver`].
+    fn offline() -> Rig {
+        Self::new(&RigOptions::default())
+    }
+
+    /// Build the rig and start the primary's receiver, the way most scenarios
+    /// run: `(rig, receiver)`.
+    async fn start(opts: RigOptions) -> (Rig, SyncReceiverHandle) {
+        let rig = Self::new(&opts);
+        let (_info, receiver) = spawn_receiver(
+            &rig.primary_store,
+            &rig.primary_dir,
+            &rig.primary_ctx,
+            &rig.receiver_ep,
+            opts.control
+                .unwrap_or_else(|| Arc::new(InboundControl::new())),
+            opts.emitter.unwrap_or_else(|| Arc::new(NullEmitter)),
+        )
+        .await
+        .expect("spawn primary receiver");
+        (rig, receiver)
+    }
+
+    fn new(opts: &RigOptions) -> Rig {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture_dir = tmp.path().join("capture");
+        let primary_dir = tmp.path().join("primary");
+        let capture_files = capture_dir.join("files");
+        std::fs::create_dir_all(&capture_files).unwrap();
+        std::fs::create_dir_all(&primary_dir).unwrap();
+        let capture_db = capture_dir.join("catalog.db");
+        let primary_db = primary_dir.join("catalog.db");
+
+        // Two full ServiceContexts, each with its own DB + data dir.
+        let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+        let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+        capture_ctx.db.get().unwrap();
+        primary_ctx.db.get().unwrap();
+
+        // The responder is the in-process stand-in for a running receiver's
+        // `CatalogDedupResponder`: it answers the sender's `negotiate_want` from
+        // the primary's real catalog. Built from the primary's catalog store
+        // BEFORE the endpoint is minted, then registered into the endpoint's inbox
+        // on `start`.
+        let net = LoopbackNetwork::new();
+        let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+        let receiver_ep = Arc::new(match &opts.responder {
+            RigResponder::None => net.endpoint(),
+            RigResponder::Catalog => net.endpoint_with_responder(Arc::new(
+                CatalogDedupResponder::new(Arc::clone(&primary_store)),
+            )),
+            RigResponder::Custom(r) => net.endpoint_with_responder(Arc::clone(r)),
+        });
+        let receiver_node = receiver_ep.node_id();
+
+        // Designate a `sync_incoming` scan root on the primary — received files
+        // must land under it, not under the internal `<sync_dir>/incoming` staging
+        // default.
+        let designated = tmp.path().join("designated_incoming");
+        designate_incoming(&primary_ctx, &designated);
+
+        if let Some(plan) = &opts.fault {
+            receiver_ep.set_fault(plan.clone());
+        }
+
+        Rig {
+            receiver_ep,
+            primary_store,
+            net,
+            primary_ctx,
+            capture_ctx,
+            receiver_node,
+            designated,
+            capture_files,
+            capture_db,
+            primary_dir,
+            _tmp: tmp,
+        }
+    }
 }
 
 /// Terminal states that crash-resume must not re-drive (mirrors
@@ -510,95 +734,28 @@ fn landed_count(dir: &Path) -> usize {
 
 #[tokio::test]
 async fn two_instance_sync_e2e() {
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    // Two full ServiceContexts, each with its own DB + data dir.
-    // Owned `Arc` so `enqueue_sync_selection` (which now builds a `'static` retry
-    // address-refresher, T8) accepts `&capture_ctx`; `&Arc` still coerces to
-    // `&ServiceContext` for every other helper here.
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions::default()).await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
 
-    // ── Primary receiver over loopback ───────────────────────────────────────
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    // Designate a `sync_incoming` scan root on the primary — received files must
-    // land under it, not under the internal `<sync_dir>/incoming` staging default.
-    let designated = tmp.path().join("designated_incoming");
-    std::fs::create_dir_all(&designated).unwrap();
-    athenaeum_core::api::scan_roots::add_scan_root(
-        &primary_ctx,
-        designated.to_string_lossy().into_owned(),
-        &athenaeum_core::api::PathPolicy::AllowAll,
-        Some("sync_incoming".to_string()),
-    )
-    .expect("designate sync_incoming root");
-
-    // The live per-package landing resolver, built exactly as the host builds it:
-    // it re-reads the designated `sync_incoming` root from the primary catalog on
-    // every package (falling back to `<sync_dir>/incoming` when none is set).
-    let resolver_db = primary_ctx.db.get().unwrap().clone();
-    let fallback_incoming = primary_dir.join("incoming");
-    let incoming: athenaeum_core::sync::receiver::IncomingResolver = Arc::new(move || {
-        let conn = resolver_db.conn();
-        match athenaeum_core::db::scan_root_path_of_kind(&conn, "sync_incoming") {
-            Ok(Some(p)) => std::path::PathBuf::from(p),
-            _ => fallback_incoming.clone(),
-        }
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(athenaeum_core::sync::InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
-
-    // ── Capture sender engine over loopback, injected into a SyncSenderRuntime
-    // exactly as `ensure_sender_engine` would populate it — so the real
-    // `enqueue_sync_selection` path runs unchanged, minus the iroh/hub build. ──
-    let sender_ep = net.endpoint();
-    let sender_node = sender_ep.node_id();
-    let engine_store = Arc::new(CatalogSyncStore::open(&capture_db).unwrap());
-    let engine = Arc::new(SyncEngine::spawn(
-        engine_store as Arc<dyn SyncStore>,
-        Arc::new(sender_ep) as Arc<dyn SharingTransport>,
+    let (engine, sender, sync, sender_node) = inject_sender(
+        &net,
+        &capture_db,
         receiver_node,
-    ));
-    let sender = Arc::new(SyncSenderRuntime::new());
-    // T7: `enqueue_sync_selection` threads a SyncRuntime (only touched when
-    // `ensure_sender_engine` has to build an engine; here the engine is pre-injected
-    // above, so the peers-refresh-timer install is short-circuited and `sync` is
-    // unused — a fresh unstarted runtime satisfies the signature).
-    let sync = SyncRuntime::new();
-    {
-        let mut guard = sender.lock_inner().await;
-        guard.insert(
-            receiver_node,
-            StartedSender {
-                engine: Arc::clone(&engine),
-                origin_device: node_id_hex(&sender_node),
-                peer: receiver_node,
-            },
-        );
-    }
+        SyncConfig::default(),
+        None,
+    )
+    .await;
 
     // Name the incoming sender's landing folder by its CURRENT friendly device
     // name: seed the receiver's cached hex → name map (the source the ingest
@@ -878,97 +1035,37 @@ async fn two_instance_sync_e2e() {
 /// with a [`RecordingEmitter`] that captures each package's outcome.
 #[tokio::test]
 async fn resend_transfers_only_new_frames() {
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    // Owned `Arc` so `enqueue_sync_selection` (which now builds a `'static` retry
-    // address-refresher, T8) accepts `&capture_ctx`; `&Arc` still coerces to
-    // `&ServiceContext` for every other helper here.
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions {
+        // The responder is the in-process stand-in for a running receiver's
+        // `CatalogDedupResponder`: it answers A's `negotiate_want` from B's real
+        // catalog, so a re-sent frame B already holds is recognized as a duplicate and
+        // never transferred.
+        responder: RigResponder::Catalog,
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_node,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let pdb = primary_ctx.db.get().unwrap();
 
-    // ── Primary receiver over loopback, WITH a catalog dedup responder ──────────
-    // The responder is the in-process stand-in for a running receiver's
-    // `CatalogDedupResponder`: it answers A's `negotiate_want` from B's real
-    // catalog, so a re-sent frame B already holds is recognized as a duplicate and
-    // never transferred. Built from B's catalog store BEFORE the endpoint is
-    // minted, then registered into the endpoint's inbox on `start`.
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let responder: Arc<dyn DedupResponder> =
-        Arc::new(CatalogDedupResponder::new(Arc::clone(&primary_store)));
-    let receiver_ep = Arc::new(net.endpoint_with_responder(responder));
-    let receiver_node = receiver_ep.node_id();
-
-    // Designate a `sync_incoming` scan root so received files land under it (same
-    // as the metadata-delivery e2e); its live resolver re-reads it per package.
-    let designated = tmp.path().join("designated_incoming");
-    std::fs::create_dir_all(&designated).unwrap();
-    athenaeum_core::api::scan_roots::add_scan_root(
-        &primary_ctx,
-        designated.to_string_lossy().into_owned(),
-        &athenaeum_core::api::PathPolicy::AllowAll,
-        Some("sync_incoming".to_string()),
-    )
-    .expect("designate sync_incoming root");
-    let resolver_db = primary_ctx.db.get().unwrap().clone();
-    let fallback_incoming = primary_dir.join("incoming");
-    let incoming: athenaeum_core::sync::receiver::IncomingResolver = Arc::new(move || {
-        let conn = resolver_db.conn();
-        match athenaeum_core::db::scan_root_path_of_kind(&conn, "sync_incoming") {
-            Ok(Some(p)) => std::path::PathBuf::from(p),
-            _ => fallback_incoming.clone(),
-        }
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(athenaeum_core::sync::InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
-
-    // ── Capture sender engine over loopback, WITH a recording emitter so the test
-    // can read each package's `{new, duplicate}` dedup outcome. ──
-    let sender_ep = net.endpoint();
-    let sender_node = sender_ep.node_id();
-    let engine_store = Arc::new(CatalogSyncStore::open(&capture_db).unwrap());
+    // WITH a recording emitter so the test can read each package's `{new, duplicate}`
+    // dedup outcome.
     let emitter = Arc::new(RecordingEmitter::default());
-    let engine = Arc::new(SyncEngine::spawn_with_emitter(
-        engine_store as Arc<dyn SyncStore>,
-        Arc::new(sender_ep) as Arc<dyn SharingTransport>,
+    let (engine, sender, sync, _) = inject_sender(
+        &net,
+        &capture_db,
         receiver_node,
+        SyncConfig::default(),
         Some(Arc::clone(&emitter) as Arc<dyn ProgressEmitter>),
-    ));
-    let sender = Arc::new(SyncSenderRuntime::new());
-    // T7: `enqueue_sync_selection` threads a SyncRuntime (only touched when
-    // `ensure_sender_engine` has to build an engine; here the engine is pre-injected
-    // above, so the peers-refresh-timer install is short-circuited and `sync` is
-    // unused — a fresh unstarted runtime satisfies the signature).
-    let sync = SyncRuntime::new();
-    {
-        let mut guard = sender.lock_inner().await;
-        guard.insert(
-            receiver_node,
-            StartedSender {
-                engine: Arc::clone(&engine),
-                origin_device: node_id_hex(&sender_node),
-                peer: receiver_node,
-            },
-        );
-    }
+    )
+    .await;
 
     // Seed 4 fixture frames on A: idx 0,1,2 are the first batch; idx 3 is the one
     // new frame the overlapping re-send adds. Each idx writes a distinct pixel
@@ -1142,30 +1239,24 @@ async fn resend_transfers_only_new_frames() {
 #[tokio::test]
 async fn offline_peer_delivers_after_reconnect_without_user_action() {
     const N: usize = 6;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
-    let cdb = capture_ctx.db.get().unwrap();
-    let pdb = primary_ctx.db.get().unwrap();
-
     // Mint the receiver endpoint — its node id is available BEFORE it starts, so we
     // can address (and enqueue toward) a peer that is not yet online.
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+    let rig = Rig::offline();
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        primary_store,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        primary_dir,
+        ..
+    } = rig;
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
 
     // Short-ack-timeout sender engine (ms-scale rungs), injected as the host would.
     let (engine, sender, sync) =
@@ -1228,13 +1319,12 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
 
     // Bring the receiver online — and DO NOT kick. The backoff schedule alone must
     // re-announce and deliver.
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
+    let (_info, receiver) = spawn_receiver(
+        &primary_store,
+        &primary_dir,
+        &primary_ctx,
+        &receiver_ep,
         Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
     .await
@@ -1314,29 +1404,6 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
 #[tokio::test]
 async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     const N: usize = 4;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
-    let cdb = capture_ctx.db.get().unwrap();
-    let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
     // The receiver's own cancel signal (the object a started SyncRuntime would hand
     // `cancel_incoming_package`). A fresh SyncRuntime for the command surface — its
     // in-process `inbound_control()` is None, so the command exercises its
@@ -1344,23 +1411,29 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     let control = Arc::new(InboundControl::new());
     let primary_sync = SyncRuntime::new();
 
-    // Hold the payload fetch aborting so no ingest can complete before we cancel.
-    receiver_ep.set_fault(FaultPlan {
-        abort_after_bytes: Some(1),
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Hold the payload fetch aborting so no ingest can complete before we cancel.
+        fault: Some(FaultPlan {
+            abort_after_bytes: Some(1),
+            ..Default::default()
+        }),
+        control: Some(Arc::clone(&control)),
         ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::clone(&control),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
@@ -1569,46 +1642,28 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
 #[tokio::test]
 async fn sender_cancel_then_resend_delivers() {
     const N: usize = 3;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Hold the payload fetch aborting so the cancel always lands before any ingest.
+        fault: Some(FaultPlan {
+            abort_after_bytes: Some(1),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    // Hold the payload fetch aborting so the cancel always lands before any ingest.
-    receiver_ep.set_fault(FaultPlan {
-        abort_after_bytes: Some(1),
-        ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
@@ -1745,41 +1800,23 @@ async fn sender_cancel_then_resend_delivers() {
 #[tokio::test]
 async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
     const N: usize = 5;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
-    let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
     // A capturing emitter on the RECEIVER: the per-file + stage trail is the oracle.
     let recorder = Arc::new(RecordingEmitter::default());
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
-    )
-    .await
-    .expect("spawn primary receiver");
+    let (rig, receiver) = Rig::start(RigOptions {
+        emitter: Some(Arc::clone(&recorder) as Arc<dyn ProgressEmitter>),
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_node,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
+    let pdb = primary_ctx.db.get().unwrap();
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
@@ -1984,31 +2021,27 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     let designated_b = tmp.path().join("incoming_b");
     designate_incoming(&ctx_a, &designated_a);
     designate_incoming(&ctx_b, &designated_b);
-    let incoming_a = incoming_resolver_for(&ctx_a, a_dir.join("incoming"));
-    let incoming_b = incoming_resolver_for(&ctx_b, b_dir.join("incoming"));
 
     let recorder_a = Arc::new(RecordingEmitter::default());
     let recorder_b = Arc::new(RecordingEmitter::default());
 
-    let (_ia, receiver_a) = SyncReceiver::spawn(
-        Arc::clone(&store_a),
-        a_dir.clone(),
-        incoming_a,
-        allow_all_peers(),
+    let (_ia, receiver_a) = spawn_receiver(
+        &store_a,
+        &a_dir,
+        &ctx_a,
+        &recv_ep_a,
         Arc::new(InboundControl::new()),
-        Arc::clone(&recv_ep_a) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder_a) as Arc<dyn ProgressEmitter>,
     )
     .await
     .expect("spawn receiver A");
 
-    let (_ib, receiver_b) = SyncReceiver::spawn(
-        Arc::clone(&store_b),
-        b_dir.clone(),
-        incoming_b,
-        allow_all_peers(),
+    let (_ib, receiver_b) = spawn_receiver(
+        &store_b,
+        &b_dir,
+        &ctx_b,
+        &recv_ep_b,
         Arc::new(InboundControl::new()),
-        Arc::clone(&recv_ep_b) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder_b) as Arc<dyn ProgressEmitter>,
     )
     .await
@@ -2369,40 +2402,20 @@ fn landed_paths(dir: &Path) -> Vec<String> {
 /// transient state string.
 #[tokio::test]
 async fn manifest_visible_before_payload_then_structured_batch_lands() {
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions::default()).await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     // Moderate ack timeout so the held package re-announces on a comfortable cadence
     // (each retry re-records the manifest, the re-armed abort keeps the payload from
@@ -2569,48 +2582,29 @@ async fn manifest_visible_before_payload_then_structured_batch_lands() {
 #[tokio::test]
 async fn restart_resumes_per_file_picture_then_confirms() {
     const N: usize = 4;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Delay the receiver's ack so the sender rests in Delivered (fetch complete,
+        // not yet confirmed) long enough to snapshot the resume point and kill the
+        // engine before the ack lands.
+        fault: Some(FaultPlan {
+            delay_ack: Some(Duration::from_secs(2)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    // Delay the receiver's ack so the sender rests in Delivered (fetch complete,
-    // not yet confirmed) long enough to snapshot the resume point and kill the
-    // engine before the ack lands.
-    receiver_ep.set_fault(FaultPlan {
-        delay_ack: Some(Duration::from_secs(2)),
-        ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     // Long ack timeout: the first engine must NOT time out while the ack is held —
     // it should rest in Delivered until we kill it.
@@ -2759,47 +2753,28 @@ fn loopback_engine_builder<'a>(
 #[tokio::test]
 async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
     const N: usize = 4;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Hold the ack so the row rests non-terminal (Delivered) while we simulate the
+        // crash + resurrection, then release it so the resumed engine confirms.
+        fault: Some(FaultPlan {
+            delay_ack: Some(Duration::from_secs(3)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    // Hold the ack so the row rests non-terminal (Delivered) while we simulate the
-    // crash + resurrection, then release it so the resumed engine confirms.
-    receiver_ep.set_fault(FaultPlan {
-        delay_ack: Some(Duration::from_secs(3)),
-        ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     // The pre-crash engine (long ack timeout so it rests in Delivered, not retry).
     let (engine_a, sender, sync) =
@@ -2921,45 +2896,24 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
 #[tokio::test]
 async fn cancel_succeeds_on_resurrected_sender_row() {
     const N: usize = 4;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
-    let cdb = capture_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    // Hold the ack for the whole test so the row stays non-terminal (never confirms).
-    receiver_ep.set_fault(FaultPlan {
-        delay_ack: Some(Duration::from_secs(60)),
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Hold the ack for the whole test so the row stays non-terminal (never confirms).
+        fault: Some(FaultPlan {
+            delay_ack: Some(Duration::from_secs(60)),
+            ..Default::default()
+        }),
         ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        net,
+        receiver_node,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
+    let cdb = capture_ctx.db.get().unwrap();
 
     let (engine_a, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(60)).await;
@@ -3027,51 +2981,34 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
 #[tokio::test]
 async fn receiver_cancel_records_v2_history_files_and_both_journals() {
     const N: usize = 4;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
-    let cdb = capture_ctx.db.get().unwrap();
-    let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
     // Receiver-side cancel signal + a fresh runtime for the command boundary (same
     // wiring as the acceptance cancel test).
     let control = Arc::new(InboundControl::new());
     let primary_sync = SyncRuntime::new();
 
-    // Hold the payload fetch aborting so no ingest can complete before the cancel.
-    receiver_ep.set_fault(FaultPlan {
-        abort_after_bytes: Some(1),
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Hold the payload fetch aborting so no ingest can complete before the cancel.
+        fault: Some(FaultPlan {
+            abort_after_bytes: Some(1),
+            ..Default::default()
+        }),
+        control: Some(Arc::clone(&control)),
         ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::clone(&control),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
@@ -3186,49 +3123,30 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
 #[tokio::test]
 async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
     const N: usize = 3;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Attempt 1 aborts (one-shot) → no ack → ack timeout. Attempt 2 completes but
+        // holds the ack 300ms (< the 600ms timeout, so no re-timeout) so the row rests
+        // in Delivered with the error already cleared, before it confirms.
+        fault: Some(FaultPlan {
+            abort_after_bytes: Some(1),
+            delay_ack: Some(Duration::from_millis(300)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    // Attempt 1 aborts (one-shot) → no ack → ack timeout. Attempt 2 completes but
-    // holds the ack 300ms (< the 600ms timeout, so no re-timeout) so the row rests
-    // in Delivered with the error already cleared, before it confirms.
-    receiver_ep.set_fault(FaultPlan {
-        abort_after_bytes: Some(1),
-        delay_ack: Some(Duration::from_millis(300)),
-        ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(600)).await;
@@ -3350,40 +3268,19 @@ async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
 /// whole structured tree.
 #[tokio::test]
 async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions::default()).await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
@@ -3651,42 +3548,6 @@ fn outbound_wire_id(db: &Database, id: i64) -> Option<String> {
         .expect("outbound row present")
 }
 
-/// Like [`inject_sender_engine`] but spawns the engine with a host
-/// [`ProgressEmitter`] (so a test can read each package's `{new, duplicate}` dedup
-/// split off the send-side `sync-finished`) alongside the short `ack_timeout`.
-async fn inject_sender_engine_with_emitter(
-    net: &LoopbackNetwork,
-    capture_db: &Path,
-    peer: NodeId,
-    ack_timeout: Duration,
-    emitter: Arc<dyn ProgressEmitter>,
-) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, SyncRuntime) {
-    let sender_ep = net.endpoint();
-    let sender_node = sender_ep.node_id();
-    let engine_store = Arc::new(CatalogSyncStore::open(capture_db).unwrap());
-    let engine = Arc::new(SyncEngine::spawn_with_config_and_emitter(
-        engine_store as Arc<dyn SyncStore>,
-        Arc::new(sender_ep) as Arc<dyn SharingTransport>,
-        peer,
-        SyncConfig { ack_timeout },
-        Some(emitter),
-    ));
-    let sender = Arc::new(SyncSenderRuntime::new());
-    let sync = SyncRuntime::new();
-    {
-        let mut guard = sender.lock_inner().await;
-        guard.insert(
-            peer,
-            StartedSender {
-                engine: Arc::clone(&engine),
-                origin_device: node_id_hex(&sender_node),
-                peer,
-            },
-        );
-    }
-    (engine, sender, sync)
-}
-
 /// B8 scenario 1 — **sender cancel stops the receiver promptly (two-engine)**. The
 /// two-context composition of the receiver-unit
 /// `revoke_mid_fetch_aborts_promptly_not_at_fetch_completion`: a genuinely-blocking
@@ -3706,49 +3567,33 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
     const DELAY: Duration = Duration::from_millis(500);
     const ABORT_DEADLINE: Duration = Duration::from_secs(3);
 
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
-    let cdb = capture_ctx.db.get().unwrap();
-    let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    // Pace the fetch so it is genuinely mid-flight when we fire the sender cancel.
-    receiver_ep.set_fault(FaultPlan {
-        delay_per_read: Some(DELAY),
-        ..Default::default()
-    });
-
     // A recording emitter on the RECEIVER: the revoke path's terminal `sync-finished`
     // is the observable the Transfers widget dismisses a row on.
     let recorder = Arc::new(RecordingEmitter::default());
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
-    )
-    .await
-    .expect("spawn primary receiver");
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Pace the fetch so it is genuinely mid-flight when we fire the sender cancel.
+        fault: Some(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        }),
+        emitter: Some(Arc::clone(&recorder) as Arc<dyn ProgressEmitter>),
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        primary_dir,
+        ..
+    } = rig;
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
 
     // Long ack timeout so the sender rests in Transferring (awaiting the never-coming
     // ack) rather than re-announcing during the paced fetch.
@@ -3905,44 +3750,25 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
 /// the missing frames travel.
 #[tokio::test]
 async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Receiver WITH a catalog dedup responder so the resend's negotiate drops the
+        // pre-seeded frames (strict-subset Want).
+        responder: RigResponder::Catalog,
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    // Receiver WITH a catalog dedup responder so the resend's negotiate drops the
-    // pre-seeded frames (strict-subset Want).
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let responder: Arc<dyn DedupResponder> =
-        Arc::new(CatalogDedupResponder::new(Arc::clone(&primary_store)));
-    let receiver_ep = Arc::new(net.endpoint_with_responder(responder));
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     // Long ack timeout so, after attempt-1's single announce + aborted fetch, the
     // sender rests in Transferring and does NOT re-announce on its own — so the
@@ -4257,51 +4083,33 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
     // file-open would touch the cleaned payload.
     const HOLD: Duration = Duration::from_secs(12);
 
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    // Receiver WITH a flipping responder (want-all → all-duplicate).
+    let all_dup = Arc::new(AtomicBool::new(false));
+    let (rig, receiver) = Rig::start(RigOptions {
+        responder: RigResponder::Custom(Arc::new(SwitchableResponder {
+            all_duplicate: Arc::clone(&all_dup),
+        })),
+        // Hold every fetch so session 1's row rests `fetching`, nothing ingests.
+        fault: Some(FaultPlan {
+            delay_per_read: Some(HOLD),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        primary_dir,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    // Receiver WITH a flipping responder (want-all → all-duplicate).
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let all_dup = Arc::new(AtomicBool::new(false));
-    let responder: Arc<dyn DedupResponder> = Arc::new(SwitchableResponder {
-        all_duplicate: Arc::clone(&all_dup),
-    });
-    let receiver_ep = Arc::new(net.endpoint_with_responder(responder));
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    // Hold every fetch so session 1's row rests `fetching`, nothing ingests.
-    receiver_ep.set_fault(FaultPlan {
-        delay_per_read: Some(HOLD),
-        ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     // ── Session 1: want-all announce → Transferring; held fetch keeps the receiver
     // row non-terminal. Long ack timeout so the sender rests (doesn't re-announce). ──
@@ -4433,29 +4241,23 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
 #[tokio::test]
 async fn restart_mid_resend_resumes_same_row_and_confirms() {
     const N: usize = 4;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    // Mint the receiver endpoint (node id known) but keep it OFFLINE for now.
+    let rig = Rig::offline();
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        primary_store,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        primary_dir,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    // Mint the receiver endpoint (node id known) but keep it OFFLINE for now.
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
 
     // Short ack timeout → ms-scale retries against the offline peer.
     let (engine1, sender, sync) =
@@ -4527,13 +4329,12 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
     // Bring the receiver online, THEN stand up a fresh engine over the SAME store: its
     // crash-resume re-drives the persisted gen-2 row and, with the peer now reachable,
     // delivers and confirms — unattended.
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
+    let (_info, receiver) = spawn_receiver(
+        &primary_store,
+        &primary_dir,
+        &primary_ctx,
+        &receiver_ep,
         Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
     .await
@@ -4597,40 +4398,19 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
 /// unreachable over loopback where the fetch seeds no in-flight tag).
 #[tokio::test]
 async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let (rig, receiver) = Rig::start(RigOptions::default()).await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::new(InboundControl::new()),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
@@ -4865,49 +4645,32 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
 #[tokio::test]
 async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
     const N: usize = 3;
-    let tmp = tempfile::tempdir().unwrap();
-    let capture_dir = tmp.path().join("capture");
-    let primary_dir = tmp.path().join("primary");
-    let capture_files = capture_dir.join("files");
-    std::fs::create_dir_all(&capture_files).unwrap();
-    std::fs::create_dir_all(&primary_dir).unwrap();
-    let capture_db = capture_dir.join("catalog.db");
-    let primary_db = primary_dir.join("catalog.db");
-
-    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
-    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
-    let cdb = capture_ctx.db.get().unwrap();
-    let pdb = primary_ctx.db.get().unwrap();
-
-    let net = LoopbackNetwork::new();
-    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
-    let receiver_ep = Arc::new(net.endpoint());
-    let receiver_node = receiver_ep.node_id();
-
-    let designated = tmp.path().join("designated_incoming");
-    designate_incoming(&primary_ctx, &designated);
-    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
-
     let control = Arc::new(InboundControl::new());
     let primary_sync = SyncRuntime::new();
 
-    // Hold the payload fetch aborting so no ingest can complete before the decline.
-    receiver_ep.set_fault(FaultPlan {
-        abort_after_bytes: Some(1),
+    let (rig, receiver) = Rig::start(RigOptions {
+        // Hold the payload fetch aborting so no ingest can complete before the decline.
+        fault: Some(FaultPlan {
+            abort_after_bytes: Some(1),
+            ..Default::default()
+        }),
+        control: Some(Arc::clone(&control)),
         ..Default::default()
-    });
-
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&primary_store),
-        primary_dir.clone(),
-        incoming,
-        allow_all_peers(),
-        Arc::clone(&control),
-        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
-        Arc::new(NullEmitter),
-    )
-    .await
-    .expect("spawn primary receiver");
+    })
+    .await;
+    let Rig {
+        capture_ctx,
+        primary_ctx,
+        net,
+        receiver_ep,
+        receiver_node,
+        designated,
+        capture_files,
+        capture_db,
+        ..
+    } = rig;
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
 
     let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
@@ -5164,7 +4927,6 @@ async fn two_senders_one_receiver_fetch_windows_overlap() {
 
     let designated = tmp.path().join("designated_incoming");
     designate_incoming(&ctx_recv, &designated);
-    let incoming = incoming_resolver_for(&ctx_recv, recv_dir.join("incoming"));
 
     let recorder = Arc::new(RecordingEmitter::default());
     // Held so the mutation proof can dial the gate down to 1 in place (see TEETH on
@@ -5176,13 +4938,12 @@ async fn two_senders_one_receiver_fetch_windows_overlap() {
         "the shipped receive cap admits both transfers at once"
     );
 
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&recv_store),
-        recv_dir.clone(),
-        incoming,
-        allow_all_peers(),
+    let (_info, receiver) = spawn_receiver(
+        &recv_store,
+        &recv_dir,
+        &ctx_recv,
+        &recv_ep,
         Arc::clone(&control),
-        Arc::clone(&recv_ep) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
     )
     .await
@@ -5456,16 +5217,14 @@ async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
 
     let designated = tmp.path().join("designated_incoming");
     designate_incoming(&ctx_recv, &designated);
-    let incoming = incoming_resolver_for(&ctx_recv, recv_dir.join("incoming"));
 
     let recorder = Arc::new(RecordingEmitter::default());
-    let (_info, receiver) = SyncReceiver::spawn(
-        Arc::clone(&recv_store),
-        recv_dir.clone(),
-        incoming,
-        allow_all_peers(),
+    let (_info, receiver) = spawn_receiver(
+        &recv_store,
+        &recv_dir,
+        &ctx_recv,
+        &recv_ep,
         Arc::new(InboundControl::new()),
-        Arc::clone(&recv_ep) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
     )
     .await
