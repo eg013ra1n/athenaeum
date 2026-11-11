@@ -937,7 +937,7 @@ fn calibrate_outputs_disambiguate_same_basename_within_a_group() {
     // name). `add_light` gives the first one a real file; the second
     // is a manual copy into a sibling directory with the same
     // filename, inserted the same way `add_light`'s own `insert_light_row`
-    // would (this test's file scope is `run.rs` only — the fixture
+    // would (this test's file scope is `run/` only — the fixture
     // builder itself is untouched).
     let (dup_a, path_a) =
         test_fixtures::add_light(&fixture, &light_spec("dup", THREE_TIMES[0]));

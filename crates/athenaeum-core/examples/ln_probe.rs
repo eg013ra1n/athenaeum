@@ -1023,7 +1023,7 @@ catalog has no artifact for)",
         "groupBeta": group_beta_value,
         "referenceBuildMs": reference_build_ms,
         // Perf tier A Task 12: `normalize_frame`'s own per-phase timing —
-        // `run.rs` logs these via `tracing::debug!` on every real run, but
+        // `run/` logs these via `tracing::debug!` on every real run, but
         // this probe calls `normalize_frame` directly and prints its own
         // JSON, so they need to be surfaced here too for the task's own
         // before/after measurement (`background_ms` is the target of this

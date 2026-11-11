@@ -1,8 +1,13 @@
+//! The rig the run's tests share (`seed_ready`, `Recording`, `Pass1Rig`, the seeded groups and projects) and the
+//! tests of a run as a whole: start and cancel, the thread's one `stacking-complete`, a full run and its rerun. A
+//! stage's own tests are in `<stage>_tests.rs`, a child module of the stage's file.
+
 use super::*;
 use crate::events::NullEmitter;
 use crate::stacking::groups::{group_frames, set_slug};
 use crate::stacking::test_fixtures::{
-    self, date_obs_at, seed_star_group, shifted_stars, star_light_spec, wait_for_run, LightSpec, BASE_STARS, STAR_FIELD_HEIGHT, STAR_FIELD_WIDTH,
+    self, date_obs_at, seed_star_group, shifted_stars, star_light_spec, wait_for_run, LightSpec,
+    BASE_STARS, STAR_FIELD_HEIGHT, STAR_FIELD_WIDTH,
 };
 
 /// A frame nothing has measured yet, for the summary-row tests of Plan B B0.

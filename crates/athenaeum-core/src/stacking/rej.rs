@@ -44,7 +44,7 @@ pub const REJ_MAGIC: &[u8; 8] = b"ATHREJ01";
 /// The forced-rejection budget when this machine's RAM cannot be read
 /// (M4c Task 3) — a conservative absolute cap rather than "no cap", so an
 /// unreadable `/proc/meminfo` can never turn into an unbounded allocation.
-/// `run.rs`'s rejection-map check treats unknown RAM as "does not fit" at
+/// `run/`'s rejection-map check treats unknown RAM as "does not fit" at
 /// all; that is right for a whole-image f32 map pair, but here the normal
 /// cost is a few megabytes, and refusing the feature outright on a machine
 /// that merely cannot report its RAM would be the worse answer.

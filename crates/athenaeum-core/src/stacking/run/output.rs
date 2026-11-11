@@ -21,8 +21,6 @@ fn rejection_map_stems(group: &IntegrationGroup, included_ids: &[i64]) -> Vec<St
         .collect()
 }
 
-// ── Stages 6/7/9 (Task 8): normalize, integrate, output ────────────────────
-
 /// One process, one writer: `master_file_name`/`write_master_light`
 /// (`resolve_collision`) are check-then-write, so two groups' writes — even
 /// across two concurrent runs of the same process — must never race on the

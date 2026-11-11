@@ -888,7 +888,7 @@ pub(crate) struct LnReferencePayload {
 /// is a plain caller-supplied string with no NULL handling of its own — a
 /// `NULL` stored `registration_results.config_hash` must be turned into
 /// `""` by BOTH sides before it reaches here (M12, final fix wave):
-/// `run.rs`'s writer already does (`unwrap_or_default()`), and
+/// `run/`'s writer already does (`unwrap_or_default()`), and
 /// `plan.rs`'s own freshness read now mirrors it, so a frame with a
 /// genuinely-NULL config hash is not reported permanently stale by the plan
 /// gate while cache-hitting correctly inside a real run.
@@ -1113,7 +1113,7 @@ pub(crate) fn file_matches_identity(
 /// [`fits_artifact_fresh`]; the `Measure` staleness check in [`build_plan`]
 /// requires both).
 ///
-/// `pub(crate)`: `run.rs`'s calibrate stage (Task 6) calls this SAME rule to
+/// `pub(crate)`: `run/`'s calibrate stage (Task 6) calls this SAME rule to
 /// decide whether an existing `calibrated` artifact can be reused instead of
 /// regenerated — the plan and the run it precedes must never disagree about
 /// what "fresh" means.
@@ -1227,7 +1227,7 @@ pub(crate) fn wants_cfa_mosaic(cfg: &StackingConfig, group: &IntegrationGroup) -
 /// (mosaics kept as mosaics).
 ///
 /// C-17: the plan gate needs this to apply the SAME `k.len()` filter the
-/// run applies to a stored `ln_calibration` payload (`run.rs` compares
+/// run applies to a stored `ln_calibration` payload (`run/` compares
 /// against `ln_reference.planes.len()`, which it has because it has the
 /// reference).
 pub(crate) fn stage_one_planes(
@@ -1243,10 +1243,10 @@ pub(crate) fn stage_one_planes(
     }
 }
 
-/// Whether a frame's registration reads Measure's `fits.0` artifact (frame-level cache spec §5.5): the group's
-/// stage-1 frames are one plane (`stage_one_planes == 1`: mono, or an OSC frame set calibrated with `debayerOsc`
-/// off, whose mosaic reads `fits.0`, `run.rs::resolve_register_fits`). Only then does the registration hash fold the
-/// measurement hash. NOT `run.rs::expected_stage_one_planes`, which always assumes the Prepare path.
+/// Whether a frame's registration reads Measure's `fits.0` artifact (frame-level cache spec §5.5): the group's stage-1
+/// frames are one plane (`stage_one_planes == 1`: mono, or an OSC frame set calibrated with `debayerOsc` off, whose
+/// mosaic reads `fits.0`, `run/register.rs::resolve_register_fits`). Only then does the registration hash fold the
+/// measurement hash. NOT `run/calibrate.rs::expected_stage_one_planes`, which always assumes the Prepare path.
 pub(crate) fn register_reads_measure_fits(
     cfg: &StackingConfig,
     group: &IntegrationGroup,
@@ -1790,7 +1790,7 @@ fn largest_group<'a>(
 /// `reference_frame_id` matches, its `status` is `aligned` /
 /// `aligned_flipped` / `reference`, and its `config_hash` equals the
 /// expected one. Shared by [`compute_register_stale`] (the plan's own
-/// whole-build staleness check, below) and `run.rs`'s stage 5 (Task 7's
+/// whole-build staleness check, below) and `run/`'s stage 5 (Task 7's
 /// per-frame reuse decision) — the plan and the run it precedes must never
 /// disagree about what "fresh" means, so both call this SAME function
 /// rather than each re-deriving the three-part check.
@@ -1904,7 +1904,7 @@ fn cleanup_stale_note(
 /// mode (`None` there — a run that recorded no reference — is stale). Each
 /// included frame then needs a `registration_results` row passing
 /// [`registration_row_is_fresh`] against the CURRENT stage-1 hashes of both
-/// the reference and the frame — the SAME predicate `run.rs`'s stage 5
+/// the reference and the frame — the SAME predicate `run/`'s stage 5
 /// uses, so the plan and the run it precedes can never disagree about what
 /// "fresh" means. A reference change (manual re-pick, or an auto run
 /// choosing a different frame than last time) is caught the same way: the
@@ -2075,7 +2075,7 @@ fn compute_register_stale(
         // means the alignment itself does not need to be redone — perf
         // tier A Task 6a's materialized `registered` artifact is a
         // separate on-disk file the run rewrites per frame whenever it is
-        // missing or stale (`registered_artifact_is_fresh` in `run.rs`;
+        // missing or stale (`registered_artifact_is_fresh` in `run/register.rs`;
         // same rule, mirrored here so the plan and the run can never
         // disagree about what "cached" means). Without this, an existing
         // catalog's first run after Task 6a — real registration rows, zero
@@ -3585,13 +3585,13 @@ pub fn build_plan(
     // Carry-over (c), Task 5's re-review: a frame the LATEST run itself
     // runtime-excluded for a local-normalization reason (`TooFewMatches`, a
     // sidecar write failure, an unreadable cached sidecar — M2 Task 7's
-    // `exclude_frame_and_persist` calls, `run.rs`) has no `ln` artifact by
+    // `exclude_frame_and_persist` calls, `run/`) has no `ln` artifact by
     // design — its own `normalize_frame` call never produced one, and won't
     // for the same underlying reason until something upstream changes.
     // Without this, `normalize_stale` would stay true FOREVER for that
     // group: this one known-bad frame can never earn a fresh `ln` row on
     // its own. Every LN exclusion reason (`LnError`'s `Display`, and
-    // `run.rs`'s own hand-built "writing .athln sidecar: reading it back
+    // `run/`'s own hand-built "writing .athln sidecar: reading it back
     // failed: …" post-write read-back text) starts with the literal
     // "local normalization:" prefix — checked, never assumed, so an
     // unrelated exclusion (registration failure, manual list, weight floor)
@@ -3735,7 +3735,7 @@ pub fn build_plan(
         // so this gate has to read the SAME stored value the run will use.
         // A group with no `ln_calibration` row yet (a catalog normalized
         // before this existed, or one whose calibration could not be
-        // measured) hashes with `None`, which is exactly what `run.rs` does
+        // measured) hashes with `None`, which is exactly what `run/` does
         // in that case — the two sides stay in step without this gate ever
         // running a measurement of its own. The row's own freshness is NOT
         // re-derived here (it keys on the calibration frames' registration
@@ -3748,7 +3748,7 @@ pub fn build_plan(
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<SeedsCalibration>(&s).ok())
                 // C-17: the same shape filter the run applies
-                // (`run.rs`'s `stored_calibration`) — a payload whose `k`
+                // (`run/`'s `stored_calibration`) — a payload whose `k`
                 // does not match the group's channel count is unusable
                 // THERE, so it must read as absent HERE too.
                 .filter(|c| c.k.len() == ln_channels)
@@ -3907,7 +3907,7 @@ pub fn build_plan(
                     (Some(ref_info), Some(hash_opt)) => {
                         // M12 (final fix wave): a `NULL` stored
                         // `config_hash` must hash as `""` here, exactly
-                        // the way `run.rs` writes it
+                        // the way `run/` writes it
                         // (`record.config_hash.clone().unwrap_or_default()`)
                         // — without this, a frame whose registration row
                         // genuinely has no `config_hash` would cache-hit
@@ -3922,7 +3922,7 @@ pub fn build_plan(
                         };
                         // C-17: the same measurement hash the Measure
                         // check above resolved for this frame, and the
-                        // same value `run.rs` folds in. `None` (no group
+                        // same value `run/` folds in. `None` (no group
                         // frame, no calibration hash) hashes as "" on
                         // BOTH sides, so the gate and the run still
                         // agree.
@@ -3979,7 +3979,7 @@ pub fn build_plan(
         }
 
         // Fix round 1, Minor M3: `group_anchor_geometry` (shared with
-        // `run.rs`'s own `stacking_run_groups.width`/`height` DB write,
+        // `run/`'s own `stacking_run_groups.width`/`height` DB write,
         // which keeps `Some(0)` — a DB column, not this struct's own "is it
         // known" contract) reports `GroupFrame.width`/`height` verbatim,
         // and `GroupFrame` stores an absent `NAXIS1`/`NAXIS2` as `0`
@@ -7020,7 +7020,7 @@ mod tests {
     /// [`compute_register_stale`]) reads it as usable. `hash` is the SAME
     /// registration hash the caller already computed for this frame
     /// (`registration_hash_for`) — the registered artifact's freshness
-    /// rides the registration row's own hash, exactly as `run.rs`'s
+    /// rides the registration row's own hash, exactly as `run/`'s
     /// `registered_artifact_is_fresh` call site does.
     fn seed_registered_artifact(
         f: &test_fixtures::Fixture,
@@ -8718,7 +8718,7 @@ mod tests {
     /// The rule needed no new code: [`compute_register_stale`] in `Auto`
     /// mode already takes the expected reference from the LAST RUN's own
     /// `stacking_runs.reference_frame_id`, which is exactly what
-    /// `run.rs`'s switch updates (`set_run_reference`). This test is the
+    /// `run/`'s switch updates (`set_run_reference`). This test is the
     /// pin on that.
     ///
     /// Flipping `reference.twoPass` off does NOT make Register stale

@@ -1,5 +1,6 @@
 //! Plan D D1w: the reweigh in the run (`reweigh_groups`, the floor deferral). A child module of `run::reweigh` (its
-//! private items are in reach). The fixtures render 16-bit star fields of a chosen width and transparency on a 384 x 288 canvas.
+//! private items are in reach). The fixtures render 16-bit star fields of a chosen width and transparency on a
+//! 384 x 288 canvas.
 //!
 //! Why the fixtures look the way they do: the Measure-time weight reads EVERY accepted fit of a frame, and the stars a
 //! frame fits differ from sub to sub (a clipped star, a lost one, a refused one). The Gaussian stars rendered here are

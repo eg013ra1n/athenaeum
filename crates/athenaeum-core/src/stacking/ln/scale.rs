@@ -1074,7 +1074,7 @@ impl PreparedReferenceChannel {
     /// (perf tier 1 Task 2 fix round 1, item 3): the reference-side
     /// detect+fit this hoists once per group is real parallel work —
     /// routed to `image_pool` when the caller has one
-    /// (`LnReferenceForDetection::build`, itself called from `run.rs` with
+    /// (`LnReferenceForDetection::build`, itself called from `run/` with
     /// `rc.ctx.image_pool` in scope), `None` from the probe/tests.
     pub fn build(
         reference: &[f32],

@@ -20,6 +20,13 @@
 //! stages 3-9 to the SAME [`run_pipeline`]/[`RunContext`] this task defines —
 //! see each item's doc comment for exactly what is provisioned now and
 //! consumed later.
+//!
+//! The stages are this folder's files, each with its tests beside it in `<file>_tests.rs`: `masters` (stage 0.5),
+//! `calibrate` and `prepare` (stage 1), `solve` and `measure` (stage 3), `reference` (stage 4), `register`,
+//! `two_pass` and `reweigh` (stage 5), `normalize` (stage 6), `output` (stages 7 and 9) and `crop`. `fan_out` is the
+//! worker pool and the memory admission the stages share; `frames` is the frame rows and the frame-level file
+//! names. This file keeps the run thread, [`RunContext`], the in-memory frame entries and the events; `tests.rs`
+//! keeps the rig every stage's tests use and the tests of a run as a whole.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1563,8 +1570,6 @@ fn run_pipeline(rc: &mut RunContext) -> Result<(), RunError> {
 
     Ok(())
 }
-
-// ── Stages 3-5 (Task 7): measure & select, reference, register ─────────────
 
 /// One frame's stage 3-5 lifecycle, tracked per group
 /// (`RunContext::measured`, keyed by `group_key`) across those three stages

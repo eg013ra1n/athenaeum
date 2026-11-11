@@ -8,7 +8,7 @@
 //! isolation test; Measure marks the kept fits within that test's radius of it (`StarFlags::BLEND_NEIGHBOUR`, PD-36) and
 //! [`candidates`] reads the mark as "not isolated", so the set is the one the unrefused fits gave.
 //!
-//! Pure logic, no I/O and no weights. The caller (`run.rs::reweigh_groups`, D1w) reads one member's `.athf` fits at a
+//! Pure logic, no I/O and no weights. The caller (`run/reweigh.rs::reweigh_groups`, D1w) reads one member's `.athf` fits at a
 //! time and hands the module their [`MemberPlane`]. On a THREE-plane image (PD-32: [`APERTURE_SUM_PLANES`], the gate of the
 //! sibling rescue) the flux the paired ratios read is each fit's aperture sum `S`
 //! (`StarFit::ap_sum`, Plan D D2b, PD-26; its aperture Plan D D2c, PD-30): the sum of `v - B_i` over the pixels within
@@ -71,9 +71,10 @@ pub struct MemberPlane<'a> {
     /// `aperture_correction_group` of a plane at floor (i), else 1: the fits' `signal` of such a plane carries no `c`,
     /// and `take_group_c` scales the plane's totals by this (PD-3).
     pub c_stand_in: f64,
-    /// The image's plane count (`run.rs::reweigh_group`'s `nch`; the master's and the best sub's `GroupInput::channels`): three
-    /// planes weigh by the aperture sum, any other count by the model flux times `c` (PD-32). Every member of one call
-    /// chain ([`candidates`], [`match_member`], [`common_flux`]) carries the same count.
+    /// The image's plane count (`run/reweigh.rs::reweigh_group`'s `nch`; the master's and the best sub's
+    /// `GroupInput::channels`): three planes weigh by the aperture sum, any other count by the model flux times `c`
+    /// (PD-32). Every member of one call chain ([`candidates`], [`match_member`], [`common_flux`]) carries the same
+    /// count.
     pub planes: usize,
 }
 

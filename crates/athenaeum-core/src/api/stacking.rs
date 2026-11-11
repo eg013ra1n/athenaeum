@@ -1493,8 +1493,8 @@ mod tests {
     /// (`stacking::test_fixtures::frame_set_with_conn`'s own contract) —
     /// mirrors `stacking::run::tests::seed_ready`, duplicated here (not
     /// `pub(crate)` there, and this task's file scope doesn't touch
-    /// `run.rs`) at a fraction of its size, since this module's own tests
-    /// never need `run.rs`'s fan-out/registration machinery.
+    /// `run/`) at a fraction of its size, since this module's own tests
+    /// never need `run/`'s fan-out/registration machinery.
     fn seed_ready_fixture(
         db_path: &std::path::Path,
         set_name: &str,
@@ -2126,7 +2126,7 @@ mod tests {
 
         // Let the freshly started run finish (whatever its outcome) so its
         // background thread does not outlive the test — same 30s-capped
-        // poll `run.rs`'s own `wait_for_run` test helper uses.
+        // poll `run/`'s own `wait_for_run` test helper uses.
         let wait_start = std::time::Instant::now();
         loop {
             if !ctx

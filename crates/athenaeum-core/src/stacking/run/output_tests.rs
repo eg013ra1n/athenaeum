@@ -2402,7 +2402,7 @@ fn cancel_during_drizzle_keeps_the_master_removes_rej_leaves_drizzle_path_null()
     assert_eq!(completes[0]["cancelled"].as_bool(), Some(true));
 }
 
-/// B1 (M3 final fix wave, I1) run.rs composite test (b): a second group
+/// B1 (M3 final fix wave, I1) run's composite test (b): a second group
 /// whose members are natively LARGER than the run's reference — the
 /// acceptance set's own shape (the OSC group's 6248x4176 native frames
 /// registered onto a 6224x4168 reference) since the 2026-09-10 owner

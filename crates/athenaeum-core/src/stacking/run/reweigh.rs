@@ -1,8 +1,6 @@
-//! The reweigh at the end of stage 5 (`reweigh_groups`).
+//! Plan D D1w: the reweigh at the end of stage 5 (`reweigh_groups`).
 
 use super::*;
-
-// ── Plan D D1w: the reweigh (end of stage 5) ────────────────────────────────
 
 /// `reason` of a fallback names "under 20 common stars"; the count it names is the module's.
 const _: () = assert!(common_set::COMMON_MIN_STARS == 20);
