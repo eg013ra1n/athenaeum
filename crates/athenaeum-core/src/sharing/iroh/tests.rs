@@ -4125,6 +4125,20 @@ async fn live_hedge_cancels_scenario() {
         "every item must be credited exactly once, hedge-won ones included: {:?}",
         out.report
     );
+    // The slow peer's primaries were each cancelled by a hedge that finished the
+    // item. What it moved before that is payload the run kept, so it is credited;
+    // being cancelled is not a failure, so no strike is.
+    let slow_stats = live_stats(&out.report, swarm.ids[2]);
+    assert!(
+        slow_stats.bytes > 0 && !slow_stats.elapsed.is_zero(),
+        "a cancelled hedge loser must be credited what it moved: {:?}",
+        out.report
+    );
+    assert_eq!(
+        slow_stats.failures, 0,
+        "a cancelled loser is not a failure: {:?}",
+        out.report
+    );
     const CANCEL_BOUND: u64 = 4 * (LIVE_HEDGE_SIZE as u64) + SERVED_PAYLOAD_FLOOR;
     assert!(
         slow_sent < CANCEL_BOUND,
