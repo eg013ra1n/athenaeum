@@ -1,17 +1,271 @@
-//! Archive commands both hosts wrap: the three listings the Archive page reads
-//! (archived frame sets, an operation's zips, restore suggestions), the
-//! restore worker and the deletion of an archive. The listings return ad-hoc
-//! JSON with the keys the frontend reads, so the wire shape does not change.
+//! Archive commands both hosts wrap: the archive roots and settings, the plan
+//! and the start of an operation, resume and rollback, the three listings the
+//! Archive page reads (archived frame sets, an operation's zips, restore
+//! suggestions), the restore worker and the deletion of an archive. The
+//! listings return ad-hoc JSON with the keys the frontend reads, so the wire
+//! shape does not change.
 
 use crate::api::{db, ApiError};
-use crate::archive::models::{ArchiveCompression, ConflictResolution, Dispositions};
-use crate::archive::{db as adb, executor, planner, restore};
+use crate::archive::models::{
+    ArchiveCompression, ArchiveOperationSummary, ArchivePlan, ConflictResolution, Dispositions,
+};
+use crate::archive::{db as adb, executor, planner, restore, resume, rollback};
 use crate::events::ProgressEmitter;
+use crate::settings::keys;
 use crate::services::operation_queue::{OperationKind, QueuedJob};
 use crate::services::{ArchiveHandle, ServiceContext};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+/// The archive roots, default flag included. Migrates the legacy single-folder
+/// `archive.root_path` setting into the table first.
+pub fn list_archive_roots(ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    crate::archive::migrate_legacy_archive_root(&conn, &ctx.settings)
+        .map_err(|e| ApiError::Internal(format!("{:#}", e)))?;
+    let mut stmt = conn
+        .prepare("SELECT id, path, label, is_default FROM archive_roots ORDER BY id")
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "path": row.get::<_, String>(1)?,
+                "label": row.get::<_, Option<String>>(2)?,
+                "is_default": row.get::<_, i32>(3)? == 1,
+            }))
+        })
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(rows)
+}
+
+/// Add an archive root; the first one added becomes the default. Returns the
+/// new row id.
+pub fn add_archive_root(
+    ctx: &ServiceContext,
+    path: String,
+    label: Option<String>,
+) -> Result<i64, ApiError> {
+    if !Path::new(&path).is_dir() {
+        return Err(ApiError::Invalid(format!("'{}' is not a directory", path)));
+    }
+    // Store the canonical normalized spelling — archive roots were the one
+    // root table whose rows were inserted verbatim from the picker, so
+    // `C:\Archive` vs `c:\Archive` (or a \\?\-verbatim form) could coexist as
+    // two rows and the exact-string lookup in resolve_archive_root rejected
+    // legitimate re-picks of the same folder.
+    let path = match Path::new(&path).canonicalize() {
+        Ok(c) => crate::api::scan_roots::normalize_path(&c)
+            .to_string_lossy()
+            .to_string(),
+        Err(e) => return Err(ApiError::Invalid(format!("failed to resolve '{}': {}", path, e))),
+    };
+    let db = db(ctx)?;
+    let conn = db.conn();
+    crate::archive::migrate_legacy_archive_root(&conn, &ctx.settings)
+        .map_err(|e| ApiError::Internal(format!("{:#}", e)))?;
+    // First root added becomes default automatically.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM archive_roots", [], |r| r.get(0))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let is_default = if count == 0 { 1 } else { 0 };
+    conn.execute(
+        "INSERT INTO archive_roots (path, label, is_default) VALUES (?1, ?2, ?3)",
+        rusqlite::params![path, label, is_default],
+    )
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Delete an archive root; when it was the default, the lowest-id remaining
+/// row becomes the default.
+pub fn delete_archive_root(ctx: &ServiceContext, id: i64) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let was_default: i32 = conn
+        .query_row("SELECT is_default FROM archive_roots WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap_or(0);
+    conn.execute("DELETE FROM archive_roots WHERE id = ?1", [id])
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // If we deleted the default, promote the lowest-id remaining row to default.
+    if was_default == 1 {
+        if let Ok(new_default_id) = conn.query_row(
+            "SELECT id FROM archive_roots ORDER BY id LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            conn.execute(
+                "UPDATE archive_roots SET is_default = 1 WHERE id = ?1",
+                [new_default_id],
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Make one archive root the default (and every other one not).
+pub fn set_default_archive_root(ctx: &ServiceContext, id: i64) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    conn.execute("UPDATE archive_roots SET is_default = 0", [])
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let n = conn
+        .execute("UPDATE archive_roots SET is_default = 1 WHERE id = ?1", [id])
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if n == 0 {
+        return Err(ApiError::NotFound(format!("archive root id {} not found", id)));
+    }
+    Ok(())
+}
+
+/// The legacy archive folder and the compression setting.
+pub fn get_archive_settings(ctx: &ServiceContext) -> Result<serde_json::Value, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let root = ctx
+        .settings
+        .get_archive_root_path(&conn)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let compression = ctx
+        .settings
+        .get_archive_compression(&conn)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(serde_json::json!({
+        "rootPath": root,
+        "compression": compression,
+    }))
+}
+
+/// Set the legacy single-folder archive root setting.
+pub fn set_archive_root_path(ctx: &ServiceContext, path: &str) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    ctx.settings
+        .persist_setting(&db.conn(), keys::ARCHIVE_ROOT_PATH, path)
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Set the archive compression (`store` or `deflate`).
+pub fn set_archive_compression(ctx: &ServiceContext, compression: &str) -> Result<(), ApiError> {
+    if !matches!(compression, "store" | "deflate") {
+        return Err(ApiError::Invalid(format!(
+            "invalid compression value: {}",
+            compression
+        )));
+    }
+    let db = db(ctx)?;
+    ctx.settings
+        .persist_setting(&db.conn(), keys::ARCHIVE_COMPRESSION, compression)
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Build (without committing) the plan of an archive of one frame set.
+pub fn plan_archive_operation(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+    dispositions: &Dispositions,
+    compression: ArchiveCompression,
+    archive_root_path: Option<&str>,
+) -> Result<ArchivePlan, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let root = crate::archive::resolve_archive_root(&conn, &ctx.settings, archive_root_path)
+        .map_err(|e| ApiError::Invalid(format!("{:#}", e)))?;
+    planner::build_plan(&conn, frames_set_id, Path::new(&root), dispositions, compression)
+        .map_err(|e| ApiError::Internal(format!("{:#}", e)))
+}
+
+/// Raise the cancel flag of an active archive operation.
+pub fn cancel_archive_operation(ctx: &ServiceContext, operation_id: i64) -> Result<(), ApiError> {
+    let map = ctx.active_archives.lock().unwrap();
+    if let Some(handle) = map.get(&operation_id) {
+        handle.cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    } else {
+        Err(ApiError::NotFound(format!(
+            "no active archive operation with id {}",
+            operation_id
+        )))
+    }
+}
+
+/// Operations that a restart or a crash left unfinished.
+pub fn list_unfinished_archive_operations(
+    ctx: &ServiceContext,
+) -> Result<Vec<ArchiveOperationSummary>, ApiError> {
+    let db = db(ctx)?;
+    resume::find_unfinished_operations(&db.conn()).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Queue the resume of an interrupted operation on the shared disk worker.
+/// Registers the cancel handle at once (no busy guard) and drops it when the
+/// job is done; the terminal `archive-finished` event is emitted inside
+/// `resume::resume_operation_standalone`.
+pub fn resume_archive_operation(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    operation_id: i64,
+) -> Result<(), ApiError> {
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    ctx.active_archives.lock().unwrap().insert(
+        operation_id,
+        ArchiveHandle {
+            operation_id,
+            cancel_flag: cancel_flag.clone(),
+        },
+    );
+
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id,
+        run: Box::new(move || {
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            // Terminal event + failure bookkeeping in core — this worker used
+            // to emit nothing, so the resume widget could never dismiss.
+            // Errors logged inside.
+            let _ = resume::resume_operation_standalone(
+                &conn,
+                operation_id,
+                &cancel_flag,
+                emitter.as_ref(),
+            );
+            ctx_for_worker.active_archives.lock().unwrap().remove(&operation_id);
+        }),
+    });
+
+    Ok(())
+}
+
+/// Queue the rollback of an operation on the shared disk worker. No handle is
+/// registered and no busy guard applies; the terminal `archive-finished` event
+/// is emitted inside `rollback::rollback_operation_standalone`.
+pub fn rollback_archive_operation(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    operation_id: i64,
+) -> Result<(), ApiError> {
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id,
+        run: Box::new(move || {
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            if let Err(e) =
+                rollback::rollback_operation_standalone(&conn, operation_id, emitter.as_ref())
+            {
+                tracing::error!(operation_id, error = ?e, "archive rollback failed");
+            }
+        }),
+    });
+    Ok(())
+}
 
 /// Every frame set that has been archived, with the per-role file counts of the
 /// operation that archived it.
@@ -501,5 +755,96 @@ mod tests {
             assert_ne!(e.to_string(), "another archive operation is already in progress");
         }
         assert!(ctx.active_archives.lock().unwrap().contains_key(&7));
+    }
+
+    fn roots(ctx: &ServiceContext) -> Vec<(i64, bool)> {
+        list_archive_roots(ctx)
+            .unwrap()
+            .iter()
+            .map(|r| (r["id"].as_i64().unwrap(), r["is_default"].as_bool().unwrap()))
+            .collect()
+    }
+
+    /// The first root added becomes the default, the second does not; a file
+    /// path is refused as `Invalid`.
+    #[test]
+    fn add_archive_root_makes_the_first_root_the_default() {
+        let (tmp, ctx) = test_ctx();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let id_a = add_archive_root(&ctx, a.to_str().unwrap().into(), Some("A".into())).unwrap();
+        let id_b = add_archive_root(&ctx, b.to_str().unwrap().into(), None).unwrap();
+        assert_eq!(roots(&ctx), vec![(id_a, true), (id_b, false)]);
+
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let err = add_archive_root(&ctx, file.to_str().unwrap().into(), None).expect_err("file");
+        assert!(matches!(err, ApiError::Invalid(_)));
+    }
+
+    /// Deleting the default root promotes the lowest-id remaining one.
+    #[test]
+    fn delete_archive_root_promotes_the_next_default() {
+        let (tmp, ctx) = test_ctx();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let id_a = add_archive_root(&ctx, a.to_str().unwrap().into(), None).unwrap();
+        let id_b = add_archive_root(&ctx, b.to_str().unwrap().into(), None).unwrap();
+        delete_archive_root(&ctx, id_a).unwrap();
+        assert_eq!(roots(&ctx), vec![(id_b, true)]);
+    }
+
+    /// Setting the default flips exactly one row; an unknown id is `NotFound`.
+    #[test]
+    fn set_default_archive_root_moves_the_flag() {
+        let (tmp, ctx) = test_ctx();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let id_a = add_archive_root(&ctx, a.to_str().unwrap().into(), None).unwrap();
+        let id_b = add_archive_root(&ctx, b.to_str().unwrap().into(), None).unwrap();
+        set_default_archive_root(&ctx, id_b).unwrap();
+        assert_eq!(roots(&ctx), vec![(id_a, false), (id_b, true)]);
+        let err = set_default_archive_root(&ctx, 9999).expect_err("unknown id");
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    /// Compression accepts `store` and `deflate` and refuses the rest as `Invalid`.
+    #[test]
+    fn set_archive_compression_validates_the_value() {
+        let (_tmp, ctx) = test_ctx();
+        set_archive_compression(&ctx, "deflate").unwrap();
+        assert_eq!(get_archive_settings(&ctx).unwrap()["compression"], "deflate");
+        let err = set_archive_compression(&ctx, "zstd").expect_err("bad value");
+        assert!(matches!(err, ApiError::Invalid(_)));
+    }
+
+    /// The legacy root path setting round-trips through the settings read.
+    #[test]
+    fn set_archive_root_path_is_read_back_by_the_settings() {
+        let (_tmp, ctx) = test_ctx();
+        set_archive_root_path(&ctx, "/archive/legacy").unwrap();
+        assert_eq!(get_archive_settings(&ctx).unwrap()["rootPath"], "/archive/legacy");
+    }
+
+    /// Cancel raises the flag of an active operation and is `NotFound` for
+    /// an id with no handle.
+    #[test]
+    fn cancel_archive_operation_raises_the_flag() {
+        let (_tmp, ctx) = test_ctx();
+        let flag = Arc::new(AtomicBool::new(false));
+        ctx.active_archives.lock().unwrap().insert(
+            4,
+            ArchiveHandle { operation_id: 4, cancel_flag: flag.clone() },
+        );
+        cancel_archive_operation(&ctx, 4).unwrap();
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        let err = cancel_archive_operation(&ctx, 5).expect_err("no handle");
+        assert!(matches!(err, ApiError::NotFound(_)));
     }
 }
