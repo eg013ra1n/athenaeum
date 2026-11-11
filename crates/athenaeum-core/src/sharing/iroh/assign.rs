@@ -215,10 +215,15 @@ const HEDGE_REEVALUATE_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// `bytes` is payload bytes THIS provider delivered: `Stats.payload_bytes_read`
 /// on a completed assignment, and the last observed progress value on one that
-/// stalled or failed (so a provider that served 90 % and then died is not
-/// recorded as having served nothing). `elapsed` is wall clock, dial included —
-/// one rule for every outcome; `Stats.elapsed` (transfer only) is available at
-/// the [`transfer_once`] seam when A4 wants a tighter goodput denominator.
+/// stalled, failed or was CANCELLED as the loser of a hedge race (so a provider
+/// that served 90 % and then died, or served the front half of an item that a
+/// hedge then finished, is not recorded as having served nothing). `elapsed` is
+/// wall clock, dial included — one rule for every outcome;
+/// `Stats.elapsed` (transfer only) is available at the [`transfer_once`] seam
+/// when A4 wants a tighter goodput denominator.
+///
+/// A cancelled loser is credited bytes and time only ([`record_cancelled`]): it
+/// is not a failure and it is not a sample of the provider's goodput.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProviderStats {
     pub bytes: u64,
@@ -236,7 +241,8 @@ pub(crate) struct AssignmentReport {
     pub hedges: u32,
     /// DUPLICATE bytes hedging actually cost: the part of each hedge's charge
     /// that became debt, i.e. bytes some peer sent that another peer had
-    /// already sent. This is the quantity [`HEDGE_BUDGET_RATIO`] is a budget
+    /// already sent. Both copies are in the per-provider `bytes`, so this is the
+    /// part of [`total_bytes`](Self::total_bytes) that is not payload. This is the quantity [`HEDGE_BUDGET_RATIO`] is a budget
     /// FOR, and it is deliberately not "bytes a hedge delivered" — a hedge that
     /// wins delivers the half its primary never would have and duplicates
     /// nothing, so counting its delivery as a cost would libel the mechanism.
@@ -244,7 +250,11 @@ pub(crate) struct AssignmentReport {
 }
 
 impl AssignmentReport {
-    /// Total payload bytes accounted to some provider.
+    /// Total payload bytes accounted to some provider. Counts what each
+    /// provider MOVED, so a range a hedge race fetched on both sides is in it
+    /// twice: the payload the run kept is this minus
+    /// [`hedge_bytes`](Self::hedge_bytes), up to the bytes of an attempt that
+    /// was dropped before they were imported.
     pub(crate) fn total_bytes(&self) -> u64 {
         self.per_provider.values().map(|s| s.bytes).sum()
     }
@@ -1531,8 +1541,12 @@ async fn run_child(
                         // byte the hedge moved was fetched twice. Its own
                         // progress is already request-relative to the hedged
                         // range, so it needs no offsetting.
-                        let duplicated = h.progress.load(Ordering::Relaxed).min(h.charge.bytes);
+                        let hedge_moved = h.progress.load(Ordering::Relaxed);
+                        let duplicated = hedge_moved.min(h.charge.bytes);
                         settle_hedge_loser(&mut h, duplicated);
+                        // The cancelled hedge's own bytes and time, to its own
+                        // provider (report only).
+                        record_cancelled(&states, h.provider, hedge_moved, h.started.elapsed());
                         tracing::debug!(
                             child = index,
                             loser = %h.provider.fmt_short(),
@@ -1627,8 +1641,12 @@ async fn run_child(
                             }
                             if !primary_gone {
                                 // Cancelling the primary IS dropping it; the
-                                // `continue` below ends its scope.
+                                // `continue` below ends its scope. What it
+                                // moved before that is credited to it (report
+                                // only); a primary that already failed was
+                                // credited by `note_fault`.
                                 drop(primary);
+                                record_cancelled(&states, provider, moved, started.elapsed());
                                 tracing::debug!(
                                     child = index,
                                     loser = %provider.fmt_short(),
@@ -2544,6 +2562,18 @@ fn record_success(
     }
 }
 
+/// Credit the loser of a hedge race — the attempt that was cancelled because
+/// the other side finished — with what it moved and how long it ran.
+///
+/// Report-only. A cancelled attempt is neither a success nor a failure, so
+/// nothing a pick or a hedge decision reads moves: not the consecutive-failure
+/// count, the back-off, the goodput average, the stall count or the child count.
+/// Without this the front half a primary served before a hedge finished the item
+/// is real payload the run kept, credited to nobody.
+fn record_cancelled(states: &States, provider: EndpointId, bytes: u64, elapsed: Duration) {
+    credit_attempt(states, provider, bytes, elapsed);
+}
+
 /// This provider's smoothed goodput, or — for one that has completed nothing —
 /// the median of the providers that have measured one.
 ///
@@ -2832,6 +2862,49 @@ mod tests {
         assert!(g[&a].next_try.is_none(), "a success clears the backoff");
         assert_eq!(g[&a].failures, 0, "and resets the consecutive count");
         assert_eq!(g[&a].stats.children, 1);
+    }
+
+    /// A cancelled hedge loser is credited bytes and time and nothing else:
+    /// nothing a provider pick or a hedge decision reads moves.
+    #[test]
+    fn a_cancelled_loser_is_credited_bytes_and_time_only() {
+        let a = distinct_id();
+        let states: States = Arc::new(Mutex::new(states_of(vec![(a, ProviderState::default())])));
+        // A provider with a failure on record and a goodput reading.
+        record_failure(&states, a, &TransferFault::Stalled { bytes: 5 }, Duration::from_millis(2));
+        record_success(&states, a, &Stats::default(), Duration::from_millis(1), false);
+        record_failure(&states, a, &TransferFault::Stalled { bytes: 5 }, Duration::from_millis(2));
+        let (failures, next_try, goodput, samples, stalls, children, stat_failures) = {
+            let g = states.lock().unwrap();
+            let st = &g[&a];
+            (
+                st.failures,
+                st.next_try,
+                st.goodput,
+                st.goodput_samples,
+                st.stalls,
+                st.stats.children,
+                st.stats.failures,
+            )
+        };
+        let (bytes0, elapsed0) = {
+            let g = states.lock().unwrap();
+            (g[&a].stats.bytes, g[&a].stats.elapsed)
+        };
+
+        record_cancelled(&states, a, 1234, Duration::from_millis(40));
+
+        let g = states.lock().unwrap();
+        let st = &g[&a];
+        assert_eq!(st.stats.bytes, bytes0 + 1234);
+        assert_eq!(st.stats.elapsed, elapsed0 + Duration::from_millis(40));
+        assert_eq!(st.failures, failures);
+        assert_eq!(st.stats.failures, stat_failures);
+        assert_eq!(st.next_try, next_try);
+        assert_eq!(st.goodput, goodput);
+        assert_eq!(st.goodput_samples, samples);
+        assert_eq!(st.stalls, stalls);
+        assert_eq!(st.stats.children, children);
     }
 
     fn close(a: f64, b: f64) -> bool {
