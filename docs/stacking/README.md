@@ -5149,7 +5149,10 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
 - **Kinds.** `db::stacking::ArtifactKind` is the one list of artifact kinds (`Fits(plane)` is stored as `fits.<plane>`), and
   `ArtifactKind::is_frame_level` says which belong to a frame. `find_artifact` and `upsert_artifact` take the kind and the group's key and
   apply the rule themselves (`ArtifactKind::group_key`): a frame-level kind is stored and looked up under `''` whatever key came with it,
-  for the run and the plan gate alike. A caller cannot key a frame's own artifact on the group (2026-11-11; before that the kinds were
+  for the run and the plan gate alike. The other side of the rule: `upsert_artifact` refuses a group-level kind that comes with an empty
+  key (an error, in every build), because no group has the empty key, so the row would never be found by its group and, with no frame,
+  every group of the subject would share it. A group-level kind written under ANOTHER group's key is still stored as given: this layer
+  cannot tell. A caller cannot key a frame's own artifact on the group (2026-11-11; before that the kinds were
   bare strings and every call site wrapped its key by hand in `paths::artifact_group_key`, over `paths::FRAME_LEVEL_KINDS`). The stored
   strings did not change, `artifact_kind_strings_are_pinned` holds them: no migration, no hash moved. A new kind is a new variant; the
   compiler then asks for its string, whether it is frame-level, its place in `ArtifactKind::FIXED` (the list the keys migration and the

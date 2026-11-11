@@ -547,7 +547,8 @@ pub struct NewArtifact<'a> {
     pub subject: &'a StackSubject,
     pub frame_id: Option<i64>,
     /// The key of the group the artifact was made for. A frame-level kind is stored under `''` whatever is given
-    /// here ([`ArtifactKind::group_key`]); a writer with no group at hand passes `""`.
+    /// here ([`ArtifactKind::group_key`]); a writer of a frame-level kind with no group at hand passes `""`. A
+    /// group-level kind needs the group's own key: [`upsert_artifact`] refuses an empty one.
     pub group_key: &'a str,
     pub kind: ArtifactKind,
     pub path: Option<&'a str>,
@@ -955,8 +956,18 @@ pub fn list_frame_rows(conn: &Connection, run_id: i64) -> Result<Vec<StackingRun
 /// The frame / group rule (frame-level cache spec §5.1) is applied HERE: the row is stored under
 /// [`ArtifactKind::group_key`] of `a.group_key`, `''` for a frame-level kind and the group's key otherwise, and
 /// [`find_artifact`] looks it up the same way. A caller names the kind and the group; it does not choose the key.
+///
+/// A group-level kind with an empty `group_key` is refused: no group has the empty key (`groups::group_key` and
+/// `project_source::project_group_key` always compose tokens), so no lookup by a group's key would find the row,
+/// and with no frame every group of the subject would share it.
 pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
-    upsert_artifact_row(conn, a, a.kind.group_key(a.group_key))
+    let group_key = a.kind.group_key(a.group_key);
+    anyhow::ensure!(
+        a.kind.is_frame_level() || !group_key.is_empty(),
+        "a group-level artifact ({}) must be written under its group's key, not an empty one",
+        a.kind.as_db_str()
+    );
+    upsert_artifact_row(conn, a, group_key)
 }
 
 /// Test-only: store the row under `a.group_key` AS GIVEN, past the frame / group rule. The shape of a row written
@@ -1801,6 +1812,40 @@ mod tests {
             b
         );
         assert!(find_artifact(&c, &subject, "", ArtifactKind::Ln, Some(5)).unwrap().is_none());
+
+        // A group-level kind with no group's key is refused, with or without a frame, and leaves no row.
+        for (kind, frame_id) in [
+            (ArtifactKind::Ln, Some(5)),
+            (ArtifactKind::LnGlobal, Some(5)),
+            (ArtifactKind::LnReference, None),
+            (ArtifactKind::LnCalibration, None),
+            (ArtifactKind::TwoPass, None),
+        ] {
+            let refused = upsert_artifact(
+                &c,
+                &NewArtifact {
+                    subject: &subject,
+                    frame_id,
+                    group_key: "",
+                    kind,
+                    path: None,
+                    config_hash: "h",
+                    size: None,
+                    modified_at: None,
+                    payload_json: None,
+                },
+            );
+            let message = refused.expect_err("an empty group key must be refused").to_string();
+            assert!(message.contains(&*kind.as_db_str()), "{message}");
+        }
+        let empty_keyed_group_rows: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM stacking_artifacts WHERE group_key = '' AND (kind LIKE 'ln%' OR kind = 'two_pass')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty_keyed_group_rows, 0);
 
         // The test door stores the key as given: the shape of a row from before the frame-level keys migration.
         // The rule does not find it, and it does not collide with the frame's own row.
