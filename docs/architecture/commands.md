@@ -66,11 +66,11 @@ Both hosts carried their own copy of these; each now has one in core.
 | `api/settings.rs` | `set_setting` (the monitor is a parameter, as in `set_scan_root_monitor_enabled`) |
 | `api/archive.rs` (new) | `list_archived_frame_sets`, `list_archive_zips`, `get_restore_suggestions`, `delete_archive`, `start_restore_operation` |
 | `api/export.rs` | `export_to_wbpp` (the web's export directory is the `allowed_export_dir` parameter), the WBPP config commands |
-| `api/plate_solve.rs` | `download_catalog_layers`, `CatalogDownloadProgress` |
+| `api/plate_solve.rs` | `download_catalog_layers`, `CatalogDownloadProgress`; `prepare_plate_solve_batch` + `run_plate_solve_batch`, `prepare_autofind_objects` + `run_autofind_objects` (the host resolves the star-catalog layers, index packs and DSO catalog from its own state and keeps its own waiting: the desktop awaits the run, the web starts it and returns) |
 | `api/scan_roots.rs`, `api/files.rs` | already there; the web routes `check_missing_files_in_scan_root`, `set_scan_root_unique_camera_flag`, `get_duplicates` now call them |
 
 Still copied in both hosts, because the copies differ in behaviour and the owner has not ruled which side wins:
-`plate_solve_batch`, `autofind_objects_from_coordinates`, `find_new_frames_for_set`, `start_archive_operation`. Also
+`find_new_frames_for_set`, `start_archive_operation`. Also
 still copied, same behaviour, not yet moved: the archive root commands, `resume_archive_operation`,
 `rollback_archive_operation`, `plan_archive_operation`, the frame-set detail loader, the export preview and summary
 commands, and the rest of `missing_files`.

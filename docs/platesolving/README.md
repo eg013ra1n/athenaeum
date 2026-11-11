@@ -338,7 +338,7 @@ Takeaways:
   catalog; bright is a speed optimization on top of it.
 ## Per-Frame Pipeline
 
-The batch driver is `plate_solve_batch` in the Tauri command and its Axum mirror. Core exposes `service::solve_frame`, `solve_frame_tiered`, `solve_frame_layered` (single-frame conveniences, mostly for tests and tools) and `solve_frame_with_hints`, the hot path both hosts and the stacking solve call. There is no single-frame solve command.
+The batch driver is `api::plate_solve::{prepare_plate_solve_batch, run_plate_solve_batch}` in core; the Tauri command and its Axum mirror resolve the star-catalog layers, index packs and DSO catalog, call prepare, then run (the desktop awaits the run, the web does not). A panic inside one frame fails that frame with code `PANIC`; the run always ends the batch (cancel handle 0 removed, `plate-solve-complete` emitted). Core exposes `service::solve_frame`, `solve_frame_tiered`, `solve_frame_layered` (single-frame conveniences, mostly for tests and tools) and `solve_frame_with_hints`, the hot path both hosts and the stacking solve call. There is no single-frame solve command.
 
 ### 1. Load and gate (calling thread, holds the DB)
 
