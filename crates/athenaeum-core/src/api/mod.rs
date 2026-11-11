@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 
 pub mod calibration;
+// Archive listings, restore start and archive deletion. Ungated: archive + db only.
+pub mod archive;
 pub mod files;
 // Missing-files listing and recheck. Ungated: db + zip_store only.
 pub mod missing_files;

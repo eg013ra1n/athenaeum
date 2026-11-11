@@ -1,7 +1,7 @@
 //! Archive feature Tauri commands.
 
 use super::AppState;
-use athenaeum_core::archive::{db as adb, executor, planner, resume, restore, rollback, models::*};
+use athenaeum_core::archive::{executor, planner, resume, rollback, models::*};
 use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
 use athenaeum_core::services::ArchiveHandle;
 use athenaeum_core::settings::keys;
@@ -311,54 +311,8 @@ pub async fn get_restore_suggestions(
     state: State<'_, AppState>,
     operation_id: i64,
 ) -> Result<serde_json::Value, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Take the first operation file and strip the target_path_in_zip from
-    // the source_path; what remains is the original parent directory.
-    // All files in a single operation share the same parent (since prefixes
-    // are scan-root-relative).
-    let suggested: Option<String> = conn
-        .query_row(
-            "SELECT source_path, target_path_in_zip
-             FROM archive_operation_files
-             WHERE operation_id = ?1
-             LIMIT 1",
-            [operation_id],
-            |row| {
-                let source_path: String = row.get(0)?;
-                let path_in_zip: String = row.get(1)?;
-                Ok(
-                    athenaeum_core::archive::path_layout::original_parent_for_restore(
-                        &source_path,
-                        &path_in_zip,
-                    ),
-                )
-            },
-        )
-        .map_err(|e| e.to_string())?;
-
-    // Existing scan roots
-    let mut stmt = conn
-        .prepare("SELECT path FROM scan_roots ORDER BY path")
-        .map_err(|e| e.to_string())?;
-    let scan_roots: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())?;
-
-    // Whether the suggested original path still exists and is writable.
-    let suggested_exists = suggested
-        .as_ref()
-        .map(|p| std::path::Path::new(p).is_dir())
-        .unwrap_or(false);
-
-    Ok(serde_json::json!({
-        "suggested_original_path": suggested,
-        "suggested_original_exists": suggested_exists,
-        "scan_roots": scan_roots,
-    }))
+    athenaeum_core::api::archive::get_restore_suggestions(&state.ctx, operation_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -392,50 +346,8 @@ pub async fn list_archive_zips(
     state: State<'_, AppState>,
     operation_id: i64,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    // Unique target_zip_paths for the operation, ordered by frame_role priority.
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT target_zip_path, frame_role
-             FROM archive_operation_files
-             WHERE operation_id = ?1
-             ORDER BY
-                CASE frame_role
-                    WHEN 'light' THEN 0
-                    WHEN 'flat'  THEN 1
-                    WHEN 'darkflat' THEN 2
-                    WHEN 'dark'  THEN 3
-                    WHEN 'bias'  THEN 4
-                    ELSE 5
-                END,
-                target_zip_path",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([operation_id], |row| {
-            let path: String = row.get(0)?;
-            let frame_role: String = row.get(1)?;
-            let p = std::path::Path::new(&path);
-            let filename = p
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let exists = p.is_file();
-            let size_bytes = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
-            Ok(serde_json::json!({
-                "path": path,
-                "filename": filename,
-                "frame_role": frame_role,
-                "exists": exists,
-                "size_bytes": size_bytes,
-            }))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+    athenaeum_core::api::archive::list_archive_zips(&state.ctx, operation_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -443,44 +355,7 @@ pub async fn list_archive_zips(
 pub async fn list_archived_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    let mut stmt = conn.prepare(
-        "SELECT fs.id, fs.name, fs.archived_at, fs.archive_operation_id,
-                op.archive_root_path, op.started_at,
-                (SELECT COUNT(*) FROM archive_operation_files
-                 WHERE operation_id = op.id AND frame_role = 'light') AS lights,
-                (SELECT COUNT(*) FROM archive_operation_files
-                 WHERE operation_id = op.id AND frame_role = 'flat') AS flats,
-                (SELECT COUNT(*) FROM archive_operation_files
-                 WHERE operation_id = op.id AND frame_role = 'dark') AS darks,
-                (SELECT COUNT(*) FROM archive_operation_files
-                 WHERE operation_id = op.id AND frame_role = 'bias') AS bias,
-                (SELECT COUNT(*) FROM archive_operation_files
-                 WHERE operation_id = op.id AND frame_role = 'darkflat') AS darkflats
-         FROM frames_set fs
-         LEFT JOIN archive_operations op ON op.id = fs.archive_operation_id
-         WHERE fs.archived_at IS NOT NULL
-         ORDER BY fs.archived_at DESC",
-    ).map_err(|e| e.to_string())?;
-    let rows: Vec<serde_json::Value> = stmt.query_map([], |row| {
-        Ok(serde_json::json!({
-            "frames_set_id": row.get::<_, i64>(0)?,
-            "name": row.get::<_, Option<String>>(1)?,
-            "archived_at": row.get::<_, Option<String>>(2)?,
-            "operation_id": row.get::<_, Option<i64>>(3)?,
-            "archive_root_path": row.get::<_, Option<String>>(4)?,
-            "started_at": row.get::<_, Option<String>>(5)?,
-            "lights_count": row.get::<_, i64>(6)?,
-            "flats_count": row.get::<_, i64>(7)?,
-            "darks_count": row.get::<_, i64>(8)?,
-            "bias_count": row.get::<_, i64>(9)?,
-            "darkflats_count": row.get::<_, i64>(10)?,
-        }))
-    }).map_err(|e| e.to_string())?
-      .collect::<rusqlite::Result<Vec<_>>>()
-      .map_err(|e| e.to_string())?;
-    Ok(rows)
+    athenaeum_core::api::archive::list_archived_frame_sets(&state.ctx).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -493,60 +368,16 @@ pub async fn start_restore_operation(
     overwrite_existing: bool,
     keep_zip_after_restore: bool,
 ) -> Result<(), String> {
-    {
-        let map = state.ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err("another archive operation is already in progress".into());
-        }
-    }
-    let ctx = state.ctx.clone();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    ctx.active_archives.lock().unwrap().insert(operation_id, ArchiveHandle {
-        operation_id, cancel_flag: cancel_flag.clone(),
-    });
-    let app_for_emitter = app.clone();
-    let ctx_for_worker = ctx.clone();
-    ctx.operation_queue.enqueue(QueuedJob {
-        kind: OperationKind::ZipArchive,
+    let emitter = Arc::new(crate::tauri_events::TauriProgressEmitter(app));
+    athenaeum_core::api::archive::start_restore_operation(
+        state.ctx.clone(),
+        emitter,
         operation_id,
-        run: Box::new(move || {
-            let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
-            let db = ctx_for_worker.db.get().expect("db");
-            let conn = db.conn();
-            let (outcome, conflicts) = match restore::run_restore(
-                &conn, operation_id, Path::new(&target_root_path),
-                overwrite_existing, keep_zip_after_restore, &cancel_flag, &emitter,
-            ) {
-                Ok(result) if result.has_conflicts() => {
-                    tracing::warn!(
-                        operation_id,
-                        conflicts = result.conflicts.len(),
-                        paths = ?result.conflicts.iter().map(|c| c.source_path.as_str()).collect::<Vec<_>>(),
-                        "restore completed with conflicts"
-                    );
-                    ("completed_with_conflicts", result.conflicts.len())
-                }
-                Ok(_) => ("completed", 0),
-                Err(e) => {
-                    tracing::error!(operation_id, error = ?e, "restore failed");
-                    let outcome = if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" };
-                    (outcome, 0)
-                }
-            };
-            athenaeum_core::events::emit_event(
-                &emitter,
-                "archive-finished",
-                &serde_json::json!({
-                    "operation_id": operation_id,
-                    "outcome": outcome,
-                    "kind": "restore",
-                    "conflicts": conflicts,
-                }),
-            );
-            ctx_for_worker.active_archives.lock().unwrap().remove(&operation_id);
-        }),
-    });
-    Ok(())
+        target_root_path,
+        overwrite_existing,
+        keep_zip_after_restore,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -555,57 +386,6 @@ pub async fn delete_archive(
     state: State<'_, AppState>,
     operation_id: i64,
 ) -> Result<(), String> {
-    {
-        let map = state.ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err("another archive operation is already in progress".into());
-        }
-    }
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Delete zip files. A zip we could not delete (Windows sharing violation,
-    // read-only volume) must abort the whole command BEFORE any catalog row
-    // goes away — otherwise the zip is orphaned on disk with nothing pointing
-    // at it and the archive becomes unrestorable.
-    let files = adb::list_operation_files(&conn, operation_id).map_err(|e| e.to_string())?;
-    let mut seen = std::collections::HashSet::new();
-    let mut failed: Vec<String> = Vec::new();
-    for f in &files {
-        if seen.insert(f.target_zip_path.clone()) {
-            let p = std::path::Path::new(&f.target_zip_path);
-            if p.exists() {
-                if let Err(e) = std::fs::remove_file(p) {
-                    tracing::error!(operation_id, path = %f.target_zip_path, error = %e, "failed to delete archive zip");
-                    failed.push(format!("{}: {}", f.target_zip_path, e));
-                }
-            }
-        }
-    }
-    if !failed.is_empty() {
-        return Err(format!(
-            "could not delete {} zip file(s); catalog rows kept — any zip already removed in this pass is not restorable: {}",
-            failed.len(),
-            failed.join("; ")
-        ));
-    }
-
-    // Get frames_set_id, then delete frame set + cascading rows.
-    let op = adb::get_operation(&conn, operation_id).map_err(|e| e.to_string())?;
-    match op.frames_set_id {
-        Some(fs_id) => {
-            conn.execute("DELETE FROM frames_set WHERE id = ?1", [fs_id])
-                .map_err(|e| e.to_string())?;
-            // archive_operations row is also deleted via FK cascade from frames_set_id.
-        }
-        None => {
-            // Calibration-set archive op (Task 14): no frames_set to cascade
-            // from — delete the archive_operations row directly (cascades to
-            // archive_operation_files/steps via their own FKs).
-            conn.execute("DELETE FROM archive_operations WHERE id = ?1", [operation_id])
-                .map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
+    athenaeum_core::api::archive::delete_archive(&state.ctx, operation_id)
+        .map_err(|e| e.to_string())
 }
