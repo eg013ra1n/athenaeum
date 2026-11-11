@@ -1,12 +1,12 @@
-//! Plan D D1w: the reweigh in the run (`reweigh_groups`, the floor deferral). A child module of `run` (its private items
-//! are in reach). The fixtures render 16-bit star fields of a chosen width and transparency on a 384 x 288 canvas.
+//! Plan D D1w: the reweigh in the run (`reweigh_groups`, the floor deferral). A child module of `run::reweigh` (its
+//! private items are in reach). The fixtures render 16-bit star fields of a chosen width and transparency on a 384 x 288 canvas.
 //!
 //! Why the fixtures look the way they do: the Measure-time weight reads EVERY accepted fit of a frame, and the stars a
 //! frame fits differ from sub to sub (a clipped star, a lost one, a refused one). The Gaussian stars rendered here are
 //! extrapolated almost exactly even when they clip, so a clipped star would not move a Measure-time weight; the
 //! "stars only one sub has" stand in for the ones real subs clip, lose or refuse. The common set must ignore them.
 
-use super::tests::{run_stages_for_test, seed_run_and_groups, SET_NAME};
+use crate::stacking::run::tests::{run_stages_for_test, seed_run_and_groups, SET_NAME};
 use super::*;
 use crate::db::stacking::StackingRunFrameRow;
 use crate::events::NullEmitter;
@@ -1453,7 +1453,7 @@ fn fails_the_floor(h: &Harness, id: i64) -> bool {
 }
 
 fn pick_entry(id: i64, weight: f64, floored: bool) -> MeasuredFrame {
-    let mut e = super::tests::bare_measured_frame(id);
+    let mut e = crate::stacking::run::tests::bare_measured_frame(id);
     e.weight = Some(FrameWeight {
         channels: vec![weight],
         normalized: vec![weight],
