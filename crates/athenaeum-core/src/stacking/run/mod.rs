@@ -41,10 +41,10 @@ use crate::api::{db, ApiError, PathPolicy};
 use crate::calibration_library::cosmetic::{hot_pixel_map_from_dark, HotPixelMapOutcome};
 use crate::calibration_library::light_cal::{preload_master_plane, PreloadedMasters};
 use crate::db::stacking::{
-    ArtifactKind, finish_run, get_run, insert_group, insert_master_light, insert_run,
+    finish_run, get_run, insert_group, insert_master_light, insert_run,
     set_frame_rejected_fraction, set_run_reference, set_run_status, update_group, upsert_artifact,
-    upsert_frame_row, GroupUpdate, NewArtifact, NewFrameRow, NewGroup, NewMasterLight, NewRun,
-    StackSubject,
+    upsert_frame_row, ArtifactKind, GroupUpdate, NewArtifact, NewFrameRow, NewGroup, NewMasterLight,
+    NewRun, StackSubject,
 };
 use crate::events::{emit_event, ProgressEmitter};
 use crate::export::{

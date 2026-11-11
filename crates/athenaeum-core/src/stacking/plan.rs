@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::lights::{compute_export_readiness_for_frames, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
 use crate::db::stacking::{
-    ArtifactKind, active_run_for_subject, find_artifact, get_set_config, list_artifacts, list_frame_rows,
-    list_runs, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
+    active_run_for_subject, find_artifact, get_set_config, list_artifacts, list_frame_rows,
+    list_runs, upsert_artifact, ArtifactKind, NewArtifact, StackSubject, StackingArtifactRow,
 };
 use crate::export::{applied_master_paths, DivisorCache};
 use crate::integration::stats::RejectionNormalization;
@@ -7027,7 +7027,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key: group_key,
+                group_key,
                 kind: ArtifactKind::Registered,
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
@@ -7157,7 +7157,7 @@ mod tests {
             &crate::db::stacking::NewArtifact {
                 subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
-                group_key: group_key,
+                group_key,
                 kind: ArtifactKind::Fits(plane),
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,

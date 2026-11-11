@@ -2001,7 +2001,7 @@ fn persist_measurement(
                 subject: &rc.subject,
                 frame_id: Some(frame.frame_id),
                 group_key: &group.key,
-                kind: kind,
+                kind,
                 path: fits_path.to_str(),
                 config_hash: expected_hash,
                 size: Some(size),

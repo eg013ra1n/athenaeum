@@ -2155,7 +2155,13 @@ fn record_registered_artifact(
     let (size, modified_at) = file_identity(out)?;
     let conn = db(&rc.ctx)?.conn();
     // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
-    let old = crate::db::stacking::find_artifact(&conn, &rc.subject, group_key, ArtifactKind::Registered, Some(frame_id))?;
+    let old = crate::db::stacking::find_artifact(
+        &conn,
+        &rc.subject,
+        group_key,
+        ArtifactKind::Registered,
+        Some(frame_id),
+    )?;
     upsert_artifact(
         &conn,
         &NewArtifact {

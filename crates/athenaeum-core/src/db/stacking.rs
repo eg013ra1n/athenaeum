@@ -343,7 +343,8 @@ pub enum ArtifactKind {
 
 impl ArtifactKind {
     /// Every kind but the per-plane [`ArtifactKind::Fits`], for code that walks the kinds: the pin test, the
-    /// migration's list, the cleanup's list.
+    /// migration's list, the cleanup's list. Checked against [`ArtifactKind::fixed_index`] at compile time, so a
+    /// kind cannot be left out of it.
     pub const FIXED: [ArtifactKind; 12] = [
         ArtifactKind::Calibrated,
         ArtifactKind::CalibratedMosaic,
@@ -358,6 +359,27 @@ impl ArtifactKind {
         ArtifactKind::LnGlobal,
         ArtifactKind::TwoPass,
     ];
+
+    /// The kind's place in [`ArtifactKind::FIXED`], `None` for the per-plane `Fits`. An exhaustive match: a new
+    /// variant does not compile until it names its place, and the assertion below does not compile until `FIXED`
+    /// holds it there.
+    const fn fixed_index(self) -> Option<usize> {
+        match self {
+            ArtifactKind::Calibrated => Some(0),
+            ArtifactKind::CalibratedMosaic => Some(1),
+            ArtifactKind::Measured => Some(2),
+            ArtifactKind::Metrics => Some(3),
+            ArtifactKind::Registered => Some(4),
+            ArtifactKind::Registration => Some(5),
+            ArtifactKind::Solve => Some(6),
+            ArtifactKind::Ln => Some(7),
+            ArtifactKind::LnReference => Some(8),
+            ArtifactKind::LnCalibration => Some(9),
+            ArtifactKind::LnGlobal => Some(10),
+            ArtifactKind::TwoPass => Some(11),
+            ArtifactKind::Fits(_) => None,
+        }
+    }
 
     /// The prefix of every [`ArtifactKind::Fits`] string. The two SQL predicates that select every plane at once (the
     /// frame-level keys migration, the cleanup's sweep) spell it out.
@@ -412,6 +434,19 @@ impl ArtifactKind {
         }
     }
 }
+
+/// `FIXED` holds every kind at the place `fixed_index` gives it. A place past the end of `FIXED` (a new variant with
+/// no line there) fails in the pin test, which looks every pinned kind up by its place.
+const _: () = {
+    let mut i = 0;
+    while i < ArtifactKind::FIXED.len() {
+        match ArtifactKind::FIXED[i].fixed_index() {
+            Some(place) if place == i => {}
+            _ => panic!("ArtifactKind::FIXED and ArtifactKind::fixed_index disagree"),
+        }
+        i += 1;
+    }
+};
 
 impl std::fmt::Display for ArtifactKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1689,7 +1724,16 @@ mod tests {
             assert_eq!(kind.as_db_str(), stored);
             assert_eq!(kind.to_string(), stored);
             assert_eq!(kind.is_frame_level(), frame_level, "{stored}");
-            assert_eq!(kind.group_key("osc__x__bin1__180s"), if frame_level { "" } else { "osc__x__bin1__180s" }, "{stored}");
+            let group = "osc__x__bin1__180s";
+            assert_eq!(kind.group_key(group), if frame_level { "" } else { group }, "{stored}");
+        }
+        // Every pinned kind sits in `FIXED` at its own place (`Fits` has none): a variant given a place past the
+        // end of `FIXED` fails here.
+        for (kind, stored, _) in pinned {
+            match kind.fixed_index() {
+                Some(place) => assert_eq!(ArtifactKind::FIXED.get(place), Some(&kind), "{stored}"),
+                None => assert!(matches!(kind, ArtifactKind::Fits(_)), "{stored}"),
+            }
         }
         assert_eq!(ArtifactKind::Fits(10).as_db_str(), "fits.10");
         assert_eq!(ArtifactKind::FITS_PREFIX, "fits.");

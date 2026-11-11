@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::collab::frame_meta::ProjectFrameMeta;
 use crate::db::stacking::{
-    ArtifactKind, find_artifact, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
+    find_artifact, upsert_artifact, ArtifactKind, NewArtifact, StackSubject, StackingArtifactRow,
 };
 use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
 use crate::integration::plane_reader::PlaneReader;

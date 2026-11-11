@@ -20,7 +20,7 @@
 //! counts (an OSC frame's R/G/B fits independently), and the fixed header
 //! below has no per-plane sub-count to express more than one plane in a
 //! single file — `stacking::run` writes `<stem>.p<plane>.athf` per plane
-//! and one `stacking_artifacts` row per plane ([`artifact_kind`]), keyed on
+//! and one `stacking_artifacts` row per plane ([`crate::db::stacking::ArtifactKind::Fits`]), keyed on
 //! the same measurement hash as the frame's `metrics` row.
 
 use std::io::{Read, Write};
