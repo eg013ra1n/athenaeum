@@ -3,23 +3,18 @@
 // Mirrors the Tauri export commands.  Progress events are broadcast via SSE
 // instead of Tauri's emit mechanism.
 
-use athenaeum_core::api::export::{run_export_organize, ExportRunOutcome};
+use athenaeum_core::api::export::load_wbpp_config;
 use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
-use athenaeum_core::events::{emit_event, ProgressEmitter};
 use athenaeum_core::export::frame_set_queries::{self, ExportableFrameSet};
 use athenaeum_core::export::models::{
-    CalibratedLightOptions, CalibrationRoute, ExportCompleteEvent, ExportData, ExportMode,
-    ExportProgressEvent, ExportResult, ExportSummary, WbppExportConfig,
+    CalibratedLightOptions, CalibrationRoute, ExportData, ExportMode, ExportResult,
+    ExportSummary, WbppExportConfig,
 };
-use athenaeum_core::export::{
-    apply_export_mode, collect_export_data, collect_export_summary, resolve_export_mode,
-};
+use athenaeum_core::export::{collect_export_data, collect_export_summary, resolve_export_mode};
 use athenaeum_core::fits_writer::OutputFormat;
-use athenaeum_core::services::ExportHandle;
 use axum::{extract::State, http::StatusCode, Json};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::events::SseProgressEmitter;
@@ -41,26 +36,6 @@ fn no_db() -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Database not initialized".to_string(),
     )
-}
-
-const WBPP_CONFIG_KEY: &str = "export.wbpp_config";
-
-fn load_wbpp_config(conn: &rusqlite::Connection) -> Result<WbppExportConfig, String> {
-    let result: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            rusqlite::params![WBPP_CONFIG_KEY],
-            |row| row.get(0),
-        )
-        .ok();
-
-    match result {
-        Some(json) => serde_json::from_str(&json).map_err(|e| {
-            tracing::warn!(error = %e, "failed to parse WBPP config");
-            e.to_string()
-        }),
-        None => Ok(WbppExportConfig::default()),
-    }
 }
 
 // ── Request arg structs ───────────────────────────────────────────────────────
@@ -161,11 +136,9 @@ pub async fn get_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
 ) -> Result<Json<WbppExportConfig>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let config = load_wbpp_config(&conn).map_err(db_err)?;
-    Ok(Json(config))
+    athenaeum_core::api::export::get_wbpp_export_config(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Save WBPP export configuration to the database.
@@ -174,17 +147,9 @@ pub async fn set_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(args): Json<SetWbppExportConfigArgs>,
 ) -> Result<Json<WbppExportConfig>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let json = serde_json::to_string(&args.config).map_err(db_err)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
-        rusqlite::params![WBPP_CONFIG_KEY, json],
-    )
-    .map_err(db_err)?;
-
-    Ok(Json(args.config))
+    athenaeum_core::api::export::set_wbpp_export_config(&state.ctx, args.config)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Reset WBPP export configuration to defaults.
@@ -193,16 +158,9 @@ pub async fn reset_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
 ) -> Result<Json<WbppExportConfig>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    conn.execute(
-        "DELETE FROM settings WHERE key = ?1",
-        rusqlite::params![WBPP_CONFIG_KEY],
-    )
-    .map_err(db_err)?;
-
-    Ok(Json(WbppExportConfig::default()))
+    athenaeum_core::api::export::reset_wbpp_export_config(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
 }
 
 // ── Data collection handlers ──────────────────────────────────────────────────
@@ -323,273 +281,24 @@ pub async fn export_to_wbpp(
     State(state): State<WebAppState>,
     Json(args): Json<ExportToWbppArgs>,
 ) -> Result<Json<ExportResult>, (StatusCode, String)> {
-    let frame_set_id = args.frame_set_id;
-
-    // Create cancel flag and register this export
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut exports = state.ctx.active_exports.lock().unwrap();
-        exports.insert(
-            frame_set_id,
-            ExportHandle {
-                cancel_flag: cancel_flag.clone(),
-            },
-        );
-    }
-
-    // Emit "collecting" phase progress
-    let emitter = SseProgressEmitter::new(state.event_tx.clone());
-    emit_event(
-        &emitter,
-        "export-progress",
-        &ExportProgressEvent {
-            frame_set_id,
-            current: 0,
-            total: 0,
-            percent: 0.0,
-            current_file: None,
-            phase: "collecting".to_string(),
-        },
-    );
-
-    // Collect export data and config — release the DB lock immediately after.
-    // A DB failure here must still route through `finish_export` (the export
-    // was just registered above), so it is folded into `result` below instead
-    // of a bare `?` — the same fix M1 named at the resolve block further down,
-    // applied here too since it is the identical shape.
-    let collected: Result<(ExportData, WbppExportConfig), String> = (|| {
-        let db = state
-            .ctx
-            .db
-            .get()
-            .ok_or_else(|| "Database not initialized".to_string())?;
-        let conn = db.conn();
-
-        let data = collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?;
-        let cfg = load_wbpp_config(&conn).unwrap_or_default();
-        Ok((data, cfg))
-    })(); // DB lock released here
-
-    let output_path = PathBuf::from(&args.output_dir);
-
-    let make_fail = |error: String| ExportResult {
-        success: false,
-        output_dir: args.output_dir.clone(),
-        files_organized: 0,
-        scripts_generated: Vec::new(),
-        warnings: Vec::new(),
-        error: Some(error),
-        linked: 0,
-        copied: 0,
-        rewritten: 0,
-        failed: 0,
-        zip_copied: 0,
-        link_fallback: Default::default(),
-    };
-
-    let result = match collected {
-        Err(e) => {
-            tracing::error!(frame_set_id, error = %e, "export blocked before collecting data");
-            make_fail(e)
-        }
-        Ok((mut export_data, config)) => {
-            // Explicit per-invocation override wins over the persisted config's mode.
-            let mode = resolve_export_mode(args.export_mode, &config);
-            // Read by the calibrated-lights mode only; the transform ignores it
-            // in the others (its debayer flag decides the output NAMES, so it
-            // must be the same value the pixel phase later resolves against).
-            // Defaults resolve through the type's own `resolve`, shared with
-            // the Tauri command and the summary preview.
-            let gen_opts = CalibratedLightOptions::resolve(
-                args.flat_norm,
-                args.flat_norm_mode,
-                args.params,
-                args.hot_pixel,
-                args.debayer,
-                args.format,
-            );
-
-            // Validate output path is within the configured export directory.
-            // A rejection here must still finish the export (same reasoning
-            // as the DB failure above) rather than short-circuit past it.
-            let path_ok = match state.export_dir {
-                Some(ref export_dir) if !output_path.starts_with(export_dir) => Err(format!(
-                    "Export path must be within {}",
-                    export_dir.display()
-                )),
-                _ => Ok(()),
-            };
-
-            // Strict gate (spec §12.2) + mode transform. Returns per-set
-            // omission warnings to fold in, or an Err message that aborts
-            // before any file write.
-            let prepare = |export_data: &mut ExportData| -> Result<Vec<String>, String> {
-                let readiness = api_get_export_readiness(&state.ctx, frame_set_id)
-                    .map_err(|e| e.to_string())?;
-                if let Err(msg) = athenaeum_core::api::lights::check_mode_ready(&readiness, mode) {
-                    tracing::warn!(frame_set_id, ?mode, error = %msg, "export refused: mode not ready");
-                    return Err(msg);
-                }
-                let db = state
-                    .ctx
-                    .db
-                    .get()
-                    .ok_or_else(|| "Database not initialized".to_string())?;
-                let conn = db.conn();
-                apply_export_mode(&conn, export_data, mode, Some(&gen_opts))
-                    .map_err(|e| e.to_string())
-            };
-
-            let was_cancelled = cancel_flag.load(Ordering::Relaxed);
-            if was_cancelled {
-                make_fail("Export cancelled".to_string())
-            } else if let Err(e) = path_ok {
-                make_fail(e)
-            } else {
-                match prepare(&mut export_data) {
-                    Err(e) => {
-                        tracing::error!(frame_set_id, error = %e, "export blocked before organizing");
-                        make_fail(e)
-                    }
-                    Ok(mode_warnings) => {
-                        // I3: admission (a condvar park) + plan resolution +
-                        // the pixel batch must not run on the async runtime
-                        // worker — a multi-minute calibration run would block
-                        // it for the whole export. `run_export_organize` is
-                        // the ONE body both hosts drive from spawn_blocking;
-                        // it also owns the I2 ordering (permit acquired
-                        // before the per-frame resolve loop, catalog
-                        // connection scoped and dropped before any pixel
-                        // work — see its doc comment).
-                        let ctx = state.ctx.clone();
-                        let event_tx_bg = state.event_tx.clone();
-                        let cancel_flag_bg = cancel_flag.clone();
-                        let output_path_bg = output_path.clone();
-                        let config_bg = config.clone();
-                        let gen_opts_bg = gen_opts.clone();
-                        let use_symlinks = args.use_symlinks;
-
-                        let joined = tokio::task::spawn_blocking(move || {
-                            let bg_emitter = SseProgressEmitter::new(event_tx_bg);
-                            run_export_organize(
-                                &ctx,
-                                &output_path_bg,
-                                &export_data,
-                                use_symlinks,
-                                &config_bg,
-                                Some(&bg_emitter as &dyn ProgressEmitter),
-                                frame_set_id,
-                                &cancel_flag_bg,
-                                mode,
-                                &gen_opts_bg,
-                            )
-                        })
-                        .await;
-
-                        match joined {
-                            Err(join_err) => {
-                                tracing::error!(frame_set_id, error = %join_err, "export task panicked");
-                                make_fail(format!("Export task panicked: {}", join_err))
-                            }
-                            Ok(Err(api_err)) => {
-                                make_fail(format!("Failed to organize files: {}", api_err))
-                            }
-                            // Cancelled while queued for a compute slot —
-                            // `run_export_organize` never touched the disk.
-                            Ok(Ok(ExportRunOutcome::Cancelled)) => ExportResult {
-                                success: false,
-                                output_dir: args.output_dir.clone(),
-                                files_organized: 0,
-                                scripts_generated: Vec::new(),
-                                warnings: mode_warnings,
-                                error: Some("Export cancelled".to_string()),
-                                linked: 0,
-                                copied: 0,
-                                rewritten: 0,
-                                failed: 0,
-                                zip_copied: 0,
-                                link_fallback: Default::default(),
-                            },
-                            Ok(Ok(ExportRunOutcome::Organized(org_result))) => {
-                                let was_cancelled = cancel_flag.load(Ordering::Relaxed);
-                                let mut warnings = org_result.warnings;
-                                warnings.extend(mode_warnings);
-                                if was_cancelled {
-                                    ExportResult {
-                                        success: false,
-                                        output_dir: args.output_dir.clone(),
-                                        files_organized: org_result.files_organized,
-                                        scripts_generated: Vec::new(),
-                                        warnings,
-                                        error: Some("Export cancelled".to_string()),
-                                        linked: 0,
-                                        copied: 0,
-                                        rewritten: 0,
-                                        failed: 0,
-                                        zip_copied: org_result.zip_copied,
-                                        link_fallback: org_result.link_fallback,
-                                    }
-                                } else {
-                                    ExportResult {
-                                        success: true,
-                                        output_dir: args.output_dir.clone(),
-                                        files_organized: org_result.files_organized,
-                                        scripts_generated: Vec::new(),
-                                        warnings,
-                                        error: None,
-                                        linked: 0,
-                                        copied: 0,
-                                        rewritten: 0,
-                                        failed: 0,
-                                        zip_copied: org_result.zip_copied,
-                                        link_fallback: org_result.link_fallback,
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    finish_export(&state, &emitter, frame_set_id, result.clone());
-    Ok(Json(result))
-}
-
-/// Unregister the export and broadcast its completion event. Extracted so the
-/// compute-queue cancellation can leave `export_to_wbpp` early without
-/// stranding the `active_exports` entry or skipping `export-complete` — a
-/// cancelled export must look exactly like any other finished one. Mirrors the
-/// Tauri command's `finish_export`.
-fn finish_export(
-    state: &WebAppState,
-    emitter: &SseProgressEmitter,
-    frame_set_id: i64,
-    result: ExportResult,
-) {
-    {
-        let mut exports = state.ctx.active_exports.lock().unwrap();
-        exports.remove(&frame_set_id);
-    }
-    emit_event(
+    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    let result = athenaeum_core::api::export::export_to_wbpp(
+        state.ctx.clone(),
         emitter,
-        "export-complete",
-        &ExportCompleteEvent {
-            frame_set_id,
-            success: result.success,
-            files_organized: result.files_organized,
-            warnings: result.warnings.clone(),
-            error: result.error.clone(),
-            output_dir: result.output_dir.clone(),
-            linked: 0,
-            copied: 0,
-            rewritten: 0,
-            failed: 0,
-            zip_copied: result.zip_copied,
-            link_fallback: result.link_fallback,
-        },
-    );
+        args.frame_set_id,
+        args.output_dir,
+        args.use_symlinks,
+        args.export_mode,
+        args.flat_norm,
+        args.flat_norm_mode,
+        args.params,
+        args.hot_pixel,
+        args.debayer,
+        args.format,
+        state.export_dir.as_deref(),
+    )
+    .await;
+    Ok(Json(result))
 }
 
 /// Returns the configured export directory path, or null if not set.
@@ -744,11 +453,13 @@ mod export_cancel_while_queued_tests {
     use crate::events::SseEvent;
     use athenaeum_core::cache::MemoryImageCache;
     use athenaeum_core::db::Database;
+    use athenaeum_core::export::models::ExportCompleteEvent;
     use athenaeum_core::services::compute_queue::{ComputeJobKind, ComputeQueue};
     use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
     use athenaeum_core::settings::SettingsManager;
     use rusqlite::Connection;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Mutex, OnceLock, RwLock};
     use tempfile::TempDir;
 

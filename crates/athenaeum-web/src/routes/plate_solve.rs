@@ -831,18 +831,6 @@ pub struct CatalogStatusInfo {
     pub mag_limit: f32,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CatalogDownloadProgress {
-    phase: String,
-    current: usize,
-    total: usize,
-    percent: f64,
-    tier_density: u32,
-    tier_index: usize,
-    n_tiers: usize,
-}
-
 /// Return one `CatalogStatusInfo` per declared density tier, merged with
 /// on-disk installed state. Returns an empty Vec when no manifest is available.
 #[tracing::instrument(skip_all, err(Debug))]
@@ -899,65 +887,15 @@ pub async fn download_catalog_layers(
     State(state): State<WebAppState>,
     Json(args): Json<TargetDensityArgs>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let app_data_dir = db.path().to_path_buf().parent()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?
-        .to_path_buf();
-
-    let event_tx = state.event_tx.clone();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-
-    let result = tokio::task::spawn_blocking(move || {
-        use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
-        let cur = std::sync::Mutex::new((0u32, 0usize, 0usize)); // (density, index, n_tiers)
-        athenaeum_core::catalog::gaia_prebuilt::download_catalog_layers(
-            &app_data_dir,
-            args.target_density,
-            cancel_flag,
-            &|progress| {
-                let (td, ti, nt) = *cur.lock().unwrap();
-                let event = match progress {
-                    P::Tier { density, index, n_tiers } => {
-                        *cur.lock().unwrap() = (density, index, n_tiers);
-                        CatalogDownloadProgress {
-                            phase: "tier".into(), current: index, total: n_tiers,
-                            percent: 0.0, tier_density: density, tier_index: index, n_tiers,
-                        }
-                    }
-                    P::Downloading { received, total } => CatalogDownloadProgress {
-                        phase: "downloading".into(), current: received as usize, total: total as usize,
-                        percent: if total > 0 { received as f64 / total as f64 * 100.0 } else { 0.0 },
-                        tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Verifying => CatalogDownloadProgress {
-                        phase: "verifying".into(), current: 0, total: 0,
-                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Extracting { done, total } => CatalogDownloadProgress {
-                        phase: "extracting".into(), current: done, total,
-                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Complete { files } => CatalogDownloadProgress {
-                        phase: "complete".into(), current: files, total: files,
-                        percent: 100.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                    P::Error(_) => CatalogDownloadProgress {
-                        phase: "error".into(), current: 0, total: 0,
-                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
-                    },
-                };
-                let _ = event_tx.send(SseEvent {
-                    event_name: "catalog-download-progress".into(),
-                    data: serde_json::to_value(event).unwrap_or_default(),
-                });
-            },
-        )
-    })
+    let emitter = Arc::new(crate::events::SseProgressEmitter::new(state.event_tx.clone()));
+    athenaeum_core::api::plate_solve::download_catalog_layers(
+        &state.ctx,
+        emitter,
+        args.target_density,
+    )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("download task panicked: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(result.display().to_string()))
+    .map(Json)
+    .map_err(crate::routes::api_err)
 }
 
 /// One row per declared quad-index pack (`base`, `narrow`), merged with the
