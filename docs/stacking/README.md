@@ -5146,8 +5146,16 @@ geometry each group has its own reference, so a regroup also re-registers by `re
 evidence: a stops regroup missed every frame by key (3.5 GB recalibrated before the run was cancelled), and a tolerance-200 regroup missed
 every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-run, Register again).
 
-- **Kinds.** `paths::FRAME_LEVEL_KINDS` plus every `fits.<plane>` (`is_frame_level_kind`); `paths::artifact_group_key(kind, group_key)` is
-  the one rule every `find_artifact` / `upsert_artifact` call site goes through (the run and the plan gate alike).
+- **Kinds.** `db::stacking::ArtifactKind` is the one list of artifact kinds (`Fits(plane)` is stored as `fits.<plane>`), and
+  `ArtifactKind::is_frame_level` says which belong to a frame. `find_artifact` and `upsert_artifact` take the kind and the group's key and
+  apply the rule themselves (`ArtifactKind::group_key`): a frame-level kind is stored and looked up under `''` whatever key came with it,
+  for the run and the plan gate alike. A caller cannot key a frame's own artifact on the group (2026-11-11; before that the kinds were
+  bare strings and every call site wrapped its key by hand in `paths::artifact_group_key`, over `paths::FRAME_LEVEL_KINDS`). The stored
+  strings did not change, `artifact_kind_strings_are_pinned` holds them: no migration, no hash moved. A new kind is a new variant; the
+  compiler then asks for its string, whether it is frame-level, its place in `ArtifactKind::FIXED` (the list the keys migration and the
+  cleanup walk) and whether "Delete intermediates" drops it (`paths::is_intermediate_kind`, the former list
+  `INTERMEDIATE_ARTIFACT_KINDS`). A test that needs a row under a key the rule would not give it (a row from before the migration, a
+  stray one) writes it with `upsert_artifact_under_key`, which exists in test builds only.
 
   | Class | Kinds | Key | Survives "Delete intermediates" |
   | ---- | ---- | ---- | ---- |
