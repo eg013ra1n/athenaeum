@@ -1237,6 +1237,9 @@ pub(crate) async fn run_live(
     tracing::debug!(
         count = taken,
         bytes = report.total_bytes(),
+        stalls = report.stalls,
+        hedges = report.hedges,
+        hedge_bytes = report.hedge_bytes,
         "live assignment run finished"
     );
     report
