@@ -2173,8 +2173,10 @@ async fn publish_seed(
     })
 }
 
-/// Section 5: announce the new frames, at most 500 per batch. A batch the hub
-/// refuses is unseeded and held back; the first error is kept for the result.
+/// Section 5: announce the new frames, at most 500 per batch. A refused batch
+/// is unseeded; most refusals hold it back and record an error, an outdated
+/// api sets `outdated` instead, and a publishing-device refusal replaces the
+/// error recorded so far.
 #[allow(clippy::too_many_arguments)]
 async fn publish_announce(
     pass: &PublishPass<'_>,
