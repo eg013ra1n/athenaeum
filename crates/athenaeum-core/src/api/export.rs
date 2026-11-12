@@ -22,8 +22,8 @@ use crate::export::file_organizer::{
 };
 use crate::export::ZipMasters;
 use crate::export::models::{
-    CalibratedLightOptions, ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent,
-    ExportResult, WbppExportConfig,
+    CalibratedLightOptions, CalibrationRoute, ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent,
+    ExportResult, ExportSummary, WbppExportConfig,
 };
 use crate::export::{apply_export_mode, collect_export_data, resolve_export_mode};
 use crate::fits_writer::OutputFormat;
@@ -95,6 +95,72 @@ pub fn reset_wbpp_export_config(ctx: &ServiceContext) -> Result<WbppExportConfig
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(WbppExportConfig::default())
+}
+
+/// Preview data for a frame set: every light frame with its calibrations.
+pub fn get_export_preview(ctx: &ServiceContext, frame_set_id: i64) -> Result<ExportData, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    collect_export_data(&conn, frame_set_id).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// The frame sets that can be exported.
+pub fn get_exportable_frame_sets(
+    ctx: &ServiceContext,
+) -> Result<Vec<crate::export::frame_set_queries::ExportableFrameSet>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    crate::export::frame_set_queries::get_exportable_frame_sets(&conn)
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// The export groups and their calibration trees, for the UI.
+pub fn get_calibration_route(
+    ctx: &ServiceContext,
+    frame_set_id: i64,
+) -> Result<CalibrationRoute, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    crate::export::frame_set_queries::get_calibration_route(&conn, frame_set_id)
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Enhanced export summary for the Export tab: equipment, filter groups with
+/// exposure breakdown, calibration details with match quality, the folder
+/// structure preview and detailed warnings.
+///
+/// Drawn for the mode the tab has selected — the tree, file total and size
+/// estimate describe THAT export. `export_mode` `None` falls back to the
+/// persisted config like `export_to_wbpp`; the six generation options are read
+/// by `calibratedLights` only (the debayer flag decides the `c_*` names in the
+/// tree) and default the same way as the export's.
+#[allow(clippy::too_many_arguments)]
+pub fn get_export_summary(
+    ctx: &ServiceContext,
+    frame_set_id: i64,
+    export_mode: Option<ExportMode>,
+    flat_norm: Option<bool>,
+    flat_norm_mode: Option<FlatNormMode>,
+    params: Option<LightCalParams>,
+    hot_pixel: Option<bool>,
+    debayer: Option<bool>,
+    format: Option<OutputFormat>,
+) -> Result<ExportSummary, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let config = load_wbpp_config(&conn).unwrap_or_default();
+    let mode = resolve_export_mode(export_mode, &config);
+    let gen_opts = CalibratedLightOptions::resolve(
+        flat_norm,
+        flat_norm_mode,
+        params,
+        hot_pixel,
+        debayer,
+        format,
+    );
+
+    crate::export::collect_export_summary(&conn, frame_set_id, &config, mode, Some(&gen_opts))
+        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// What the blocking phase produced.

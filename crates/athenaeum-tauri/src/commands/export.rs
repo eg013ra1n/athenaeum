@@ -4,15 +4,11 @@
 
 use crate::commands::AppState;
 use crate::export::{
-    collect_export_data, collect_export_summary,
-    frame_set_queries::{self, ExportableFrameSet},
+    frame_set_queries::ExportableFrameSet,
     models::{
-        CalibratedLightOptions, CalibrationRoute, ExportData, ExportMode, ExportResult,
-        ExportSummary, WbppExportConfig,
+        CalibrationRoute, ExportData, ExportMode, ExportResult, ExportSummary, WbppExportConfig,
     },
-    resolve_export_mode,
 };
-use athenaeum_core::api::export::load_wbpp_config;
 use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
 use std::sync::atomic::Ordering;
@@ -65,10 +61,7 @@ pub async fn get_export_preview(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<ExportData, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())
+    athenaeum_core::api::export::get_export_preview(&state.ctx, frame_set_id).map_err(|e| e.to_string())
 }
 
 /// Get a list of available frame sets for export
@@ -77,10 +70,7 @@ pub async fn get_export_preview(
 pub async fn get_exportable_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<Vec<ExportableFrameSet>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    frame_set_queries::get_exportable_frame_sets(&conn).map_err(|e| e.to_string())
+    athenaeum_core::api::export::get_exportable_frame_sets(&state.ctx).map_err(|e| e.to_string())
 }
 
 /// Get calibration route for UI display
@@ -93,10 +83,7 @@ pub async fn get_calibration_route(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<CalibrationRoute, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    frame_set_queries::get_calibration_route(&conn, frame_set_id).map_err(|e| e.to_string())
+    athenaeum_core::api::export::get_calibration_route(&state.ctx, frame_set_id).map_err(|e| e.to_string())
 }
 
 /// Export-readiness tallies for the WBPP export dialog's mode selector
@@ -220,19 +207,16 @@ pub async fn get_export_summary(
     debayer: Option<bool>,
     format: Option<athenaeum_core::fits_writer::OutputFormat>,
 ) -> Result<ExportSummary, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    let config = load_wbpp_config(&conn).unwrap_or_default();
-    let mode = resolve_export_mode(export_mode, &config);
-    let gen_opts = CalibratedLightOptions::resolve(
+    athenaeum_core::api::export::get_export_summary(
+        &state.ctx,
+        frame_set_id,
+        export_mode,
         flat_norm,
         flat_norm_mode,
         params,
         hot_pixel,
         debayer,
         format,
-    );
-
-    collect_export_summary(&conn, frame_set_id, &config, mode, Some(&gen_opts))
-        .map_err(|e| e.to_string())
+    )
+    .map_err(|e| e.to_string())
 }
