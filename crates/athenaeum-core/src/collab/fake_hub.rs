@@ -48,7 +48,15 @@
 //! - the manifest is ordered by `(manifestVersion, frameUuid)` and paged with
 //!   `next = {since, after}` (page size overridable for tests);
 //! - a frame's `frameSeq` is a dense per-project ordinal, assigned at
-//!   announce/seed, never reused.
+//!   announce/seed, never reused;
+//! - a project that does not exist reads as "not a member": a body-less 403
+//!   wherever the hub starts with its membership lookup (approve, reject,
+//!   patch and the public page say 404 `project not found`);
+//! - a body axum's `Json` cannot read is refused in plain text before any
+//!   handler check (415, 400, 422);
+//! - `GET /devices` and `/me/projects` list the newest first, the membership
+//!   snapshot lists members by account id and `nodes` by raw key bytes, and
+//!   the retired routes sit behind the token check (401 first).
 //!
 //! The membership snapshot is signed with a fixed test keypair exactly as the
 //! hub signs it, so the app's TOFU pin + `verify_and_parse` run for real.
@@ -197,6 +205,9 @@ pub struct FeedMsg {
 
 /// One project's hub-side state.
 pub struct FakeProject {
+    /// Creation stamp (`creation_stamp`): `/me/projects` lists the newest
+    /// project first.
+    pub created_at: String,
     pub slug: String,
     pub title: String,
     /// `active` | `closed`.
@@ -464,7 +475,10 @@ impl FakeHubState {
             .unwrap_or_else(|| "former member".to_string())
     }
 
-    /// Every device pubkey of an account, sorted (the snapshot's `nodes`).
+    /// Every device pubkey of an account (the snapshot's `nodes`), sorted by
+    /// the key's raw bytes as the hub's `ORDER BY d.pubkey` does. The base64
+    /// text does not sort like its bytes, so the keys are decoded to compare
+    /// (an undecodable test key falls back to its text).
     fn devices_of(&self, account_id: &str) -> Vec<String> {
         let mut devices: Vec<String> = self
             .tokens
@@ -472,7 +486,7 @@ impl FakeHubState {
             .filter(|a| a.account_id == account_id)
             .map(|a| a.device_pubkey_b64.clone())
             .collect();
-        devices.sort();
+        devices.sort_by_key(|k| (B64.decode(k).unwrap_or_default(), k.clone()));
         devices.dedup();
         devices
     }
@@ -726,13 +740,17 @@ pub fn default_dictionary() -> Vec<DictionaryEntry> {
         kind: kind.to_string(),
     };
     vec![
-        entry("L", &["Lum", "Luminance"], "broadband"),
-        entry("R", &["Red"], "broadband"),
-        entry("G", &["Green"], "broadband"),
-        entry("B", &["Blue"], "broadband"),
-        entry("Ha", &["H-alpha", "Halpha"], "narrowband"),
-        entry("OIII", &["O3"], "narrowband"),
-        entry("SII", &["S2"], "narrowband"),
+        entry("L", &["lum", "luminance", "clear", "l"], "luminance"),
+        entry("R", &["red", "r"], "broadband"),
+        entry("G", &["green", "g"], "broadband"),
+        entry("B", &["blue", "b"], "broadband"),
+        entry(
+            "Ha",
+            &["h-alpha", "halpha", "h_alpha", "h\u{3b1}", "ha"],
+            "narrowband",
+        ),
+        entry("OIII", &["o3", "oiii", "o-iii"], "narrowband"),
+        entry("SII", &["s2", "sii", "s-ii"], "narrowband"),
         entry(
             "None",
             &["none", "nofilter", "no filter", "no-filter", "unfiltered"],
@@ -751,6 +769,26 @@ fn hex_of(seed: &str, len: usize) -> String {
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// A creation stamp strictly later than every stamp in `existing` (all made
+/// by this function): microsecond precision, fixed width, so the strings
+/// order as the instants do and two rows made back to back never tie. The
+/// hub's `created_at` has a microsecond clock and `ORDER BY created_at DESC`
+/// lists the newest first.
+fn creation_stamp<'a>(existing: impl Iterator<Item = &'a str>) -> String {
+    use chrono::SubsecRound;
+    let mut now = chrono::Utc::now().trunc_subsecs(6);
+    let latest = existing
+        .filter_map(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .max();
+    if let Some(latest) = latest {
+        if now <= latest {
+            now = latest + chrono::Duration::microseconds(1);
+        }
+    }
+    now.to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
 }
 
 impl FakeHub {
@@ -924,13 +962,15 @@ impl FakeHub {
         name: &str,
         last_seen: Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        self.lock().devices.insert(
+        let mut st = self.lock();
+        let created_at = creation_stamp(st.devices.values().map(|d| d.created_at.as_str()));
+        st.devices.insert(
             id.to_string(),
             FakeDeviceRow {
                 account_id: account_id.to_string(),
                 pubkey: pubkey_b64.to_string(),
                 name: name.to_string(),
-                created_at: now_rfc3339(),
+                created_at,
                 last_seen_at: last_seen.map(|t| t.to_rfc3339()),
                 retired: false,
                 revoked: false,
@@ -967,9 +1007,12 @@ impl FakeHub {
                 trusted: false,
             })
             .collect();
-        self.lock().projects.insert(
+        let mut st = self.lock();
+        let created_at = creation_stamp(st.projects.values().map(|p| p.created_at.as_str()));
+        st.projects.insert(
             id.to_string(),
             FakeProject {
+                created_at,
                 slug: slug.to_string(),
                 title: slug.to_uppercase(),
                 status: "active".to_string(),
@@ -2072,6 +2115,58 @@ fn not_found_project() -> ResponseTemplate {
     error(404, "project not found")
 }
 
+/// The hub's `require_member` refusal: a body-less 403 for a caller that is
+/// no member of the project, and the same one for a project that does not
+/// exist (the lookup is the membership row, so an unknown id reads as "not a
+/// member"). Only the routes that lock the project row first (approve,
+/// reject, patch) and the public page answer 404 `project not found`.
+fn forbidden() -> ResponseTemplate {
+    empty(403)
+}
+
+/// Whether the request carries a JSON content type, as axum's `Json`
+/// extractor decides it: `application/json` or any `application/*+json`.
+fn has_json_content_type(req: &Request) -> bool {
+    let Some(ct) = req
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// The refusal axum's `Json` extractor gives a body it cannot take: a plain
+/// text body, 415 without a JSON content type, 400 for text that is not
+/// JSON, 422 for JSON of the wrong shape. The extractor runs before the
+/// handler, so a refusal here precedes every check the handler makes.
+fn json_refusal(status: u16, text: impl Into<String>) -> ResponseTemplate {
+    let text = text.into();
+    tracing::debug!(status, reason = %text, "fake hub: request body refused");
+    ResponseTemplate::new(status).set_body_string(text)
+}
+
+/// The request body as the hub's `Json<T>` extractor reads it.
+fn json_body<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, ResponseTemplate> {
+    if !has_json_content_type(req) {
+        return Err(json_refusal(
+            415,
+            "Expected request with `Content-Type: application/json`",
+        ));
+    }
+    axum::Json::<T>::from_bytes(&req.body)
+        .map(|j| j.0)
+        .map_err(|r| json_refusal(r.status().as_u16(), r.body_text()))
+}
+
 fn bearer(req: &Request) -> Option<String> {
     let h = req.headers.get("authorization")?.to_str().ok()?;
     h.strip_prefix("Bearer ").map(str::to_string)
@@ -2107,8 +2202,7 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
     let segs: Vec<&str> = rest.trim_matches('/').split('/').collect();
     let method = req.method.as_str().to_string();
 
-    // Public routes and every retired route (predates the per-frame api, or
-    // predates the v3 live exchange).
+    // The public routes.
     match (method.as_str(), segs.as_slice()) {
         ("GET", ["collab", "pubkey"]) => {
             return ok(json!({ "pubkey": B64.encode(key.verifying_key().to_bytes()) }))
@@ -2116,13 +2210,6 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         ("GET", ["projects", pid]) => {
             let caller = bearer(req).and_then(|t| st.tokens.get(&t).cloned());
             return project_page(st, pid, caller.as_ref());
-        }
-        (_, ["announcements", ..])
-        | (_, ["projects", _, "announcements", ..])
-        | (_, ["projects", _, "have"])
-        | ("GET", ["me", "project-versions"])
-        | ("GET", ["projects", _, "frames", _, "holders"]) => {
-            return error(409, "collab_api_outdated")
         }
         _ => {}
     }
@@ -2134,6 +2221,14 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         return empty(401);
     };
     match (method.as_str(), segs.as_slice()) {
+        // Every retired route (predates the per-frame api, or predates the
+        // v3 live exchange). The hub keeps them behind its account
+        // middleware, so a caller without a valid token gets 401 first.
+        (_, ["announcements", ..])
+        | (_, ["projects", _, "announcements", ..])
+        | (_, ["projects", _, "have"])
+        | ("GET", ["me", "project-versions"])
+        | ("GET", ["projects", _, "frames", _, "holders"]) => error(409, "collab_api_outdated"),
         ("GET", ["devices"]) => list_devices_route(st, &acct),
         ("POST", ["devices", id, "revoke"]) => revoke_device_route(st, &acct, id, req),
         ("GET", ["me", "projects"]) => my_projects(st, &acct),
@@ -2206,33 +2301,42 @@ fn project_page(st: &FakeHubState, pid: &str, caller: Option<&FakeAccount>) -> R
     }))
 }
 
-/// `GET /devices` — the calling account's own, non-retired devices (T7).
+/// `GET /devices` — the calling account's own, non-revoked devices, newest
+/// first. `name` is `null` for a device with no name; `endpointAddr` is the
+/// device's self-reported iroh address, `null` until it reports one (the fake
+/// never stores one).
 fn list_devices_route(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {
-    let mut out: Vec<(String, Value)> = st
+    let mut rows: Vec<(&String, &FakeDeviceRow)> = st
         .devices
         .iter()
         .filter(|(_, d)| d.account_id == acct.account_id && !d.retired && !d.revoked)
+        .collect();
+    // `ORDER BY created_at DESC`; the id only settles two equal stamps, and
+    // `add_device` never issues those.
+    rows.sort_by(|(ia, a), (ib, b)| b.created_at.cmp(&a.created_at).then_with(|| ia.cmp(ib)));
+    let out: Vec<Value> = rows
+        .into_iter()
         .map(|(id, d)| {
-            (
-                id.clone(),
-                json!({
-                    "id": id,
-                    "name": d.name,
-                    "pubkey": d.pubkey,
-                    "capability": "athenaeum",
-                    "createdAt": d.created_at,
-                    "lastSeenAt": d.last_seen_at,
-                }),
-            )
+            json!({
+                "id": id,
+                "name": (!d.name.is_empty()).then(|| d.name.clone()),
+                "pubkey": d.pubkey,
+                "capability": "athenaeum",
+                "createdAt": d.created_at,
+                "lastSeenAt": d.last_seen_at,
+                "endpointAddr": Value::Null,
+            })
         })
         .collect();
-    out.sort_by(|(a, _), (b, _)| a.cmp(b));
-    ok(Value::Array(out.into_iter().map(|(_, v)| v).collect()))
+    ok(Value::Array(out))
 }
 
 /// `POST /devices/{id}/revoke` — optional `{"retire":bool}` body (T7). Scoped
-/// to the calling account: a device id of another account 404s, exactly like
-/// an unknown id.
+/// to the calling account: a device id of another account 404s `device not
+/// found`, exactly like an unknown id. The hub keeps one out-of-service mark
+/// for revoke and retire alike, and a second revoke of an own device that is
+/// already out of service is an idempotent 204 no-op (its effects ran on the
+/// revoke that flipped the mark).
 fn revoke_device_route(
     st: &mut FakeHubState,
     acct: &FakeAccount,
@@ -2244,22 +2348,27 @@ fn revoke_device_route(
         #[serde(default)]
         retire: bool,
     }
-    let retire = if req.body.is_empty() {
+    // The body is optional, as the hub's `Option<Json<_>>`: no content type
+    // is no body; a content type makes the body strict.
+    let retire = if req.headers.get("content-type").is_none() {
         false
     } else {
-        req.body_json::<RevokeBody>()
-            .map(|b| b.retire)
-            .unwrap_or(false)
+        match json_body::<RevokeBody>(req) {
+            Ok(b) => b.retire,
+            Err(refusal) => return refusal,
+        }
     };
-    let Some(dev) = st.devices.get(id).cloned() else {
-        return error(404, "no such device");
+    let Some(dev) = st
+        .devices
+        .get(id)
+        .filter(|d| d.account_id == acct.account_id)
+        .cloned()
+    else {
+        return error(404, "device not found");
     };
-    // Retired is terminal: a device already retired 404s on a second
-    // revoke, exactly like an unknown id — this is what lets a caller treat
-    // a 404 here as "already done" (fix round 1, point 1). A merely
-    // `revoked` (non-retire) device can still be acted on again.
-    if dev.account_id != acct.account_id || dev.retired {
-        return error(404, "no such device");
+    if dev.retired || dev.revoked {
+        tracing::debug!(device_id = id, "fake hub: device revoke is a no-op");
+        return empty(204);
     }
     if let Some(d) = st.devices.get_mut(id) {
         if retire {
@@ -2273,8 +2382,14 @@ fn revoke_device_route(
 }
 
 fn my_projects(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {
+    // `ORDER BY p.created_at DESC`.
     let mut ids: Vec<&String> = st.projects.keys().collect();
-    ids.sort();
+    ids.sort_by(|a, b| {
+        st.projects[*b]
+            .created_at
+            .cmp(&st.projects[*a].created_at)
+            .then_with(|| a.cmp(b))
+    });
     let mut out = Vec::new();
     for id in ids {
         let p = &st.projects[id];
@@ -2305,18 +2420,16 @@ fn my_projects(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {
     ok(Value::Array(out))
 }
 
-/// The project and the caller's membership, or the hub's refusal (404 for an
-/// unknown project, a body-less 403 for a non-member).
+/// The project and the caller's membership, or the hub's `require_member`
+/// refusal: a body-less 403 for a non-member and for an unknown project
+/// alike.
 fn member_of<'a>(
     st: &'a FakeHubState,
     acct: &FakeAccount,
     pid: &str,
 ) -> Result<(&'a FakeProject, FakeMember), ResponseTemplate> {
-    let p = st.projects.get(pid).ok_or_else(not_found_project)?;
-    let m = p
-        .member(&acct.account_id)
-        .cloned()
-        .ok_or_else(|| empty(403))?;
+    let p = st.projects.get(pid).ok_or_else(forbidden)?;
+    let m = p.member(&acct.account_id).cloned().ok_or_else(forbidden)?;
     Ok((p, m))
 }
 
@@ -2330,9 +2443,11 @@ fn membership(
         Ok(x) => x,
         Err(r) => return r,
     };
-    let members: Vec<Value> = p
-        .members
-        .iter()
+    // The hub lists the members by account id (`ORDER BY pm.account_id`).
+    let mut ordered: Vec<&FakeMember> = p.members.iter().collect();
+    ordered.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+    let members: Vec<Value> = ordered
+        .into_iter()
         .map(|m| {
             json!({
                 "accountId": m.account_id,
@@ -2458,12 +2573,27 @@ struct FrameIn {
     xxh3: String,
     filter_raw: String,
     filter_canonical: String,
+    /// The hub defaults an absent `channel` to `mono` and an absent `meta` to
+    /// `{}` (an explicit `null` is not absent: it fails the object check).
+    #[serde(default = "default_channel")]
     channel: String,
     exptime_sec: f64,
     date_obs: Option<String>,
     gate_version: i32,
+    #[serde(default = "empty_meta")]
     meta: Value,
 }
+
+fn default_channel() -> String {
+    "mono".to_string()
+}
+
+fn empty_meta() -> Value {
+    Value::Object(Default::default())
+}
+
+/// The hub's channel names (`frames.rs::CHANNELS`).
+const CHANNELS: [&str; 5] = ["mono", "osc", "osc-r", "osc-g", "osc-b"];
 
 #[derive(serde::Deserialize)]
 struct AnnounceBody {
@@ -2490,7 +2620,10 @@ fn file_name_ok(name: &str) -> bool {
 
 fn validate_frame(f: &FrameIn) -> Result<(), String> {
     if !file_name_ok(&f.file_name) {
-        return Err(format!("{}: invalid fileName", f.file_name));
+        return Err(format!(
+            "fileName {:?} is not a plain file name",
+            f.file_name
+        ));
     }
     if !is_lower_hex(&f.blake3, 64) {
         return Err(format!(
@@ -2507,14 +2640,18 @@ fn validate_frame(f: &FrameIn) -> Result<(), String> {
     if f.byte_size <= 0 {
         return Err(format!("{}: byteSize must be > 0", f.file_name));
     }
-    if !matches!(
-        f.channel.as_str(),
-        "mono" | "osc" | "osc-r" | "osc-g" | "osc-b"
-    ) {
-        return Err(format!("{}: unknown channel {:?}", f.file_name, f.channel));
+    if !(f.exptime_sec.is_finite() && f.exptime_sec > 0.0 && f.exptime_sec <= 86400.0) {
+        return Err(format!(
+            "{}: exptimeSec must be within (0, 86400]",
+            f.file_name
+        ));
     }
-    if !(f.exptime_sec > 0.0 && f.exptime_sec <= 86400.0) {
-        return Err(format!("{}: exptimeSec must be in (0, 86400]", f.file_name));
+    if !CHANNELS.contains(&f.channel.as_str()) {
+        return Err(format!(
+            "{}: channel must be one of {}",
+            f.file_name,
+            CHANNELS.join(", ")
+        ));
     }
     // Controller ruling 2026-09-28: the hub accepts an EMPTY filterRaw
     // (0..=80 chars after trimming) — an unfiltered light with no dictionary
@@ -2543,6 +2680,11 @@ fn announce(
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
+    // The `Json` extractor runs first, then membership, then the batch rules.
+    let body: AnnounceBody = match json_body(req) {
+        Ok(b) => b,
+        Err(refusal) => return refusal,
+    };
     let display = st.display_of(&acct.account_id);
     let revoked = st.out_of_service();
     let names: HashMap<String, String> = st
@@ -2551,14 +2693,10 @@ fn announce(
         .map(|d| (d.pubkey.clone(), d.name.clone()))
         .collect();
     let Some(p) = st.projects.get_mut(pid) else {
-        return not_found_project();
+        return forbidden();
     };
     let Some(member) = p.member(&acct.account_id).cloned() else {
-        return empty(403);
-    };
-    let body: AnnounceBody = match req.body_json() {
-        Ok(b) => b,
-        Err(e) => return error(422, format!("bad announce body: {e}")),
+        return forbidden();
     };
     if body.frames.is_empty() || body.frames.len() > MAX_BATCH {
         return error(400, format!("frames must contain 1..={MAX_BATCH} items"));
@@ -2765,15 +2903,15 @@ fn put_grid(
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let grid: crate::collab::grid::CanonicalGrid = match req.body_json() {
+    let grid: crate::collab::grid::CanonicalGrid = match json_body(req) {
         Ok(g) => g,
-        Err(e) => return error(422, format!("bad grid body: {e}")),
+        Err(refusal) => return refusal,
     };
     let Some(p) = st.projects.get_mut(pid) else {
-        return not_found_project();
+        return forbidden();
     };
     let Some(member) = p.member(&acct.account_id).cloned() else {
-        return empty(403);
+        return forbidden();
     };
     if !member.has_cap("project.edit") {
         return empty(403);
@@ -2811,19 +2949,22 @@ fn new_version(
         .values()
         .map(|d| (d.pubkey.clone(), d.name.clone()))
         .collect();
-    let Some(p) = st.projects.get_mut(pid) else {
-        return not_found_project();
-    };
-    if p.member(&acct.account_id).is_none() {
-        return empty(403);
-    }
-    let body: NewVersionBody = match req.body_json() {
+    // The hub's order: the `Json` extractor, the wave-2 body check (a missing
+    // `expectedVersion` is 409 for anyone, a non-member included), then
+    // membership, then the hashes.
+    let body: NewVersionBody = match json_body(req) {
         Ok(b) => b,
-        Err(e) => return error(422, format!("bad version body: {e}")),
+        Err(refusal) => return refusal,
     };
     let Some(expected) = body.expected_version else {
         return error(409, "collab_api_outdated");
     };
+    let Some(p) = st.projects.get_mut(pid) else {
+        return forbidden();
+    };
+    if p.member(&acct.account_id).is_none() {
+        return forbidden();
+    }
     if !is_lower_hex(&body.blake3, 64) {
         return error(400, "blake3 must be 64 lowercase hex chars");
     }
@@ -2908,18 +3049,41 @@ fn frame_versions_batch(
     req: &Request,
 ) -> ResponseTemplate {
     let revoked = st.out_of_service();
-    let body: VersionsBatchBody = match req.body_json() {
+    let body: VersionsBatchBody = match json_body(req) {
         Ok(b) => b,
-        Err(e) => return error(422, format!("bad versions body: {e}")),
+        Err(refusal) => return refusal,
     };
+    let Some(p) = st.projects.get_mut(pid) else {
+        return forbidden();
+    };
+    if p.member(&acct.account_id).is_none() {
+        return forbidden();
+    }
     if body.versions.is_empty() || body.versions.len() > 500 {
         return error(400, "versions must contain 1..=500 items");
     }
-    let Some(p) = st.projects.get_mut(pid) else {
-        return not_found_project();
-    };
-    if p.member(&acct.account_id).is_none() {
-        return empty(403);
+    // Every whole-batch refusal names its entry: the hash rules of the
+    // single-frame route, then the duplicate check, entry by entry.
+    let mut seen = HashSet::with_capacity(body.versions.len());
+    for v in &body.versions {
+        if !is_lower_hex(&v.blake3, 64) {
+            return error(
+                400,
+                format!("{}: blake3 must be 64 lowercase hex chars", v.uuid),
+            );
+        }
+        if !is_lower_hex(&v.xxh3, 16) {
+            return error(
+                400,
+                format!("{}: xxh3 must be 16 lowercase hex chars", v.uuid),
+            );
+        }
+        if v.byte_size <= 0 {
+            return error(400, format!("{}: byteSize must be > 0", v.uuid));
+        }
+        if !seen.insert(v.uuid.as_str()) {
+            return error(400, format!("{}: duplicate uuid in batch", v.uuid));
+        }
     }
     if p.status != "active" {
         return error(409, "project is closed");
@@ -3011,9 +3175,9 @@ fn approve(
     uuid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let body: ApproveBody = match req.body_json() {
+    let body: ApproveBody = match json_body(req) {
         Ok(b) => b,
-        Err(e) => return error(422, format!("bad approve body: {e}")),
+        Err(refusal) => return refusal,
     };
     let Some(p) = st.projects.get_mut(pid) else {
         return not_found_project();
@@ -3074,9 +3238,9 @@ fn reject(
     uuid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let body: RejectBody = match req.body_json() {
+    let body: RejectBody = match json_body(req) {
         Ok(b) => b,
-        Err(e) => return error(422, format!("bad reject body: {e}")),
+        Err(refusal) => return refusal,
     };
     let reason = body.reason.trim().to_string();
     if reason.is_empty() || reason.chars().count() > 500 {
@@ -3152,9 +3316,9 @@ fn patch_frame(
     uuid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let body: FramePatch = match req.body_json() {
+    let body: FramePatch = match json_body(req) {
         Ok(b) => b,
-        Err(e) => return error(422, format!("bad patch body: {e}")),
+        Err(refusal) => return refusal,
     };
     if body.accepted.is_none() && body.filter_canonical.is_none() {
         return error(400, "accepted or filterCanonical is required");
@@ -3499,14 +3663,9 @@ fn report_holders(
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let raw: Value = match req.body_json() {
+    let raw: Value = match json_body(req) {
         Ok(v) => v,
-        Err(e) => {
-            return error(
-                400,
-                format!("Failed to parse the request body as JSON: {e}"),
-            )
-        }
+        Err(refusal) => return refusal,
     };
     if raw.get("reportSeq").is_none() {
         return error(409, "collab_api_outdated"); // a wave-2 body (P25)
@@ -3523,10 +3682,10 @@ fn report_holders(
     };
     let report_seq = body.report_seq;
     let Some(p) = st.projects.get_mut(pid) else {
-        return not_found_project();
+        return forbidden();
     };
     let Some(member) = p.member(&acct.account_id).cloned() else {
-        return empty(403);
+        return forbidden();
     };
 
     let moderator = member.has_cap("data.moderate");
@@ -4621,18 +4780,21 @@ mod tests {
         assert_eq!(member["displayName"], "Me");
     }
 
-    /// Fix round 1, point 6: `GET /devices` / `POST /devices/{id}/revoke`
-    /// (T7's account device registry, distinct from `revoke_device`'s
-    /// collab-claims effects above). A plain revoke and a retire both hide
-    /// the row from the list, but only a retire is terminal (a second
-    /// revoke/retire attempt 404s) — `device_retired` proves `retire: true`
-    /// was actually sent, not just that some revoke happened.
+    /// The device registry (T7; distinct from `revoke_device`'s
+    /// collab-claims effects above). On the hub a plain revoke and a retire
+    /// are the same out-of-service mark: both hide the device from the list,
+    /// a second revoke of an own device is an idempotent 204 no-op whichever
+    /// kind it is, and only an id that is not the caller's, or unknown, is
+    /// 404 `device not found`. `device_retired` proves `retire: true` was
+    /// actually sent.
     #[tokio::test]
-    async fn revoke_and_retire_both_hide_the_device_but_only_retire_is_terminal() {
+    async fn a_second_revoke_of_an_own_device_is_a_no_op_and_an_unknown_one_is_not_found() {
         let hub = FakeHub::start().await;
         hub.add_account("tok", "acc-me", "Me", "MY-PUBKEY", None);
+        hub.add_account("tok-o", "acc-o", "Other", "OTHER-PUBKEY", None);
         hub.add_device("acc-me", "PLAIN-DEV", "plain-id", "Plain laptop", None);
         hub.add_device("acc-me", "RETIRE-DEV", "retire-id", "Retire laptop", None);
+        hub.add_device("acc-o", "OTHER-DEV", "other-id", "Other laptop", None);
         let client = crate::account::HubClient::new(hub.uri()).unwrap();
 
         let before = client.list_devices("tok").await.unwrap();
@@ -4654,7 +4816,7 @@ mod tests {
         client
             .revoke_device("tok", "plain-id", false)
             .await
-            .expect("a merely revoked device can be acted on again");
+            .expect("a second revoke of an own device is a 204 no-op");
 
         client
             .revoke_device("tok", "retire-id", true)
@@ -4666,14 +4828,34 @@ mod tests {
             after_retire.iter().all(|d| d.id != "retire-id"),
             "hidden from the list"
         );
-        let err = client
+        client
             .revoke_device("tok", "retire-id", true)
             .await
-            .unwrap_err();
+            .expect("a second retire is the same no-op");
+        client
+            .revoke_device("tok", "plain-id", true)
+            .await
+            .expect("a retire after a revoke is the same no-op");
         assert!(
-            matches!(err, crate::account::AccountClientError::NotFound(_)),
-            "retired is terminal: a second retire 404s, {err:?}"
+            !hub.device_retired("plain-id"),
+            "the no-op does not change the mark"
         );
+
+        for id in ["no-such-id", "other-id"] {
+            let (status, body) = call(
+                &hub,
+                "POST",
+                &format!("/devices/{id}/revoke"),
+                Some("tok"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, body.as_str()),
+                (404, r#"{"error":"device not found"}"#),
+                "{id}: unknown, or another account's"
+            );
+        }
     }
 
     // ── implicit claims and the hub's validation ──
@@ -4876,5 +5058,544 @@ mod tests {
             reply["results"][0]["contentVersion"], 0,
             "a foreign frame's version is not disclosed"
         );
+    }
+
+    // ── answers the hub gives and the fake used to give differently ──
+
+    /// One request straight over HTTP as `token` (or with none): the status
+    /// and the body text. `body` goes out as JSON.
+    async fn call(
+        hub: &FakeHub,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (u16, String) {
+        let mut req = reqwest::Client::new().request(
+            method.parse().unwrap(),
+            format!("{}/api/v1{path}", hub.uri()),
+        );
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let r = req.send().await.unwrap();
+        (r.status().as_u16(), r.text().await.unwrap())
+    }
+
+    /// Like [`call`], with the body text and content type exactly as given.
+    async fn call_text(
+        hub: &FakeHub,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (u16, String) {
+        let mut req = reqwest::Client::new()
+            .request(
+                method.parse().unwrap(),
+                format!("{}/api/v1{path}", hub.uri()),
+            )
+            .bearer_auth("tok")
+            .body(body.to_string());
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        let r = req.send().await.unwrap();
+        (r.status().as_u16(), r.text().await.unwrap())
+    }
+
+    /// The announce body of one frame as raw JSON, to bend a field at a time.
+    fn announce_json(frame: Value) -> Value {
+        json!({ "frames": [frame] })
+    }
+
+    fn frame_json(uuid: &str) -> Value {
+        serde_json::to_value(frame_in(uuid)).unwrap()
+    }
+
+    /// On the hub a project that does not exist reads as "not a member":
+    /// every route that starts with the membership lookup answers a body-less
+    /// 403, as it does for a stranger. Only the routes that lock the project
+    /// row first (approve, reject, patch) and the public page say 404
+    /// `project not found`.
+    #[tokio::test]
+    async fn an_unknown_project_is_refused_with_a_body_less_403_where_the_hub_checks_membership() {
+        let hub = hub_with_member().await;
+        let version = json!({
+            "expectedVersion": 1, "blake3": "b".repeat(64), "byteSize": 10, "xxh3": "0".repeat(16)
+        });
+        let grid = json!({
+            "scaleArcsec": 1.0, "widthPx": 1000, "heightPx": 1000,
+            "crval1": 10.0, "crval2": 20.0, "rotationDeg": 0.0
+        });
+        let report = report_body(1, false, &[], &[]);
+        let guarded: Vec<(&str, &str, Option<Value>)> = vec![
+            ("GET", "/projects/nope/membership", None),
+            ("GET", "/projects/nope/thresholds", None),
+            ("GET", "/projects/nope/dictionary", None),
+            ("GET", "/projects/nope/manifest", None),
+            ("GET", "/projects/nope/holders/snapshot", None),
+            ("GET", "/projects/nope/holders?since=0", None),
+            ("PUT", "/projects/nope/holders/self", Some(report)),
+            ("PUT", "/projects/nope/publishing-device", None),
+            ("PUT", "/projects/nope/grid", Some(grid)),
+            (
+                "POST",
+                "/projects/nope/frames",
+                Some(announce_json(frame_json("n1"))),
+            ),
+            ("POST", "/projects/nope/frames/u1/version", Some(version)),
+            (
+                "POST",
+                "/projects/nope/frames/versions",
+                Some(json!({"versions": [{
+                    "uuid": "u1", "expectedVersion": 1, "blake3": "b".repeat(64),
+                    "byteSize": 10, "xxh3": "0".repeat(16)
+                }]})),
+            ),
+        ];
+        for (method, path, body) in guarded {
+            let (status, text) = call(&hub, method, path, Some("tok"), body).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (403, ""),
+                "{method} {path}: an unknown project is a body-less 403"
+            );
+        }
+        for (path, body) in [
+            ("/projects/nope/frames/u1/approve", json!({"trust": false})),
+            ("/projects/nope/frames/u1/reject", json!({"reason": "bad"})),
+        ] {
+            let (status, text) = call(&hub, "POST", path, Some("tok"), Some(body)).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (404, r#"{"error":"project not found"}"#),
+                "{path}"
+            );
+        }
+        let (status, text) = call(
+            &hub,
+            "PATCH",
+            "/projects/nope/frames/u1",
+            Some("tok"),
+            Some(json!({"accepted": true})),
+        )
+        .await;
+        assert_eq!(
+            (status, text.as_str()),
+            (404, r#"{"error":"project not found"}"#)
+        );
+        let (status, _) = call(&hub, "GET", "/projects/nope", None, None).await;
+        assert_eq!(status, 404, "the public page keeps its 404");
+    }
+
+    /// The hub's announce refusals, in its words and order: the `fileName`
+    /// message carries no frame prefix; `exptimeSec` is checked before the
+    /// channel; the channel message lists the five names.
+    #[tokio::test]
+    async fn announce_refusals_carry_the_hub_words_and_check_the_exposure_before_the_channel() {
+        let hub = hub_with_member().await;
+        let v0 = hub.version("p1");
+        let refused = |frame: Value| {
+            let hub = &hub;
+            async move {
+                call(
+                    hub,
+                    "POST",
+                    "/projects/p1/frames",
+                    Some("tok"),
+                    Some(announce_json(frame)),
+                )
+                .await
+            }
+        };
+        let mut f = frame_json("a1");
+        f["fileName"] = json!("sub/a1.fits");
+        assert_eq!(
+            refused(f).await,
+            (
+                400,
+                r#"{"error":"fileName \"sub/a1.fits\" is not a plain file name"}"#.to_string()
+            )
+        );
+        for exptime in [0.0, 86_400.5, -1.0] {
+            let mut f = frame_json("a1");
+            f["exptimeSec"] = json!(exptime);
+            f["channel"] = json!("bogus");
+            assert_eq!(
+                refused(f).await,
+                (
+                    400,
+                    r#"{"error":"a1.fits: exptimeSec must be within (0, 86400]"}"#.to_string()
+                ),
+                "exptime {exptime}: checked before the channel"
+            );
+        }
+        let mut f = frame_json("a1");
+        f["exptimeSec"] = json!(86_400.0);
+        f["channel"] = json!("bogus");
+        assert_eq!(
+            refused(f).await,
+            (
+                400,
+                r#"{"error":"a1.fits: channel must be one of mono, osc, osc-r, osc-g, osc-b"}"#
+                    .to_string()
+            ),
+            "the upper bound is inclusive"
+        );
+        assert_eq!(hub.version("p1"), v0, "a refused batch writes nothing");
+    }
+
+    /// An announce without `channel` or `meta` takes the hub's defaults:
+    /// `mono` and `{}`.
+    #[tokio::test]
+    async fn an_announce_without_channel_or_meta_takes_mono_and_an_empty_object() {
+        let hub = hub_with_member().await;
+        let mut f = frame_json("d1");
+        f.as_object_mut().unwrap().remove("channel");
+        f.as_object_mut().unwrap().remove("meta");
+        let (status, text) = call(
+            &hub,
+            "POST",
+            "/projects/p1/frames",
+            Some("tok"),
+            Some(announce_json(f)),
+        )
+        .await;
+        assert_eq!(status, 200, "{text}");
+        let row = hub.frame("p1", "d1").unwrap();
+        assert_eq!((row.channel.as_str(), row.meta), ("mono", json!({})));
+    }
+
+    /// A body axum's `Json` extractor cannot read is refused in plain text,
+    /// before any check the handler makes (a stranger with a broken body gets
+    /// the body's refusal, not the 403): 415 without a JSON content type,
+    /// 400 for text that is not JSON, 422 for JSON of the wrong shape.
+    #[tokio::test]
+    async fn an_unreadable_body_is_refused_in_plain_text_before_the_membership_check() {
+        let hub = hub_with_member().await;
+        hub.add_account("tok-x", "acc-x", "X", "XXX=", None);
+        let (status, text) = call_text(
+            &hub,
+            "POST",
+            "/projects/p1/frames",
+            None,
+            r#"{"frames": []}"#,
+        )
+        .await;
+        assert_eq!(
+            (status, text.as_str()),
+            (
+                415,
+                "Expected request with `Content-Type: application/json`"
+            )
+        );
+        let (status, text) = call_text(
+            &hub,
+            "POST",
+            "/projects/p1/frames",
+            Some("application/json"),
+            "{not json",
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(
+            text.starts_with("Failed to parse the request body as JSON: "),
+            "{text}"
+        );
+        for (method, path, wrong) in [
+            ("POST", "/projects/p1/frames", r#"{"x": 1}"#),
+            ("POST", "/projects/p1/frames/u1/version", r#"{"x": 1}"#),
+            ("POST", "/projects/p1/frames/versions", r#"{"x": 1}"#),
+            (
+                "POST",
+                "/projects/p1/frames/u1/approve",
+                r#"{"trust": "yes"}"#,
+            ),
+            ("POST", "/projects/p1/frames/u1/reject", r#"{"x": 1}"#),
+            ("PATCH", "/projects/p1/frames/u1", r#"{"accepted": "yes"}"#),
+            ("PUT", "/projects/p1/grid", r#"{"x": 1}"#),
+        ] {
+            let (status, text) =
+                call_text(&hub, method, path, Some("application/json"), wrong).await;
+            assert_eq!(status, 422, "{method} {path}: {text}");
+            assert!(
+                text.starts_with("Failed to deserialize the JSON body into the target type: "),
+                "{method} {path}: {text}"
+            );
+        }
+        let r = reqwest::Client::new()
+            .post(format!("{}/api/v1/projects/p1/frames", hub.uri()))
+            .bearer_auth("tok-x")
+            .header("content-type", "application/json")
+            .body(r#"{"frames": 3}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 422, "not the stranger's 403");
+        let (status, text) = call_text(
+            &hub,
+            "POST",
+            "/devices/none/revoke",
+            Some("application/json"),
+            "{not json",
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "the optional revoke body is strict once sent: {text}"
+        );
+    }
+
+    /// `frames/versions` refuses a bad entry for the whole batch, naming it:
+    /// the three hash rules of the single route, then a repeated uuid. The
+    /// membership check comes first; nothing is written.
+    #[tokio::test]
+    async fn a_versions_batch_refuses_bad_hashes_and_repeated_uuids_naming_the_entry() {
+        let hub = hub_with_member().await;
+        hub.seed_frames("p1", "acc-me", &["m1", "m2"], "published");
+        let entry = |uuid: &str| {
+            json!({
+                "uuid": uuid, "expectedVersion": 1, "blake3": "b".repeat(64),
+                "byteSize": 10, "xxh3": "0".repeat(16)
+            })
+        };
+        let send = |entries: Vec<Value>| {
+            let hub = &hub;
+            async move {
+                call(
+                    hub,
+                    "POST",
+                    "/projects/p1/frames/versions",
+                    Some("tok"),
+                    Some(json!({ "versions": entries })),
+                )
+                .await
+            }
+        };
+        let mut bad = entry("m2");
+        bad["blake3"] = json!("XYZ");
+        assert_eq!(
+            send(vec![entry("m1"), bad]).await,
+            (
+                400,
+                r#"{"error":"m2: blake3 must be 64 lowercase hex chars"}"#.to_string()
+            )
+        );
+        let mut bad = entry("m1");
+        bad["xxh3"] = json!("0".repeat(15));
+        assert_eq!(
+            send(vec![bad]).await,
+            (
+                400,
+                r#"{"error":"m1: xxh3 must be 16 lowercase hex chars"}"#.to_string()
+            )
+        );
+        let mut bad = entry("m1");
+        bad["byteSize"] = json!(0);
+        assert_eq!(
+            send(vec![bad]).await,
+            (400, r#"{"error":"m1: byteSize must be > 0"}"#.to_string())
+        );
+        assert_eq!(
+            send(vec![entry("m1"), entry("m2"), entry("m1")]).await,
+            (
+                400,
+                r#"{"error":"m1: duplicate uuid in batch"}"#.to_string()
+            )
+        );
+        assert_eq!(
+            send(vec![]).await,
+            (
+                400,
+                r#"{"error":"versions must contain 1..=500 items"}"#.to_string()
+            )
+        );
+        assert_eq!(hub.frame("p1", "m1").unwrap().content_version, 1);
+        hub.add_account("tok-x", "acc-x", "X", "XXX=", None);
+        let (status, text) = call(
+            &hub,
+            "POST",
+            "/projects/p1/frames/versions",
+            Some("tok-x"),
+            Some(json!({"versions": []})),
+        )
+        .await;
+        assert_eq!(
+            (status, text.as_str()),
+            (403, ""),
+            "membership before the batch rules"
+        );
+    }
+
+    /// A `frames/{uuid}/version` body without `expectedVersion` is the
+    /// wave-2 body: 409 `collab_api_outdated` for anyone, a stranger
+    /// included — the check comes before the membership lookup.
+    #[tokio::test]
+    async fn a_version_without_expected_version_is_409_before_the_membership_check() {
+        let hub = hub_with_member().await;
+        hub.add_account("tok-x", "acc-x", "X", "XXX=", None);
+        let body = json!({"blake3": "b".repeat(64), "byteSize": 10, "xxh3": "0".repeat(16)});
+        for token in ["tok", "tok-x"] {
+            let (status, text) = call(
+                &hub,
+                "POST",
+                "/projects/p1/frames/u1/version",
+                Some(token),
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(
+                (status, text.as_str()),
+                (409, r#"{"error":"collab_api_outdated"}"#),
+                "{token}"
+            );
+        }
+        let mut with = body;
+        with["expectedVersion"] = json!(1);
+        let (status, text) = call(
+            &hub,
+            "POST",
+            "/projects/p1/frames/u1/version",
+            Some("tok-x"),
+            Some(with),
+        )
+        .await;
+        assert_eq!(
+            (status, text.as_str()),
+            (403, ""),
+            "with the field the stranger is refused"
+        );
+    }
+
+    /// `GET /devices` lists the newest device first, a nameless device with
+    /// `name: null`, and carries the `endpointAddr` field (`null` until the
+    /// device reports an address).
+    #[tokio::test]
+    async fn the_device_list_is_newest_first_with_a_nullable_name_and_an_endpoint_address() {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "MY-PUBKEY", None);
+        hub.add_device("acc-me", "KEY-A", "id-a", "First", None);
+        hub.add_device("acc-me", "KEY-B", "id-b", "", None);
+        hub.add_device("acc-me", "KEY-C", "id-c", "Third", None);
+        let (status, text) = call(&hub, "GET", "/devices", Some("tok"), None).await;
+        assert_eq!(status, 200);
+        let list: Vec<Value> = serde_json::from_str(&text).unwrap();
+        let ids: Vec<&str> = list.iter().map(|d| d["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["id-c", "id-b", "id-a"], "newest first");
+        assert_eq!(list[1]["name"], Value::Null, "a nameless device reads null");
+        assert_eq!(list[0]["name"], "Third");
+        for d in &list {
+            assert!(d.as_object().unwrap().contains_key("endpointAddr"), "{d}");
+            assert_eq!(d["endpointAddr"], Value::Null);
+        }
+    }
+
+    /// `/me/projects` lists the caller's projects newest first (the hub's
+    /// `ORDER BY p.created_at DESC`), whatever their ids sort like.
+    #[tokio::test]
+    async fn my_projects_lists_the_newest_project_first() {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        for id in ["p-b", "p-c", "p-a"] {
+            hub.add_project(id, id, &[("acc-me", "send_receive", false)], false);
+        }
+        let listed = my_projects_json(&hub, "tok").await;
+        let ids: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["p-a", "p-c", "p-b"]);
+    }
+
+    /// A new project's dictionary is the hub's seed: `L` is `luminance` with
+    /// lower-case aliases, and the unfiltered entry follows the seven.
+    #[tokio::test]
+    async fn the_default_dictionary_is_the_hubs_seed() {
+        let hub_seed = r#"[{"canonical":"L","aliases":["lum","luminance","clear","l"],"kind":"luminance"},{"canonical":"R","aliases":["red","r"],"kind":"broadband"},{"canonical":"G","aliases":["green","g"],"kind":"broadband"},{"canonical":"B","aliases":["blue","b"],"kind":"broadband"},{"canonical":"Ha","aliases":["h-alpha","halpha","h_alpha","hα","ha"],"kind":"narrowband"},{"canonical":"OIII","aliases":["o3","oiii","o-iii"],"kind":"narrowband"},{"canonical":"SII","aliases":["s2","sii","s-ii"],"kind":"narrowband"},{"canonical":"None","aliases":["none","nofilter","no filter","no-filter","unfiltered"],"kind":"unfiltered"}]"#;
+        let expected: Vec<DictionaryEntry> = serde_json::from_str(hub_seed).unwrap();
+        assert_eq!(default_dictionary(), expected);
+    }
+
+    /// The signed membership snapshot lists the members by account id and
+    /// each member's `nodes` by the keys' raw bytes: base64 text does not sort
+    /// like its bytes (`+/v7…` is the byte string `fb fb …`, after `01 01 …`
+    /// which reads `AQEB…`).
+    #[tokio::test]
+    async fn the_membership_snapshot_orders_members_by_account_and_nodes_by_key_bytes() {
+        let hub = FakeHub::start().await;
+        let high = B64.encode([0xFBu8; 32]);
+        let low = B64.encode([0x01u8; 32]);
+        assert!(
+            high < low,
+            "the text order is the opposite of the byte order"
+        );
+        hub.add_account("tok-b", "acc-b", "Bee", &high, None);
+        hub.add_account("tok-b2", "acc-b", "Bee", &low, None);
+        hub.add_account("tok-a", "acc-a", "Ann", &B64.encode([0x55u8; 32]), None);
+        hub.add_project(
+            "p1",
+            "m31",
+            &[("acc-b", "send_receive", true), ("acc-a", "send", false)],
+            false,
+        );
+        let (status, text) =
+            call(&hub, "GET", "/projects/p1/membership", Some("tok-a"), None).await;
+        assert_eq!(status, 200, "{text}");
+        let signed: Value = serde_json::from_str(&text).unwrap();
+        let payload = B64.decode(signed["payload"].as_str().unwrap()).unwrap();
+        let payload: Value = serde_json::from_slice(&payload).unwrap();
+        let accounts: Vec<&str> = payload["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["accountId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            accounts,
+            ["acc-a", "acc-b"],
+            "by account id, not insertion order"
+        );
+        assert_eq!(payload["members"][1]["nodes"], json!([low, high]));
+    }
+
+    /// The retired routes sit behind the hub's account middleware: without a
+    /// valid token they answer 401 (empty), with one 409 `collab_api_outdated`.
+    #[tokio::test]
+    async fn retired_routes_answer_401_without_a_token_and_409_with_one() {
+        let hub = hub_with_member().await;
+        for (method, path) in [
+            ("GET", "/me/project-versions"),
+            ("POST", "/projects/p1/announcements"),
+            ("GET", "/projects/p1/announcements"),
+            ("PUT", "/projects/p1/have"),
+            ("POST", "/announcements/a1/approve"),
+            ("POST", "/announcements/a1/have"),
+            ("GET", "/projects/p1/frames/u1/holders"),
+        ] {
+            let (status, text) = call(&hub, method, path, None, None).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (401, ""),
+                "{method} {path}: no token"
+            );
+            let (status, text) = call(&hub, method, path, Some("bad"), None).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (401, ""),
+                "{method} {path}: unknown token"
+            );
+            let (status, text) = call(&hub, method, path, Some("tok"), None).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (409, r#"{"error":"collab_api_outdated"}"#),
+                "{method} {path}: with a token"
+            );
+        }
     }
 }
