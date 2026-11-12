@@ -11,6 +11,36 @@ use crate::stacking::test_fixtures::{
     wait_for_run_within, LightSpec, STAR_FIELD_HEIGHT, STAR_FIELD_WIDTH,
 };
 
+/// A `GroupStats` with only the low-rejection fraction set (every other field empty).
+fn stats_with_low_rejection(low: f64) -> GroupStats {
+    let mut stats: GroupStats = serde_json::from_value(serde_json::json!({
+        "frames": 3, "included": 3, "droppedBelowMinWeight": 0, "recipe": "test",
+        "rejectedLowFraction": 0.0, "rejectedHighFraction": 0.0, "rejectedFractionPerFrame": [],
+        "masterNoise": [], "masterLocation": [], "masterScale": [], "bestSubNoise": [],
+        "masterPsfSnr": [], "bestSubPsfSnr": [], "snrGain": [], "masterFwhmPx": [],
+        "masterEccentricity": [], "weightedExposureS": 0.0, "totalExposureS": 0.0,
+        "readMs": 0, "combineMs": 0, "bytesRead": 0, "lnFrames": 0
+    }))
+    .unwrap();
+    stats.rejected_low_fraction = low;
+    stats
+}
+
+/// The dark guard's master half: below the 0.5 bar (healthy stacks reject at most about 3 %) nothing is said; at
+/// and above it the sentence names the group and the percentage.
+#[test]
+fn low_rejection_sentence_fires_at_half_and_names_the_group() {
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.03)), None);
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.49)), None);
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(f64::NAN)), None);
+    let half = low_rejection_sentence("L", &stats_with_low_rejection(0.5)).unwrap();
+    assert!(half.starts_with("group L: 50 % of the samples were rejected low"), "{half}");
+    assert_eq!(
+        low_rejection_sentence("L", &stats_with_low_rejection(0.9)).unwrap(),
+        "group L: 90 % of the samples were rejected low \u{2014} the calibrated frames are mostly at or below zero; check the dark's gain and offset"
+    );
+}
+
 /// A group already skipped at Measure ("fewer than 3 included frames") has that line once: Output's own skip for
 /// the same reason does not repeat it, a different reason adds its own line, and the row keeps the reason in `error`.
 #[test]

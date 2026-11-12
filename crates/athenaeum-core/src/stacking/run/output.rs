@@ -2052,6 +2052,18 @@ fn process_group_output(
         path = %master_path_str,
         "master written"
     );
+    // The dark guard's master half: most samples rejected low means the calibrated frames are mostly at or below
+    // zero (range rejection at the default floor of 0). Output integrates on every run, so a cached calibrated
+    // frame, which Calibrate cannot count, is still caught here.
+    if let Some(sentence) = low_rejection_sentence(&group.key, &output.stats) {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            rejected_low_fraction = output.stats.rejected_low_fraction,
+            "most samples rejected low: calibrated frames at or below zero"
+        );
+        rc.warnings.push(sentence);
+    }
 
     // M4d Task 2 fix round 1 (ruling R-T2-1): XISF has no row-order concept
     // — row 0 IS the top row for every XISF reader — while this master's
@@ -2908,6 +2920,27 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
     }
 
     Ok(())
+}
+
+/// The bar for a master the dark guard calls broken: the share of all samples (every included frame and plane)
+/// rejected low, range rejection included. On a healthy stack almost nothing sits at or below the range floor of
+/// 0: the repo's acceptance runs reject at most about 3 % in total, low and high together (`docs/stacking/README.md`,
+/// the 2026-09-11 acceptance table: 2.985 % mono, 2.733 % OSC), so 0.5 is more than sixteen times the highest
+/// recorded total. A light's median after dark subtraction is its sky, which is above zero; when half the samples
+/// are rejected low, most calibrated pixels are at or below zero.
+const MASTER_REJECTED_LOW_BAR: f64 = 0.5;
+
+/// The run warning for a group whose master rejected most samples low, or `None` below
+/// [`MASTER_REJECTED_LOW_BAR`] (or for a non-finite fraction). Pure: the caller logs and pushes.
+fn low_rejection_sentence(key: &str, s: &GroupStats) -> Option<String> {
+    let f = s.rejected_low_fraction;
+    if !(f.is_finite() && f >= MASTER_REJECTED_LOW_BAR) {
+        return None;
+    }
+    Some(format!(
+        "group {key}: {} % of the samples were rejected low \u{2014} the calibrated frames are mostly at or below zero; check the dark's gain and offset",
+        (100.0 * f).round() as i64
+    ))
 }
 
 #[cfg(test)]

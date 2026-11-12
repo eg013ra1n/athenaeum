@@ -98,6 +98,14 @@ pub struct GeneratedLight {
     /// path, so a stale file from an earlier run can never be mistaken for
     /// this generation's output.
     pub mosaic_written: bool,
+    /// Pixels at or below zero right after the dark or bias was subtracted
+    /// (see [`crate::calibration_library::light_cal::LightCalOutcome::non_positive_pixels`]).
+    /// A counter only; counted on the mosaic, before any debayer. A frame the
+    /// caller served from its cache is never regenerated and has no count.
+    pub non_positive_pixels: u64,
+    /// The pixels that count was taken over: `0` when no dark or bias was
+    /// subtracted, so a caller can tell "none counted" from "none lost".
+    pub pixels: u64,
 }
 
 /// One frame's resolved plan: everything [`execute_generation`] needs, with no
@@ -1039,6 +1047,7 @@ pub fn execute_generation(
         width = frame.width,
         height = frame.height,
         floored_flat_pixels = outcome.floored_flat_pixels,
+        non_positive_pixels = outcome.non_positive_pixels,
         compute_ms,
         cosmetic_ms,
         debayer_ms,
@@ -1054,6 +1063,8 @@ pub fn execute_generation(
         byte_size,
         warnings,
         mosaic_written,
+        non_positive_pixels: outcome.non_positive_pixels,
+        pixels: outcome.pixels,
     })
 }
 

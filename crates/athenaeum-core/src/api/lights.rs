@@ -301,6 +301,19 @@ pub fn pedestal_run_sentence(
     )
 }
 
+const SUBTRACTION_FIX: &str =
+    "the dark is brighter than the lights; check that the dark's gain and offset match";
+
+/// The run warning for a group whose dark or bias left most pixels at or below zero (the dark guard):
+/// `n` of the `m` frames that had one subtracted. `offset_gain` is the lost lights' own
+/// `"OFFSET 1, GAIN 100"` text. It does not reuse `PEDESTAL_FIX` (that line says to link a master, and here one
+/// is linked and is the wrong one).
+pub fn subtraction_run_sentence(group_key: &str, n: usize, m: usize, offset_gain: &str) -> String {
+    format!(
+        "group {group_key}: dark subtraction left most pixels at or below zero in {n} of {m} frames ({offset_gain}) \u{2014} {SUBTRACTION_FIX}"
+    )
+}
+
 // ── Membership ──────────────────────────────────────────────────────────────
 
 /// LIGHT members (frame_id, filename) of a frame set, mirroring the
@@ -1670,6 +1683,14 @@ mod tests {
             .unwrap()
             .frame_ids
             .is_empty());
+    }
+
+    #[test]
+    fn the_subtraction_sentence_names_the_group_the_counts_and_the_check() {
+        assert_eq!(
+            subtraction_run_sentence("L", 12, 12, "OFFSET 1, GAIN 100"),
+            "group L: dark subtraction left most pixels at or below zero in 12 of 12 frames (OFFSET 1, GAIN 100) \u{2014} the dark is brighter than the lights; check that the dark's gain and offset match"
+        );
     }
 
     #[test]

@@ -254,6 +254,9 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 | `light_gain` | string | the same format for GAIN (`GAIN 100`, `GAIN 100–120`, `GAIN not recorded`) | pedestal warn |
 | `set_offset` | string | the calibration set's declared OFFSET in the `light_offset` format (`OFFSET 200`, `OFFSET not recorded`); 2026-11-12 | manual-link warn (`manual calibration accepted with another gain or offset`) |
 | `set_gain` | string | the same for the set's GAIN (`GAIN 100`, `GAIN not recorded`); 2026-11-12 | same |
+| `non_positive_pixels` | u64 | pixels at or below zero right after the dark or bias was subtracted, per frame (0 when nothing was subtracted); 2026-11-12 | `"light calibrated"` (debug, both lines) |
+| `non_positive_fraction` | f64 | the median, over a group's lost frames (those with at least half their pixels at or below zero), of `non_positive_pixels / pixels`; 2026-11-12 | `"dark subtraction left most pixels at or below zero"` (warn, per group; with `count` = the lost frames, `light_offset`, `light_gain`) |
+| `rejected_low_fraction` | f64 | `GroupStats.rejected_low_fraction`, the share of all samples rejected low, range rejection included (the dictionary's `rejected_fraction` is low plus high); 2026-11-12 | `"most samples rejected low: calibrated frames at or below zero"` (warn, per master, at 0.5 or more) |
 | `flat_set_ids` | string | comma-joined flat set ids | pedestal warn |
 | `flat_corner_ratio` | f64 | `V`, the flat's darkest corner over its centre (NaN when it could not be read) | pedestal warn (run only) |
 

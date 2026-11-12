@@ -189,12 +189,20 @@ fn calibrate_queue(
 ///
 /// `bytes_done` for a GENERATED frame is only known once `commit_calibrated` returns its file's real size, so
 /// the byte count advances at the group boundary, not mid-fan-out.
+///
+/// The dark guard's per-group tally rides along: a regenerated frame whose dark or bias left
+/// [`DARK_SUBTRACTION_LOST_BAR`] or more of its pixels at or below zero is "lost", and a group with any lost
+/// frame gets one `warn!` and one run warning ([`warn_subtraction_lost`]). A frame served from the cache was not
+/// regenerated, has no count, and is not tallied; counting changes no byte of any frame or any stage hash.
 fn commit_calibrate_group(
     rc: &mut RunContext,
+    group_key: &str,
     jobs: &[CalibrateJob],
     results: Vec<Option<Result<GeneratedLight, String>>>,
     bytes_done: &mut u64,
 ) -> Result<(), RunError> {
+    let mut counted = 0usize;
+    let mut lost: Vec<(i64, f64)> = Vec::new();
     for (pos, res) in results.into_iter().enumerate() {
         let job = &jobs[pos];
         match res {
@@ -210,12 +218,104 @@ fn commit_calibrate_group(
                 rc.runtime_exclusions.push((job.frame_id, msg));
             }
             Some(Ok(generated)) => {
+                if generated.pixels > 0 {
+                    counted += 1;
+                    let fraction = generated.non_positive_pixels as f64 / generated.pixels as f64;
+                    if fraction >= DARK_SUBTRACTION_LOST_BAR {
+                        lost.push((job.frame_id, fraction));
+                    }
+                }
                 *bytes_done += commit_calibrated(rc, job, generated)?;
                 rc.cached_calibrated.insert(job.frame_id, false);
             }
         }
     }
+    if !lost.is_empty() {
+        warn_subtraction_lost(rc, group_key, counted, &lost);
+    }
     Ok(())
+}
+
+/// The bar for a frame the dark guard calls lost: the share of its pixels at or below zero right after the dark
+/// or bias was subtracted. A light's median after that subtraction is its sky, which is above zero, so a frame
+/// with half its pixels at or below zero has a dark brighter than the light itself (a mismatched gain or offset,
+/// or a dark from another setup). There is no recorded healthy measurement of this fraction: the standard test
+/// fixture (500 ADU background against a 100 ADU dark) reads 0 %, which is the order a real frame has.
+const DARK_SUBTRACTION_LOST_BAR: f64 = 0.5;
+
+/// The median of the lost frames' fractions (`fractions` is non-empty, finite).
+fn median_fraction(fractions: &mut [f64]) -> f64 {
+    fractions.sort_by(f64::total_cmp);
+    let n = fractions.len();
+    if n % 2 == 1 {
+        fractions[n / 2]
+    } else {
+        (fractions[n / 2 - 1] + fractions[n / 2]) / 2.0
+    }
+}
+
+/// One `warn!` and one run warning for a group with lost frames (`counted` is how many of its regenerated frames
+/// had a dark or bias subtracted). Advisory: a catalog failure reading the lost lights' gain and offset is a
+/// `warn!` and the sentence says "not recorded", never a failed run.
+fn warn_subtraction_lost(rc: &mut RunContext, group_key: &str, counted: usize, lost: &[(i64, f64)]) {
+    use crate::api::lights::{card_text, subtraction_run_sentence};
+    let mut offsets: Vec<Option<f64>> = Vec::new();
+    let mut gains: Vec<Option<f64>> = Vec::new();
+    match db(&rc.ctx) {
+        Ok(handle) => {
+            let conn = handle.conn();
+            for &(id, _) in lost {
+                let row: rusqlite::Result<(Option<f64>, Option<f64>)> = conn.query_row(
+                    "SELECT offset, gain FROM frames WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                );
+                match row {
+                    Ok((offset, gain)) => {
+                        offsets.push(offset);
+                        gains.push(gain);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            run_id = rc.run_id,
+                            frame_id = id,
+                            error = %e,
+                            "gain and offset unreadable; the dark subtraction warning omits them"
+                        );
+                        offsets.push(None);
+                        gains.push(None);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key,
+                error = %e,
+                "gain and offset unreadable: catalog unavailable; the dark subtraction warning omits them"
+            );
+        }
+    }
+    let offset_text = card_text("OFFSET", &offsets);
+    let gain_text = card_text("GAIN", &gains);
+    let mut fractions: Vec<f64> = lost.iter().map(|&(_, f)| f).collect();
+    let fraction = median_fraction(&mut fractions);
+    tracing::warn!(
+        run_id = rc.run_id,
+        group_key,
+        count = lost.len(),
+        non_positive_fraction = fraction,
+        light_offset = %offset_text,
+        light_gain = %gain_text,
+        "dark subtraction left most pixels at or below zero"
+    );
+    rc.warnings.push(subtraction_run_sentence(
+        group_key,
+        lost.len(),
+        counted,
+        &format!("{offset_text}, {gain_text}"),
+    ));
 }
 
 /// Stage 1's per-frame RESOLVE phase (perf tier 1 Task 4, spec §9.3): every
@@ -1287,7 +1387,7 @@ fn stage_calibrate_with(rc: &mut RunContext, force_merge: Option<bool>) -> Resul
             // error in a LATER group is honoured, as the per-group loop did.
             for (plan, res) in plans.iter().zip(results) {
                 replay_list_stash(rc, &mut stash, &mut replayed, plan.group_idx);
-                commit_calibrate_group(rc, &plan.jobs, res, &mut bytes_done)?;
+                commit_calibrate_group(rc, &groups[plan.group_idx].key, &plan.jobs, res, &mut bytes_done)?;
                 rc.progress(
                     Stage::Calibrate,
                     Some(groups[plan.group_idx].key.clone()),
@@ -1368,6 +1468,7 @@ fn stage_calibrate_with(rc: &mut RunContext, force_merge: Option<bool>) -> Resul
                 current = ticker.done();
                 commit_calibrate_group(
                     rc,
+                    &group.key,
                     &plan.jobs,
                     results.pop().unwrap_or_default(),
                     &mut bytes_done,

@@ -2166,6 +2166,34 @@ the new model through the normal cache invalidation (below).
   warning path on and off), enters no hash and moves no pixel; attested sets
   and project frames are out of its reach, and collab publish receives the
   field without showing it.
+- **The dark guard (2026-11-12).** Two run-time guards say when dark
+  subtraction destroyed the data; both only add a string to
+  `RunSummary.warnings` and a `warn!`, move no pixel, and enter no hash, cache
+  key or stored summary shape.
+  - *Calibrate, per frame and group.* `calibrate_light_compute_inner` counts the
+    pixels at or below zero right after the dark or bias is subtracted
+    (`LightCalOutcome::non_positive_pixels` over `pixels`, carried on
+    `GeneratedLight`; the debug line `"light calibrated"` has the count). A
+    frame is lost at a fraction of 0.5 or more (`DARK_SUBTRACTION_LOST_BAR`):
+    a light's median after subtraction is its sky, which is above zero, so
+    half the pixels at or below zero means the dark is brighter than the light
+    (mismatched gain or offset, or a dark from another setup). A group with at
+    least one lost frame gets one `warn!` (`count`, the median
+    `non_positive_fraction`, `light_offset`, `light_gain`) and one run warning
+    (`api::lights::subtraction_run_sentence`): `group L: dark subtraction left
+    most pixels at or below zero in 12 of 12 frames (OFFSET 1, GAIN 100) — the
+    dark is brighter than the lights; check that the dark's gain and offset
+    match`. A frame served from the cache is not regenerated, has no count and
+    is not tallied; the master guard covers re-runs. No healthy measurement of
+    the fraction is recorded (the fixture reads 0 %); the debug line gives the
+    figure for the next acceptance run.
+  - *Output, per master.* After `"master written"`, `rejected_low_fraction >=
+    0.5` (`MASTER_REJECTED_LOW_BAR`; range rejection at the default floor of 0
+    counts) pushes `group L: 90 % of the samples were rejected low — the
+    calibrated frames are mostly at or below zero; check the dark's gain and
+    offset` and logs `rejected_low_fraction`. The bar is more than sixteen times
+    the highest healthy total rejection in the acceptance runs (2.985 % mono,
+    2.733 % OSC at Auto 5.0/3.5, 2026-09-11).
 - **Not re-proposed / measured out.**
   - C-29 (LN background on a 4×4-binned plane) still applies: the tiles take a
     robust median of full-resolution pixels.
