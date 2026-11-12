@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -3215,7 +3216,7 @@ async fn cancel_epilogue(
         emitter,
         "sync-finished",
         &SyncFinishedEvent {
-            package_id,
+            package_id: package_id.clone(),
             direction: super::Direction::Received,
             outcome: "cancelled".to_string(),
             peer_device,
@@ -3225,7 +3226,32 @@ async fn cancel_epilogue(
             duplicate_count: 0,
         },
     );
+    sweep_returned_staging(&staging, &package_id).await;
     Ok(())
+}
+
+/// How often, and how many times, a cancelled package's staging folder is looked at again.
+const STAGING_RECHECK_INTERVAL: Duration = Duration::from_millis(200);
+const STAGING_RECHECKS: u32 = 3;
+
+/// A cancelled or revoked package's staging folder can come back: a file call of the dropped fetch that was
+/// already on the blocking pool finishes after the cleanup and recreates it. Looks again every
+/// `STAGING_RECHECK_INTERVAL`, up to `STAGING_RECHECKS` times, removing what came back, and stops at the first
+/// look that finds nothing. Warns when the folder is still there after the last removal.
+async fn sweep_returned_staging(staging: &Path, package_id: &str) {
+    for _ in 0..STAGING_RECHECKS {
+        tokio::time::sleep(STAGING_RECHECK_INTERVAL).await;
+        if !staging.exists() {
+            return;
+        }
+        tracing::debug!(package_id = %package_id, path = %staging.display(), "staging folder came back after cleanup");
+        if let Err(e) = std::fs::remove_dir_all(staging) {
+            tracing::debug!(error = %e, path = %staging.display(), "staging sweep removal failed");
+        }
+    }
+    if staging.exists() {
+        tracing::warn!(package_id = %package_id, path = %staging.display(), "staging folder still present after cleanup");
+    }
 }
 
 /// Basename of a forward-slash manifest `rel_path` (mirrors [`ingest::filename_of`]).
@@ -3505,7 +3531,7 @@ async fn handle_revoke(
         emitter,
         "sync-finished",
         &SyncFinishedEvent {
-            package_id: wire_id,
+            package_id: wire_id.clone(),
             direction: super::Direction::Received,
             outcome: row_state.as_str().to_string(),
             peer_device,
@@ -3515,6 +3541,7 @@ async fn handle_revoke(
             duplicate_count: 0,
         },
     );
+    sweep_returned_staging(&staging, &wire_id).await;
 }
 
 // ── App-lifecycle runtime holder ────────────────────────────────────────────
@@ -3763,6 +3790,41 @@ mod tests {
                 .unwrap()
                 .push((name.to_string(), payload));
         }
+    }
+
+    /// Row 19: a staging folder recreated by a file call of the dropped fetch
+    /// (already on the blocking pool when the cleanup ran) is removed again.
+    #[tokio::test]
+    async fn sweep_returned_staging_removes_a_folder_that_comes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging").join("wire-1");
+        let for_thread = staging.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::create_dir_all(&for_thread).unwrap();
+            std::fs::write(for_thread.join("late-file.bin"), b"late").unwrap();
+        });
+        sweep_returned_staging(&staging, "wire-1").await;
+        late.join().unwrap();
+        assert!(
+            !staging.exists(),
+            "the recreated staging folder must be gone when the sweep returns"
+        );
+    }
+
+    /// Row 19: nothing came back, so the sweep looks once and returns.
+    #[tokio::test]
+    async fn sweep_returned_staging_stops_at_the_first_empty_look() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging").join("wire-2");
+        let started = std::time::Instant::now();
+        sweep_returned_staging(&staging, "wire-2").await;
+        let took = started.elapsed();
+        assert!(!staging.exists());
+        assert!(
+            took >= STAGING_RECHECK_INTERVAL && took < STAGING_RECHECK_INTERVAL * 2,
+            "one interval and no more, took {took:?}"
+        );
     }
 
     /// C1 regression: an announce carrying a path-shaped `package_id` must be
