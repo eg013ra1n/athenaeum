@@ -12,7 +12,6 @@ use athenaeum_core::export::models::{
 };
 use athenaeum_core::fits_writer::OutputFormat;
 use axum::{extract::State, http::StatusCode, Json};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::events::SseProgressEmitter;
@@ -291,16 +290,9 @@ pub async fn cancel_export(
     State(state): State<WebAppState>,
     Json(args): Json<CancelExportArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let exports = state.ctx.active_exports.lock().unwrap();
-    if let Some(handle) = exports.get(&args.frame_set_id) {
-        handle.cancel_flag.store(true, Ordering::SeqCst);
-        Ok(Json(()))
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            format!("No active export for frame set {}", args.frame_set_id),
-        ))
-    }
+    athenaeum_core::api::export::cancel_export(&state.ctx, args.frame_set_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 #[cfg(test)]
