@@ -5179,6 +5179,16 @@ struct PublishPass<'a> {
     after_split: AfterSplit<'a>,
 }
 
+/// The hub link of one publish pass: credentials, client, node, and this
+/// device's own account in the project.
+struct PublishLink {
+    token: String,
+    client: CollabClient,
+    node: Arc<crate::sharing::iroh::node::SharedIrohNode>,
+    account_id: String,
+    display: String,
+}
+
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -5408,63 +5418,13 @@ async fn run_publish(
     }
 
     // ── 2. Hub, node, and my own identity in the project ─────────────────────
-    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
-        tracing::warn!(project_id, "publish refused: signed out");
-        return Err(ApiError::SignedOut(
-            "Sign in to publish to a project.".into(),
-        ));
-    };
-    let client = CollabClient::new(&hub_url).map_err(|e| {
-        tracing::error!(project_id, error = %e, "publish: hub client failed");
-        client_err(e)
-    })?;
-    let node = crate::api::sync::ensure_iroh_node(ctx).await.map_err(|e| {
-        tracing::error!(project_id, error = %e, "publish: iroh node unavailable");
-        e
-    })?;
-    // I3: nothing can be seeded without the collab store — refuse before any
-    // calibration, never regenerate every frame only to hold it back.
-    if crate::api::collab_exchange::ensure_collab_store(ctx)
-        .await
-        .is_none()
-    {
-        tracing::warn!(
-            project_id,
-            outcome = "collab_store_unmounted",
-            "publish refused: the collab store is not mounted"
-        );
-        return Err(ApiError::Conflict(COLLAB_STORE_UNMOUNTED.into()));
-    }
-    let dirs = crate::api::sync::sync_dirs(ctx).map_err(|e| {
-        tracing::error!(project_id, error = %e, "publish: sync dirs unavailable");
-        e
-    })?;
-    let own_node = DeviceKey::load_or_create(&device_key_path(&dirs.identity_dir))
-        .map_err(|e| {
-            tracing::error!(project_id, error = %format!("{e:#}"), "publish: device key unavailable");
-            ApiError::Internal(format!("device key: {e:#}"))
-        })?
-        .node_id();
-    let (account_id, display) = {
-        let members: Vec<SnapshotMember> = serde_json::from_str(&project.members_json)
-            .unwrap_or_else(|e| {
-                tracing::warn!(project_id, error = %e, "publish: members_json does not parse");
-                Vec::new()
-            });
-        match members
-            .iter()
-            .find(|m| member_node_ids(m).iter().any(|n| n == &own_node))
-        {
-            Some(m) => (m.account_id.clone(), m.display_name.clone()),
-            None => {
-                tracing::warn!(
-                    project_id,
-                    "publish: this device is not in the project snapshot; publishing under \"own\""
-                );
-                (String::new(), String::new())
-            }
-        }
-    };
+    let PublishLink {
+        token,
+        client,
+        node,
+        account_id,
+        display,
+    } = publish_link(&pass, &project).await?;
 
     // A6: one publishing device per (project, account). When the cached
     // binding names another device (in service — a revoked one reads as
@@ -7447,6 +7407,81 @@ async fn publish_generate(
             })??
     };
     Ok(outcome)
+}
+
+/// The hub, the node and this device's own identity in the project. Refusals
+/// come in a fixed order: signed out, client, node, store, dirs, key.
+async fn publish_link(
+    pass: &PublishPass<'_>,
+    project: &CollabProjectRow,
+) -> Result<PublishLink, ApiError> {
+    let PublishPass {
+        ctx, project_id, ..
+    } = *pass;
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        tracing::warn!(project_id, "publish refused: signed out");
+        return Err(ApiError::SignedOut(
+            "Sign in to publish to a project.".into(),
+        ));
+    };
+    let client = CollabClient::new(&hub_url).map_err(|e| {
+        tracing::error!(project_id, error = %e, "publish: hub client failed");
+        client_err(e)
+    })?;
+    let node = crate::api::sync::ensure_iroh_node(ctx).await.map_err(|e| {
+        tracing::error!(project_id, error = %e, "publish: iroh node unavailable");
+        e
+    })?;
+    // I3: nothing can be seeded without the collab store — refuse before any
+    // calibration, never regenerate every frame only to hold it back.
+    if crate::api::collab_exchange::ensure_collab_store(ctx)
+        .await
+        .is_none()
+    {
+        tracing::warn!(
+            project_id,
+            outcome = "collab_store_unmounted",
+            "publish refused: the collab store is not mounted"
+        );
+        return Err(ApiError::Conflict(COLLAB_STORE_UNMOUNTED.into()));
+    }
+    let dirs = crate::api::sync::sync_dirs(ctx).map_err(|e| {
+        tracing::error!(project_id, error = %e, "publish: sync dirs unavailable");
+        e
+    })?;
+    let own_node = DeviceKey::load_or_create(&device_key_path(&dirs.identity_dir))
+        .map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: device key unavailable");
+            ApiError::Internal(format!("device key: {e:#}"))
+        })?
+        .node_id();
+    let (account_id, display) = {
+        let members: Vec<SnapshotMember> = serde_json::from_str(&project.members_json)
+            .unwrap_or_else(|e| {
+                tracing::warn!(project_id, error = %e, "publish: members_json does not parse");
+                Vec::new()
+            });
+        match members
+            .iter()
+            .find(|m| member_node_ids(m).iter().any(|n| n == &own_node))
+        {
+            Some(m) => (m.account_id.clone(), m.display_name.clone()),
+            None => {
+                tracing::warn!(
+                    project_id,
+                    "publish: this device is not in the project snapshot; publishing under \"own\""
+                );
+                (String::new(), String::new())
+            }
+        }
+    };
+    Ok(PublishLink {
+        token,
+        client,
+        node,
+        account_id,
+        display,
+    })
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
