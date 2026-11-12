@@ -213,6 +213,7 @@ pub async fn get_files_with_frames_by_ids(
 // ── Browse directories (web-only) ──────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowseDirectoriesArgs {
     pub path: Option<String>,
     /// `"scan"` (default) and `"stacking"` both validate against
@@ -220,11 +221,18 @@ pub struct BrowseDirectoriesArgs {
     /// Transfers picker's roots verbatim (M1 Plan 5b, plan ruling 6);
     /// `"export"` validates against the configured export directory.
     pub scope: Option<String>,
+    /// File mode: also list the regular files of the folder.
+    #[serde(default)]
+    pub include_files: bool,
+    /// File mode: keep only these extensions (empty = all files).
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 /// POST /api/browse_directories
 ///
-/// Returns subdirectories of the given path. If path is empty or omitted,
+/// Returns subdirectories of the given path (and its files when
+/// `includeFiles` is set). If path is empty or omitted,
 /// returns the root entries for the requested scope.
 ///
 /// `scope = "scan"` (default) / `"stacking"`: validates against
@@ -258,7 +266,9 @@ pub async fn browse_directories(
         }
     };
 
-    api::browse_directories(args.path, &root_paths).map(Json).map_err(api_err)
+    api::browse_directories(args.path, &root_paths, args.include_files, &args.extensions)
+        .map(Json)
+        .map_err(api_err)
 }
 
 // ============================================================================
@@ -376,4 +386,28 @@ pub async fn rename_path(
     let policy = allowed_roots_policy(&state.allowed_paths);
     api::rename_path(&state.ctx, args.old_path, args.new_name, &policy).map_err(api_err)?;
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod args_serde_tests {
+    use super::*;
+
+    #[test]
+    fn browse_args_read_file_mode_fields() {
+        let args: BrowseDirectoriesArgs = serde_json::from_str(
+            r#"{"path":"/x","scope":"scan","includeFiles":true,"extensions":["fits"]}"#,
+        )
+        .expect("camelCase body should deserialize");
+        assert_eq!(args.path.as_deref(), Some("/x"));
+        assert_eq!(args.scope.as_deref(), Some("scan"));
+        assert!(args.include_files);
+        assert_eq!(args.extensions, ["fits"]);
+    }
+
+    #[test]
+    fn browse_args_default_to_folder_mode() {
+        let args: BrowseDirectoriesArgs = serde_json::from_str("{}").unwrap();
+        assert!(!args.include_files);
+        assert!(args.extensions.is_empty());
+    }
 }

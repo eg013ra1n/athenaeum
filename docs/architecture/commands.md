@@ -47,7 +47,8 @@ pub async fn get_my_setting(State(state): State<AppState>) -> impl IntoResponse 
 `crates/athenaeum-web/src/routes/parity_tests.rs` reads the desktop's `generate_handler![…]` list and the
 `.route("/api/…")` calls of `build_router` as text and fails when a command is registered in one host only. A
 route the web host has on purpose goes into the test's `WEB_ONLY` list with its reason (five today: `events`,
-`browse_directories`, `get_export_dir`, `get_cache_stats`, `stacking/master-preview`). A desktop-only command still
+`browse_directories`, `get_export_dir`, `get_cache_stats`, `stacking/master-preview`). `browse_directories` lists files as well when `includeFiles` is set (optional
+`extensions`, case-insensitive; dot-files and symlinks are skipped) and stays web-only. A desktop-only command still
 gets a route, one that answers "not available in web mode".
 
 The test compares names, not behaviour. What keeps behaviour the same is rule 1 above: one function in
@@ -74,7 +75,8 @@ three that stayed in the hosts for that reason moved: `set_blink_threads` (core 
 value as `Invalid` with the desktop's text, stores nothing then, and returns the permit count; each host rebuilds its
 own semaphore, and the web no longer clamps), `cancel_export` (one `NotFound("No active export for this frame set")`),
 `relocate_missing_file` (desktop passes `PathPolicy::AllowAll`; the web has a real route that checks the path against
-the allowed roots, canonicalized, before it asks whether the path exists). `monitor/orchestrator.rs`'s auto-merge pass
+the allowed roots, canonicalized, before it asks whether the path exists); the web's Locate picks that path through the folder browser's file mode,
+bounded by the same allowed roots. `monitor/orchestrator.rs`'s auto-merge pass
 is not a copy of `auto_merge_new_frames_for_set`: it walks every set, skips archived sets and sets without
 coordinates, is behind `AUTO_MERGE_ON_MONITOR_DETECT`, writes no audit row for a set with no candidates and logs
 and goes on where the command returns the error; only the `merge_candidates` call and the event are the same.
