@@ -1169,3 +1169,47 @@ fn prepare_uses_a_three_plane_replica_without_a_manifest_bayerpat_in_an_osc_grou
         }
     }
 }
+
+/// The file-identity write order (§4.2) at Prepare: a row is gone before the file it names is replaced. Run B
+/// (`debayer_osc` flipped, which moves the prepare hash) is cut short at its second frame; the later jobs already
+/// rewrote their `prepared/` files, so without the delete they would keep run A's row over them. The files of a mono
+/// light come out byte-equal whatever the flip, so this proves the delete order, not wrong pixels.
+#[test]
+fn a_cancelled_prepare_leaves_no_row_over_its_files() {
+    let rig = Pass1Rig::attested_16bit();
+    let frames: Vec<i64> = rig.plan_groups[0].frames.iter().map(|f| f.frame_id).collect();
+    assert_eq!(frames.len(), 4);
+    let cfg_a = StackingConfig::default();
+    rig.try_stage_one(&cfg_a).unwrap();
+    let rows_a = rig.rows(ArtifactKind::Calibrated);
+    assert_eq!(rows_a.len(), 4, "premise: run A prepared every frame");
+    for (frame_id, row) in &rows_a {
+        let path = Path::new(row.path.as_deref().unwrap());
+        assert!(path.starts_with(rig.layout.prepared_root()), "frame {frame_id}: {path:?}");
+    }
+
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.calibration.debayer_osc = !cfg_b.calibration.debayer_osc;
+    let res = rig.try_stage_one_with_job_cancelled(&cfg_b, rig.layout.prepared_root(), frames[1]);
+    assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+
+    let rows_b = rig.rows(ArtifactKind::Calibrated);
+    let first_b = rows_b.get(&frames[0]).expect("frame 1 was committed before the cancelled job");
+    assert_ne!(first_b.config_hash, rows_a[&frames[0]].config_hash, "frame 1 carries run B's hash");
+    for frame_id in &frames[1..] {
+        let old = &rows_a[frame_id];
+        assert!(Path::new(old.path.as_deref().unwrap()).is_file(), "frame {frame_id}'s file is still there");
+        assert!(
+            !rows_b.contains_key(frame_id),
+            "frame {frame_id} keeps a row over a file it may have been rewritten: {:?}",
+            rows_b.get(frame_id)
+        );
+    }
+
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&cfg_a));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs, "calibrate", "prepare"), 4, "{logs}");
+    for (frame_id, row) in rig.rows(ArtifactKind::Calibrated) {
+        assert_eq!(row.config_hash, rows_a[&frame_id].config_hash, "frame {frame_id} is back at A's hash");
+    }
+}

@@ -1056,6 +1056,38 @@ pub fn find_artifact(
         .optional()?)
 }
 
+/// The SQL of [`delete_artifact`], on the same six key expressions as [`find_artifact_sql`].
+const DELETE_ARTIFACT_SQL: &str = "DELETE FROM stacking_artifacts
+     WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
+       AND group_key = ?3 AND kind = ?4
+       AND COALESCE(frame_id, 0) = ?5 AND COALESCE(project_frame, 0) = ?6";
+
+/// Delete the one artifact row [`find_artifact`] would return for the same arguments (a point delete on the unique
+/// key, `kind.group_key(group_key)` included). Returns whether a row went. A writer that is about to replace a
+/// frame-level file calls this BEFORE it writes, so a cancelled or killed run leaves no row over another config's
+/// file; a failed delete stops the job (`?`), it is never a warning followed by the write.
+pub fn delete_artifact(
+    conn: &Connection,
+    subject: &StackSubject,
+    group_key: &str,
+    kind: ArtifactKind,
+    frame_id: Option<i64>,
+) -> Result<bool> {
+    let (fid, pf) = subject.frame_columns(frame_id);
+    let n = conn.execute(
+        DELETE_ARTIFACT_SQL,
+        params![
+            subject.frame_set_id().unwrap_or(0),
+            subject.project_id().unwrap_or(""),
+            kind.group_key(group_key),
+            kind.as_db_str(),
+            fid.unwrap_or(0),
+            pf.unwrap_or(0),
+        ],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn list_artifacts(
     conn: &Connection,
     subject: &StackSubject,
@@ -2380,6 +2412,68 @@ mod tests {
         .unwrap()
         .expect("the legacy row is found through the new key");
         assert_eq!((row.id, row.config_hash.as_str()), (legacy_id, "c1"));
+    }
+
+    #[test]
+    fn delete_artifact_is_a_point_delete_on_the_artifacts_key() {
+        let c = conn();
+        let set_a = seed_set(&c);
+        c.execute("INSERT INTO frames_set (id, name) VALUES (8, 'M 31')", []).unwrap();
+        seed_frame(&c, 1);
+        seed_frame(&c, 2);
+        let a = StackSubject::FrameSet(set_a);
+        let b = StackSubject::FrameSet(8);
+        let put = |subject: &StackSubject, kind: ArtifactKind, group_key: &str, frame_id: Option<i64>| {
+            upsert_artifact(
+                &c,
+                &NewArtifact {
+                    subject,
+                    frame_id,
+                    group_key,
+                    kind,
+                    path: Some("/p"),
+                    config_hash: "h",
+                    size: Some(1),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        };
+        let has = |subject: &StackSubject, kind: ArtifactKind, frame_id: Option<i64>| {
+            find_artifact(&c, subject, "g", kind, frame_id).unwrap().is_some()
+        };
+        for subject in [&a, &b] {
+            for frame in [1, 2] {
+                put(subject, ArtifactKind::Calibrated, "g", Some(frame));
+            }
+        }
+        put(&a, ArtifactKind::Ln, "g", Some(1));
+
+        // A frame-level kind is keyed on the frame whatever group key comes with it.
+        assert!(delete_artifact(&c, &a, "any_key", ArtifactKind::Calibrated, Some(1)).unwrap());
+        assert!(!has(&a, ArtifactKind::Calibrated, Some(1)));
+        assert!(has(&a, ArtifactKind::Calibrated, Some(2)), "another frame is untouched");
+        assert!(has(&b, ArtifactKind::Calibrated, Some(1)), "another subject is untouched");
+        assert!(has(&a, ArtifactKind::Ln, Some(1)), "another kind is untouched");
+        assert!(!delete_artifact(&c, &a, "any_key", ArtifactKind::Calibrated, Some(1)).unwrap());
+
+        // A group-level kind goes only under its own group key.
+        assert!(!delete_artifact(&c, &a, "other", ArtifactKind::Ln, Some(1)).unwrap());
+        assert!(has(&a, ArtifactKind::Ln, Some(1)));
+        assert!(delete_artifact(&c, &a, "g", ArtifactKind::Ln, Some(1)).unwrap());
+        assert!(!has(&a, ArtifactKind::Ln, Some(1)));
+    }
+
+    #[test]
+    fn delete_artifact_is_a_search_on_the_artifacts_key() {
+        let c = conn();
+        let plan = plan_details(&c, DELETE_ARTIFACT_SQL, &[&7_i64, &"", &"g", &"calibrated", &5_i64, &0_i64]);
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH") && d.contains("stacking_artifacts_subject_key")),
+            "{plan:?}"
+        );
     }
 
     #[test]

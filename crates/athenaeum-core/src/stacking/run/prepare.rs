@@ -244,6 +244,35 @@ fn resolve_prepare_job(
                     ..
                 }
         );
+    // The write order (a row is gone before the file it names is replaced): a cancelled or killed run then leaves no
+    // row of this hash over another config's file. `Reused` and `Excluded` returned above and delete nothing. The
+    // mosaic row goes too when the run keeps a mosaic or its file is one this job overwrites.
+    {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::stacking::delete_artifact(
+            &conn,
+            &rc.subject,
+            &group.key,
+            ArtifactKind::Calibrated,
+            Some(frame.frame_id),
+        )?;
+        let mosaic_names_output = mosaic_row
+            .as_ref()
+            .and_then(|row| row.path.as_deref())
+            .is_some_and(|path| {
+                let path = Path::new(path);
+                path == converted_out.as_path() || path == debayered_out.as_path()
+            });
+        if keep_mosaic || mosaic_names_output {
+            crate::db::stacking::delete_artifact(
+                &conn,
+                &rc.subject,
+                &group.key,
+                ArtifactKind::CalibratedMosaic,
+                Some(frame.frame_id),
+            )?;
+        }
+    }
     Ok(PrepareResolved::Job(Box::new(PrepareRunJob {
         frame_id: frame.frame_id,
         group_key: group.key.clone(),
@@ -525,6 +554,12 @@ pub(super) fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
             FanOutLabel::new(rc, Stage::Calibrate, Some(&group.key), "prepare"),
             cancel_ref,
             move |job: &PrepareRunJob| {
+                if stage_one_job_cancelled(&job.job.converted_out, job.frame_id)
+                    || stage_one_job_cancelled(&job.job.debayered_out, job.frame_id)
+                {
+                    ticker_ref.tick(Some(job.frame_id));
+                    return Err(CANCELLED_MARKER.to_string());
+                }
                 let out = detach_zip_source(job)
                     .and_then(|prepared_job| {
                         crate::stacking::prepare::execute_prepare(

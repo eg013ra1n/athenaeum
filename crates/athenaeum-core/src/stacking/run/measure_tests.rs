@@ -814,6 +814,70 @@ fn measure_pass1_artifact_survives_a_touched_source() {
     assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
 }
 
+/// The write order of a first pass (file-identity §4.2): the `measured` row of a member left owed is deleted BEFORE
+/// pass 1 replaces its file. Run B (another first-pass key) is cancelled after its first first pass, so the files
+/// of the frames it never reached are untouched, but a frame it did reach was rewritten: no row of run A's key is
+/// left anywhere, every row is B's or absent.
+#[test]
+fn a_cancelled_first_pass_leaves_no_row_of_the_old_key() {
+    let mut rig = Pass1Rig::new();
+    rig.run("run A", None);
+    let rows_a = rig.rows(ArtifactKind::Measured);
+    assert_eq!(rows_a.len(), 4, "premise: run A wrote every first pass");
+    let keys_a: Vec<String> = rows_a.values().map(|r| r.config_hash.clone()).collect();
+
+    rig.cfg.measurement.max_stars += 1;
+    let res = rig.try_run(None, Some(1));
+    assert!(matches!(res, Err(RunError::Cancelled)), "{:?}", res.map(|o| o.beta));
+    let rows_b = rig.rows(ArtifactKind::Measured);
+    for (frame_id, row) in &rows_b {
+        assert!(
+            !keys_a.contains(&row.config_hash),
+            "frame {frame_id}: a row of run A's key is left over a file run B may have rewritten"
+        );
+    }
+    assert!(
+        rows_b.len() < rows_a.len(),
+        "premise: the frames run B never reached lost their row: {} rows",
+        rows_b.len()
+    );
+}
+
+/// The write order of the `.athf` (file-identity §4.2, ruling C-30 as amended): a failed write leaves no row for
+/// that plane (the delete came first), where it used to leave the old run's row in place. Run 2 is at another
+/// measurement hash; one frame's `.athf` path is a directory, so its write fails and only that frame loses its row.
+#[test]
+fn a_failed_fits_write_leaves_no_row() {
+    let mut rig = Pass1Rig::new();
+    rig.run("run 1", None);
+    let rows = rig.rows(ArtifactKind::Fits(0));
+    assert_eq!(rows.len(), 4, "premise: run 1 wrote every .athf");
+    let victim_id = *rows.keys().min().unwrap();
+    let victim_path = PathBuf::from(rows[&victim_id].path.clone().unwrap());
+    std::fs::remove_file(&victim_path).unwrap();
+    std::fs::create_dir(&victim_path).unwrap();
+
+    let failures_before = FITS_WRITE_FAILURE_LOG.lock().unwrap().len();
+    rig.cfg.measurement.max_stars += 1;
+    rig.run("run 2", None);
+    let failures: Vec<PathBuf> = FITS_WRITE_FAILURE_LOG.lock().unwrap()[failures_before..]
+        .iter()
+        .filter(|p| p.starts_with(victim_path.parent().unwrap()))
+        .cloned()
+        .collect();
+    assert_eq!(failures, vec![victim_path.clone()], "the write of the planted collision failed");
+
+    let rows_after = rig.rows(ArtifactKind::Fits(0));
+    assert!(!rows_after.contains_key(&victim_id), "the failed write left a row: {rows_after:?}");
+    assert_eq!(rows_after.len(), 3, "the other frames wrote theirs: {rows_after:?}");
+    for (frame_id, row) in &rows_after {
+        assert_ne!(
+            row.config_hash, rows[frame_id].config_hash,
+            "premise: frame {frame_id} was re-measured at the new hash"
+        );
+    }
+}
+
 /// Ruling R12 (a): a file Athenaeum never rewrites (an attested light used in place) keeps its modification time in
 /// the first pass's stamp. A same-size pixel edit by someone else (a new mtime, the catalog row refreshed as a
 /// rescan does) makes THAT frame's first pass stale; it re-runs, the others do not, nothing is excluded. Without
@@ -1915,10 +1979,10 @@ fn a_fits_artifact_write_failure_degrades_to_detection() {
     .unwrap();
     assert_eq!(metrics_after.len(), 4, "{metrics_after:?}");
 
-    // No row was written for a file that is not on disk: the victim's
-    // row is the ONE left over from run 1, and it reads STALE (the
-    // recorded size does not match what is at that path now), which is
-    // exactly the `resolve_register_fits` gate — a frame with no fresh
+    // No row was written for a file that is not on disk, and none is
+    // left: the write order deletes a plane's row BEFORE it writes
+    // (file-identity §4.2), so the victim has no `fits.0` row at all, which
+    // is exactly the `resolve_register_fits` gate — a frame with no fresh
     // `fits.0` registers through `detect_frame_stars`'s detection arm,
     // `star_source = "detected"`. Its three siblings stay `"fits"`.
     let fits_after = crate::db::stacking::list_artifacts(
@@ -1929,8 +1993,12 @@ fn a_fits_artifact_write_failure_degrades_to_detection() {
     .unwrap();
     assert_eq!(
         fits_after.len(),
-        4,
-        "the skipped write leaves run 1's row in place, it does not add one: {fits_after:?}"
+        3,
+        "the failed write leaves no row for the victim: {fits_after:?}"
+    );
+    assert!(
+        fits_after.iter().all(|row| row.frame_id != Some(victim_id)),
+        "{fits_after:?}"
     );
     let plan_after = build_plan(
         &fixture.conn,

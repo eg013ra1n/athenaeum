@@ -1173,6 +1173,10 @@ struct MeasureMember {
     /// A fresh artifact row exists but its head is not validated yet: the member's own β came from its `metrics`
     /// row, so the artifact is only validated once the member is known to need pass 2 (R11c-5 (3)).
     spill_pending: bool,
+    /// The frame's `measured` row as it stood when the step-0 reads ran (read always, also under `force_fresh`). It is
+    /// deleted before pass 1 replaces its file unless it is fresh and kept, and handed to [`upsert_pass1_row`] so the
+    /// write retires a legacy file the row named.
+    old_measured: Option<crate::db::stacking::StackingArtifactRow>,
 }
 /// The artifact's head validated against the calibrated file now: usable, or `None` after the log line that says
 /// why (stale before use `debug!`, any other refusal `warn!`).
@@ -1333,27 +1337,35 @@ fn measure_two_pass_prepare(
             own: None,
             source: Pass1Source::Owed,
             spill_pending: false,
+            old_measured: None,
         };
-        if !force_fresh {
-            let (existing, spilled) = {
-                let conn = db(&rc.ctx)?.conn();
-                (
+        // The `measured` row is read for every member, `force_fresh` included: a member left owed deletes it before
+        // pass 1 replaces its file, whatever the reason it is owed.
+        let (existing, spilled) = {
+            let conn = db(&rc.ctx)?.conn();
+            (
+                if force_fresh {
+                    None
+                } else {
                     crate::db::stacking::find_artifact(
                         &conn,
                         &rc.subject,
                         &group.key,
                         ArtifactKind::Metrics,
                         Some(member.frame.frame_id),
-                    )?,
-                    crate::db::stacking::find_artifact(
-                        &conn,
-                        &rc.subject,
-                        &group.key,
-                        ArtifactKind::Measured,
-                        Some(member.frame.frame_id),
-                    )?,
-                )
-            };
+                    )?
+                },
+                crate::db::stacking::find_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group.key,
+                    ArtifactKind::Measured,
+                    Some(member.frame.frame_id),
+                )?,
+            )
+        };
+        member.old_measured = spilled.clone();
+        if !force_fresh {
             if let Some(payload) = existing.as_ref().and_then(|row| row.payload_json.as_ref()) {
                 match serde_json::from_str::<FrameMeasurement>(payload) {
                     Ok(m) => {
@@ -1415,6 +1427,25 @@ fn measure_two_pass_prepare(
     let need_pass1: Vec<usize> = (0..members.len())
         .filter(|&i| members[i].own.is_none())
         .collect();
+    // The write order (a row is gone before the file it names is replaced): a member left owed without a fresh
+    // artifact row will run pass 1 and rewrite its `measured` file, so a cancelled or killed run must not leave the
+    // old row over it. That is every member of `need_pass1`, and a member whose own β came from its `metrics` row
+    // while its `measured` row is not fresh at its key (it is not in `need_pass1`, but needs pass 2 -> pass 1 writes
+    // the file under `layout_spill`, under another key than the row's). A `spill_pending` member keeps its fresh row.
+    {
+        let conn = db(&rc.ctx)?.conn();
+        for member in &members {
+            if member.source == Pass1Source::Owed && !member.spill_pending && member.old_measured.is_some() {
+                crate::db::stacking::delete_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group.key,
+                    ArtifactKind::Measured,
+                    Some(member.frame.frame_id),
+                )?;
+            }
+        }
+    }
     Ok(TwoPassState {
         members,
         need_pass1,
@@ -1518,6 +1549,7 @@ fn upsert_pass1_rows(
                 &state.members[i].frame,
                 &state.members[i].layout_spill,
                 &state.members[i].pass1_key,
+                state.members[i].old_measured.as_ref(),
             )?;
         }
     }
@@ -1795,6 +1827,7 @@ fn measure_two_pass_rest(
                 &members[i].frame,
                 &members[i].layout_spill,
                 &members[i].pass1_key,
+                members[i].old_measured.as_ref(),
             )?;
         }
     }
@@ -1824,23 +1857,19 @@ fn measure_two_pass_rest(
 
 /// A frame's first-pass artifact row, upserted right after its file was written (Plan A Task 11c, R11c-5: a cancelled
 /// run's re-run reuses it). The identity recorded is the file's own, as `fits.<plane>`'s is.
+///
+/// `old` is the row the step-0 reads found before the write (deleted before the file was replaced, unless it was
+/// fresh and kept): its file goes once nothing points to it (a frame whose stem or folder changed since the old row
+/// was written; a legacy `measured/<key>/` file).
 fn upsert_pass1_row(
     rc: &RunContext,
     frame: &GroupFrame,
     spill: &Path,
     key: &str,
+    old: Option<&crate::db::stacking::StackingArtifactRow>,
 ) -> Result<(), RunError> {
     let (size, modified_at) = file_identity(spill)?;
     let conn = db(&rc.ctx)?.conn();
-    // The row this write replaces, read BEFORE the upsert: its file goes once nothing points to it (a frame whose
-    // stem or folder changed since the old row was written).
-    let old = crate::db::stacking::find_artifact(
-        &conn,
-        &rc.subject,
-        "",
-        ArtifactKind::Measured,
-        Some(frame.frame_id),
-    )?;
     upsert_artifact(
         &conn,
         &NewArtifact {
@@ -1855,7 +1884,7 @@ fn upsert_pass1_row(
             payload_json: None,
         },
     )?;
-    replace_frame_level_file(&conn, &rc.layout.measured_root(), old.as_ref(), spill);
+    replace_frame_level_file(&conn, &rc.layout.measured_root(), old, spill);
     Ok(())
 }
 
@@ -1934,14 +1963,29 @@ fn persist_measurement(
         // `RejBitmapSet`) and the LN sidecar's per-frame
         // exclusion: loud, never silent, never fatal.
         //
-        // The plane's `stacking_artifacts` row is SKIPPED
-        // — never a row for a file that is not on disk.
-        // An EXISTING row from an earlier run is left
-        // alone on purpose: if the old file is still
-        // there and valid (a transient rename failure),
-        // it stays reusable; if it is gone or wrong,
-        // `is_fresh`'s own size-on-disk check reports it
-        // stale, which is exactly the fallback above.
+        // The write order: the plane's row is deleted BEFORE the file is replaced, and upserted after, so a failed
+        // write leaves no row — never a row of the old key over a file another config wrote, and never a row for a
+        // file that is not on disk. A consumer falls back as it does for a missing row.
+        let kind = ArtifactKind::Fits(plane);
+        // The row this write replaces, read BEFORE the delete (see `replace_frame_level_file`).
+        let old = {
+            let conn = db(&rc.ctx)?.conn();
+            let old = crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group.key,
+                kind,
+                Some(frame.frame_id),
+            )?;
+            crate::db::stacking::delete_artifact(
+                &conn,
+                &rc.subject,
+                &group.key,
+                kind,
+                Some(frame.frame_id),
+            )?;
+            old
+        };
         let timed = tracing::enabled!(tracing::Level::DEBUG);
         let (write_t, write_cpu0) = (
             std::time::Instant::now(),
@@ -1985,16 +2029,7 @@ fn persist_measurement(
             continue;
         }
         let (size, modified_at) = file_identity(&fits_path)?;
-        let kind = ArtifactKind::Fits(plane);
         let conn = db(&rc.ctx)?.conn();
-        // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
-        let old = crate::db::stacking::find_artifact(
-            &conn,
-            &rc.subject,
-            &group.key,
-            kind,
-            Some(frame.frame_id),
-        )?;
         upsert_artifact(
             &conn,
             &NewArtifact {
