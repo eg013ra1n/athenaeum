@@ -67,11 +67,24 @@ pub struct BrowseDirectoryEntry {
     pub path: String,
 }
 
+/// A file row of the folder browser's file mode.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowseFileEntry {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowseDirectoriesResponse {
     pub current: String,
     pub parent: Option<String>,
     pub directories: Vec<BrowseDirectoryEntry>,
+    /// Present only when the caller asked for files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<BrowseFileEntry>>,
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -1014,9 +1027,18 @@ fn zip_catalog_err(e: anyhow::Error) -> ApiError {
 /// `ServiceContext` equivalent (mirrors how `set_scan_root_monitor_enabled`
 /// in Task 9 took an extra non-`ServiceContext` param for state that lives
 /// alongside, not inside, the shared context).
+///
+/// With `include_files` the answer also carries the regular files of the
+/// folder (`files`, sorted by name): dot-files and symlinks are not listed,
+/// and a non-empty `extensions` keeps only names with one of those extensions
+/// (case-insensitive, a leading `.` in a filter entry is ignored). The
+/// sandbox is the same as for folders. The root listing has no files.
+/// Without the flag the answer is exactly what it always was.
 pub fn browse_directories(
     path: Option<String>,
     root_paths: &[PathBuf],
+    include_files: bool,
+    extensions: &[String],
 ) -> Result<BrowseDirectoriesResponse, ApiError> {
     let path_str = path.unwrap_or_default();
 
@@ -1041,6 +1063,7 @@ pub fn browse_directories(
             current: "/".to_string(),
             parent: None,
             directories,
+            files: include_files.then(Vec::new),
         });
     }
 
@@ -1072,6 +1095,7 @@ pub fn browse_directories(
     }
 
     let mut directories = Vec::new();
+    let mut files = Vec::new();
     let entries = std::fs::read_dir(&canonical)
         .map_err(|e| ApiError::Internal(format!("Failed to read directory: {}", e)))?;
 
@@ -1086,9 +1110,31 @@ pub fn browse_directories(
                 name: entry.file_name().to_string_lossy().to_string(),
                 path: entry_path.to_string_lossy().to_string(),
             });
+        } else if include_files && metadata.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let wanted = extensions.is_empty()
+                || std::path::Path::new(&name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        extensions
+                            .iter()
+                            .any(|f| ext.eq_ignore_ascii_case(f.trim_start_matches('.')))
+                    });
+            if wanted {
+                files.push(BrowseFileEntry {
+                    name,
+                    path: entry.path().to_string_lossy().to_string(),
+                    size: metadata.len(),
+                });
+            }
         }
     }
     directories.sort_by(|a, b| a.name.cmp(&b.name));
+    files.sort_by(|a, b| a.name.cmp(&b.name));
 
     let parent = canonical.parent().and_then(|p| {
         let parent_str = p.to_string_lossy().to_string();
@@ -1111,7 +1157,139 @@ pub fn browse_directories(
         current: canonical.to_string_lossy().to_string(),
         parent,
         directories,
+        files: include_files.then_some(files),
     })
+}
+
+#[cfg(test)]
+mod browse_directories_tests {
+    use super::*;
+
+    fn names(v: &[BrowseDirectoryEntry]) -> Vec<&str> {
+        v.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    fn file_names(r: &BrowseDirectoriesResponse) -> Vec<&str> {
+        r.files
+            .as_ref()
+            .expect("files requested")
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+
+    fn browse(root: &std::path::Path, files: bool, ext: &[&str]) -> BrowseDirectoriesResponse {
+        let ext: Vec<String> = ext.iter().map(|s| s.to_string()).collect();
+        browse_directories(
+            Some(root.to_string_lossy().to_string()),
+            &[root.to_path_buf()],
+            files,
+            &ext,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn without_the_flag_the_answer_is_todays() {
+        let (_dir, root) = crate::test_support::canonical_tempdir();
+        std::fs::create_dir(root.join("b")).unwrap();
+        std::fs::create_dir(root.join("A")).unwrap();
+        std::fs::write(root.join("x.fits"), b"x").unwrap();
+        let r = browse(&root, false, &["fits"]);
+        assert_eq!(names(&r.directories), ["A", "b"]);
+        assert!(r.files.is_none());
+        let v = serde_json::to_value(&r).unwrap();
+        let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["current", "directories", "parent"]);
+    }
+
+    #[test]
+    fn files_are_listed_only_when_asked() {
+        let (_dir, root) = crate::test_support::canonical_tempdir();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("b.fits"), b"abc").unwrap();
+        std::fs::write(root.join("a.fits"), b"").unwrap();
+        let r = browse(&root, true, &[]);
+        assert_eq!(names(&r.directories), ["sub"]);
+        assert_eq!(file_names(&r), ["a.fits", "b.fits"]);
+        let files = r.files.as_ref().unwrap();
+        assert_eq!(files[1].size, 3);
+        assert_eq!(
+            files[1].path,
+            root.join("b.fits").to_string_lossy().to_string()
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["files"][1]["name"], "b.fits");
+        assert_eq!(v["files"][1]["size"], 3);
+    }
+
+    #[test]
+    fn extension_filter_ignores_case_and_empty_means_all() {
+        let (_dir, root) = crate::test_support::canonical_tempdir();
+        for n in ["M31.FITS", "a.fit", "b.xisf", "notes.txt", "noext"] {
+            std::fs::write(root.join(n), b"x").unwrap();
+        }
+        let r = browse(&root, true, &["fits", ".fit", "xisf"]);
+        assert_eq!(file_names(&r), ["M31.FITS", "a.fit", "b.xisf"]);
+        let r = browse(&root, true, &[]);
+        assert_eq!(r.files.unwrap().len(), 5);
+    }
+
+    #[test]
+    fn dot_files_are_not_listed() {
+        let (_dir, root) = crate::test_support::canonical_tempdir();
+        std::fs::write(root.join("._M31.fits"), b"x").unwrap();
+        std::fs::write(root.join("M31.fits"), b"x").unwrap();
+        let r = browse(&root, true, &["fits"]);
+        assert_eq!(file_names(&r), ["M31.fits"]);
+    }
+
+    #[test]
+    fn root_listing_has_roots_and_no_files() {
+        let (_dir, root) = crate::test_support::canonical_tempdir();
+        std::fs::write(root.join("x.fits"), b"x").unwrap();
+        let r = browse_directories(None, &[root.clone()], true, &[]).unwrap();
+        assert_eq!(r.current, "/");
+        assert_eq!(r.directories.len(), 1);
+        assert_eq!(r.files.as_deref().map(<[_]>::len), Some(0));
+        let r = browse_directories(None, &[root], false, &[]).unwrap();
+        assert!(r.files.is_none());
+    }
+
+    #[test]
+    fn file_mode_keeps_the_sandbox() {
+        let (_dir, root) = crate::test_support::canonical_tempdir();
+        let (_other, outside) = crate::test_support::canonical_tempdir();
+        std::fs::write(root.join("x.fits"), b"x").unwrap();
+        let roots = [root.clone()];
+        let err = browse_directories(
+            Some(outside.to_string_lossy().to_string()),
+            &roots,
+            true,
+            &[],
+        );
+        assert!(matches!(err, Err(ApiError::Forbidden(_))));
+        let err = browse_directories(
+            Some(root.join("x.fits").to_string_lossy().to_string()),
+            &roots,
+            true,
+            &[],
+        );
+        assert!(matches!(err, Err(ApiError::Invalid(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_is_not_listed() {
+        let (_dir, root) = crate::test_support::canonical_tempdir();
+        let (_other, outside) = crate::test_support::canonical_tempdir();
+        std::fs::write(outside.join("real.fits"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("real.fits"), root.join("link.fits")).unwrap();
+        std::fs::write(root.join("own.fits"), b"x").unwrap();
+        let r = browse(&root, true, &["fits"]);
+        assert_eq!(file_names(&r), ["own.fits"]);
+    }
 }
 
 #[cfg(test)]
