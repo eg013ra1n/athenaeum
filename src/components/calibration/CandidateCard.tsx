@@ -1,6 +1,6 @@
 import { Check, Layers } from 'lucide-react';
 import type { CalibrationSetWithScore, ParameterVerdict } from '../../types/models';
-import { blockersOf, describeDifference, formatSeconds, geometryLabel, geometryRefuses, geometryWarns } from './pickerModel';
+import { blockersOf, describeDifference, formatSeconds, geometryLabel, geometryRefuses, geometryWarns, levelBadge } from './pickerModel';
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const day = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -76,6 +76,9 @@ export function CandidateCard({
     ...blockersOf(parameters),
     ...(originVerdict ? [originVerdict] : []),
   ];
+  // A dark, bias or dark flat at another or unknown gain / offset: allowed by
+  // hand, never blocked — badged from the values, whatever the config says.
+  const levelWarning = levelBadge(candidate);
   const percent = Math.round(match_score * 100);
 
   return (
@@ -111,6 +114,14 @@ export function CandidateCard({
               title="Same frame size, another sub-frame origin — never linked automatically; allowed by hand"
             >
               Another sub-frame origin
+            </span>
+          )}
+          {levelWarning && (
+            <span
+              className="rounded bg-warning-muted px-1.5 py-0.5 text-xs font-medium text-warning"
+              title="The pedestal this set subtracts may not match the lights' — allowed by hand"
+            >
+              {levelWarning}
             </span>
           )}
           {isCurrent && (

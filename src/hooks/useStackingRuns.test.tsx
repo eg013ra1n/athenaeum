@@ -116,6 +116,43 @@ describe('useStackingRuns', () => {
     expect(note.detail).toBe('L_master.xisf, R_master.xisf');
   });
 
+  it('a run that lost groups says so in the title, turns to a warning and names the group keys', async () => {
+    const { handlers } = await mount();
+
+    act(() => handlers['stacking-complete']({
+      ...complete(null, 'p1'),
+      masters: [{ path: '/work/p1/R_master.xisf', drizzlePath: null }],
+      groupsWithoutMaster: ['L', 'G', 'B'],
+    }));
+    const note = notifyMock.mock.calls[0][0];
+    expect(note.title).toBe('Stacking finished — 1 master(s) · 3 groups without a master');
+    expect(note.tone).toBe('warning');
+    expect(note.detail).toBe('Without a master: L, G, B · R_master.xisf');
+
+    act(() => handlers['stacking-complete']({
+      ...complete(null, 'p2', 2),
+      groupsWithoutMaster: ['L'],
+    }));
+    const one = notifyMock.mock.calls[1][0];
+    expect(one.title).toBe('Stacking finished — 0 master(s) · 1 group without a master');
+    expect(one.detail).toBe('Without a master: L');
+  });
+
+  it('a run with every group mastered, or an event without the field, notifies as before', async () => {
+    const { handlers } = await mount();
+    const masters = [{ path: '/work/p1/L_master.xisf', drizzlePath: null }];
+
+    act(() => handlers['stacking-complete']({ ...complete(null, 'p1'), masters, groupsWithoutMaster: [] }));
+    // an older backend: the field is not on the wire at all
+    act(() => handlers['stacking-complete']({ ...complete(null, 'p2', 2), masters }));
+    for (const [note] of notifyMock.mock.calls) {
+      expect(note.title).toBe('Stacking finished — 1 master(s)');
+      expect(note.tone).toBe('success');
+      expect(note.detail).toBe('L_master.xisf');
+    }
+    expect(notifyMock).toHaveBeenCalledTimes(2);
+  });
+
   it('ignores and logs an event that carries neither a set nor a project, or both', async () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     const { result, handlers } = await mount();

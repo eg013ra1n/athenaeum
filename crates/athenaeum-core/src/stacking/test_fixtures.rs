@@ -370,7 +370,20 @@ pub(crate) fn add_master_dark_and_flat(
     width: usize,
     height: usize,
 ) -> (i64, i64) {
-    let dark_set = seed_registered_master(f, "Dark", "MasterDark", width, height, 100.0, None);
+    add_master_dark_and_flat_valued(f, light_frame_ids, width, height, 100.0)
+}
+
+/// [`add_master_dark_and_flat`] with the master dark's constant value chosen by the caller (the standard one is
+/// 100 ADU against the lights' 500 ADU background; a dark guard test wants one brighter than the lights).
+pub(crate) fn add_master_dark_and_flat_valued(
+    f: &Fixture,
+    light_frame_ids: &[i64],
+    width: usize,
+    height: usize,
+    dark_value: f32,
+) -> (i64, i64) {
+    let dark_set =
+        seed_registered_master(f, "Dark", "MasterDark", width, height, dark_value, None);
     let flat_set = seed_registered_master(f, "Flat", "MasterFlat", width, height, 0.5, Some(0.5));
     for &frame_id in light_frame_ids {
         link_calibration(&f.conn, frame_id, dark_set, "Dark");

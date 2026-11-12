@@ -11,6 +11,93 @@ use crate::stacking::test_fixtures::{
     wait_for_run_within, LightSpec, STAR_FIELD_HEIGHT, STAR_FIELD_WIDTH,
 };
 
+/// A `GroupStats` with only the low-rejection fraction set (every other field empty).
+fn stats_with_low_rejection(low: f64) -> GroupStats {
+    let mut stats: GroupStats = serde_json::from_value(serde_json::json!({
+        "frames": 3, "included": 3, "droppedBelowMinWeight": 0, "recipe": "test",
+        "rejectedLowFraction": 0.0, "rejectedHighFraction": 0.0, "rejectedFractionPerFrame": [],
+        "masterNoise": [], "masterLocation": [], "masterScale": [], "bestSubNoise": [],
+        "masterPsfSnr": [], "bestSubPsfSnr": [], "snrGain": [], "masterFwhmPx": [],
+        "masterEccentricity": [], "weightedExposureS": 0.0, "totalExposureS": 0.0,
+        "readMs": 0, "combineMs": 0, "bytesRead": 0, "lnFrames": 0
+    }))
+    .unwrap();
+    stats.rejected_low_fraction = low;
+    stats
+}
+
+/// The dark guard's master half: below the 0.75 bar (healthy stacks reject at most about 3 %, a narrowband OSC
+/// master about 40 %) nothing is said; at and above it the sentence names the group and the percentage.
+#[test]
+fn low_rejection_sentence_fires_at_three_quarters_and_names_the_group() {
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.03)), None);
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.5)), None);
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.74)), None);
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(f64::NAN)), None);
+    let bar = low_rejection_sentence("L", &stats_with_low_rejection(0.75)).unwrap();
+    assert!(bar.starts_with("group L: 75 % of the samples were rejected low"), "{bar}");
+    assert_eq!(
+        low_rejection_sentence("L", &stats_with_low_rejection(0.9)).unwrap(),
+        "group L: 90 % of the samples were rejected low \u{2014} the calibrated frames are mostly at or below zero; check the dark's gain and offset"
+    );
+}
+
+/// A group already skipped at Measure ("fewer than 3 included frames") has that line once: Output's own skip for
+/// the same reason does not repeat it, a different reason adds its own line, and the row keeps the reason in `error`.
+#[test]
+fn a_skip_line_is_pushed_once_per_reason() {
+    use crate::stacking::config::StackingConfig;
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("catalog.db");
+    let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+    let (fixture, _light_ids, working, output) =
+        seed_star_group(&db_path, "skip-once", &[(0.0, 0.0), (3.0, 0.0)], &[4.0f32; 2]);
+    let cfg = StackingConfig::default();
+    let layout = WorkingLayout::new(working.path(), &set_slug("skip-once"));
+    let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+    let group_key = plan_groups[0].key.clone();
+    let (run_id, group_ids) = seed_run_and_groups(
+        &fixture.conn,
+        fixture.set_id,
+        &plan_groups,
+        working.path(),
+        output.path(),
+    );
+    let mut rc = test_context(
+        ctx,
+        Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+        run_id,
+        fixture.set_id,
+        "skip-once",
+        cfg,
+        plan_groups.clone(),
+        layout,
+        output.path().to_path_buf(),
+        group_ids,
+    );
+
+    // Measure's own line, as `measure.rs` pushes it.
+    let measure_line = format!("group {group_key} skipped: fewer than 3 included frames");
+    rc.warnings.push(measure_line.clone());
+    skip_group(&mut rc, &plan_groups[0], 2, "fewer than 3 included frames").unwrap();
+    assert_eq!(rc.warnings, vec![measure_line.clone()], "the same line is not repeated");
+
+    skip_group(&mut rc, &plan_groups[0], 1, "1 of 2 frames registered; at least 3 are needed").unwrap();
+    assert_eq!(
+        rc.warnings,
+        vec![
+            measure_line,
+            format!("group {group_key} skipped: 1 of 2 frames registered; at least 3 are needed"),
+        ]
+    );
+    let rows = crate::db::stacking::list_groups(&fixture.conn, rc.run_id).unwrap();
+    assert_eq!(rows[0].status, "skipped");
+    assert_eq!(
+        rows[0].error.as_deref(),
+        Some("1 of 2 frames registered; at least 3 are needed")
+    );
+}
+
 /// Route E: `SummaryFrame.field_width_at_floor` is true when any channel's field width sat at the floor, false
 /// otherwise and for a frame without a measurement; a summary written before the field reads it as false.
 #[test]

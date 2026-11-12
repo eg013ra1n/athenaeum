@@ -260,7 +260,7 @@ export function CalibrationHierarchyView({
   // Each slot arrives as a ManualPick: `null` = untouched (skip), `'clear'` =
   // explicitly deselected (clear that type's link), a number = assign it.
   const handleManualCalibrationApply = useCallback(
-    async (flatSetId: ManualPick, darkSetId: ManualPick, biasSetId: ManualPick, originNotes: string[] = []) => {
+    async (flatSetId: ManualPick, darkSetId: ManualPick, biasSetId: ManualPick, originNotes: string[] = [], levelNotes: string[] = []) => {
       // `clear_manual_calibration_override` deletes MANUAL links only, so a
       // deselect aimed at an auto-matched link deletes nothing and the backend
       // keeps the link. Say so (audit I6) instead of blanking the slot locally
@@ -330,6 +330,17 @@ export function CalibrationHierarchyView({
           notify({
             title: 'Calibration at another sub-frame origin',
             detail: originNotes.join('; '),
+            kind: 'generic',
+            tone: 'warning',
+          });
+        }
+
+        // A dark, bias or dark flat at another or unknown gain or offset is
+        // allowed by hand too — its pedestal may not match the lights'.
+        if (levelNotes.length > 0) {
+          notify({
+            title: 'Calibration with another gain or offset',
+            detail: levelNotes.join('; '),
             kind: 'generic',
             tone: 'warning',
           });

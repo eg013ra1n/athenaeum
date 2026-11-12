@@ -115,6 +115,111 @@ fn a_flat_only_group_gets_one_run_warning_with_the_corner_ratio() {
     );
 }
 
+/// Stage 1 on a fresh fixture whose three lights link a master dark of the given constant value and the master
+/// flat; the warn lines of `stage_calibrate` itself are counted (the dark guard's `warn!`).
+fn dark_guard_stage_one(dark_value: f32) -> (RunContext, String, usize, tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("catalog.db");
+    let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+    let fixture_conn = rusqlite::Connection::open(&db_path).unwrap();
+    let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+    let mut light_ids = Vec::new();
+    for (i, t) in THREE_TIMES.iter().enumerate() {
+        let (id, _) = test_fixtures::add_light(&fixture, &light_spec(&format!("f{i}"), t));
+        light_ids.push(id);
+    }
+    fixture
+        .conn
+        .execute("UPDATE frames SET offset = 1, gain = 100 WHERE id IN (?1, ?2, ?3)", rusqlite::params![light_ids[0], light_ids[1], light_ids[2]])
+        .unwrap();
+    test_fixtures::add_master_dark_and_flat_valued(&fixture, &light_ids, 64, 48, dark_value);
+    let working = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let cfg = StackingConfig::default();
+    let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+    let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+    let group_key = plan_groups[0].key.clone();
+    let mut rc = test_context(
+        ctx,
+        Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+        1,
+        fixture.set_id,
+        SET_NAME,
+        cfg,
+        plan_groups,
+        layout,
+        output.path().to_path_buf(),
+        HashMap::new(),
+    );
+    let (res, warns) = crate::calibration::geometry::test_support::count_warns(
+        "dark subtraction left most pixels at or below zero",
+        || stage_calibrate(&mut rc),
+    );
+    res.unwrap();
+    // The fixture DB lives in `tmp`; the caller keeps it alive for the test's length.
+    (rc, group_key, warns, working, output, tmp)
+}
+
+/// The dark guard's frame half: a master dark brighter than the lights' background leaves most pixels at or
+/// below zero, which is ONE `warn!` and ONE run warning for the group (not one per frame); the standard dark
+/// (100 ADU against a 500 ADU background) says nothing. A re-run served from the cache has no count and adds
+/// no second line (the Output-stage guard covers re-runs).
+#[test]
+fn a_dark_brighter_than_the_lights_gives_one_run_warning_for_the_group() {
+    let (mut rc, key, warns, _w, _o, _t) = dark_guard_stage_one(1000.0);
+    assert_eq!(warns, 1, "one warn! line per group");
+    let hits: Vec<&String> = rc
+        .warnings
+        .iter()
+        .filter(|w| w.contains("dark subtraction left most pixels at or below zero"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", rc.warnings);
+    assert_eq!(
+        hits[0].as_str(),
+        format!(
+            "group {key}: dark subtraction left most pixels at or below zero in 3 of 3 frames (OFFSET 1, GAIN 100) \u{2014} the dark is brighter than the lights; check that its gain and offset match those of the lights"
+        )
+    );
+
+    rc.warnings.clear();
+    stage_calibrate(&mut rc).unwrap();
+    assert!(rc.cached_calibrated.values().all(|c| *c), "stage 1 not cached");
+    assert!(
+        !rc.warnings.iter().any(|w| w.contains("at or below zero")),
+        "a cached frame has no count: {:?}",
+        rc.warnings
+    );
+
+    let (rc_ok, _k, warns_ok, _w2, _o2, _t2) = dark_guard_stage_one(100.0);
+    assert_eq!(warns_ok, 0);
+    assert!(
+        !rc_ok.warnings.iter().any(|w| w.contains("at or below zero")),
+        "{:?}",
+        rc_ok.warnings
+    );
+}
+
+/// The bar sits at 0.9: a healthy low-signal frame (a narrowband sub, an OSC sensor behind a narrowband filter)
+/// can read 0.5-0.6 at or below zero and is not lost; a real gain or offset mismatch reads 0.986 and up.
+#[test]
+fn a_frame_is_lost_only_near_the_top_of_the_range() {
+    assert!(!subtraction_lost(0.0));
+    assert!(!subtraction_lost(0.5));
+    assert!(!subtraction_lost(0.6));
+    assert!(!subtraction_lost(0.89));
+    assert!(subtraction_lost(0.9));
+    assert!(subtraction_lost(0.986));
+    assert!(subtraction_lost(1.0));
+}
+
+/// The median of the lost frames' fractions, for an odd and an even count.
+#[test]
+fn the_lost_fraction_is_the_median_over_the_lost_frames() {
+    assert_eq!(median_fraction(&mut [0.9, 0.5, 1.0]), 0.9);
+    assert_eq!(median_fraction(&mut [0.6, 1.0]), 0.8);
+    assert_eq!(median_fraction(&mut [0.7]), 0.7);
+}
+
 /// The corner ratio is corner over centre, so switching flat
 /// normalization off must not change the sentence.
 #[test]

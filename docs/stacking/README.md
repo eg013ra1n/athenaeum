@@ -109,6 +109,13 @@ Progress rides `stacking-progress` (per stage/group/frame, throttled 300 ms)
 and exactly one `stacking-complete` fires from the run's single exit path
 regardless of success/cancel/failure/panic.
 
+**A group that ends without a master says so** (2026-11-12): `output.rs::skip_group(rc, group, included_count, reason)` writes
+the reason to the group row's `error` and pushes one run warning `group {key} skipped: {reason}` (not again when Measure
+already pushed that exact line). The three reasons: `fewer than 3 included frames`, `{n} of {m} frames registered; at least 3
+are needed`, `local normalization left {n} frames; at least 3 are needed`. `stacking-complete` carries
+`groupsWithoutMaster` (`StackingCompleteEvent.groups_without_master`): the keys of the summary's groups with no master path,
+skipped and failed alike; wire-only, never stored. The run status stays `done` / `cancelled` / `failed`.
+
 **26 commands** (`api/stacking.rs` + `commands/stacking.rs` +
 `routes/stacking.rs`, all mirrored on both hosts) — the frame-set path's 19
 listed here plus the seven project-path twins (`*_project_stacking_*`, see
@@ -2159,6 +2166,43 @@ the new model through the normal cache invalidation (below).
   warning path on and off), enters no hash and moves no pixel; attested sets
   and project frames are out of its reach, and collab publish receives the
   field without showing it.
+- **The dark guard (2026-11-12).** Two run-time guards say when dark
+  subtraction destroyed the data; both only add a string to
+  `RunSummary.warnings` and a `warn!`, move no pixel, and enter no hash, cache
+  key or stored summary shape.
+  - *Calibrate, per frame and group.* `calibrate_light_compute_inner` counts the
+    pixels at or below zero right after the dark or bias is subtracted
+    (`LightCalOutcome::non_positive_pixels` over `pixels`, carried on
+    `GeneratedLight`; the debug line `"light calibrated"` has the count). A
+    frame is lost at a fraction of 0.9 or more (`DARK_SUBTRACTION_LOST_BAR`):
+    the share is 0.5 exactly when the frame's median sits at zero, and a
+    healthy low-signal frame gets there on its own (a short narrowband sub has
+    a sky of the order of the read noise, so 20-30 % of its pixels are already
+    at or below zero with a matching dark; a pedestal drift of about 1 ADU or an
+    OSC sensor behind a narrowband filter reaches 0.5). At 0.9 the median is
+    more than 1.28 sigma below zero, which drift cannot produce and a gain or
+    offset mismatch does (the real case read 98.6-99.9 %). A group with at
+    least one lost frame gets one `warn!` (`count`, the median
+    `non_positive_fraction`, `light_offset`, `light_gain`) and one run warning
+    (`api::lights::subtraction_run_sentence`; the subtrahend is named from the
+    lost frames' CALSTAT, "dark", "bias", or "dark or bias" when they differ):
+    `group L: dark subtraction left most pixels at or below zero in 12 of 12
+    frames (OFFSET 1, GAIN 100) — the dark is brighter than the lights; check
+    that its gain and offset match those of the lights`. A frame served from
+    the cache is not regenerated, has no count and is not tallied; the master
+    guard covers re-runs. No healthy measurement of
+    the fraction is recorded (the fixture reads 0 %); the debug line gives the
+    figure for the next acceptance run.
+  - *Output, per master.* After `"master written"`, `rejected_low_fraction >=
+    0.75` (`MASTER_REJECTED_LOW_BAR`; range rejection at the default floor of 0
+    counts) pushes `group L: 90 % of the samples were rejected low — the
+    calibrated frames are mostly at or below zero; check the dark's gain and
+    offset` and logs `rejected_low_fraction`. Acceptance runs reject at most
+    about 3 % in total (2.985 % mono, 2.733 % OSC at Auto 5.0/3.5, 2026-09-11),
+    but with `rangeLow = 0` every sample at or below zero is rejected low, so a
+    healthy narrowband-through-OSC master can reject about 0.4 low; the broken
+    real case read about 0.9, and the bar sits between them (0.9 would be too
+    close to that case).
 - **Not re-proposed / measured out.**
   - C-29 (LN background on a 4×4-binned plane) still applies: the tiles take a
     robust median of full-resolution pixels.
@@ -5271,6 +5315,7 @@ In-app light stacking — the frame set's own master light(s) from its matched c
 - **SNR gain is an SNR factor, measured like for like** (2026-10-25): `GroupStats.snr_gain` = `√(PSF SNR master / PSF SNR best sub)` from `integrate::paired_snr_gain` — the best sub read through the same registration source the master integrated (registered artifact or on-the-fly warp) and both measured with the master's options on the largest rectangle where both are finite. PSF SNR is TFlux²/σ² (a power ratio), and the smoothing cubic B-spline lowers every warped frame's noise, so the old `master_psf_snr / best_sub_psf_snr` (raw sub) read 751.98× and 777.33× on set 109 (208 / 160 frames); eight equal synthetic frames now read ≈ 0.9 √N where the old figure read 54.8. `master_psf_snr` / `best_sub_psf_snr` stay each image's own measurement. Cost: one extra frame read + two measurements per plane per group. Runs stored before the fix keep their old figure, but it no longer passes for the new metric: `GroupStats.snr_gain_version` (`integrate::SNR_GAIN_VERSION`, 1 at v0.7.0 and 2 since Plan D, `#[serde(default)]`) marks a gain measured now, a pre-v0.7.0 `stats_json` has no key and reads 0, and the Results panel (`src/components/stacking/snrGain.ts`) shows "SNR gain —" with the tooltip "measured before v0.7.0 — re-run to get the SNR gain" for it. **On real data** (2026-10-31, set 109 re-stacked on a copy of the owner's catalog through the release web build at 549e20a5, run 9, 19 min): mono 208 frames 7.08× (√N 14.42), OSC 160 frames R / G / B 7.41 / 7.99 / 7.86× (√N 12.65) — bounded by √N, the 752× gone. It reads low on this set because PSF SNR carries the tflux width dependence (open-items → Plan D → the stacking weight): per-frame PSF SNR grows ≈ FWHM² across the mono group, and the best sub by weight (`…_0071.fits`) is one of the widest frames, 4.88 px against the master's 2.96 px; scaled by that law the mono gain is near 11.7×. **Plan D (2026-11-02; D1b, DF-c): the gain is read over the group's frame-common star set (`SNR_GAIN_VERSION` 2).** TFlux is summed over the stars matched and usable in BOTH crops, so a clipped star or a wider PSF's extra flux no longer moves the figure, and the best sub (the top frame by the weight) is a sharp one (set 109 mono: 1.65 px against a group median 2.61); a v1 gain shows "SNR gain —" with "measured with an older formula — re-run to get the SNR gain", a colour group shows every plane ("SNR gain 7.41 / 7.99 / 7.86×", an unmeasured plane "—"), and the set is built in every weight mode, so a gain of 0 reads "not measured for this group" whatever the mode. **PD-35:** the stored `masterPsfSnr` is a set-total (∝ (Σ signal)²), so it is comparable within one (plane, set) only, never across planes or sets and never as a gain; the paired `snrGain` is the figure. **PD-48:** the figure's ceiling is the run's own weighted-mean prediction, not √N: per plane, measured `snrGain` ≤ Σ w · SNR / (√Σ w² · SNR_b) (SNR = √`psfSnr`, w the plane's weight, b = `best_by_weight`'s frame; √N and RMS(SNR) / SNR_b are printed beside, and "above run 9's" stands). √N presumes the top-weight frame is a top-SNR frame; it is not where the sharpest frame sits under bright sky (set 109 OSC: the sharpest frame is under the Moon, so G's 13.45 above √160 = 12.65 is correct; over the max-SNR sub the same master reads 8.40 / 9.17 / 9.29). A ratio above 1 (correlated noise, a wrong N) is a defect and stops. Set 109 at f899a691: mono 8.05 (run 9: 7.08), OSC 10.66 / 13.45 / 10.76 (7.41 / 7.99 / 7.86), realized / predicted 0.79 / 0.81 / 0.78 (OSC) / 0.79 (mono).
 - **The run** (`stacking::run`): one `stacking-run-<id>` thread admitted through the shared `ComputeQueue` (the sidebar's `ComputeQueueIndicator` lists it — no separate widget), cooperative cancel via `ServiceContext::active_stacks`, `heal_interrupted_runs` from every API entry point, `stacking-progress` throttled 300 ms (`FanOutTicker` inside the fan-out stages), exactly one `stacking-complete` from the single exit path.
 - **Config precedence is WHOLE-CONFIG** (`resolve_config`): a stored per-set document IS the run's config, no field-level merge; new fields are `#[serde(default)]` without a version bump. Presets (Default / Fast preview / Maximum quality) are a single Rust source of truth; user presets are one `stacking.presets` settings row, entry-wise decoded, written under `BEGIN IMMEDIATE`.
+- **A group without a master is visible** (2026-11-12): `skip_group` takes a `reason`, writes it to the group row's `error` and pushes `group {key} skipped: {reason}` once into `RunSummary.warnings`; `StackingCompleteEvent.groups_without_master` (`groupsWithoutMaster`) lists the summary's groups with no master path (skipped and failed), wire-only. No new run status.
 - **26 commands** in `api/stacking.rs`, mirrored on both hosts: plan/start/cancel, runs, config/defaults/presets, paths/work-usage/cleanup, `get_master_light_preview` (`maxPx` clamped to `[64, 2048]`), `list/save/delete_stacking_preset`, and the seven project twins (wave 6b-3). A project run stacks onto the coordinator's canonical grid: one composed map per frame, LN on the overlap, a coverage map and an optional crop (`docs/stacking/README.md`, The project path on the grid).
 - **Tab** (`src/components/stacking/`): `StackingTab` → `PipelineBoard`/`StageRow` (ten rows: nine stages + the display-only Debayer) + `GroupsTable`, `StageInspector` + one panel per stage, `FramesTable` (the Frames block: exclusion from the next run and the reference star are the frame-level writes), `ResultsPanel`/`ProvenanceModal`. Settings → Stacking: global defaults + working/output folders (`<working_dir>/<set_slug>/{calibrated,measured,registered,ln,runs,rej,previews}/`) + a Compute section (`compute.memory_budget_mb`, the frame memory budget; 0 = auto = a quarter of the effective memory, clamped above it; R-OSP-13).
 - **Method rules**: a numeric change is judged on the WHOLE group at master level (a full checkpoint), never on a few-frame probe; a speedup that misses a spec §8 tolerance row is reverted with its numbers; only interleaved before/after brackets are comparable on this Mac; `cargo check --no-default-features` does not compile `integration/`, and `cargo test --lib` hides example breakage (`--all-targets`). Per-core efficiency (SIMD / branchless, bit-identical, scalar oracle kept) comes before threads or GPU, and work units are compared with the ERP, not stage walls (R-OSP-14). Measured-out ideas are recorded in the reference and in doc comments — do not re-propose them. Acceptance harness and the synthetic star lab: the private `athenaeum-lab` repository (`harness/acceptance/`, `star-lab/`; reuse, never rebuild; `ATHENAEUM_REPO` names this checkout). Lab and measurement tools are committed there, never here; the Rust probes stay in `examples/`.

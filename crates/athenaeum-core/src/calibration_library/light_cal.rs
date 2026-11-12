@@ -221,6 +221,18 @@ pub struct LightCalOutcome {
     /// was dead, negative, or non-finite. Reported/logged only — a floored
     /// pixel is a warning, never a frame failure.
     pub floored_flat_pixels: u64,
+    /// How many pixels were at or below zero right after the dark or bias was
+    /// subtracted (before the flat, the scale divide and the output pedestal;
+    /// none of those can change a pixel's sign). `0` when nothing was
+    /// subtracted. A counter only: the output bytes are the same with or
+    /// without it. A healthy light's median after subtraction is its sky,
+    /// which is above zero, so a count near [`LightCalOutcome::pixels`] means
+    /// the dark is brighter than the light.
+    pub non_positive_pixels: u64,
+    /// The pixels the counter looked at: `width * height` when a dark or bias
+    /// was subtracted, `0` when none was. The denominator of
+    /// [`LightCalOutcome::non_positive_pixels`].
+    pub pixels: u64,
 }
 
 /// One calibrated image plane held in RAM, handed from the compute phase to the
@@ -399,6 +411,7 @@ fn calibrate_light_inner(
         width = frame.width,
         height = frame.height,
         floored_flat_pixels = outcome.floored_flat_pixels,
+        non_positive_pixels = outcome.non_positive_pixels,
         "light calibrated"
     );
 
@@ -524,6 +537,10 @@ fn calibrate_light_compute_inner(
     // Dead/negative flat pixels that hit FLAT_DENOM_FLOOR. The band loop is
     // serial, so a plain counter is correct.
     let mut floored_flat_pixels: u64 = 0;
+    // Pixels at or below zero right after the subtraction. A counter only: it
+    // reads `v`, never writes it, so the output bytes do not depend on it.
+    let subtracted = pre_sub.is_some() || sub_idx.is_some();
+    let mut non_positive_pixels: u64 = 0;
 
     let mut y = 0;
     while y < h {
@@ -546,6 +563,9 @@ fn calibrate_light_compute_inner(
                 (Some(sub), _) => v -= sub.data[full] as f64,
                 (None, Some(si)) => v -= planes.sample(si, idx) as f64,
                 (None, None) => {}
+            }
+            if subtracted && v <= 0.0 {
+                non_positive_pixels += 1;
             }
             let flat_sample = match (pre_flat, flat_idx) {
                 (Some(f), _) => Some(f.data[full] as f64),
@@ -617,6 +637,8 @@ fn calibrate_light_compute_inner(
             // Empty until the write phase hashes the file it produced.
             output_hash: String::new(),
             floored_flat_pixels,
+            non_positive_pixels,
+            pixels: if subtracted { (w * h) as u64 } else { 0 },
         },
     ))
 }
@@ -1425,6 +1447,42 @@ mod tests {
         assert!(expected < 0.0, "fixture must produce a negative expectation");
         assert!(data.iter().all(|&v| v == expected), "got {}, want {expected}", data[0]);
         assert!(data.iter().all(|&v| v < 0.0), "negatives must survive unclamped");
+    }
+
+    #[test]
+    fn the_non_positive_count_is_the_pixels_a_dark_leaves_at_or_below_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 9usize);
+        // The light reads 500 everywhere; the dark is 800 on the left three
+        // columns and 100 elsewhere, so exactly 3 columns go below zero.
+        let light = write_plane(dir.path(), "light.fits", w, h, 500.0, &[]);
+        let dark = write_fill(
+            dir.path(),
+            "dark.fits",
+            w,
+            h,
+            |x, _| if x < 3 { 800.0 } else { 100.0 },
+            &[],
+        );
+        let out = dir.path().join("out.fits");
+        let cfg = inputs(dir.path(), light.clone(), Some(dark), None, None, true, out);
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert_eq!(outcome.non_positive_pixels, 3 * h as u64);
+        assert_eq!(outcome.pixels, (w * h) as u64);
+
+        // A pixel exactly at zero counts (the bar is `<= 0`).
+        let dark_eq = write_plane(dir.path(), "dark_eq.fits", w, h, 500.0, &[]);
+        let out_eq = dir.path().join("out_eq.fits");
+        let cfg = inputs(dir.path(), light.clone(), Some(dark_eq), None, None, true, out_eq);
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert_eq!(outcome.non_positive_pixels, (w * h) as u64);
+
+        // A flat-only frame subtracts nothing: nothing counted, and no denominator.
+        let out_none = dir.path().join("out_none.fits");
+        let flat = write_plane(dir.path(), "flat.fits", w, h, 2.0, &[fnrm_card(2.0)]);
+        let cfg = inputs(dir.path(), light, None, None, Some(flat), true, out_none);
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert_eq!((outcome.non_positive_pixels, outcome.pixels), (0, 0));
     }
 
     #[test]

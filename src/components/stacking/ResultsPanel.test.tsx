@@ -237,3 +237,90 @@ describe('ResultsPanel coverage map', () => {
     expect(screen.queryByText(CAPTION)).toBeNull();
   });
 });
+
+// Dark guard: a skipped group says why on its card, the header counts them, and a finished run that lost groups says
+// so in the run dropdown.
+describe('ResultsPanel skipped groups', () => {
+  const skippedGroup = (id: number, key: string, error: string | null) => ({
+    id, runId: 5, groupKey: key, masterPath: null, drizzlePath: null,
+    includedCount: 0, frameCount: 14, status: 'skipped', error, statsJson: null,
+  });
+  const doneGroup = {
+    id: 1, runId: 5, groupKey: 'R', masterPath: '/out/R_master.fits', drizzlePath: null,
+    includedCount: 9, frameCount: 10, status: 'done', error: null, statsJson: null,
+  };
+
+  function installGroups(groups: unknown[], runSummary: { groupCount: number; masterPaths: string[]; status?: string }) {
+    previews = [];
+    const run = { ...RUN, status: runSummary.status ?? 'done' };
+    const runs = () => [{ run, groupCount: runSummary.groupCount, masterPaths: runSummary.masterPaths }];
+    routeInvoke({
+      get_stacking_runs: runs,
+      get_project_stacking_runs: runs,
+      get_stacking_run: () => ({ run, frames: [], groups, summary: null }),
+      get_stacking_work_usage: USAGE,
+      get_project_stacking_work_usage: USAGE,
+      get_master_light_preview: () => new Promise(() => undefined),
+    }, () => undefined);
+  }
+
+  const header = (start: string) => {
+    const p = Array.from(document.querySelectorAll('p')).find((e) => e.textContent?.startsWith(start));
+    if (!p) throw new Error(`no header line starting ${start}`);
+    return p;
+  };
+
+  it('a skipped card shows the reason in the warning colour', async () => {
+    installGroups(
+      [doneGroup, skippedGroup(2, 'L', '2 of 14 frames registered; at least 3 are needed')],
+      { groupCount: 2, masterPaths: ['/out/R_master.fits'] },
+    );
+    mount();
+    const line = await screen.findByText('Skipped: 2 of 14 frames registered; at least 3 are needed');
+    expect(line.className).toContain('text-warning');
+  });
+
+  it('a skipped card from an older run has no reason and says only Skipped', async () => {
+    installGroups([skippedGroup(2, 'L', null), skippedGroup(3, 'G', '')], { groupCount: 2, masterPaths: [] });
+    mount();
+    const lines = await screen.findAllByText('Skipped');
+    expect(lines).toHaveLength(2);
+    expect(lines[0].className).toContain('text-warning');
+  });
+
+  it('the header counts the skipped groups, and only when there are some', async () => {
+    installGroups(
+      [doneGroup, skippedGroup(2, 'L', 'fewer than 3 included frames'), skippedGroup(3, 'G', null)],
+      { groupCount: 3, masterPaths: ['/out/R_master.fits'] },
+    );
+    const first = mount();
+    const count = await screen.findByText('· 2 skipped');
+    expect(count.className).toContain('text-warning');
+    expect(header('3 groups')).toBeDefined();
+    first.unmount();
+
+    installGroups([doneGroup], { groupCount: 1, masterPaths: ['/out/R_master.fits'] });
+    mount();
+    await waitFor(() => expect(header('1 group')).toBeDefined());
+    expect(screen.queryByText(/skipped/)).toBeNull();
+  });
+
+  it('the run dropdown says how many groups of a finished run have no master', async () => {
+    installGroups([doneGroup], { groupCount: 3, masterPaths: ['/out/R_master.fits'] });
+    mount();
+    const option = await screen.findByRole('option', { name: /#5 · .* · done · 2 of 3 groups without a master/ });
+    expect(option).toBeDefined();
+  });
+
+  it('the run dropdown stays plain when every group has a master or the run is not done', async () => {
+    installGroups([doneGroup], { groupCount: 1, masterPaths: ['/out/R_master.fits'] });
+    const first = mount();
+    expect((await screen.findByRole('option', { name: /#5 · .* · done$/ }))).toBeDefined();
+    first.unmount();
+
+    installGroups([doneGroup], { groupCount: 2, masterPaths: [], status: 'failed' });
+    mount();
+    const option = await screen.findByRole('option', { name: /#5 · .* · failed$/ });
+    expect(option.textContent).not.toContain('without a master');
+  });
+});

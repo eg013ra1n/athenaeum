@@ -212,39 +212,7 @@ pub fn offset_gain_text(t: &FlatOnlyTally) -> String {
     )
 }
 
-pub(crate) fn card_text(name: &str, values: &[Option<f64>]) -> String {
-    let mut recorded: Vec<f64> = values
-        .iter()
-        .flatten()
-        .copied()
-        .filter(|v| v.is_finite())
-        .collect();
-    recorded.sort_by(f64::total_cmp);
-    recorded.dedup();
-    let partial = if values.iter().any(|v| v.is_none()) {
-        " (not recorded on some)"
-    } else {
-        ""
-    };
-    match recorded.as_slice() {
-        [] => format!("{name} not recorded"),
-        [v] => format!("{name} {}{partial}", card_number(*v)),
-        [lo, .., hi] => format!(
-            "{name} {}\u{2013}{}{partial}",
-            card_number(*lo),
-            card_number(*hi)
-        ),
-    }
-}
-
-fn card_number(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        let s = format!("{v:.2}");
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    }
-}
+pub(crate) use crate::calibration::manual::card_text;
 
 /// Two significant figures: 2.4, 12, 120.
 fn two_significant(x: f64) -> String {
@@ -298,6 +266,23 @@ pub fn pedestal_run_sentence(
     };
     format!(
         "group {group_key}: {n} lights were calibrated with a flat but no dark or bias ({offset_gain}).{corner} {PEDESTAL_FIX}"
+    )
+}
+
+/// The run warning for a group whose dark or bias left most pixels at or below zero (the dark guard):
+/// `n` of the `m` frames that had one subtracted. `offset_gain` is the lost lights' own
+/// `"OFFSET 1, GAIN 100"` text; `subtrahend` names what was subtracted (`"dark"`, `"bias"`, or `"dark or bias"`
+/// when the lost frames differ). It does not reuse `PEDESTAL_FIX` (that line says to link a master, and here one
+/// is linked and is the wrong one).
+pub fn subtraction_run_sentence(
+    group_key: &str,
+    n: usize,
+    m: usize,
+    offset_gain: &str,
+    subtrahend: &str,
+) -> String {
+    format!(
+        "group {group_key}: dark subtraction left most pixels at or below zero in {n} of {m} frames ({offset_gain}) \u{2014} the {subtrahend} is brighter than the lights; check that its gain and offset match those of the lights"
     )
 }
 
@@ -1670,6 +1655,16 @@ mod tests {
             .unwrap()
             .frame_ids
             .is_empty());
+    }
+
+    #[test]
+    fn the_subtraction_sentence_names_the_group_the_counts_and_the_check() {
+        assert_eq!(
+            subtraction_run_sentence("L", 12, 12, "OFFSET 1, GAIN 100", "dark"),
+            "group L: dark subtraction left most pixels at or below zero in 12 of 12 frames (OFFSET 1, GAIN 100) \u{2014} the dark is brighter than the lights; check that its gain and offset match those of the lights"
+        );
+        assert!(subtraction_run_sentence("L", 2, 3, "OFFSET 1, GAIN 100", "bias")
+            .ends_with("the bias is brighter than the lights; check that its gain and offset match those of the lights"));
     }
 
     #[test]

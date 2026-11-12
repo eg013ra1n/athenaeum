@@ -329,10 +329,15 @@ fn push_summary_group(
 /// return [`GroupOutcome::Skipped`] — the shared tail for "fewer than 3
 /// included frames reached Output", whether stage 3 already said so or a
 /// stage-5 registration exclusion narrowed it further since.
+///
+/// `reason` is the plain sentence the owner reads: it becomes the group row's
+/// `error` and the run warning `group {key} skipped: {reason}` (pushed once —
+/// Measure's own line for the same reason is not repeated).
 fn skip_group(
     rc: &mut RunContext,
     group: &IntegrationGroup,
     included_count: usize,
+    reason: &str,
 ) -> Result<GroupOutcome, RunError> {
     let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
         RunError::Other(format!(
@@ -348,9 +353,14 @@ fn skip_group(
             &GroupUpdate {
                 included_count: Some(included_count as i64),
                 status: Some("skipped"),
+                error: Some(reason),
                 ..Default::default()
             },
         )?;
+    }
+    let warning = format!("group {} skipped: {reason}", group.key);
+    if !rc.warnings.iter().any(|w| *w == warning) {
+        rc.warnings.push(warning);
     }
     push_summary_group(
         rc,
@@ -859,7 +869,7 @@ fn process_group_output(
         .unwrap_or(0);
     if included_count < 3 {
         let (n, i, d, o) = zero();
-        return Ok((skip_group(rc, group, included_count)?, n, i, d, o));
+        return Ok((skip_group(rc, group, included_count, "fewer than 3 included frames")?, n, i, d, o));
     }
 
     // Snapshot the included members' data — nothing below needs `rc` again
@@ -948,7 +958,11 @@ fn process_group_output(
             "stacking group skipped: fewer than 3 registered members reached integration"
         );
         let (n, i, d, o) = zero();
-        return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
+        let reason = format!(
+            "{} of {included_count} frames registered; at least 3 are needed",
+            members.len()
+        );
+        return Ok((skip_group(rc, group, members.len(), &reason)?, n, i, d, o));
     }
 
     // Ruling R-M3-17 v2 (supersedes Ruling 7): the set's reference (manual
@@ -1257,7 +1271,11 @@ fn process_group_output(
                         finish_meter(&mut normalize_meter);
                         let n = normalize_start.elapsed();
                         let (_, i, d, o) = zero();
-                        return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
+                        let reason = format!(
+                            "local normalization left {} frames; at least 3 are needed",
+                            members.len()
+                        );
+                        return Ok((skip_group(rc, group, members.len(), &reason)?, n, i, d, o));
                     }
                     reference_idx = match pick_reference_idx(&members) {
                         Some(pick) => {
@@ -2034,6 +2052,18 @@ fn process_group_output(
         path = %master_path_str,
         "master written"
     );
+    // The dark guard's master half: most samples rejected low means the calibrated frames are mostly at or below
+    // zero (range rejection at the default floor of 0). Output integrates on every run, so a cached calibrated
+    // frame, which Calibrate cannot count, is still caught here.
+    if let Some(sentence) = low_rejection_sentence(&group.key, &output.stats) {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            rejected_low_fraction = output.stats.rejected_low_fraction,
+            "most samples rejected low: calibrated frames at or below zero"
+        );
+        rc.warnings.push(sentence);
+    }
 
     // M4d Task 2 fix round 1 (ruling R-T2-1): XISF has no row-order concept
     // — row 0 IS the top row for every XISF reader — while this master's
@@ -2890,6 +2920,27 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
     }
 
     Ok(())
+}
+
+/// The bar for a master the dark guard calls broken: the share of all samples (every included frame and plane)
+/// rejected low, range rejection included. On a healthy stack almost nothing sits at or below the range floor of
+/// 0: the repo's acceptance runs reject at most about 3 % in total, low and high together (`docs/stacking/README.md`,
+/// the 2026-09-11 acceptance table: 2.985 % mono, 2.733 % OSC). But with `rangeLow = 0` every sample at or below
+/// zero is rejected low, so a healthy narrowband-through-OSC master can reject about 0.4 low, while the broken
+/// real case read about 0.9. The bar sits between them; 0.9 would be too close to that case.
+const MASTER_REJECTED_LOW_BAR: f64 = 0.75;
+
+/// The run warning for a group whose master rejected most samples low, or `None` below
+/// [`MASTER_REJECTED_LOW_BAR`] (or for a non-finite fraction). Pure: the caller logs and pushes.
+fn low_rejection_sentence(key: &str, s: &GroupStats) -> Option<String> {
+    let f = s.rejected_low_fraction;
+    if !(f.is_finite() && f >= MASTER_REJECTED_LOW_BAR) {
+        return None;
+    }
+    Some(format!(
+        "group {key}: {} % of the samples were rejected low \u{2014} the calibrated frames are mostly at or below zero; check the dark's gain and offset",
+        (100.0 * f).round() as i64
+    ))
 }
 
 #[cfg(test)]

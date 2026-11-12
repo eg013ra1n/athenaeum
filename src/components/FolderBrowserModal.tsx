@@ -66,7 +66,13 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
   const filtersRef = useRef(fileFilters);
   filtersRef.current = fileFilters;
 
+  // Orders the answers: every request takes a number, and an answer whose
+  // number is no longer the latest (a newer request, or the modal closed and
+  // reopened since) is dropped without touching state.
+  const seq = useRef(0);
+
   const browse = useCallback(async (path: string, filterIndex: number) => {
+    const mine = ++seq.current;
     setLoading(true);
     setError(null);
     setFiles([]);
@@ -84,23 +90,32 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
         }
       }
       const result = await api.invoke<BrowseDirectoriesResponse>('browse_directories', request);
+      if (mine !== seq.current) return;
       setCurrentPath(result.current);
       setInputPath(result.current);
       setParentPath(result.parent);
       setDirectories(result.directories);
       setFiles(result.files ?? []);
     } catch (err) {
+      if (mine !== seq.current) {
+        console.warn('[FolderBrowserModal] superseded browse failed:', err);
+        return;
+      }
+      console.error('[FolderBrowserModal] browse failed:', err);
       setError(typeof err === 'string' ? err : 'Failed to browse directory');
     } finally {
-      setLoading(false);
+      if (mine === seq.current) setLoading(false);
     }
   }, [scope, mode]);
 
-  // Load root listing when modal opens
+  // Load root listing when modal opens; closing drops any answer still in flight.
   useEffect(() => {
     if (isOpen) {
       setActiveFilter(0);
       browse('', 0);
+    } else {
+      seq.current += 1;
+      setLoading(false);
     }
   }, [isOpen, browse]);
 

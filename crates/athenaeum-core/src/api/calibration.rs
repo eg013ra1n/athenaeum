@@ -468,6 +468,48 @@ fn refuse_unfit_assignment(
     )))
 }
 
+/// Link-time note for a manual pick of a subtrahend set (dark, bias,
+/// dark-flat) at another or unknown gain/offset (design 2026-11-12): one
+/// `warn!` with the header values; the link is still written, nothing is
+/// refused. `light_*` are one value per frame (or the source set's one).
+fn warn_on_level_difference(
+    conn: &rusqlite::Connection,
+    light_gains: &[Option<f64>],
+    light_offsets: &[Option<f64>],
+    calibration_set_id: i64,
+    calibration_type: &str,
+    count: usize,
+) {
+    use crate::calibration::manual::{card_text, level_check, most_common_f64, set_levels};
+    let (set_gain, set_offset) = match set_levels(conn, calibration_set_id) {
+        Ok(levels) => levels,
+        Err(error) => {
+            tracing::warn!(set_id = calibration_set_id, %error, "could not read the set's gain and offset for the link-time check");
+            return;
+        }
+    };
+    let check = level_check(
+        calibration_type,
+        most_common_f64(light_gains),
+        most_common_f64(light_offsets),
+        set_gain,
+        set_offset,
+    );
+    if !check.is_flagged() {
+        return;
+    }
+    tracing::warn!(
+        set_id = calibration_set_id,
+        count,
+        calibration_type,
+        light_offset = %card_text("OFFSET", light_offsets),
+        light_gain = %card_text("GAIN", light_gains),
+        set_offset = %card_text("OFFSET", &[set_offset]),
+        set_gain = %card_text("GAIN", &[set_gain]),
+        "manual calibration accepted with another gain or offset"
+    );
+}
+
 /// [`refuse_unfit_assignment`] for a calibration set's own sub-calibration.
 fn refuse_unfit_subcalibration(
     conn: &rusqlite::Connection,
@@ -665,6 +707,19 @@ pub fn manual_assign_calibration(
     }
 
     refuse_unfit_assignment(&conn, &frame_ids, calibration_set_id, &calibration_type)?;
+    match crate::calibration::manual::frame_levels(&conn, &frame_ids) {
+        Ok((gains, offsets)) => warn_on_level_difference(
+            &conn,
+            &gains,
+            &offsets,
+            calibration_set_id,
+            &calibration_type,
+            frame_ids.len(),
+        ),
+        Err(error) => {
+            tracing::warn!(set_id = calibration_set_id, %error, "could not read the lights' gain and offset for the link-time check");
+        }
+    }
 
     let mut assigned_count = 0;
 
@@ -1249,6 +1304,14 @@ pub fn manual_assign_subcalibration(
     }
 
     refuse_unfit_subcalibration(&conn, source_set_id, calibration_set_id, &calibration_type)?;
+    match crate::calibration::manual::set_levels(&conn, source_set_id) {
+        Ok((gain, offset)) => {
+            warn_on_level_difference(&conn, &[gain], &[offset], calibration_set_id, &calibration_type, 1)
+        }
+        Err(error) => {
+            tracing::warn!(set_id = source_set_id, %error, "could not read the source set's gain and offset for the link-time check");
+        }
+    }
 
     // Create the calibration link with source_type = 'calibration_set'
     let link = CalibrationLink {
@@ -2203,6 +2266,141 @@ mod tests {
             |r| r.get(0),
         ).unwrap();
         assert_eq!(manual, 1);
+    }
+
+    const LEVEL_WARNING: &str = "manual calibration accepted with another gain or offset";
+
+    /// A light at gain 100 / offset `light_offset` and a set of `imagetyp` at
+    /// the given header values (None = the set declares none), same size and
+    /// origin. Returns `(light, set)`.
+    fn level_rig(
+        ctx: &ServiceContext,
+        imagetyp: &str,
+        light_offset: f64,
+        set_gain: Option<f64>,
+        set_offset: Option<f64>,
+    ) -> (i64, i64) {
+        let conn = db(ctx).unwrap().conn();
+        let light = geo::seed_frame(&conn, "l", "Light", Some((6384, 4258)), Some((0, 0)));
+        conn.execute(
+            "UPDATE frames SET gain = 100, offset = ?1 WHERE id = ?2",
+            rusqlite::params![light_offset, light],
+        )
+        .unwrap();
+        let set = geo::seed_set(&conn, imagetyp);
+        let m = geo::seed_frame(&conn, "m", imagetyp, Some((6384, 4258)), Some((0, 0)));
+        geo::add_members(&conn, set, &[m]);
+        conn.execute(
+            "UPDATE calibration_set SET gain = ?1, offset = ?2 WHERE id = ?3",
+            rusqlite::params![set_gain, set_offset, set],
+        )
+        .unwrap();
+        (light, set)
+    }
+
+    fn manual_flag(ctx: &ServiceContext, light: i64, set: i64) -> i64 {
+        db(ctx).unwrap().conn().query_row(
+            "SELECT is_manual_override FROM calibration_set_to_frames WHERE source_id = ?1 AND calibration_set_id = ?2",
+            rusqlite::params![light, set],
+            |r| r.get(0),
+        ).unwrap()
+    }
+
+    /// A dark that declares no gain or offset: one warning, the link is
+    /// still written as a manual override.
+    #[test]
+    fn manual_assign_warns_when_the_dark_declares_no_gain_or_offset() {
+        let (_tmp, ctx) = geo_ctx();
+        let (light, set) = level_rig(&ctx, "MasterDark", 1.0, None, None);
+        let (assigned, warns) = geo::count_warns(LEVEL_WARNING, || {
+            manual_assign_calibration(&ctx, vec![light], set, "Dark".to_string())
+        });
+        assert_eq!(assigned.unwrap(), 1);
+        assert_eq!(warns, 1);
+        assert_eq!(manual_flag(&ctx, light, set), 1);
+    }
+
+    /// Another offset: one warning, the link is written.
+    #[test]
+    fn manual_assign_warns_when_the_dark_has_another_offset() {
+        let (_tmp, ctx) = geo_ctx();
+        let (light, set) = level_rig(&ctx, "Dark", 30.0, Some(100.0), Some(200.0));
+        let (assigned, warns) = geo::count_warns(LEVEL_WARNING, || {
+            manual_assign_calibration(&ctx, vec![light], set, "Dark".to_string())
+        });
+        assert_eq!(assigned.unwrap(), 1);
+        assert_eq!(warns, 1);
+        assert_eq!(manual_flag(&ctx, light, set), 1);
+    }
+
+    /// A rig whose lights and master carry no GAIN / OFFSET card at all (a
+    /// DSLR, an old CCD) has nothing to compare: no warning, the link is
+    /// written.
+    #[test]
+    fn manual_assign_is_quiet_when_neither_lights_nor_dark_declare_gain_or_offset() {
+        let (_tmp, ctx) = geo_ctx();
+        let (light, set) = level_rig(&ctx, "MasterDark", 1.0, None, None);
+        db(&ctx)
+            .unwrap()
+            .conn()
+            .execute("UPDATE frames SET gain = NULL, offset = NULL WHERE id = ?1", rusqlite::params![light])
+            .unwrap();
+        let (assigned, warns) = geo::count_warns(LEVEL_WARNING, || {
+            manual_assign_calibration(&ctx, vec![light], set, "Dark".to_string())
+        });
+        assert_eq!(assigned.unwrap(), 1);
+        assert_eq!(warns, 0);
+        assert_eq!(manual_flag(&ctx, light, set), 1);
+    }
+
+    /// Equal gain and offset: nothing to say.
+    #[test]
+    fn manual_assign_is_quiet_when_gain_and_offset_agree() {
+        let (_tmp, ctx) = geo_ctx();
+        let (light, set) = level_rig(&ctx, "Dark", 30.0, Some(100.0), Some(30.0));
+        let (assigned, warns) = geo::count_warns(LEVEL_WARNING, || {
+            manual_assign_calibration(&ctx, vec![light], set, "Dark".to_string())
+        });
+        assert_eq!(assigned.unwrap(), 1);
+        assert_eq!(warns, 0);
+    }
+
+    /// A flat is divided, not subtracted: another offset is not worth a
+    /// warning.
+    #[test]
+    fn manual_assign_is_quiet_for_a_flat_at_another_offset() {
+        let (_tmp, ctx) = geo_ctx();
+        let (light, set) = level_rig(&ctx, "Flat", 30.0, Some(100.0), Some(200.0));
+        let (assigned, warns) = geo::count_warns(LEVEL_WARNING, || {
+            manual_assign_calibration(&ctx, vec![light], set, "Flat".to_string())
+        });
+        assert_eq!(assigned.unwrap(), 1);
+        assert_eq!(warns, 0);
+    }
+
+    /// The sub-calibration path warns the same way: a flat set's own dark at
+    /// another offset.
+    #[test]
+    fn manual_subcalibration_warns_when_the_dark_has_another_offset() {
+        let (_tmp, ctx) = geo_ctx();
+        let (flat, dark) = {
+            let conn = db(&ctx).unwrap().conn();
+            let flat = geo::seed_set(&conn, "Flat");
+            let f = geo::seed_frame(&conn, "f", "Flat", Some((6384, 4258)), Some((0, 0)));
+            geo::add_members(&conn, flat, &[f]);
+            conn.execute("UPDATE calibration_set SET gain = 100, offset = 30 WHERE id = ?1", [flat]).unwrap();
+            let dark = geo::seed_set(&conn, "Dark");
+            let d = geo::seed_frame(&conn, "d", "Dark", Some((6384, 4258)), Some((0, 0)));
+            geo::add_members(&conn, dark, &[d]);
+            conn.execute("UPDATE calibration_set SET gain = 100, offset = 200 WHERE id = ?1", [dark]).unwrap();
+            (flat, dark)
+        };
+        let (done, warns) = geo::count_warns(LEVEL_WARNING, || {
+            manual_assign_subcalibration(&ctx, flat, dark, "Dark".to_string())
+        });
+        done.unwrap();
+        assert_eq!(warns, 1);
+        assert_eq!(link_count(&ctx), 1);
     }
 
     #[test]

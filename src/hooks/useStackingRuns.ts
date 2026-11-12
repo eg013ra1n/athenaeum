@@ -153,16 +153,29 @@ export function useStackingRuns() {
         // has a drizzle output — `StackingMasterRef.drizzlePath`, filled by
         // M3 Task 5.
         const anyDrizzled = payload.masters.some((m) => m.drizzlePath != null);
+        // A finished run can still have groups that ended without a master
+        // (skipped or failed): say so, and turn the tone to a warning. An
+        // older backend sends no such field.
+        const withoutMaster = payload.groupsWithoutMaster ?? [];
+        const lostGroups = payload.success && withoutMaster.length > 0;
+        const masterNames = payload.masters.map((m) => basename(m.path)).join(', ');
         notify({
           title: payload.success
-            ? `Stacking finished — ${payload.masters.length} master(s)${anyDrizzled ? ' · drizzled' : ''}`
+            ? `Stacking finished — ${payload.masters.length} master(s)${anyDrizzled ? ' · drizzled' : ''}${
+                lostGroups
+                  ? ` · ${withoutMaster.length} group${withoutMaster.length === 1 ? '' : 's'} without a master`
+                  : ''
+              }`
             : payload.cancelled
               ? 'Stacking cancelled'
               : 'Stacking failed',
-          detail: payload.error ?? payload.masters.map((m) => basename(m.path)).join(', '),
+          detail: payload.error
+            ?? (lostGroups
+              ? `Without a master: ${withoutMaster.join(', ')}${masterNames ? ` · ${masterNames}` : ''}`
+              : masterNames),
           kind: 'stacking',
           hasErrors: !payload.success && !payload.cancelled,
-          tone: payload.success ? 'success' : payload.cancelled ? 'info' : 'warning',
+          tone: payload.success ? (lostGroups ? 'warning' : 'success') : payload.cancelled ? 'info' : 'warning',
           dedupeKey: `stack-${payload.runId}`,
           link: eventLink(payload),
         });

@@ -271,6 +271,122 @@ export function originChoiceNote(candidate: CalibrationSetWithScore): string | n
   return `Set #${candidate.set.id} is ${verdict.setValue ?? '—'}, the frames are ${verdict.frameValue ?? '—'} — another sub-frame origin`;
 }
 
+/** A set that is SUBTRACTED from the lights: its gain and offset set the
+ *  pedestal that comes off, so they have to agree with the lights'. A flat is
+ *  divided, and gain / offset barely matter to it. */
+const SUBTRAHEND_NOUN: Partial<Record<string, string>> = {
+  Dark: 'dark',
+  MasterDark: 'dark',
+  Bias: 'bias',
+  MasterBias: 'bias',
+  DarkFlat: 'dark flat',
+  MasterDarkFlat: 'dark flat',
+};
+
+/** Two header numbers as the picker prints them: `1`, `0.5`, never `1.0000`. */
+const level = (v: string): string => tidyNumbers(v);
+
+/** Further apart than this is another gain / offset (header values are read
+ *  from floats, so a hair of noise is not a difference). */
+const LEVEL_TOLERANCE = 0.01;
+
+interface LevelFacts {
+  noun: string;
+  /** What the lights declare (their most common value) and what the set does. */
+  gain: { frame: string; set: string | null } | null;
+  offset: { frame: string; set: string | null } | null;
+  gainUnknown: boolean;
+  offsetUnknown: boolean;
+  gainDiffers: boolean;
+  offsetDiffers: boolean;
+}
+
+function levelFact(
+  parameters: ParameterVerdict[],
+  name: 'gain' | 'offset',
+): { value: { frame: string; set: string | null } | null; unknown: boolean; differs: boolean } {
+  const v = parameters.find(p => p.name === name);
+  // No verdict, or the lights declare nothing: there is nothing to compare
+  // the set against.
+  if (!v || v.frameValue == null) return { value: null, unknown: false, differs: false };
+  const value = { frame: v.frameValue, set: v.setValue };
+  if (v.setValue == null) return { value, unknown: true, differs: false };
+  const a = Number(v.frameValue);
+  const b = Number(v.setValue);
+  const differs = Number.isNaN(a) || Number.isNaN(b)
+    ? v.frameValue !== v.setValue
+    : Math.abs(a - b) > LEVEL_TOLERANCE;
+  return { value, unknown: false, differs };
+}
+
+/** The gain / offset facts of a subtrahend candidate, from the VALUES the
+ *  verdicts carry — never from `status` or `enforced`, which follow the
+ *  user's matching config (a config that ignores gain still gets the note).
+ *  Null for any set that is not subtracted. */
+function levelFacts(candidate: CalibrationSetWithScore): LevelFacts | null {
+  const noun = SUBTRAHEND_NOUN[candidate.set.imagetyp];
+  if (!noun) return null;
+  const gain = levelFact(candidate.parameters, 'gain');
+  const offset = levelFact(candidate.parameters, 'offset');
+  return {
+    noun,
+    gain: gain.value,
+    offset: offset.value,
+    gainUnknown: gain.unknown,
+    offsetUnknown: offset.unknown,
+    gainDiffers: gain.differs,
+    offsetDiffers: offset.differs,
+  };
+}
+
+/** The card's badge for a dark / bias / dark-flat at another or unknown gain
+ *  or offset; null when both are known and equal, and for any other set. */
+export function levelBadge(candidate: CalibrationSetWithScore): string | null {
+  const f = levelFacts(candidate);
+  if (!f) return null;
+  if (f.gainUnknown || f.offsetUnknown) return 'Gain/offset unknown';
+  if (f.gainDiffers && f.offsetDiffers) return 'Another gain and offset';
+  if (f.offsetDiffers) return 'Another offset';
+  if (f.gainDiffers) return 'Another gain';
+  return null;
+}
+
+/** The sentence a person sees after choosing a dark, bias or dark flat whose
+ *  gain or offset is unknown or differs from the lights'. The link is never
+ *  blocked: the pedestal that comes off is the set's own, and this says when
+ *  it may not be the lights'. Null for any other candidate. */
+export function levelChoiceNote(candidate: CalibrationSetWithScore): string | null {
+  const f = levelFacts(candidate);
+  if (!f) return null;
+  const parts: string[] = [];
+  if (f.offset && f.offsetUnknown) {
+    parts.push(
+      `Offset ${level(f.offset.frame)} on the lights, the ${f.noun} declares none — its pedestal may not match`,
+    );
+  } else if (f.offset && f.offsetDiffers && f.offset.set != null) {
+    const frame = Number(f.offset.frame);
+    const set = Number(f.offset.set);
+    const how = Number.isNaN(frame) || Number.isNaN(set)
+      ? 'another offset, so its pedestal will not match'
+      : set > frame
+        ? `the ${f.noun}'s offset is higher, so its pedestal will be over-subtracted`
+        : `the ${f.noun}'s offset is lower, so its pedestal will be under-subtracted`;
+    parts.push(
+      `Offset ${level(f.offset.frame)} on the lights, ${level(f.offset.set)} on the ${f.noun} — ${how}`,
+    );
+  }
+  if (f.gain && f.gainUnknown) {
+    parts.push(
+      `Gain ${level(f.gain.frame)} on the lights, the ${f.noun} declares none — its signal level may not match`,
+    );
+  } else if (f.gain && f.gainDiffers && f.gain.set != null) {
+    parts.push(
+      `Gain ${level(f.gain.frame)} on the lights, ${level(f.gain.set)} on the ${f.noun} — the ${f.noun} was shot at another gain`,
+    );
+  }
+  return parts.length > 0 ? `Set #${candidate.set.id}: ${parts.join('; ')}` : null;
+}
+
 /** The one slot a sub-calibration save writes: a flat takes ONE of dark flat /
  *  dark / bias — the fallback chain, in order — so the first chosen slot wins
  *  and the rest are left cleared. */
@@ -298,6 +414,27 @@ export function originNotesFor(
     if (chosen === null || chosen === current[k]) return [];
     const c = candidates[k].find(x => x.set.id === chosen);
     const note = c ? originChoiceNote(c) : null;
+    return note ? [`${SLOT_LABEL[k]}: ${note}`] : [];
+  });
+}
+
+/** One sentence per newly chosen dark, bias or dark flat at another or unknown
+ *  gain or offset, naming only links the save really writes — the same slot
+ *  rules as `originNotesFor`. */
+export function levelNotesFor(
+  subjectKind: PickerSubject['kind'],
+  slots: SlotKind[],
+  selected: Partial<Record<SlotKind, number | null>>,
+  current: Record<SlotKind, number | null>,
+  candidates: Record<SlotKind, CalibrationSetWithScore[]>,
+): string[] {
+  const written = subjectKind === 'set' ? writtenSubSlot(selected) : null;
+  return slots.flatMap(k => {
+    if (subjectKind === 'set' && k !== written) return [];
+    const chosen = selected[k] ?? null;
+    if (chosen === null || chosen === current[k]) return [];
+    const c = candidates[k].find(x => x.set.id === chosen);
+    const note = c ? levelChoiceNote(c) : null;
     return note ? [`${SLOT_LABEL[k]}: ${note}`] : [];
   });
 }
