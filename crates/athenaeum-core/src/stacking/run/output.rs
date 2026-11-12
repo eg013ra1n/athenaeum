@@ -329,10 +329,15 @@ fn push_summary_group(
 /// return [`GroupOutcome::Skipped`] — the shared tail for "fewer than 3
 /// included frames reached Output", whether stage 3 already said so or a
 /// stage-5 registration exclusion narrowed it further since.
+///
+/// `reason` is the plain sentence the owner reads: it becomes the group row's
+/// `error` and the run warning `group {key} skipped: {reason}` (pushed once —
+/// Measure's own line for the same reason is not repeated).
 fn skip_group(
     rc: &mut RunContext,
     group: &IntegrationGroup,
     included_count: usize,
+    reason: &str,
 ) -> Result<GroupOutcome, RunError> {
     let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
         RunError::Other(format!(
@@ -348,9 +353,14 @@ fn skip_group(
             &GroupUpdate {
                 included_count: Some(included_count as i64),
                 status: Some("skipped"),
+                error: Some(reason),
                 ..Default::default()
             },
         )?;
+    }
+    let warning = format!("group {} skipped: {reason}", group.key);
+    if !rc.warnings.iter().any(|w| *w == warning) {
+        rc.warnings.push(warning);
     }
     push_summary_group(
         rc,
@@ -859,7 +869,7 @@ fn process_group_output(
         .unwrap_or(0);
     if included_count < 3 {
         let (n, i, d, o) = zero();
-        return Ok((skip_group(rc, group, included_count)?, n, i, d, o));
+        return Ok((skip_group(rc, group, included_count, "fewer than 3 included frames")?, n, i, d, o));
     }
 
     // Snapshot the included members' data — nothing below needs `rc` again
@@ -948,7 +958,11 @@ fn process_group_output(
             "stacking group skipped: fewer than 3 registered members reached integration"
         );
         let (n, i, d, o) = zero();
-        return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
+        let reason = format!(
+            "{} of {included_count} frames registered; at least 3 are needed",
+            members.len()
+        );
+        return Ok((skip_group(rc, group, members.len(), &reason)?, n, i, d, o));
     }
 
     // Ruling R-M3-17 v2 (supersedes Ruling 7): the set's reference (manual
@@ -1257,7 +1271,11 @@ fn process_group_output(
                         finish_meter(&mut normalize_meter);
                         let n = normalize_start.elapsed();
                         let (_, i, d, o) = zero();
-                        return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
+                        let reason = format!(
+                            "local normalization left {} frames; at least 3 are needed",
+                            members.len()
+                        );
+                        return Ok((skip_group(rc, group, members.len(), &reason)?, n, i, d, o));
                     }
                     reference_idx = match pick_reference_idx(&members) {
                         Some(pick) => {

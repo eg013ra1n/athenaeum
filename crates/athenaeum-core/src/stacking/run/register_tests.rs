@@ -2290,6 +2290,27 @@ fn a_group_that_loses_its_master_after_registering_reports_no_reference() {
         "{:?}",
         group.frames
     );
+
+    // The skip is visible: one run warning that says why, the same reason on
+    // the group row's `error`, and the group named by the completion event's
+    // source list (`groups_without_master` reads the summary's groups).
+    // Register excluded the two starless frames, so the group reaches the Output boundary with 2 included.
+    let reason = "fewer than 3 included frames";
+    let expected = format!("group {group_key} skipped: {reason}");
+    let lines: Vec<&String> = rc.warnings.iter().filter(|w| **w == expected).collect();
+    assert_eq!(lines.len(), 1, "{:?}", rc.warnings);
+    let rows = crate::db::stacking::list_groups(&fixture.conn, rc.run_id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "skipped");
+    assert_eq!(rows[0].error.as_deref(), Some(reason));
+    let without_master: Vec<&str> = rc
+        .summary
+        .groups
+        .iter()
+        .filter(|g| g.master_path.is_none())
+        .map(|g| g.key.as_str())
+        .collect();
+    assert_eq!(without_master, vec![group_key.as_str()]);
 }
 
 #[test]

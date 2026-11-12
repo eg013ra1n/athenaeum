@@ -628,7 +628,12 @@ export type StackingProgressEvent = { runId: number, setId: number | null, proje
 
 export type StackingMasterRef = { groupKey: string, path: string, drizzlePath: string | null, };
 
-export type StackingCompleteEvent = { runId: number, setId: number | null, projectId: string | null, success: boolean, cancelled: boolean, error: string | null, warnings: Array<string>, masters: Array<StackingMasterRef>, };
+export type StackingCompleteEvent = { runId: number, setId: number | null, projectId: string | null, success: boolean, cancelled: boolean, error: string | null, warnings: Array<string>, masters: Array<StackingMasterRef>, 
+/**
+ * Keys of the groups the run summary lists without a master (skipped or
+ * failed); wire-only, never stored.
+ */
+groupsWithoutMaster: Array<string>, };
 
 export type StartedStacking = { runId: number, };
 

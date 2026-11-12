@@ -220,6 +220,9 @@ pub struct StackingCompleteEvent {
     pub error: Option<String>,
     pub warnings: Vec<String>,
     pub masters: Vec<StackingMasterRef>,
+    /// Keys of the groups the run summary lists without a master (skipped or
+    /// failed); wire-only, never stored.
+    pub groups_without_master: Vec<String>,
 }
 
 pub const STACKING_PROGRESS_EVENT: &str = "stacking-progress";
@@ -1326,6 +1329,13 @@ fn run_thread(mut rc: RunContext) {
             })
         })
         .collect();
+    let groups_without_master: Vec<String> = rc
+        .summary
+        .groups
+        .iter()
+        .filter(|g| g.master_path.is_none())
+        .map(|g| g.key.clone())
+        .collect();
     let success = success && !masters.is_empty();
 
     rc.summary.status = status.to_string();
@@ -1430,6 +1440,7 @@ fn run_thread(mut rc: RunContext) {
             error,
             warnings: rc.warnings.clone(),
             masters,
+            groups_without_master,
         },
     );
 
