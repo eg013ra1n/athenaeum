@@ -61,7 +61,7 @@ const newSet = await api.invoke<FrameSetDetail>('split_frame_set', {
   newName: 'M31 Widefield - Split 1',
 });
 ```
-There is no separate pre-check command. `split_frame_set` itself refuses a selection that would leave the source empty (all nights, all sessions or all frames) and a selection that resolves to no frames.
+There is no separate pre-check command. `split_frame_set` itself refuses a selection that holds a night, session or frame of another set, a selection that would leave the source empty (all nights, all sessions or all frames) and a selection that resolves to no frames.
 
 ### Other Commands
 
@@ -131,7 +131,7 @@ The UI offers this as a mouse-driven drag of one set card onto another on the Ob
 
 ### Split
 
-`split_frame_set` moves the selected nights, sessions or frames into a new custom set (nights and sessions of the new set come from `detect_sessions` over the moved frames), deletes the selected rows from the source, refreshes the source's metadata and marks the source custom. In the UI the split dialog on the detail page sends a `frames` selection.
+`split_frame_set` moves the selected nights, sessions or frames into a new custom set (nights and sessions of the new set come from `detect_sessions` over the moved frames), deletes the selected rows from the source, refreshes the source's metadata and marks the source custom, all in one BEGIN IMMEDIATE transaction (any error rolls the whole split back; `create_frame_set_from_selection` is one such transaction too). In the UI the split dialog on the detail page sends a `frames` selection.
 
 ### Metadata Calculation
 
