@@ -229,18 +229,14 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
                 "registered artifact row has no path"
             );
         }
-        let (size, modified_at) = artifact
-            .as_ref()
-            .map_or((None, None), |a| (a.size, a.modified_at.clone()));
+        let size = artifact.as_ref().and_then(|a| a.size);
         let path = artifact
             .and_then(|artifact| artifact.path)
             .map(PathBuf::from)
             .filter(|p| file_exists(p, run_id, frame_id));
         out.push(match path {
-            // Rows that recorded no modification time keep the existence check alone.
-            Some(path)
-                if modified_at.is_some()
-                    && !file_matches_identity(&path, size, modified_at.as_deref()) =>
+            // A row that recorded a size is judged by it (key + size); one without keeps the existence check alone.
+            Some(path) if size.is_some() && !file_matches_identity(&path, size) =>
             {
                 Resolved::without_file(frame_id, AlignedState::Replaced)
             }
@@ -690,19 +686,24 @@ mod tests {
         ));
     }
 
-    /// A file that is no longer the one its row recorded - a later run overwrote it and was cancelled before it recorded
-    /// the new identity - is not the run's aligned frame either, whatever the groups say.
+    /// An aligned file is judged by its size, not its time (FI-2): a later time is the same file; a file of another
+    /// size is not the run's aligned frame whatever the groups say; a row a later run deleted reads as missing.
     #[test]
-    fn aligned_file_that_is_not_the_recorded_one_is_replaced() {
+    fn aligned_file_is_judged_by_its_size_not_its_time() {
         let s = seeded(&[4.0; 4], 0);
         let run_id = run_once(&s, &config());
         let path = resolve_stacking_aligned_path(&s.ctx, run_id, s.ids[2]).unwrap();
         let recorded = std::fs::metadata(&path).unwrap().modified().unwrap();
-        // Same bytes, later modification time: only the identity tells the files apart.
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_modified(recorded + std::time::Duration::from_secs(5)).unwrap();
         drop(file);
+        assert_eq!(states(&s, run_id), vec![AlignedState::Available; 4]);
 
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"x").unwrap();
+        }
         let mut expected = vec![AlignedState::Available; 4];
         expected[2] = AlignedState::Replaced;
         assert_eq!(states(&s, run_id), expected);
@@ -710,6 +711,16 @@ mod tests {
             resolve_stacking_aligned_path(&s.ctx, run_id, s.ids[2]),
             Err(ApiError::NotFound(m)) if m.contains("later run")
         ));
+
+        s.fixture
+            .conn
+            .execute(
+                "DELETE FROM stacking_artifacts WHERE kind = 'registered' AND frame_id = ?1",
+                [s.ids[2]],
+            )
+            .unwrap();
+        expected[2] = AlignedState::Missing;
+        assert_eq!(states(&s, run_id), expected);
     }
 
     #[test]

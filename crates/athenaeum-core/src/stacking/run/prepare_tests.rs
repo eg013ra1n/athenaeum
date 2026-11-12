@@ -1213,3 +1213,82 @@ fn a_cancelled_prepare_leaves_no_row_over_its_files() {
         assert_eq!(row.config_hash, rows_a[&frame_id].config_hash, "frame {frame_id} is back at A's hash");
     }
 }
+
+/// The in-place rule (file-identity §4.1): a `calibrated` row that names the user's own light is fresh only while it
+/// names THIS frame's current input. After a relocate the row names the light's old path, where another file of the
+/// same size and the recorded time now sits: the gate counts that frame stale, and the run re-points the row without
+/// writing a byte under `prepared/` and without reading the pixels of pass 1 again.
+#[test]
+fn an_in_place_row_at_another_path_than_its_light_is_stale() {
+    let mut rig = Pass1Rig::attested();
+    let output = tempfile::tempdir().unwrap();
+    for (key, dir) in [
+        (crate::settings::keys::STACKING_WORKING_DIR, rig.working.path()),
+        (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+    ] {
+        crate::db::set_setting(&rig.fixture.conn, key, dir.to_str().unwrap()).unwrap();
+    }
+    let cached = |rig: &Pass1Rig| {
+        crate::stacking::plan::build_plan(
+            &rig.fixture.conn,
+            &rig.ctx.settings,
+            &crate::api::PathPolicy::AllowAll,
+            &rig.subject,
+            Some(rig.cfg.clone()),
+        )
+        .expect("the plan should build")
+        .groups[0]
+            .calibrated_cached
+    };
+
+    let first = rig.run("run 1", None);
+    assert_eq!(first.logged.len(), 4, "premise: run 1 measured every light");
+    let frame = rig.plan_groups[0].frames[0].clone();
+    let old_path = PathBuf::from(&frame.path);
+    let row = rig.rows(ArtifactKind::Calibrated)[&frame.frame_id].clone();
+    assert_eq!(Path::new(row.path.as_deref().unwrap()), old_path, "premise: the row names the light in place");
+    let n = cached(&rig);
+    assert_eq!(n, 4, "premise: the gate reads every in-place row as cached");
+
+    // The light moves: a copy that keeps its time, the catalog row follows (as a relocate does), and another file of
+    // the same size carrying the recorded time is left at the old path.
+    let mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+    let new_path = old_path.with_file_name("moved_f0.fits");
+    std::fs::copy(&old_path, &new_path).unwrap();
+    let stamp = |path: &Path| {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(mtime).unwrap();
+    };
+    stamp(&new_path);
+    let mut bytes = std::fs::read(&old_path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&old_path, &bytes).unwrap();
+    stamp(&old_path);
+    assert_eq!(std::fs::metadata(&old_path).unwrap().len(), row.size.unwrap() as u64, "premise: the decoy has the recorded size");
+    assert_eq!(std::fs::metadata(&old_path).unwrap().modified().unwrap(), mtime, "premise: and the recorded time");
+    rig.fixture
+        .conn
+        .execute(
+            "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
+            rusqlite::params![new_path.to_str().unwrap(), "moved_f0.fits", old_path.to_str().unwrap()],
+        )
+        .unwrap();
+    assert_eq!(cached(&rig), 3, "the row at the old path is not this frame's input");
+
+    // The run takes `GroupFrame.path` from the plan groups: recompute them.
+    let (groups, origins) =
+        frame_source(&rig.fixture.conn, &rig.subject, &rig.cfg).unwrap();
+    assert_eq!(groups[0].frames.iter().find(|f| f.frame_id == frame.frame_id).unwrap().path, new_path.to_string_lossy());
+    rig.plan_groups = groups;
+    rig.set_origins(origins);
+    let second = rig.run("run 2", None);
+
+    let prepared = rig.layout.prepared_root();
+    let written = std::fs::read_dir(&prepared).map_or(0, |entries| entries.count());
+    assert_eq!(written, 0, "an in-place frame writes nothing under prepared/");
+    let row_after = rig.rows(ArtifactKind::Calibrated)[&frame.frame_id].clone();
+    assert_eq!(Path::new(row_after.path.as_deref().unwrap()), new_path, "the row is re-pointed at the current input");
+    assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
+    assert_eq!(cached(&rig), 4);
+}

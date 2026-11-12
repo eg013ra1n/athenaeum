@@ -13,7 +13,7 @@
 //! that preceded it can never disagree about what "fresh" means.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -1046,19 +1046,12 @@ pub(crate) fn render_modified_at(modified: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339()
 }
 
-/// Whether the file at `path` is still the file a row recorded (ruling R7 b): a
-/// stat only, no pixel I/O. Its length equals `size`, and, when the row recorded a
-/// `modified_at`, its modification time renders to exactly that string. A row
-/// without `modified_at` keeps the size-only check (rows written before the
-/// identity was kept); a row without `size` never matches. A writer that
-/// rewrites a file and is cancelled before it records the new identity leaves
-/// the file and its row disagreeing: this is what catches it, for the gate and
-/// the run alike.
-pub(crate) fn file_matches_identity(
-    path: &Path,
-    size: Option<i64>,
-    modified_at: Option<&str>,
-) -> bool {
+/// Whether the file at `path` is still the file a row recorded: a stat only, no pixel I/O. Its length equals `size`;
+/// a row without `size` never matches. Athenaeum's own working files are judged by key + size, never by the
+/// modification time (FI-2): a copy or a restore that rounds the time is still the same file. The write order (a
+/// writer deletes the row before it replaces the file, then upserts the new one) closes ruling R7 b, a file and a
+/// row that disagree after a cancel, so no row over another config's file exists for this check to catch.
+pub(crate) fn file_matches_identity(path: &Path, size: Option<i64>) -> bool {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         // A file that is not there is the ordinary "stale"; any other failure (permissions, a dropped mount) is not,
@@ -1069,40 +1062,28 @@ pub(crate) fn file_matches_identity(
             return false;
         }
     };
-    if Some(meta.len() as i64) != size {
-        return false;
-    }
-    let Some(recorded) = modified_at else {
-        return true;
-    };
-    let current = match meta.modified() {
-        Ok(modified) => render_modified_at(modified),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "cached file has no modification time; counted as changed");
-            return false;
-        }
-    };
-    if current == recorded {
-        return true;
-    }
-    // The size matches and the time does not: the one case where a file looks right and is refused. Say why, once per
-    // look, so "everything recomputed after I moved the folder" is explained by the log (a copy tool that does not
-    // keep mtimes, a filesystem that reports another time after close).
-    tracing::debug!(
-        path = %path.display(),
-        recorded,
-        current = %current,
-        "cached file has the recorded size but another modification time; counted as changed"
-    );
-    false
+    size == Some(meta.len() as i64)
+}
+
+/// The in-place rule's gate half (file-identity §4.1): whether a Prepare subject's `calibrated` (or mosaic) row names
+/// the frame's CURRENT input. A row either names the input itself (a light or replica used in place) or a file under
+/// one of the subject's own `prepared/` and `calibrated/` folders (`roots`: the subject roots, one per spelling of the
+/// working folder). A row at any other path names a light's old location, where another file of the same size may sit
+/// now, and is stale: the run re-points it.
+pub(crate) fn prepare_row_names_its_input(row_path: &Path, input: &Path, roots: &[PathBuf]) -> bool {
+    row_path == input
+        || roots.iter().any(|root| {
+            let layout = crate::stacking::paths::WorkingLayout { root: root.clone() };
+            row_path.starts_with(layout.prepared_root())
+                || row_path.starts_with(layout.calibrated_root())
+        })
 }
 
 /// The `calibrated`-artifact reuse contract (spec §9.3): a row is reusable
 /// only when ALL of these hold — its `config_hash` equals the frame's
 /// CURRENT stage-1 hash, its `path` is `Some`, its `size` is `Some`, AND a
-/// live `std::fs::metadata` read of that path reports exactly that size (and,
-/// when the row recorded a `modified_at`, that modification time:
-/// [`file_matches_identity`]). A
+/// live `std::fs::metadata` read of that path reports exactly that size
+/// ([`file_matches_identity`]: key + size, never the time). A
 /// row missing `path`/`size` (an artifact recorded before the pixel phase
 /// ever wrote anything, or one some other kind stores without a path) is
 /// NEVER assumed fresh — "we don't know" is "stale", not "trust the hash
@@ -1118,9 +1099,10 @@ pub(crate) fn file_matches_identity(
 /// what "fresh" means.
 pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bool {
     artifact.config_hash == current_hash
-        && artifact.path.as_deref().is_some_and(|p| {
-            file_matches_identity(Path::new(p), artifact.size, artifact.modified_at.as_deref())
-        })
+        && artifact
+            .path
+            .as_deref()
+            .is_some_and(|p| file_matches_identity(Path::new(p), artifact.size))
 }
 
 /// Whether every one of a frame's `fits.<plane>` rows is fresh against
@@ -3387,6 +3369,9 @@ pub fn build_plan(
     let mut free_bytes: Option<u64> = None;
     let mut working_dir: Option<String> = None;
     let mut output_dir: Option<String> = None;
+    // The subject roots a Prepare row may legitimately sit under (the in-place rule); empty without a working folder
+    // and for a subject that calibrates.
+    let mut prepare_roots: Vec<PathBuf> = Vec::new();
     match (resolved_dirs.working, resolved_dirs.output) {
         (Some(working), Some(output)) => {
             match paths::validate_dirs(conn, policy, &working, &output, paths::ValidateMode::Plan) {
@@ -3443,6 +3428,24 @@ pub fn build_plan(
                     code: "folders".to_string(),
                     message: "Choose an output folder".to_string(),
                 });
+            }
+        }
+    }
+
+    // The in-place rule's roots: the subject root under the validated working folder as configured, plus the one under
+    // the spelling a run records (rows carry the run's spelling in the app, the configured one in tests).
+    let prepare_gate = crate::stacking::origin::subject_prepares(subject, &origins);
+    if prepare_gate {
+        if let Some(working) = working_dir.as_deref().map(Path::new) {
+            let spellings = std::iter::once(working.to_path_buf())
+                .chain(paths::run_spelled_working(working).filter(|spelled| spelled != working));
+            for spelling in spellings {
+                match paths::subject_layout(conn, &spelling, subject) {
+                    Ok(layout) => prepare_roots.push(layout.root),
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "working root of the subject not resolved; rows over it read as stale");
+                    }
+                }
             }
         }
     }
@@ -3806,8 +3809,24 @@ pub fn build_plan(
                 None
             };
 
+            // In-place rule: a Prepare subject's row that names a file outside its own working folders is fresh only
+            // while it names this frame's current input (a relocated light's old path is a miss).
+            let prepare_input_path: Option<PathBuf> = if prepare_gate {
+                origin_of(&origins, f.frame_id)
+                    .ok()
+                    .map(|origin| crate::stacking::origin::prepare_input(origin, f).path)
+            } else {
+                None
+            };
+            let names_input = |row: &StackingArtifactRow| match (&prepare_input_path, row.path.as_deref()) {
+                (Some(input), Some(row_path)) => {
+                    prepare_row_names_its_input(Path::new(row_path), input, &prepare_roots)
+                }
+                (Some(_), None) => false,
+                (None, _) => !prepare_gate,
+            };
             let calib_fresh = match (&calib_artifact, &current_calib_hash) {
-                (Some(row), Some(hash)) => is_fresh(row, hash),
+                (Some(row), Some(hash)) => is_fresh(row, hash) && names_input(row),
                 _ => false,
             };
             // The mosaic half of stage 1's freshness — the same rule
@@ -3824,7 +3843,7 @@ pub fn build_plan(
                     Some(f.frame_id),
                 )?;
                 match (&mosaic_artifact, &current_calib_hash) {
-                    (Some(row), Some(hash)) => is_fresh(row, hash),
+                    (Some(row), Some(hash)) => is_fresh(row, hash) && names_input(row),
                     _ => false,
                 }
             } else {
@@ -4188,47 +4207,42 @@ mod tests {
         );
     }
 
-    /// Ruling R10 M1: a file with the recorded size and another mtime is refused with a `debug!` that names the path
-    /// and both times; a file that is not there, or whose identity matches, logs nothing.
+    /// FI-2: an own working file is judged by its size, never by its time: a later time, a time cut to whole seconds
+    /// and a copy that kept nothing are all the same file; one byte more is not; a missing file is the ordinary stale
+    /// and logs nothing; a stat failure that is not "not found" is a warn.
     #[test]
-    fn identity_refusal_by_mtime_says_why() {
+    fn identity_is_the_size_never_the_time() {
+        use std::time::{Duration, UNIX_EPOCH};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         std::fs::write(&path, b"12345678").unwrap();
-        let recorded = render_modified_at(std::fs::metadata(&path).unwrap().modified().unwrap());
+        let recorded = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let set_time = |t: std::time::SystemTime| {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(t).unwrap();
+        };
 
-        let (ok, quiet) = crate::stacking::telemetry::capture_logs(|| {
-            file_matches_identity(&path, Some(8), Some(&recorded))
-        });
-        assert!(ok);
-        assert!(!quiet.contains("modification time"), "{quiet}");
+        set_time(recorded + Duration::from_secs(5));
+        let (later, quiet) =
+            crate::stacking::telemetry::capture_logs(|| file_matches_identity(&path, Some(8)));
+        assert!(later, "a later time is the same file");
+        assert!(quiet.trim().is_empty(), "no line for a time: {quiet}");
+
+        let whole = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_time(whole);
+        assert!(file_matches_identity(&path, Some(8)), "a time cut to whole seconds");
+
+        assert!(!file_matches_identity(&path, Some(9)), "one byte more");
+        assert!(!file_matches_identity(&path, None), "a row without a size never matches");
 
         let (gone, quiet) = crate::stacking::telemetry::capture_logs(|| {
-            file_matches_identity(&dir.path().join("nope.bin"), Some(8), Some(&recorded))
+            file_matches_identity(&dir.path().join("nope.bin"), Some(8))
         });
         assert!(!gone);
         assert!(quiet.trim().is_empty(), "a missing file is the ordinary stale: {quiet}");
 
-        let other = "1999-01-01T00:00:00+00:00";
-        let (moved, text) = crate::stacking::telemetry::capture_logs(|| {
-            file_matches_identity(&path, Some(8), Some(other))
-        });
-        assert!(!moved);
-        assert!(text.contains("DEBUG"), "{text}");
-        assert!(text.contains("f.bin"), "{text}");
-        assert!(text.contains(other), "the recorded time: {text}");
-        assert!(text.contains(&recorded), "the current time: {text}");
-
-        // A different size is refused without the mtime line (the size already says why).
-        let (resized, text) = crate::stacking::telemetry::capture_logs(|| {
-            file_matches_identity(&path, Some(9), Some(&recorded))
-        });
-        assert!(!resized);
-        assert!(!text.contains("modification time"), "{text}");
-
-        // A stat failure that is not "not found" is a warn, not a silent "changed".
         let (broken, text) = crate::stacking::telemetry::capture_logs(|| {
-            file_matches_identity(Path::new("a\0b"), Some(8), Some(&recorded))
+            file_matches_identity(Path::new("a\0b"), Some(8))
         });
         assert!(!broken);
         assert!(text.contains("WARN") && text.contains("cannot be stat-ed"), "{text}");

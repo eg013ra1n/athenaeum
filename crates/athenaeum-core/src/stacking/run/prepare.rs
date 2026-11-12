@@ -191,11 +191,34 @@ fn resolve_prepare_job(
         )?;
         (existing, mosaic_row)
     };
+    // The in-place rule (file-identity §4.1): a row that names the user's own light (or a project replica), not a
+    // working-folder file, is fresh only while it names THIS frame's current input. After a relocate the row can
+    // name the light's old path, where another file of the same size may now sit; a miss is a Job, which re-points
+    // the row. A zip frame used in place is detached into `prepared/`, an own file, so it has no expectation.
+    let expected_calibrated = (zip_markers.is_none() && matches!(action, PrepareAction::InPlace))
+        .then(|| catalog_path.clone());
+    let expected_mosaic = (zip_markers.is_none()
+        && keep_mosaic
+        && matches!(
+            action,
+            PrepareAction::Write {
+                read: crate::stacking::prepare::PrepareRead::InPlaceFits,
+                ..
+            }
+        ))
+    .then(|| catalog_path.clone());
+    let names_expected = |row: &crate::db::stacking::StackingArtifactRow, expected: &Option<PathBuf>| {
+        expected
+            .as_deref()
+            .is_none_or(|input| row.path.as_deref().is_some_and(|p| Path::new(p) == input))
+    };
     if rc.rerun_from != Some(Stage::Calibrate) {
-        let mosaic_fresh =
-            !keep_mosaic || mosaic_row.as_ref().is_some_and(|row| is_fresh(row, &hash));
+        let mosaic_fresh = !keep_mosaic
+            || mosaic_row.as_ref().is_some_and(|row| {
+                is_fresh(row, &hash) && names_expected(row, &expected_mosaic)
+            });
         if let Some(row) = &existing {
-            if is_fresh(row, &hash) && mosaic_fresh {
+            if is_fresh(row, &hash) && names_expected(row, &expected_calibrated) && mosaic_fresh {
                 return Ok(PrepareResolved::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
                 });

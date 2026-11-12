@@ -656,6 +656,11 @@ impl Pass1Rig {
         rig
     }
 
+    /// Replace the run's frame origins (a test that recomputes `plan_groups` after the catalog moved a light).
+    pub(super) fn set_origins(&mut self, origins: FrameOrigins) {
+        self.origins = Some(origins);
+    }
+
     /// As [`Self::attested`], but the lights stay the fixture's 16-bit mono files: Prepare converts them into the
     /// unit domain under `prepared/` (the rig of a Prepare write-order test).
     pub(super) fn attested_16bit() -> Pass1Rig {
@@ -697,6 +702,8 @@ impl Pass1Rig {
             group_ids,
         );
         if let Some(origins) = &self.origins {
+            // The memo carries the origins too: an attested set's rows must carry the hash the gate computes.
+            rc.memo = HashMemo::new(origins.clone());
             rc.origins = origins.clone();
         }
         stage_calibrate(&mut rc)
@@ -752,6 +759,8 @@ impl Pass1Rig {
         );
         rc.rerun_from = rerun_from;
         if let Some(origins) = &self.origins {
+            // The memo carries the origins too: an attested set's rows must carry the hash the gate computes.
+            rc.memo = HashMemo::new(origins.clone());
             rc.origins = origins.clone();
         }
         if let Some(n) = cancel_after {

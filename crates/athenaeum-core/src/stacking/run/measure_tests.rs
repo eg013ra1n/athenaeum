@@ -791,9 +791,9 @@ fn measure_pass1_from_the_artifact_after_a_lost_pass_two() {
     );
 }
 
-/// Plan A Task 11c (R11c-4), amended by the frame-level cache (spec §5.3): a calibrated file whose mtime moved
-/// since the artifact was written is recalibrated by the calibrate stage (its row records the old mtime), and the
-/// first pass survives: validity follows the calibration hash, not the mtime. Nothing is excluded.
+/// Plan A Task 11c (R11c-4), amended by the frame-level cache (spec §5.3) and the file identity (FI-2): a calibrated
+/// file whose mtime moved since the artifact was written is reused, not recalibrated (an own file is judged by key +
+/// size), and the first pass survives: validity follows the calibration hash, not the mtime. Nothing is excluded.
 #[test]
 fn measure_pass1_artifact_survives_a_touched_source() {
     let rig = Pass1Rig::new();
@@ -1078,8 +1078,7 @@ fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
         assert!(
             crate::stacking::plan::file_matches_identity(
                 Path::new(row.path.as_deref().unwrap()),
-                row.size,
-                row.modified_at.as_deref()
+                row.size
             ),
             "frame {id}: the rewritten artifact's row describes another file"
         );
