@@ -5189,6 +5189,19 @@ struct PublishLink {
     display: String,
 }
 
+/// What the selection step hands on: the live project, the publishing device,
+/// the candidates, the held-back frames and the prepared rows to drop or consume.
+struct Selection {
+    project: CollabProjectRow,
+    binding: Option<crate::db::collab::PublishingDevice>,
+    held_back: Vec<HeldBackFrame>,
+    candidates: Vec<PublishCandidate>,
+    stale_ids: Vec<i64>,
+    withheld_prepared: Vec<i64>,
+    adopt_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow>,
+    from_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow>,
+}
+
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -5215,192 +5228,16 @@ async fn run_publish(
 
     // ── 1. Collaboration root, then the gate ─────────────────────────────────
     let collab_root = require_collaboration_root(ctx)?;
-    let (project, gated, binding) = {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        let project = crate::api::collab_exchange::live_project(&conn, project_id)?;
-        let gated = project_gate(&conn, &project)?;
-        let binding =
-            crate::db::collab::publishing_device(&conn, project_id).map_err(|e| {
-                tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the publishing device failed");
-                internal(e)
-            })?;
-        (project, gated, binding)
-    };
-    // Wave 2 (plan 2026-09-30 Task 1): a selection restricts the run to the
-    // chosen gate rows; the rest are neither candidates nor held back.
-    let gated: Vec<_> = match only {
-        None => gated,
-        Some(ids) => {
-            let keep: HashSet<i64> = ids.iter().copied().collect();
-            let kept: Vec<_> = gated
-                .into_iter()
-                .filter(|(_, row)| keep.contains(&row.frame_id))
-                .collect();
-            tracing::info!(
-                project_id,
-                count = kept.len(),
-                "publish: restricted to a selection"
-            );
-            kept
-        }
-    };
-    let mut held_back: Vec<HeldBackFrame> = Vec::new();
-    let mut candidates: Vec<PublishCandidate> = Vec::new();
-    // Prepared frames whose recipe or file moved. Dropped only after the
-    // account, node and store checks (section 2): a refused run never
-    // touches disk.
-    let mut stale_ids: Vec<i64> = Vec::new();
-    // Plan W3: prepared rows of frames withheld before this Publish run —
-    // dropped with the stale ones (never an attested original), not counted
-    // as stale.
-    let mut withheld_prepared: Vec<i64> = Vec::new();
-    // P6: the prepared row of an adopt-class frame. The frame is published
-    // (adopted), so the row is consumed — and its file may be the very
-    // landing the adoption writes to.
-    let mut adopt_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow> = HashMap::new();
-    // Publish scope (spec §4.3): the prepared row behind each New candidate
-    // — its reviewed file is what is seeded and announced, never regenerated.
-    let mut from_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow> = HashMap::new();
-    {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        let ids: Vec<i64> = gated.iter().map(|(_, row)| row.frame_id).collect();
-        // The section 4.1 local facts.
-        let mut local = ProjectLocal::load(&conn, project_id, &ids)?;
-        let own_by_src = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
-            tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
-            internal(e)
-        })?;
-        for (id, row) in gated {
-            if !row.publishable {
-                // Plan W1: a gate failure is the run's business only when
-                // the member selected the frame.
-                if only.is_some() {
-                    held_back.push(HeldBackFrame {
-                        frame_id: row.frame_id,
-                        filename: row.filename,
-                        reasons: row.failures,
-                        publishing_device: None,
-                    });
-                }
-                continue;
-            }
-            let fid = row.frame_id;
-            match scope {
-                RunScope::Calibrate { .. } => {
-                    // Spec §4.3: only Ready frames are calibrated — never one
-                    // already published, withheld, black-holed or prepared
-                    // and still current.
-                    if own_by_src.contains_key(&fid)
-                        || local.withheld.contains(&fid)
-                        || local.black_holed.contains(&fid)
-                    {
-                        continue;
-                    }
-                    if let Some(p) = local.prepared.get(&fid) {
-                        if prepared_is_current(&conn, p, id.attested) {
-                            continue;
-                        }
-                        stale_ids.push(fid);
-                    }
-                }
-                RunScope::Publish { .. } | RunScope::Republish { .. }
-                    if !own_by_src.contains_key(&fid) =>
-                {
-                    // P6: a frame the hub already lists as mine with no
-                    // local binding (a replaced device's) is adopted as an
-                    // update, never reviewed — whatever its prepared state.
-                    match is_adopt_class(&conn, project_id, &id.uuid) {
-                        Ok(true) => {
-                            if let Some(p) = local.prepared.remove(&fid) {
-                                adopt_prepared.insert(fid, p);
-                            }
-                        }
-                        Ok(false) => {
-                            let RunScope::Publish { include_new, .. } = scope else {
-                                // Ruling R5 (spec P2, P4): Republish never
-                                // produces a New frame — a frame with no own
-                                // row reaches the hub only through Calibrate
-                                // → review → Publish, and never withheld.
-                                if only.is_some() {
-                                    held_back.push(held(
-                                        fid,
-                                        &row.filename,
-                                        "not published yet — calibrate and publish it first".into(),
-                                    ));
-                                }
-                                continue;
-                            };
-                            // Spec §4.3: a New frame is published only from
-                            // its prepared (calibrated and reviewed) file.
-                            if local.withheld.contains(&fid) {
-                                // P4 / plan W3: never announced; its
-                                // prepared row and file go.
-                                if local.prepared.contains_key(&fid) {
-                                    withheld_prepared.push(fid);
-                                }
-                                // Plan W1: a selected frame is reported.
-                                if only.is_some() {
-                                    held_back.push(held(
-                                        fid,
-                                        &row.filename,
-                                        crate::collab::contributor_state::WITHHELD_REASON.into(),
-                                    ));
-                                }
-                                continue;
-                            }
-                            if local.black_holed.contains(&fid) {
-                                // Spec §4.4: skipped; a prepared row stays
-                                // (a restore brings the frame back to Review).
-                                continue;
-                            }
-                            match local.prepared.remove(&fid) {
-                                Some(p) if prepared_is_current(&conn, &p, id.attested) => {
-                                    if !include_new {
-                                        continue;
-                                    }
-                                    from_prepared.insert(fid, p);
-                                }
-                                Some(_) => {
-                                    stale_ids.push(fid);
-                                    continue;
-                                }
-                                None => {
-                                    if only.is_some() {
-                                        held_back.push(held(
-                                            fid,
-                                            &row.filename,
-                                            "not calibrated yet — calibrate it first".into(),
-                                        ));
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: read frame row failed");
-                            held_back.push(held(
-                                fid,
-                                &row.filename,
-                                format!("cannot read the frame's project row: {e:#}"),
-                            ));
-                            continue;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            candidates.push(PublishCandidate {
-                frame_id: fid,
-                filename: row.filename,
-                uuid: id.uuid,
-                // `publishable` implies a dictionary match (P3).
-                filter_canonical: id.filter_canonical.unwrap_or_default(),
-                attested: id.attested,
-            });
-        }
-    }
+    let Selection {
+        project,
+        binding,
+        mut held_back,
+        candidates,
+        stale_ids,
+        withheld_prepared,
+        adopt_prepared,
+        from_prepared,
+    } = publish_select(&pass)?;
     if candidates.is_empty() && stale_ids.is_empty() && withheld_prepared.is_empty() {
         tracing::info!(
             project_id,
@@ -7513,6 +7350,216 @@ fn publish_drop_prepared(
         );
     }
     Ok(stale)
+}
+
+/// Section 1: the live project and its gate, the selection, then the candidate
+/// walk that sorts every gated frame into a candidate, a held-back frame or a
+/// prepared row to drop.
+fn publish_select(pass: &PublishPass<'_>) -> Result<Selection, ApiError> {
+    let PublishPass {
+        ctx,
+        project_id,
+        scope,
+        only,
+        ..
+    } = *pass;
+    use crate::db::collab_frames as frames_db;
+    let (project, gated, binding) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let project = crate::api::collab_exchange::live_project(&conn, project_id)?;
+        let gated = project_gate(&conn, &project)?;
+        let binding =
+            crate::db::collab::publishing_device(&conn, project_id).map_err(|e| {
+                tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the publishing device failed");
+                internal(e)
+            })?;
+        (project, gated, binding)
+    };
+    // Wave 2 (plan 2026-09-30 Task 1): a selection restricts the run to the
+    // chosen gate rows; the rest are neither candidates nor held back.
+    let gated: Vec<_> = match only {
+        None => gated,
+        Some(ids) => {
+            let keep: HashSet<i64> = ids.iter().copied().collect();
+            let kept: Vec<_> = gated
+                .into_iter()
+                .filter(|(_, row)| keep.contains(&row.frame_id))
+                .collect();
+            tracing::info!(
+                project_id,
+                count = kept.len(),
+                "publish: restricted to a selection"
+            );
+            kept
+        }
+    };
+    let mut held_back: Vec<HeldBackFrame> = Vec::new();
+    let mut candidates: Vec<PublishCandidate> = Vec::new();
+    // Prepared frames whose recipe or file moved. Dropped only after the
+    // account, node and store checks (section 2): a refused run never
+    // touches disk.
+    let mut stale_ids: Vec<i64> = Vec::new();
+    // Plan W3: prepared rows of frames withheld before this Publish run —
+    // dropped with the stale ones (never an attested original), not counted
+    // as stale.
+    let mut withheld_prepared: Vec<i64> = Vec::new();
+    // P6: the prepared row of an adopt-class frame. The frame is published
+    // (adopted), so the row is consumed — and its file may be the very
+    // landing the adoption writes to.
+    let mut adopt_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow> = HashMap::new();
+    // Publish scope (spec §4.3): the prepared row behind each New candidate
+    // — its reviewed file is what is seeded and announced, never regenerated.
+    let mut from_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow> = HashMap::new();
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let ids: Vec<i64> = gated.iter().map(|(_, row)| row.frame_id).collect();
+        // The section 4.1 local facts.
+        let mut local = ProjectLocal::load(&conn, project_id, &ids)?;
+        let own_by_src = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
+            internal(e)
+        })?;
+        for (id, row) in gated {
+            if !row.publishable {
+                // Plan W1: a gate failure is the run's business only when
+                // the member selected the frame.
+                if only.is_some() {
+                    held_back.push(HeldBackFrame {
+                        frame_id: row.frame_id,
+                        filename: row.filename,
+                        reasons: row.failures,
+                        publishing_device: None,
+                    });
+                }
+                continue;
+            }
+            let fid = row.frame_id;
+            match scope {
+                RunScope::Calibrate { .. } => {
+                    // Spec §4.3: only Ready frames are calibrated — never one
+                    // already published, withheld, black-holed or prepared
+                    // and still current.
+                    if own_by_src.contains_key(&fid)
+                        || local.withheld.contains(&fid)
+                        || local.black_holed.contains(&fid)
+                    {
+                        continue;
+                    }
+                    if let Some(p) = local.prepared.get(&fid) {
+                        if prepared_is_current(&conn, p, id.attested) {
+                            continue;
+                        }
+                        stale_ids.push(fid);
+                    }
+                }
+                RunScope::Publish { .. } | RunScope::Republish { .. }
+                    if !own_by_src.contains_key(&fid) =>
+                {
+                    // P6: a frame the hub already lists as mine with no
+                    // local binding (a replaced device's) is adopted as an
+                    // update, never reviewed — whatever its prepared state.
+                    match is_adopt_class(&conn, project_id, &id.uuid) {
+                        Ok(true) => {
+                            if let Some(p) = local.prepared.remove(&fid) {
+                                adopt_prepared.insert(fid, p);
+                            }
+                        }
+                        Ok(false) => {
+                            let RunScope::Publish { include_new, .. } = scope else {
+                                // Ruling R5 (spec P2, P4): Republish never
+                                // produces a New frame — a frame with no own
+                                // row reaches the hub only through Calibrate
+                                // → review → Publish, and never withheld.
+                                if only.is_some() {
+                                    held_back.push(held(
+                                        fid,
+                                        &row.filename,
+                                        "not published yet — calibrate and publish it first".into(),
+                                    ));
+                                }
+                                continue;
+                            };
+                            // Spec §4.3: a New frame is published only from
+                            // its prepared (calibrated and reviewed) file.
+                            if local.withheld.contains(&fid) {
+                                // P4 / plan W3: never announced; its
+                                // prepared row and file go.
+                                if local.prepared.contains_key(&fid) {
+                                    withheld_prepared.push(fid);
+                                }
+                                // Plan W1: a selected frame is reported.
+                                if only.is_some() {
+                                    held_back.push(held(
+                                        fid,
+                                        &row.filename,
+                                        crate::collab::contributor_state::WITHHELD_REASON.into(),
+                                    ));
+                                }
+                                continue;
+                            }
+                            if local.black_holed.contains(&fid) {
+                                // Spec §4.4: skipped; a prepared row stays
+                                // (a restore brings the frame back to Review).
+                                continue;
+                            }
+                            match local.prepared.remove(&fid) {
+                                Some(p) if prepared_is_current(&conn, &p, id.attested) => {
+                                    if !include_new {
+                                        continue;
+                                    }
+                                    from_prepared.insert(fid, p);
+                                }
+                                Some(_) => {
+                                    stale_ids.push(fid);
+                                    continue;
+                                }
+                                None => {
+                                    if only.is_some() {
+                                        held_back.push(held(
+                                            fid,
+                                            &row.filename,
+                                            "not calibrated yet — calibrate it first".into(),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: read frame row failed");
+                            held_back.push(held(
+                                fid,
+                                &row.filename,
+                                format!("cannot read the frame's project row: {e:#}"),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            candidates.push(PublishCandidate {
+                frame_id: fid,
+                filename: row.filename,
+                uuid: id.uuid,
+                // `publishable` implies a dictionary match (P3).
+                filter_canonical: id.filter_canonical.unwrap_or_default(),
+                attested: id.attested,
+            });
+        }
+    }
+    Ok(Selection {
+        project,
+        binding,
+        held_back,
+        candidates,
+        stale_ids,
+        withheld_prepared,
+        adopt_prepared,
+        from_prepared,
+    })
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
