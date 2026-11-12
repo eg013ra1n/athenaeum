@@ -5220,6 +5220,15 @@ struct ToRecord {
     already_versioned: Vec<SeededFrame>,
 }
 
+/// What the seed-by-reference step hands on: the new frames seeded for the
+/// announce, the updates staged for their versions, and the frames bound at
+/// identical bytes.
+struct Seeded {
+    new_frames: Vec<SeededFrame>,
+    updates: Vec<SeededFrame>,
+    bound: Vec<SeededFrame>,
+}
+
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -5242,7 +5251,7 @@ async fn run_publish(
         after_split,
     };
     use crate::account::AccountClientError as E;
-    use crate::db::collab_frames::{self as frames_db, FrameOrigin};
+    use crate::db::collab_frames as frames_db;
 
     // ── 1. Collaboration root, then the gate ─────────────────────────────────
     let collab_root = require_collaboration_root(ctx)?;
@@ -5411,244 +5420,22 @@ async fn run_publish(
     // columns follow after `…/version` (`set_own_version`), or are put back
     // when the hub refuses it (`unstage_updates`).
     let disk_lock = crate::api::collab_exchange::project_disk_lock(ctx, project_id)?;
-    let mut new_frames: Vec<SeededFrame> = Vec::new();
-    let mut updates: Vec<SeededFrame> = Vec::new();
-    let mut bound: Vec<SeededFrame> = Vec::new();
-    for (i, w) in outcome.written.into_iter().enumerate() {
-        // One tick per frame, however its iteration ends.
-        let _seeded = FrameDone {
-            run,
-            done: i + 1,
-            file: w.filename.clone(),
-        };
-        if w.kind.row().is_none() {
-            // A reviewed file is announced with its calibrate-time xxh3 and
-            // size, so it is seeded only while it is still that file: the
-            // section-1 currency check may be long past (other frames'
-            // generation and seeding ran since). Changed or gone → stale:
-            // back to Ready (row and non-external file), never announced.
-            if let Some(p) = from_prepared.get(&w.frame_id) {
-                if p.size_mtime_seen.is_none()
-                    || size_mtime_seen_quiet(&w.target) != p.size_mtime_seen
-                {
-                    tracing::info!(project_id, frame_id = w.frame_id, path = %w.target.display(), "publish: prepared file changed since its review; back to ready");
-                    let dropped = {
-                        let db = db(ctx)?;
-                        let conn = db.conn();
-                        drop_stale_prepared(&conn, project_id, &[w.frame_id])
-                    };
-                    match dropped {
-                        Ok(n) => stale += n,
-                        // Logged at `error` by `drop_stale_prepared`.
-                        Err(e) => held_back.push(held(
-                            w.frame_id,
-                            &w.filename,
-                            format!("the calibrated file changed since its review: {e}"),
-                        )),
-                    }
-                    continue;
-                }
-            }
-            match node
-                .seed_project_frame(project_id, &w.uuid, 1, &w.target)
-                .await
-            {
-                Ok(hash) => new_frames.push(SeededFrame {
-                    blake3: hash.to_hex().to_string(),
-                    content_version: 1,
-                    hub_prior: None,
-                    written: w,
-                }),
-                Err(e) => {
-                    tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: seeding a new frame failed; not announced");
-                    held_back.push(held(
-                        w.frame_id,
-                        &w.filename,
-                        format!("seeding failed: {e:#}"),
-                    ));
-                }
-            }
-            continue;
-        }
-        let _disk = disk_lock.lock().await;
-        // C1c: the row as it is NOW — not as the split saw it.
-        let current = {
-            let db = db(ctx)?;
-            let conn = db.conn();
-            frames_db::get(&conn, project_id, &w.uuid)
-        };
-        let current = match current {
-            Ok(Some(row)) if row.origin == FrameOrigin::Own => row,
-            Ok(_) => {
-                tracing::error!(project_id, frame_uuid = %w.uuid, "publish: the own frame row vanished before seeding");
-                // F5/A1: `staged == target` for an external frame — its
-                // original is never removed.
-                if w.staged != w.target {
-                    remove_temp(project_id, &w.staged);
-                }
-                held_back.push(held(
-                    w.frame_id,
-                    &w.filename,
-                    "the frame's project row vanished during the run".into(),
-                ));
-                continue;
-            }
-            Err(e) => {
-                tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: re-reading the own frame failed");
-                if w.staged != w.target {
-                    remove_temp(project_id, &w.staged);
-                }
-                held_back.push(held(
-                    w.frame_id,
-                    &w.filename,
-                    format!("cannot read the frame's project row: {e:#}"),
-                ));
-                continue;
-            }
-        };
-        let identical = w.identical || w.staged_blake3.as_deref() == Some(current.blake3.as_str());
-        if identical && !w.identical {
-            // C1c: another run already versioned exactly these bytes.
-            tracing::info!(project_id, frame_uuid = %w.uuid, content_version = current.content_version, "publish: the hub already has these bytes; no new version");
-            if let PublishKind::Update(_) = &w.kind {
-                // F5/A1: never remove an external frame's original.
-                if w.staged != w.target {
-                    remove_temp(project_id, &w.staged);
-                }
-                // I2: an attested original moved on disk (the app's own file
-                // browser, or a forced Republish reading its CURRENT catalog
-                // path) keeps identical bytes and size/mtime, so the recipe
-                // is unchanged and this identical-bytes branch is the one
-                // that runs — but `landed_path` still names the OLD location
-                // unless moved here too, or the row reads "not on disk"
-                // forever. Same `update_landed_path` + UNIQUE-failure
-                // handling as the generated-file move above.
-                let new_landed = w.target.to_string_lossy().to_string();
-                if current.landed_path.as_deref() != Some(new_landed.as_str()) {
-                    let moved = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
-                        frames_db::update_landed_path(&db.conn(), project_id, &w.uuid, &new_landed)
-                    });
-                    match moved {
-                        Ok(n) if n > 0 => {
-                            tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved (identical bytes, moved on disk)");
-                        }
-                        Ok(_) => {
-                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, "publish: moving the own frame's landed path matched no row");
-                        }
-                        Err(e) => {
-                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed");
-                        }
-                    }
-                }
-                let written = {
-                    let db = db(ctx)?;
-                    let conn = db.conn();
-                    frames_db::set_recipe_hash(&conn, project_id, &w.uuid, &w.recipe).and_then(
-                        |n| {
-                            // The hub already versioned exactly these bytes: a
-                            // row staged with them is confirmed (Task 10, C11).
-                            frames_db::clear_own_staged(
-                                &conn,
-                                project_id,
-                                &w.uuid,
-                                &current.blake3,
-                                &w.xxh3,
-                            )?;
-                            Ok(n)
-                        },
-                    )
-                };
-                if let Err(e) = written {
-                    tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: storing the new recipe failed");
-                }
-                unchanged += 1;
-                continue;
-            }
-        }
-        let prior_version = current.content_version;
-        let version = if identical {
-            prior_version
-        } else {
-            // The old tag must not pin the old content once the landed file
-            // is replaced.
-            if let Err(e) = node.unseed_project_frame(project_id, &w.uuid).await {
-                tracing::warn!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: unseeding the previous version failed");
-            }
-            prior_version + 1
-        };
-        // F5/A1: an external Update's `staged` IS `target` — the same
-        // original path — so there is nothing to rename, and never a
-        // `remove_temp` on it either.
-        if w.staged != w.target {
-            if let Err(e) = std::fs::rename(&w.staged, &w.target) {
-                tracing::error!(project_id, frame_uuid = %w.uuid, src = %w.staged.display(), dest = %w.target.display(), error = %e, "publish: replacing the landed frame failed");
-                remove_temp(project_id, &w.staged);
-                held_back.push(held(
-                    w.frame_id,
-                    &w.filename,
-                    format!("cannot replace the published file: {e}"),
-                ));
-                continue;
-            }
-        }
-        match node
-            .seed_project_frame(project_id, &w.uuid, version, &w.target)
-            .await
-        {
-            Ok(hash) => {
-                publish_move_landed_path(ctx, project_id, &own_dir, &w, &current);
-                let mut f = SeededFrame {
-                    blake3: hash.to_hex().to_string(),
-                    content_version: version,
-                    hub_prior: None,
-                    written: w,
-                };
-                if identical {
-                    f.written.identical = true;
-                    bound.push(f);
-                    continue;
-                }
-                f.hub_prior = Some((current.xxh3.clone(), current.byte_size));
-                let staged = {
-                    let db = db(ctx)?;
-                    let conn = db.conn();
-                    frames_db::stage_own_file(
-                        &conn,
-                        project_id,
-                        &f.written.uuid,
-                        &f.written.target.to_string_lossy(),
-                        &f.written.xxh3,
-                        f.written.byte_size as i64,
-                        size_mtime_seen(&f.written.target).as_deref(),
-                    )
-                };
-                match staged {
-                    Ok(0) => {
-                        // Fix round 2 (finding 1): a silent no-match here
-                        // means `landed_path` in the row does not (yet, or
-                        // any longer) equal `f.written.target` — most often
-                        // because the move above failed (finding 2) — and
-                        // disk truth is now silently stale until the next
-                        // publish notices the drift.
-                        tracing::error!(project_id, frame_uuid = %f.written.uuid, path = %f.written.target.display(), "publish: recording the regenerated file matched no row");
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: recording the regenerated file failed");
-                    }
-                }
-                updates.push(f);
-            }
-            Err(e) => {
-                tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: seeding failed");
-                held_back.push(held(
-                    w.frame_id,
-                    &w.filename,
-                    format!("seeding failed: {e:#}"),
-                ));
-            }
-        }
-    }
+    let Seeded {
+        new_frames,
+        updates,
+        bound,
+    } = publish_seed(
+        &pass,
+        &node,
+        &disk_lock,
+        &own_dir,
+        &from_prepared,
+        outcome.written,
+        &mut held_back,
+        &mut stale,
+        &mut unchanged,
+    )
+    .await?;
 
     // ── 5. Announce new frames, ≤ 500 per batch ──────────────────────────────
     run.stage(PublishStage::Announcing, new_frames.len());
@@ -7714,6 +7501,273 @@ fn publish_record_own_rows(
         }
     }
     Ok((announced_n, updated_n))
+}
+
+/// Seed by reference: every written frame is seeded under the project's disk
+/// lock (an update or adoption) or without it (a new frame), and sorted into
+/// the new frames, the updates and the frames bound at identical bytes.
+#[allow(clippy::too_many_arguments)]
+async fn publish_seed(
+    pass: &PublishPass<'_>,
+    node: &crate::sharing::iroh::node::SharedIrohNode,
+    disk_lock: &tokio::sync::Mutex<()>,
+    own_dir: &Path,
+    from_prepared: &HashMap<i64, crate::db::collab_prepare::PreparedRow>,
+    written: Vec<WrittenFrame>,
+    held_back: &mut Vec<HeldBackFrame>,
+    stale: &mut usize,
+    unchanged: &mut usize,
+) -> Result<Seeded, ApiError> {
+    let PublishPass {
+        ctx,
+        project_id,
+        run,
+        ..
+    } = *pass;
+    use crate::db::collab_frames::{self as frames_db, FrameOrigin};
+    let mut new_frames: Vec<SeededFrame> = Vec::new();
+    let mut updates: Vec<SeededFrame> = Vec::new();
+    let mut bound: Vec<SeededFrame> = Vec::new();
+    for (i, w) in written.into_iter().enumerate() {
+        // One tick per frame, however its iteration ends.
+        let _seeded = FrameDone {
+            run,
+            done: i + 1,
+            file: w.filename.clone(),
+        };
+        if w.kind.row().is_none() {
+            // A reviewed file is announced with its calibrate-time xxh3 and
+            // size, so it is seeded only while it is still that file: the
+            // section-1 currency check may be long past (other frames'
+            // generation and seeding ran since). Changed or gone → stale:
+            // back to Ready (row and non-external file), never announced.
+            if let Some(p) = from_prepared.get(&w.frame_id) {
+                if p.size_mtime_seen.is_none()
+                    || size_mtime_seen_quiet(&w.target) != p.size_mtime_seen
+                {
+                    tracing::info!(project_id, frame_id = w.frame_id, path = %w.target.display(), "publish: prepared file changed since its review; back to ready");
+                    let dropped = {
+                        let db = db(ctx)?;
+                        let conn = db.conn();
+                        drop_stale_prepared(&conn, project_id, &[w.frame_id])
+                    };
+                    match dropped {
+                        Ok(n) => *stale += n,
+                        // Logged at `error` by `drop_stale_prepared`.
+                        Err(e) => held_back.push(held(
+                            w.frame_id,
+                            &w.filename,
+                            format!("the calibrated file changed since its review: {e}"),
+                        )),
+                    }
+                    continue;
+                }
+            }
+            match node
+                .seed_project_frame(project_id, &w.uuid, 1, &w.target)
+                .await
+            {
+                Ok(hash) => new_frames.push(SeededFrame {
+                    blake3: hash.to_hex().to_string(),
+                    content_version: 1,
+                    hub_prior: None,
+                    written: w,
+                }),
+                Err(e) => {
+                    tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: seeding a new frame failed; not announced");
+                    held_back.push(held(
+                        w.frame_id,
+                        &w.filename,
+                        format!("seeding failed: {e:#}"),
+                    ));
+                }
+            }
+            continue;
+        }
+        let _disk = disk_lock.lock().await;
+        // C1c: the row as it is NOW — not as the split saw it.
+        let current = {
+            let db = db(ctx)?;
+            let conn = db.conn();
+            frames_db::get(&conn, project_id, &w.uuid)
+        };
+        let current = match current {
+            Ok(Some(row)) if row.origin == FrameOrigin::Own => row,
+            Ok(_) => {
+                tracing::error!(project_id, frame_uuid = %w.uuid, "publish: the own frame row vanished before seeding");
+                // F5/A1: `staged == target` for an external frame — its
+                // original is never removed.
+                if w.staged != w.target {
+                    remove_temp(project_id, &w.staged);
+                }
+                held_back.push(held(
+                    w.frame_id,
+                    &w.filename,
+                    "the frame's project row vanished during the run".into(),
+                ));
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: re-reading the own frame failed");
+                if w.staged != w.target {
+                    remove_temp(project_id, &w.staged);
+                }
+                held_back.push(held(
+                    w.frame_id,
+                    &w.filename,
+                    format!("cannot read the frame's project row: {e:#}"),
+                ));
+                continue;
+            }
+        };
+        let identical = w.identical || w.staged_blake3.as_deref() == Some(current.blake3.as_str());
+        if identical && !w.identical {
+            // C1c: another run already versioned exactly these bytes.
+            tracing::info!(project_id, frame_uuid = %w.uuid, content_version = current.content_version, "publish: the hub already has these bytes; no new version");
+            if let PublishKind::Update(_) = &w.kind {
+                // F5/A1: never remove an external frame's original.
+                if w.staged != w.target {
+                    remove_temp(project_id, &w.staged);
+                }
+                // I2: an attested original moved on disk (the app's own file
+                // browser, or a forced Republish reading its CURRENT catalog
+                // path) keeps identical bytes and size/mtime, so the recipe
+                // is unchanged and this identical-bytes branch is the one
+                // that runs — but `landed_path` still names the OLD location
+                // unless moved here too, or the row reads "not on disk"
+                // forever. Same `update_landed_path` + UNIQUE-failure
+                // handling as the generated-file move above.
+                let new_landed = w.target.to_string_lossy().to_string();
+                if current.landed_path.as_deref() != Some(new_landed.as_str()) {
+                    let moved = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
+                        frames_db::update_landed_path(&db.conn(), project_id, &w.uuid, &new_landed)
+                    });
+                    match moved {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved (identical bytes, moved on disk)");
+                        }
+                        Ok(_) => {
+                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, "publish: moving the own frame's landed path matched no row");
+                        }
+                        Err(e) => {
+                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed");
+                        }
+                    }
+                }
+                let written = {
+                    let db = db(ctx)?;
+                    let conn = db.conn();
+                    frames_db::set_recipe_hash(&conn, project_id, &w.uuid, &w.recipe).and_then(
+                        |n| {
+                            // The hub already versioned exactly these bytes: a
+                            // row staged with them is confirmed (Task 10, C11).
+                            frames_db::clear_own_staged(
+                                &conn,
+                                project_id,
+                                &w.uuid,
+                                &current.blake3,
+                                &w.xxh3,
+                            )?;
+                            Ok(n)
+                        },
+                    )
+                };
+                if let Err(e) = written {
+                    tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: storing the new recipe failed");
+                }
+                *unchanged += 1;
+                continue;
+            }
+        }
+        let prior_version = current.content_version;
+        let version = if identical {
+            prior_version
+        } else {
+            // The old tag must not pin the old content once the landed file
+            // is replaced.
+            if let Err(e) = node.unseed_project_frame(project_id, &w.uuid).await {
+                tracing::warn!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: unseeding the previous version failed");
+            }
+            prior_version + 1
+        };
+        // F5/A1: an external Update's `staged` IS `target` — the same
+        // original path — so there is nothing to rename, and never a
+        // `remove_temp` on it either.
+        if w.staged != w.target {
+            if let Err(e) = std::fs::rename(&w.staged, &w.target) {
+                tracing::error!(project_id, frame_uuid = %w.uuid, src = %w.staged.display(), dest = %w.target.display(), error = %e, "publish: replacing the landed frame failed");
+                remove_temp(project_id, &w.staged);
+                held_back.push(held(
+                    w.frame_id,
+                    &w.filename,
+                    format!("cannot replace the published file: {e}"),
+                ));
+                continue;
+            }
+        }
+        match node
+            .seed_project_frame(project_id, &w.uuid, version, &w.target)
+            .await
+        {
+            Ok(hash) => {
+                publish_move_landed_path(ctx, project_id, &own_dir, &w, &current);
+                let mut f = SeededFrame {
+                    blake3: hash.to_hex().to_string(),
+                    content_version: version,
+                    hub_prior: None,
+                    written: w,
+                };
+                if identical {
+                    f.written.identical = true;
+                    bound.push(f);
+                    continue;
+                }
+                f.hub_prior = Some((current.xxh3.clone(), current.byte_size));
+                let staged = {
+                    let db = db(ctx)?;
+                    let conn = db.conn();
+                    frames_db::stage_own_file(
+                        &conn,
+                        project_id,
+                        &f.written.uuid,
+                        &f.written.target.to_string_lossy(),
+                        &f.written.xxh3,
+                        f.written.byte_size as i64,
+                        size_mtime_seen(&f.written.target).as_deref(),
+                    )
+                };
+                match staged {
+                    Ok(0) => {
+                        // Fix round 2 (finding 1): a silent no-match here
+                        // means `landed_path` in the row does not (yet, or
+                        // any longer) equal `f.written.target` — most often
+                        // because the move above failed (finding 2) — and
+                        // disk truth is now silently stale until the next
+                        // publish notices the drift.
+                        tracing::error!(project_id, frame_uuid = %f.written.uuid, path = %f.written.target.display(), "publish: recording the regenerated file matched no row");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: recording the regenerated file failed");
+                    }
+                }
+                updates.push(f);
+            }
+            Err(e) => {
+                tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: seeding failed");
+                held_back.push(held(
+                    w.frame_id,
+                    &w.filename,
+                    format!("seeding failed: {e:#}"),
+                ));
+            }
+        }
+    }
+    Ok(Seeded {
+        new_frames,
+        updates,
+        bound,
+    })
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
