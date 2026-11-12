@@ -26,18 +26,6 @@ pub use athenaeum_core::api::files::{BrowseDirectoriesResponse, CatalogSearchHit
 // ── Request structs ──────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
-pub struct GetFilesArgs {
-    pub limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct GetFilesByDirectoryArgs {
-    #[serde(rename = "directoryPath")]
-    pub directory_path: String,
-    pub limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize)]
 pub struct GetDirectoryContentsArgs {
     #[serde(rename = "directoryPath")]
     pub path: String,
@@ -70,31 +58,6 @@ pub struct GetFilesWithFramesByIdsArgs {
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
-
-/// POST /api/get_files
-///
-/// Returns files with their frame metadata, most recently created first.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn get_files(
-    State(state): State<WebAppState>,
-    Json(args): Json<GetFilesArgs>,
-) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    api::get_files(&state.ctx, args.limit).map(Json).map_err(api_err)
-}
-
-/// POST /api/get_files_by_directory
-///
-/// Returns files directly inside the given directory (non-recursive), with
-/// their frame metadata. The `directoryPath` must be an absolute path.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn get_files_by_directory(
-    State(state): State<WebAppState>,
-    Json(args): Json<GetFilesByDirectoryArgs>,
-) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    api::get_files_by_directory(&state.ctx, args.directory_path, args.limit)
-        .map(Json)
-        .map_err(api_err)
-}
 
 /// POST /api/get_directory_contents
 ///

@@ -429,30 +429,6 @@ pub async fn cleanup_transfer_leftovers(
         .map_err(api_err)
 }
 
-/// POST /api/get_sync_auto_mode
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn get_sync_auto_mode(
-    State(state): State<WebAppState>,
-    _body: Json<serde_json::Value>,
-) -> Result<Json<bool>, (StatusCode, String)> {
-    api::get_sync_auto_mode(&state.ctx).map(Json).map_err(api_err)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetAutoModeArgs {
-    pub enabled: bool,
-}
-
-/// POST /api/set_sync_auto_mode
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn set_sync_auto_mode(
-    State(state): State<WebAppState>,
-    Json(args): Json<SetAutoModeArgs>,
-) -> Result<Json<()>, (StatusCode, String)> {
-    api::set_sync_auto_mode(&state.ctx, args.enabled).map(Json).map_err(api_err)
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSyncUploadLimitArgs {

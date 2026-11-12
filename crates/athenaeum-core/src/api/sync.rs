@@ -5636,29 +5636,6 @@ pub async fn cleanup_finished_transfers(
     })
 }
 
-/// Whether full-app capture-node auto mode is enabled (`sync.auto_mode`).
-pub fn get_sync_auto_mode(ctx: &ServiceContext) -> Result<bool, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let v =
-        ctx.settings
-            .get_with_precedence(&conn, keys::SYNC_AUTO_MODE, defaults::SYNC_AUTO_MODE)?;
-    Ok(v.eq_ignore_ascii_case("true"))
-}
-
-/// Toggle full-app capture-node auto mode.
-pub fn set_sync_auto_mode(ctx: &ServiceContext, enabled: bool) -> Result<(), ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    crate::db::set_setting(
-        &conn,
-        keys::SYNC_AUTO_MODE,
-        if enabled { "true" } else { "false" },
-    )?;
-    tracing::info!(enabled, "sync auto mode set");
-    Ok(())
-}
-
 /// Bounds check for [`set_sync_upload_limit`], split out so the real guard
 /// (not a test-local copy) is what tests pin — the same shape
 /// `api::compute::validate_max_concurrent` uses.

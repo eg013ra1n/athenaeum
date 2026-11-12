@@ -76,33 +76,6 @@ pub struct BrowseDirectoriesResponse {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-pub fn get_files(
-    ctx: &ServiceContext,
-    limit: Option<usize>,
-) -> Result<Vec<FileWithFrame>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let files = crate::db::get_files(&conn, limit)?;
-    Ok(files
-        .into_iter()
-        .map(|(file, frame)| FileWithFrame { file, frame })
-        .collect())
-}
-
-pub fn get_files_by_directory(
-    ctx: &ServiceContext,
-    directory_path: String,
-    limit: Option<usize>,
-) -> Result<Vec<FileWithFrame>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let files = crate::db::get_files_by_directory(&conn, &directory_path, limit)?;
-    Ok(files
-        .into_iter()
-        .map(|(file, frame)| FileWithFrame { file, frame })
-        .collect())
-}
-
 /// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
 pub fn get_frames_with_missing_metadata(
     ctx: &ServiceContext,

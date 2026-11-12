@@ -22,7 +22,7 @@ use crate::export::file_organizer::{
 };
 use crate::export::ZipMasters;
 use crate::export::models::{
-    CalibratedLightOptions, CalibrationRoute, ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent,
+    CalibratedLightOptions, ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent,
     ExportResult, ExportSummary, WbppExportConfig,
 };
 use crate::export::{apply_export_mode, collect_export_data, resolve_export_mode};
@@ -95,34 +95,6 @@ pub fn reset_wbpp_export_config(ctx: &ServiceContext) -> Result<WbppExportConfig
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(WbppExportConfig::default())
-}
-
-/// Preview data for a frame set: every light frame with its calibrations.
-pub fn get_export_preview(ctx: &ServiceContext, frame_set_id: i64) -> Result<ExportData, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    collect_export_data(&conn, frame_set_id).map_err(|e| ApiError::Internal(e.to_string()))
-}
-
-/// The frame sets that can be exported.
-pub fn get_exportable_frame_sets(
-    ctx: &ServiceContext,
-) -> Result<Vec<crate::export::frame_set_queries::ExportableFrameSet>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    crate::export::frame_set_queries::get_exportable_frame_sets(&conn)
-        .map_err(|e| ApiError::Internal(e.to_string()))
-}
-
-/// The export groups and their calibration trees, for the UI.
-pub fn get_calibration_route(
-    ctx: &ServiceContext,
-    frame_set_id: i64,
-) -> Result<CalibrationRoute, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    crate::export::frame_set_queries::get_calibration_route(&conn, frame_set_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// Enhanced export summary for the Export tab: equipment, filter groups with

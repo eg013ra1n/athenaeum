@@ -305,20 +305,6 @@ pub async fn cleanup_transfer_leftovers(state: State<'_, AppState>) -> Result<u6
         .map_err(|e| e.to_string())
 }
 
-/// Whether full-app capture-node auto mode is enabled.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_sync_auto_mode(state: State<'_, AppState>) -> Result<bool, String> {
-    api::get_sync_auto_mode(&state.ctx).map_err(|e| e.to_string())
-}
-
-/// Toggle full-app capture-node auto mode.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn set_sync_auto_mode(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    api::set_sync_auto_mode(&state.ctx, enabled).map_err(|e| e.to_string())
-}
-
 /// Persist and live-apply the device-wide sync UPLOAD limit in bytes/sec
 /// (W1). `0` = unlimited; any real cap must be >= 100000. Reads go through the
 /// generic `get_setting` — there is no dedicated getter command.

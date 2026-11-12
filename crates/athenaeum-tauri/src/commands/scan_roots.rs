@@ -34,15 +34,6 @@ pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>,
     api::get_scan_roots(&state.ctx).map_err(|e| e.to_string())
 }
 
-/// The (single) calibration library root, if configured — legacy accessor
-/// for the dedicated-root case; the effective master-write destination is
-/// `get_calibration_library_dir`.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_calibration_library_root(state: State<'_, AppState>) -> Result<Option<ScanRoot>, String> {
-    api::get_calibration_library_root(&state.ctx).map_err(|e| e.to_string())
-}
-
 /// Effective calibration-library directory (master-frame write destination) —
 /// used by File Manager → Folders.
 #[tauri::command]

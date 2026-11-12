@@ -326,20 +326,6 @@ export interface ArchiveZip {
 }
 
 // ============================================================================
-// export.ts TS-ONLY material
-// ============================================================================
-
-/** Frame set summary for export selection */
-export interface ExportableFrameSet {
-  id: number;
-  name: string | null;
-  totalExposureSeconds: number;
-  frameCount: number;
-  objectName: string | null;
-  filters: string[];
-}
-
-// ============================================================================
 // calibration-config.ts TS-ONLY material
 // ============================================================================
 

@@ -3,12 +3,7 @@
 //! Commands for exporting frame sets to WBPP folder structure.
 
 use crate::commands::AppState;
-use crate::export::{
-    frame_set_queries::ExportableFrameSet,
-    models::{
-        CalibrationRoute, ExportData, ExportMode, ExportResult, ExportSummary, WbppExportConfig,
-    },
-};
+use crate::export::models::{ExportMode, ExportResult, ExportSummary, WbppExportConfig};
 use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
 use std::sync::Arc;
@@ -45,44 +40,6 @@ pub async fn reset_wbpp_export_config(
     state: State<'_, AppState>,
 ) -> Result<WbppExportConfig, String> {
     athenaeum_core::api::export::reset_wbpp_export_config(&state.ctx).map_err(|e| e.to_string())
-}
-
-// ============================================================================
-// Export Preview & Data Commands
-// ============================================================================
-
-/// Get export preview data for a frame set
-///
-/// Collects all light frames and their calibrations for preview before export.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_export_preview(
-    state: State<'_, AppState>,
-    frame_set_id: i64,
-) -> Result<ExportData, String> {
-    athenaeum_core::api::export::get_export_preview(&state.ctx, frame_set_id).map_err(|e| e.to_string())
-}
-
-/// Get a list of available frame sets for export
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_exportable_frame_sets(
-    state: State<'_, AppState>,
-) -> Result<Vec<ExportableFrameSet>, String> {
-    athenaeum_core::api::export::get_exportable_frame_sets(&state.ctx).map_err(|e| e.to_string())
-}
-
-/// Get calibration route for UI display
-///
-/// Returns a structured view of the export groups and their calibration trees,
-/// suitable for displaying in the UI.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_calibration_route(
-    state: State<'_, AppState>,
-    frame_set_id: i64,
-) -> Result<CalibrationRoute, String> {
-    athenaeum_core::api::export::get_calibration_route(&state.ctx, frame_set_id).map_err(|e| e.to_string())
 }
 
 /// Export-readiness tallies for the WBPP export dialog's mode selector
