@@ -4233,7 +4233,7 @@ mod tests {
         );
     }
 
-    /// Hub b485578: the holders snapshot names a device by its OWN registry
+    /// The hub's holders snapshot names a device by its OWN registry
     /// name (`COALESCE(d.name, '')`) — `""` for a device registered without
     /// one — while the member's name stays in the membership snapshot.
     #[tokio::test]
@@ -4676,7 +4676,7 @@ mod tests {
         );
     }
 
-    // ── final fix (hub 06198cc): implicit claims and the hub's validation ──
+    // ── implicit claims and the hub's validation ──
 
     /// A full or delta report as `tok`, straight over HTTP: the status and
     /// the body.
@@ -4710,8 +4710,7 @@ mod tests {
         })
     }
 
-    /// Hub 06198cc `a_full_report_read_before_an_announce_keeps_the_announce_claim`:
-    /// a full report that never names an announce's implicit claim keeps it
+    /// On the hub a full report that never names an announce's implicit claim keeps it
     /// (the digests differ); one that lists it clears the mark; after that,
     /// omission removes it as before.
     #[tokio::test]
@@ -4743,8 +4742,7 @@ mod tests {
         assert!(claim().removed, "an ordinary claim ends by omission");
     }
 
-    /// Hub 06198cc `a_full_report_read_before_a_version_keeps_the_version_claim`:
-    /// a full report that read the frame before its version was accepted
+    /// On the hub a full report that read the frame before its version was accepted
     /// never rolls the hub's version claim back.
     #[tokio::test]
     async fn a_full_report_older_than_a_version_claim_keeps_it() {
@@ -4766,7 +4764,7 @@ mod tests {
         assert!(!hub.claim_of("p1", "AAA=", "m1").unwrap().implicit);
     }
 
-    /// Hub 06198cc: `remove` is accepted beside `full: true` and is the one
+    /// On the hub `remove` is accepted beside `full: true` and is the one
     /// way a full report ends an implicit claim; a frame in both lists is
     /// still a 400; a remove of an unknown claim is an invisible pin.
     #[tokio::test]
@@ -4793,7 +4791,7 @@ mod tests {
         );
     }
 
-    /// Hub 06198cc `a_delta_add_clears_the_implicit_mark`.
+    /// On the hub a delta report that adds an implicit claim clears its mark.
     #[tokio::test]
     async fn a_delta_add_clears_the_implicit_mark() {
         let hub = hub_with_member().await;
