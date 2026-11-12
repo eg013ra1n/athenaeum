@@ -5,7 +5,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { api } from '../api';
 import { useBlackholeEvents } from './useBlackholeEvents';
 
-vi.mock('../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../api');
 
 const listeners = new Map<string, (p: unknown) => void>();
 let fileLevel: number[];

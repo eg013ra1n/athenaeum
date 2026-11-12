@@ -18,9 +18,7 @@ import { AnalysisSettingsPanel } from './AnalysisSettingsPanel';
 import { api } from '../../api';
 import type { AnalysisConfig } from '../../types/analysis-config';
 
-vi.mock('../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../contexts/NotificationContext', () => ({

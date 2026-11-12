@@ -9,9 +9,7 @@ import { getIndexStatusText } from './useIndexPacks';
 import { api } from '../../api';
 import type { IndexStatusInfo, IndexDownloadProgress } from '../../types/helpers';
 
-vi.mock('../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../api');
 
 const base: IndexStatusInfo = {
   name: 'base',

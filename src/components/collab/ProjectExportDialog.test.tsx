@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import ProjectExportDialog from './ProjectExportDialog';
 import { api } from '../../api';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 vi.mock('../../api/desktop', () => ({ pickDirectory: vi.fn().mockResolvedValue('/out') }));
 const platform = vi.hoisted(() => ({ tauri: true }));
 vi.mock('../../utils/platform', () => ({ get isTauri() { return platform.tauri; } }));

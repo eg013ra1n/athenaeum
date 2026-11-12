@@ -6,7 +6,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api } from '../api';
 import BlackHole from './BlackHole';
 
-vi.mock('../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../api');
 vi.mock('../components/HistoryNav', () => ({ HistoryNav: () => null }));
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../contexts/NotificationContext', () => ({

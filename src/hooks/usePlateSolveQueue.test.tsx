@@ -7,7 +7,7 @@ import type { PlateSolveProgressEvent } from '../types/helpers';
 vi.mock('../contexts/NotificationContext', () => ({
   useNotifications: () => ({ notify: vi.fn() }),
 }));
-vi.mock('../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../api');
 
 describe('usePlateSolveQueue', () => {
   it('progress never steps back across parallel workers and labels the frame by file name', async () => {

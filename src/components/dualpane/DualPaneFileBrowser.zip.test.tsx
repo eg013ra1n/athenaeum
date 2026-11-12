@@ -6,7 +6,7 @@ import { api } from '../../api';
 import type { ScanRootWithAvailability } from '../../types/helpers';
 import DualPaneFileBrowser from './DualPaneFileBrowser';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 vi.mock('../../api/desktop', () => ({ revealItemInDir: vi.fn() }));
 vi.mock('../../utils/platform', () => ({ isTauri: true, isMac: false }));
 vi.mock('../BlinkViewer', () => ({ default: () => null }));

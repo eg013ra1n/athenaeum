@@ -9,7 +9,7 @@ import { api } from '../../api';
 import type { CollabLiveStatus as Status, CollabStorageStatus } from '../../types/models';
 import { advance } from '../../test/fakeClock';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const base: Status = {
   state: 'live',

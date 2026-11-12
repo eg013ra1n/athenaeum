@@ -12,7 +12,7 @@ import { STACKING_SELECTED_STAGE_KEY } from './stackingPrefs';
 import { api } from '../../api';
 import type { PlanPrepare, StackingConfig, StackingPlan } from '../../types/stacking';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 vi.mock('../../contexts/NotificationContext', () => ({
   useNotifications: () => ({ notify: vi.fn() }),

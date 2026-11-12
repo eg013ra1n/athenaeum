@@ -7,7 +7,7 @@ import { api } from '../../api';
 import { ResultsPanel } from './ResultsPanel';
 import type { StackSubject } from './subject';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 // The web build prints a path and a copy button; the desktop build has a Reveal button instead.
 const { platform, revealMock } = vi.hoisted(() => ({

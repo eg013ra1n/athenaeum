@@ -12,7 +12,7 @@ import type { FrameRow } from './frameRows';
 import { StackingBlink } from './StackingBlink';
 import type { StackSubject } from './subject';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../contexts/NotificationContext', () => ({

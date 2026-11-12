@@ -6,7 +6,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../../api';
 import type { FrameVM } from './frames';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 afterEach(cleanup);
 

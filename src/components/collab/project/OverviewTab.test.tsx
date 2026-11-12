@@ -7,9 +7,7 @@ import { formatSize } from '../format';
 import type { ExchangeSnapshot, FlowView, MemberSummary, OwnFrameRow, ProjectFlows, ThresholdRuleView } from '../../../types/models';
 
 vi.mock('../../../contexts/NotificationContext', () => ({ useNotifications: () => ({ notify: vi.fn() }) }));
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 afterEach(cleanup);
 

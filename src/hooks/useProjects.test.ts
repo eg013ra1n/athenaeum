@@ -9,9 +9,7 @@ vi.mock('../contexts/NotificationContext', () => ({
   useNotifications: () => ({ notify: notifyMock }),
 }));
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 beforeEach(() => {
   notifyMock.mockReset();

@@ -5,7 +5,7 @@ import { NotificationProvider, useNotifications } from '../../../contexts/Notifi
 import type { CollabPublishFinished, CollabPublishProgress, CollabPublishRunView } from '../../../types/models';
 import { useCollabPublishRun } from './useCollabPublishRun';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 const listeners: Record<string, (p: unknown) => void> = {};
 const progress = (o: Partial<CollabPublishProgress> = {}): CollabPublishProgress => ({

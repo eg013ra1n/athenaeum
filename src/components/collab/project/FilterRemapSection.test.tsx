@@ -4,9 +4,7 @@ import { api } from '../../../api';
 import FilterRemapSection from './FilterRemapSection';
 import type { CollabRemapFinished, CollabRemapProgress, FilterBucket, FilterBucketSheet } from '../../../types/models';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 afterEach(cleanup);
 

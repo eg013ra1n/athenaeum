@@ -13,7 +13,7 @@ import type {
   UnknownDeviceView,
 } from '../../types/models';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const offer: DeviceReplaceOfferView = {
   deviceId: 'old-id',

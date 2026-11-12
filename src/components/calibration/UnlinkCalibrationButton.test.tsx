@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { UnlinkCalibrationButton } from './UnlinkCalibrationButton';
 import { api } from '../../api';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../contexts/NotificationContext', () => ({

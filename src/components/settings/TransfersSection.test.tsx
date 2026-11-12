@@ -8,7 +8,7 @@ import { SettingsDefaultsProvider } from '../../settings/SettingsDefaultsContext
 import TransfersSection from './TransfersSection';
 import { api } from '../../api';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 vi.mock('../../api/desktop', () => ({ pickDirectory: vi.fn() }));
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));

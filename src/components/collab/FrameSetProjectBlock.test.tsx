@@ -5,7 +5,7 @@ import FrameSetProjectBlock from './FrameSetProjectBlock';
 import { api } from '../../api';
 import type { FrameSetProjectStatus } from '../../types/models';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../contexts/NotificationContext', () => ({
   useNotifications: () => ({ notify: notifyMock }),

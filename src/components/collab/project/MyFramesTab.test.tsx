@@ -8,9 +8,7 @@ import { api } from '../../../api';
 import type { OwnFrameRow } from '../../../types/models';
 import MyFramesTab, { type MyFramesTabProps } from './MyFramesTab';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 /** The props of the last `ProjectBlink` mounted — the real one still renders. */
 let blinkProps: Record<string, unknown> | null = null;

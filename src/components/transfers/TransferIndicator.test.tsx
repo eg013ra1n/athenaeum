@@ -5,9 +5,7 @@ import { api } from '../../api';
 import { TransferIndicator } from './TransferIndicator';
 import type { ExchangeSnapshot, FlowView, ProjectFlows, SyncStatus } from '../../types/models';
 
-vi.mock('../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../api');
 
 function emptyStatus(): SyncStatus {
   return {

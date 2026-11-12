@@ -14,9 +14,7 @@ import type {
   TerminalTransfers,
 } from '../types/models';
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 function emptyStatus(): SyncStatus {
   return {

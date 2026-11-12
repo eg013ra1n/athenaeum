@@ -27,9 +27,7 @@ import type {
 } from '../types/models';
 import type { PlanGrid, StackingConfig } from '../types/stacking';
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 // The Stacking tab's own children are pinned in `components/stacking/*.test.tsx`; here the tab's place on the page,
 // its deep link and the member colours of the grid card's schematic are. The grid card and the toolbar stay real.

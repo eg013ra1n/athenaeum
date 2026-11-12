@@ -4,7 +4,7 @@ import { api } from '../../../api';
 import { NotificationProvider, useNotifications } from '../../../contexts/NotificationContext';
 import { gb, noSpaceRefusal, noSpaceText, usePublishing } from './usePublishing';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 /** Core's free-space refusal: decimal bytes, `needed` includes the 1 GB reserve. */
 const NO_SPACE = 'collab_no_space:12500000000:3200000000';

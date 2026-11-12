@@ -6,7 +6,7 @@ import { NotificationProvider } from '../../../contexts/NotificationContext';
 import { ToastStack } from '../../Toast';
 import { useWithhold } from './useWithhold';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 afterEach(cleanup);
 beforeEach(() => {

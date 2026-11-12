@@ -4,7 +4,7 @@ import LinkObjectDialog from './LinkObjectDialog';
 import { api } from '../../api';
 import type { LinkSuggestion, LinkedSetView } from '../../types/models';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 const notify = vi.fn();
 vi.mock('../../contexts/NotificationContext', () => ({ useNotifications: () => ({ notify }) }));
 afterEach(cleanup);

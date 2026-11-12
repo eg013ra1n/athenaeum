@@ -11,9 +11,7 @@ import type { FrameVM } from './frames';
 import type { BlinkViewerProps } from '../../blink/types';
 import type { CollabBlinkEntry, FileWithFrame } from '../../../types/models';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 let blink: BlinkViewerProps | null = null;
 vi.mock('../../BlinkViewer', () => ({

@@ -8,9 +8,7 @@ import { AutoMergeSection } from './AutoMergeSection';
 import { SettingsDefaultsProvider, type SettingsDefaults } from '../../../settings/SettingsDefaultsContext';
 import { api } from '../../../api';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../../contexts/NotificationContext', () => ({

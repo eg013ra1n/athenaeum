@@ -6,9 +6,7 @@ import { api } from '../../api';
 import { CollabTrafficGroups } from './CollabTrafficGroups';
 import type { ExchangeSnapshot, FlowView, ProjectFlows } from '../../types/models';
 
-vi.mock('../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../api');
 
 afterEach(cleanup);
 

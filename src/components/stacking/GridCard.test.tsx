@@ -20,7 +20,7 @@ import type {
   StackingRunDetail,
 } from '../../types/stacking';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../contexts/NotificationContext', () => ({

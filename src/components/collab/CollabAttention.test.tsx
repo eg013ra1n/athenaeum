@@ -7,7 +7,7 @@ import CollabAttention from './CollabAttention';
 import { api } from '../../api';
 import type { CollabAttention as Attention, CollabAttentionChanged, LastCopyView } from '../../types/models';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const attention: Attention = {
   changed: [

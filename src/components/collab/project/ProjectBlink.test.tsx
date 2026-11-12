@@ -10,7 +10,7 @@ import { fromLibrary, fromOwn, type FrameVM } from './frames';
 import ProjectBlink from './ProjectBlink';
 import { ownFrameRow as own, projectFrameView as lib } from './testFixtures';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 let blink: BlinkViewerProps | null = null;
 vi.mock('../../BlinkViewer', () => ({

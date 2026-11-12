@@ -15,9 +15,7 @@ import type {
   ProjectCard,
 } from '../types/models';
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 /** Every registered listener, by event name (the last registration wins). */
 let listeners: Record<string, (p: unknown) => void> = {};

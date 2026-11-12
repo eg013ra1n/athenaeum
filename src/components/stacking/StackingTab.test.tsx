@@ -17,7 +17,7 @@ import { api } from '../../api';
 import type { StackingConfig, StackingPlan } from '../../types/stacking';
 import type { FrameSetReference } from '../../types/models';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../contexts/NotificationContext', () => ({
