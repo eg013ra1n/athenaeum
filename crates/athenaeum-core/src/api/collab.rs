@@ -5164,6 +5164,21 @@ pub async fn calibrate_collab_frames(
     .await
 }
 
+/// What every step of one publish pass reads: the service context, the
+/// project, the scope and what it derives, the run handle and the split hook.
+// The fields no extracted step reads yet are read by the steps still to come.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct PublishPass<'a> {
+    ctx: &'a ServiceContext,
+    project_id: &'a str,
+    scope: RunScope<'a>,
+    force: bool,
+    only: Option<&'a [i64]>,
+    run: &'a crate::api::collab_publish_run::RunHandle,
+    after_split: AfterSplit<'a>,
+}
+
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -5175,6 +5190,15 @@ async fn run_publish(
     let (force, only) = match scope {
         RunScope::Republish { only } => (true, only),
         RunScope::Publish { only, .. } | RunScope::Calibrate { only } => (false, only),
+    };
+    let pass = PublishPass {
+        ctx,
+        project_id,
+        scope,
+        force,
+        only,
+        run,
+        after_split,
     };
     use crate::account::AccountClientError as E;
     use crate::db::collab_frames::{self as frames_db, FrameOrigin};
@@ -6137,39 +6161,7 @@ async fn run_publish(
         plans.into_iter().partition(|p| {
             matches!(p.kind, PublishKind::New) && from_prepared.contains_key(&p.cand.frame_id)
         });
-    let mut outcome = if plans.is_empty() {
-        GenerationOutcome {
-            written: Vec::new(),
-            unchanged: 0,
-            held_back: Vec::new(),
-            cancelled: false,
-        }
-    } else {
-        // The generation reports its own stages (queued for the compute
-        // slot, then calibrating) and one tick per frame.
-        let job = GenerationJob {
-            db: db(ctx)?.clone(),
-            queue: ctx.compute_queue.clone(),
-            pool: Arc::clone(&ctx.image_pool),
-            project_id: project_id.to_string(),
-            collab_root: collab_root.clone(),
-            label: format!("collab publish {}", project.title),
-            plans,
-            cancel: run.cancel_flag(),
-            run: run.clone(),
-            prepare: matches!(scope, RunScope::Calibrate { .. }).then(|| PrepareSink {
-                project_id: project_id.to_string(),
-                own_dir: own_dir.to_string_lossy().into_owned(),
-                publish_run_id: run.id(),
-            }),
-        };
-        tokio::task::spawn_blocking(move || run_publish_generation(job))
-            .await
-            .map_err(|e| {
-                tracing::error!(project_id, error = %e, "publish: generation task failed");
-                ApiError::Internal(format!("publish generation task: {e}"))
-            })??
-    };
+    let mut outcome = publish_generate(&pass, &collab_root, &project, &own_dir, plans).await?;
     held_back.extend(outcome.held_back);
     unchanged += outcome.unchanged;
 
@@ -7403,6 +7395,58 @@ fn publish_move_landed_path(
             }
         }
     }
+}
+
+/// Generation: one compute permit, only when there is work. The empty branch
+/// never touches the compute queue.
+async fn publish_generate(
+    pass: &PublishPass<'_>,
+    collab_root: &Path,
+    project: &CollabProjectRow,
+    own_dir: &Path,
+    plans: Vec<PlannedFrame>,
+) -> Result<GenerationOutcome, ApiError> {
+    let PublishPass {
+        ctx,
+        project_id,
+        scope,
+        run,
+        ..
+    } = *pass;
+    let outcome = if plans.is_empty() {
+        GenerationOutcome {
+            written: Vec::new(),
+            unchanged: 0,
+            held_back: Vec::new(),
+            cancelled: false,
+        }
+    } else {
+        // The generation reports its own stages (queued for the compute
+        // slot, then calibrating) and one tick per frame.
+        let job = GenerationJob {
+            db: db(ctx)?.clone(),
+            queue: ctx.compute_queue.clone(),
+            pool: Arc::clone(&ctx.image_pool),
+            project_id: project_id.to_string(),
+            collab_root: collab_root.to_path_buf(),
+            label: format!("collab publish {}", project.title),
+            plans,
+            cancel: run.cancel_flag(),
+            run: run.clone(),
+            prepare: matches!(scope, RunScope::Calibrate { .. }).then(|| PrepareSink {
+                project_id: project_id.to_string(),
+                own_dir: own_dir.to_string_lossy().into_owned(),
+                publish_run_id: run.id(),
+            }),
+        };
+        tokio::task::spawn_blocking(move || run_publish_generation(job))
+            .await
+            .map_err(|e| {
+                tracing::error!(project_id, error = %e, "publish: generation task failed");
+                ApiError::Internal(format!("publish generation task: {e}"))
+            })??
+    };
+    Ok(outcome)
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
