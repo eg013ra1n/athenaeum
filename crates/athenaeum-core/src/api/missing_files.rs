@@ -3,7 +3,8 @@
 //! sync after a rescan, ignore / unignore and the purge of the catalog rows.
 //! Both hosts wrap these; the table itself is kept by `db::sync_missing_files`.
 
-use crate::api::{db, ApiError};
+use crate::api::{db, ApiError, PathPolicy};
+use std::path::{Path, PathBuf};
 use crate::services::ServiceContext;
 
 /// Missing file record with status from the database
@@ -219,6 +220,59 @@ pub fn delete_missing_files(ctx: &ServiceContext, file_ids: &[i64]) -> Result<()
     Ok(())
 }
 
+/// Point a missing file at a new location: updates `files.path` and
+/// `files.filename`, then drops the `missing_files` row.
+///
+/// The path is checked against `policy` BEFORE the disk is asked whether it
+/// exists, so a path outside the allowed roots is refused without saying whether
+/// it exists. Per `PathPolicy::check`'s precondition the candidate is
+/// canonicalized for the check (a path that cannot be canonicalized is checked as
+/// given); the catalog stores the user's own spelling (`normalize_separators`),
+/// never the canonical one. Desktop passes `AllowAll`.
+pub fn relocate_missing_file(
+    ctx: &ServiceContext,
+    file_id: i64,
+    new_path: String,
+    policy: &PathPolicy,
+) -> Result<(), ApiError> {
+    let new_path = crate::db::normalize_separators(&new_path);
+
+    let candidate = Path::new(&new_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&new_path));
+    policy.check(&candidate)?;
+
+    // Verify the new path exists
+    if !Path::new(&new_path).exists() {
+        return Err(ApiError::Invalid(format!(
+            "File does not exist at path: {}",
+            new_path
+        )));
+    }
+
+    let db = db(ctx)?;
+    let conn = db.conn();
+
+    // Extract new filename from path
+    let new_filename = Path::new(&new_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| new_path.clone());
+
+    // Update the file path
+    conn.execute(
+        "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
+        rusqlite::params![&new_path, &new_filename, file_id],
+    )
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Remove from missing_files table
+    conn.execute("DELETE FROM missing_files WHERE file_id = ?1", [file_id])
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +435,113 @@ mod tests {
             )
             .unwrap();
         assert_eq!(files_left, 0, "the purged file row is gone");
+    }
+
+    /// One missing file (id 1) under scan root 1, recorded at `old_path`.
+    fn seed_missing(ctx: &ServiceContext, root: &Path, old_path: &str) {
+        let conn = ctx.db.get().unwrap().conn();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1, ?1, 'old.fits', 1, '2025-01-01T00:00:00Z', 'FITS')",
+            [old_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO missing_files (file_id, scan_root_id, detected_at, last_checked_at)
+             VALUES (1, 1, '2025-01-02T00:00:00Z', '2025-01-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn catalog_state(ctx: &ServiceContext) -> (String, String, i64) {
+        let conn = ctx.db.get().unwrap().conn();
+        let (path, name): (String, String) = conn
+            .query_row("SELECT path, filename FROM files WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM missing_files WHERE file_id = 1", [], |r| r.get(0))
+            .unwrap();
+        (path, name, rows)
+    }
+
+    #[test]
+    fn relocate_missing_file_updates_the_row_and_drops_the_missing_entry() {
+        let (tmp, ctx) = test_ctx();
+        seed_missing(&ctx, tmp.path(), "/gone/old.fits");
+        let new = tmp.path().join("moved-1.fits");
+        std::fs::write(&new, b"x").unwrap();
+        let new_str = new.to_str().unwrap().to_string();
+
+        relocate_missing_file(&ctx, 1, new_str.clone(), &PathPolicy::AllowAll).expect("relocate");
+
+        let (path, name, rows) = catalog_state(&ctx);
+        assert_eq!(path, crate::db::normalize_separators(&new_str));
+        assert_eq!(name, "moved-1.fits");
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn relocate_missing_file_to_a_path_that_does_not_exist_is_refused() {
+        let (tmp, ctx) = test_ctx();
+        seed_missing(&ctx, tmp.path(), "/gone/old.fits");
+        let nope = tmp.path().join("nope.fits");
+        let nope_str = nope.to_str().unwrap().to_string();
+
+        match relocate_missing_file(&ctx, 1, nope_str.clone(), &PathPolicy::AllowAll) {
+            Err(ApiError::Invalid(m)) => assert_eq!(
+                m,
+                format!(
+                    "File does not exist at path: {}",
+                    crate::db::normalize_separators(&nope_str)
+                )
+            ),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        let (path, _, rows) = catalog_state(&ctx);
+        assert_eq!(path, "/gone/old.fits");
+        assert_eq!(rows, 1);
+    }
+
+    /// A path outside the allowed roots is refused the same way whether it
+    /// exists or not, and the catalog is untouched.
+    #[test]
+    fn relocate_missing_file_outside_the_allowed_roots_is_refused_without_leaking_existence() {
+        let (tmp, ctx) = test_ctx();
+        let allowed = tmp.path().join("allowed");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        seed_missing(&ctx, &allowed, "/gone/old.fits");
+        let existing = outside.join("there-1.fits");
+        std::fs::write(&existing, b"x").unwrap();
+        let absent = outside.join("absent-1.fits");
+        let policy = PathPolicy::AllowedRoots(vec![allowed.canonicalize().unwrap()]);
+
+        for p in [&existing, &absent] {
+            match relocate_missing_file(&ctx, 1, p.to_str().unwrap().to_string(), &policy) {
+                Err(ApiError::Forbidden(m)) => assert!(m.contains("outside the allowed roots"), "{m}"),
+                other => panic!("expected Forbidden, got {other:?}"),
+            }
+        }
+        // `..` back out of the allowed root is resolved before the check.
+        let sneaky = allowed.join("..").join("outside").join("there-1.fits");
+        assert!(matches!(
+            relocate_missing_file(&ctx, 1, sneaky.to_str().unwrap().to_string(), &policy),
+            Err(ApiError::Forbidden(_))
+        ));
+        let (path, _, rows) = catalog_state(&ctx);
+        assert_eq!(path, "/gone/old.fits");
+        assert_eq!(rows, 1);
+
+        // Inside the allowed root it goes through.
+        let inside = allowed.join("here-1.fits");
+        std::fs::write(&inside, b"x").unwrap();
+        relocate_missing_file(&ctx, 1, inside.to_str().unwrap().to_string(), &policy).expect("inside");
+        assert_eq!(catalog_state(&ctx).2, 0);
     }
 }

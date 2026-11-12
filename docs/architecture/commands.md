@@ -62,17 +62,19 @@ Both hosts carried their own copy of these; each now has one in core.
 | Core module | Functions |
 | ---- | ---- |
 | `api/frame_sets.rs` | `split_frame_set`, `create_frame_set_from_selection`, `auto_merge_new_frames_for_set`, the list, detail (`get_frame_set_detail`, which merge, recalculate and split in both hosts now call), delete, rename, mark-custom, archive, merge-log and excluded-frame commands (`FramesSetWithCount` moved with them), `find_new_frames_for_set` (`scan_when_idle`: the desktop passes an emitter and scans the monitored roots when no scan runs, the web passes `None` and does not; the 5-minute wait timeout is `ApiError::Timeout`, HTTP 504) |
-| `api/missing_files.rs` (new) | `get_missing_files`, `recheck_missing_files`, `MissingFileRecord`, `sync_missing_files`, `ignore_missing_file`, `unignore_missing_file`, `delete_missing_files` |
-| `api/settings.rs` | `set_setting` (the monitor is a parameter, as in `set_scan_root_monitor_enabled`) |
+| `api/missing_files.rs` (new) | `get_missing_files`, `recheck_missing_files`, `MissingFileRecord`, `sync_missing_files`, `ignore_missing_file`, `unignore_missing_file`, `delete_missing_files`, `relocate_missing_file` |
+| `api/settings.rs` | `set_setting` (the monitor is a parameter, as in `set_scan_root_monitor_enabled`), `set_blink_threads` |
 | `api/archive.rs` (new) | the archive root commands (list, add, delete, set default), `get_archive_settings`, `set_archive_root_path`, `set_archive_compression`, `plan_archive_operation`, `cancel_archive_operation`, `list_unfinished_archive_operations`, `resume_archive_operation`, `rollback_archive_operation`, `list_archived_frame_sets`, `list_archive_zips`, `get_restore_suggestions`, `delete_archive`, `start_restore_operation`, `start_archive_operation` (`refuse_when_busy`: the web passes `true` and answers 409 while an archive, file operation or master build runs; the desktop passes `false` and queues; the owner ruled on 2026-11-11 that the desktop keeps queueing) |
-| `api/export.rs` | `export_to_wbpp` (the web's export directory is the `allowed_export_dir` parameter), the WBPP config commands, `get_export_preview`, `get_exportable_frame_sets`, `get_calibration_route`, `get_export_summary` |
+| `api/export.rs` | `export_to_wbpp` (the web's export directory is the `allowed_export_dir` parameter), the WBPP config commands, `get_export_preview`, `get_exportable_frame_sets`, `get_calibration_route`, `get_export_summary`, `cancel_export` |
 | `api/plate_solve.rs` | `download_catalog_layers`, `CatalogDownloadProgress`, `download_index_packs`; `prepare_plate_solve_batch` + `run_plate_solve_batch`, `prepare_autofind_objects` + `run_autofind_objects` (the host resolves the star-catalog layers, index packs and DSO catalog from its own state and keeps its own waiting: the desktop awaits the run, the web starts it and returns) |
 | `api/scan_roots.rs`, `api/files.rs` | already there; the web routes `check_missing_files_in_scan_root`, `set_scan_root_unique_camera_flag`, `get_duplicates` and the desktop's `get_missing_files_counts` now call them |
 
-Still in the hosts on purpose, because the two copies differ in behaviour (each needs the owner's word on which
-side wins): `set_blink_threads` (the desktop refuses a value above the maximum, the web clamps it and stores the
-clamped value), `cancel_export` (the web answers 404 with its own text, the desktop a plain error),
-`relocate_missing_file` (desktop only; the web registers a 501 stub). `monitor/orchestrator.rs`'s auto-merge pass
+The owner ruled on 2026-11-12 that the web repeats the desktop's behaviour where the two copies differed, and the
+three that stayed in the hosts for that reason moved: `set_blink_threads` (core validates 0..=max, refuses a larger
+value as `Invalid` with the desktop's text, stores nothing then, and returns the permit count; each host rebuilds its
+own semaphore, and the web no longer clamps), `cancel_export` (one `NotFound("No active export for this frame set")`),
+`relocate_missing_file` (desktop passes `PathPolicy::AllowAll`; the web has a real route that checks the path against
+the allowed roots, canonicalized, before it asks whether the path exists). `monitor/orchestrator.rs`'s auto-merge pass
 is not a copy of `auto_merge_new_frames_for_set`: it walks every set, skips archived sets and sets without
 coordinates, is behind `AUTO_MERGE_ON_MONITOR_DETECT`, writes no audit row for a set with no candidates and logs
 and goes on where the command returns the error; only the `merge_candidates` call and the event are the same.

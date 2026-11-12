@@ -4,6 +4,7 @@ use axum::{extract::State, http::StatusCode, Json};
 
 use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
+use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
 // ── Response DTOs ─────────────────────────────────────────────────────────────
@@ -35,6 +36,13 @@ pub struct FileIdArgs {
 #[serde(rename_all = "camelCase")]
 pub struct DeleteMissingFilesArgs {
     pub file_ids: Vec<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelocateMissingFileArgs {
+    pub file_id: i64,
+    pub new_path: String,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -120,6 +128,26 @@ pub async fn unignore_missing_file(
     athenaeum_core::api::missing_files::unignore_missing_file(&state.ctx, args.file_id)
         .map(Json)
         .map_err(api_err)
+}
+
+/// POST /api/relocate_missing_file
+///
+/// Point a missing file at a new path: updates `files.path` / `files.filename` and drops
+/// the `missing_files` row. The path must sit under the allowed roots (when any are configured).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn relocate_missing_file(
+    State(state): State<WebAppState>,
+    Json(args): Json<RelocateMissingFileArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    athenaeum_core::api::missing_files::relocate_missing_file(
+        &state.ctx,
+        args.file_id,
+        args.new_path,
+        &policy,
+    )
+    .map(Json)
+    .map_err(api_err)
 }
 
 /// POST /api/delete_missing_files
