@@ -1,0 +1,360 @@
+{
+  "format": 1,
+  "fixture": "04-holder_report_rules",
+  "given": {
+    "epoch": "test-epoch",
+    "project": {
+      "sym": "P",
+      "title": "Contract Four",
+      "slug": "contract-four",
+      "requireApproval": false,
+      "gateVersion": 1,
+      "dictionaryVersion": 1
+    },
+    "accounts": [
+      {
+        "sym": "A",
+        "memberName": "Coord",
+        "coordinator": true,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": ["members.manage", "data.moderate", "project.edit", "thresholds.edit", "invites.manage", "posts.write"],
+        "devices": [
+          {
+            "sym": "A1",
+            "pubkeySeed": 1,
+            "pubkey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "name": "Desktop",
+            "relayUrl": null
+          }
+        ]
+      },
+      {
+        "sym": "B",
+        "memberName": "Bea",
+        "coordinator": false,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": [],
+        "devices": [
+          {
+            "sym": "B1",
+            "pubkeySeed": 2,
+            "pubkey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "name": "Bea-PC",
+            "relayUrl": null
+          }
+        ]
+      }
+    ]
+  },
+  "steps": [
+    {
+      "n": 0,
+      "note": "the baselines before anything is announced",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {
+        "h0": "/holderSeq",
+        "v0": "/version"
+      },
+      "response": {
+        "devices": [
+          {
+            "claims": [],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "Desktop",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Bea-PC",
+            "relayUrl": null
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [],
+        "holderSeq": "{{h0}}",
+        "version": "{{v0}}"
+      }
+    },
+    {
+      "n": 1,
+      "note": "the publisher announces frames 1 and 2 and so holds both",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "A1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000001",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0001.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000001",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000001"
+          },
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 2,
+        "projectVersion": "{{v0+1}}",
+        "state": "published"
+      }
+    },
+    {
+      "n": 2,
+      "note": "a full report naming nothing leaves the holds the announce made",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/holders/self",
+      "who": "A1",
+      "body": {
+        "add": [],
+        "count": 0,
+        "digest": "00000000000000000000000000000000",
+        "full": true,
+        "remove": [],
+        "reportSeq": 1
+      },
+      "status": 200,
+      "wire": "HoldersReportReplyWire",
+      "capture": {},
+      "response": {
+        "digestMatch": false,
+        "holderSeq": "{{h0+1}}",
+        "nextFlushMs": 1000,
+        "refused": []
+      }
+    },
+    {
+      "n": 3,
+      "note": "a full report naming frame 1: frame 2 is still held",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/holders/self",
+      "who": "A1",
+      "body": {
+        "add": [
+          {
+            "contentVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          }
+        ],
+        "count": 1,
+        "digest": "129cef69895583884285d1404f99e181",
+        "full": true,
+        "remove": [],
+        "reportSeq": 2
+      },
+      "status": 200,
+      "wire": "HoldersReportReplyWire",
+      "capture": {},
+      "response": {
+        "digestMatch": false,
+        "holderSeq": "{{h0+1}}",
+        "nextFlushMs": 1000,
+        "refused": []
+      }
+    },
+    {
+      "n": 4,
+      "note": "a full report naming nothing now ends frame 1, which was named; frame 2 stays",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/holders/self",
+      "who": "A1",
+      "body": {
+        "add": [],
+        "count": 0,
+        "digest": "00000000000000000000000000000000",
+        "full": true,
+        "remove": [],
+        "reportSeq": 3
+      },
+      "status": 200,
+      "wire": "HoldersReportReplyWire",
+      "capture": {},
+      "response": {
+        "digestMatch": false,
+        "holderSeq": "{{h0+2}}",
+        "nextFlushMs": 1000,
+        "refused": []
+      }
+    },
+    {
+      "n": 5,
+      "note": "another member sees the publisher's device hold frame 2 only",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "B1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {},
+      "response": {
+        "devices": [
+          {
+            "claims": [
+              [2, 1, 1]
+            ],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "Desktop",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Bea-PC",
+            "relayUrl": null
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [
+          {
+            "contentVersion": 1,
+            "seq": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "contentVersion": 1,
+            "seq": 2,
+            "uuid": "00000000-0000-4000-8000-000000000002"
+          }
+        ],
+        "holderSeq": "{{h0+2}}",
+        "version": "{{v0+1}}"
+      }
+    },
+    {
+      "n": 6,
+      "note": "one frame in both add and remove",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/holders/self",
+      "who": "A1",
+      "body": {
+        "add": [
+          {
+            "contentVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000002"
+          }
+        ],
+        "count": 1,
+        "digest": "c3ef44a7f50605a0dee0abca26ecf959",
+        "full": false,
+        "remove": ["00000000-0000-4000-8000-000000000002"],
+        "reportSeq": 4
+      },
+      "status": 400,
+      "wire": "error:Http",
+      "capture": {},
+      "response": {
+        "error": "uuid 00000000-0000-4000-8000-000000000002 present in both add and remove"
+      }
+    },
+    {
+      "n": 7,
+      "note": "a report naming an unknown frame and a version the frame does not have",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/holders/self",
+      "who": "B1",
+      "body": {
+        "add": [
+          {
+            "contentVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "contentVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000009"
+          },
+          {
+            "contentVersion": 5,
+            "uuid": "00000000-0000-4000-8000-000000000002"
+          }
+        ],
+        "count": 3,
+        "digest": "7c6b0098e0137a301a071b8962650f2a",
+        "full": false,
+        "remove": [],
+        "reportSeq": 1
+      },
+      "status": 200,
+      "wire": "HoldersReportReplyWire",
+      "capture": {},
+      "response": {
+        "digestMatch": true,
+        "holderSeq": "{{h0+3}}",
+        "nextFlushMs": 1000,
+        "refused": ["00000000-0000-4000-8000-000000000009", "00000000-0000-4000-8000-000000000002"]
+      }
+    },
+    {
+      "n": 8,
+      "note": "an empty delta: nothing to apply, the digest is checked",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/holders/self",
+      "who": "B1",
+      "body": {
+        "add": [],
+        "count": 1,
+        "digest": "129cef69895583884285d1404f99e181",
+        "full": false,
+        "remove": [],
+        "reportSeq": 2
+      },
+      "status": 200,
+      "wire": "HoldersReportReplyWire",
+      "capture": {},
+      "response": {
+        "digestMatch": true,
+        "holderSeq": "{{h0+3}}",
+        "nextFlushMs": 1000,
+        "refused": []
+      }
+    }
+  ],
+  "ignore": [],
+  "unordered": []
+}

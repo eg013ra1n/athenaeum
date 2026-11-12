@@ -1,0 +1,259 @@
+{
+  "format": 1,
+  "fixture": "01-snapshot_after_announce",
+  "given": {
+    "epoch": "test-epoch",
+    "project": {
+      "sym": "P",
+      "title": "Contract One",
+      "slug": "contract-one",
+      "requireApproval": false,
+      "gateVersion": 1,
+      "dictionaryVersion": 1
+    },
+    "accounts": [
+      {
+        "sym": "A",
+        "memberName": "Coord",
+        "coordinator": true,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": ["members.manage", "data.moderate", "project.edit", "thresholds.edit", "invites.manage", "posts.write"],
+        "devices": [
+          {
+            "sym": "A1",
+            "pubkeySeed": 2,
+            "pubkey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "name": "Desktop",
+            "relayUrl": "https://relay-a.contract.test/"
+          }
+        ]
+      },
+      {
+        "sym": "B",
+        "memberName": "Bea",
+        "coordinator": false,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": [],
+        "devices": [
+          {
+            "sym": "B1",
+            "pubkeySeed": 1,
+            "pubkey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "name": "",
+            "relayUrl": null
+          }
+        ]
+      }
+    ]
+  },
+  "steps": [
+    {
+      "n": 0,
+      "note": "the baselines before anything is announced",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {
+        "h0": "/holderSeq",
+        "v0": "/version"
+      },
+      "response": {
+        "devices": [
+          {
+            "claims": [],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Desktop",
+            "relayUrl": "https://relay-a.contract.test/"
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [],
+        "holderSeq": "{{h0}}",
+        "version": "{{v0}}"
+      }
+    },
+    {
+      "n": 1,
+      "note": "the coordinator announces three frames",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "A1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000001",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0001.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000001",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000001"
+          },
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          },
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000003",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0003.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000003",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000003"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 3,
+        "projectVersion": "{{v0+1}}",
+        "state": "published"
+      }
+    },
+    {
+      "n": 2,
+      "note": "B's device reports frames 1 and 3",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/holders/self",
+      "who": "B1",
+      "body": {
+        "add": [
+          {
+            "contentVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "contentVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000003"
+          }
+        ],
+        "count": 2,
+        "digest": "aa5b200fb950a2a1c51e7a29066d9cda",
+        "full": false,
+        "remove": [],
+        "reportSeq": 1
+      },
+      "status": 200,
+      "wire": "HoldersReportReplyWire",
+      "capture": {},
+      "response": {
+        "digestMatch": true,
+        "holderSeq": "{{h0+2}}",
+        "nextFlushMs": 1000,
+        "refused": []
+      }
+    },
+    {
+      "n": 3,
+      "note": "B's view after A's announce and B's report",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "B1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {},
+      "response": {
+        "devices": [
+          {
+            "claims": [
+              [1, 1, 1],
+              [3, 1, 1]
+            ],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "",
+            "relayUrl": null
+          },
+          {
+            "claims": [
+              [1, 3, 1]
+            ],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Desktop",
+            "relayUrl": "https://relay-a.contract.test/"
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [
+          {
+            "contentVersion": 1,
+            "seq": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "contentVersion": 1,
+            "seq": 2,
+            "uuid": "00000000-0000-4000-8000-000000000002"
+          },
+          {
+            "contentVersion": 1,
+            "seq": 3,
+            "uuid": "00000000-0000-4000-8000-000000000003"
+          }
+        ],
+        "holderSeq": "{{h0+2}}",
+        "version": "{{v0+1}}"
+      }
+    }
+  ],
+  "ignore": [],
+  "unordered": []
+}

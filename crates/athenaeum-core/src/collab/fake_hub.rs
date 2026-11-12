@@ -11,8 +11,13 @@
 //! hub through its HTTP routes (as the app does) and reach into its state
 //! directly (as a portal admin or another member would).
 //!
-//! The responders implement the hub rules the app depends on (hub `main`
-//! 6127951, `routes/frames.rs` / `routes/holders.rs`, amended for the v3
+//! The hub's own recorded answers are the reference: `fake_hub_contract`
+//! replays them against this fake, and the hub commit they were copied from
+//! is in `tests/fixtures/hub_contract/HUB_COMMIT`. Where this fake and a
+//! recorded answer differ, the fake is wrong.
+//!
+//! The responders implement the hub rules the app depends on
+//! (`routes/frames.rs` / `routes/holders.rs`, amended for the v3
 //! live-exchange wire contract):
 //!
 //! - `gateVersion` must equal the current thresholds version (0 when none):
@@ -32,11 +37,11 @@
 //! - a claim the hub writes itself (announce, accepted version) is
 //!   implicit: a `full: true` report keeps it unless it lists the frame under
 //!   `remove` (allowed beside `full`), and any report write clears the mark
-//!   (hub 06198cc, migration 0025); a report is validated with the hub's
+//!   (hub migration 0025); a report is validated with the hub's
 //!   rules and words (`validate_report`, the 100 000-item cap);
 //! - the holders snapshot names a device by the DEVICE's own registry name
-//!   (hub b485578, `COALESCE(d.name, '')`): a device with no name reads `""`,
-//!   never its member's name;
+//!   (`COALESCE(d.name, '')`): a device with no name reads `""`,
+//!   never its member's name, and lists the devices sorted by public key;
 //! - every manifest-visible change bumps the project version and stamps the
 //!   touched rows' `manifestVersion` with it, and every visible claim change
 //!   bumps the project's `holderSeq` once per commit;
@@ -3275,6 +3280,9 @@ fn holders_snapshot(st: &FakeHubState, acct: &FakeAccount, pid: &str) -> Respons
         }
     }
 
+    // The hub lists the devices by public key, whatever the member order.
+    devices.sort_by(|a, b| a["device"].as_str().cmp(&b["device"].as_str()));
+
     ok(json!({
         "epoch": st.epoch,
         "holderSeq": p.holder_seq,
@@ -4225,7 +4233,7 @@ mod tests {
         );
     }
 
-    /// Hub b485578: the holders snapshot names a device by its OWN registry
+    /// The hub's holders snapshot names a device by its OWN registry
     /// name (`COALESCE(d.name, '')`) — `""` for a device registered without
     /// one — while the member's name stays in the membership snapshot.
     #[tokio::test]
@@ -4668,7 +4676,7 @@ mod tests {
         );
     }
 
-    // ── final fix (hub 06198cc): implicit claims and the hub's validation ──
+    // ── implicit claims and the hub's validation ──
 
     /// A full or delta report as `tok`, straight over HTTP: the status and
     /// the body.
@@ -4702,8 +4710,7 @@ mod tests {
         })
     }
 
-    /// Hub 06198cc `a_full_report_read_before_an_announce_keeps_the_announce_claim`:
-    /// a full report that never names an announce's implicit claim keeps it
+    /// On the hub a full report that never names an announce's implicit claim keeps it
     /// (the digests differ); one that lists it clears the mark; after that,
     /// omission removes it as before.
     #[tokio::test]
@@ -4735,8 +4742,7 @@ mod tests {
         assert!(claim().removed, "an ordinary claim ends by omission");
     }
 
-    /// Hub 06198cc `a_full_report_read_before_a_version_keeps_the_version_claim`:
-    /// a full report that read the frame before its version was accepted
+    /// On the hub a full report that read the frame before its version was accepted
     /// never rolls the hub's version claim back.
     #[tokio::test]
     async fn a_full_report_older_than_a_version_claim_keeps_it() {
@@ -4758,7 +4764,7 @@ mod tests {
         assert!(!hub.claim_of("p1", "AAA=", "m1").unwrap().implicit);
     }
 
-    /// Hub 06198cc: `remove` is accepted beside `full: true` and is the one
+    /// On the hub `remove` is accepted beside `full: true` and is the one
     /// way a full report ends an implicit claim; a frame in both lists is
     /// still a 400; a remove of an unknown claim is an invisible pin.
     #[tokio::test]
@@ -4785,7 +4791,7 @@ mod tests {
         );
     }
 
-    /// Hub 06198cc `a_delta_add_clears_the_implicit_mark`.
+    /// On the hub a delta report that adds an implicit claim clears its mark.
     #[tokio::test]
     async fn a_delta_add_clears_the_implicit_mark() {
         let hub = hub_with_member().await;
