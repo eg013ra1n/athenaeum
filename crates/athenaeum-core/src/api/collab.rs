@@ -5166,8 +5166,6 @@ pub async fn calibrate_collab_frames(
 
 /// What every step of one publish pass reads: the service context, the
 /// project, the scope and what it derives, the run handle and the split hook.
-// The fields no extracted step reads yet are read by the steps still to come.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct PublishPass<'a> {
     ctx: &'a ServiceContext,
@@ -5210,6 +5208,16 @@ struct Split {
     unchanged: usize,
     refused_new: usize,
     stale: usize,
+}
+
+/// What section 7 records: the frames announced, adopted at the hub, bound
+/// at identical bytes, versioned, and found already versioned.
+struct ToRecord {
+    announced: Vec<(SeededFrame, String, i32)>,
+    hub_adopted: Vec<(SeededFrame, i32)>,
+    bound: Vec<SeededFrame>,
+    versioned: Vec<SeededFrame>,
+    already_versioned: Vec<SeededFrame>,
 }
 
 async fn run_publish(
@@ -6152,205 +6160,20 @@ async fn run_publish(
     }
 
     // ── 7. Own rows and their claims, per frame (never aborts the run) ───────
-    // Claims (spec §6.2, hub § "Implicit claims"): an announce made the hub
-    // claim `(uuid, 1)` for this device and a version `(uuid, new)` — both
-    // enter the claim set WITHOUT an outbox row, in the same transaction as
-    // the own row. An adoption (R8a/R8b) may have no hub claim of this
-    // device behind it: `ensure_claimed` adds it through the outbox.
-    let mut announced_n = 0usize;
-    let mut updated_n = 0usize;
-    {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        let mut record_failed = |f: &SeededFrame, what: &str, e: &anyhow::Error| {
-            tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: recording the own frame failed");
-            held_back.push(held(
-                f.written.frame_id,
-                &f.written.filename,
-                format!("{what}, but recording it locally failed: {e:#}"),
-            ));
-        };
-        let new_row = |f: &SeededFrame, frame_state: &str, gv: i32, accepted: bool| {
-            let w = &f.written;
-            let wire = frame_in_wire(f, gv);
-            let mut manifest = serde_json::to_value(&wire).unwrap_or_else(|e| {
-                tracing::error!(project_id, frame_uuid = %w.uuid, error = %e, "publish: encoding the manifest row failed");
-                serde_json::json!({})
-            });
-            if let Some(obj) = manifest.as_object_mut() {
-                obj.insert("publisherAccountId".into(), serde_json::json!(account_id));
-                obj.insert("publisherDisplayName".into(), serde_json::json!(display));
-                obj.insert("own".into(), serde_json::json!(true));
-                obj.insert(
-                    "contentVersion".into(),
-                    serde_json::json!(f.content_version),
-                );
-                obj.insert("accepted".into(), serde_json::json!(accepted));
-                obj.insert("state".into(), serde_json::json!(frame_state));
-                obj.insert("manifestVersion".into(), serde_json::json!(0));
-                obj.insert(
-                    "createdAt".into(),
-                    serde_json::json!(crate::sync::now_iso()),
-                );
-                obj.insert("holderCount".into(), serde_json::json!(1));
-            }
-            frames_db::LocalFrameRow {
-                project_id: project_id.to_string(),
-                frame_uuid: w.uuid.clone(),
-                content_version: f.content_version,
-                origin: FrameOrigin::Own,
-                publisher_account_id: account_id.clone(),
-                publisher_display: display.clone(),
-                file_name: wire.file_name.clone(),
-                filter_canonical: w.filter_canonical.clone(),
-                state: frame_state.to_string(),
-                accepted,
-                byte_size: w.byte_size as i64,
-                xxh3: w.xxh3.clone(),
-                blake3: f.blake3.clone(),
-                manifest_version: 0,
-                manifest_json: manifest.to_string(),
-                landed_path: Some(w.target.to_string_lossy().to_string()),
-                size_mtime_seen: size_mtime_seen(&w.target),
-                on_disk: true,
-                awaiting_gc: false,
-                source_frame_id: Some(w.frame_id),
-                recipe_hash: Some(w.recipe.clone()),
-                last_error: None,
-                updated_at: String::new(),
-                local_state: frames_db::LocalState::OwnHeld,
-                frame_seq: None,
-                own_staged: false,
-            }
-        };
-        let adopt = |conn: &Connection, f: &SeededFrame| -> anyhow::Result<()> {
-            let w = &f.written;
-            let n = frames_db::adopt_own(
-                conn,
-                project_id,
-                &w.uuid,
-                w.frame_id,
-                &w.target.to_string_lossy(),
-                &w.recipe,
-                size_mtime_seen(&w.target).as_deref(),
-            )?;
-            if n == 0 {
-                anyhow::bail!("no own row for frame {} to bind", w.uuid);
-            }
-            Ok(())
-        };
-        // One transaction per frame: the own-row write(s) and the claim.
-        // IMMEDIATE: a body may read before it writes (the "already
-        // announced" bind reads the row first); a deferred read-to-write
-        // upgrade under another writer fails at once with SQLITE_BUSY, never
-        // waiting the busy timeout.
-        let in_tx = |body: &dyn Fn(&Connection) -> anyhow::Result<()>| -> anyhow::Result<()> {
-            let tx = rusqlite::Transaction::new_unchecked(
-                &conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            body(&tx)?;
-            tx.commit()?;
-            Ok(())
-        };
-
-        for (f, frame_state, gv) in &announced {
-            let row = new_row(f, frame_state, *gv, true);
-            match in_tx(&|c| {
-                frames_db::record_own(c, &row)?;
-                // Spec §4.3: the prepared row is consumed; its file stays —
-                // it is now the published `landed_path`.
-                crate::db::collab_prepare::delete_prepared(c, project_id, &[f.written.frame_id])?;
-                crate::db::collab_live::add_implicit_claim(
-                    c,
-                    project_id,
-                    &f.written.uuid,
-                    f.content_version,
-                )
-            }) {
-                Ok(()) => announced_n += 1,
-                Err(e) => record_failed(f, "announced", &e),
-            }
-        }
-        // R8a: the hub already had these as mine. Bind an existing own row
-        // (a manifest sync got there first), else record one from the local
-        // plan with the state unknown — the manifest sync sets the hub truth.
-        for (f, gv) in &hub_adopted {
-            let result = in_tx(&|c| {
-                match frames_db::get(c, project_id, &f.written.uuid)? {
-                    Some(row) if row.origin == FrameOrigin::Own => adopt(c, f)?,
-                    Some(_) => {
-                        anyhow::bail!("frame {} is cached as another publisher's", f.written.uuid)
-                    }
-                    None => frames_db::record_own(c, &new_row(f, "unknown", *gv, false))?,
-                }
-                crate::db::collab_prepare::delete_prepared(c, project_id, &[f.written.frame_id])?;
-                frames_db::ensure_claimed(c, project_id, &f.written.uuid)?;
-                Ok(())
-            });
-            match result {
-                Ok(()) => announced_n += 1,
-                Err(e) => record_failed(f, "already announced", &e),
-            }
-        }
-        // R8b, identical bytes: bound and seeded at the hub's version.
-        for f in &bound {
-            match in_tx(&|c| {
-                adopt(c, f)?;
-                frames_db::ensure_claimed(c, project_id, &f.written.uuid)?;
-                Ok(())
-            }) {
-                Ok(()) => unchanged += 1,
-                Err(e) => record_failed(f, "already published", &e),
-            }
-        }
-        for (f, already) in versioned
-            .iter()
-            .map(|f| (f, false))
-            .chain(already_versioned.iter().map(|f| (f, true)))
-        {
-            let w = &f.written;
-            let result = in_tx(&|c| {
-                if matches!(w.kind, PublishKind::Adopt(_)) {
-                    adopt(c, f)?;
-                }
-                if !already {
-                    // The hub's implicit claim of the new version.
-                    crate::db::collab_live::add_implicit_claim(
-                        c,
-                        project_id,
-                        &w.uuid,
-                        f.content_version,
-                    )?;
-                }
-                frames_db::set_own_version(
-                    c,
-                    project_id,
-                    &w.uuid,
-                    f.content_version,
-                    &f.blake3,
-                    &w.xxh3,
-                    w.byte_size as i64,
-                    &w.recipe,
-                    size_mtime_seen(&w.target).as_deref(),
-                )?;
-                if already {
-                    frames_db::ensure_claimed(c, project_id, &w.uuid)?;
-                }
-                Ok(())
-            });
-            match result {
-                Ok(()) => {
-                    if already {
-                        unchanged += 1;
-                    } else {
-                        updated_n += 1;
-                    }
-                }
-                Err(e) => record_failed(f, "versioned", &e),
-            }
-        }
-    }
+    let (announced_n, updated_n) = publish_record_own_rows(
+        &pass,
+        &account_id,
+        &display,
+        ToRecord {
+            announced,
+            hub_adopted,
+            bound,
+            versioned,
+            already_versioned,
+        },
+        &mut held_back,
+        &mut unchanged,
+    )?;
     publish_after_conflicts(ctx, project_id, &conflicts).await?;
 
     // ── 8. Log (the run tracker emits the one finished event) ─────────────────
@@ -7667,6 +7490,230 @@ fn publish_split_targets(
         targeted.push((cand, kind, osc, target, external));
     }
     Ok((taken_names, name_taken, targeted))
+}
+
+/// Section 7: the own rows and their claims, one `BEGIN IMMEDIATE`
+/// transaction per frame; a frame whose record fails is held back, never
+/// aborts the run. Returns how many were announced and how many updated.
+fn publish_record_own_rows(
+    pass: &PublishPass<'_>,
+    account_id: &str,
+    display: &str,
+    rows: ToRecord,
+    held_back: &mut Vec<HeldBackFrame>,
+    unchanged: &mut usize,
+) -> Result<(usize, usize), ApiError> {
+    let PublishPass {
+        ctx, project_id, ..
+    } = *pass;
+    use crate::db::collab_frames::{self as frames_db, FrameOrigin};
+    let ToRecord {
+        announced,
+        hub_adopted,
+        bound,
+        versioned,
+        already_versioned,
+    } = rows;
+    // Claims (spec §6.2, hub § "Implicit claims"): an announce made the hub
+    // claim `(uuid, 1)` for this device and a version `(uuid, new)` — both
+    // enter the claim set WITHOUT an outbox row, in the same transaction as
+    // the own row. An adoption (R8a/R8b) may have no hub claim of this
+    // device behind it: `ensure_claimed` adds it through the outbox.
+    let mut announced_n = 0usize;
+    let mut updated_n = 0usize;
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let mut record_failed = |f: &SeededFrame, what: &str, e: &anyhow::Error| {
+            tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: recording the own frame failed");
+            held_back.push(held(
+                f.written.frame_id,
+                &f.written.filename,
+                format!("{what}, but recording it locally failed: {e:#}"),
+            ));
+        };
+        let new_row = |f: &SeededFrame, frame_state: &str, gv: i32, accepted: bool| {
+            let w = &f.written;
+            let wire = frame_in_wire(f, gv);
+            let mut manifest = serde_json::to_value(&wire).unwrap_or_else(|e| {
+                tracing::error!(project_id, frame_uuid = %w.uuid, error = %e, "publish: encoding the manifest row failed");
+                serde_json::json!({})
+            });
+            if let Some(obj) = manifest.as_object_mut() {
+                obj.insert("publisherAccountId".into(), serde_json::json!(account_id));
+                obj.insert("publisherDisplayName".into(), serde_json::json!(display));
+                obj.insert("own".into(), serde_json::json!(true));
+                obj.insert(
+                    "contentVersion".into(),
+                    serde_json::json!(f.content_version),
+                );
+                obj.insert("accepted".into(), serde_json::json!(accepted));
+                obj.insert("state".into(), serde_json::json!(frame_state));
+                obj.insert("manifestVersion".into(), serde_json::json!(0));
+                obj.insert(
+                    "createdAt".into(),
+                    serde_json::json!(crate::sync::now_iso()),
+                );
+                obj.insert("holderCount".into(), serde_json::json!(1));
+            }
+            frames_db::LocalFrameRow {
+                project_id: project_id.to_string(),
+                frame_uuid: w.uuid.clone(),
+                content_version: f.content_version,
+                origin: FrameOrigin::Own,
+                publisher_account_id: account_id.to_owned(),
+                publisher_display: display.to_owned(),
+                file_name: wire.file_name.clone(),
+                filter_canonical: w.filter_canonical.clone(),
+                state: frame_state.to_string(),
+                accepted,
+                byte_size: w.byte_size as i64,
+                xxh3: w.xxh3.clone(),
+                blake3: f.blake3.clone(),
+                manifest_version: 0,
+                manifest_json: manifest.to_string(),
+                landed_path: Some(w.target.to_string_lossy().to_string()),
+                size_mtime_seen: size_mtime_seen(&w.target),
+                on_disk: true,
+                awaiting_gc: false,
+                source_frame_id: Some(w.frame_id),
+                recipe_hash: Some(w.recipe.clone()),
+                last_error: None,
+                updated_at: String::new(),
+                local_state: frames_db::LocalState::OwnHeld,
+                frame_seq: None,
+                own_staged: false,
+            }
+        };
+        let adopt = |conn: &Connection, f: &SeededFrame| -> anyhow::Result<()> {
+            let w = &f.written;
+            let n = frames_db::adopt_own(
+                conn,
+                project_id,
+                &w.uuid,
+                w.frame_id,
+                &w.target.to_string_lossy(),
+                &w.recipe,
+                size_mtime_seen(&w.target).as_deref(),
+            )?;
+            if n == 0 {
+                anyhow::bail!("no own row for frame {} to bind", w.uuid);
+            }
+            Ok(())
+        };
+        // One transaction per frame: the own-row write(s) and the claim.
+        // IMMEDIATE: a body may read before it writes (the "already
+        // announced" bind reads the row first); a deferred read-to-write
+        // upgrade under another writer fails at once with SQLITE_BUSY, never
+        // waiting the busy timeout.
+        let in_tx = |body: &dyn Fn(&Connection) -> anyhow::Result<()>| -> anyhow::Result<()> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            body(&tx)?;
+            tx.commit()?;
+            Ok(())
+        };
+
+        for (f, frame_state, gv) in &announced {
+            let row = new_row(f, frame_state, *gv, true);
+            match in_tx(&|c| {
+                frames_db::record_own(c, &row)?;
+                // Spec §4.3: the prepared row is consumed; its file stays —
+                // it is now the published `landed_path`.
+                crate::db::collab_prepare::delete_prepared(c, project_id, &[f.written.frame_id])?;
+                crate::db::collab_live::add_implicit_claim(
+                    c,
+                    project_id,
+                    &f.written.uuid,
+                    f.content_version,
+                )
+            }) {
+                Ok(()) => announced_n += 1,
+                Err(e) => record_failed(f, "announced", &e),
+            }
+        }
+        // R8a: the hub already had these as mine. Bind an existing own row
+        // (a manifest sync got there first), else record one from the local
+        // plan with the state unknown — the manifest sync sets the hub truth.
+        for (f, gv) in &hub_adopted {
+            let result = in_tx(&|c| {
+                match frames_db::get(c, project_id, &f.written.uuid)? {
+                    Some(row) if row.origin == FrameOrigin::Own => adopt(c, f)?,
+                    Some(_) => {
+                        anyhow::bail!("frame {} is cached as another publisher's", f.written.uuid)
+                    }
+                    None => frames_db::record_own(c, &new_row(f, "unknown", *gv, false))?,
+                }
+                crate::db::collab_prepare::delete_prepared(c, project_id, &[f.written.frame_id])?;
+                frames_db::ensure_claimed(c, project_id, &f.written.uuid)?;
+                Ok(())
+            });
+            match result {
+                Ok(()) => announced_n += 1,
+                Err(e) => record_failed(f, "already announced", &e),
+            }
+        }
+        // R8b, identical bytes: bound and seeded at the hub's version.
+        for f in &bound {
+            match in_tx(&|c| {
+                adopt(c, f)?;
+                frames_db::ensure_claimed(c, project_id, &f.written.uuid)?;
+                Ok(())
+            }) {
+                Ok(()) => *unchanged += 1,
+                Err(e) => record_failed(f, "already published", &e),
+            }
+        }
+        for (f, already) in versioned
+            .iter()
+            .map(|f| (f, false))
+            .chain(already_versioned.iter().map(|f| (f, true)))
+        {
+            let w = &f.written;
+            let result = in_tx(&|c| {
+                if matches!(w.kind, PublishKind::Adopt(_)) {
+                    adopt(c, f)?;
+                }
+                if !already {
+                    // The hub's implicit claim of the new version.
+                    crate::db::collab_live::add_implicit_claim(
+                        c,
+                        project_id,
+                        &w.uuid,
+                        f.content_version,
+                    )?;
+                }
+                frames_db::set_own_version(
+                    c,
+                    project_id,
+                    &w.uuid,
+                    f.content_version,
+                    &f.blake3,
+                    &w.xxh3,
+                    w.byte_size as i64,
+                    &w.recipe,
+                    size_mtime_seen(&w.target).as_deref(),
+                )?;
+                if already {
+                    frames_db::ensure_claimed(c, project_id, &w.uuid)?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => {
+                    if already {
+                        *unchanged += 1;
+                    } else {
+                        updated_n += 1;
+                    }
+                }
+                Err(e) => record_failed(f, "versioned", &e),
+            }
+        }
+    }
+    Ok((announced_n, updated_n))
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
