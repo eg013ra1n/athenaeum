@@ -1043,6 +1043,18 @@ where
     }
 }
 
+/// Runs [`classify`] on a recorded hub answer (status and raw body), for the
+/// hub-contract replay: the variant the client really maps it to.
+#[cfg(test)]
+pub(crate) async fn classify_for_contract(status: u16, body: Vec<u8>) -> AccountClientError {
+    let status = StatusCode::from_u16(status).expect("a valid HTTP status");
+    let response = axum::http::Response::builder()
+        .status(status)
+        .body(body)
+        .expect("a response with a status and a body");
+    classify(status, reqwest::Response::from(response), "contract replay").await
+}
+
 #[cfg(test)]
 #[allow(deprecated)] // exercises the wave-2 Task-11-deprecated package methods
 mod tests {

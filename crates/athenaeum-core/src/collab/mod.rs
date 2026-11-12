@@ -11,6 +11,10 @@ pub mod contributor_state;
 // A stateful fake of the hub's collab v3 api for tests (plan P16).
 #[cfg(test)]
 pub mod fake_hub;
+// Replays the hub's recorded answers (tests/fixtures/hub_contract) against
+// the fake and reports every place it answers differently.
+#[cfg(test)]
+mod fake_hub_contract;
 // Automatic filter-name matching against a project's cached dictionary (P3).
 // Pure and ungated — no render/solver dependency — so the headless build
 // still carries it.
