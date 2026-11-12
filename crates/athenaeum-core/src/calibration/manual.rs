@@ -396,6 +396,99 @@ pub fn load_set_with_score(
     }))
 }
 
+/// Imagetypes whose frames are SUBTRACTED from the lights (or from a flat):
+/// their pedestal rides on the gain and offset they were taken at. A flat is
+/// divided, not subtracted, and is not one of them.
+pub fn is_subtrahend_type(imagetyp: &str) -> bool {
+    matches!(
+        imagetyp,
+        "Dark" | "MasterDark" | "Bias" | "MasterBias" | "DarkFlat" | "MasterDarkFlat"
+    )
+}
+
+/// Two gain or offset values closer than this are the same setting.
+const LEVEL_TOLERANCE: f64 = 0.01;
+
+/// What a manual link of a subtrahend set says about gain and offset
+/// relative to the frames it calibrates. Built by [`level_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LevelCheck {
+    /// The set declares no gain.
+    pub gain_unknown: bool,
+    /// Both declare a gain and they are more than 0.01 apart.
+    pub gain_differs: bool,
+    /// The set declares no offset.
+    pub offset_unknown: bool,
+    /// Both declare an offset and they are more than 0.01 apart.
+    pub offset_differs: bool,
+    /// The set's offset is above the lights' (its pedestal would be
+    /// over-subtracted).
+    pub offset_higher: bool,
+}
+
+impl LevelCheck {
+    /// Anything worth saying at link time.
+    pub fn is_flagged(&self) -> bool {
+        self.gain_unknown || self.gain_differs || self.offset_unknown || self.offset_differs
+    }
+}
+
+/// Is a manual link of a set of `imagetyp` at another or unknown gain/offset
+/// relative to the lights (or the source set)? "Unknown" = the set declares
+/// none; "differs" = both declare one and they are more than 0.01 apart. A
+/// set that is not a subtrahend (a flat) is never flagged. Header values
+/// only: no pixel is read, and nothing is refused.
+pub fn level_check(
+    imagetyp: &str,
+    light_gain: Option<f64>,
+    light_offset: Option<f64>,
+    set_gain: Option<f64>,
+    set_offset: Option<f64>,
+) -> LevelCheck {
+    if !is_subtrahend_type(imagetyp) {
+        return LevelCheck::default();
+    }
+    let apart = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() > LEVEL_TOLERANCE,
+        _ => false,
+    };
+    LevelCheck {
+        gain_unknown: set_gain.is_none(),
+        gain_differs: apart(light_gain, set_gain),
+        offset_unknown: set_offset.is_none(),
+        offset_differs: apart(light_offset, set_offset),
+        offset_higher: matches!((light_offset, set_offset), (Some(l), Some(s)) if s - l > LEVEL_TOLERANCE),
+    }
+}
+
+/// The `gain` / `offset` header values of these frames, one entry per frame.
+pub fn frame_levels(
+    conn: &Connection,
+    frame_ids: &[i64],
+) -> Result<(Vec<Option<f64>>, Vec<Option<f64>>)> {
+    let mut stmt = conn.prepare("SELECT gain, offset FROM frames WHERE id = ?1")?;
+    let mut gains = Vec::with_capacity(frame_ids.len());
+    let mut offsets = Vec::with_capacity(frame_ids.len());
+    for id in frame_ids {
+        let (g, o): (Option<f64>, Option<f64>) = stmt
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .with_context(|| format!("frame {id} not found"))?;
+        gains.push(g);
+        offsets.push(o);
+    }
+    Ok((gains, offsets))
+}
+
+/// A calibration set's declared `(gain, offset)`.
+pub fn set_levels(conn: &Connection, set_id: i64) -> Result<(Option<f64>, Option<f64>)> {
+    conn.query_row(
+        "SELECT gain, offset FROM calibration_set WHERE id = ?1",
+        [set_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .with_context(|| format!("calibration set {set_id} not found"))
+}
+
 fn most_common_option(values: &[Option<String>]) -> Option<String> {
     let mut counts: HashMap<&String, usize> = HashMap::new();
     for v in values.iter().flatten() {
@@ -407,7 +500,7 @@ fn most_common_option(values: &[Option<String>]) -> Option<String> {
         .map(|(v, _)| v.clone())
 }
 
-fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
+pub(crate) fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
     let mut counts: HashMap<String, (f64, usize)> = HashMap::new();
     for v in values.iter().flatten() {
         let key = format!("{:.6}", v);
@@ -485,5 +578,50 @@ mod geometry_tests {
         let swc = load_set_with_score(&conn, &candidate).unwrap().unwrap();
         assert_eq!((swc.set.naxis1, swc.set.naxis2), (Some(6384), Some(4258)));
         assert_eq!((swc.set.xorgsubf, swc.set.yorgsubf), (Some(1584), Some(1064)));
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_gain_or_offset_on_the_set_is_flagged() {
+        let c = level_check("MasterDark", Some(100.0), Some(1.0), None, None);
+        assert!(c.gain_unknown && c.offset_unknown && c.is_flagged());
+        assert!(!c.gain_differs && !c.offset_differs && !c.offset_higher);
+    }
+
+    #[test]
+    fn a_unknown_value_on_the_lights_alone_is_not_flagged() {
+        let c = level_check("Dark", None, None, Some(100.0), Some(30.0));
+        assert_eq!(c, LevelCheck::default());
+    }
+
+    #[test]
+    fn a_higher_offset_differs_and_says_so() {
+        let c = level_check("Dark", Some(100.0), Some(30.0), Some(100.0), Some(200.0));
+        assert!(c.offset_differs && c.offset_higher && c.is_flagged());
+        assert!(!c.gain_differs);
+        let lower = level_check("Dark", Some(100.0), Some(200.0), Some(100.0), Some(30.0));
+        assert!(lower.offset_differs && !lower.offset_higher);
+    }
+
+    #[test]
+    fn a_difference_up_to_the_tolerance_is_the_same_setting() {
+        let c = level_check("Bias", Some(100.0), Some(30.0), Some(100.005), Some(30.005));
+        assert_eq!(c, LevelCheck::default());
+        let apart = level_check("Bias", Some(100.0), Some(30.0), Some(100.02), Some(30.0));
+        assert!(apart.gain_differs && apart.is_flagged());
+    }
+
+    #[test]
+    fn only_subtrahend_types_are_checked() {
+        for t in ["Dark", "MasterDark", "Bias", "MasterBias", "DarkFlat"] {
+            assert!(level_check(t, Some(1.0), Some(1.0), None, None).is_flagged(), "{t}");
+        }
+        for t in ["Flat", "MasterFlat", "Light"] {
+            assert_eq!(level_check(t, Some(1.0), Some(1.0), None, Some(9.0)), LevelCheck::default(), "{t}");
+        }
     }
 }

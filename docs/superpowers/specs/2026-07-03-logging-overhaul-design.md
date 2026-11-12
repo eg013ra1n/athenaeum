@@ -252,6 +252,8 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 | `ln_annulus_crowding` | f64 | the median, over the pairs the ratio uses, of the larger of the two frames' fractions of present annulus pixels above the annulus median + 3 σ (L-26; NaN when not measured, log-only) | `"ln relative scale"` (common aperture) |
 | `light_offset` | string | the distinct OFFSET values of the affected lights, formatted `OFFSET <v>`, `OFFSET <lo>–<hi>` (a name prefix plus an en-dash range, e.g. `OFFSET 1–5`) or `OFFSET not recorded`, with ` (not recorded on some)` appended when only some lights carry the card | pedestal warn |
 | `light_gain` | string | the same format for GAIN (`GAIN 100`, `GAIN 100–120`, `GAIN not recorded`) | pedestal warn |
+| `set_offset` | string | the calibration set's declared OFFSET in the `light_offset` format (`OFFSET 200`, `OFFSET not recorded`); 2026-11-12 | manual-link warn (`manual calibration accepted with another gain or offset`) |
+| `set_gain` | string | the same for the set's GAIN (`GAIN 100`, `GAIN not recorded`); 2026-11-12 | same |
 | `flat_set_ids` | string | comma-joined flat set ids | pedestal warn |
 | `flat_corner_ratio` | f64 | `V`, the flat's darkest corner over its centre (NaN when it could not be read) | pedestal warn (run only) |
 
