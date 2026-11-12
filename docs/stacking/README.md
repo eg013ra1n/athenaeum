@@ -1320,7 +1320,8 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - The colour token follows the project rule (`project_source::attested_color_token`):
     the catalog `BAYERPAT` when present, otherwise a header-only plane probe
     (three planes → `osc`, else `mono`; an unreadable file falls back to the
-    catalog rule, with a warning). `groups::group_frames_with` takes this only
+    catalog rule; one warning per grouping pass with the count, the per-file
+    lines are debug). `groups::group_frames_with` takes this only
     for an attested set; a non-attested set is grouped exactly as before, with
     no probe. The plan and the run share `frame_source`, so their group keys
     cannot differ.

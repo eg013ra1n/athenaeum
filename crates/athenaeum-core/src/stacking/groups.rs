@@ -777,6 +777,7 @@ pub(crate) fn group_frames_with(
     } else {
         Default::default()
     };
+    let mut unreadable_shapes = 0usize;
     for m in members {
         let token: &'static str = match attested_debayer_osc {
             Some(debayer_osc) => crate::stacking::project_source::attested_color_token(
@@ -787,6 +788,7 @@ pub(crate) fn group_frames_with(
                 color_mode_of(&m.bayerpat) == ColorMode::Osc,
                 std::path::Path::new(&m.path),
                 debayer_osc,
+                &mut unreadable_shapes,
             ),
             None if color_mode_of(&m.bayerpat) == ColorMode::Osc => "osc",
             None => "mono",
@@ -798,6 +800,13 @@ pub(crate) fn group_frames_with(
             members: Vec::new(),
         });
         bucket.members.push(m);
+    }
+    if unreadable_shapes > 0 {
+        tracing::warn!(
+            set_id = frames_set_id,
+            count = unreadable_shapes,
+            "attested lights with an unreadable file shape; colour token fell back"
+        );
     }
 
     let mut groups = Vec::new();

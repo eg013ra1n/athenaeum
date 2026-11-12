@@ -10464,6 +10464,48 @@ mod tests {
         );
     }
 
+    /// Row 12 follow-up: the colour-token fallback of an attested set is one warning per plan build, with
+    /// the count; the per-file lines are debug. An unattested set never takes the path.
+    #[test]
+    fn an_attested_set_logs_one_colour_token_warning_per_plan_build() {
+        let build = |attested: bool| {
+            let f = test_fixtures::frame_set("LDN 1272");
+            for (i, t) in THREE_TIMES.iter().enumerate() {
+                add_float_light(&f, &format!("l{i}"), t);
+            }
+            test_fixtures::add_light(&f, &light_spec("l3", "2025-01-01T00:15:00"));
+            test_fixtures::add_light(&f, &light_spec("l4", "2025-01-01T00:20:00"));
+            if attested {
+                attest(&f);
+            }
+            crate::stacking::telemetry::capture_logs(|| set_plan_of(&f)).1
+        };
+
+        let log = build(true);
+        let warns: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(" WARN ") && l.contains("colour token fell back"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{log}");
+        assert!(warns[0].contains("count=2"), "{}", warns[0]);
+        let debug = log
+            .lines()
+            .filter(|l| {
+                l.contains(" DEBUG ")
+                    && l.contains("file shape unreadable; colour token falls back to the catalog (mono)")
+            })
+            .count();
+        assert_eq!(debug, 2, "one debug line per unreadable file: {log}");
+        assert!(
+            !log.lines()
+                .any(|l| l.contains(" WARN ") && l.contains("file shape unreadable; colour token")),
+            "no per-file warn: {log}"
+        );
+
+        let log = build(false);
+        assert!(!log.contains("colour token"), "{log}");
+    }
+
     /// Spec §13 (R3): an attested set needs no masters — no masters / links
     /// / masterFiles blocker and nothing to build; its unattested twin does.
     #[test]
