@@ -9,6 +9,13 @@
 - Tailwind + design tokens (above). Icons from `lucide-react`. Charts from `recharts`.
 - Custom hooks prefixed `use…`; pages mostly presentational, logic in hooks.
 - TS interfaces in `src/types/models.ts` mirror Rust models; `src/types/calibration-config.ts` mirrors the calibration config.
+- **Tests mock `api` in one place (2026-11-12).** A test file writes `vi.mock('<relative path to src/api>')` with no
+  factory; vitest then uses `src/api/__mocks__/index.ts` (`invoke` and `listen` are bare `vi.fn()`s). Commands are
+  answered with `routeInvoke({ command: value | (args) => value }, fallback?)` from `src/test/apiMock.ts`: the answer
+  is always a promise, a command with no route resolves `null`, and `unexpectedCommand` is the fallback that
+  rejects. A file keeps its own factory only when its default must differ (`listen` resolving an unlisten, `invoke`
+  with a default answer) or when it calls `vi.resetModules()` — a `__mocks__` file is re-imported after that and
+  loses its state. A router with counters or sequencing stays hand-written.
 - Shared compact UI primitives live in `src/components/ui/` (they mirror the collab mockup's CSS: `Button`, `Chip`, `Card`, `KV`, `DialogShell`, `SidePanel`, …); a new or reworked modal uses `DialogShell` (the collab dialogs and `ConfirmDialog`/`AlertDialog` do; the rest move in wave 5.6). `npm run ui:harness` renders the project page on the mockup's data for side-by-side checks.
 
 **Settings page** (`docs/settings/README.md` is the contract — read it before adding a setting).
