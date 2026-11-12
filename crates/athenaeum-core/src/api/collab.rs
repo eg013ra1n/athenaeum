@@ -7272,35 +7272,7 @@ async fn run_publish(
             }
         }
     }
-    if !conflicts.is_empty() {
-        // The hub moved on under this run (another device of this account
-        // versioned the frame). Asking for another run right away would
-        // regenerate and conflict again until the manifest catches up, so
-        // pull the manifest delta first, and ask only once the local rows
-        // actually carry the hub's newer versions.
-        match crate::api::collab_exchange::sync_manifest(ctx, project_id, None, None).await {
-            Ok(_) => {
-                let caught_up = {
-                    let db = db(ctx)?;
-                    let conn = db.conn();
-                    conflicts.iter().all(|(u, n)| {
-                        frames_db::get(&conn, project_id, u)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|r| r.content_version >= *n)
-                    })
-                };
-                if caught_up {
-                    crate::api::collab_autopublish::request_auto_publish(Some(project_id));
-                } else {
-                    tracing::info!(project_id, count = conflicts.len(), "publish: the manifest does not show the hub's newer versions yet; no new run requested");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(project_id, error = %e, "publish: manifest sync after a version conflict failed; no new run requested");
-            }
-        }
-    }
+    publish_after_conflicts(ctx, project_id, &conflicts).await?;
 
     // ── 8. Log (the run tracker emits the one finished event) ─────────────────
     tracing::info!(
@@ -7377,6 +7349,46 @@ fn publish_merge_reviewed(
             staged_blake3: None,
         });
     }
+}
+
+/// After the version batches: a version conflict means the hub moved on under
+/// this run, so pull the manifest and ask for another run once it caught up.
+async fn publish_after_conflicts(
+    ctx: &ServiceContext,
+    project_id: &str,
+    conflicts: &[(String, i32)],
+) -> Result<(), ApiError> {
+    use crate::db::collab_frames as frames_db;
+    if !conflicts.is_empty() {
+        // The hub moved on under this run (another device of this account
+        // versioned the frame). Asking for another run right away would
+        // regenerate and conflict again until the manifest catches up, so
+        // pull the manifest delta first, and ask only once the local rows
+        // actually carry the hub's newer versions.
+        match crate::api::collab_exchange::sync_manifest(ctx, project_id, None, None).await {
+            Ok(_) => {
+                let caught_up = {
+                    let db = db(ctx)?;
+                    let conn = db.conn();
+                    conflicts.iter().all(|(u, n)| {
+                        frames_db::get(&conn, project_id, u)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| r.content_version >= *n)
+                    })
+                };
+                if caught_up {
+                    crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+                } else {
+                    tracing::info!(project_id, count = conflicts.len(), "publish: the manifest does not show the hub's newer versions yet; no new run requested");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(project_id, error = %e, "publish: manifest sync after a version conflict failed; no new run requested");
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
