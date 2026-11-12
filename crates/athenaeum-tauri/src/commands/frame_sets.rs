@@ -1,6 +1,5 @@
 // Frame set commands - frame set management and operations
 
-use crate::db::{self};
 use crate::models::*;
 use std::sync::Arc;
 use tauri::State;
@@ -34,22 +33,8 @@ pub async fn get_frames_sets(
     project_id: i64,
     state: State<'_, AppState>,
 ) -> Result<Vec<FramesSetWithCount>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    let sets = db::get_frames_sets_by_project(&conn, project_id).map_err(|e| e.to_string())?;
-    let zip_counts = db::get_frames_set_zip_member_counts(&conn).map_err(|e| e.to_string())?;
-    let duplicate_counts = db::get_frames_set_duplicate_counts(&conn).map_err(|e| e.to_string())?;
-
-    Ok(sets
-        .into_iter()
-        .map(|(set, count)| FramesSetWithCount {
-            zip_member_count: set.id.and_then(|id| zip_counts.get(&id).copied()).unwrap_or(0),
-            duplicate_count: set.id.and_then(|id| duplicate_counts.get(&id).copied()).unwrap_or(0),
-            frames_set: set,
-            member_count: count,
-        })
-        .collect())
+    athenaeum_core::api::frame_sets::get_frames_sets(&state.ctx, project_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Delete a frames_set
@@ -59,20 +44,16 @@ pub async fn delete_frames_set(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::delete_frames_set(&conn, frames_set_id).map_err(|e| e.to_string())
+    athenaeum_core::api::frame_sets::delete_frames_set(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Delete all auto-generated frames_sets (is_custom = false)
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn delete_auto_generated_frame_sets(state: State<'_, AppState>) -> Result<usize, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::delete_auto_generated_frame_sets(&conn).map_err(|e| e.to_string())
+    athenaeum_core::api::frame_sets::delete_auto_generated_frame_sets(&state.ctx)
+        .map_err(|e| e.to_string())
 }
 
 /// Rename a frames_set
@@ -83,10 +64,8 @@ pub async fn rename_frames_set(
     new_name: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::update_frames_set_name(&conn, frames_set_id, &new_name).map_err(|e| e.to_string())
+    athenaeum_core::api::frame_sets::rename_frames_set(&state.ctx, frames_set_id, &new_name)
+        .map_err(|e| e.to_string())
 }
 
 /// Mark a frames_set as custom (one-way conversion from auto-generated to custom)
@@ -96,40 +75,8 @@ pub async fn mark_frame_set_custom(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<FramesSet, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Get current metadata to preserve it
-    let metadata =
-        crate::frames_set_metadata::calculate_metadata_for_frame_set(frames_set_id, &conn)
-            .map_err(|e| format!("Failed to calculate metadata: {}", e))?;
-
-    // Update frame set to mark as custom
-    db::update_frames_set_metadata(
-        &conn,
-        frames_set_id,
-        metadata.date_obs_start.as_deref(),
-        metadata.date_obs_end.as_deref(),
-        metadata.objctra.as_deref(),
-        metadata.objctdec.as_deref(),
-        metadata.total_exp_time,
-        true, // Mark as custom
-        metadata.avg_rotation,
-        metadata.min_rotation,
-        metadata.max_rotation,
-    )
-    .map_err(|e| format!("Failed to update frame set: {}", e))?;
-
-    // Return the updated frame set
-    let sets = db::get_frames_sets_by_project(&conn, 1).map_err(|e| e.to_string())?;
-
-    let frames_set = sets
-        .into_iter()
-        .find(|(set, _)| set.id == Some(frames_set_id))
-        .ok_or("Frame set not found")?
-        .0;
-
-    Ok(frames_set)
+    athenaeum_core::api::frame_sets::mark_frame_set_custom(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Merge source frame set into target frame set
@@ -147,7 +94,8 @@ pub async fn merge_frame_sets(
 ) -> Result<FrameSetDetail, String> {
     athenaeum_core::api::frame_sets::merge_frame_sets(&state.ctx, source_id, target_id)
         .map_err(|e| e.to_string())?;
-    get_frame_set_detail(target_id, state).await
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, target_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Recompute this set's center and rotation from its lights (Black Hole
@@ -173,7 +121,8 @@ pub async fn recalculate_frame_set_nights(
 ) -> Result<FrameSetDetail, String> {
     athenaeum_core::api::frame_sets::recalculate_frame_set_nights(&state.ctx, frames_set_id)
         .map_err(|e| e.to_string())?;
-    get_frame_set_detail(frames_set_id, state).await
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Cheap, idempotent nights/sessions check meant to run whenever a frame
@@ -222,7 +171,8 @@ pub async fn split_frame_set(
     .map_err(|e| e.to_string())?;
 
     // Return the new frame set detail
-    get_frame_set_detail(new_set_id, state).await
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, new_set_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Get frame set detail with imaging nights and sessions
@@ -232,35 +182,8 @@ pub async fn get_frame_set_detail(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<FrameSetDetail, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Get the frame set
-    let sets = db::get_frames_sets_by_project(&conn, 1).map_err(|e| e.to_string())?;
-
-    let frames_set = sets
-        .into_iter()
-        .find(|(set, _)| set.id == Some(frames_set_id))
-        .ok_or("Frame set not found")?
-        .0;
-
-    // Check if sessions exist
-    let sessions_exist =
-        db::sessions_exist_for_frame_set(&conn, frames_set_id).map_err(|e| e.to_string())?;
-
-    if !sessions_exist {
-        // Return empty nights instead of error
-        return Ok(FrameSetDetail {
-            frames_set,
-            nights: Vec::new(),
-        });
-    }
-
-    // Get the complete structure from database
-    let nights =
-        db::get_imaging_nights_with_sessions(&conn, frames_set_id).map_err(|e| e.to_string())?;
-
-    Ok(FrameSetDetail { frames_set, nights })
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -279,10 +202,8 @@ pub async fn create_frame_set_from_selection(
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn get_excluded_frames_count(state: State<'_, AppState>) -> Result<i64, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::get_excluded_frames_count(&conn).map_err(|e| e.to_string())
+    athenaeum_core::api::frame_sets::get_excluded_frames_count(&state.ctx)
+        .map_err(|e| e.to_string())
 }
 
 /// Get all excluded frames with full file + frame metadata. Drives the
@@ -292,10 +213,8 @@ pub async fn get_excluded_frames_count(state: State<'_, AppState>) -> Result<i64
 pub async fn get_excluded_frames_with_metadata(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::ExcludedFrameRow>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::get_excluded_frames_with_metadata(&conn).map_err(|e| e.to_string())
+    athenaeum_core::api::frame_sets::get_excluded_frames_with_metadata(&state.ctx)
+        .map_err(|e| e.to_string())
 }
 
 /// Remove the given file IDs from the `excluded_frames` table.
@@ -311,11 +230,8 @@ pub async fn remove_files_from_excluded(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::delete_excluded_frames_by_file_ids(&conn, &file_ids)
-        .map_err(|e| format!("Failed to remove from excluded: {}", e))
+    athenaeum_core::api::frame_sets::remove_files_from_excluded(&state.ctx, &file_ids)
+        .map_err(|e| e.to_string())
 }
 
 // DTOs for frame sets
@@ -323,15 +239,7 @@ pub async fn remove_files_from_excluded(
 // re-exported so `commands::*` keeps exposing the same name.
 pub use athenaeum_core::api::frame_sets::AutoGenerateResult;
 
-#[derive(serde::Serialize)]
-pub struct FramesSetWithCount {
-    pub frames_set: FramesSet,
-    pub member_count: usize,
-    /// Members (counted in `member_count`) whose file lives inside a zip.
-    pub zip_member_count: usize,
-    /// Second copies of a frame the set already holds — not in `member_count`, never used.
-    pub duplicate_count: usize,
-}
+pub use athenaeum_core::api::frame_sets::FramesSetWithCount;
 
 /// Archive a frame set (move to Archive tab)
 #[tauri::command]
@@ -340,11 +248,8 @@ pub async fn archive_frame_set(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::set_frame_set_archived(&conn, frames_set_id, true)
-        .map_err(|e| format!("Failed to archive frame set: {}", e))
+    athenaeum_core::api::frame_sets::archive_frame_set(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -416,8 +321,6 @@ pub async fn get_frame_set_merge_log(
     limit: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<MergeLogEntry>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    crate::auto_merge::log_ops::get_log_entries(&conn, frames_set_id, limit)
+    athenaeum_core::api::frame_sets::get_frame_set_merge_log(&state.ctx, frames_set_id, limit)
         .map_err(|e| e.to_string())
 }

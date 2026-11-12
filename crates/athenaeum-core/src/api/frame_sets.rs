@@ -1092,6 +1092,198 @@ pub fn auto_merge_new_frames_for_set(
     Ok(report)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Listing, detail and one-statement edits both hosts used to carry by hand
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A frame set with its member counts, as the frame-set list shows it.
+#[derive(serde::Serialize)]
+pub struct FramesSetWithCount {
+    pub frames_set: crate::models::FramesSet,
+    pub member_count: usize,
+    /// Members (counted in `member_count`) whose file lives inside a zip.
+    pub zip_member_count: usize,
+    /// Second copies of a frame the set already holds — not in `member_count`, never used.
+    pub duplicate_count: usize,
+}
+
+/// All frame sets with their member, zip-member and duplicate counts.
+/// `project_id` is kept for the wire shape and ignored by the catalog query.
+pub fn get_frames_sets(
+    ctx: &ServiceContext,
+    project_id: i64,
+) -> Result<Vec<FramesSetWithCount>, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+
+    let sets = db::get_frames_sets_by_project(&conn, project_id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let zip_counts = db::get_frames_set_zip_member_counts(&conn)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let duplicate_counts = db::get_frames_set_duplicate_counts(&conn)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(sets
+        .into_iter()
+        .map(|(set, count)| FramesSetWithCount {
+            zip_member_count: set.id.and_then(|id| zip_counts.get(&id).copied()).unwrap_or(0),
+            duplicate_count: set.id.and_then(|id| duplicate_counts.get(&id).copied()).unwrap_or(0),
+            frames_set: set,
+            member_count: count,
+        })
+        .collect())
+}
+
+/// The frame set row with `frames_set_id`, or `Internal("Frame set not found")`
+/// (both hosts always answered that as a 500, never a 404).
+fn load_frames_set(
+    conn: &Connection,
+    frames_set_id: i64,
+) -> Result<crate::models::FramesSet, ApiError> {
+    let sets = db::get_frames_sets_by_project(conn, 1)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    sets.into_iter()
+        .find(|(set, _)| set.id == Some(frames_set_id))
+        .map(|(set, _)| set)
+        .ok_or_else(|| ApiError::Internal("Frame set not found".to_string()))
+}
+
+/// Frame set detail with its imaging nights and sessions. A set without any
+/// stored nights returns an empty night list rather than an error.
+pub fn get_frame_set_detail(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+) -> Result<crate::models::FrameSetDetail, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+
+    let frames_set = load_frames_set(&conn, frames_set_id)?;
+
+    let sessions_exist = db::sessions_exist_for_frame_set(&conn, frames_set_id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !sessions_exist {
+        return Ok(crate::models::FrameSetDetail {
+            frames_set,
+            nights: Vec::new(),
+        });
+    }
+
+    let nights = db::get_imaging_nights_with_sessions(&conn, frames_set_id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(crate::models::FrameSetDetail { frames_set, nights })
+}
+
+/// Delete a frame set (cascade removes its nights, sessions and members).
+pub fn delete_frames_set(ctx: &ServiceContext, frames_set_id: i64) -> Result<(), ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    db::delete_frames_set(&conn, frames_set_id).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Delete every auto-generated frame set (`is_custom = 0`); returns how many.
+pub fn delete_auto_generated_frame_sets(ctx: &ServiceContext) -> Result<usize, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    db::delete_auto_generated_frame_sets(&conn).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Rename a frame set.
+pub fn rename_frames_set(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+    new_name: &str,
+) -> Result<(), ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    db::update_frames_set_name(&conn, frames_set_id, new_name)
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Mark a frame set custom (one-way from auto-generated): its metadata is
+/// recalculated from its members and stored with `is_custom = 1`. Returns the
+/// updated row.
+pub fn mark_frame_set_custom(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+) -> Result<crate::models::FramesSet, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+
+    // Get current metadata to preserve it
+    let metadata =
+        crate::frames_set_metadata::calculate_metadata_for_frame_set(frames_set_id, &conn)
+            .map_err(failed("calculate metadata"))?;
+
+    db::update_frames_set_metadata(
+        &conn,
+        frames_set_id,
+        metadata.date_obs_start.as_deref(),
+        metadata.date_obs_end.as_deref(),
+        metadata.objctra.as_deref(),
+        metadata.objctdec.as_deref(),
+        metadata.total_exp_time,
+        true, // Mark as custom
+        metadata.avg_rotation,
+        metadata.min_rotation,
+        metadata.max_rotation,
+    )
+    .map_err(failed("update frame set"))?;
+
+    load_frames_set(&conn, frames_set_id)
+}
+
+/// Archive a frame set (it moves to the Archive tab).
+pub fn archive_frame_set(ctx: &ServiceContext, frames_set_id: i64) -> Result<(), ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    db::set_frame_set_archived(&conn, frames_set_id, true).map_err(failed("archive frame set"))
+}
+
+/// How many frames are in the excluded list (lightweight check).
+pub fn get_excluded_frames_count(ctx: &ServiceContext) -> Result<i64, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    db::get_excluded_frames_count(&conn).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Every excluded frame with its full file + frame metadata. Drives the
+/// Excluded Frames page's Missing-Metadata-style repair toolbar.
+pub fn get_excluded_frames_with_metadata(
+    ctx: &ServiceContext,
+) -> Result<Vec<crate::models::ExcludedFrameRow>, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    db::get_excluded_frames_with_metadata(&conn).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Remove the given file ids from the `excluded_frames` table.
+///
+/// Used by the Excluded Frames page after a metadata edit: once the user has
+/// fixed the offending fields the row should leave the excluded list, even
+/// though the underlying frame may or may not satisfy the next auto-generate
+/// pass — the user has explicitly told us the metadata is now correct. Returns
+/// the number of rows actually deleted.
+pub fn remove_files_from_excluded(
+    ctx: &ServiceContext,
+    file_ids: &[i64],
+) -> Result<usize, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    db::delete_excluded_frames_by_file_ids(&conn, file_ids).map_err(failed("remove from excluded"))
+}
+
+/// The auto-merge audit log for a frame set, newest first.
+pub fn get_frame_set_merge_log(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+    limit: Option<i64>,
+) -> Result<Vec<crate::models::MergeLogEntry>, ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    crate::auto_merge::log_ops::get_log_entries(&conn, frames_set_id, limit)
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1537,5 +1729,82 @@ mod tests {
             crate::api::frame_sets::set_frame_set_attestation(&ctx, 4242, true),
             Err(crate::api::ApiError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn rename_archive_and_delete_a_frame_set() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'A'), (2, 'B')", [])
+                .unwrap();
+        }
+        rename_frames_set(&ctx, 1, "Renamed").unwrap();
+        archive_frame_set(&ctx, 1).unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            assert_eq!(
+                conn.query_row("SELECT name FROM frames_set WHERE id = 1", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "Renamed"
+            );
+            assert_eq!(count(&conn, "SELECT is_archived FROM frames_set WHERE id = 1"), 1);
+        }
+        delete_frames_set(&ctx, 2).unwrap();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames_set"), 1);
+    }
+
+    #[test]
+    fn delete_auto_generated_frame_sets_keeps_the_custom_ones() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            conn.execute(
+                "INSERT INTO frames_set (id, name, is_custom) VALUES (1, 'Auto', 0), (2, 'Mine', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(delete_auto_generated_frame_sets(&ctx).unwrap(), 1);
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert_eq!(count(&conn, "SELECT id FROM frames_set"), 2);
+    }
+
+    #[test]
+    fn mark_frame_set_custom_stores_the_flag_and_returns_the_row() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_light_at(&conn, 10, "2025-09-13T21:55:00Z");
+            seed_set_with_night(&conn, 1, "2025-09-13T21:55:00Z", "2025-09-13T21:55:00Z", &[10]);
+        }
+        let set = mark_frame_set_custom(&ctx, 1).unwrap();
+        assert_eq!(set.id, Some(1));
+        assert!(set.is_custom);
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert_eq!(count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"), 1);
+        drop(conn);
+        assert!(get_frame_set_detail(&ctx, 1).unwrap().nights.len() == 1);
+        assert!(get_frame_set_detail(&ctx, 99).is_err());
+    }
+
+    #[test]
+    fn remove_files_from_excluded_deletes_only_the_given_files() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_light_at(&conn, 10, "2025-09-13T21:55:00Z");
+            seed_light_at(&conn, 11, "2025-09-13T21:56:00Z");
+            conn.execute(
+                "INSERT INTO excluded_frames (file_id, reason) VALUES (10, 'x'), (11, 'y')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(get_excluded_frames_count(&ctx).unwrap(), 2);
+        assert_eq!(remove_files_from_excluded(&ctx, &[10]).unwrap(), 1);
+        assert_eq!(get_excluded_frames_count(&ctx).unwrap(), 1);
     }
 }
