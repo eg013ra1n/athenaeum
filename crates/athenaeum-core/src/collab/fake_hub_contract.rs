@@ -50,7 +50,13 @@ use crate::collab::live::wire::{
 
 /// The fixtures this module replays, one test each. `every_fixture_is_replayed`
 /// keeps the list equal to the folder.
-const FIXTURES: &[&str] = &["01-snapshot_after_announce"];
+const FIXTURES: &[&str] = &[
+    "01-snapshot_after_announce",
+    "02-announce_refusals",
+    "03-version_cas",
+    "04-holder_report_rules",
+    "05-publishing_device",
+];
 
 /// What a report prints for a side that has no value at a pointer.
 const MISSING: &str = "<missing>";
@@ -833,6 +839,26 @@ mod tests {
     #[tokio::test]
     async fn hub_contract_01_snapshot_after_announce() {
         replay_fixture("01-snapshot_after_announce").await;
+    }
+
+    #[tokio::test]
+    async fn hub_contract_02_announce_refusals() {
+        replay_fixture("02-announce_refusals").await;
+    }
+
+    #[tokio::test]
+    async fn hub_contract_03_version_cas() {
+        replay_fixture("03-version_cas").await;
+    }
+
+    #[tokio::test]
+    async fn hub_contract_04_holder_report_rules() {
+        replay_fixture("04-holder_report_rules").await;
+    }
+
+    #[tokio::test]
+    async fn hub_contract_05_publishing_device() {
+        replay_fixture("05-publishing_device").await;
     }
 
     #[test]

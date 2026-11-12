@@ -1,0 +1,340 @@
+{
+  "format": 1,
+  "fixture": "05-publishing_device",
+  "given": {
+    "epoch": "test-epoch",
+    "project": {
+      "sym": "P",
+      "title": "Contract Five",
+      "slug": "contract-five",
+      "requireApproval": false,
+      "gateVersion": 1,
+      "dictionaryVersion": 1
+    },
+    "accounts": [
+      {
+        "sym": "A",
+        "memberName": "Coord",
+        "coordinator": true,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": ["members.manage", "data.moderate", "project.edit", "thresholds.edit", "invites.manage", "posts.write"],
+        "devices": [
+          {
+            "sym": "A1",
+            "pubkeySeed": 1,
+            "pubkey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "name": "Desktop",
+            "relayUrl": null
+          }
+        ]
+      },
+      {
+        "sym": "B",
+        "memberName": "Bea",
+        "coordinator": false,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": [],
+        "devices": [
+          {
+            "sym": "B1",
+            "pubkeySeed": 2,
+            "pubkey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "name": "Obs PC",
+            "relayUrl": null
+          },
+          {
+            "sym": "B2",
+            "pubkeySeed": 3,
+            "pubkey": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "name": "Laptop",
+            "relayUrl": null
+          }
+        ]
+      }
+    ]
+  },
+  "steps": [
+    {
+      "n": 0,
+      "note": "the baselines before anything is announced",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {
+        "h0": "/holderSeq",
+        "v0": "/version"
+      },
+      "response": {
+        "devices": [
+          {
+            "claims": [],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "Desktop",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Obs PC",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "displayName": "Laptop",
+            "relayUrl": null
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [],
+        "holderSeq": "{{h0}}",
+        "version": "{{v0}}"
+      }
+    },
+    {
+      "n": 1,
+      "note": "the member's project list before any device publishes",
+      "method": "GET",
+      "path": "/api/v1/me/projects",
+      "who": "B1",
+      "body": null,
+      "status": 200,
+      "wire": "Vec<MyProjectWire>",
+      "capture": {},
+      "response": [
+        {
+          "coordinator": false,
+          "dataRole": "send_receive",
+          "govCaps": [],
+          "id": "{{project:P}}",
+          "pendingAnnouncements": 0,
+          "pendingFrames": 0,
+          "publishingDevice": null,
+          "requireApproval": false,
+          "slug": "contract-five",
+          "title": "Contract Five"
+        }
+      ]
+    },
+    {
+      "n": 2,
+      "note": "the first device to announce is bound as the account's publishing device",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "B1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000001",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0001.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000001",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000001"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 1,
+        "projectVersion": "{{v0+1}}",
+        "state": "published"
+      }
+    },
+    {
+      "n": 3,
+      "note": "another device of the same account is refused",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "B2",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          }
+        ]
+      },
+      "status": 409,
+      "wire": "error:PublishingDevice",
+      "capture": {},
+      "response": {
+        "deviceId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        "deviceName": "Obs PC",
+        "error": "publishing_device"
+      }
+    },
+    {
+      "n": 4,
+      "note": "the refused device sees which device is bound",
+      "method": "GET",
+      "path": "/api/v1/me/projects",
+      "who": "B2",
+      "body": null,
+      "status": 200,
+      "wire": "Vec<MyProjectWire>",
+      "capture": {},
+      "response": [
+        {
+          "coordinator": false,
+          "dataRole": "send_receive",
+          "govCaps": [],
+          "id": "{{project:P}}",
+          "pendingAnnouncements": 0,
+          "pendingFrames": 0,
+          "publishingDevice": {
+            "deviceId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "name": "Obs PC"
+          },
+          "requireApproval": false,
+          "slug": "contract-five",
+          "title": "Contract Five"
+        }
+      ]
+    },
+    {
+      "n": 5,
+      "note": "the refused device takes over",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/publishing-device",
+      "who": "B2",
+      "body": {},
+      "status": 200,
+      "wire": "PublishingDeviceSwitchWire",
+      "capture": {},
+      "response": {
+        "changed": true,
+        "deviceId": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+        "name": "Laptop",
+        "projectVersion": "{{v0+2}}"
+      }
+    },
+    {
+      "n": 6,
+      "note": "taking over again changes nothing",
+      "method": "PUT",
+      "path": "/api/v1/projects/{{project:P}}/publishing-device",
+      "who": "B2",
+      "body": {},
+      "status": 200,
+      "wire": "PublishingDeviceSwitchWire",
+      "capture": {},
+      "response": {
+        "changed": false,
+        "deviceId": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+        "name": "Laptop",
+        "projectVersion": "{{v0+2}}"
+      }
+    },
+    {
+      "n": 7,
+      "note": "the first device sees the new binding",
+      "method": "GET",
+      "path": "/api/v1/me/projects",
+      "who": "B1",
+      "body": null,
+      "status": 200,
+      "wire": "Vec<MyProjectWire>",
+      "capture": {},
+      "response": [
+        {
+          "coordinator": false,
+          "dataRole": "send_receive",
+          "govCaps": [],
+          "id": "{{project:P}}",
+          "pendingAnnouncements": 0,
+          "pendingFrames": 0,
+          "publishingDevice": {
+            "deviceId": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "name": "Laptop"
+          },
+          "requireApproval": false,
+          "slug": "contract-five",
+          "title": "Contract Five"
+        }
+      ]
+    },
+    {
+      "n": 8,
+      "note": "the bound device announces",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "B2",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 1,
+        "projectVersion": "{{v0+3}}",
+        "state": "published"
+      }
+    }
+  ],
+  "ignore": [],
+  "unordered": []
+}

@@ -1,0 +1,403 @@
+{
+  "format": 1,
+  "fixture": "03-version_cas",
+  "given": {
+    "epoch": "test-epoch",
+    "project": {
+      "sym": "P",
+      "title": "Contract Three",
+      "slug": "contract-three",
+      "requireApproval": false,
+      "gateVersion": 1,
+      "dictionaryVersion": 1
+    },
+    "accounts": [
+      {
+        "sym": "A",
+        "memberName": "Coord",
+        "coordinator": true,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": ["members.manage", "data.moderate", "project.edit", "thresholds.edit", "invites.manage", "posts.write"],
+        "devices": [
+          {
+            "sym": "A1",
+            "pubkeySeed": 1,
+            "pubkey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "name": "Desktop",
+            "relayUrl": null
+          }
+        ]
+      },
+      {
+        "sym": "B",
+        "memberName": "Bea",
+        "coordinator": false,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": [],
+        "devices": [
+          {
+            "sym": "B1",
+            "pubkeySeed": 2,
+            "pubkey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "name": "Bea-PC",
+            "relayUrl": null
+          }
+        ]
+      }
+    ]
+  },
+  "steps": [
+    {
+      "n": 0,
+      "note": "the baselines before anything is announced",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {
+        "h0": "/holderSeq",
+        "v0": "/version"
+      },
+      "response": {
+        "devices": [
+          {
+            "claims": [],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "Desktop",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Bea-PC",
+            "relayUrl": null
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [],
+        "holderSeq": "{{h0}}",
+        "version": "{{v0}}"
+      }
+    },
+    {
+      "n": 1,
+      "note": "the coordinator announces frames 1 and 2",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "A1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000001",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0001.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000001",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000001"
+          },
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 2,
+        "projectVersion": "{{v0+1}}",
+        "state": "published"
+      }
+    },
+    {
+      "n": 2,
+      "note": "the member announces frame 3",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "B1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000003",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0003.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000003",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000003"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 1,
+        "projectVersion": "{{v0+2}}",
+        "state": "published"
+      }
+    },
+    {
+      "n": 3,
+      "note": "new content for frame 1, expecting version 1",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames/00000000-0000-4000-8000-000000000001/version",
+      "who": "A1",
+      "body": {
+        "blake3": "00000000000000000000000000000000000000000000000000000000000003e9",
+        "byteSize": 1,
+        "expectedVersion": 1,
+        "xxh3": "00000000000003e9"
+      },
+      "status": 200,
+      "wire": "NewVersionWire",
+      "capture": {},
+      "response": {
+        "contentVersion": 2,
+        "projectVersion": "{{v0+3}}"
+      }
+    },
+    {
+      "n": 4,
+      "note": "the same request again: frame 1 is at version 2",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames/00000000-0000-4000-8000-000000000001/version",
+      "who": "A1",
+      "body": {
+        "blake3": "00000000000000000000000000000000000000000000000000000000000003e9",
+        "byteSize": 1,
+        "expectedVersion": 1,
+        "xxh3": "00000000000003e9"
+      },
+      "status": 409,
+      "wire": "error:VersionConflict",
+      "capture": {},
+      "response": {
+        "contentVersion": 2,
+        "error": "version_conflict"
+      }
+    },
+    {
+      "n": 5,
+      "note": "the publisher holds what it published, at the version it published",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {},
+      "response": {
+        "devices": [
+          {
+            "claims": [
+              [1, 1, 2],
+              [2, 1, 1]
+            ],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "Desktop",
+            "relayUrl": null
+          },
+          {
+            "claims": [
+              [3, 1, 1]
+            ],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Bea-PC",
+            "relayUrl": null
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [
+          {
+            "contentVersion": 2,
+            "seq": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "contentVersion": 1,
+            "seq": 2,
+            "uuid": "00000000-0000-4000-8000-000000000002"
+          },
+          {
+            "contentVersion": 1,
+            "seq": 3,
+            "uuid": "00000000-0000-4000-8000-000000000003"
+          }
+        ],
+        "holderSeq": "{{h0+3}}",
+        "version": "{{v0+3}}"
+      }
+    },
+    {
+      "n": 6,
+      "note": "four re-versions in one request: ok, conflict, someone else's frame, unknown frame",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames/versions",
+      "who": "A1",
+      "body": {
+        "versions": [
+          {
+            "blake3": "00000000000000000000000000000000000000000000000000000000000003ea",
+            "byteSize": 1,
+            "expectedVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000002",
+            "xxh3": "00000000000003ea"
+          },
+          {
+            "blake3": "00000000000000000000000000000000000000000000000000000000000003e9",
+            "byteSize": 1,
+            "expectedVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001",
+            "xxh3": "00000000000003e9"
+          },
+          {
+            "blake3": "00000000000000000000000000000000000000000000000000000000000003eb",
+            "byteSize": 1,
+            "expectedVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000003",
+            "xxh3": "00000000000003eb"
+          },
+          {
+            "blake3": "00000000000000000000000000000000000000000000000000000000000003f1",
+            "byteSize": 1,
+            "expectedVersion": 1,
+            "uuid": "00000000-0000-4000-8000-000000000009",
+            "xxh3": "00000000000003f1"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "VersionsReplyWire",
+      "capture": {},
+      "response": {
+        "projectVersion": "{{v0+4}}",
+        "results": [
+          {
+            "contentVersion": 2,
+            "status": "ok",
+            "uuid": "00000000-0000-4000-8000-000000000002"
+          },
+          {
+            "contentVersion": 2,
+            "status": "conflict",
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "contentVersion": 0,
+            "status": "forbidden",
+            "uuid": "00000000-0000-4000-8000-000000000003"
+          },
+          {
+            "contentVersion": 0,
+            "status": "not_found",
+            "uuid": "00000000-0000-4000-8000-000000000009"
+          }
+        ]
+      }
+    },
+    {
+      "n": 7,
+      "note": "only the frame that was versioned moved",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {},
+      "response": {
+        "devices": [
+          {
+            "claims": [
+              [1, 2, 2]
+            ],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "Desktop",
+            "relayUrl": null
+          },
+          {
+            "claims": [
+              [3, 1, 1]
+            ],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Bea-PC",
+            "relayUrl": null
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [
+          {
+            "contentVersion": 2,
+            "seq": 1,
+            "uuid": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "contentVersion": 2,
+            "seq": 2,
+            "uuid": "00000000-0000-4000-8000-000000000002"
+          },
+          {
+            "contentVersion": 1,
+            "seq": 3,
+            "uuid": "00000000-0000-4000-8000-000000000003"
+          }
+        ],
+        "holderSeq": "{{h0+4}}",
+        "version": "{{v0+4}}"
+      }
+    }
+  ],
+  "ignore": [],
+  "unordered": []
+}

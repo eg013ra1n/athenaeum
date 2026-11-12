@@ -1,0 +1,545 @@
+{
+  "format": 1,
+  "fixture": "02-announce_refusals",
+  "given": {
+    "epoch": "test-epoch",
+    "project": {
+      "sym": "P",
+      "title": "Contract Two",
+      "slug": "contract-two",
+      "requireApproval": true,
+      "gateVersion": 1,
+      "dictionaryVersion": 1
+    },
+    "accounts": [
+      {
+        "sym": "A",
+        "memberName": "Coord",
+        "coordinator": true,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": ["members.manage", "data.moderate", "project.edit", "thresholds.edit", "invites.manage", "posts.write"],
+        "devices": [
+          {
+            "sym": "A1",
+            "pubkeySeed": 1,
+            "pubkey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "name": "Desktop",
+            "relayUrl": null
+          }
+        ]
+      },
+      {
+        "sym": "B",
+        "memberName": "Bea",
+        "coordinator": false,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": [],
+        "devices": [
+          {
+            "sym": "B1",
+            "pubkeySeed": 2,
+            "pubkey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "name": "Bea-PC",
+            "relayUrl": null
+          }
+        ]
+      },
+      {
+        "sym": "C",
+        "memberName": "Cy",
+        "coordinator": false,
+        "dataRole": "send_receive",
+        "trusted": false,
+        "govCaps": [],
+        "devices": [
+          {
+            "sym": "C1",
+            "pubkeySeed": 3,
+            "pubkey": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "name": "Cy-PC",
+            "relayUrl": null
+          }
+        ]
+      }
+    ]
+  },
+  "steps": [
+    {
+      "n": 0,
+      "note": "the baselines before anything is announced",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/holders/snapshot",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "HoldersSnapshotWire",
+      "capture": {
+        "h0": "/holderSeq",
+        "v0": "/version"
+      },
+      "response": {
+        "devices": [
+          {
+            "claims": [],
+            "device": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "displayName": "Desktop",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "displayName": "Bea-PC",
+            "relayUrl": null
+          },
+          {
+            "claims": [],
+            "device": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "displayName": "Cy-PC",
+            "relayUrl": null
+          }
+        ],
+        "epoch": "test-epoch",
+        "frames": [],
+        "holderSeq": "{{h0}}",
+        "version": "{{v0}}"
+      }
+    },
+    {
+      "n": 1,
+      "note": "a frame measured against a gate version the project has left",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "A1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000001",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0001.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000001",
+            "gateVersion": 0,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000001"
+          }
+        ]
+      },
+      "status": 409,
+      "wire": "error:Http",
+      "capture": {},
+      "response": {
+        "error": "gate version 0 is stale, current is 1"
+      }
+    },
+    {
+      "n": 2,
+      "note": "one bad frame refuses the whole batch",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "A1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          },
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000003",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0003.fits",
+            "filterCanonical": "Q",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000003",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000003"
+          }
+        ]
+      },
+      "status": 400,
+      "wire": "error:Http",
+      "capture": {},
+      "response": {
+        "error": "c_L_0003.fits: filter \"Q\" is not in the project dictionary"
+      }
+    },
+    {
+      "n": 3,
+      "note": "a moderator's frame is born published",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "A1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 1,
+        "projectVersion": "{{v0+1}}",
+        "state": "published"
+      }
+    },
+    {
+      "n": 4,
+      "note": "a frame announced twice refuses the batch, the new frame with it",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "A1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000004",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0004.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000004",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000004"
+          },
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000002"
+          }
+        ]
+      },
+      "status": 409,
+      "wire": "error:Http",
+      "capture": {},
+      "response": {
+        "error": "frame 00000000-0000-4000-8000-000000000002 already announced; use /version to publish new content"
+      }
+    },
+    {
+      "n": 5,
+      "note": "the three refusals wrote nothing",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/manifest?since=0&limit=1000",
+      "who": "A1",
+      "body": null,
+      "status": 200,
+      "wire": "ManifestPageWire",
+      "capture": {},
+      "response": {
+        "hasMore": false,
+        "next": null,
+        "projectVersion": "{{v0+1}}",
+        "rows": [
+          {
+            "accepted": true,
+            "acceptedReason": null,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "contentVersion": 1,
+            "createdAt": "{{ts}}",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameSeq": 1,
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "manifestVersion": "{{v0+1}}",
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "own": true,
+            "publisherAccountId": "{{account:A}}",
+            "publisherDeviceId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "publisherDisplayName": "Coord",
+            "rejectReason": null,
+            "state": "published",
+            "xxh3": "0000000000000002"
+          }
+        ]
+      }
+    },
+    {
+      "n": 6,
+      "note": "a member who is not a moderator announces into an approval-required project",
+      "method": "POST",
+      "path": "/api/v1/projects/{{project:P}}/frames",
+      "who": "B1",
+      "body": {
+        "frames": [
+          {
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000005",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0005.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameUuid": "00000000-0000-4000-8000-000000000005",
+            "gateVersion": 1,
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "xxh3": "0000000000000005"
+          }
+        ]
+      },
+      "status": 200,
+      "wire": "AnnounceFramesWire",
+      "capture": {},
+      "response": {
+        "announced": 1,
+        "projectVersion": "{{v0+2}}",
+        "state": "pending"
+      }
+    },
+    {
+      "n": 7,
+      "note": "another member does not see the pending frame",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/manifest?since=0&limit=1000",
+      "who": "C1",
+      "body": null,
+      "status": 200,
+      "wire": "ManifestPageWire",
+      "capture": {},
+      "response": {
+        "hasMore": false,
+        "next": null,
+        "projectVersion": "{{v0+2}}",
+        "rows": [
+          {
+            "accepted": true,
+            "acceptedReason": null,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "contentVersion": 1,
+            "createdAt": "{{ts}}",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameSeq": 1,
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "manifestVersion": "{{v0+1}}",
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "own": false,
+            "publisherAccountId": "{{account:A}}",
+            "publisherDeviceId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "publisherDisplayName": "Coord",
+            "rejectReason": null,
+            "state": "published",
+            "xxh3": "0000000000000002"
+          }
+        ]
+      }
+    },
+    {
+      "n": 8,
+      "note": "the publisher sees its pending frame",
+      "method": "GET",
+      "path": "/api/v1/projects/{{project:P}}/manifest?since=0&limit=1000",
+      "who": "B1",
+      "body": null,
+      "status": 200,
+      "wire": "ManifestPageWire",
+      "capture": {},
+      "response": {
+        "hasMore": false,
+        "next": null,
+        "projectVersion": "{{v0+2}}",
+        "rows": [
+          {
+            "accepted": true,
+            "acceptedReason": null,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000002",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "contentVersion": 1,
+            "createdAt": "{{ts}}",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0002.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameSeq": 1,
+            "frameUuid": "00000000-0000-4000-8000-000000000002",
+            "gateVersion": 1,
+            "manifestVersion": "{{v0+1}}",
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "own": false,
+            "publisherAccountId": "{{account:A}}",
+            "publisherDeviceId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "publisherDisplayName": "Coord",
+            "rejectReason": null,
+            "state": "published",
+            "xxh3": "0000000000000002"
+          },
+          {
+            "accepted": true,
+            "acceptedReason": null,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000005",
+            "byteSize": 104000000,
+            "channel": "mono",
+            "contentVersion": 1,
+            "createdAt": "{{ts}}",
+            "dateObs": "2026-09-01T22:14:00Z",
+            "exptimeSec": 300.0,
+            "fileName": "c_L_0005.fits",
+            "filterCanonical": "L",
+            "filterRaw": "Luminance",
+            "frameSeq": 2,
+            "frameUuid": "00000000-0000-4000-8000-000000000005",
+            "gateVersion": 1,
+            "manifestVersion": "{{v0+2}}",
+            "meta": {
+              "instrume": "Cam A",
+              "metrics": {
+                "eccentricity": 0.35,
+                "fwhmArcsec": 2.1,
+                "starsDetected": 812
+              },
+              "pixelScaleArcsec": 1.25
+            },
+            "own": true,
+            "publisherAccountId": "{{account:B}}",
+            "publisherDeviceId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "publisherDisplayName": "Bea",
+            "rejectReason": null,
+            "state": "pending",
+            "xxh3": "0000000000000005"
+          }
+        ]
+      }
+    }
+  ],
+  "ignore": [],
+  "unordered": []
+}
