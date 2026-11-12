@@ -86,9 +86,20 @@ pub fn add_archive_root(
 pub fn delete_archive_root(ctx: &ServiceContext, id: i64) -> Result<(), ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    let was_default: i32 = conn
-        .query_row("SELECT is_default FROM archive_roots WHERE id = ?1", [id], |r| r.get(0))
-        .unwrap_or(0);
+    // A row that does not exist is not a default (the delete below is then a no-op); any
+    // other failure leaves the question unanswered, so nothing is deleted.
+    let was_default: i32 = match conn.query_row(
+        "SELECT is_default FROM archive_roots WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+        Err(e) => {
+            tracing::error!(error = %e, "archive root default flag read failed");
+            return Err(ApiError::Internal(e.to_string()));
+        }
+    };
     conn.execute("DELETE FROM archive_roots WHERE id = ?1", [id])
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     // If we deleted the default, promote the lowest-id remaining row to default.
@@ -796,6 +807,34 @@ mod tests {
         let id_b = add_archive_root(&ctx, b.to_str().unwrap().into(), None).unwrap();
         delete_archive_root(&ctx, id_a).unwrap();
         assert_eq!(roots(&ctx), vec![(id_b, true)]);
+    }
+
+    /// A failing `is_default` read is an error and deletes nothing; an id with no row is still `Ok`.
+    #[test]
+    fn delete_archive_root_does_not_delete_when_the_default_flag_cannot_be_read() {
+        let (tmp, ctx) = test_ctx();
+        let a = tmp.path().join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let id_a = add_archive_root(&ctx, a.to_str().unwrap().into(), None).unwrap();
+        delete_archive_root(&ctx, 9999).expect("a missing id is Ok as before");
+        assert_eq!(roots(&ctx).len(), 1);
+
+        ctx.db
+            .get()
+            .unwrap()
+            .conn()
+            .execute("ALTER TABLE archive_roots RENAME COLUMN is_default TO is_default_gone", [])
+            .unwrap();
+        let err = delete_archive_root(&ctx, id_a).expect_err("the flag read fails");
+        assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
+        let rows: i64 = ctx
+            .db
+            .get()
+            .unwrap()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM archive_roots WHERE id = ?1", [id_a], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     /// Setting the default flips exactly one row; an unknown id is `NotFound`.
