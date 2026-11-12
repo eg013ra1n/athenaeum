@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api } from '../api';
 import { pickFile } from '../api/desktop';
+import { FolderBrowserModal } from './FolderBrowserModal';
 import { isTauri } from '../utils/platform';
 import { useNotifications } from '../contexts/NotificationContext';
 import {
@@ -15,6 +16,13 @@ import {
 } from 'lucide-react';
 import type { MissingFileRecord } from '../types/helpers';
 
+// GTK file-dialog filters are case-sensitive globs — a '.FITS' file
+// is invisible on Linux unless the uppercase form is listed too.
+const LOCATE_FILTERS = [
+  { name: 'FITS/XISF Files', extensions: ['fits', 'fit', 'xisf', 'FITS', 'FIT', 'XISF'] },
+  { name: 'All Files', extensions: ['*'] },
+];
+
 interface MissingFilesPanelProps {
   rootId: number;
   missingFiles: MissingFileRecord[];
@@ -27,6 +35,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
   const [isRechecking, setIsRechecking] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [actionInProgress, setActionInProgress] = useState<number | null>(null);
+  const [locating, setLocating] = useState<MissingFileRecord | null>(null);
 
   const activeMissing = missingFiles.filter(f => f.status === 'missing');
   const ignoredFiles = missingFiles.filter(f => f.status === 'ignored');
@@ -130,32 +139,42 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
     }
   };
 
-  const handleLocate = async (file: MissingFileRecord) => {
+  const relocate = async (file: MissingFileRecord, newPath: string) => {
     try {
-      const selected = await pickFile({
-        title: `Locate ${file.filename}`,
-        filters: [
-          // GTK file-dialog filters are case-sensitive globs — a '.FITS' file
-          // is invisible on Linux unless the uppercase form is listed too.
-          { name: 'FITS/XISF Files', extensions: ['fits', 'fit', 'xisf', 'FITS', 'FIT', 'XISF'] },
-          { name: 'All Files', extensions: ['*'] },
-        ],
+      setActionInProgress(file.file_id);
+      await api.invoke('relocate_missing_file', {
+        fileId: file.file_id,
+        newPath,
       });
-
-      if (selected && typeof selected === 'string') {
-        setActionInProgress(file.file_id);
-        await api.invoke('relocate_missing_file', {
-          fileId: file.file_id,
-          newPath: selected,
-        });
-        onRefresh();
-        setActionInProgress(null);
-      }
+      onRefresh();
+      setActionInProgress(null);
     } catch (error) {
       console.error('Failed to relocate file:', error);
       const message = typeof error === 'string' ? error : 'Failed to relocate file';
       notify({ title: 'Relocate failed', detail: message, kind: 'files', tone: 'warning' });
       setActionInProgress(null);
+    }
+  };
+
+  const handleLocate = async (file: MissingFileRecord) => {
+    // On the web there is no native dialog: the folder browser's file mode picks the path.
+    if (!isTauri) {
+      setLocating(file);
+      return;
+    }
+    try {
+      const selected = await pickFile({
+        title: `Locate ${file.filename}`,
+        filters: LOCATE_FILTERS,
+      });
+
+      if (selected && typeof selected === 'string') {
+        await relocate(file, selected);
+      }
+    } catch (error) {
+      console.error('Failed to relocate file:', error);
+      const message = typeof error === 'string' ? error : 'Failed to relocate file';
+      notify({ title: 'Relocate failed', detail: message, kind: 'files', tone: 'warning' });
     }
   };
 
@@ -260,16 +279,14 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                   </td>
                   <td className="p-2">
                     <div className="flex items-center gap-1 justify-end">
-                      {isTauri && (
-                        <button
-                          onClick={() => handleLocate(file)}
-                          disabled={actionInProgress === file.file_id}
-                          className="p-1.5 hover:bg-accent/30 rounded text-accent transition"
-                          title="Locate file"
-                        >
-                          <FolderSearch size={14} />
-                        </button>
-                      )}
+                      <button
+                        onClick={() => handleLocate(file)}
+                        disabled={actionInProgress === file.file_id}
+                        className="p-1.5 hover:bg-accent/30 rounded text-accent transition"
+                        title="Locate file"
+                      >
+                        <FolderSearch size={14} />
+                      </button>
                       <button
                         onClick={() => handleIgnore(file.file_id)}
                         disabled={actionInProgress === file.file_id}
@@ -355,6 +372,20 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
           </button>
         </div>
       )}
+
+      <FolderBrowserModal
+        isOpen={locating !== null}
+        mode="file"
+        scope="scan"
+        title={locating ? `Locate ${locating.filename}` : undefined}
+        fileFilters={LOCATE_FILTERS}
+        onSelect={(path) => {
+          const file = locating;
+          setLocating(null);
+          if (file) void relocate(file, path);
+        }}
+        onClose={() => setLocating(null)}
+      />
     </div>
   );
 }

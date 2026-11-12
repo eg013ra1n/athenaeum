@@ -56,7 +56,8 @@ export async function pickDirectory(): Promise<string | null> {
 
 /**
  * Open a native file picker dialog for relocating a file.
- * Only works in Tauri desktop mode — returns null in web mode.
+ * Only works in Tauri desktop mode — returns null in web mode, where the
+ * caller opens `FolderBrowserModal` in file mode instead.
  */
 export async function pickFile(options?: {
   title?: string;

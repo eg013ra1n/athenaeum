@@ -1,16 +1,25 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Folder, ArrowUp, Loader2, X } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { File as FileIcon, Folder, ArrowUp, Loader2, X } from 'lucide-react';
 import { api } from '../api';
+import { formatBytes } from './folders/format';
 
 interface BrowseDirectoryEntry {
   name: string;
   path: string;
 }
 
+interface BrowseFileEntry {
+  name: string;
+  path: string;
+  size: number;
+}
+
 interface BrowseDirectoriesResponse {
   current: string;
   parent: string | null;
   directories: BrowseDirectoryEntry[];
+  /** Present only when the request asked for files (`includeFiles`). */
+  files?: BrowseFileEntry[];
 }
 
 interface FolderBrowserModalProps {
@@ -21,6 +30,15 @@ interface FolderBrowserModalProps {
    *  directory; `"stacking"` browses the same roots as `"scan"` (the Stacking
    *  tab's Output panel folder picker, plan 5b Task 1/3, plan Ruling 6). */
   scope?: 'scan' | 'export' | 'stacking';
+  /** `'folder'` (default) picks the folder being viewed; `'file'` lists files
+   *  too and picks one of them. */
+  mode?: 'folder' | 'file';
+  /** Header text; defaults to `Select Directory` / `Select File`. */
+  title?: string;
+  /** File mode only: the extension filters, in the shape `pickFile` takes. A
+   *  filter containing `'*'` lists every file; with more than one filter a
+   *  selector appears under the path box. */
+  fileFilters?: { name: string; extensions: string[] }[];
 }
 
 export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
@@ -28,6 +46,9 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
   onSelect,
   onClose,
   scope,
+  mode = 'folder',
+  title,
+  fileFilters,
 }) => {
   const [currentPath, setCurrentPath] = useState('');
   const [inputPath, setInputPath] = useState('');
@@ -35,44 +56,74 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
   const [parentPath, setParentPath] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [files, setFiles] = useState<BrowseFileEntry[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [activeFilter, setActiveFilter] = useState(0);
+  const isFileMode = mode === 'file';
 
-  const browse = useCallback(async (path: string) => {
+  // A caller may pass the filter list inline; reading it through a ref keeps
+  // `browse` (and with it the open-effect below) from re-running every render.
+  const filtersRef = useRef(fileFilters);
+  filtersRef.current = fileFilters;
+
+  const browse = useCallback(async (path: string, filterIndex: number) => {
     setLoading(true);
     setError(null);
+    setFiles([]);
+    setSelectedFile(null);
     try {
-      const result = await api.invoke<BrowseDirectoriesResponse>('browse_directories', {
+      const request: Record<string, unknown> = {
         path: path || undefined,
         scope: scope || undefined,
-      });
+      };
+      if (mode === 'file') {
+        request.includeFiles = true;
+        const extensions = filtersRef.current?.[filterIndex]?.extensions;
+        if (extensions && !extensions.includes('*')) {
+          request.extensions = extensions;
+        }
+      }
+      const result = await api.invoke<BrowseDirectoriesResponse>('browse_directories', request);
       setCurrentPath(result.current);
       setInputPath(result.current);
       setParentPath(result.parent);
       setDirectories(result.directories);
+      setFiles(result.files ?? []);
     } catch (err) {
       setError(typeof err === 'string' ? err : 'Failed to browse directory');
     } finally {
       setLoading(false);
     }
-  }, [scope]);
+  }, [scope, mode]);
 
   // Load root listing when modal opens
   useEffect(() => {
     if (isOpen) {
-      browse('');
+      setActiveFilter(0);
+      browse('', 0);
     }
   }, [isOpen, browse]);
 
   const handleNavigate = (path: string) => {
-    browse(path);
+    browse(path, activeFilter);
+  };
+
+  const handleFilterChange = (index: number) => {
+    setActiveFilter(index);
+    browse(currentPath, index);
   };
 
   const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
-      browse(inputPath);
+      browse(inputPath, activeFilter);
     }
   };
 
   const handleConfirm = () => {
+    if (isFileMode) {
+      if (selectedFile) onSelect(selectedFile);
+      return;
+    }
     if (currentPath && currentPath !== '/') {
       onSelect(currentPath);
     }
@@ -87,7 +138,9 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
       <div className="bg-surface-elevated rounded-lg w-full max-w-xl mx-4 border border-border shadow-xl flex flex-col max-h-[80vh]">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border">
-          <h3 className="text-lg font-semibold">Select Directory</h3>
+          <h3 className="text-lg font-semibold">
+            {title ?? (isFileMode ? 'Select File' : 'Select Directory')}
+          </h3>
           <button
             onClick={onClose}
             className="p-1 hover:bg-surface-hover rounded transition"
@@ -106,6 +159,20 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
             placeholder="Enter path and press Enter"
             className="w-full px-3 py-2 bg-surface border border-border rounded font-mono text-sm focus:outline-none focus:ring-2 focus:ring-accent"
           />
+          {isFileMode && fileFilters && fileFilters.length > 1 && (
+            <select
+              value={activeFilter}
+              onChange={(e) => handleFilterChange(Number(e.target.value))}
+              aria-label="File type"
+              className="mt-2 px-2 py-1 bg-surface border border-border rounded text-sm"
+            >
+              {fileFilters.map((filter, index) => (
+                <option key={filter.name} value={index}>
+                  {filter.name}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
 
         {/* Directory listing */}
@@ -144,9 +211,14 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
                 </button>
               )}
 
-              {directories.length === 0 && !loading && (
+              {directories.length === 0 && !loading && !isFileMode && (
                 <div className="px-4 py-8 text-center text-content-muted text-sm">
                   No subdirectories
+                </div>
+              )}
+              {isFileMode && directories.length === 0 && files.length === 0 && !loading && (
+                <div className="px-4 py-8 text-center text-content-muted text-sm">
+                  No matching files
                 </div>
               )}
 
@@ -160,6 +232,26 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
                   <span className="truncate">{dir.name}</span>
                 </button>
               ))}
+
+              {isFileMode &&
+                files.map((file) => {
+                  const selected = selectedFile === file.path;
+                  return (
+                    <button
+                      key={file.path}
+                      onClick={() => setSelectedFile(file.path)}
+                      onDoubleClick={() => onSelect(file.path)}
+                      aria-selected={selected}
+                      className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-surface-hover transition text-left ${
+                        selected ? 'bg-accent/30 text-accent' : ''
+                      }`}
+                    >
+                      <FileIcon size={18} className="text-content-muted flex-shrink-0" />
+                      <span className="truncate flex-1">{file.name}</span>
+                      <span className="text-xs text-content-muted">{formatBytes(file.size)}</span>
+                    </button>
+                  );
+                })}
             </div>
           )}
         </div>
@@ -168,9 +260,13 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
         <div className="flex items-center justify-between p-4 border-t border-border">
           <span
             className="text-xs text-content-muted truncate mr-4 font-mono"
-            title={isRoot ? undefined : currentPath}
+            title={isFileMode ? (selectedFile ?? undefined) : isRoot ? undefined : currentPath}
           >
-            {isRoot ? 'Select a directory' : currentPath}
+            {isFileMode
+              ? (selectedFile ?? 'Select a file')
+              : isRoot
+                ? 'Select a directory'
+                : currentPath}
           </span>
           <div className="flex gap-3 flex-shrink-0">
             <button
@@ -181,7 +277,7 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
             </button>
             <button
               onClick={handleConfirm}
-              disabled={isRoot}
+              disabled={isFileMode ? selectedFile === null : isRoot}
               className="px-4 py-2 bg-accent text-white rounded hover:bg-accent-hover transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Select
