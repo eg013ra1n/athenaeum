@@ -2,7 +2,6 @@
 
 use crate::db;
 use crate::logging;
-use crate::settings;
 use std::sync::Arc;
 use tauri::State;
 
@@ -50,36 +49,19 @@ pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(
 }
 
 /// Set the number of concurrent blink image processing threads.
-/// Validates 0..=max_blink_threads (0 = auto, use all cores), persists to DB,
+/// Validates 0..=max_blink_threads (0 = auto, half the cores), persists to DB,
 /// and rebuilds the semaphore.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn set_blink_threads(threads: u32, state: State<'_, AppState>) -> Result<(), String> {
-    let max = state.max_blink_threads as u32;
-    if threads > max {
-        return Err(format!(
-            "Blink threads must be between 0 and {} (0 = auto)",
-            max
-        ));
-    }
+    let effective = athenaeum_core::api::settings::set_blink_threads(
+        &state.ctx,
+        threads,
+        state.max_blink_threads,
+    )
+    .map_err(|e| e.to_string())?;
 
-    // Persist to DB
-    {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        let conn = db.conn();
-        state
-            .ctx
-            .settings
-            .persist_setting(&conn, settings::keys::BLINK_THREADS, &threads.to_string())
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Rebuild semaphore — 0 means auto (half of available cores)
-    let effective = if threads == 0 {
-        ((max as usize) / 2).max(2)
-    } else {
-        threads as usize
-    };
+    // Rebuild semaphore
     *state.image_semaphore.write().unwrap() = Arc::new(tokio::sync::Semaphore::new(effective));
 
     tracing::info!(
