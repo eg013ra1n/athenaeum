@@ -5229,6 +5229,16 @@ struct Seeded {
     bound: Vec<SeededFrame>,
 }
 
+/// What the announce step hands on: the hub's state after the last accepted
+/// batch, the frames announced, the frames adopted at the hub, and whether the
+/// hub refused an outdated collab api.
+struct Announced {
+    state: Option<String>,
+    announced: Vec<(SeededFrame, String, i32)>,
+    hub_adopted: Vec<(SeededFrame, i32)>,
+    outdated: bool,
+}
+
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -5452,257 +5462,30 @@ async fn run_publish(
             .chain(updates.iter())
             .map(|f| f.written.uuid.clone()),
     );
-    let mut gate_version: i32 = project.thresholds_version.unwrap_or(0);
-    let mut state: Option<String> = None;
-    let mut announced: Vec<(SeededFrame, String, i32)> = Vec::new();
-    let mut hub_adopted: Vec<(SeededFrame, i32)> = Vec::new();
     let mut first_err: Option<ApiError> = (refused_new > 0).then(|| {
         ApiError::Conflict(crate::account::client::publishing_device_msg(
             bound_elsewhere.clone().flatten().as_deref(),
         ))
     });
-    let mut stale_retried = false;
-    let mut outdated = false;
-    let mut announced_so_far = 0usize;
-    let mut batches = announce_batches(new_frames);
-    'batches: while let Some(mut batch) = batches.pop_front() {
-        // Plan W3 / review focus 2: a frame withheld since the split is
-        // never announced — untagged, its prepared row and file removed.
-        // Fail-closed: when the withheld set cannot be read, this batch is
-        // not announced.
-        let withheld = {
-            let db = db(ctx)?;
-            let conn = db.conn();
-            crate::db::collab_prepare::withheld_ids(&conn, project_id)
-        };
-        let withheld = match withheld {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!(project_id, count = batch.len(), error = %format!("{e:#}"), "publish: reading the withheld frames failed; batch not announced");
-                fail_batch(
-                    &node,
-                    project_id,
-                    &batch,
-                    &format!("cannot read the withheld frames: {e:#}"),
-                    &mut held_back,
-                )
-                .await;
-                first_err.get_or_insert(internal(e));
-                continue;
-            }
-        };
-        let (keep, dropped): (Vec<SeededFrame>, Vec<SeededFrame>) = batch
-            .into_iter()
-            .partition(|f| !withheld.contains(&f.written.frame_id));
-        batch = keep;
-        if !dropped.is_empty() {
-            let refs: Vec<&SeededFrame> = dropped.iter().collect();
-            unseed_all(&node, project_id, &refs).await;
-            let ids: Vec<i64> = dropped.iter().map(|f| f.written.frame_id).collect();
-            drop_withheld_mid_run(ctx, project_id, &ids, &from_prepared);
-        }
-        // W4: cancel before each New-frame announce batch. What was seeded
-        // and not announced is untagged; the frames stay prepared.
-        if run.cancelled() {
-            let mut rest: Vec<&SeededFrame> = batch.iter().collect();
-            rest.extend(batches.iter().flatten());
-            unseed_all(&node, project_id, &rest).await;
-            tracing::info!(
-                project_id,
-                count = rest.len(),
-                outcome = "cancelled",
-                "publish: cancelled before announcing; frames stay prepared"
-            );
-            break 'batches;
-        }
-        loop {
-            if batch.is_empty() {
-                break;
-            }
-            let wire: Vec<_> = batch
-                .iter()
-                .map(|f| frame_in_wire(f, gate_version))
-                .collect();
-            match client.announce_frames(&token, project_id, &wire).await {
-                Ok(resp) => {
-                    state = Some(resp.state.clone());
-                    tracing::info!(project_id, count = batch.len(), state = %resp.state, "publish: frames announced");
-                    announced_so_far += batch.len();
-                    announced.extend(
-                        batch
-                            .drain(..)
-                            .map(|f| (f, resp.state.clone(), gate_version)),
-                    );
-                    run.tick(announced_so_far, None);
-                    break;
-                }
-                Err(E::CollabApiOutdated) => {
-                    // Nothing more goes out: roll back every seed that is not
-                    // yet announced; what the hub already took is recorded
-                    // below so it never becomes an orphan.
-                    tracing::error!(
-                        project_id,
-                        outcome = "collab_api_outdated",
-                        "publish: hub refused an outdated collab api; rolling back unsent seeds"
-                    );
-                    outdated = true;
-                    let mut unsent: Vec<&SeededFrame> = batch.iter().collect();
-                    unsent.extend(batches.iter().flatten());
-                    unsent.extend(updates.iter());
-                    unseed_all(&node, project_id, &unsent).await;
-                    let staged: Vec<&SeededFrame> = updates.iter().collect();
-                    unstage_updates(ctx, &disk_lock, project_id, &staged).await;
-                    break 'batches;
-                }
-                Err(E::PublishingDevice {
-                    device_id,
-                    device_name,
-                }) => {
-                    // A6: another in-service device of this account is the
-                    // project's publishing device. Nothing of this batch was
-                    // written; nothing more is announced this run. Recorded
-                    // so the next run (auto-publish included) stops before
-                    // any generation, until the binding moves.
-                    tracing::info!(
-                        project_id,
-                        count = batch.len(),
-                        bound_device_id = %device_id,
-                        outcome = "publishing_device",
-                        "publish refused: another device of the account publishes into this project"
-                    );
-                    {
-                        let recorded = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
-                            crate::db::collab::set_publishing_device(
-                                &db.conn(),
-                                project_id,
-                                Some(&crate::db::collab::PublishingDevice {
-                                    device_id: device_id.clone(),
-                                    name: device_name.clone(),
-                                }),
-                            )
-                        });
-                        if let Err(e) = recorded {
-                            tracing::error!(project_id, error = %format!("{e:#}"), "publish: recording the publishing device failed");
-                        }
-                    }
-                    let rest: Vec<SeededFrame> = batches.drain(..).flatten().collect();
-                    for group in [&batch, &rest] {
-                        let refs: Vec<&SeededFrame> = group.iter().collect();
-                        unseed_all(&node, project_id, &refs).await;
-                        held_back.extend(group.iter().map(|f| {
-                            held_bound_elsewhere(
-                                f.written.frame_id,
-                                &f.written.filename,
-                                device_name.as_deref(),
-                            )
-                        }));
-                    }
-                    first_err = Some(ApiError::Conflict(
-                        crate::account::client::publishing_device_msg(device_name.as_deref()),
-                    ));
-                    break 'batches;
-                }
-                Err(e) if !already_announced_in(&e, &batch).is_empty() => {
-                    // R8a: the hub already holds these uuids as mine (an
-                    // announce whose reply was lost, or whose row was never
-                    // recorded). Adopt them and retry the rest — each retry
-                    // drops at least one frame, so the loop is bounded by the
-                    // batch size.
-                    let named = already_announced_in(&e, &batch);
-                    tracing::warn!(project_id, count = named.len(), error = %e, "publish: frames already announced; adopting them and retrying the rest");
-                    let mut i = 0usize;
-                    let mut keep = Vec::with_capacity(batch.len());
-                    for f in batch.drain(..) {
-                        if named.contains(&i) {
-                            hub_adopted.push((f, gate_version));
-                        } else {
-                            keep.push(f);
-                        }
-                        i += 1;
-                    }
-                    batch = keep;
-                }
-                Err(e) if !stale_retried && is_stale_gate_refusal(&e) => {
-                    stale_retried = true;
-                    tracing::warn!(project_id, version = gate_version, error = %e, "publish: stale gate version; refreshing thresholds and retrying once");
-                    let verdicts =
-                        match refresh_project_thresholds(ctx, &client, &token, project_id).await {
-                            Ok(refreshed) => {
-                                gate_version = refreshed.thresholds_version.unwrap_or(0);
-                                regate(ctx, &refreshed)
-                            }
-                            Err(err) => Err(err),
-                        };
-                    let verdicts = match verdicts {
-                        Ok(v) => v,
-                        Err(err) => {
-                            fail_batch(
-                                &node,
-                                project_id,
-                                &batch,
-                                &format!("announce failed: {err}"),
-                                &mut held_back,
-                            )
-                            .await;
-                            first_err.get_or_insert(err);
-                            break;
-                        }
-                    };
-                    // The refreshed verdicts apply to this batch AND every
-                    // queued one: a frame that no longer passes leaves.
-                    let passes = |f: &SeededFrame| {
-                        verdicts
-                            .get(&f.written.frame_id)
-                            .is_some_and(|r| r.publishable)
-                    };
-                    let mut dropped: Vec<SeededFrame> = Vec::new();
-                    let (keep, drop_now): (Vec<_>, Vec<_>) =
-                        batch.into_iter().partition(|f| passes(f));
-                    batch = keep;
-                    dropped.extend(drop_now);
-                    for queued in batches.iter_mut() {
-                        let (keep, drop_now): (Vec<_>, Vec<_>) =
-                            std::mem::take(queued).into_iter().partition(|f| passes(f));
-                        *queued = keep;
-                        dropped.extend(drop_now);
-                    }
-                    let refs: Vec<&SeededFrame> = dropped.iter().collect();
-                    unseed_all(&node, project_id, &refs).await;
-                    for f in &dropped {
-                        let reasons = verdicts
-                            .get(&f.written.frame_id)
-                            .map(|r| r.failures.clone())
-                            .filter(|r| !r.is_empty())
-                            .unwrap_or_else(|| {
-                                vec!["no longer in the project's linked sets".into()]
-                            });
-                        held_back.push(HeldBackFrame {
-                            frame_id: f.written.frame_id,
-                            filename: f.written.filename.clone(),
-                            reasons,
-                            publishing_device: None,
-                        });
-                    }
-                }
-                Err(e) => {
-                    // F5: nothing of this batch is announced — stop seeding
-                    // it. The files stay; own rows are recorded only after a
-                    // successful announce, so the next run re-announces them.
-                    tracing::error!(project_id, count = batch.len(), error = %e, "publish: announce failed");
-                    fail_batch(
-                        &node,
-                        project_id,
-                        &batch,
-                        &format!("announce failed: {e}"),
-                        &mut held_back,
-                    )
-                    .await;
-                    first_err.get_or_insert(client_err(e));
-                    break;
-                }
-            }
-        }
-    }
+    let Announced {
+        state,
+        announced,
+        hub_adopted,
+        mut outdated,
+    } = publish_announce(
+        &pass,
+        &token,
+        &client,
+        &node,
+        &disk_lock,
+        project.thresholds_version.unwrap_or(0),
+        new_frames,
+        &updates,
+        &from_prepared,
+        &mut first_err,
+        &mut held_back,
+    )
+    .await?;
 
     // ── 6. New content versions ──────────────────────────────────────────────
     run.stage(PublishStage::Versions, updates.len());
@@ -7767,6 +7550,282 @@ async fn publish_seed(
         new_frames,
         updates,
         bound,
+    })
+}
+
+/// Section 5: announce the new frames, at most 500 per batch. A batch the hub
+/// refuses is unseeded and held back; the first error is kept for the result.
+#[allow(clippy::too_many_arguments)]
+async fn publish_announce(
+    pass: &PublishPass<'_>,
+    token: &str,
+    client: &CollabClient,
+    node: &crate::sharing::iroh::node::SharedIrohNode,
+    disk_lock: &tokio::sync::Mutex<()>,
+    mut gate_version: i32,
+    new_frames: Vec<SeededFrame>,
+    updates: &[SeededFrame],
+    from_prepared: &HashMap<i64, crate::db::collab_prepare::PreparedRow>,
+    first_err: &mut Option<ApiError>,
+    held_back: &mut Vec<HeldBackFrame>,
+) -> Result<Announced, ApiError> {
+    let PublishPass {
+        ctx,
+        project_id,
+        run,
+        ..
+    } = *pass;
+    use crate::account::AccountClientError as E;
+    let mut state: Option<String> = None;
+    let mut announced: Vec<(SeededFrame, String, i32)> = Vec::new();
+    let mut hub_adopted: Vec<(SeededFrame, i32)> = Vec::new();
+    let mut stale_retried = false;
+    let mut outdated = false;
+    let mut announced_so_far = 0usize;
+    let mut batches = announce_batches(new_frames);
+    'batches: while let Some(mut batch) = batches.pop_front() {
+        // Plan W3 / review focus 2: a frame withheld since the split is
+        // never announced — untagged, its prepared row and file removed.
+        // Fail-closed: when the withheld set cannot be read, this batch is
+        // not announced.
+        let withheld = {
+            let db = db(ctx)?;
+            let conn = db.conn();
+            crate::db::collab_prepare::withheld_ids(&conn, project_id)
+        };
+        let withheld = match withheld {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(project_id, count = batch.len(), error = %format!("{e:#}"), "publish: reading the withheld frames failed; batch not announced");
+                fail_batch(
+                    &node,
+                    project_id,
+                    &batch,
+                    &format!("cannot read the withheld frames: {e:#}"),
+                    held_back,
+                )
+                .await;
+                first_err.get_or_insert(internal(e));
+                continue;
+            }
+        };
+        let (keep, dropped): (Vec<SeededFrame>, Vec<SeededFrame>) = batch
+            .into_iter()
+            .partition(|f| !withheld.contains(&f.written.frame_id));
+        batch = keep;
+        if !dropped.is_empty() {
+            let refs: Vec<&SeededFrame> = dropped.iter().collect();
+            unseed_all(&node, project_id, &refs).await;
+            let ids: Vec<i64> = dropped.iter().map(|f| f.written.frame_id).collect();
+            drop_withheld_mid_run(ctx, project_id, &ids, &from_prepared);
+        }
+        // W4: cancel before each New-frame announce batch. What was seeded
+        // and not announced is untagged; the frames stay prepared.
+        if run.cancelled() {
+            let mut rest: Vec<&SeededFrame> = batch.iter().collect();
+            rest.extend(batches.iter().flatten());
+            unseed_all(&node, project_id, &rest).await;
+            tracing::info!(
+                project_id,
+                count = rest.len(),
+                outcome = "cancelled",
+                "publish: cancelled before announcing; frames stay prepared"
+            );
+            break 'batches;
+        }
+        loop {
+            if batch.is_empty() {
+                break;
+            }
+            let wire: Vec<_> = batch
+                .iter()
+                .map(|f| frame_in_wire(f, gate_version))
+                .collect();
+            match client.announce_frames(&token, project_id, &wire).await {
+                Ok(resp) => {
+                    state = Some(resp.state.clone());
+                    tracing::info!(project_id, count = batch.len(), state = %resp.state, "publish: frames announced");
+                    announced_so_far += batch.len();
+                    announced.extend(
+                        batch
+                            .drain(..)
+                            .map(|f| (f, resp.state.clone(), gate_version)),
+                    );
+                    run.tick(announced_so_far, None);
+                    break;
+                }
+                Err(E::CollabApiOutdated) => {
+                    // Nothing more goes out: roll back every seed that is not
+                    // yet announced; what the hub already took is recorded
+                    // below so it never becomes an orphan.
+                    tracing::error!(
+                        project_id,
+                        outcome = "collab_api_outdated",
+                        "publish: hub refused an outdated collab api; rolling back unsent seeds"
+                    );
+                    outdated = true;
+                    let mut unsent: Vec<&SeededFrame> = batch.iter().collect();
+                    unsent.extend(batches.iter().flatten());
+                    unsent.extend(updates.iter());
+                    unseed_all(&node, project_id, &unsent).await;
+                    let staged: Vec<&SeededFrame> = updates.iter().collect();
+                    unstage_updates(ctx, &disk_lock, project_id, &staged).await;
+                    break 'batches;
+                }
+                Err(E::PublishingDevice {
+                    device_id,
+                    device_name,
+                }) => {
+                    // A6: another in-service device of this account is the
+                    // project's publishing device. Nothing of this batch was
+                    // written; nothing more is announced this run. Recorded
+                    // so the next run (auto-publish included) stops before
+                    // any generation, until the binding moves.
+                    tracing::info!(
+                        project_id,
+                        count = batch.len(),
+                        bound_device_id = %device_id,
+                        outcome = "publishing_device",
+                        "publish refused: another device of the account publishes into this project"
+                    );
+                    {
+                        let recorded = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
+                            crate::db::collab::set_publishing_device(
+                                &db.conn(),
+                                project_id,
+                                Some(&crate::db::collab::PublishingDevice {
+                                    device_id: device_id.clone(),
+                                    name: device_name.clone(),
+                                }),
+                            )
+                        });
+                        if let Err(e) = recorded {
+                            tracing::error!(project_id, error = %format!("{e:#}"), "publish: recording the publishing device failed");
+                        }
+                    }
+                    let rest: Vec<SeededFrame> = batches.drain(..).flatten().collect();
+                    for group in [&batch, &rest] {
+                        let refs: Vec<&SeededFrame> = group.iter().collect();
+                        unseed_all(&node, project_id, &refs).await;
+                        held_back.extend(group.iter().map(|f| {
+                            held_bound_elsewhere(
+                                f.written.frame_id,
+                                &f.written.filename,
+                                device_name.as_deref(),
+                            )
+                        }));
+                    }
+                    *first_err = Some(ApiError::Conflict(
+                        crate::account::client::publishing_device_msg(device_name.as_deref()),
+                    ));
+                    break 'batches;
+                }
+                Err(e) if !already_announced_in(&e, &batch).is_empty() => {
+                    // R8a: the hub already holds these uuids as mine (an
+                    // announce whose reply was lost, or whose row was never
+                    // recorded). Adopt them and retry the rest — each retry
+                    // drops at least one frame, so the loop is bounded by the
+                    // batch size.
+                    let named = already_announced_in(&e, &batch);
+                    tracing::warn!(project_id, count = named.len(), error = %e, "publish: frames already announced; adopting them and retrying the rest");
+                    let mut i = 0usize;
+                    let mut keep = Vec::with_capacity(batch.len());
+                    for f in batch.drain(..) {
+                        if named.contains(&i) {
+                            hub_adopted.push((f, gate_version));
+                        } else {
+                            keep.push(f);
+                        }
+                        i += 1;
+                    }
+                    batch = keep;
+                }
+                Err(e) if !stale_retried && is_stale_gate_refusal(&e) => {
+                    stale_retried = true;
+                    tracing::warn!(project_id, version = gate_version, error = %e, "publish: stale gate version; refreshing thresholds and retrying once");
+                    let verdicts =
+                        match refresh_project_thresholds(ctx, &client, &token, project_id).await {
+                            Ok(refreshed) => {
+                                gate_version = refreshed.thresholds_version.unwrap_or(0);
+                                regate(ctx, &refreshed)
+                            }
+                            Err(err) => Err(err),
+                        };
+                    let verdicts = match verdicts {
+                        Ok(v) => v,
+                        Err(err) => {
+                            fail_batch(
+                                &node,
+                                project_id,
+                                &batch,
+                                &format!("announce failed: {err}"),
+                                held_back,
+                            )
+                            .await;
+                            first_err.get_or_insert(err);
+                            break;
+                        }
+                    };
+                    // The refreshed verdicts apply to this batch AND every
+                    // queued one: a frame that no longer passes leaves.
+                    let passes = |f: &SeededFrame| {
+                        verdicts
+                            .get(&f.written.frame_id)
+                            .is_some_and(|r| r.publishable)
+                    };
+                    let mut dropped: Vec<SeededFrame> = Vec::new();
+                    let (keep, drop_now): (Vec<_>, Vec<_>) =
+                        batch.into_iter().partition(|f| passes(f));
+                    batch = keep;
+                    dropped.extend(drop_now);
+                    for queued in batches.iter_mut() {
+                        let (keep, drop_now): (Vec<_>, Vec<_>) =
+                            std::mem::take(queued).into_iter().partition(|f| passes(f));
+                        *queued = keep;
+                        dropped.extend(drop_now);
+                    }
+                    let refs: Vec<&SeededFrame> = dropped.iter().collect();
+                    unseed_all(&node, project_id, &refs).await;
+                    for f in &dropped {
+                        let reasons = verdicts
+                            .get(&f.written.frame_id)
+                            .map(|r| r.failures.clone())
+                            .filter(|r| !r.is_empty())
+                            .unwrap_or_else(|| {
+                                vec!["no longer in the project's linked sets".into()]
+                            });
+                        held_back.push(HeldBackFrame {
+                            frame_id: f.written.frame_id,
+                            filename: f.written.filename.clone(),
+                            reasons,
+                            publishing_device: None,
+                        });
+                    }
+                }
+                Err(e) => {
+                    // F5: nothing of this batch is announced — stop seeding
+                    // it. The files stay; own rows are recorded only after a
+                    // successful announce, so the next run re-announces them.
+                    tracing::error!(project_id, count = batch.len(), error = %e, "publish: announce failed");
+                    fail_batch(
+                        &node,
+                        project_id,
+                        &batch,
+                        &format!("announce failed: {e}"),
+                        held_back,
+                    )
+                    .await;
+                    first_err.get_or_insert(client_err(e));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(Announced {
+        state,
+        announced,
+        hub_adopted,
+        outdated,
     })
 }
 
