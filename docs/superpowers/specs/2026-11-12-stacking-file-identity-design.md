@@ -1,6 +1,6 @@
 # Stacking file identity without the modification time: design
 
-Date: 2026-11-12. Status: approved by the owner on 2026-11-12 («одобряю спеку, перепривязку включай»). This spec starts from `docs/superpowers/research/2026-11-08-stacking-file-identity-without-mtime.md`. It changes the cache of `docs/superpowers/specs/2026-11-08-stacking-frame-level-cache-design.md`, including that cache's ruling R7 b. The rulings are FI-1 to FI-9 (§2).
+Date: 2026-11-12. Status: approved by the owner on 2026-11-12 («одобряю спеку, перепривязку включай»). This spec starts from `docs/superpowers/research/2026-11-08-stacking-file-identity-without-mtime.md`. It changes the cache of `docs/superpowers/specs/2026-11-08-stacking-frame-level-cache-design.md`, including that cache's ruling R7 b. The rulings are FI-1 to FI-10 (§2).
 
 Code paths are under `crates/athenaeum-core/src/` unless they start with `docs/`. Line numbers are taken from `main` at 484fa75f.
 
@@ -31,6 +31,7 @@ The change: a file's identity is its size plus a content sample, never its time.
 | FI-7 | 2026-11-12, with the approval | The gate may read Calibrate stale after a scan re-parse until a run samples the inputs again; the run then reuses everything. The gate reads no file (§11, point 1). |
 | FI-8 | 2026-11-12, with the approval | No full read of a master rewritten in place with its header kept; the risk of §6 is accepted (§11, point 2). |
 | FI-9 | 2026-11-12, «перепривязку включай» | A working folder that now lives at another path reuses its cache: the path rebase is part of this cycle (§4.10; §11, point 3). |
+| FI-10 | 2026-11-13, «Ок, начинай» (the plan's approval) | RB-1 of §4.10 stands: a copied or moved working folder is reused only when its files kept their times within 2 s. A content sample per working file is a follow-up only if a tool the owner uses drops times. |
 
 The "accept ±2 s" remedy stays dropped (open-items, backlog line).
 
@@ -277,7 +278,7 @@ The gate's over-report in the regroup finding's item (3) goes away.
 
 ### 4.10 A working folder at another path (FI-9)
 
-Added after the approval, from the design note of 2026-11-12. Line numbers in this section are of `main` at 12ada293. Its three calls carry the controller's defaults (RB-1 to RB-3, at the end of the section) until the owner confirms them with the plan.
+Added after the approval, from the design note of 2026-11-12. Line numbers in this section are of `main` at 12ada293. Its three calls (RB-1 to RB-3, at the end of the section) were confirmed by the owner with the plan on 2026-11-13 (FI-10).
 
 **The rule.** A cached file that moved with its working folder is reused at the new place. Rows keep absolute paths. The run points a row at the subject's current working root when its file is there as recorded. Nothing on disk is moved, copied or deleted.
 
@@ -567,3 +568,19 @@ The three points this draft left open, as the owner closed them on 2026-11-12. P
 1. **The gate after a scan re-parse.** The scan NULLs `content_hash` on any drift (`scanner/mod.rs:1384-1396`). After a rescan of copied files, the gate therefore reads Calibrate stale until a run samples them again; the run then reuses everything. Default: accept it and document it. The alternatives are the gate reading 1.5 MiB per input (about 74 s for 551 lights on the share), or a stacking-side copy of the last sample.
 2. **A FITS master rewritten in place with its header kept.** The research note proposed keeping the time as a trigger for a full re-read of masters in this case. Default: no full read (FI-1), with the risk stated in §6.
 3. **A working folder moved to another path.** Rows name absolute paths, so such a move recomputes everything: the cause is the path, not the time. The draft's default was out of scope. The owner put it in scope (FI-9): §4.10.
+
+## 12. Corrections found while planning (2026-11-12)
+
+The plan `docs/superpowers/plans/2026-11-12-stacking-file-identity-plan.md` re-verified every line number of this spec at `0df147a7` and lists the moved ones under its "Spec corrections"; they are not repeated here. The corrections below change a rule or a claim of this spec. Where this section and an earlier one disagree, this section holds.
+
+- **§4.2, the mosaic row.** It is always read, and it is deleted whenever the job writes its path: when the job wants a mosaic, or when the row names a file the job writes. With the debayer off, an OSC frame's calibrated file takes the mosaic's name (`c_<stem>.fits`), so a mosaic row left there at the old hash would be reused by a later Bayer run over another run's pixels.
+- **§4.2, "the one write without a delete".** The note that pass 2's fallback writes under the SAME key is wrong for a member whose own β came from its `metrics` row while its `measured` row is not fresh: that member is not owed pass 1, and its pass-2 worker writes under another key. The `measured` row of every member left owed without a fresh row is deleted before pass 2's fan-out.
+- **§4.2, a failed delete.** A failed `delete_artifact` stops the job; it is never a warning followed by the write. The dry pass of the two-pass reference deletes nothing, because it persists nothing.
+- **§4.2, the LN reference.** Its file is written by `write_reference` at `stacking/run/normalize.rs:1766`; `:1836-1870` is its identity and upsert (`upsert_artifact` at `:1855`). The delete goes before `:1766`.
+- **§4.1, "in place".** The run decides it from Prepare's action (`InPlace`, or the kept float mosaic, for a frame not in a zip). The gate, which has no action, decides it from the row lying outside the `prepared/` and `calibrated/` folders of the subject's roots, in both spellings.
+- **§4.4, the run's book** also covers manually excluded frames: every stage's hash call propagates its error, and a lookup outside the book would fail the run.
+- **§4.10, the 2 s rule.** The time is compared with `MTIME_TOLERANCE_SECS` at full precision, not through `Stamp::matches`, which truncates both times to whole seconds and so accepts up to 2.999 s.
+- **§10, the order.** T1 → T2, T3 → T4 → T5, then T8. T8's run tests use T4's regroup rig and its trigger sits before T4's book, so T8 does not run beside T3 to T5.
+- **§9 A1.** The first run in a new working folder reads the rows left at the previous folder there and computes nothing. A1 needs `rerunFrom: calibrate` (or the previous folder removed) to write its files in the new folder first.
+- **§9 A2.** Lights are relocated through Missing files; a rescan of the copies' root makes new rows and new frames outside the set. Only a master may be rescanned (FI-3).
+- **§9 A2c.** While the source copy exists, the left rows are read there, with no warning and no recompute. The warning appears only once the source copy is gone.
