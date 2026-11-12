@@ -383,10 +383,26 @@ function MasterCard({
       {group.status === 'failed' && group.error && (
         <p className="text-xs text-error">{group.error}</p>
       )}
+      {/* A skipped group ends with no master; its row says why (a run from an
+       *  older build has no reason, so the bare word stands). */}
+      {group.status === 'skipped' && (
+        <p className="text-xs text-warning">
+          {group.error ? `Skipped: ${group.error}` : 'Skipped'}
+        </p>
+      )}
 
       <RevealOrPath path={group.masterPath} />
     </div>
   );
+}
+
+/** `" · 2 of 5 groups without a master"` for a finished run that lost some
+ *  groups (skipped or failed); empty otherwise. */
+function withoutMasterLabel(r: StackingRunSummary): string {
+  const without = r.groupCount - r.masterPaths.length;
+  return r.run.status === 'done' && without > 0
+    ? ` · ${without} of ${r.groupCount} group${r.groupCount === 1 ? '' : 's'} without a master`
+    : '';
 }
 
 /** The command names a failure line reports, per subject kind (the adapter in
@@ -550,6 +566,7 @@ export function ResultsPanel({ subject, running, onSelectedRunDetailChange }: Re
   }, [subjectApi, commandNames, notify, fetchUsage]);
 
   const selectedRun = runs?.find((r) => r.run.id === selectedRunId) ?? null;
+  const skippedCount = runDetail?.groups.filter((g) => g.status === 'skipped').length ?? 0;
   // Brief's literal gate: disabled only while a run is active for this subject
   // (the backend's own `Conflict` refusal is the same condition, checked
   // again server-side — see the catch below).
@@ -569,7 +586,7 @@ export function ResultsPanel({ subject, running, onSelectedRunDetailChange }: Re
             >
               {runs.map((r) => (
                 <option key={r.run.id} value={r.run.id}>
-                  #{r.run.id} · {formatTimestamp(r.run.startedAt)} · {r.run.status}
+                  {`#${r.run.id} · ${formatTimestamp(r.run.startedAt)} · ${r.run.status}${withoutMasterLabel(r)}`}
                 </option>
               ))}
             </select>
@@ -595,6 +612,7 @@ export function ResultsPanel({ subject, running, onSelectedRunDetailChange }: Re
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs text-content-muted">
               {runDetail.groups.length} group{runDetail.groups.length === 1 ? '' : 's'}
+              {skippedCount > 0 && <span className="text-warning"> · {skippedCount} skipped</span>}
               {runDetail.run.error ? ` · ${runDetail.run.error}` : ''}
               {/* The run's resolved reference, and — when stage 5's
                *  two-pass pick moved it (M4a Task 4, ruling R-M4a-5) — the

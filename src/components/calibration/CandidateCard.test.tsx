@@ -59,3 +59,43 @@ describe('CandidateCard geometry', () => {
     expect(onSelect).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('CandidateCard gain and offset', () => {
+  const level = (
+    imagetyp: 'MasterDark' | 'MasterFlat',
+    gain: [string | null, string | null],
+    offset: [string | null, string | null],
+    enforced = true,
+  ): CalibrationSetWithScore => {
+    const c = candidate('match');
+    c.set.imagetyp = imagetyp;
+    c.parameters = [
+      { name: 'gain', enforced, status: 'match', frameValue: gain[0], setValue: gain[1], diff: null, warningThreshold: null, matchingThreshold: null },
+      { name: 'offset', enforced, status: 'match', frameValue: offset[0], setValue: offset[1], diff: null, warningThreshold: null, matchingThreshold: null },
+    ];
+    return c;
+  };
+  const show = (c: CalibrationSetWithScore) =>
+    render(<CandidateCard candidate={c} selected={false} isCurrent={false} onSelect={vi.fn()} />).container.textContent ?? '';
+
+  it('badges a dark whose offset is unknown, even when the config ignores it', () => {
+    expect(show(level('MasterDark', ['100', '100'], ['1', null], false))).toContain('Gain/offset unknown');
+  });
+  it('badges another offset, another gain, or both', () => {
+    expect(show(level('MasterDark', ['100', '100'], ['30', '200']))).toContain('Another offset');
+    cleanup();
+    expect(show(level('MasterDark', ['100', '200'], ['30', '30']))).toContain('Another gain');
+    cleanup();
+    expect(show(level('MasterDark', ['100', '200'], ['30', '200']))).toContain('Another gain and offset');
+  });
+  it('has no badge when both agree, and none on a flat', () => {
+    expect(show(level('MasterDark', ['100', '100'], ['30', '30']))).not.toMatch(/Another|unknown/);
+    cleanup();
+    expect(show(level('MasterFlat', ['100', '200'], ['30', '200']))).not.toMatch(/Another|unknown/);
+  });
+  it('uses the warning badge classes', () => {
+    render(<CandidateCard candidate={level('MasterDark', ['100', '100'], ['30', '200'])} selected={false} isCurrent={false} onSelect={vi.fn()} />);
+    expect(screen.getByText('Another offset').className).toContain('bg-warning-muted');
+    expect(screen.getByText('Another offset').className).toContain('text-warning');
+  });
+});

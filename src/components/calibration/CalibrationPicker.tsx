@@ -11,6 +11,7 @@ import {
   exposuresOf,
   formatSeconds,
   filterIsActive,
+  levelNotesFor,
   originNotesFor,
   slotsFor,
   SLOT_LABEL,
@@ -54,12 +55,14 @@ export function CalibrationPicker({
   subject: PickerSubject;
   /** `originNotes`: one sentence per newly chosen set at another recorded
    *  sub-frame origin (G-7: allowed by hand, with a visible warning) — the
-   *  caller shows them once the assignment succeeded. */
+   *  caller shows them once the assignment succeeded. `levelNotes`: the same
+   *  for a dark, bias or dark flat at another or unknown gain or offset. */
   onApplyLights?: (
     flat: ManualPick,
     dark: ManualPick,
     bias: ManualPick,
     originNotes: string[],
+    levelNotes: string[],
   ) => void;
   /** Called after a successful save so the opener can refresh. */
   onApplied?: () => void;
@@ -115,6 +118,17 @@ export function CalibrationPicker({
       candidates,
     );
 
+  // A dark, bias or dark flat at another or unknown gain or offset is allowed
+  // by hand too; what is newly chosen is told after the save.
+  const levelNotes = (): string[] =>
+    levelNotesFor(
+      subject.kind,
+      slots,
+      Object.fromEntries(slots.map(k => [k, selectedIn(k)])),
+      current,
+      candidates,
+    );
+
   const handleApply = async () => {
     if (subject.kind === 'lights') {
       onApplyLights?.(
@@ -122,10 +136,12 @@ export function CalibrationPicker({
         pick(selectedIn('dark'), current.dark),
         pick(selectedIn('bias'), current.bias),
         originNotes(),
+        levelNotes(),
       );
       return;
     }
     const notes = originNotes();
+    const gainOffsetNotes = levelNotes();
     setSaving(true);
     try {
       await saveSubCalibration(subject.setId, {
@@ -137,6 +153,14 @@ export function CalibrationPicker({
         notify({
           title: 'Calibration at another sub-frame origin',
           detail: notes.join('; '),
+          kind: 'merge',
+          tone: 'warning',
+        });
+      }
+      if (gainOffsetNotes.length > 0) {
+        notify({
+          title: 'Calibration with another gain or offset',
+          detail: gainOffsetNotes.join('; '),
           kind: 'merge',
           tone: 'warning',
         });

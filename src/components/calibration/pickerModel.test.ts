@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CalibrationSetWithScore, ParameterVerdict } from '../../types/models';
-import { describeDifference, formatSeconds, tidyNumbers, geometryLabel, geometryRefuses, geometryWarns, originChoiceNote, originNotesFor, sizeCellState, writtenSubSlot, type SlotKind } from './pickerModel';
+import { describeDifference, formatSeconds, tidyNumbers, geometryLabel, geometryRefuses, geometryWarns, levelBadge, levelChoiceNote, levelNotesFor, originChoiceNote, originNotesFor, sizeCellState, writtenSubSlot, type SlotKind } from './pickerModel';
 
 const verdict = (status: ParameterVerdict['status']): ParameterVerdict => ({
   name: 'geometry', enforced: true, status,
@@ -80,5 +80,89 @@ describe('exposure and parameter numbers read like a person writes them', () => 
     expect(tidyNumbers('6.71999979019165')).toBe('6.72');
     expect(tidyNumbers('9576×6388')).toBe('9576×6388');
     expect(tidyNumbers('-9.8')).toBe('-9.8');
+  });
+});
+
+describe('gain and offset of a subtracted set', () => {
+  const pair = (name: 'gain' | 'offset', frame: string | null, set: string | null, enforced = true): ParameterVerdict => ({
+    name, enforced, status: 'match', frameValue: frame, setValue: set,
+    diff: null, warningThreshold: null, matchingThreshold: null,
+  });
+  const cand = (
+    imagetyp: string,
+    gain: [string | null, string | null],
+    offset: [string | null, string | null],
+    enforced = true,
+    id = 1843,
+  ) =>
+    ({
+      set: { id, imagetyp },
+      parameters: [pair('gain', gain[0], gain[1], enforced), pair('offset', offset[0], offset[1], enforced)],
+    }) as unknown as CalibrationSetWithScore;
+
+  it('names a dark that declares no offset', () => {
+    const c = cand('MasterDark', ['100', '100'], ['1', null]);
+    expect(levelChoiceNote(c)).toBe(
+      'Set #1843: Offset 1 on the lights, the dark declares none — its pedestal may not match',
+    );
+    expect(levelBadge(c)).toBe('Gain/offset unknown');
+  });
+  it('says which way another offset goes', () => {
+    const higher = cand('MasterDark', ['100', '100'], ['30', '200']);
+    expect(levelChoiceNote(higher)).toContain(
+      "Offset 30 on the lights, 200 on the dark — the dark's offset is higher, so its pedestal will be over-subtracted",
+    );
+    expect(levelBadge(higher)).toBe('Another offset');
+    const lower = cand('MasterBias', ['100', '100'], ['200', '30']);
+    expect(levelChoiceNote(lower)).toContain("the bias's offset is lower, so its pedestal will be under-subtracted");
+  });
+  it('says another gain, and both together', () => {
+    const gain = cand('DarkFlat', ['100', '200'], ['30', '30']);
+    expect(levelChoiceNote(gain)).toBe(
+      'Set #1843: Gain 100 on the lights, 200 on the dark flat — the dark flat was shot at another gain',
+    );
+    expect(levelBadge(gain)).toBe('Another gain');
+    const both = cand('MasterDark', ['100', '200'], ['30', '200']);
+    expect(levelBadge(both)).toBe('Another gain and offset');
+    expect(levelChoiceNote(both)?.split('; ')).toHaveLength(2);
+  });
+  it('is value-based: the same note when the config ignores gain and offset', () => {
+    const enforced = cand('MasterDark', ['100', '100'], ['30', '200'], true);
+    const ignored = cand('MasterDark', ['100', '100'], ['30', '200'], false);
+    expect(levelChoiceNote(ignored)).toBe(levelChoiceNote(enforced));
+    expect(levelChoiceNote(ignored)).not.toBeNull();
+  });
+  it('is null when gain and offset are known and equal (within 0.01)', () => {
+    expect(levelChoiceNote(cand('MasterDark', ['100', '100'], ['30', '30.004']))).toBeNull();
+    expect(levelBadge(cand('MasterDark', ['100', '100'], ['30', '30']))).toBeNull();
+  });
+  it('applies only to a subtracted set, never to a flat or a light', () => {
+    for (const t of ['Flat', 'MasterFlat', 'Light', 'MasterLight']) {
+      expect(levelChoiceNote(cand(t, ['100', '200'], ['30', null]))).toBeNull();
+      expect(levelBadge(cand(t, ['100', '200'], ['30', null]))).toBeNull();
+    }
+    for (const t of ['Dark', 'MasterDark', 'Bias', 'MasterBias', 'DarkFlat', 'MasterDarkFlat']) {
+      expect(levelChoiceNote(cand(t, ['100', '100'], ['1', null]))).not.toBeNull();
+    }
+  });
+  it('has nothing to compare when the lights declare no value or the verdict is absent', () => {
+    expect(levelChoiceNote(cand('MasterDark', [null, '100'], [null, '30']))).toBeNull();
+    expect(levelChoiceNote({ set: { id: 1, imagetyp: 'MasterDark' }, parameters: [] } as unknown as CalibrationSetWithScore)).toBeNull();
+  });
+  it('names only newly chosen sets, with the same slot rules as the origin notes', () => {
+    const none = { flat: null, darkflat: null, dark: null, bias: null } as Record<SlotKind, number | null>;
+    const candidates = {
+      flat: [],
+      darkflat: [cand('MasterDarkFlat', ['100', '100'], ['1', null], true, 7)],
+      dark: [cand('MasterDark', ['100', '100'], ['30', '200'], true, 9)],
+      bias: [],
+    } as Record<SlotKind, CalibrationSetWithScore[]>;
+    const slots: SlotKind[] = ['darkflat', 'dark', 'bias'];
+    const picks = { darkflat: 7, dark: 9, bias: null };
+    const notes = levelNotesFor('set', slots, picks, none, candidates);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatch(/^Dark flats: Set #7: /);
+    expect(levelNotesFor('lights', slots, picks, none, candidates)).toHaveLength(2);
+    expect(levelNotesFor('set', slots, picks, { ...none, darkflat: 7 }, candidates)).toEqual([]);
   });
 });
