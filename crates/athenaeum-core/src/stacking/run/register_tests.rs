@@ -852,21 +852,32 @@ fn a_cancelled_rewrite_does_not_leave_another_runs_pixels_fresh() {
     assert!(!rig.register_stale(&cfg), "run A's own rows read fresh");
     let rows_a = rig.registered_snapshot();
     assert_eq!(rows_a.len(), 4);
+    let sizes_a: HashMap<i64, i64> = rig
+        .registered_rows()
+        .into_iter()
+        .map(|(frame_id, row)| (frame_id, row.size.unwrap()))
+        .collect();
 
     // Run B: another reference, cancelled right after its Register fan-out.
     crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, rig.light_ids[1])
         .unwrap();
     let (_rc_b, res) = rig.run_with(&cfg, true);
     assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
-    let rows_b = rig.registered_snapshot();
-    assert_eq!(rows_b.len(), rows_a.len());
-    for (a, b) in rows_a.iter().zip(&rows_b) {
-        assert_eq!((&a.1, &a.4, &a.5), (&b.1, &b.4, &b.5), "the cancelled run recorded a row");
-        assert_ne!(a.6, b.6, "premise: run B overwrote frame {}'s file", a.0);
+    // The write order (file-identity spec §4.2): every row was deleted before its file was replaced, and the
+    // cancelled run recorded none of its own, so no row is left over run B's files.
+    assert!(
+        rig.registered_rows().is_empty(),
+        "a row was left over the files the cancelled run wrote: {:?}",
+        rig.registered_rows()
+    );
+    for a in &rows_a {
+        let path = a.5.as_ref().unwrap();
+        let meta = std::fs::metadata(path).unwrap_or_else(|e| panic!("run B's file {path} is gone: {e}"));
+        assert_ne!(Some(meta.modified().unwrap()), a.6, "premise: run B overwrote frame {}'s file", a.0);
         assert_eq!(
-            std::fs::metadata(a.5.as_ref().unwrap()).unwrap().len() as i64,
-            rig.registered_rows()[&a.0].size.unwrap(),
-            "premise: the sizes still agree, so only the modification time tells the files apart"
+            meta.len() as i64,
+            sizes_a[&a.0],
+            "premise: the sizes still agree with run A's rows, so the gate assertion below cannot pass on a size change"
         );
     }
 
@@ -893,6 +904,51 @@ fn a_cancelled_rewrite_does_not_leave_another_runs_pixels_fresh() {
             "plane {p}: the master is not run A's"
         );
     }
+}
+
+/// The write order (file-identity spec §4.2) deletes a `registered` row only where a file is written: the two-pass
+/// dry pass persists nothing, so it deletes nothing. After a run, the dry pass against ANOTHER reference (every
+/// frame a miss, and every frame queued for registration) leaves every row and file as it was.
+#[test]
+fn a_dry_pass_leaves_the_registered_rows_alone() {
+    use crate::stacking::config::ExposureMode;
+
+    let rig = RegisterRig::new();
+    let cfg = rig.cfg(ExposureMode::Seconds);
+    let mut rc = rig.run(&cfg);
+    let before = rig.registered_snapshot();
+    assert_eq!(before.len(), 4, "premise: run A recorded a row per frame");
+
+    let group = rc.plan_groups[0].clone();
+    let other = rig.light_ids[1];
+    let other_calibrated = rc.measured[&group.key]
+        .iter()
+        .find(|e| e.frame.frame_id == other)
+        .and_then(|e| e.calibrated.clone())
+        .expect("the other reference's calibrated file");
+    let ref_stars = reference_stars(&other_calibrated, &cfg.registration, Some(&rc.ctx.image_pool), None).unwrap();
+    let other_frame = find_frame_in_groups(&rc.plan_groups, other).unwrap();
+    let reference_hash = {
+        let conn = db(&rc.ctx).unwrap().conn();
+        rc.memo.calibration_hash_checked(&conn, &cfg, &other_frame).unwrap()
+    };
+    let by_frame: HashMap<i64, RegistrationRecord> = HashMap::new();
+    let mut progress = (0usize, 8usize);
+    let dry = register_group_pass(
+        &mut rc,
+        &group,
+        &ref_stars,
+        other,
+        &reference_hash,
+        &by_frame,
+        false,
+        false,
+        &mut progress,
+        &mut SolveCache::new(),
+    )
+    .unwrap();
+    assert_eq!(dry.len(), 4, "premise: the dry pass registered every frame: {dry:?}");
+    assert_eq!(rig.registered_snapshot(), before, "the dry pass touched the registered rows or files");
 }
 
 /// Ruling R9: a run cancelled inside Register is the newest run and has no frame rows (they are written when the

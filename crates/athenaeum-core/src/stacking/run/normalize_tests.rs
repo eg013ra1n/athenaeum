@@ -2565,3 +2565,37 @@ fn a_member_under_a_quarter_overlap_rejection_only_warns_in_rejection_words() {
         rc.warnings
     );
 }
+
+/// The write order at the LN sidecars (file-identity spec §4.2): a member's `ln` row is deleted before its sidecar
+/// is rewritten, so a run cancelled at the fan-out leaves no row of the old hash. Run 1 normalizes locally; run 2
+/// moves the star selection (the LN hash with it) and is cancelled right before the normalize fan-out. It proves
+/// the delete order only, not wrong pixels: the hook cancels before any sidecar is written.
+#[test]
+fn a_cancelled_normalization_leaves_no_row_of_the_old_hash() {
+    let rig = LnRig::new();
+    let cfg_1 = ln_stored_config();
+    let plan_groups = rig.plan_groups(&cfg_1);
+    assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+    let mut rc_1 = rig.context(cfg_1.clone(), plan_groups);
+    run_register_and_output(&mut rc_1);
+    let rows_1 = rig.artifacts(ArtifactKind::Ln);
+    assert_eq!(rows_1.len(), 4, "premise: run 1 wrote a row per frame: {rows_1:?}");
+    let hashes_1: std::collections::HashSet<String> =
+        rows_1.iter().map(|r| r.config_hash.clone()).collect();
+
+    let mut cfg_2 = cfg_1.clone();
+    cfg_2.normalization.local.star_selection.min_peak_snr += 1.0;
+    let plan_groups = rig.plan_groups(&cfg_2);
+    let mut rc_2 = rig.context(cfg_2, plan_groups);
+    let dir = rig.working.path().to_path_buf();
+    LN_CANCEL_BEFORE_FAN_OUT.lock().unwrap().push(dir.clone());
+    let result = run_stages_for_test(&mut rc_2, Stage::Register).and_then(|()| stage_output(&mut rc_2));
+    LN_CANCEL_BEFORE_FAN_OUT.lock().unwrap().retain(|d| d != &dir);
+    assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
+
+    let rows_2 = rig.artifacts(ArtifactKind::Ln);
+    assert!(
+        rows_2.iter().all(|r| !hashes_1.contains(&r.config_hash)),
+        "an ln row of run 1's hash survived the cancelled run: {rows_2:?}"
+    );
+}
