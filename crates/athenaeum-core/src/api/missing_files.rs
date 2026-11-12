@@ -520,7 +520,7 @@ mod tests {
         let existing = outside.join("there-1.fits");
         std::fs::write(&existing, b"x").unwrap();
         let absent = outside.join("absent-1.fits");
-        let policy = PathPolicy::AllowedRoots(vec![allowed.canonicalize().unwrap()]);
+        let policy = PathPolicy::AllowedRoots(vec![crate::test_support::canonical_path(&allowed)]);
 
         for p in [&existing, &absent] {
             match relocate_missing_file(&ctx, 1, p.to_str().unwrap().to_string(), &policy) {
