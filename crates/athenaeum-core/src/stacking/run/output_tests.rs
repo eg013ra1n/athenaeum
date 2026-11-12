@@ -26,15 +26,16 @@ fn stats_with_low_rejection(low: f64) -> GroupStats {
     stats
 }
 
-/// The dark guard's master half: below the 0.5 bar (healthy stacks reject at most about 3 %) nothing is said; at
-/// and above it the sentence names the group and the percentage.
+/// The dark guard's master half: below the 0.75 bar (healthy stacks reject at most about 3 %, a narrowband OSC
+/// master about 40 %) nothing is said; at and above it the sentence names the group and the percentage.
 #[test]
-fn low_rejection_sentence_fires_at_half_and_names_the_group() {
+fn low_rejection_sentence_fires_at_three_quarters_and_names_the_group() {
     assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.03)), None);
-    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.49)), None);
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.5)), None);
+    assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(0.74)), None);
     assert_eq!(low_rejection_sentence("L", &stats_with_low_rejection(f64::NAN)), None);
-    let half = low_rejection_sentence("L", &stats_with_low_rejection(0.5)).unwrap();
-    assert!(half.starts_with("group L: 50 % of the samples were rejected low"), "{half}");
+    let bar = low_rejection_sentence("L", &stats_with_low_rejection(0.75)).unwrap();
+    assert!(bar.starts_with("group L: 75 % of the samples were rejected low"), "{bar}");
     assert_eq!(
         low_rejection_sentence("L", &stats_with_low_rejection(0.9)).unwrap(),
         "group L: 90 % of the samples were rejected low \u{2014} the calibrated frames are mostly at or below zero; check the dark's gain and offset"

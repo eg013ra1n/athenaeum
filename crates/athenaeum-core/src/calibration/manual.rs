@@ -413,11 +413,11 @@ const LEVEL_TOLERANCE: f64 = 0.01;
 /// relative to the frames it calibrates. Built by [`level_check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LevelCheck {
-    /// The set declares no gain.
+    /// The lights declare a gain and the set declares none.
     pub gain_unknown: bool,
     /// Both declare a gain and they are more than 0.01 apart.
     pub gain_differs: bool,
-    /// The set declares no offset.
+    /// The lights declare an offset and the set declares none.
     pub offset_unknown: bool,
     /// Both declare an offset and they are more than 0.01 apart.
     pub offset_differs: bool,
@@ -434,8 +434,9 @@ impl LevelCheck {
 }
 
 /// Is a manual link of a set of `imagetyp` at another or unknown gain/offset
-/// relative to the lights (or the source set)? "Unknown" = the set declares
-/// none; "differs" = both declare one and they are more than 0.01 apart. A
+/// relative to the lights (or the source set)? "Unknown" = the lights declare
+/// one and the set declares none (a rig whose frames carry no such card at
+/// all has nothing to compare); "differs" = both declare one and they are more than 0.01 apart. A
 /// set that is not a subtrahend (a flat) is never flagged. Header values
 /// only: no pixel is read, and nothing is refused.
 pub fn level_check(
@@ -453,9 +454,9 @@ pub fn level_check(
         _ => false,
     };
     LevelCheck {
-        gain_unknown: set_gain.is_none(),
+        gain_unknown: light_gain.is_some() && set_gain.is_none(),
         gain_differs: apart(light_gain, set_gain),
-        offset_unknown: set_offset.is_none(),
+        offset_unknown: light_offset.is_some() && set_offset.is_none(),
         offset_differs: apart(light_offset, set_offset),
         offset_higher: matches!((light_offset, set_offset), (Some(l), Some(s)) if s - l > LEVEL_TOLERANCE),
     }
@@ -627,6 +628,16 @@ mod level_tests {
         let c = level_check("MasterDark", Some(100.0), Some(1.0), None, None);
         assert!(c.gain_unknown && c.offset_unknown && c.is_flagged());
         assert!(!c.gain_differs && !c.offset_differs && !c.offset_higher);
+    }
+
+    #[test]
+    fn a_rig_with_no_gain_or_offset_cards_anywhere_is_not_flagged() {
+        let c = level_check("MasterDark", None, None, None, None);
+        assert_eq!(c, LevelCheck::default());
+        assert!(!c.is_flagged());
+        // One card known on the lights and missing on the set is still flagged, per card.
+        let c = level_check("Dark", Some(100.0), None, None, None);
+        assert!(c.gain_unknown && !c.offset_unknown && c.is_flagged());
     }
 
     #[test]

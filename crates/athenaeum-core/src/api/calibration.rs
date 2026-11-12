@@ -2333,6 +2333,26 @@ mod tests {
         assert_eq!(manual_flag(&ctx, light, set), 1);
     }
 
+    /// A rig whose lights and master carry no GAIN / OFFSET card at all (a
+    /// DSLR, an old CCD) has nothing to compare: no warning, the link is
+    /// written.
+    #[test]
+    fn manual_assign_is_quiet_when_neither_lights_nor_dark_declare_gain_or_offset() {
+        let (_tmp, ctx) = geo_ctx();
+        let (light, set) = level_rig(&ctx, "MasterDark", 1.0, None, None);
+        db(&ctx)
+            .unwrap()
+            .conn()
+            .execute("UPDATE frames SET gain = NULL, offset = NULL WHERE id = ?1", rusqlite::params![light])
+            .unwrap();
+        let (assigned, warns) = geo::count_warns(LEVEL_WARNING, || {
+            manual_assign_calibration(&ctx, vec![light], set, "Dark".to_string())
+        });
+        assert_eq!(assigned.unwrap(), 1);
+        assert_eq!(warns, 0);
+        assert_eq!(manual_flag(&ctx, light, set), 1);
+    }
+
     /// Equal gain and offset: nothing to say.
     #[test]
     fn manual_assign_is_quiet_when_gain_and_offset_agree() {

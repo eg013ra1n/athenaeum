@@ -203,6 +203,8 @@ fn commit_calibrate_group(
 ) -> Result<(), RunError> {
     let mut counted = 0usize;
     let mut lost: Vec<(i64, f64)> = Vec::new();
+    // What the lost frames had subtracted, from the engine's own CALSTAT: "BD…" is a dark, "B…" a bias.
+    let (mut lost_dark, mut lost_bias) = (false, false);
     for (pos, res) in results.into_iter().enumerate() {
         let job = &jobs[pos];
         match res {
@@ -221,8 +223,13 @@ fn commit_calibrate_group(
                 if generated.pixels > 0 {
                     counted += 1;
                     let fraction = generated.non_positive_pixels as f64 / generated.pixels as f64;
-                    if fraction >= DARK_SUBTRACTION_LOST_BAR {
+                    if subtraction_lost(fraction) {
                         lost.push((job.frame_id, fraction));
+                        if generated.calstat.starts_with("BD") {
+                            lost_dark = true;
+                        } else if generated.calstat.starts_with('B') {
+                            lost_bias = true;
+                        }
                     }
                 }
                 *bytes_done += commit_calibrated(rc, job, generated)?;
@@ -231,17 +238,30 @@ fn commit_calibrate_group(
         }
     }
     if !lost.is_empty() {
-        warn_subtraction_lost(rc, group_key, counted, &lost);
+        let subtrahend = match (lost_dark, lost_bias) {
+            (true, false) => "dark",
+            (false, true) => "bias",
+            _ => "dark or bias",
+        };
+        warn_subtraction_lost(rc, group_key, counted, &lost, subtrahend);
     }
     Ok(())
 }
 
 /// The bar for a frame the dark guard calls lost: the share of its pixels at or below zero right after the dark
-/// or bias was subtracted. A light's median after that subtraction is its sky, which is above zero, so a frame
-/// with half its pixels at or below zero has a dark brighter than the light itself (a mismatched gain or offset,
-/// or a dark from another setup). There is no recorded healthy measurement of this fraction: the standard test
-/// fixture (500 ADU background against a 100 ADU dark) reads 0 %, which is the order a real frame has.
-const DARK_SUBTRACTION_LOST_BAR: f64 = 0.5;
+/// or bias was subtracted. The share is 0.5 exactly when the frame's median sits at zero, and a healthy
+/// low-signal frame gets there on its own: a short narrowband sub has a sky of the order of the read noise, so
+/// 20-30 % of its pixels are already at or below zero with a matching dark, a pedestal drift of about 1 ADU
+/// (temperature, an old dark library) moves it further, and an OSC sensor behind a narrowband filter (three
+/// quarters of its sites see almost no light) reaches 0.5. At 0.9 the median is more than 1.28 sigma below
+/// zero, which drift cannot produce and a real gain or offset mismatch does (the real case read 98.6-99.9 %).
+/// The standard test fixture (500 ADU background against a 100 ADU dark) reads 0 %.
+const DARK_SUBTRACTION_LOST_BAR: f64 = 0.9;
+
+/// Whether a frame with this share of pixels at or below zero is "lost" ([`DARK_SUBTRACTION_LOST_BAR`]).
+fn subtraction_lost(non_positive_fraction: f64) -> bool {
+    non_positive_fraction >= DARK_SUBTRACTION_LOST_BAR
+}
 
 /// The median of the lost frames' fractions (`fractions` is non-empty, finite).
 fn median_fraction(fractions: &mut [f64]) -> f64 {
@@ -257,7 +277,13 @@ fn median_fraction(fractions: &mut [f64]) -> f64 {
 /// One `warn!` and one run warning for a group with lost frames (`counted` is how many of its regenerated frames
 /// had a dark or bias subtracted). Advisory: a catalog failure reading the lost lights' gain and offset is a
 /// `warn!` and the sentence says "not recorded", never a failed run.
-fn warn_subtraction_lost(rc: &mut RunContext, group_key: &str, counted: usize, lost: &[(i64, f64)]) {
+fn warn_subtraction_lost(
+    rc: &mut RunContext,
+    group_key: &str,
+    counted: usize,
+    lost: &[(i64, f64)],
+    subtrahend: &str,
+) {
     use crate::api::lights::{card_text, subtraction_run_sentence};
     let mut offsets: Vec<Option<f64>> = Vec::new();
     let mut gains: Vec<Option<f64>> = Vec::new();
@@ -315,6 +341,7 @@ fn warn_subtraction_lost(rc: &mut RunContext, group_key: &str, counted: usize, l
         lost.len(),
         counted,
         &format!("{offset_text}, {gain_text}"),
+        subtrahend,
     ));
 }
 

@@ -117,7 +117,7 @@ fn a_flat_only_group_gets_one_run_warning_with_the_corner_ratio() {
 
 /// Stage 1 on a fresh fixture whose three lights link a master dark of the given constant value and the master
 /// flat; the warn lines of `stage_calibrate` itself are counted (the dark guard's `warn!`).
-fn dark_guard_stage_one(dark_value: f32) -> (RunContext, String, usize, tempfile::TempDir, tempfile::TempDir) {
+fn dark_guard_stage_one(dark_value: f32) -> (RunContext, String, usize, tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("catalog.db");
     let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
@@ -156,9 +156,8 @@ fn dark_guard_stage_one(dark_value: f32) -> (RunContext, String, usize, tempfile
         || stage_calibrate(&mut rc),
     );
     res.unwrap();
-    // The fixture DB lives in `tmp`; keep it alive through the rig's own directories.
-    std::mem::forget(tmp);
-    (rc, group_key, warns, working, output)
+    // The fixture DB lives in `tmp`; the caller keeps it alive for the test's length.
+    (rc, group_key, warns, working, output, tmp)
 }
 
 /// The dark guard's frame half: a master dark brighter than the lights' background leaves most pixels at or
@@ -167,7 +166,7 @@ fn dark_guard_stage_one(dark_value: f32) -> (RunContext, String, usize, tempfile
 /// no second line (the Output-stage guard covers re-runs).
 #[test]
 fn a_dark_brighter_than_the_lights_gives_one_run_warning_for_the_group() {
-    let (mut rc, key, warns, _w, _o) = dark_guard_stage_one(1000.0);
+    let (mut rc, key, warns, _w, _o, _t) = dark_guard_stage_one(1000.0);
     assert_eq!(warns, 1, "one warn! line per group");
     let hits: Vec<&String> = rc
         .warnings
@@ -178,7 +177,7 @@ fn a_dark_brighter_than_the_lights_gives_one_run_warning_for_the_group() {
     assert_eq!(
         hits[0].as_str(),
         format!(
-            "group {key}: dark subtraction left most pixels at or below zero in 3 of 3 frames (OFFSET 1, GAIN 100) \u{2014} the dark is brighter than the lights; check that the dark's gain and offset match"
+            "group {key}: dark subtraction left most pixels at or below zero in 3 of 3 frames (OFFSET 1, GAIN 100) \u{2014} the dark is brighter than the lights; check that its gain and offset match those of the lights"
         )
     );
 
@@ -191,13 +190,26 @@ fn a_dark_brighter_than_the_lights_gives_one_run_warning_for_the_group() {
         rc.warnings
     );
 
-    let (rc_ok, _k, warns_ok, _w2, _o2) = dark_guard_stage_one(100.0);
+    let (rc_ok, _k, warns_ok, _w2, _o2, _t2) = dark_guard_stage_one(100.0);
     assert_eq!(warns_ok, 0);
     assert!(
         !rc_ok.warnings.iter().any(|w| w.contains("at or below zero")),
         "{:?}",
         rc_ok.warnings
     );
+}
+
+/// The bar sits at 0.9: a healthy low-signal frame (a narrowband sub, an OSC sensor behind a narrowband filter)
+/// can read 0.5-0.6 at or below zero and is not lost; a real gain or offset mismatch reads 0.986 and up.
+#[test]
+fn a_frame_is_lost_only_near_the_top_of_the_range() {
+    assert!(!subtraction_lost(0.0));
+    assert!(!subtraction_lost(0.5));
+    assert!(!subtraction_lost(0.6));
+    assert!(!subtraction_lost(0.89));
+    assert!(subtraction_lost(0.9));
+    assert!(subtraction_lost(0.986));
+    assert!(subtraction_lost(1.0));
 }
 
 /// The median of the lost frames' fractions, for an odd and an even count.

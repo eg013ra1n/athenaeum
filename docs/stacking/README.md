@@ -2174,26 +2174,35 @@ the new model through the normal cache invalidation (below).
     pixels at or below zero right after the dark or bias is subtracted
     (`LightCalOutcome::non_positive_pixels` over `pixels`, carried on
     `GeneratedLight`; the debug line `"light calibrated"` has the count). A
-    frame is lost at a fraction of 0.5 or more (`DARK_SUBTRACTION_LOST_BAR`):
-    a light's median after subtraction is its sky, which is above zero, so
-    half the pixels at or below zero means the dark is brighter than the light
-    (mismatched gain or offset, or a dark from another setup). A group with at
+    frame is lost at a fraction of 0.9 or more (`DARK_SUBTRACTION_LOST_BAR`):
+    the share is 0.5 exactly when the frame's median sits at zero, and a
+    healthy low-signal frame gets there on its own (a short narrowband sub has
+    a sky of the order of the read noise, so 20-30 % of its pixels are already
+    at or below zero with a matching dark; a pedestal drift of about 1 ADU or an
+    OSC sensor behind a narrowband filter reaches 0.5). At 0.9 the median is
+    more than 1.28 sigma below zero, which drift cannot produce and a gain or
+    offset mismatch does (the real case read 98.6-99.9 %). A group with at
     least one lost frame gets one `warn!` (`count`, the median
     `non_positive_fraction`, `light_offset`, `light_gain`) and one run warning
-    (`api::lights::subtraction_run_sentence`): `group L: dark subtraction left
-    most pixels at or below zero in 12 of 12 frames (OFFSET 1, GAIN 100) — the
-    dark is brighter than the lights; check that the dark's gain and offset
-    match`. A frame served from the cache is not regenerated, has no count and
-    is not tallied; the master guard covers re-runs. No healthy measurement of
+    (`api::lights::subtraction_run_sentence`; the subtrahend is named from the
+    lost frames' CALSTAT, "dark", "bias", or "dark or bias" when they differ):
+    `group L: dark subtraction left most pixels at or below zero in 12 of 12
+    frames (OFFSET 1, GAIN 100) — the dark is brighter than the lights; check
+    that its gain and offset match those of the lights`. A frame served from
+    the cache is not regenerated, has no count and is not tallied; the master
+    guard covers re-runs. No healthy measurement of
     the fraction is recorded (the fixture reads 0 %); the debug line gives the
     figure for the next acceptance run.
   - *Output, per master.* After `"master written"`, `rejected_low_fraction >=
-    0.5` (`MASTER_REJECTED_LOW_BAR`; range rejection at the default floor of 0
+    0.75` (`MASTER_REJECTED_LOW_BAR`; range rejection at the default floor of 0
     counts) pushes `group L: 90 % of the samples were rejected low — the
     calibrated frames are mostly at or below zero; check the dark's gain and
-    offset` and logs `rejected_low_fraction`. The bar is more than sixteen times
-    the highest healthy total rejection in the acceptance runs (2.985 % mono,
-    2.733 % OSC at Auto 5.0/3.5, 2026-09-11).
+    offset` and logs `rejected_low_fraction`. Acceptance runs reject at most
+    about 3 % in total (2.985 % mono, 2.733 % OSC at Auto 5.0/3.5, 2026-09-11),
+    but with `rangeLow = 0` every sample at or below zero is rejected low, so a
+    healthy narrowband-through-OSC master can reject about 0.4 low; the broken
+    real case read about 0.9, and the bar sits between them (0.9 would be too
+    close to that case).
 - **Not re-proposed / measured out.**
   - C-29 (LN background on a 4×4-binned plane) still applies: the tiles take a
     robust median of full-resolution pixels.

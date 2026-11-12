@@ -2925,10 +2925,10 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
 /// The bar for a master the dark guard calls broken: the share of all samples (every included frame and plane)
 /// rejected low, range rejection included. On a healthy stack almost nothing sits at or below the range floor of
 /// 0: the repo's acceptance runs reject at most about 3 % in total, low and high together (`docs/stacking/README.md`,
-/// the 2026-09-11 acceptance table: 2.985 % mono, 2.733 % OSC), so 0.5 is more than sixteen times the highest
-/// recorded total. A light's median after dark subtraction is its sky, which is above zero; when half the samples
-/// are rejected low, most calibrated pixels are at or below zero.
-const MASTER_REJECTED_LOW_BAR: f64 = 0.5;
+/// the 2026-09-11 acceptance table: 2.985 % mono, 2.733 % OSC). But with `rangeLow = 0` every sample at or below
+/// zero is rejected low, so a healthy narrowband-through-OSC master can reject about 0.4 low, while the broken
+/// real case read about 0.9. The bar sits between them; 0.9 would be too close to that case.
+const MASTER_REJECTED_LOW_BAR: f64 = 0.75;
 
 /// The run warning for a group whose master rejected most samples low, or `None` below
 /// [`MASTER_REJECTED_LOW_BAR`] (or for a non-finite fraction). Pure: the caller logs and pushes.
