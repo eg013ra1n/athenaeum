@@ -5429,43 +5429,13 @@ async fn run_publish(
     let bound_elsewhere = publish_bound_elsewhere(ctx, project_id, binding)?;
     let mut refused_new = 0usize;
 
-    // Spec §4.1 step 5: stale prepared frames go back to Ready — only now,
-    // past the account, node and store checks, so a refused run never
-    // touches disk. Under another device's binding no new frame moves on
-    // this device (the run is refused, or posts versions only): the rows
-    // wait for a run that can act on them. Calibrate counts its stale frames
-    // as calibrated again, never as stale.
-    let mut stale = if stale_ids.is_empty() {
-        0
-    } else if bound_elsewhere.is_some() {
-        tracing::debug!(
-            project_id,
-            count = stale_ids.len(),
-            "publish: stale prepared frames kept while another device publishes new frames"
-        );
-        0
-    } else {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        drop_stale_prepared(&conn, project_id, &stale_ids)?
-    };
-    // Plan W3 / P4: a frame withheld before the run loses its prepared row
-    // and file (never an attested original) — under the same condition.
-    if !withheld_prepared.is_empty() && bound_elsewhere.is_none() {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        let gone = crate::db::collab_prepare::delete_prepared(&conn, project_id, &withheld_prepared)
-            .map_err(|e| {
-                tracing::error!(project_id, error = %format!("{e:#}"), "withheld frames' prepared rows not dropped");
-                internal(e)
-            })?;
-        crate::api::collab_prepare::remove_prepared_files(&gone);
-        tracing::info!(
-            project_id,
-            count = gone.len(),
-            "withheld frames' prepared rows dropped"
-        );
-    }
+    let mut stale = publish_drop_prepared(
+        ctx,
+        project_id,
+        &stale_ids,
+        &withheld_prepared,
+        &bound_elsewhere,
+    )?;
     if candidates.is_empty() {
         tracing::info!(
             project_id,
@@ -7493,6 +7463,56 @@ fn publish_bound_elsewhere(
         .filter(|b| b.device_id != me && !replaced.contains_key(&b.device_id))
         .map(|b| b.name);
     Ok(bound_elsewhere)
+}
+
+/// Spec §4.1 step 5 and plan W3 / P4: the stale prepared rows go back to
+/// Ready, then the withheld frames' prepared rows are dropped; both only when
+/// no other device holds the binding. Returns how many frames went stale.
+fn publish_drop_prepared(
+    ctx: &ServiceContext,
+    project_id: &str,
+    stale_ids: &[i64],
+    withheld_prepared: &[i64],
+    bound_elsewhere: &Option<Option<String>>,
+) -> Result<usize, ApiError> {
+    // Spec §4.1 step 5: stale prepared frames go back to Ready — only now,
+    // past the account, node and store checks, so a refused run never
+    // touches disk. Under another device's binding no new frame moves on
+    // this device (the run is refused, or posts versions only): the rows
+    // wait for a run that can act on them. Calibrate counts its stale frames
+    // as calibrated again, never as stale.
+    let stale = if stale_ids.is_empty() {
+        0
+    } else if bound_elsewhere.is_some() {
+        tracing::debug!(
+            project_id,
+            count = stale_ids.len(),
+            "publish: stale prepared frames kept while another device publishes new frames"
+        );
+        0
+    } else {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        drop_stale_prepared(&conn, project_id, &stale_ids)?
+    };
+    // Plan W3 / P4: a frame withheld before the run loses its prepared row
+    // and file (never an attested original) — under the same condition.
+    if !withheld_prepared.is_empty() && bound_elsewhere.is_none() {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let gone = crate::db::collab_prepare::delete_prepared(&conn, project_id, &withheld_prepared)
+            .map_err(|e| {
+                tracing::error!(project_id, error = %format!("{e:#}"), "withheld frames' prepared rows not dropped");
+                internal(e)
+            })?;
+        crate::api::collab_prepare::remove_prepared_files(&gone);
+        tracing::info!(
+            project_id,
+            count = gone.len(),
+            "withheld frames' prepared rows dropped"
+        );
+    }
+    Ok(stale)
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
