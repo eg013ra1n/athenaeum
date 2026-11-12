@@ -15,8 +15,54 @@ use crate::settings::keys;
 use crate::services::operation_queue::{OperationKind, QueuedJob};
 use crate::services::{ArchiveHandle, ServiceContext};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// Provisional keys for `ctx.active_archives` while an archive plan is being
+/// built (the operation id does not exist until `commit_plan`). Negative, so
+/// never an AUTOINCREMENT id.
+static NEXT_PENDING_KEY: AtomicI64 = AtomicI64::new(-1);
+
+/// The busy check and the registration under ONE lock; `false` = refused,
+/// nothing inserted. Every start that guards on `active_archives` goes
+/// through it, so two starts cannot both pass the check.
+pub(crate) fn try_register(
+    map: &Mutex<HashMap<i64, ArchiveHandle>>,
+    key: i64,
+    cancel_flag: &Arc<AtomicBool>,
+    refuse_when_busy: bool,
+) -> bool {
+    let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
+    if refuse_when_busy && !map.is_empty() {
+        return false;
+    }
+    map.insert(
+        key,
+        ArchiveHandle {
+            operation_id: key,
+            cancel_flag: cancel_flag.clone(),
+        },
+    );
+    true
+}
+
+/// A reserved `active_archives` slot under a provisional key; dropping it
+/// frees the slot, so an error or a panic while planning cannot leave the
+/// guard stuck busy.
+struct PendingSlot<'a> {
+    map: &'a Mutex<HashMap<i64, ArchiveHandle>>,
+    key: i64,
+}
+
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
 
 /// The archive roots, default flag included. Migrates the legacy single-folder
 /// `archive.root_path` setting into the table first.
@@ -432,7 +478,9 @@ pub fn get_restore_suggestions(
 /// web passes `true` and is refused (`Conflict`) while `ctx.active_archives` is
 /// not empty; the desktop passes `false` and the job queues behind the running
 /// one. `active_archives` also holds file operations and master builds, so the
-/// guard refuses during those too.
+/// guard refuses during those too. The check and the reservation are one
+/// `try_register` under a provisional key held while the plan is built, then
+/// swapped for the real operation id, so two web starts cannot both pass.
 #[allow(clippy::too_many_arguments)]
 pub fn start_archive_operation(
     ctx: Arc<ServiceContext>,
@@ -444,14 +492,17 @@ pub fn start_archive_operation(
     archive_root_path: Option<&str>,
     refuse_when_busy: bool,
 ) -> Result<i64, ApiError> {
-    if refuse_when_busy {
-        let map = ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err(ApiError::Conflict(
-                "another archive operation is already in progress".into(),
-            ));
-        }
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let key = NEXT_PENDING_KEY.fetch_sub(1, Ordering::Relaxed);
+    if !try_register(&ctx.active_archives, key, &cancel_flag, refuse_when_busy) {
+        return Err(ApiError::Conflict(
+            "another archive operation is already in progress".into(),
+        ));
     }
+    let pending = PendingSlot {
+        map: &ctx.active_archives,
+        key,
+    };
     let op_id = {
         let db = db(&ctx)?;
         let conn = db.conn();
@@ -471,15 +522,19 @@ pub fn start_archive_operation(
             .map_err(|e| ApiError::Internal(format!("{:#}", e)))?
     };
 
-    // Register the cancel flag so cancel_archive_operation can find it.
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    ctx.active_archives.lock().unwrap().insert(
-        op_id,
-        ArchiveHandle {
-            operation_id: op_id,
-            cancel_flag: cancel_flag.clone(),
-        },
-    );
+    // Register the real id so cancel_archive_operation can find it, then free
+    // the provisional slot: the map is never empty in between.
+    ctx.active_archives
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            op_id,
+            ArchiveHandle {
+                operation_id: op_id,
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
+    drop(pending);
 
     // Enqueue. Single global worker (shared with file ops) drives execution
     // serially. The DB connection is obtained inside the closure since
@@ -514,22 +569,12 @@ pub fn start_restore_operation(
     overwrite_existing: bool,
     keep_zip_after_restore: bool,
 ) -> Result<(), ApiError> {
-    {
-        let map = ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err(ApiError::Conflict(
-                "another archive operation is already in progress".into(),
-            ));
-        }
-    }
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    ctx.active_archives.lock().unwrap().insert(
-        operation_id,
-        ArchiveHandle {
-            operation_id,
-            cancel_flag: cancel_flag.clone(),
-        },
-    );
+    if !try_register(&ctx.active_archives, operation_id, &cancel_flag, true) {
+        return Err(ApiError::Conflict(
+            "another archive operation is already in progress".into(),
+        ));
+    }
     let ctx_for_worker = ctx.clone();
     ctx.operation_queue.enqueue(QueuedJob {
         kind: OperationKind::ZipArchive,
@@ -654,6 +699,44 @@ mod tests {
             assert_ne!(e.to_string(), "another archive operation is already in progress");
         }
         assert!(ctx.active_archives.lock().unwrap().contains_key(&7));
+        // Neither start left a reservation of its own behind.
+        assert_eq!(ctx.active_archives.lock().unwrap().len(), 1);
+    }
+
+    /// Planning that fails (the path is not a configured root) frees the
+    /// provisional slot, with and without the busy guard.
+    #[test]
+    fn start_archive_operation_drops_its_reservation_when_planning_fails() {
+        let (_tmp, ctx) = test_ctx();
+        for refuse in [true, false] {
+            let err = start_archive_operation(
+                ctx.clone(),
+                Arc::new(NullEmitter),
+                1,
+                &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+                ArchiveCompression::Store,
+                ConflictResolution::AddSuffix,
+                Some("/archive"),
+                refuse,
+            )
+            .expect_err("not a configured root");
+            assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+            assert!(ctx.active_archives.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The check and the insert are one step: of two refusing starts only the
+    /// first gets in, a non-refusing one always does.
+    #[test]
+    fn try_register_lets_only_the_first_of_two_refusing_starts_in() {
+        let map = Mutex::new(HashMap::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(try_register(&map, 1, &flag, true));
+        assert!(!try_register(&map, 2, &flag, true));
+        assert_eq!(map.lock().unwrap().len(), 1);
+        assert!(map.lock().unwrap().contains_key(&1));
+        assert!(try_register(&map, 3, &flag, false));
+        assert_eq!(map.lock().unwrap().len(), 2);
     }
 
     fn roots(ctx: &ServiceContext) -> Vec<(i64, bool)> {
