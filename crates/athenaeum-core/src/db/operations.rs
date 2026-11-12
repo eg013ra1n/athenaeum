@@ -1229,8 +1229,8 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
 }
 
 /// Projection shared by every `files` × `frames` row this module hands back as
-/// a [`File`] + [`Frame`] pair — the three listing queries (`get_files`,
-/// `get_files_by_directory`, `get_files_by_directory_for_camera`) and the
+/// a [`File`] + [`Frame`] pair — the two listing queries (`get_files_by_directory`,
+/// `get_files_by_directory_for_camera`) and the
 /// missing-metadata / excluded-frames views, which append their own columns
 /// after this block.
 ///
@@ -1366,28 +1366,6 @@ pub(crate) fn require_joined_frame(frame: Option<Frame>) -> rusqlite::Result<Fra
             rusqlite::types::Type::Null,
         )
     })
-}
-
-/// Get all files with optional filters
-pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, Option<Frame>)>> {
-    let limit_clause = match limit {
-        Some(n) => format!("LIMIT {}", n),
-        None => String::new(),
-    };
-
-    let query = format!(
-        "SELECT {select}
-         FROM files f
-         LEFT JOIN frames fr ON f.id = fr.file_id
-         ORDER BY f.created_at DESC
-         {limit_clause}",
-        select = FILE_FRAME_SELECT,
-        limit_clause = limit_clause,
-    );
-
-    let mut stmt = conn.prepare(&query)?;
-    let results = stmt.query_map([], map_file_frame_row)?;
-    results.collect()
 }
 
 /// Get files in a specific directory
@@ -1643,25 +1621,6 @@ mod file_frame_row_tests {
             FILE_FRAME_COLUMNS,
             "FILE_FRAME_COLUMNS must equal the number of columns FILE_FRAME_SELECT projects"
         );
-    }
-
-    /// `get_files` reads the same projection, so it carries the CFA columns too.
-    #[test]
-    fn get_files_carries_cfa() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::schema::init_db(&conn).unwrap();
-        seed_directory(&conn);
-
-        let rows = get_files(&conn, None).unwrap();
-        let (_, frame) = rows
-            .iter()
-            .find(|(f, _)| f.filename == "light_osc.fits")
-            .unwrap();
-        let frame = frame.as_ref().expect("the OSC light has a frames row");
-        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
-        assert_eq!(frame.xbayroff, Some(1));
-        assert_eq!(frame.ybayroff, Some(0));
-        assert_eq!(frame.roworder.as_deref(), Some("BOTTOM-UP"));
     }
 }
 
@@ -7896,7 +7855,7 @@ mod stored_timestamp_tests {
     fn malformed_stored_timestamp_does_not_panic_listings() {
         let conn = conn_with_malformed_file();
 
-        let listed = crate::db::get_files(&conn, None).unwrap();
+        let listed = crate::db::get_files_by_directory(&conn, "/t", None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0.modified_at, DateTime::<Utc>::UNIX_EPOCH);
         assert_eq!(listed[0].0.created_at, DateTime::<Utc>::UNIX_EPOCH);
@@ -8939,6 +8898,55 @@ mod frames_set_listing_tests {
         assert_eq!(counts.get(&1), Some(&1), "a Black Hole frame is not counted");
         let sets = get_frames_sets_by_project(&conn, 1).unwrap();
         assert_eq!(sets[0].1, 2, "the member count agrees: one disk frame + one zip frame");
+    }
+
+    /// A light in the Black Hole is a rejected light: the frame-set listing neither counts it nor sums its
+    /// hours, like stacking and export. Restoring it brings it back.
+    #[test]
+    fn a_blackholed_light_is_not_counted_or_summed_by_the_listing() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'set')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (1, '2025-06-28T23:00:00Z', '2025-06-29T02:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let night = conn.last_insert_rowid();
+        conn.execute("INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'Cam')", [night]).unwrap();
+        let session = conn.last_insert_rowid();
+        let mut file_ids = Vec::new();
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, 'l.fits', 0, '2025-06-29T00:00:00Z', 'FITS')",
+                [format!("/l/{i}.fits")],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO frames (file_id, imagetyp, exptime) VALUES (?1, 'Light', 300.0)", [file_id])
+                .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)", [session, frame_id])
+                .unwrap();
+            file_ids.push(file_id);
+        }
+        for file_id in &file_ids[1..] {
+            conn.execute(
+                "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+                 VALUES (?1, 'test', '2025-06-30T00:00:00Z', '/test')",
+                [file_id],
+            )
+            .unwrap();
+        }
+        let (set, count) = &get_frames_sets_by_project(&conn, 1).unwrap()[0];
+        assert_eq!(*count, 1);
+        assert_eq!(set.total_exp_time, Some(300.0));
+
+        conn.execute("DELETE FROM black_hole", []).unwrap();
+        let (set, count) = &get_frames_sets_by_project(&conn, 1).unwrap()[0];
+        assert_eq!((*count, set.total_exp_time), (3, Some(900.0)));
     }
 }
 

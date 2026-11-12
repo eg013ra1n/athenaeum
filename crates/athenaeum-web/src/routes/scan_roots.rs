@@ -103,19 +103,6 @@ pub async fn get_scan_roots(
     api::get_scan_roots(&state.ctx).map(Json).map_err(api_err)
 }
 
-/// POST /api/get_calibration_library_root
-///
-/// The (single) calibration library root, if configured — legacy accessor
-/// for the dedicated-root case; the effective master-write destination is
-/// `get_calibration_library_dir`.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn get_calibration_library_root(
-    State(state): State<WebAppState>,
-    _body: Json<serde_json::Value>,
-) -> Result<Json<Option<ScanRoot>>, (StatusCode, String)> {
-    api::get_calibration_library_root(&state.ctx).map(Json).map_err(api_err)
-}
-
 /// POST /api/get_calibration_library_dir
 ///
 /// Effective calibration-library directory (master-frame write destination) —

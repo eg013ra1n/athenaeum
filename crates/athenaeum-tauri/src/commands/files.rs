@@ -20,27 +20,6 @@ use super::AppState;
 
 pub use athenaeum_core::api::files::{CatalogSearchHit, DirectoryContents};
 
-/// Get files from the database with optional limit
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_files(
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<FileWithFrame>, String> {
-    api::get_files(&state.ctx, limit).map_err(|e| e.to_string())
-}
-
-/// Get files from a specific directory
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_files_by_directory(
-    directory_path: String,
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<FileWithFrame>, String> {
-    api::get_files_by_directory(&state.ctx, directory_path, limit).map_err(|e| e.to_string())
-}
-
 /// Get frames with missing metadata
 /// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
 #[tauri::command]

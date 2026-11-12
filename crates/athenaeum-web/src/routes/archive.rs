@@ -21,11 +21,6 @@ pub struct OperationIdRequest {
 }
 
 #[derive(Deserialize)]
-pub struct SetRootRequest {
-    pub path: String,
-}
-
-#[derive(Deserialize)]
 pub struct SetCompressionRequest {
     pub compression: String,
 }
@@ -83,15 +78,6 @@ pub async fn get_archive_settings(
     archive_api::get_archive_settings(&state.ctx)
         .map(Json)
         .map_err(api_err)
-}
-
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn set_archive_root_path(
-    State(state): State<WebAppState>,
-    Json(req): Json<SetRootRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    archive_api::set_archive_root_path(&state.ctx, &req.path).map_err(api_err)?;
-    Ok(StatusCode::OK)
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
@@ -230,15 +216,6 @@ pub async fn start_restore_operation(
         req.keep_zip_after_restore,
     )
     .map_err(api_err)?;
-    Ok(StatusCode::OK)
-}
-
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn delete_archive(
-    State(state): State<WebAppState>,
-    Json(req): Json<OperationIdRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    archive_api::delete_archive(&state.ctx, req.operation_id).map_err(api_err)?;
     Ok(StatusCode::OK)
 }
 

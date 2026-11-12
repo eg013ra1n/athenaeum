@@ -9,7 +9,7 @@ use crate::api::{db, ApiError};
 use crate::archive::models::{
     ArchiveCompression, ArchiveOperationSummary, ArchivePlan, ConflictResolution, Dispositions,
 };
-use crate::archive::{db as adb, executor, planner, restore, resume, rollback};
+use crate::archive::{executor, planner, restore, resume, rollback};
 use crate::events::ProgressEmitter;
 use crate::settings::keys;
 use crate::services::operation_queue::{OperationKind, QueuedJob};
@@ -150,14 +150,6 @@ pub fn get_archive_settings(ctx: &ServiceContext) -> Result<serde_json::Value, A
         "rootPath": root,
         "compression": compression,
     }))
-}
-
-/// Set the legacy single-folder archive root setting.
-pub fn set_archive_root_path(ctx: &ServiceContext, path: &str) -> Result<(), ApiError> {
-    let db = db(ctx)?;
-    ctx.settings
-        .persist_setting(&db.conn(), keys::ARCHIVE_ROOT_PATH, path)
-        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// Set the archive compression (`store` or `deflate`).
@@ -590,69 +582,6 @@ pub fn start_restore_operation(
     Ok(())
 }
 
-/// Delete an archive: its zip files, then its catalog rows. No transaction: the
-/// zips go first one by one and any failure aborts before a catalog row is
-/// touched.
-pub fn delete_archive(ctx: &ServiceContext, operation_id: i64) -> Result<(), ApiError> {
-    {
-        let map = ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err(ApiError::Conflict(
-                "another archive operation is already in progress".into(),
-            ));
-        }
-    }
-    let db = db(ctx)?;
-    let conn = db.conn();
-
-    // Delete zip files. A zip we could not delete (Windows sharing violation,
-    // read-only volume) must abort the whole command BEFORE any catalog row
-    // goes away — otherwise the zip is orphaned on disk with nothing pointing
-    // at it and the archive becomes unrestorable.
-    let files = adb::list_operation_files(&conn, operation_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let mut seen = std::collections::HashSet::new();
-    let mut failed: Vec<String> = Vec::new();
-    for f in &files {
-        if seen.insert(f.target_zip_path.clone()) {
-            let p = Path::new(&f.target_zip_path);
-            if p.exists() {
-                if let Err(e) = std::fs::remove_file(p) {
-                    tracing::error!(operation_id, path = %f.target_zip_path, error = %e, "failed to delete archive zip");
-                    failed.push(format!("{}: {}", f.target_zip_path, e));
-                }
-            }
-        }
-    }
-    if !failed.is_empty() {
-        return Err(ApiError::Internal(format!(
-            "could not delete {} zip file(s); catalog rows kept — any zip already removed in this pass is not restorable: {}",
-            failed.len(),
-            failed.join("; ")
-        )));
-    }
-
-    // Get frames_set_id, then delete frame set + cascading rows.
-    let op = adb::get_operation(&conn, operation_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    match op.frames_set_id {
-        Some(fs_id) => {
-            conn.execute("DELETE FROM frames_set WHERE id = ?1", [fs_id])
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            // archive_operations row is also deleted via FK cascade from frames_set_id.
-        }
-        None => {
-            // Calibration-set archive op (Task 14): no frames_set to cascade
-            // from — delete the archive_operations row directly (cascades to
-            // archive_operation_files/steps via their own FKs).
-            conn.execute("DELETE FROM archive_operations WHERE id = ?1", [operation_id])
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,47 +591,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         (tmp, Arc::new(ctx))
-    }
-
-    /// A calibration-set style archive (no frame set): the zip goes off the
-    /// disk and the operation row (with its files) goes from the catalog.
-    #[test]
-    fn delete_archive_removes_the_zip_and_the_catalog_rows() {
-        let (tmp, ctx) = test_ctx();
-        let zip = tmp.path().join("light.zip");
-        std::fs::write(&zip, b"zip").unwrap();
-        let op_id = {
-            let conn = ctx.db.get().unwrap().conn();
-            let op_id =
-                adb::insert_operation(&conn, None, None, "/archive", None, None, None, None, "store")
-                    .unwrap();
-            adb::insert_operation_file(
-                &conn,
-                op_id,
-                None,
-                "/data/M31/a.fits",
-                zip.to_str().unwrap(),
-                "M31/a.fits",
-                "h",
-                "move",
-                "light",
-                3,
-            )
-            .unwrap();
-            op_id
-        };
-
-        delete_archive(&ctx, op_id).expect("delete archive");
-
-        assert!(!zip.exists());
-        let conn = ctx.db.get().unwrap().conn();
-        let ops: i64 = conn
-            .query_row("SELECT COUNT(*) FROM archive_operations", [], |r| r.get(0))
-            .unwrap();
-        let files: i64 = conn
-            .query_row("SELECT COUNT(*) FROM archive_operation_files", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!((ops, files), (0, 0));
     }
 
     /// A restore is refused while any archive operation holds a handle, and
@@ -861,14 +749,6 @@ mod tests {
         assert_eq!(get_archive_settings(&ctx).unwrap()["compression"], "deflate");
         let err = set_archive_compression(&ctx, "zstd").expect_err("bad value");
         assert!(matches!(err, ApiError::Invalid(_)));
-    }
-
-    /// The legacy root path setting round-trips through the settings read.
-    #[test]
-    fn set_archive_root_path_is_read_back_by_the_settings() {
-        let (_tmp, ctx) = test_ctx();
-        set_archive_root_path(&ctx, "/archive/legacy").unwrap();
-        assert_eq!(get_archive_settings(&ctx).unwrap()["rootPath"], "/archive/legacy");
     }
 
     /// Cancel raises the flag of an active operation and is `NotFound` for

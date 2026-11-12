@@ -217,10 +217,9 @@ flat falls back to bias-only, matching the calibration hierarchy's normal
 Flat → DarkFlat → Dark(±30%) → Bias fallback chain.
 
 Athenaeum never acts on this plan — no code creates master files. The plan is
-exposed through `ExportData.master_plan` (from `get_export_preview` /
-`get_calibration_route`) purely as data; the only field the shipped UI currently
-renders from it is a count (`masters_to_create` in `CalibrationRouteSummary`,
-`commands/export.rs`). The downstream processing program's WBPP creates the actual masters after the
+exposed through `ExportData.master_plan` purely as data; no command returns it on
+its own any more (`get_export_preview` and `get_calibration_route` were removed
+2026-11-12 with their UI-less callers). The downstream processing program's WBPP creates the actual masters after the
 files are organized on disk.
 
 ## Export modes
@@ -429,9 +428,6 @@ aren't imported by any page.
 | `get_wbpp_export_config` | Read `WbppExportConfig` (default if unset) | Yes — setup-guide text |
 | `set_wbpp_export_config` | Persist a `WbppExportConfig` | No (hook exists, unused) |
 | `reset_wbpp_export_config` | Delete the stored config, revert to default | No (hook exists, unused) |
-| `get_export_preview` | Full `ExportData` (groups/subgroups/master plan) for a frame set | No (hook exists, unused) |
-| `get_exportable_frame_sets` | List frame sets with light-frame counts, for a picker | No (hook exists, unused) — `ExportTab` gets `frameSetId` as a prop from the frame set detail page, it doesn't pick from a list |
-| `get_calibration_route` | `ExportData` reshaped into a UI calibration tree | No (hook exists, unused) |
 | `get_export_summary` | The enhanced summary `ExportTab` actually renders (equipment, filter groups, folder preview, warnings) | Yes |
 | `get_export_readiness` | The mode-less `ExportReadiness` counts behind the one readiness gate (`check_mode_ready`) for export and send | Yes |
 | `export_to_wbpp` | Run the organizer: copy/symlink files into the WBPP tree, emit progress | Yes |
@@ -465,8 +461,7 @@ and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress
 - `src/components/export/WarningsPanel.tsx` — renders `DetailedWarning`s
   (temperature mismatch >2°C/>5°C, missing flat/dark, calibration age) with a
   clickable set-ID chip that jumps to the Calibration Coverage tab.
-- `src/hooks/useExportData.ts` — `useExportData`, `useExportableFrameSets`,
-  `useCalibrationRoute`, `useExportSummary`, `useWbppConfig`.
+- `src/hooks/useExportData.ts` — `useExportSummary`, `useWbppConfig`.
 - `src/hooks/useExportProgress.ts` + `src/contexts/ExportProgressContext.tsx` +
   `src/components/ExportProgressIndicator.tsx` — progress/cancel state and the
   global progress banner.
@@ -484,16 +479,16 @@ and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress
   `calibration_set_to_frames`. It does not run calibration matching itself —
   if a frame set hasn't been matched yet, export runs with missing-calibration
   warnings instead of finding matches.
-- `get_export_preview` and `get_calibration_route` (and their React hooks) are
-  live commands with no current caller in the shipped UI — they were used by an
-  earlier `ExportWizard` (see `ExportTab.tsx`'s own doc comment) that has since
-  been replaced by the current tab.
+- `get_export_preview`, `get_exportable_frame_sets` and `get_calibration_route`
+  (and `export/frame_set_queries.rs`) were removed 2026-11-12: nothing called
+  them since the earlier `ExportWizard` (see `ExportTab.tsx`'s own doc comment)
+  was replaced by the current tab.
 
 ## Key files
 
 | File | Purpose |
 | ---- | ---- |
-| `crates/athenaeum-core/src/export/mod.rs` | Declares `calibrated_generator` (render-gated), `data_collector`, `file_organizer`, `filter_header`, `frame_set_queries`, `models`, `project_collector`, `project_organizer` |
+| `crates/athenaeum-core/src/export/mod.rs` | Declares `calibrated_generator` (render-gated), `data_collector`, `file_organizer`, `filter_header`, `models`, `project_collector`, `project_organizer` |
 | `crates/athenaeum-core/src/export/models.rs` | All export data structures, incl. `WbppExportConfig` |
 | `crates/athenaeum-core/src/export/data_collector.rs` | Reads the catalog + existing calibration links, builds `ExportData`/`ExportSummary` |
 | `crates/athenaeum-core/src/export/file_organizer.rs` | Builds the folder tree, copies or symlinks files, emits progress |

@@ -145,8 +145,7 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
   emptied another way showed "0 frames · 1.7 h" before 2026-10-25 ("LDN 621", "Unlocated Frames M4" on the dev
   catalog: their frames were re-ingested under new ids into another set); seven sets there carried a stale sum.
 - **A light in the Black Hole is a rejected light** and is left out of every light count and exposure a frame set
-  shows: the listing's count and hours (Objects cards and table), the export picker
-  (`export::get_exportable_frame_sets`), the set header's frames / calibrated / uncalibrated
+  shows: the listing's count and hours (Objects cards and table), the set header's frames / calibrated / uncalibrated
   (`CalibrationHierarchyView` totals; the hierarchy still carries the blackholed lights so the page can list them
   apart) and the Stacking tab's frame list — the same `db::FRAME_NOT_IN_BLACK_HOLE_SQL` predicate stacking, export,
   the send and the readiness count use. Set 182 (164 lights, 25 blackholed) reads 139 everywhere. Restoring the
@@ -154,7 +153,7 @@ Set metadata is calculated from member frames (`frames_set_metadata`):
 - **A frame held twice is one frame** (2026-10-29). The same raw frame in two files (two disk copies, or a disk copy
   and a zip entry) is two catalog rows, and both are members. `db::frame_is_used_copy_sql(set_id)` keeps ONE copy per
   identity among the SET's members, and every reader that counts or uses lights splices it in beside the Black Hole
-  fragment: the listing's count, hours and zip count, the export picker, the set header's totals and the lights
+  fragment: the listing's count, hours and zip count, the set header's totals and the lights
   tree's per-group counts, the Stacking tab's list, the stacking plan and run, the export / send / project export (`collect_export_data`), the readiness count
   and `analyze_frame_set`. The identity is the Duplicates page's header key (`DuplicateKey::Header`: fingerprint +
   size + filename, a non-empty header, raw subs only). The used copy is the least `(in a zip, missing, files.id)`:

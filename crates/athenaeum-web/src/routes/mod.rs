@@ -53,7 +53,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Scan roots
         .route("/api/add_scan_root", post(scan_roots::add_scan_root))
         .route("/api/get_scan_roots", post(scan_roots::get_scan_roots))
-        .route("/api/get_calibration_library_root", post(scan_roots::get_calibration_library_root))
         .route("/api/get_calibration_library_dir", post(scan_roots::get_calibration_library_dir))
         .route("/api/set_calibration_library_dir", post(scan_roots::set_calibration_library_dir))
         .route("/api/clear_calibration_library_dir", post(scan_roots::clear_calibration_library_dir))
@@ -84,8 +83,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/delete_missing_files", post(missing_files::delete_missing_files))
         .route("/api/relocate_missing_file", post(missing_files::relocate_missing_file))
         // Files
-        .route("/api/get_files", post(files::get_files))
-        .route("/api/get_files_by_directory", post(files::get_files_by_directory))
         .route("/api/get_directory_contents", post(files::get_directory_contents))
         .route("/api/get_camera_directories", post(files::get_camera_directories))
         .route("/api/get_camera_directory_contents", post(files::get_camera_directory_contents))
@@ -188,9 +185,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_wbpp_export_config", post(export::get_wbpp_export_config))
         .route("/api/set_wbpp_export_config", post(export::set_wbpp_export_config))
         .route("/api/reset_wbpp_export_config", post(export::reset_wbpp_export_config))
-        .route("/api/get_export_preview", post(export::get_export_preview))
-        .route("/api/get_exportable_frame_sets", post(export::get_exportable_frame_sets))
-        .route("/api/get_calibration_route", post(export::get_calibration_route))
         .route("/api/get_export_readiness", post(export::get_export_readiness))
         .route("/api/export_to_wbpp", post(export::export_to_wbpp))
         .route("/api/cancel_export", post(export::cancel_export))
@@ -290,7 +284,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_master_light_preview", post(stacking::get_master_light_preview))
         // Archive feature
         .route("/api/get_archive_settings", post(archive::get_archive_settings))
-        .route("/api/set_archive_root_path", post(archive::set_archive_root_path))
         .route("/api/set_archive_compression", post(archive::set_archive_compression))
         .route("/api/plan_archive_operation", post(archive::plan_archive_operation))
         .route("/api/start_archive_operation", post(archive::start_archive_operation))
@@ -302,7 +295,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/list_archive_zips", post(archive::list_archive_zips))
         .route("/api/start_restore_operation", post(archive::start_restore_operation))
         .route("/api/get_restore_suggestions", post(archive::get_restore_suggestions))
-        .route("/api/delete_archive", post(archive::delete_archive))
         .route("/api/list_archive_roots", post(archive::list_archive_roots))
         .route("/api/add_archive_root", post(archive::add_archive_root))
         .route("/api/delete_archive_root", post(archive::delete_archive_root))
@@ -345,8 +337,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_transfer_paths", post(sync::get_transfer_paths))
         .route("/api/set_transfer_paths", post(sync::set_transfer_paths))
         .route("/api/cleanup_transfer_leftovers", post(sync::cleanup_transfer_leftovers))
-        .route("/api/get_sync_auto_mode", post(sync::get_sync_auto_mode))
-        .route("/api/set_sync_auto_mode", post(sync::set_sync_auto_mode))
         .route("/api/set_sync_upload_limit", post(sync::set_sync_upload_limit))
         .route(
             "/api/set_sync_max_concurrent_receives",

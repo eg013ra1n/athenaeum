@@ -5,11 +5,7 @@
 
 use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
-use athenaeum_core::export::frame_set_queries::ExportableFrameSet;
-use athenaeum_core::export::models::{
-    CalibrationRoute, ExportData, ExportMode, ExportResult,
-    ExportSummary, WbppExportConfig,
-};
+use athenaeum_core::export::models::{ExportMode, ExportResult, ExportSummary, WbppExportConfig};
 use athenaeum_core::fits_writer::OutputFormat;
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
@@ -24,12 +20,6 @@ use crate::WebAppState;
 #[serde(rename_all = "camelCase")]
 pub struct SetWbppExportConfigArgs {
     pub config: WbppExportConfig,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FrameSetIdArgs {
-    pub frame_set_id: i64,
 }
 
 /// `get_export_summary` args — mirrors the Tauri command: the mode the tab has
@@ -139,44 +129,6 @@ pub async fn reset_wbpp_export_config(
     Json(_args): Json<serde_json::Value>,
 ) -> Result<Json<WbppExportConfig>, (StatusCode, String)> {
     athenaeum_core::api::export::reset_wbpp_export_config(&state.ctx)
-        .map(Json)
-        .map_err(api_err)
-}
-
-// ── Data collection handlers ──────────────────────────────────────────────────
-
-/// Get export preview data for a frame set.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn get_export_preview(
-    State(state): State<WebAppState>,
-    Json(args): Json<FrameSetIdArgs>,
-) -> Result<Json<ExportData>, (StatusCode, String)> {
-    athenaeum_core::api::export::get_export_preview(&state.ctx, args.frame_set_id)
-        .map(Json)
-        .map_err(api_err)
-}
-
-/// Get a list of available frame sets for export.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn get_exportable_frame_sets(
-    State(state): State<WebAppState>,
-    Json(_args): Json<serde_json::Value>,
-) -> Result<Json<Vec<ExportableFrameSet>>, (StatusCode, String)> {
-    athenaeum_core::api::export::get_exportable_frame_sets(&state.ctx)
-        .map(Json)
-        .map_err(api_err)
-}
-
-/// Get calibration route for UI display.
-///
-/// Builds a structured view of the export groups and their calibration trees,
-/// suitable for displaying in the UI.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn get_calibration_route(
-    State(state): State<WebAppState>,
-    Json(args): Json<FrameSetIdArgs>,
-) -> Result<Json<CalibrationRoute>, (StatusCode, String)> {
-    athenaeum_core::api::export::get_calibration_route(&state.ctx, args.frame_set_id)
         .map(Json)
         .map_err(api_err)
 }

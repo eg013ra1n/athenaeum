@@ -113,11 +113,6 @@ pub mod defaults {
     // together, GB (see hips::cache). Offline-pack tiles are kept whatever it is.
     pub const SKYCHART_HIPS_CACHE_LIMIT_GB: &str = "10";
 
-    // Full-app capture-node auto mode (task M2). When enabled on a signed-in
-    // `capture` device, files newly ingested by a scan are enqueued to the
-    // paired primary automatically. Default off — sending is manual until the
-    // operator opts in.
-    pub const SYNC_AUTO_MODE: &str = "false";
 
     // Device-wide sync UPLOAD throttle (W1). Bytes/sec across every peer and
     // every concurrent GET. `0` = unlimited, and that is the default — a fresh
@@ -382,11 +377,6 @@ pub mod keys {
     pub const SKYCHART_HIPS_ONLINE: &str = "skychart.hips_online";
     /// Sky Chart background: size limit of the browsing tile cache, GB.
     pub const SKYCHART_HIPS_CACHE_LIMIT_GB: &str = "skychart.hips_cache_limit_gb";
-
-    /// Full-app capture-node auto mode (task M2). `"true"` → a signed-in
-    /// `capture` device enqueues freshly-scanned files to its paired primary
-    /// automatically at scan-finished. Default `"false"` (manual send only).
-    pub const SYNC_AUTO_MODE: &str = "sync.auto_mode";
 
     /// Device-wide sync UPLOAD throttle in bytes/sec (W1). `0` = unlimited.
     /// One budget for the whole device — applied to the shared iroh node's

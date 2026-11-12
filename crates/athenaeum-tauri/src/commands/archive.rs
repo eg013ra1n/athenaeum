@@ -42,15 +42,6 @@ pub async fn get_archive_settings(state: State<'_, AppState>) -> Result<serde_js
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn set_archive_root_path(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<(), String> {
-    archive_api::set_archive_root_path(&state.ctx, &path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
 pub async fn set_archive_compression(
     state: State<'_, AppState>,
     compression: String,
@@ -196,14 +187,4 @@ pub async fn start_restore_operation(
         keep_zip_after_restore,
     )
     .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn delete_archive(
-    state: State<'_, AppState>,
-    operation_id: i64,
-) -> Result<(), String> {
-    archive_api::delete_archive(&state.ctx, operation_id)
-        .map_err(|e| e.to_string())
 }
