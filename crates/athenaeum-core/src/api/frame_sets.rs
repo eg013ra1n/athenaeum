@@ -1787,7 +1787,8 @@ mod tests {
         assert_eq!(count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"), 1);
         drop(conn);
         assert!(get_frame_set_detail(&ctx, 1).unwrap().nights.len() == 1);
-        assert!(get_frame_set_detail(&ctx, 99).is_err());
+        // A missing set is `Internal`: both hosts always answered 500 for it, never 404.
+        assert!(matches!(get_frame_set_detail(&ctx, 99), Err(ApiError::Internal(_))));
     }
 
     #[test]

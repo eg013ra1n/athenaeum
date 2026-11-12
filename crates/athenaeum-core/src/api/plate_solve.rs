@@ -1,6 +1,6 @@
 //! Plate-solve commands both hosts call: the batch solve (`prepare_plate_solve_batch`
 //! + `run_plate_solve_batch`), the object autofind (`prepare_autofind_objects` +
-//! `run_autofind_objects`), the catalog download, and the trigger the auto-publish
+//! `run_autofind_objects`), the catalog and index-pack downloads, and the trigger the auto-publish
 //! worker gets after a batch (collab v3 wave 2, Task 10). The hosts keep what they
 //! resolve from their own state (star-catalog layers, index packs, the DSO catalog)
 //! and keep their own waiting: the desktop awaits a run, the web starts it and
