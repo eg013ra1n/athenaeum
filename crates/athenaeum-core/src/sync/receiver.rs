@@ -3792,7 +3792,7 @@ mod tests {
         }
     }
 
-    /// Row 19: a staging folder recreated by a file call of the dropped fetch
+    /// A staging folder recreated by a file call of the dropped fetch
     /// (already on the blocking pool when the cleanup ran) is removed again.
     #[tokio::test]
     async fn sweep_returned_staging_removes_a_folder_that_comes_back() {
@@ -3812,7 +3812,7 @@ mod tests {
         );
     }
 
-    /// Row 19: nothing came back, so the sweep looks once and returns.
+    /// Nothing came back, so the sweep looks once and returns.
     #[tokio::test]
     async fn sweep_returned_staging_stops_at_the_first_empty_look() {
         let tmp = tempfile::tempdir().unwrap();
