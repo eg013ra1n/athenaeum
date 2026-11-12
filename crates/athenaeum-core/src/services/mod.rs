@@ -81,8 +81,9 @@ pub struct ServiceContext {
     pub active_analyses: Arc<Mutex<HashMap<i64, AnalysisHandle>>>,
     pub active_plate_solves: Arc<Mutex<HashMap<i64, PlateSolveHandle>>>,
     /// Active archive operations (ZIP archive feature). Capped at one at a
-    /// time by command-layer enforcement; HashMap form keeps the same shape
-    /// as the other active-handle maps for consistency.
+    /// time by `api::archive::try_register` (the busy check and the insert
+    /// under one lock); HashMap form keeps the same shape as the other
+    /// active-handle maps for consistency.
     pub active_archives: Arc<Mutex<HashMap<i64, ArchiveHandle>>>,
     /// Active master-build operations (Task 12), keyed by SOURCE calibration
     /// set id. Only one build per source set at a time.

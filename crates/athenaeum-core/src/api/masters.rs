@@ -2963,7 +2963,6 @@ pub fn restore_originals(
 ) -> Result<i64, ApiError> {
     use crate::archive::restore;
     use crate::services::operation_queue::{OperationKind, QueuedJob};
-    use crate::services::ArchiveHandle;
 
     {
         let map = ctx.active_archives.lock().unwrap();
@@ -3023,15 +3022,12 @@ pub fn restore_originals(
     };
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(
-            op_id,
-            ArchiveHandle {
-                operation_id: op_id,
-                cancel_flag: cancel_flag.clone(),
-            },
-        );
+    // The early check above gives the refusal order; this is the guard itself
+    // (check and insert under one lock).
+    if !crate::api::archive::try_register(&ctx.active_archives, op_id, &cancel_flag, true) {
+        return Err(ApiError::Conflict(
+            "another archive/restore operation is already in progress".into(),
+        ));
     }
 
     let ctx_for_worker = ctx.clone();
