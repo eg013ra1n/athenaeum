@@ -1396,6 +1396,10 @@ async fn run_child(
             return Ok(());
         }
         let missing = local.missing();
+        // What the store held of the item when `missing` was read: a hedge
+        // places its range in the primary's request by what the store has
+        // gained since (`hedge_back_start`).
+        let present_at_start = local.local_bytes();
 
         // This round's candidates: the providers now, minus the excluded.
         let current = providers.current_seen();
@@ -1622,13 +1626,11 @@ async fn run_child(
                             let moved = primary_progress.load(Ordering::Relaxed);
                             // `moved` counts payload bytes inside the PRIMARY's
                             // request, which began at ROUND START; the hedged
-                            // half begins `armed_at + split_rel` into that same
-                            // request (see `HedgeRun::armed_at`). What the
-                            // primary moved PAST that point, and only that, was
-                            // fetched twice.
-                            let duplicated = moved
-                                .saturating_sub(h.armed_at.saturating_add(h.split_rel))
-                                .min(h.charge.bytes);
+                            // half begins `back_start` into that same request
+                            // (see `HedgeRun::back_start`). What the primary
+                            // moved PAST that point, and only that, was fetched
+                            // twice.
+                            let duplicated = primary_overlap(moved, h.back_start, h.charge.bytes);
                             settle_hedge_loser(&mut h, duplicated);
                             if completed_child {
                                 // The hedge finished the child outright (ruling
@@ -1676,10 +1678,12 @@ async fn run_child(
                             // With the primary gone, nothing does — only what
                             // the primary had already moved past the split was.
                             let moved = if primary_gone {
-                                primary_progress
-                                    .load(Ordering::Relaxed)
-                                    .saturating_sub(h.armed_at.saturating_add(h.split_rel))
-                                    .min(fault.bytes())
+                                primary_overlap(
+                                    primary_progress.load(Ordering::Relaxed),
+                                    h.back_start,
+                                    h.charge.bytes,
+                                )
+                                .min(fault.bytes())
                             } else {
                                 fault.bytes()
                             }
@@ -1709,7 +1713,7 @@ async fn run_child(
                         &candidates,
                         provider,
                         started,
-                        &primary_progress,
+                        present_at_start,
                     )
                     .await;
                 }
@@ -1897,10 +1901,9 @@ struct MissingSplit {
     charge: u64,
     /// Bytes of the missing set that come BEFORE the cut — relative to the
     /// missing set AS OBSERVED AT ARM TIME, not to the primary's own request
-    /// (which began at ROUND START, before this hedge existed). That is
-    /// exactly why [`HedgeRun::armed_at`] exists: turning the primary's
-    /// request-relative progress into an arm-time-relative one needs both
-    /// numbers together, `split_rel` alone is not enough.
+    /// (which began at ROUND START, before this hedge existed). Placing the cut
+    /// in the primary's request also needs what the store gained in between:
+    /// [`hedge_back_start`].
     split_rel: u64,
 }
 
@@ -2000,24 +2003,10 @@ struct HedgeRun {
     charge: HedgeCharge,
     /// How many bytes of the primary's OWN request come before the hedged
     /// range, so its progress counter can be turned into "how much of the
-    /// charged range did it duplicate". Request-relative, never a blob offset
-    /// — see [`MissingSplit::split_rel`].
-    ///
-    /// Relative to the missing set AS IT STOOD WHEN THIS HEDGE WAS ARMED, which
-    /// is not where the primary's request began — hence `armed_at` below.
-    split_rel: u64,
-    /// The primary's progress at the instant the split was cut.
-    ///
-    /// `split_rel` indexes the missing set observed at arm time, while the
-    /// primary's counter indexes the request it was handed at ROUND START; by
-    /// arm time the primary has already consumed `armed_at` bytes of that
-    /// request. The hedged range therefore begins at `armed_at + split_rel` in
-    /// the primary's frame, and comparing its progress against `split_rel`
-    /// alone over-counts duplication by everything the primary moved before the
-    /// hedge existed — on a 1 MiB child with the primary at 600 KiB when the
-    /// hedge took the last 212 KiB, that read as 488 KiB duplicated (clamped to
-    /// the whole charge, refunding nothing) where the truth was zero.
-    armed_at: u64,
+    /// charged range did it duplicate" ([`primary_overlap`]). Request-relative,
+    /// never a blob offset; placed by [`hedge_back_start`] when the hedge is
+    /// armed.
+    back_start: u64,
     started: Instant,
     /// Keeps the hedge provider's assignment slot claimed for as long as the
     /// hedge runs; released structurally when this struct drops.
@@ -2109,6 +2098,36 @@ fn settle_hedge_loser(hedge: &mut HedgeRun, duplicated: u64) {
     hedge.charge.settle(duplicated);
 }
 
+/// Where a hedge's range begins in its primary's request, in bytes
+/// ([`HedgeRun::back_start`]).
+///
+/// The primary was handed what was missing when its round began, with
+/// `present_at_start` bytes of the item already local, and moves it in order.
+/// What the store has gained since (`present_at_arm - present_at_start`) is the
+/// primary's prefix as the store kept it, and `split_rel` more missing bytes lie
+/// in front of the cut. Never the primary's progress counter in place of the
+/// first term: the counter counts a leaf as soon as it is decoded, while the
+/// store writes leaves in batches that the next parent closes, so the counter
+/// runs one or two 16 KiB groups ahead of the bitfield the split is cut from.
+/// Placed by the counter, the cut lands that far down the primary's request,
+/// and the primary's first group or two of the hedged range counted for nobody.
+///
+/// Exact while the store gains this item from the primary alone; an earlier
+/// hedge of the same round that failed after storing bytes past the cut moves
+/// it by those bytes (its own settlement already counted them).
+fn hedge_back_start(present_at_start: u64, present_at_arm: u64, split_rel: u64) -> u64 {
+    present_at_arm
+        .saturating_sub(present_at_start)
+        .saturating_add(split_rel)
+}
+
+/// Bytes of a hedge's charged range its primary moved too, the primary being
+/// `primary_moved` bytes into its own request and the hedged range beginning
+/// `back_start` bytes into it; never more than the charge.
+fn primary_overlap(primary_moved: u64, back_start: u64, charge: u64) -> u64 {
+    primary_moved.saturating_sub(back_start).min(charge)
+}
+
 /// Decide whether to hedge this assignment, and start one if so.
 ///
 /// Returns `None` for every "not yet": size not known, nothing missing, no
@@ -2126,7 +2145,7 @@ async fn try_arm_hedge(
     candidates: &[EndpointId],
     primary: EndpointId,
     started: Instant,
-    primary_progress: &Arc<AtomicU64>,
+    present_at_start: u64,
 ) -> Option<HedgeRun> {
     // The round's candidates: the item's providers minus the ones it excluded.
     let providers: &[EndpointId] = candidates;
@@ -2142,11 +2161,6 @@ async fn try_arm_hedge(
     // them — the ceiling handles "not moving", the hedge handles "moving, but
     // far too slowly for this swarm".
     let bitfield = blobs.observe(hash).await.ok()?;
-    // Read against the SAME snapshot the split below is cut from: `split_rel`
-    // is an offset into this bitfield's missing set, so the primary's progress
-    // has to be sampled here, beside it, and not at any later point where the
-    // two would describe different instants.
-    let armed_at = primary_progress.load(Ordering::Relaxed);
     let size = bitfield.size();
     if size == 0 || bitfield.is_complete() {
         return None;
@@ -2253,13 +2267,15 @@ async fn try_arm_hedge(
         bytes = charge,
         "swarm hedge armed"
     );
+    // Placed against the SAME snapshot the split was cut from: `split_rel` is
+    // an offset into this bitfield's missing set.
+    let back_start = hedge_back_start(present_at_start, bitfield.total_bytes(), split.split_rel);
     Some(HedgeRun {
         provider: hedge_provider,
         fut,
         progress,
         charge: charge_guard,
-        split_rel: split.split_rel,
-        armed_at,
+        back_start,
         started: Instant::now(),
         _claim: claim,
     })
@@ -2973,6 +2989,75 @@ mod tests {
             split_missing_at_midpoint(&ChunkRanges::chunks(0u64..1), SIZE).is_none(),
             "one chunk left cannot be cut into two non-empty halves"
         );
+    }
+
+    /// A hedge that wins is charged what its primary moved past the cut, and the
+    /// cut is placed in the primary's request by what the store holds: the
+    /// primary's progress counter runs a group or two ahead of the store, and
+    /// placing the cut by it counted nothing in the first case below.
+    #[test]
+    fn a_won_hedge_counts_what_the_primary_moved_past_the_cut() {
+        const GROUP: u64 = 16 * CHUNK_BYTES;
+        const SIZE: u64 = 256 * CHUNK_BYTES;
+        let missing_from = |chunk: u64| ChunkRanges::chunks(chunk..256);
+
+        // The cut on a group boundary: the store holds 14 groups (the
+        // primary's counter reads 15), the last group is hedged, and the
+        // primary finishes it too, so all of it was fetched twice.
+        let s = split_missing_at_midpoint(&missing_from(224), SIZE).expect("splittable");
+        assert_eq!((s.split_rel, s.charge), (GROUP, GROUP));
+        let back_start = hedge_back_start(0, 14 * GROUP, s.split_rel);
+        assert_eq!(
+            back_start,
+            240 * CHUNK_BYTES,
+            "the hedged range begins at chunk 240"
+        );
+        assert_eq!(primary_overlap(SIZE, back_start, s.charge), GROUP);
+        assert_eq!(primary_overlap(back_start, back_start, s.charge), 0);
+
+        // The cut inside a group: 11 groups held, 80 chunks missing, the cut at
+        // chunk 216, half way through group 13.
+        let s = split_missing_at_midpoint(&missing_from(176), SIZE).expect("splittable");
+        assert_eq!(
+            (s.split_rel, s.charge),
+            (40 * CHUNK_BYTES, 40 * CHUNK_BYTES)
+        );
+        let back_start = hedge_back_start(0, 11 * GROUP, s.split_rel);
+        assert_eq!(back_start, 216 * CHUNK_BYTES);
+        assert_eq!(
+            primary_overlap(13 * GROUP, back_start, s.charge),
+            0,
+            "a primary short of the cut duplicated nothing"
+        );
+        assert_eq!(
+            primary_overlap(14 * GROUP, back_start, s.charge),
+            8 * CHUNK_BYTES,
+            "a primary that finished group 13 moved its 8 chunks past the cut"
+        );
+
+        // A hedged range smaller than a group: one group missing, cut in half.
+        let s = split_missing_at_midpoint(&missing_from(240), SIZE).expect("splittable");
+        assert_eq!(s.charge, 8 * CHUNK_BYTES);
+        let back_start = hedge_back_start(0, 15 * GROUP, s.split_rel);
+        assert_eq!(
+            primary_overlap(back_start + 4 * CHUNK_BYTES, back_start, s.charge),
+            4 * CHUNK_BYTES,
+            "less than a group past the cut counts what it moved"
+        );
+        assert_eq!(primary_overlap(SIZE, back_start, s.charge), s.charge);
+
+        // A round that began part way: [144,192) missing, the rest local; the
+        // store has gained one group of it when [160,192) is cut at chunk 176,
+        // 32 chunks into the primary's request.
+        let present_at_start = SIZE - 48 * CHUNK_BYTES;
+        let s =
+            split_missing_at_midpoint(&ChunkRanges::chunks(160u64..192), SIZE).expect("splittable");
+        let back_start = hedge_back_start(present_at_start, present_at_start + GROUP, s.split_rel);
+        assert_eq!(back_start, 2 * GROUP);
+        assert_eq!(primary_overlap(3 * GROUP, back_start, s.charge), GROUP);
+
+        // Never more than the charge, whatever the counter reads.
+        assert_eq!(primary_overlap(u64::MAX, back_start, s.charge), s.charge);
     }
 
     /// A hedge is admitted at EXACTLY half the cap (ruling R1): `available`

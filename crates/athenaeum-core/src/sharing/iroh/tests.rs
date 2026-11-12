@@ -3945,11 +3945,20 @@ async fn live_hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
 async fn live_hedge_fires_with_the_default_stream_limit() {
     const ITEMS: usize = 8;
     let (report, _) = live_hedge_fires_scenario(ITEMS, 8).await;
-    // Not a byte bound (the budget bounds bytes, and these hedges duplicate
-    // nothing): a sanity bound against a re-arm loop on the same item.
+    // Not a byte bound (the budget bounds bytes): a sanity bound against a
+    // re-arm loop on the same item.
     assert!(
         report.hedges as usize <= 2 * ITEMS,
         "a hedge storm: {report:?}"
+    );
+    // Every byte the providers moved is payload or counted as duplicated: a
+    // hedge armed beside a primary that is still moving, near the end of an
+    // item, has both sides fetch the last group or two.
+    let payload = (ITEMS * LIVE_HEDGE_SIZE) as u64;
+    assert_eq!(
+        report.total_bytes() - report.hedge_bytes,
+        payload,
+        "bytes fetched twice that no hedge was charged for: {report:?}"
     );
 }
 
