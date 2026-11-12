@@ -80,15 +80,7 @@ pub struct SetAttestationArgs {
 // wire shape (snake_case, no `rename_all`) is unchanged.
 pub use athenaeum_core::api::frame_sets::AutoGenerateResult;
 
-#[derive(serde::Serialize)]
-pub struct FramesSetWithCount {
-    pub frames_set: athenaeum_core::models::FramesSet,
-    pub member_count: usize,
-    /// Members (counted in `member_count`) whose file lives inside a zip.
-    pub zip_member_count: usize,
-    /// Second copies of a frame the set already holds — not in `member_count`, never used.
-    pub duplicate_count: usize,
-}
+pub use athenaeum_core::api::frame_sets::FramesSetWithCount;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -100,45 +92,6 @@ fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 
-fn no_db() -> (StatusCode, String) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Database not initialized".to_string(),
-    )
-}
-
-/// Fetch the FrameSetDetail for the given `frames_set_id` using an open
-/// connection.  Extracted so that handlers which need to return a detail after
-/// mutating the DB can reuse it without re-locking.
-fn load_frame_set_detail(
-    conn: &rusqlite::Connection,
-    frames_set_id: i64,
-) -> Result<athenaeum_core::models::FrameSetDetail, String> {
-    use athenaeum_core::db;
-
-    let sets = db::get_frames_sets_by_project(conn, 1).map_err(|e| e.to_string())?;
-
-    let frames_set = sets
-        .into_iter()
-        .find(|(set, _)| set.id == Some(frames_set_id))
-        .ok_or_else(|| "Frame set not found".to_string())?
-        .0;
-
-    let sessions_exist =
-        db::sessions_exist_for_frame_set(conn, frames_set_id).map_err(|e| e.to_string())?;
-
-    if !sessions_exist {
-        return Ok(athenaeum_core::models::FrameSetDetail {
-            frames_set,
-            nights: Vec::new(),
-        });
-    }
-
-    let nights =
-        db::get_imaging_nights_with_sessions(conn, frames_set_id).map_err(|e| e.to_string())?;
-
-    Ok(athenaeum_core::models::FrameSetDetail { frames_set, nights })
-}
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -169,24 +122,10 @@ pub async fn get_frames_sets(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramesSetsArgs>,
 ) -> Result<Json<Vec<FramesSetWithCount>>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
     let project_id = args.project_id.unwrap_or(1);
-    let sets = athenaeum_core::db::get_frames_sets_by_project(&conn, project_id).map_err(db_err)?;
-    let zip_counts = athenaeum_core::db::get_frames_set_zip_member_counts(&conn).map_err(db_err)?;
-    let duplicate_counts = athenaeum_core::db::get_frames_set_duplicate_counts(&conn).map_err(db_err)?;
-
-    Ok(Json(
-        sets.into_iter()
-            .map(|(frames_set, member_count)| FramesSetWithCount {
-                zip_member_count: frames_set.id.and_then(|id| zip_counts.get(&id).copied()).unwrap_or(0),
-                duplicate_count: frames_set.id.and_then(|id| duplicate_counts.get(&id).copied()).unwrap_or(0),
-                frames_set,
-                member_count,
-            })
-            .collect(),
-    ))
+    athenaeum_core::api::frame_sets::get_frames_sets(&state.ctx, project_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Get detailed structure for a single frame set (nights and sessions).
@@ -195,11 +134,9 @@ pub async fn get_frame_set_detail(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<athenaeum_core::models::FrameSetDetail>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let detail = load_frame_set_detail(&conn, args.frames_set_id).map_err(db_err)?;
-    Ok(Json(detail))
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, args.frames_set_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Delete a frame set by ID (cascade removes nights/sessions/members).
@@ -208,10 +145,7 @@ pub async fn delete_frames_set(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteFramesSetArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    athenaeum_core::db::delete_frames_set(&conn, args.frames_set_id).map_err(db_err)?;
+    athenaeum_core::api::frame_sets::delete_frames_set(&state.ctx, args.frames_set_id).map_err(api_err)?;
     Ok(Json(()))
 }
 
@@ -221,11 +155,9 @@ pub async fn delete_auto_generated_frame_sets(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let n = athenaeum_core::db::delete_auto_generated_frame_sets(&conn).map_err(db_err)?;
-    Ok(Json(n))
+    athenaeum_core::api::frame_sets::delete_auto_generated_frame_sets(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Rename a frame set.
@@ -234,11 +166,7 @@ pub async fn rename_frames_set(
     State(state): State<WebAppState>,
     Json(args): Json<RenameFramesSetArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    athenaeum_core::db::update_frames_set_name(&conn, args.frames_set_id, &args.new_name)
-        .map_err(db_err)?;
+    athenaeum_core::api::frame_sets::rename_frames_set(&state.ctx, args.frames_set_id, &args.new_name).map_err(api_err)?;
     Ok(Json(()))
 }
 
@@ -248,40 +176,9 @@ pub async fn mark_frame_set_custom(
     State(state): State<WebAppState>,
     Json(args): Json<MarkFrameSetCustomArgs>,
 ) -> Result<Json<athenaeum_core::models::FramesSet>, (StatusCode, String)> {
-    use athenaeum_core::db;
-
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
-        args.frames_set_id,
-        &conn,
-    )
-    .map_err(|e| db_err(format!("Failed to calculate metadata: {}", e)))?;
-
-    db::update_frames_set_metadata(
-        &conn,
-        args.frames_set_id,
-        metadata.date_obs_start.as_deref(),
-        metadata.date_obs_end.as_deref(),
-        metadata.objctra.as_deref(),
-        metadata.objctdec.as_deref(),
-        metadata.total_exp_time,
-        true, // mark as custom
-        metadata.avg_rotation,
-        metadata.min_rotation,
-        metadata.max_rotation,
-    )
-    .map_err(db_err)?;
-
-    let sets = db::get_frames_sets_by_project(&conn, 1).map_err(db_err)?;
-    let frames_set = sets
-        .into_iter()
-        .find(|(set, _)| set.id == Some(args.frames_set_id))
-        .ok_or_else(|| db_err("Frame set not found"))?
-        .0;
-
-    Ok(Json(frames_set))
+    athenaeum_core::api::frame_sets::mark_frame_set_custom(&state.ctx, args.frames_set_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Merge source frame set into target frame set; source is deleted afterwards.
@@ -295,10 +192,9 @@ pub async fn merge_frame_sets(
 ) -> Result<Json<athenaeum_core::models::FrameSetDetail>, (StatusCode, String)> {
     athenaeum_core::api::frame_sets::merge_frame_sets(&state.ctx, args.source_id, args.target_id)
         .map_err(db_err)?;
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-    let detail = load_frame_set_detail(&conn, args.target_id).map_err(db_err)?;
-    Ok(Json(detail))
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, args.target_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Recompute this set's center and rotation from its lights. Mirrors the
@@ -323,10 +219,9 @@ pub async fn recalculate_frame_set_nights(
 ) -> Result<Json<athenaeum_core::models::FrameSetDetail>, (StatusCode, String)> {
     athenaeum_core::api::frame_sets::recalculate_frame_set_nights(&state.ctx, args.frames_set_id)
         .map_err(db_err)?;
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-    let detail = load_frame_set_detail(&conn, args.frames_set_id).map_err(db_err)?;
-    Ok(Json(detail))
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, args.frames_set_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Cheap, idempotent nights/sessions check meant to run whenever a frame
@@ -375,10 +270,9 @@ pub async fn split_frame_set(
     .map_err(api_err)?;
 
     // Return detail of the newly created set.
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-    let detail = load_frame_set_detail(&conn, new_set_id).map_err(db_err)?;
-    Ok(Json(detail))
+    athenaeum_core::api::frame_sets::get_frame_set_detail(&state.ctx, new_set_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Create a custom frame set from a direct list of frame IDs.
@@ -406,11 +300,9 @@ pub async fn get_excluded_frames_with_metadata(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<Vec<athenaeum_core::models::ExcludedFrameRow>>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let rows = athenaeum_core::db::get_excluded_frames_with_metadata(&conn).map_err(db_err)?;
-    Ok(Json(rows))
+    athenaeum_core::api::frame_sets::get_excluded_frames_with_metadata(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
 }
 
 #[derive(Deserialize)]
@@ -426,12 +318,9 @@ pub async fn remove_files_from_excluded(
     State(state): State<WebAppState>,
     Json(args): Json<RemoveFromExcludedArgs>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let deleted = athenaeum_core::db::delete_excluded_frames_by_file_ids(&conn, &args.file_ids)
-        .map_err(db_err)?;
-    Ok(Json(deleted))
+    athenaeum_core::api::frame_sets::remove_files_from_excluded(&state.ctx, &args.file_ids)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Get count of excluded frames (lightweight check).
@@ -440,11 +329,9 @@ pub async fn get_excluded_frames_count(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<i64>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let count = athenaeum_core::db::get_excluded_frames_count(&conn).map_err(db_err)?;
-    Ok(Json(count))
+    athenaeum_core::api::frame_sets::get_excluded_frames_count(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Archive a frame set.
@@ -453,10 +340,7 @@ pub async fn archive_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, true).map_err(db_err)?;
+    athenaeum_core::api::frame_sets::archive_frame_set(&state.ctx, args.frames_set_id).map_err(api_err)?;
     Ok(Json(()))
 }
 
@@ -531,10 +415,7 @@ pub async fn get_frame_set_merge_log(
     State(state): State<WebAppState>,
     Json(args): Json<GetMergeLogArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::MergeLogEntry>>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-    let entries =
-        athenaeum_core::auto_merge::log_ops::get_log_entries(&conn, args.frames_set_id, args.limit)
-            .map_err(db_err)?;
-    Ok(Json(entries))
+    athenaeum_core::api::frame_sets::get_frame_set_merge_log(&state.ctx, args.frames_set_id, args.limit)
+        .map(Json)
+        .map_err(api_err)
 }

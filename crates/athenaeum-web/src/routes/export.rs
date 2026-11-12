@@ -3,15 +3,13 @@
 // Mirrors the Tauri export commands.  Progress events are broadcast via SSE
 // instead of Tauri's emit mechanism.
 
-use athenaeum_core::api::export::load_wbpp_config;
 use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
-use athenaeum_core::export::frame_set_queries::{self, ExportableFrameSet};
+use athenaeum_core::export::frame_set_queries::ExportableFrameSet;
 use athenaeum_core::export::models::{
-    CalibratedLightOptions, CalibrationRoute, ExportData, ExportMode, ExportResult,
+    CalibrationRoute, ExportData, ExportMode, ExportResult,
     ExportSummary, WbppExportConfig,
 };
-use athenaeum_core::export::{collect_export_data, collect_export_summary, resolve_export_mode};
 use athenaeum_core::fits_writer::OutputFormat;
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::atomic::Ordering;
@@ -20,23 +18,6 @@ use std::sync::Arc;
 use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// The raw stderr prints formerly here duplicated the `#[tracing::instrument(err(Debug))]`
-// attribute on every caller below, which already logs each returned Err at
-// the command boundary — see the T7 sweep report.
-fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
-    let s = msg.to_string();
-    (StatusCode::INTERNAL_SERVER_ERROR, s)
-}
-
-fn no_db() -> (StatusCode, String) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Database not initialized".to_string(),
-    )
-}
 
 // ── Request arg structs ───────────────────────────────────────────────────────
 
@@ -171,11 +152,9 @@ pub async fn get_export_preview(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<ExportData>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let data = collect_export_data(&conn, args.frame_set_id).map_err(db_err)?;
-    Ok(Json(data))
+    athenaeum_core::api::export::get_export_preview(&state.ctx, args.frame_set_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Get a list of available frame sets for export.
@@ -184,11 +163,9 @@ pub async fn get_exportable_frame_sets(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
 ) -> Result<Json<Vec<ExportableFrameSet>>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let frame_sets = frame_set_queries::get_exportable_frame_sets(&conn).map_err(db_err)?;
-    Ok(Json(frame_sets))
+    athenaeum_core::api::export::get_exportable_frame_sets(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Get calibration route for UI display.
@@ -200,12 +177,9 @@ pub async fn get_calibration_route(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<CalibrationRoute>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let route =
-        frame_set_queries::get_calibration_route(&conn, args.frame_set_id).map_err(db_err)?;
-    Ok(Json(route))
+    athenaeum_core::api::export::get_calibration_route(&state.ctx, args.frame_set_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// Export summary for the tab, drawn for the mode the tab has selected —
@@ -216,23 +190,19 @@ pub async fn get_export_summary(
     State(state): State<WebAppState>,
     Json(args): Json<GetExportSummaryArgs>,
 ) -> Result<Json<ExportSummary>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let config = load_wbpp_config(&conn).unwrap_or_default();
-    let mode = resolve_export_mode(args.export_mode, &config);
-    let gen_opts = CalibratedLightOptions::resolve(
+    athenaeum_core::api::export::get_export_summary(
+        &state.ctx,
+        args.frame_set_id,
+        args.export_mode,
         args.flat_norm,
         args.flat_norm_mode,
         args.params,
         args.hot_pixel,
         args.debayer,
         args.format,
-    );
-    let summary =
-        collect_export_summary(&conn, args.frame_set_id, &config, mode, Some(&gen_opts))
-            .map_err(db_err)?;
-    Ok(Json(summary))
+    )
+    .map(Json)
+    .map_err(api_err)
 }
 
 // ── Active export handlers ────────────────────────────────────────────────────

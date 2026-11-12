@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::State;
 
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::{DsoCatalog, ResolvedObject};
@@ -334,28 +334,8 @@ pub async fn download_index_packs(
     state: State<'_, AppState>,
     names: Vec<String>,
 ) -> Result<String, String> {
-    use athenaeum_core::catalog::index_prebuilt::{self, IndexProgressMapper};
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let app_data_dir = db.path().to_path_buf().parent()
-        .ok_or("Cannot determine app data directory")?.to_path_buf();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let mapper = Arc::new(IndexProgressMapper::new());
-    let (app_clone, mapper_clone) = (app.clone(), mapper.clone());
-
-    let result = tokio::task::spawn_blocking(move || {
-        index_prebuilt::download_index_packs(&app_data_dir, &names, cancel_flag, &|progress| {
-            let _ = app_clone.emit("index-download-progress", mapper_clone.map(progress));
-        })
-    })
-    .await
-    .map_err(|e| format!("download task panicked: {e}"))?;
-
-    match result {
-        Ok(p) => Ok(p.display().to_string()),
-        Err(e) => {
-            let msg = format!("{e:#}");
-            let _ = app.emit("index-download-progress", mapper.error(msg.clone()));
-            Err(msg)
-        }
-    }
+    let emitter = Arc::new(crate::tauri_events::TauriProgressEmitter(app));
+    athenaeum_core::api::plate_solve::download_index_packs(&state.ctx, emitter, names)
+        .await
+        .map_err(|e| e.to_string())
 }

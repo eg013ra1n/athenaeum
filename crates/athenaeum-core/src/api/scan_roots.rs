@@ -1916,10 +1916,8 @@ pub fn cancel_scan(ctx: &ServiceContext, root_id: i64) -> Result<(), ApiError> {
     }
 }
 
-/// Web-only: no Tauri command by this name (desktop has no analogous
-/// command). Converted anyway for single-sourcing since it lives in
-/// `routes/scan_roots.rs`, in this task's declared file scope. Returns a map
-/// of scan_root_id -> count of files with 'missing' status.
+/// A map of scan_root_id -> count of files with 'missing' status. Both hosts'
+/// `get_missing_files_counts` call it.
 pub fn get_missing_files_counts(ctx: &ServiceContext) -> Result<HashMap<i64, i64>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();

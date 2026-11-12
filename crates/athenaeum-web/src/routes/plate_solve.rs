@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, Json};
@@ -9,7 +9,7 @@ use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
 use athenaeum_core::plate_solve::CatalogOpenError;
 use athenaeum_core::plate_solve::storage;
 
-use crate::events::{SseEvent, SseProgressEmitter};
+use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
 
@@ -387,44 +387,17 @@ pub async fn download_index_packs(
     State(state): State<WebAppState>,
     Json(args): Json<IndexPackNamesArgs>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    use athenaeum_core::catalog::index_prebuilt::{self, IndexProgressMapper};
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let app_data_dir = db.path().to_path_buf().parent()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?
-        .to_path_buf();
-
-    let event_tx = state.event_tx.clone();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let mapper = Arc::new(IndexProgressMapper::new());
-    let (tx_progress, mapper_progress) = (event_tx.clone(), mapper.clone());
-
-    let result = tokio::task::spawn_blocking(move || {
-        index_prebuilt::download_index_packs(&app_data_dir, &args.names, cancel_flag, &|progress| {
-            let _ = tx_progress.send(SseEvent {
-                event_name: "index-download-progress".into(),
-                data: serde_json::to_value(mapper_progress.map(progress)).unwrap_or_default(),
-            });
-        })
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("download task panicked: {e}")))?;
-
-    match result {
-        Ok(p) => Ok(Json(p.display().to_string())),
-        Err(e) => {
-            let msg = format!("{e:#}");
-            let _ = event_tx.send(SseEvent {
-                event_name: "index-download-progress".into(),
-                data: serde_json::to_value(mapper.error(msg.clone())).unwrap_or_default(),
-            });
-            Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
-        }
-    }
+    let emitter = Arc::new(crate::events::SseProgressEmitter::new(state.event_tx.clone()));
+    athenaeum_core::api::plate_solve::download_index_packs(&state.ctx, emitter, args.names)
+        .await
+        .map(Json)
+        .map_err(crate::routes::api_err)
 }
 
 #[cfg(test)]
 mod plate_solve_config_tests {
     use super::*;
+    use crate::events::SseEvent;
     use athenaeum_core::cache::MemoryImageCache;
     use athenaeum_core::db::Database;
     use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};

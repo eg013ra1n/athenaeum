@@ -322,8 +322,8 @@ pub async fn check_all_scan_roots_availability(
 
 /// POST /api/get_missing_files_counts
 ///
-/// Web-only — no Tauri command by this name. Returns a map of
-/// scan_root_id -> count of files with 'missing' status.
+/// Returns a map of scan_root_id -> count of files with 'missing' status
+/// (the desktop's command of the same name calls the same core function).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_missing_files_counts(
     State(state): State<WebAppState>,

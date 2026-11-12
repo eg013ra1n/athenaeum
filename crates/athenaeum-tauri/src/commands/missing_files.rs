@@ -15,9 +15,8 @@ pub async fn sync_missing_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    athenaeum_core::db::sync_missing_files(&conn, root_id, &file_ids).map_err(|e| e.to_string())
+    athenaeum_core::api::missing_files::sync_missing_files(&state.ctx, root_id, &file_ids)
+        .map_err(|e| e.to_string())
 }
 
 /// Get missing files for a specific scan root with full details
@@ -38,29 +37,8 @@ pub async fn get_missing_files(
 pub async fn get_missing_files_counts(
     state: State<'_, AppState>,
 ) -> Result<HashMap<i64, i64>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT scan_root_id, COUNT(*)
-             FROM missing_files
-             WHERE status = 'missing'
-             GROUP BY scan_root_id",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let mut counts = HashMap::new();
-    let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
-        .map_err(|e| e.to_string())?;
-
-    for row in rows {
-        let (root_id, count) = row.map_err(|e| e.to_string())?;
-        counts.insert(root_id, count);
-    }
-
-    Ok(counts)
+    athenaeum_core::api::scan_roots::get_missing_files_counts(&state.ctx)
+        .map_err(|e| e.to_string())
 }
 
 /// Recheck missing files for a scan root and update their status
@@ -82,16 +60,8 @@ pub async fn ignore_missing_file(
     file_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    conn.execute(
-        "UPDATE missing_files SET status = 'ignored' WHERE file_id = ?1",
-        [file_id],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(())
+    athenaeum_core::api::missing_files::ignore_missing_file(&state.ctx, file_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Remove ignored status from a missing file
@@ -101,16 +71,8 @@ pub async fn unignore_missing_file(
     file_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    conn.execute(
-        "UPDATE missing_files SET status = 'missing' WHERE file_id = ?1",
-        [file_id],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(())
+    athenaeum_core::api::missing_files::unignore_missing_file(&state.ctx, file_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Delete files from the database entirely (removes from files, frames, missing_files tables)
@@ -120,24 +82,8 @@ pub async fn delete_missing_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if file_ids.is_empty() {
-        return Ok(());
-    }
-
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Not a bare `DELETE FROM files`: a master's file needs its raw source set
-    // un-superseded and its consumers repointed first, or the raw frames stay
-    // invisible to the matcher with nothing left in the UI to undo it
-    // (2026-08-02 audit C3). `delete_orphaned_files` is the one path that does
-    // both — the Black Hole, void and orphan-purge flows all go through it.
-    // Pinned by `deleting_a_master_file_un_supersedes_its_raw_set` on the web
-    // mirror of this command.
-    athenaeum_core::relinking::delete_orphaned_files(&conn, &file_ids)
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    athenaeum_core::api::missing_files::delete_missing_files(&state.ctx, &file_ids)
+        .map_err(|e| e.to_string())
 }
 
 /// Relocate a missing file to a new path
