@@ -84,6 +84,42 @@ pub fn set_setting(
     Ok(())
 }
 
+/// Persist the blink worker count and return the permit count the host's
+/// semaphore must be rebuilt with. `threads` is `0..=max_threads` (`0` = auto,
+/// half of `max_threads`, at least 2); a larger value is refused and nothing is
+/// stored. Both hosts call this, then rebuild their own semaphore.
+pub fn set_blink_threads(
+    ctx: &ServiceContext,
+    threads: u32,
+    max_threads: usize,
+) -> Result<usize, ApiError> {
+    let max = u32::try_from(max_threads).unwrap_or(u32::MAX);
+    if threads > max {
+        return Err(ApiError::Invalid(format!(
+            "Blink threads must be between 0 and {} (0 = auto)",
+            max
+        )));
+    }
+
+    {
+        let db = crate::api::db(ctx)?;
+        let conn = db.conn();
+        ctx.settings
+            .persist_setting(
+                &conn,
+                crate::settings::keys::BLINK_THREADS,
+                &threads.to_string(),
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+
+    Ok(if threads == 0 {
+        (max_threads / 2).max(2)
+    } else {
+        threads as usize
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +186,37 @@ mod tests {
                 .unwrap(),
             "false"
         );
+    }
+
+    fn stored_blink_threads(ctx: &ServiceContext) -> String {
+        let conn = ctx.db.get().unwrap().conn();
+        ctx.settings
+            .get_with_precedence(&conn, crate::settings::keys::BLINK_THREADS, "unset")
+            .unwrap()
+    }
+
+    #[test]
+    fn set_blink_threads_above_max_is_refused_and_not_stored() {
+        let (_tmp, ctx) = test_ctx();
+        set_blink_threads(&ctx, 3, 8).expect("in range");
+        let err = set_blink_threads(&ctx, 9, 8).expect_err("above max");
+        match err {
+            ApiError::Invalid(m) => {
+                assert_eq!(m, "Blink threads must be between 0 and 8 (0 = auto)")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(stored_blink_threads(&ctx), "3");
+    }
+
+    #[test]
+    fn set_blink_threads_returns_permits_and_stores_value() {
+        let (_tmp, ctx) = test_ctx();
+        assert_eq!(set_blink_threads(&ctx, 0, 16).unwrap(), 8);
+        assert_eq!(stored_blink_threads(&ctx), "0");
+        assert_eq!(set_blink_threads(&ctx, 0, 2).unwrap(), 2);
+        assert_eq!(set_blink_threads(&ctx, 5, 16).unwrap(), 5);
+        assert_eq!(stored_blink_threads(&ctx), "5");
+        assert_eq!(set_blink_threads(&ctx, 16, 16).unwrap(), 16);
     }
 }

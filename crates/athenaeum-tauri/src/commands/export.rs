@@ -11,7 +11,6 @@ use crate::export::{
 };
 use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::State;
 
@@ -170,13 +169,7 @@ pub async fn export_to_wbpp(
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn cancel_export(frame_set_id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let exports = state.ctx.active_exports.lock().unwrap();
-    if let Some(handle) = exports.get(&frame_set_id) {
-        handle.cancel_flag.store(true, Ordering::SeqCst);
-        Ok(())
-    } else {
-        Err("No active export for this frame set".to_string())
-    }
+    athenaeum_core::api::export::cancel_export(&state.ctx, frame_set_id).map_err(|e| e.to_string())
 }
 
 /// Get enhanced export summary for the new UI

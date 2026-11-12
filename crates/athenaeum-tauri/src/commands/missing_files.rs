@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -95,31 +94,11 @@ pub async fn relocate_missing_file(
     new_path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let new_path = athenaeum_core::db::normalize_separators(&new_path);
-    // Verify the new path exists
-    if !Path::new(&new_path).exists() {
-        return Err(format!("File does not exist at path: {}", new_path));
-    }
-
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Extract new filename from path
-    let new_filename = Path::new(&new_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| new_path.clone());
-
-    // Update the file path
-    conn.execute(
-        "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
-        rusqlite::params![&new_path, &new_filename, file_id],
+    athenaeum_core::api::missing_files::relocate_missing_file(
+        &state.ctx,
+        file_id,
+        new_path,
+        &athenaeum_core::api::PathPolicy::AllowAll,
     )
-    .map_err(|e| e.to_string())?;
-
-    // Remove from missing_files table
-    conn.execute("DELETE FROM missing_files WHERE file_id = ?1", [file_id])
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    .map_err(|e| e.to_string())
 }

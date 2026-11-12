@@ -2,7 +2,6 @@
 
 use athenaeum_core::db;
 use athenaeum_core::logging;
-use athenaeum_core::settings;
 use axum::{extract::State, http::StatusCode, Json};
 
 use crate::routes::api_err;
@@ -132,7 +131,7 @@ pub async fn get_blink_threads_max(
 
 #[derive(serde::Deserialize)]
 pub struct SetBlinkThreadsArgs {
-    pub threads: usize,
+    pub threads: u32,
 }
 
 /// POST /api/set_blink_threads
@@ -144,26 +143,15 @@ pub async fn set_blink_threads(
     State(state): State<WebAppState>,
     Json(args): Json<SetBlinkThreadsArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let threads = args.threads.clamp(0, state.max_blink_threads);
-    let effective = if threads == 0 {
-        (state.max_blink_threads / 2).max(2)
-    } else {
-        threads
-    };
+    let threads = args.threads;
+    let effective = athenaeum_core::api::settings::set_blink_threads(
+        &state.ctx,
+        threads,
+        state.max_blink_threads,
+    )
+    .map_err(api_err)?;
 
-    let db = state.ctx.db.get().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Database not initialized".to_string(),
-    ))?;
-    let conn = db.conn();
-
-    state
-        .ctx
-        .settings
-        .persist_setting(&conn, settings::keys::BLINK_THREADS, &threads.to_string())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Rebuild semaphore — 0 means use all available cores
+    // Rebuild semaphore — 0 means auto (half of available cores)
     *state.image_semaphore.write().unwrap() =
         std::sync::Arc::new(tokio::sync::Semaphore::new(effective));
 
@@ -436,5 +424,38 @@ mod logging_config_tests {
             "bare LoggingConfig body must NOT deserialize into SetLoggingConfigArgs — \
              this is what closes the silent-default hole (axum returns 422/400 for this shape)"
         );
+    }
+
+    /// A blink thread count above the maximum is refused with 400 and the
+    /// desktop's text (the route no longer clamps); the semaphore and the stored
+    /// value stay as they were. A value in range is stored and rebuilds the semaphore.
+    #[tokio::test]
+    async fn set_blink_threads_refuses_a_value_above_the_maximum() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let (status, msg) = set_blink_threads(
+            State(state.clone()),
+            Json(SetBlinkThreadsArgs { threads: 2 }),
+        )
+        .await
+        .expect_err("above the maximum of 1");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(msg, "Blink threads must be between 0 and 1 (0 = auto)");
+        {
+            let conn = state.ctx.db.get().unwrap().conn();
+            let stored = state
+                .ctx
+                .settings
+                .get_with_precedence(&conn, athenaeum_core::settings::keys::BLINK_THREADS, "unset")
+                .unwrap();
+            assert_ne!(stored, "2");
+        }
+
+        let _ = set_blink_threads(State(state.clone()), Json(SetBlinkThreadsArgs { threads: 1 }))
+            .await
+            .expect("in range");
+        assert_eq!(state.image_semaphore.read().unwrap().available_permits(), 1);
     }
 }

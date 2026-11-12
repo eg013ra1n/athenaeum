@@ -82,7 +82,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/ignore_missing_file", post(missing_files::ignore_missing_file))
         .route("/api/unignore_missing_file", post(missing_files::unignore_missing_file))
         .route("/api/delete_missing_files", post(missing_files::delete_missing_files))
-        .route("/api/relocate_missing_file", post(relocate_missing_file_stub))
+        .route("/api/relocate_missing_file", post(missing_files::relocate_missing_file))
         // Files
         .route("/api/get_files", post(files::get_files))
         .route("/api/get_files_by_directory", post(files::get_files_by_directory))
@@ -514,14 +514,6 @@ async fn get_database_path(
 }
 
 // ── Category A — Desktop-only stubs ──────────────────────────────────────────
-
-/// POST /api/relocate_missing_file — 501 in web mode (needs native file picker)
-#[tracing::instrument(skip_all)]
-async fn relocate_missing_file_stub(
-    Json(_): Json<serde_json::Value>,
-) -> (StatusCode, String) {
-    (StatusCode::NOT_IMPLEMENTED, "relocate_missing_file is not available in web mode".to_string())
-}
 
 /// POST /api/read_fits_image_rustafits — 501 in web mode (web uses get_frame_preview)
 #[tracing::instrument(skip_all)]

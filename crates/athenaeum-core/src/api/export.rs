@@ -587,6 +587,23 @@ fn finish_export(
     );
 }
 
+/// Raise the cancel flag of the export running for `frame_set_id` (a WBPP export
+/// or a collab project export registered under the same key). The running
+/// export notices the flag and finishes as cancelled. Nothing running for the
+/// key is a `NotFound`.
+pub fn cancel_export(ctx: &ServiceContext, frame_set_id: i64) -> Result<(), ApiError> {
+    let exports = ctx.active_exports.lock().unwrap();
+    match exports.get(&frame_set_id) {
+        Some(handle) => {
+            handle.cancel_flag.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        None => Err(ApiError::NotFound(
+            "No active export for this frame set".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,5 +828,32 @@ mod tests {
         assert!(check_export_dir(Path::new("/data/exports_old/m31"), Some(allowed)).is_err());
         // No configured directory: nothing is refused on this ground.
         assert!(check_export_dir(Path::new("/elsewhere/m31"), None).is_ok());
+    }
+
+    #[test]
+    fn cancel_export_without_an_active_export_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(tmp.path());
+        match cancel_export(&ctx, 7) {
+            Err(ApiError::NotFound(m)) => assert_eq!(m, "No active export for this frame set"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_export_raises_the_cancel_flag_of_the_active_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(tmp.path());
+        let flag = Arc::new(AtomicBool::new(false));
+        ctx.active_exports.lock().unwrap().insert(
+            7,
+            ExportHandle {
+                cancel_flag: flag.clone(),
+            },
+        );
+        cancel_export(&ctx, 8).expect_err("another frame set is not running");
+        assert!(!flag.load(Ordering::SeqCst));
+        cancel_export(&ctx, 7).expect("active export");
+        assert!(flag.load(Ordering::SeqCst));
     }
 }
