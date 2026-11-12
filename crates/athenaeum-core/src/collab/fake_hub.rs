@@ -34,6 +34,9 @@
 //!   `remove` (allowed beside `full`), and any report write clears the mark
 //!   (hub 06198cc, migration 0025); a report is validated with the hub's
 //!   rules and words (`validate_report`, the 100 000-item cap);
+//! - the holders snapshot names a device by the DEVICE's own registry name
+//!   (hub b485578, `COALESCE(d.name, '')`): a device with no name reads `""`,
+//!   never its member's name;
 //! - every manifest-visible change bumps the project version and stamps the
 //!   touched rows' `manifestVersion` with it, and every visible claim change
 //!   bumps the project's `holderSeq` once per commit;
@@ -3265,7 +3268,7 @@ fn holders_snapshot(st: &FakeHubState, acct: &FakeAccount, pid: &str) -> Respons
                 });
             devices.push(json!({
                 "device": device,
-                "displayName": st.display_of(&member.account_id),
+                "displayName": st.device_name(&device).unwrap_or_default(),
                 "relayUrl": relay_url,
                 "claims": claims,
             }));
@@ -4220,6 +4223,48 @@ mod tests {
         assert!(
             matches!(gone, Err(crate::account::AccountClientError::Gone(ref e)) if e == "holders_cursor_ahead")
         );
+    }
+
+    /// Hub b485578: the holders snapshot names a device by its OWN registry
+    /// name (`COALESCE(d.name, '')`) — `""` for a device registered without
+    /// one — while the member's name stays in the membership snapshot.
+    #[tokio::test]
+    async fn the_holders_snapshot_names_a_device_by_its_own_name() {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        hub.add_account("tok-o", "acc-o", "Other", "BBB=", None);
+        hub.add_device("acc-me", "AAA=", "dev-a", "Obs PC", None);
+        hub.add_device("acc-o", "BBB=", "dev-b", "", None);
+        hub.add_project(
+            "p1",
+            "m31",
+            &[("acc-me", "send_receive", false), ("acc-o", "send", false)],
+            false,
+        );
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let snap = c.holders_snapshot("tok", "p1").await.unwrap();
+        let named = snap.devices.iter().find(|d| d.device == "AAA=").unwrap();
+        assert_eq!(named.display_name, "Obs PC", "the device's own name");
+        let unnamed = snap.devices.iter().find(|d| d.device == "BBB=").unwrap();
+        assert_eq!(
+            unnamed.display_name, "",
+            "a device registered without a name reads empty, not its member's name"
+        );
+
+        let membership = c.membership_snapshot("tok", "p1").await.unwrap();
+        let payload = B64.decode(&membership.payload).unwrap();
+        let payload: Value = serde_json::from_slice(&payload).unwrap();
+        let member = |id: &str| {
+            payload["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["accountId"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(member("acc-me")["displayName"], "Me");
+        assert_eq!(member("acc-o")["displayName"], "Other");
     }
 
     #[tokio::test]
