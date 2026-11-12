@@ -6416,100 +6416,7 @@ async fn run_publish(
             .await
         {
             Ok(hash) => {
-                // C1/I1: the landing crossed between generated and attested
-                // (or its folder otherwise changed) — move `landed_path` to
-                // where this run actually put the frame's CURRENT bytes,
-                // before any downstream write depends on it agreeing
-                // (`stage_own_file`'s `WHERE landed_path = ?` needs the row
-                // to already match). The stale file is removed ONLY when
-                // the move itself actually succeeded AND it was this
-                // publisher's own-dir landing — an app-generated artifact,
-                // never an attested original (F5/A1: that file is never
-                // removed, whatever the set's attestation is now).
-                //
-                // Fix round 2 (finding 2): `landed_path` is `TEXT UNIQUE`
-                // table-wide, and a frame set can be linked to more than one
-                // project — a move CAN fail with a real collision (another
-                // project's own row already holds this exact path). A
-                // failed move must never delete the row's OWN still-current
-                // file: that would leave the row pointing at nothing.
-                let new_landed = w.target.to_string_lossy().to_string();
-                if current.landed_path.as_deref() != Some(new_landed.as_str()) {
-                    let moved = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
-                        frames_db::update_landed_path(&db.conn(), project_id, &w.uuid, &new_landed)
-                    });
-                    let moved_ok = match moved {
-                        Ok(n) if n > 0 => {
-                            tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved");
-                            true
-                        }
-                        Ok(_) => {
-                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, "publish: moving the own frame's landed path matched no row");
-                            false
-                        }
-                        Err(e) => {
-                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed");
-                            false
-                        }
-                    };
-                    if moved_ok {
-                        if let Some(old) = current.landed_path.as_deref() {
-                            let old_path = Path::new(old);
-                            if is_own_dir_landing(old_path, &own_dir) {
-                                // C1 fix round 3, part 1: `is_own_dir_landing`
-                                // only tells us the path SITS in our own
-                                // folder shape — not that WE put it there. A
-                                // user can move (or attest) their own light
-                                // straight into that folder; deleting it
-                                // would be real data loss. Two independent
-                                // guards, belt-and-braces with the
-                                // `publisher_dir` fix above:
-                                //   - a `files` row still referencing this
-                                //     exact path means it is catalogued —
-                                //     generated files are never catalogued,
-                                //     so this check is exact, no false
-                                //     positive possible.
-                                //   - `was_external_recipe(&current)`: the
-                                //     row we are moving OFF of was itself an
-                                //     attested (external) landing.
-                                let catalogued = {
-                                    let conn = match db(ctx) {
-                                        Ok(db) => Some(db.conn()),
-                                        Err(e) => {
-                                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: checking whether the superseded path is catalogued failed; not removing it");
-                                            None
-                                        }
-                                    };
-                                    match conn {
-                                        Some(conn) => {
-                                            crate::db::file_exists(&conn, old)
-                                                .unwrap_or_else(|e| {
-                                                    tracing::error!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %format!("{e:#}"), "publish: checking whether the superseded path is catalogued failed; not removing it");
-                                                    true
-                                                })
-                                        }
-                                        None => true,
-                                    }
-                                };
-                                if catalogued {
-                                    tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: skipped removing the superseded path — a files row still references it");
-                                } else if was_external_recipe(&current) {
-                                    tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: skipped removing the superseded path — its recipe was external");
-                                } else {
-                                    match std::fs::remove_file(old_path) {
-                                        Ok(()) => {
-                                            tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file")
-                                        }
-                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                        Err(e) => {
-                                            tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                publish_move_landed_path(ctx, project_id, &own_dir, &w, &current);
                 let mut f = SeededFrame {
                     blake3: hash.to_hex().to_string(),
                     content_version: version,
@@ -7389,6 +7296,113 @@ async fn publish_after_conflicts(
         }
     }
     Ok(())
+}
+
+/// A seeded Update or Adopt frame whose file now sits elsewhere: move the
+/// row's `landed_path` to it, and remove the superseded generated file when
+/// that is safe.
+fn publish_move_landed_path(
+    ctx: &ServiceContext,
+    project_id: &str,
+    own_dir: &Path,
+    w: &WrittenFrame,
+    current: &crate::db::collab_frames::LocalFrameRow,
+) {
+    use crate::db::collab_frames as frames_db;
+    // C1/I1: the landing crossed between generated and attested
+    // (or its folder otherwise changed) — move `landed_path` to
+    // where this run actually put the frame's CURRENT bytes,
+    // before any downstream write depends on it agreeing
+    // (`stage_own_file`'s `WHERE landed_path = ?` needs the row
+    // to already match). The stale file is removed ONLY when
+    // the move itself actually succeeded AND it was this
+    // publisher's own-dir landing — an app-generated artifact,
+    // never an attested original (F5/A1: that file is never
+    // removed, whatever the set's attestation is now).
+    //
+    // Fix round 2 (finding 2): `landed_path` is `TEXT UNIQUE`
+    // table-wide, and a frame set can be linked to more than one
+    // project — a move CAN fail with a real collision (another
+    // project's own row already holds this exact path). A
+    // failed move must never delete the row's OWN still-current
+    // file: that would leave the row pointing at nothing.
+    let new_landed = w.target.to_string_lossy().to_string();
+    if current.landed_path.as_deref() != Some(new_landed.as_str()) {
+        let moved = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
+            frames_db::update_landed_path(&db.conn(), project_id, &w.uuid, &new_landed)
+        });
+        let moved_ok = match moved {
+            Ok(n) if n > 0 => {
+                tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved");
+                true
+            }
+            Ok(_) => {
+                tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, "publish: moving the own frame's landed path matched no row");
+                false
+            }
+            Err(e) => {
+                tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed");
+                false
+            }
+        };
+        if moved_ok {
+            if let Some(old) = current.landed_path.as_deref() {
+                let old_path = Path::new(old);
+                if is_own_dir_landing(old_path, &own_dir) {
+                    // C1 fix round 3, part 1: `is_own_dir_landing`
+                    // only tells us the path SITS in our own
+                    // folder shape — not that WE put it there. A
+                    // user can move (or attest) their own light
+                    // straight into that folder; deleting it
+                    // would be real data loss. Two independent
+                    // guards, belt-and-braces with the
+                    // `publisher_dir` fix above:
+                    //   - a `files` row still referencing this
+                    //     exact path means it is catalogued —
+                    //     generated files are never catalogued,
+                    //     so this check is exact, no false
+                    //     positive possible.
+                    //   - `was_external_recipe(&current)`: the
+                    //     row we are moving OFF of was itself an
+                    //     attested (external) landing.
+                    let catalogued = {
+                        let conn = match db(ctx) {
+                            Ok(db) => Some(db.conn()),
+                            Err(e) => {
+                                tracing::error!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: checking whether the superseded path is catalogued failed; not removing it");
+                                None
+                            }
+                        };
+                        match conn {
+                            Some(conn) => {
+                                crate::db::file_exists(&conn, old)
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %format!("{e:#}"), "publish: checking whether the superseded path is catalogued failed; not removing it");
+                                        true
+                                    })
+                            }
+                            None => true,
+                        }
+                    };
+                    if catalogued {
+                        tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: skipped removing the superseded path — a files row still references it");
+                    } else if was_external_recipe(&current) {
+                        tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: skipped removing the superseded path — its recipe was external");
+                    } else {
+                        match std::fs::remove_file(old_path) {
+                            Ok(()) => {
+                                tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file")
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
