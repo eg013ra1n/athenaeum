@@ -10,9 +10,10 @@ import { StackingProvider } from '../../contexts/StackingContext';
 import { StackingTab } from './StackingTab';
 import { STACKING_SELECTED_STAGE_KEY } from './stackingPrefs';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { PlanPrepare, StackingConfig, StackingPlan } from '../../types/stacking';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 vi.mock('../../contexts/NotificationContext', () => ({
   useNotifications: () => ({ notify: vi.fn() }),
@@ -63,39 +64,25 @@ const PLANS = {
   project: plan({ projectId: 'p1', prepare: PREPARE }),
 };
 
-function answer(command: string, plans: typeof PLANS): Promise<unknown> {
-  switch (command) {
-    case 'get_stacking_config':
-      return Promise.resolve({ config: CONFIG, excludedFrameIds: [], isDefault: false, updatedAt: null });
-    case 'get_project_stacking_config':
-      return Promise.resolve({ config: CONFIG, excludedFrameUuids: [], referenceFrameUuid: null, isDefault: false, updatedAt: null });
-    case 'get_stacking_presets':
-      return Promise.resolve({ default: CONFIG, fastPreview: CONFIG, maximumQuality: CONFIG });
-    case 'list_stacking_presets':
-      return Promise.resolve([]);
-    case 'get_stacking_plan':
-      return Promise.resolve(plans.frameSet);
-    case 'get_project_stacking_plan':
-      return Promise.resolve(plans.project);
-    case 'get_stacking_runs':
-    case 'get_project_stacking_runs':
-      return Promise.resolve([]);
-    case 'get_stacking_work_usage':
-    case 'get_project_stacking_work_usage':
-      return Promise.resolve(USAGE);
-    case 'set_project_stacking_config':
-      return Promise.resolve({ config: CONFIG, excludedFrameUuids: [], referenceFrameUuid: null, isDefault: false, updatedAt: null });
-    default:
-      return Promise.resolve(undefined);
-  }
-}
-
 let plans: typeof PLANS;
 
 beforeEach(() => {
   plans = { ...PLANS };
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => answer(command, plans)) as never);
+  const projectConfig = { config: CONFIG, excludedFrameUuids: [], referenceFrameUuid: null, isDefault: false, updatedAt: null };
+  routeInvoke({
+    get_stacking_config: { config: CONFIG, excludedFrameIds: [], isDefault: false, updatedAt: null },
+    get_project_stacking_config: projectConfig,
+    get_stacking_presets: { default: CONFIG, fastPreview: CONFIG, maximumQuality: CONFIG },
+    list_stacking_presets: [],
+    get_stacking_plan: () => plans.frameSet,
+    get_project_stacking_plan: () => plans.project,
+    get_stacking_runs: [],
+    get_project_stacking_runs: [],
+    get_stacking_work_usage: USAGE,
+    get_project_stacking_work_usage: USAGE,
+    set_project_stacking_config: projectConfig,
+  }, () => undefined);
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
   try { localStorage.clear(); } catch { /* the tab reads its prefs defensively too */ }

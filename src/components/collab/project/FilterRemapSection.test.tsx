@@ -1,12 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import FilterRemapSection from './FilterRemapSection';
 import type { CollabRemapFinished, CollabRemapProgress, FilterBucket, FilterBucketSheet } from '../../../types/models';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 afterEach(cleanup);
 
@@ -51,10 +50,7 @@ beforeEach(() => {
   listeners = {};
   current = sheet([bucket()]);
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'get_collab_filter_buckets') return Promise.resolve(current);
-    return Promise.resolve(null);
-  }) as never);
+  routeInvoke({ get_collab_filter_buckets: () => current });
   vi.mocked(api.listen).mockImplementation(((event: string, cb: (p: unknown) => void) => {
     listeners[event] = cb;
     return Promise.resolve(() => {});
@@ -137,10 +133,7 @@ describe('FilterRemapSection', () => {
     const running: CollabRemapProgress = { projectId: 'proj-1', canonical: 'R', done: 1, failed: 0, total: 5 };
     const pending: Array<(s: FilterBucketSheet) => void> = [];
     const { rerender } = await renderSection();
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_filter_buckets') return new Promise<FilterBucketSheet>((res) => pending.push(res));
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({ get_collab_filter_buckets: () => new Promise<FilterBucketSheet>((res) => pending.push(res)) });
     rerender(<FilterRemapSection projectId="proj-1" syncToken={1} />);
     rerender(<FilterRemapSection projectId="proj-1" syncToken={2} />);
     await waitFor(() => expect(pending).toHaveLength(2));

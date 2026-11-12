@@ -5,6 +5,7 @@ import { useSettingField } from './useSettingField';
 import { boolCodec, intCodec } from '../settings/codecs';
 import { SettingsDefaultsProvider, type SettingsDefaults } from '../settings/SettingsDefaultsContext';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 
@@ -45,23 +46,18 @@ async function flush() {
 type SetSettingHandler = (args: { key: string; value: string }) => void | Promise<void>;
 
 function mockInvoke(settingValues: Record<string, string>, setSetting?: SetSettingHandler) {
-  vi.mocked(api.invoke).mockImplementation(((command: string, args?: Record<string, unknown>) => {
-    switch (command) {
-      case 'get_settings_defaults':
-        return Promise.resolve(DEFAULTS_FIXTURE);
-      case 'get_setting': {
-        const key = args?.key as string;
-        const defaultValue = args?.defaultValue as string;
-        return Promise.resolve(Object.prototype.hasOwnProperty.call(settingValues, key) ? settingValues[key] : defaultValue);
-      }
-      case 'set_setting':
-        // Deferred so a handler that throws synchronously (a failure test)
-        // becomes a rejected promise rather than a synchronous throw.
-        return Promise.resolve().then(() => setSetting?.(args as { key: string; value: string }));
-      default:
-        return Promise.reject(new Error(`unexpected api.invoke("${command}")`));
-    }
-  }) as typeof api.invoke);
+  routeInvoke({
+    get_settings_defaults: DEFAULTS_FIXTURE,
+    get_setting: (args?: Record<string, unknown>) => {
+      const key = args?.key as string;
+      const defaultValue = args?.defaultValue as string;
+      return Object.prototype.hasOwnProperty.call(settingValues, key) ? settingValues[key] : defaultValue;
+    },
+    // Deferred so a handler that throws synchronously (a failure test)
+    // becomes a rejected promise rather than a synchronous throw.
+    set_setting: (args?: Record<string, unknown>) =>
+      Promise.resolve().then(() => setSetting?.(args as { key: string; value: string })),
+  }, (command) => Promise.reject(new Error(`unexpected api.invoke("${command}")`)));
 }
 
 function setSettingCalls() {

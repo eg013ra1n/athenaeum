@@ -4,9 +4,7 @@ import { CollabExchangeProvider, useCollabExchange } from './CollabExchangeConte
 import { api } from '../api';
 import type { CollabLiveStatus, ExchangeSnapshot, FlowView, ProjectFlows } from '../types/models';
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 const flow = (o: Partial<FlowView>): FlowView => ({
   projectId: 'p1',

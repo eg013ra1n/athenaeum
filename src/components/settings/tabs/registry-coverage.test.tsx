@@ -21,6 +21,7 @@ import { SettingsDefaultsProvider } from '../../../settings/SettingsDefaultsCont
 import { SETTINGS_SECTIONS } from '../../../settings/registry';
 import { renderedSectionIds } from '../renderedSections';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import type { PlateSolveConfig } from '../../../types/plate-solve';
 import type { AnalysisConfig } from '../../../types/analysis-config';
 import type { CalibrationMatchingConfig as CalibrationMatchingConfigType } from '../../../types/calibration-config';
@@ -34,9 +35,7 @@ import { StackingTab } from './StackingTab';
 import { SkyChartTab } from './SkyChartTab';
 import { TransfersTab } from './TransfersTab';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../../contexts/NotificationContext', () => ({
@@ -107,42 +106,28 @@ const CALIBRATION_MATCHING_CONFIG_FIXTURE: CalibrationMatchingConfigType = {
   },
 };
 
-function mockInvoke(command: string, _args?: Record<string, unknown>): Promise<unknown> {
-  switch (command) {
-    case 'get_settings_defaults':
-      // `AnalysisSettingsPanel`/`PlateSolveSettingsPanel` (Task D1) read
-      // `defaults.analysis`/`defaults.plateSolve` directly (for the
-      // per-field reset affordance's default label) — a `kv`-only response
-      // leaves those `undefined` and crashes the panel's render the moment
-      // it dereferences `defaults?.analysis`. Real fixtures for
-      // every typed field the response carries, mirroring `SettingsDefaults`.
-      return Promise.resolve({
-        kv: {},
-        analysis: ANALYSIS_CONFIG_FIXTURE,
-        plateSolve: PLATE_SOLVE_CONFIG_FIXTURE,
-        calibrationMatching: CALIBRATION_MATCHING_CONFIG_FIXTURE,
-      });
-    case 'get_setting':
-      return Promise.resolve('');
-    case 'get_analysis_config':
-      return Promise.resolve(ANALYSIS_CONFIG_FIXTURE);
-    case 'get_plate_solve_config':
-      return Promise.resolve(PLATE_SOLVE_CONFIG_FIXTURE);
-    case 'get_logging_config':
-      return Promise.resolve(LOGGING_CONFIG_RESPONSE_FIXTURE);
-    case 'get_calibration_matching_config':
-      return Promise.resolve(CALIBRATION_MATCHING_CONFIG_FIXTURE);
-    case 'get_catalog_status':
-    case 'list_account_devices':
-      return Promise.resolve([]);
-    case 'get_blink_threads_max':
-      return Promise.resolve(8);
-    default:
-      return Promise.resolve(null);
-  }
-}
-
-vi.mocked(api.invoke).mockImplementation(mockInvoke as never);
+routeInvoke({
+  // `AnalysisSettingsPanel`/`PlateSolveSettingsPanel` (Task D1) read
+  // `defaults.analysis`/`defaults.plateSolve` directly (for the
+  // per-field reset affordance's default label) — a `kv`-only response
+  // leaves those `undefined` and crashes the panel's render the moment
+  // it dereferences `defaults?.analysis`. Real fixtures for
+  // every typed field the response carries, mirroring `SettingsDefaults`.
+  get_settings_defaults: {
+    kv: {},
+    analysis: ANALYSIS_CONFIG_FIXTURE,
+    plateSolve: PLATE_SOLVE_CONFIG_FIXTURE,
+    calibrationMatching: CALIBRATION_MATCHING_CONFIG_FIXTURE,
+  },
+  get_setting: '',
+  get_analysis_config: ANALYSIS_CONFIG_FIXTURE,
+  get_plate_solve_config: PLATE_SOLVE_CONFIG_FIXTURE,
+  get_logging_config: LOGGING_CONFIG_RESPONSE_FIXTURE,
+  get_calibration_matching_config: CALIBRATION_MATCHING_CONFIG_FIXTURE,
+  get_catalog_status: [],
+  list_account_devices: [],
+  get_blink_threads_max: 8,
+});
 vi.mocked(api.listen).mockResolvedValue(() => {});
 
 function renderAllTabs() {

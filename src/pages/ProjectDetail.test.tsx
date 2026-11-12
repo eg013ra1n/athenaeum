@@ -11,6 +11,7 @@ import { ToastStack } from '../components/Toast';
 import ProjectDetail, { resolveSelfAccount } from './ProjectDetail';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import { usePublishing } from '../components/collab/project/usePublishing';
 import { projectCard } from '../components/collab/project/testFixtures';
 import { memberColor } from '../components/collab/project/memberColors';
@@ -27,9 +28,7 @@ import type {
 } from '../types/models';
 import type { PlanGrid, StackingConfig } from '../types/stacking';
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 // The Stacking tab's own children are pinned in `components/stacking/*.test.tsx`; here the tab's place on the page,
 // its deep link and the member colours of the grid card's schematic are. The grid card and the toolbar stay real.
@@ -204,39 +203,22 @@ function mockCommands(
   card: ProjectCard = projectCard(),
   extra: Record<string, (args?: unknown) => Promise<unknown>> = {},
 ) {
-  vi.mocked(api.invoke).mockImplementation(((command: string, args?: unknown) => {
-    if (extra[command]) return extra[command](args);
-    switch (command) {
-      case 'get_collab_project_detail':
-        return Promise.resolve(detailFixture(card));
-      case 'list_project_own_frames':
-        return Promise.resolve([...twoReady, ...twoReview]);
-      case 'list_collab_frames':
-        return Promise.resolve([] as ProjectFrameView[]);
-      case 'get_collab_member_summary':
-        return Promise.resolve([]);
-      case 'get_collab_exchange':
-        return Promise.resolve({ projects: [], names: [] });
-      case 'list_collab_receive_sessions':
-        return Promise.resolve([]);
-      case 'list_collab_moderation':
-        return Promise.resolve([]);
-      case 'list_collab_attention':
-        return Promise.resolve({ changed: [], awaitingChoice: [], notKept: [], otherFiles: [] });
-      case 'get_collaboration_dir':
-        return Promise.resolve('/collab');
-      case 'list_collab_projects':
-        return Promise.resolve([card]);
-      case 'publish_collab_frames':
-        return Promise.resolve(okPublish);
-      case 'republish_collab_frames':
-        return Promise.resolve({ ...okPublish, announced: 0, updated: 2 });
-      case 'account_status':
-        return Promise.resolve(accountStatus);
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    get_collab_project_detail: () => detailFixture(card),
+    list_project_own_frames: () => [...twoReady, ...twoReview],
+    list_collab_frames: [] as ProjectFrameView[],
+    get_collab_member_summary: [],
+    get_collab_exchange: () => ({ projects: [], names: [] }),
+    list_collab_receive_sessions: [],
+    list_collab_moderation: [],
+    list_collab_attention: { changed: [], awaitingChoice: [], notKept: [], otherFiles: [] },
+    get_collaboration_dir: '/collab',
+    list_collab_projects: [card],
+    publish_collab_frames: okPublish,
+    republish_collab_frames: () => ({ ...okPublish, announced: 0, updated: 2 }),
+    account_status: accountStatus,
+    ...extra,
+  });
 }
 
 /** What the Stacking tab asks the backend for, answered: a project plan with nothing blocked and the given grid. */

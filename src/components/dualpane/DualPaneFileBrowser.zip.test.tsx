@@ -3,10 +3,11 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { ScanRootWithAvailability } from '../../types/helpers';
 import DualPaneFileBrowser from './DualPaneFileBrowser';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 vi.mock('../../api/desktop', () => ({ revealItemInDir: vi.fn() }));
 vi.mock('../../utils/platform', () => ({ isTauri: true, isMac: false }));
 vi.mock('../BlinkViewer', () => ({ default: () => null }));
@@ -41,40 +42,31 @@ beforeEach(() => {
   URL.createObjectURL = vi.fn(() => 'blob:preview');
   URL.revokeObjectURL = vi.fn();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { innerDir?: string }) => {
-    switch (cmd) {
-      case 'get_directory_contents':
-        return Promise.resolve({
-          subdirectories: [],
-          files: [],
-          zips: [{ path: ZIP, size: 1_000_000, frameEntries: 3, createdByOperation, inBlackHole }],
-        });
-      case 'get_zip_entry_header':
-        return Promise.resolve({
-          entry: (args as { entry?: string } | undefined)?.entry,
-          frame: { object: 'M31', filter: 'Ha', imagetyp: 'Light', exptime: 300, date_obs: '2025-10-12T20:00:00' },
-          header: 'SIMPLE  = T\nOBJECT  = M31',
-        });
-      case 'preview_zip_entry':
-        return Promise.resolve(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
-      case 'list_zip_entries':
-        return Promise.resolve(
-          args?.innerDir === 'Lights'
-            ? { subdirectories: [], files: [frameFile(`${ZIP}/Lights/L_001.fits`, 'L_001.fits')], otherEntries: [] }
-            : {
-                subdirectories: ['Lights'],
-                files: [frameFile(`${ZIP}/top.fits`, 'top.fits')],
-                otherEntries: [
-                  { name: 'notes.txt', size: 5, released: false, copyPath: null, readable: false },
-                  { name: 'L_007.fits', size: 9, released: true, copyPath: '/astro/out/L_007.fits', readable: false },
-                  { name: 'L_008.fits', size: 9, released: false, copyPath: null, readable: true },
-                ],
-              },
-        );
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    get_directory_contents: () => ({
+      subdirectories: [],
+      files: [],
+      zips: [{ path: ZIP, size: 1_000_000, frameEntries: 3, createdByOperation, inBlackHole }],
+    }),
+    get_zip_entry_header: (args?: { entry?: string }) => ({
+      entry: args?.entry,
+      frame: { object: 'M31', filter: 'Ha', imagetyp: 'Light', exptime: 300, date_obs: '2025-10-12T20:00:00' },
+      header: 'SIMPLE  = T\nOBJECT  = M31',
+    }),
+    preview_zip_entry: () => new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+    list_zip_entries: (args?: { innerDir?: string }) =>
+      args?.innerDir === 'Lights'
+        ? { subdirectories: [], files: [frameFile(`${ZIP}/Lights/L_001.fits`, 'L_001.fits')], otherEntries: [] }
+        : {
+            subdirectories: ['Lights'],
+            files: [frameFile(`${ZIP}/top.fits`, 'top.fits')],
+            otherEntries: [
+              { name: 'notes.txt', size: 5, released: false, copyPath: null, readable: false },
+              { name: 'L_007.fits', size: 9, released: true, copyPath: '/astro/out/L_007.fits', readable: false },
+              { name: 'L_008.fits', size: 9, released: false, copyPath: null, readable: true },
+            ],
+          },
+  });
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
 });
 

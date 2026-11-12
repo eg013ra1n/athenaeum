@@ -2,14 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { CollabExchangeProvider } from '../../../contexts/CollabExchangeContext';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import OverviewTab, { type OverviewTabProps } from './OverviewTab';
 import { formatSize } from '../format';
 import type { ExchangeSnapshot, FlowView, MemberSummary, OwnFrameRow, ProjectFlows, ThresholdRuleView } from '../../../types/models';
 
 vi.mock('../../../contexts/NotificationContext', () => ({ useNotifications: () => ({ notify: vi.fn() }) }));
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 afterEach(cleanup);
 
@@ -97,10 +96,7 @@ let exchangeSnapshot: ExchangeSnapshot = EMPTY_SNAPSHOT;
 beforeEach(() => {
   exchangeSnapshot = EMPTY_SNAPSHOT;
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'get_collab_exchange') return Promise.resolve(exchangeSnapshot);
-    return Promise.resolve(null);
-  }) as never);
+  routeInvoke({ get_collab_exchange: () => exchangeSnapshot });
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
 });

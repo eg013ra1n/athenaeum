@@ -6,6 +6,7 @@ import { NotificationProvider } from '../contexts/NotificationContext';
 import { TransfersProvider } from '../contexts/TransfersContext';
 import { CollabExchangeProvider } from '../contexts/CollabExchangeContext';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import Transfers from './Transfers';
 import type {
   ExchangeSnapshot,
@@ -14,9 +15,7 @@ import type {
   TerminalTransfers,
 } from '../types/models';
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 function emptyStatus(): SyncStatus {
   return {
@@ -64,31 +63,18 @@ let receiveSessions: ReceiveSessionView[] = [];
 beforeEach(() => {
   receiveSessions = [];
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    switch (command) {
-      case 'list_terminal_transfers':
-        return Promise.resolve(emptyTerminalTransfers);
-      case 'get_scan_roots':
-        return Promise.resolve([]);
-      case 'get_sync_status':
-        return Promise.resolve(emptyStatus());
-      case 'list_sync_history':
-        return Promise.resolve([]);
-      case 'get_sync_device_names':
-      case 'get_sync_device_capabilities':
-        return Promise.resolve({});
-      case 'list_collab_projects':
-        return Promise.resolve([]);
-      case 'get_sync_incoming_dir':
-        return Promise.resolve(null);
-      case 'get_collab_exchange':
-        return Promise.resolve(emptyExchangeSnapshot);
-      case 'list_collab_receive_sessions':
-        return Promise.resolve(receiveSessions);
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    list_terminal_transfers: emptyTerminalTransfers,
+    get_scan_roots: [],
+    get_sync_status: () => emptyStatus(),
+    list_sync_history: [],
+    get_sync_device_names: {},
+    get_sync_device_capabilities: {},
+    list_collab_projects: [],
+    get_sync_incoming_dir: null,
+    get_collab_exchange: emptyExchangeSnapshot,
+    list_collab_receive_sessions: () => receiveSessions,
+  });
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
 });

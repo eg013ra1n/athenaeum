@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import { api } from '../../api';
+import { routeInvoke, unexpectedCommand } from '../../test/apiMock';
 import type { BlinkViewerProps } from '../blink/types';
 import type { CollabBlinkEntry, FileWithFrame } from '../../types/models';
 import type { AlignedFrameStatus, PlanGroup, StackingRunDetail } from '../../types/stacking';
@@ -12,7 +13,7 @@ import type { FrameRow } from './frameRows';
 import { StackingBlink } from './StackingBlink';
 import type { StackSubject } from './subject';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../contexts/NotificationContext', () => ({
@@ -89,11 +90,12 @@ const PLAN_GROUPS = [
 
 /** The backend a frame set's Blink reads: the frames asked for, in date order (here: the order the test gives). */
 function setBackend(order: number[]) {
-  vi.mocked(api.invoke).mockImplementation((async (cmd: string, args?: { frameIds?: number[] }) => {
-    if (cmd !== 'get_files_with_frames_by_ids') throw new Error(`unexpected ${cmd}`);
-    const asked = new Set(args?.frameIds ?? []);
-    return order.filter((id) => asked.has(id)).map(fileFrame);
-  }) as never);
+  routeInvoke({
+    get_files_with_frames_by_ids: (args?: { frameIds?: number[] }) => {
+      const asked = new Set(args?.frameIds ?? []);
+      return order.filter((id) => asked.has(id)).map(fileFrame);
+    },
+  }, unexpectedCommand);
 }
 
 function props(over: Partial<React.ComponentProps<typeof StackingBlink>> = {}): React.ComponentProps<typeof StackingBlink> {
@@ -330,15 +332,16 @@ describe('StackingBlink', () => {
 
     /** The frame set's frames and the run's verdict on them (or a failure of that one call). */
     function setRunBackend(order: number[], aligned: AlignedFrameStatus[] | Error) {
-      vi.mocked(api.invoke).mockImplementation((async (cmd: string, args?: { frameIds?: number[] }) => {
-        if (cmd === 'get_stacking_aligned_frames') {
+      routeInvoke({
+        get_stacking_aligned_frames: () => {
           if (aligned instanceof Error) throw aligned;
           return aligned;
-        }
-        if (cmd !== 'get_files_with_frames_by_ids') throw new Error(`unexpected ${cmd}`);
-        const asked = new Set(args?.frameIds ?? []);
-        return order.filter((id) => asked.has(id)).map(fileFrame);
-      }) as never);
+        },
+        get_files_with_frames_by_ids: (args?: { frameIds?: number[] }) => {
+          const asked = new Set(args?.frameIds ?? []);
+          return order.filter((id) => asked.has(id)).map(fileFrame);
+        },
+      }, unexpectedCommand);
     }
     const alignedCalls = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_stacking_aligned_frames');
 
@@ -366,11 +369,10 @@ describe('StackingBlink', () => {
     });
 
     it('a project row is asked for by its run frame id, not its uuid', async () => {
-      vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
-        if (cmd === 'get_stacking_aligned_frames') return [{ frameId: 31, state: 'available' }];
-        if (cmd === 'get_collab_blink_frames') return [collabEntry('u1', 'raw')];
-        throw new Error(`unexpected ${cmd}`);
-      }) as never);
+      routeInvoke({
+        get_stacking_aligned_frames: () => [{ frameId: 31, state: 'available' }],
+        get_collab_blink_frames: () => [collabEntry('u1', 'raw')],
+      }, unexpectedCommand);
       render(<StackingBlink {...props({ subject: PROJECT, runDetail: RUN, rows: [row('u1', { frameId: 31 })] })} />);
       await opened();
 

@@ -5,6 +5,7 @@ import { NotificationProvider } from '../../contexts/NotificationContext';
 import { ToastStack } from '../Toast';
 import DeviceReplaceDialog, { DeviceReplaceProvider, useDeviceReplace } from './DeviceReplaceDialog';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   CollabLiveStatus,
@@ -13,7 +14,7 @@ import type {
   UnknownDeviceView,
 } from '../../types/models';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 const offer: DeviceReplaceOfferView = {
   deviceId: 'old-id',
@@ -60,11 +61,7 @@ let emitLive: ((p: CollabLiveStatus) => void) | undefined;
 
 /** `get_collab_storage_status` answers `status`; the rest per `extra`. */
 function mockCommands(status: CollabStorageStatus, extra: Record<string, () => Promise<unknown>> = {}) {
-  vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-    if (cmd === 'get_collab_storage_status') return Promise.resolve(status);
-    if (extra[cmd]) return extra[cmd]();
-    return Promise.resolve(null);
-  }) as never);
+  routeInvoke({ ...extra, get_collab_storage_status: status });
 }
 
 beforeEach(() => {

@@ -4,8 +4,9 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { ArchiveSection } from './ArchiveSection';
 import { SettingsDefaultsProvider, type SettingsDefaults } from '../../../settings/SettingsDefaultsContext';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../../contexts/NotificationContext', () => ({
@@ -22,22 +23,14 @@ beforeEach(() => {
   notifyMock.mockReset();
   clearFails = false;
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { key?: string }) => {
-    switch (cmd) {
-      case 'get_settings_defaults':
-        return Promise.resolve(DEFAULTS);
-      case 'get_setting':
-        return Promise.resolve(args?.key === 'archive.zip_cache_limit_gb' ? '32' : 'store');
-      case 'get_zip_cache_status':
-        return Promise.resolve({ bytes: 3 * 1024 * 1024 * 1024, entries: 120, limitBytes: 32 * 1024 ** 3 });
-      case 'clear_zip_cache':
-        return clearFails
-          ? Promise.reject('disk busy')
-          : Promise.resolve({ bytes: 0, entries: 0, limitBytes: 32 * 1024 ** 3 });
-      default:
-        return Promise.resolve(undefined);
-    }
-  }) as never);
+  routeInvoke({
+    get_settings_defaults: DEFAULTS,
+    get_setting: (args?: { key?: string }) => (args?.key === 'archive.zip_cache_limit_gb' ? '32' : 'store'),
+    get_zip_cache_status: { bytes: 3 * 1024 * 1024 * 1024, entries: 120, limitBytes: 32 * 1024 ** 3 },
+    clear_zip_cache: () => (clearFails
+      ? Promise.reject('disk busy')
+      : { bytes: 0, entries: 0, limitBytes: 32 * 1024 ** 3 }),
+  }, () => undefined);
   vi.mocked(api.listen).mockResolvedValue(() => {});
 });
 

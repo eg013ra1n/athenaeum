@@ -5,15 +5,14 @@ import { CollabExchangeProvider } from '../../../contexts/CollabExchangeContext'
 import { NotificationProvider } from '../../../contexts/NotificationContext';
 import { SessionStateProvider } from '../../../contexts/SessionStateContext';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import LibraryTab, { libraryToCome } from './LibraryTab';
 import type { ExchangeSnapshot, FlowView, ProjectFlows, ProjectFrameView } from '../../../types/models';
 import type { FrameVM } from './frames';
 import type { BlinkViewerProps } from '../../blink/types';
 import type { CollabBlinkEntry, FileWithFrame } from '../../../types/models';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 let blink: BlinkViewerProps | null = null;
 vi.mock('../../BlinkViewer', () => ({
@@ -102,18 +101,11 @@ beforeEach(() => {
   exchangeSnapshot = EMPTY_SNAPSHOT;
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    switch (command) {
-      case 'get_collaboration_dir':
-        return Promise.resolve('/collab');
-      case 'list_collab_attention':
-        return Promise.resolve({ changed: [], awaitingChoice: [], notKept: [], otherFiles: [] });
-      case 'get_collab_exchange':
-        return Promise.resolve(exchangeSnapshot);
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    get_collaboration_dir: '/collab',
+    list_collab_attention: { changed: [], awaitingChoice: [], notKept: [], otherFiles: [] },
+    get_collab_exchange: () => exchangeSnapshot,
+  });
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
     (listeners[event] ??= []).push(cb as unknown as (p: unknown) => void);
     return Promise.resolve(() => {});
@@ -162,14 +154,11 @@ function rowOf(fileName: string): HTMLElement {
 
 describe('LibraryTab — ported from the retired receive tab', () => {
   it('shows the Collaboration-folder banner when unset, and hides it once set', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collaboration_dir') return Promise.resolve(null);
-      if (command === 'list_collab_attention') {
-        return Promise.resolve({ changed: [], awaitingChoice: [], notKept: [], otherFiles: [] });
-      }
-      if (command === 'get_collab_exchange') return Promise.resolve(exchangeSnapshot);
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collaboration_dir: null,
+      list_collab_attention: { changed: [], awaitingChoice: [], notKept: [], otherFiles: [] },
+      get_collab_exchange: () => exchangeSnapshot,
+    });
 
     renderTab([frame({})]);
 

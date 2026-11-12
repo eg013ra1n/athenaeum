@@ -4,10 +4,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import { ResultsPanel } from './ResultsPanel';
 import type { StackSubject } from './subject';
 
-vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../api');
 
 // The web build prints a path and a copy button; the desktop build has a Reveal button instead.
 const { platform, revealMock } = vi.hoisted(() => ({
@@ -70,26 +71,20 @@ const requested = () => previews.map((p) => p.kind);
 
 function install(files: GroupFiles) {
   previews = [];
-  vi.mocked(api.invoke).mockImplementation(((command: string, args: Record<string, unknown> = {}) => {
-    switch (command) {
-      case 'get_stacking_runs':
-      case 'get_project_stacking_runs':
-        return Promise.resolve([{ run: RUN, groupCount: 1, masterPaths: [] }]);
-      case 'get_stacking_run':
-        return Promise.resolve(detail(files));
-      case 'get_stacking_work_usage':
-      case 'get_project_stacking_work_usage':
-        return Promise.resolve(USAGE);
-      case 'get_master_light_preview':
-        return new Promise((resolve, reject) => {
-          previews.push({
-            kind: String(args.kind), args, resolve: () => resolve(new Uint8Array([1, 2, 3])), reject: (e) => reject(e),
-          });
+  const runs = () => [{ run: RUN, groupCount: 1, masterPaths: [] }];
+  routeInvoke({
+    get_stacking_runs: runs,
+    get_project_stacking_runs: runs,
+    get_stacking_run: () => detail(files),
+    get_stacking_work_usage: USAGE,
+    get_project_stacking_work_usage: USAGE,
+    get_master_light_preview: (args: Record<string, unknown> = {}) =>
+      new Promise((resolve, reject) => {
+        previews.push({
+          kind: String(args.kind), args, resolve: () => resolve(new Uint8Array([1, 2, 3])), reject: (e) => reject(e),
         });
-      default:
-        return Promise.resolve(undefined);
-    }
-  }) as never);
+      }),
+  }, () => undefined);
 }
 
 const PROJECT: StackSubject = { kind: 'project', projectId: 'p1', title: 'Project' };

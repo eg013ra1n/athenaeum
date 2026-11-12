@@ -7,7 +7,7 @@ const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../contexts/NotificationContext', () => ({
   useNotifications: () => ({ notify: notifyMock }),
 }));
-vi.mock('../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../api');
 
 describe('useExportProgress', () => {
   it('the project (-1) completion notification carries counts and the first 3 warnings', async () => {

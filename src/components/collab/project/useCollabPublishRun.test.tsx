@@ -1,11 +1,12 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import { NotificationProvider, useNotifications } from '../../../contexts/NotificationContext';
 import type { CollabPublishFinished, CollabPublishProgress, CollabPublishRunView } from '../../../types/models';
 import { useCollabPublishRun } from './useCollabPublishRun';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 const listeners: Record<string, (p: unknown) => void> = {};
 const progress = (o: Partial<CollabPublishProgress> = {}): CollabPublishProgress => ({
@@ -136,12 +137,12 @@ describe('useCollabPublishRun', () => {
 
   it('a projectId change resets running, last and the reached step before the new snapshot', async () => {
     const p2 = deferred<CollabPublishRunView>();
-    vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { projectId: string }) => {
-      if (cmd !== 'get_collab_publish_run') return Promise.resolve(undefined);
-      return args?.projectId === 'p1'
-        ? Promise.resolve({ running: progress({ stage: 'seeding' }), last: finished({ publishRunId: 'r0' }) })
-        : p2.promise;
-    }) as never);
+    routeInvoke({
+      get_collab_publish_run: (args?: { projectId: string }) =>
+        args?.projectId === 'p1'
+          ? { running: progress({ stage: 'seeding' }), last: finished({ publishRunId: 'r0' }) }
+          : p2.promise,
+    }, () => undefined);
     const { result, rerender } = renderHook(({ id }) => useCollabPublishRun(id), { wrapper, initialProps: { id: 'p1' } });
     await waitFor(() => expect(result.current.running).not.toBeNull());
     expect(result.current.last?.publishRunId).toBe('r0');

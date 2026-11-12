@@ -7,10 +7,9 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { AutoMergeSection } from './AutoMergeSection';
 import { SettingsDefaultsProvider, type SettingsDefaults } from '../../../settings/SettingsDefaultsContext';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../../../api');
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../../contexts/NotificationContext', () => ({
@@ -24,23 +23,14 @@ const DEFAULTS_FIXTURE = {
   },
 } as unknown as SettingsDefaults;
 
-function mockInvoke(command: string, _args?: Record<string, unknown>): Promise<unknown> {
-  switch (command) {
-    case 'get_settings_defaults':
-      return Promise.resolve(DEFAULTS_FIXTURE);
-    case 'get_setting':
-      // Both fields start non-default so there is something to reset.
-      return Promise.resolve('true');
-    case 'set_setting':
-      return Promise.resolve(undefined);
-    default:
-      return Promise.resolve(null);
-  }
-}
-
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(mockInvoke as never);
+  routeInvoke({
+    get_settings_defaults: DEFAULTS_FIXTURE,
+    // Both fields start non-default so there is something to reset.
+    get_setting: 'true',
+    set_setting: undefined,
+  });
   vi.mocked(api.listen).mockResolvedValue(() => {});
 });
 

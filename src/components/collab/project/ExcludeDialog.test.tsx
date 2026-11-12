@@ -4,9 +4,10 @@ import ExcludeDialog from './ExcludeDialog';
 import FramePanel from './FramePanel';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../../api';
+import { routeInvoke, unexpectedCommand } from '../../../test/apiMock';
 import type { FrameVM } from './frames';
 
-vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../../../api');
 
 afterEach(cleanup);
 
@@ -118,14 +119,11 @@ describe('ExcludeDialog', () => {
 
   it('fix round 1: Escape does not close the dialog while a request is in flight', async () => {
     let resolveInvoke: (() => void) | null = null;
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'exclude_collab_frame') {
-        return new Promise<void>((resolve) => {
-          resolveInvoke = () => resolve();
-        });
-      }
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({
+      exclude_collab_frame: () => new Promise<void>((resolve) => {
+        resolveInvoke = () => resolve();
+      }),
+    }, unexpectedCommand);
     const onClose = vi.fn();
 
     render(<ExcludeDialog projectId="p" frames={[frame()]} onClose={onClose} onDone={vi.fn()} />);
@@ -187,10 +185,7 @@ describe('ExcludeDialog', () => {
   });
 
   it('calls onDone(N) then onClose when every frame excludes successfully', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'exclude_collab_frame') return Promise.resolve(undefined);
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ exclude_collab_frame: undefined }, unexpectedCommand);
     const onDone = vi.fn();
     const onClose = vi.fn();
 
@@ -220,10 +215,7 @@ describe('ExcludeDialog', () => {
   });
 
   it('Escape over a FramePanel closes only the dialog, never the panel', () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return Promise.resolve([]);
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: [] }, unexpectedCommand);
     vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
     const onClose = vi.fn();
     render(

@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { useProjects } from './useProjects';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 
@@ -9,9 +10,7 @@ vi.mock('../contexts/NotificationContext', () => ({
   useNotifications: () => ({ notify: notifyMock }),
 }));
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 beforeEach(() => {
   notifyMock.mockReset();
@@ -22,20 +21,14 @@ beforeEach(() => {
 
 describe('useProjects', () => {
   it('sets updateRequired and does not notify when the hub refuses with collab_api_outdated', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      switch (command) {
-        case 'list_collab_projects':
-          return Promise.resolve([]);
-        case 'refresh_collab_projects':
-          return Promise.reject(
-            new Error(
-              'collab_api_outdated: this hub needs a newer Athenaeum — update to keep collaborating',
-            ),
-          );
-        default:
-          return Promise.resolve([]);
-      }
-    }) as never);
+    routeInvoke({
+      list_collab_projects: [],
+      refresh_collab_projects: () => Promise.reject(
+        new Error(
+          'collab_api_outdated: this hub needs a newer Athenaeum — update to keep collaborating',
+        ),
+      ),
+    }, () => []);
 
     const { result } = renderHook(() => useProjects());
 
@@ -51,15 +44,7 @@ describe('useProjects', () => {
   });
 
   it('does not flag updateRequired on a normal successful refresh, and never syncs by itself', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      switch (command) {
-        case 'list_collab_projects':
-        case 'refresh_collab_projects':
-          return Promise.resolve([]);
-        default:
-          return Promise.resolve(null);
-      }
-    }) as never);
+    routeInvoke({ list_collab_projects: [], refresh_collab_projects: [] });
 
     const { result } = renderHook(() => useProjects());
 
@@ -74,15 +59,7 @@ describe('useProjects', () => {
 
   it('never polls the hub: one refresh on mount, no periodic timer', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      switch (command) {
-        case 'list_collab_projects':
-        case 'refresh_collab_projects':
-          return Promise.resolve([]);
-        default:
-          return Promise.resolve(null);
-      }
-    }) as never);
+    routeInvoke({ list_collab_projects: [], refresh_collab_projects: [] });
 
     const { result, unmount } = renderHook(() => useProjects());
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -101,15 +78,7 @@ describe('useProjects', () => {
   });
 
   it('the manual refresh runs "Sync now" once the projects refreshed', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      switch (command) {
-        case 'list_collab_projects':
-        case 'refresh_collab_projects':
-          return Promise.resolve([]);
-        default:
-          return Promise.resolve(null);
-      }
-    }) as never);
+    routeInvoke({ list_collab_projects: [], refresh_collab_projects: [] });
 
     const { result } = renderHook(() => useProjects());
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -123,17 +92,11 @@ describe('useProjects', () => {
 
   it('a failed "Sync now" on the manual refresh is logged, not a sign-out', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      switch (command) {
-        case 'list_collab_projects':
-        case 'refresh_collab_projects':
-          return Promise.resolve([]);
-        case 'collab_sync_now':
-          return Promise.reject('The live exchange is not running (signed out, or no Collaboration folder yet).');
-        default:
-          return Promise.resolve(null);
-      }
-    }) as never);
+    routeInvoke({
+      list_collab_projects: [],
+      refresh_collab_projects: [],
+      collab_sync_now: () => Promise.reject('The live exchange is not running (signed out, or no Collaboration folder yet).'),
+    });
 
     const { result } = renderHook(() => useProjects());
     await waitFor(() => expect(result.current.loading).toBe(false));

@@ -4,9 +4,10 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import BlackHole from './BlackHole';
 
-vi.mock('../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
+vi.mock('../api');
 vi.mock('../components/HistoryNav', () => ({ HistoryNav: () => null }));
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../contexts/NotificationContext', () => ({
@@ -51,18 +52,11 @@ beforeEach(() => {
   listener = null;
   frames = [ZIP_FRAME];
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-    switch (cmd) {
-      case 'get_black_hole_files':
-        return Promise.resolve(frames);
-      case 'get_black_hole_zips':
-        return Promise.resolve([ZIP]);
-      case 'send_to_void':
-        return Promise.reject(VOID_REFUSAL);
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    get_black_hole_files: () => frames,
+    get_black_hole_zips: () => [ZIP],
+    send_to_void: () => Promise.reject(VOID_REFUSAL),
+  });
   vi.mocked(api.listen).mockImplementation(((_e: string, cb: (p: unknown) => void) => {
     listener = cb;
     return Promise.resolve(() => {});
@@ -169,13 +163,12 @@ describe('BlackHole — zip archives', () => {
 
     it('rescans once, with the distinct folders of the voided loose files', async () => {
       frames = [LOOSE(1, '/astro/out'), LOOSE(2, '/astro/out'), LOOSE(3, '/astro/other')];
-      vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-        if (cmd === 'get_black_hole_files') return Promise.resolve(frames);
-        if (cmd === 'get_black_hole_zips') return Promise.resolve([ZIP]);
-        if (cmd === 'send_to_void') return Promise.resolve(null);
-        if (cmd === 'rescan_after_void') return Promise.resolve({ directories: 2, zips: 1 });
-        return Promise.resolve(null);
-      }) as never);
+      routeInvoke({
+        get_black_hole_files: () => frames,
+        get_black_hole_zips: () => [ZIP],
+        send_to_void: null,
+        rescan_after_void: { directories: 2, zips: 1 },
+      });
       await voidAllFiles();
       await waitFor(() => expect(calls('rescan_after_void')).toHaveLength(1));
       const dirs = (calls('rescan_after_void')[0][1] as { dirs: string[] }).dirs;
@@ -193,13 +186,12 @@ describe('BlackHole — zip archives', () => {
     it('a failed rescan is logged and shows one warning, and the list still reloads', async () => {
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       frames = [LOOSE(1, '/astro/out')];
-      vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-        if (cmd === 'get_black_hole_files') return Promise.resolve(frames);
-        if (cmd === 'get_black_hole_zips') return Promise.resolve([ZIP]);
-        if (cmd === 'send_to_void') return Promise.resolve(null);
-        if (cmd === 'rescan_after_void') return Promise.reject('scan failed');
-        return Promise.resolve(null);
-      }) as never);
+      routeInvoke({
+        get_black_hole_files: () => frames,
+        get_black_hole_zips: () => [ZIP],
+        send_to_void: null,
+        rescan_after_void: () => Promise.reject('scan failed'),
+      });
       await voidAllFiles();
       await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(1));
       expect(notifyMock.mock.calls[0][0]).toMatchObject({ tone: 'warning' });

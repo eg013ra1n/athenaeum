@@ -6,6 +6,7 @@ import { NotificationProvider } from '../contexts/NotificationContext';
 import { ToastStack } from '../components/Toast';
 import { useCollabNotifications } from './useCollabNotifications';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import type {
   CollabDeletionChoice,
   CollabFrameChanged,
@@ -15,9 +16,7 @@ import type {
   ProjectCard,
 } from '../types/models';
 
-vi.mock('../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
+vi.mock('../api');
 
 /** Every registered listener, by event name (the last registration wins). */
 let listeners: Record<string, (p: unknown) => void> = {};
@@ -63,12 +62,7 @@ beforeEach(() => {
   listeners = {};
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'list_collab_projects') {
-      return Promise.resolve([projectCard({})]);
-    }
-    return Promise.resolve([]);
-  }) as never);
+  routeInvoke({ list_collab_projects: () => [projectCard({})] }, () => []);
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
     listeners[event] = cb as unknown as (p: unknown) => void;
     return Promise.resolve(() => {});
