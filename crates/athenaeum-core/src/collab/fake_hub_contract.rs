@@ -48,16 +48,6 @@ use crate::collab::live::wire::{
     HoldersReportReplyWire, HoldersSnapshotWire, VersionStatus, VersionsReplyWire,
 };
 
-/// The fixtures this module replays, one test each. `every_fixture_is_replayed`
-/// keeps the list equal to the folder.
-const FIXTURES: &[&str] = &[
-    "01-snapshot_after_announce",
-    "02-announce_refusals",
-    "03-version_cas",
-    "04-holder_report_rules",
-    "05-publishing_device",
-];
-
 /// What a report prints for a side that has no value at a pointer.
 const MISSING: &str = "<missing>";
 
@@ -525,6 +515,7 @@ async fn check_wire(wire: &str, status: u16, body: &Value) -> Result<(), String>
             }
             check_wire_error(variant, status, body).await
         }
+        None if status >= 400 => Err(format!("status {status} needs an error:<Variant> wire")),
         None => check_wire_ok(wire, body),
     }
 }
@@ -544,6 +535,44 @@ fn assert_keys(v: &Value, expected: &[&str], what: &str) {
     assert_eq!(
         got, want,
         "fixture {what} carries keys this replayer does not build"
+    );
+}
+
+/// Refuses a key the replayer does not read, in the document, a step, an
+/// `ignore` entry or an `unordered` entry.
+fn assert_document_keys(doc: &Value) {
+    let fixture = doc["fixture"].as_str().unwrap_or("?");
+    assert_keys(
+        doc,
+        &["format", "fixture", "given", "steps", "ignore", "unordered"],
+        &format!("{fixture} document"),
+    );
+    for (i, step) in doc["steps"].as_array().expect("steps").iter().enumerate() {
+        assert_keys(
+            step,
+            &[
+                "n", "note", "method", "path", "who", "body", "status", "wire", "capture",
+                "response",
+            ],
+            &format!("{fixture} steps[{i}]"),
+        );
+    }
+    for (i, entry) in doc["ignore"].as_array().into_iter().flatten().enumerate() {
+        assert_keys(entry, &["step", "path", "reason"], &format!("{fixture} ignore[{i}]"));
+    }
+    for (i, entry) in doc["unordered"].as_array().into_iter().flatten().enumerate() {
+        assert_keys(entry, &["step", "path", "key"], &format!("{fixture} unordered[{i}]"));
+    }
+}
+
+/// Binds the counter base `name` to `value`. A base is captured once: a second
+/// capture of the same name would make every later check of it true by
+/// construction.
+fn bind_base(bases: &mut BTreeMap<String, i64>, fixture: &str, step: usize, name: &str, value: i64) {
+    let previous = bases.insert(name.to_string(), value);
+    assert!(
+        previous.is_none(),
+        "fixture {fixture} step {step}: capture {name} names a base that is already bound"
     );
 }
 
@@ -724,6 +753,7 @@ fn step_header(step: &Value) -> String {
 /// Replays `doc` on a fresh fake and returns the report, `None` when the fake
 /// answered like the hub at every step.
 async fn replay(doc: &Value) -> Option<String> {
+    assert_document_keys(doc);
     assert_eq!(doc["format"], json!(1), "unknown fixture format");
     let fixture = doc["fixture"].as_str().expect("fixture name").to_string();
     let Built {
@@ -781,7 +811,7 @@ async fn replay(doc: &Value) -> Option<String> {
             let pointer = pointer.as_str().expect("a capture is a pointer");
             match double.pointer(pointer).and_then(Value::as_i64) {
                 Some(v) => {
-                    bindings.bases.insert(name.clone(), v);
+                    bind_base(&mut bindings.bases, &fixture, index, name, v);
                 }
                 None => {
                     captured_all = false;
@@ -836,29 +866,29 @@ async fn replay_fixture(stem: &str) {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn hub_contract_01_snapshot_after_announce() {
-        replay_fixture("01-snapshot_after_announce").await;
+    /// Declares `FIXTURES` and one test per fixture from one list, so a listed
+    /// fixture is always replayed by a test that names its own stem.
+    macro_rules! fixture_tests {
+        ($($name:ident => $stem:literal),+ $(,)?) => {
+            /// The fixtures this module replays, one test each.
+            /// `every_fixture_is_replayed` keeps the list equal to the folder.
+            const FIXTURES: &[&str] = &[$($stem),+];
+
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    replay_fixture($stem).await;
+                }
+            )+
+        };
     }
 
-    #[tokio::test]
-    async fn hub_contract_02_announce_refusals() {
-        replay_fixture("02-announce_refusals").await;
-    }
-
-    #[tokio::test]
-    async fn hub_contract_03_version_cas() {
-        replay_fixture("03-version_cas").await;
-    }
-
-    #[tokio::test]
-    async fn hub_contract_04_holder_report_rules() {
-        replay_fixture("04-holder_report_rules").await;
-    }
-
-    #[tokio::test]
-    async fn hub_contract_05_publishing_device() {
-        replay_fixture("05-publishing_device").await;
+    fixture_tests! {
+        hub_contract_01_snapshot_after_announce => "01-snapshot_after_announce",
+        hub_contract_02_announce_refusals => "02-announce_refusals",
+        hub_contract_03_version_cas => "03-version_cas",
+        hub_contract_04_holder_report_rules => "04-holder_report_rules",
+        hub_contract_05_publishing_device => "05-publishing_device",
     }
 
     #[test]
@@ -949,5 +979,85 @@ mod tests {
             "hub contract 03-example (hub abc123): 2 difference(s)\n  step 1 GET /y as B1 - after\n    /n: hub {{v0+3}} = 6, double 7\n"
         ));
         assert!(!report.contains("step 0"));
+    }
+
+    #[tokio::test]
+    async fn an_error_status_needs_an_error_wire() {
+        let err = check_wire("none", 401, &Value::Null)
+            .await
+            .expect_err("a 401 recorded with wire none is refused");
+        assert_eq!(err, "status 401 needs an error:<Variant> wire");
+        let err = check_wire("HoldersSnapshotWire", 500, &json!({}))
+            .await
+            .expect_err("a 500 recorded with a success wire is refused");
+        assert_eq!(err, "status 500 needs an error:<Variant> wire");
+        check_wire("none", 204, &Value::Null)
+            .await
+            .expect("an empty success answer is fine");
+        let err = check_wire("error:Unauthorized", 200, &Value::Null)
+            .await
+            .expect_err("an error wire on a success status is refused");
+        assert_eq!(err, "status 200 is not an error");
+    }
+
+    fn minimal_document() -> Value {
+        json!({
+            "format": 1,
+            "fixture": "09-example",
+            "given": {},
+            "steps": [{
+                "n": 0, "note": "n", "method": "GET", "path": "/x", "who": null,
+                "body": null, "status": 200, "wire": "none", "capture": {},
+                "response": null
+            }],
+            "ignore": [{"step": "*", "path": "/a", "reason": "r"}],
+            "unordered": [{"step": 0, "path": "/b", "key": "/k"}]
+        })
+    }
+
+    #[test]
+    fn a_complete_document_passes_the_key_check() {
+        assert_document_keys(&minimal_document());
+    }
+
+    #[test]
+    #[should_panic(expected = "09-example document carries keys this replayer does not build")]
+    fn an_unknown_top_level_key_is_refused() {
+        let mut doc = minimal_document();
+        doc["recordedAt"] = json!("2026-11-12");
+        assert_document_keys(&doc);
+    }
+
+    #[test]
+    #[should_panic(expected = "09-example steps[0] carries keys this replayer does not build")]
+    fn an_unknown_step_key_is_refused() {
+        let mut doc = minimal_document();
+        doc["steps"][0]["headers"] = json!({});
+        assert_document_keys(&doc);
+    }
+
+    #[test]
+    #[should_panic(expected = "09-example ignore[0] carries keys this replayer does not build")]
+    fn an_unknown_ignore_key_is_refused() {
+        let mut doc = minimal_document();
+        doc["ignore"][0]["until"] = json!(3);
+        assert_document_keys(&doc);
+    }
+
+    #[test]
+    #[should_panic(expected = "09-example unordered[0] carries keys this replayer does not build")]
+    fn an_unknown_unordered_key_is_refused() {
+        let mut doc = minimal_document();
+        doc["unordered"][0]["mode"] = json!("set");
+        assert_document_keys(&doc);
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture 09-example step 1: capture v0 names a base that is already bound")]
+    fn a_base_is_captured_once() {
+        let mut bases = BTreeMap::new();
+        bind_base(&mut bases, "09-example", 0, "v0", 4);
+        assert_eq!(bases.get("v0"), Some(&4));
+        bind_base(&mut bases, "09-example", 1, "v0", 9);
     }
 }
