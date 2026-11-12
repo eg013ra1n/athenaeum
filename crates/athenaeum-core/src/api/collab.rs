@@ -6190,45 +6190,13 @@ async fn run_publish(
         });
     }
 
-    // The prepared New frames join the generated ones, as written.
-    for plan in from_review {
-        let Some(p) = from_prepared.get(&plan.cand.frame_id) else {
-            continue; // never: the partition keyed on `from_prepared`
-        };
-        let PlannedFrame {
-            cand,
-            kind,
-            target,
-            mut meta,
-            external,
-            ..
-        } = plan;
-        if let Some(m) = meta.as_mut() {
-            m.meta["calibration"] = if external {
-                calibration_meta(None, true)
-            } else {
-                prepared_cal.remove(&cand.frame_id).unwrap_or_else(|| {
-                    tracing::warn!(project_id, frame_id = cand.frame_id, "publish: no calibration links read for a prepared frame; its meta names no masters");
-                    calibration_meta(None, false)
-                })
-            };
-        }
-        outcome.written.push(WrittenFrame {
-            frame_id: cand.frame_id,
-            filename: cand.filename,
-            uuid: cand.uuid,
-            filter_canonical: cand.filter_canonical,
-            kind,
-            staged: target.clone(),
-            target,
-            recipe: p.recipe_hash.clone(),
-            xxh3: p.xxh3.clone(),
-            byte_size: u64::try_from(p.byte_size).unwrap_or_default(),
-            meta,
-            identical: false,
-            staged_blake3: None,
-        });
-    }
+    publish_merge_reviewed(
+        project_id,
+        from_review,
+        &from_prepared,
+        &mut prepared_cal,
+        &mut outcome.written,
+    );
 
     // W4: a cancel before seeding starts ends the run here — also one that
     // landed after the last regenerated frame. Nothing is seeded or staged
@@ -7360,6 +7328,55 @@ async fn run_publish(
         stale,
         ..Default::default()
     })
+}
+
+/// The prepared New frames join the generated ones as written.
+fn publish_merge_reviewed(
+    project_id: &str,
+    from_review: Vec<PlannedFrame>,
+    from_prepared: &HashMap<i64, crate::db::collab_prepare::PreparedRow>,
+    prepared_cal: &mut HashMap<i64, serde_json::Value>,
+    written: &mut Vec<WrittenFrame>,
+) {
+    // The prepared New frames join the generated ones, as written.
+    for plan in from_review {
+        let Some(p) = from_prepared.get(&plan.cand.frame_id) else {
+            continue; // never: the partition keyed on `from_prepared`
+        };
+        let PlannedFrame {
+            cand,
+            kind,
+            target,
+            mut meta,
+            external,
+            ..
+        } = plan;
+        if let Some(m) = meta.as_mut() {
+            m.meta["calibration"] = if external {
+                calibration_meta(None, true)
+            } else {
+                prepared_cal.remove(&cand.frame_id).unwrap_or_else(|| {
+                    tracing::warn!(project_id, frame_id = cand.frame_id, "publish: no calibration links read for a prepared frame; its meta names no masters");
+                    calibration_meta(None, false)
+                })
+            };
+        }
+        written.push(WrittenFrame {
+            frame_id: cand.frame_id,
+            filename: cand.filename,
+            uuid: cand.uuid,
+            filter_canonical: cand.filter_canonical,
+            kind,
+            staged: target.clone(),
+            target,
+            recipe: p.recipe_hash.clone(),
+            xxh3: p.xxh3.clone(),
+            byte_size: u64::try_from(p.byte_size).unwrap_or_default(),
+            meta,
+            identical: false,
+            staged_blake3: None,
+        });
+    }
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
