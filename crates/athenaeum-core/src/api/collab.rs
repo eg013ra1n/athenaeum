@@ -7218,105 +7218,15 @@ fn publish_split(
             }
             split.push((cand, kind, osc, external));
         }
-        // Pass 2 (final review I1): every update and adoption target is
-        // reserved BEFORE any new frame picks its name — an adoption without
-        // a recorded path lands at `<own>/<fileName>`, which no row
-        // references yet, so a new frame could otherwise pick the same file.
-        // F5: an external candidate's target is always deferred to pass 3
-        // (its own CURRENT catalog path, dedup-checked there) regardless of
-        // kind — never the previous own row's `landed_path`, which for a
-        // frame attested after an earlier generated publish would still name
-        // the old calibrated file, not the original.
-        let mut taken_names = if account_id.is_empty() {
-            HashSet::new()
-        } else {
-            frames_db::file_names_of_publisher(&conn, project_id, &account_id).map_err(|e| {
-                tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the publisher's file names failed");
-                internal(e)
-            })?
-        };
-        // Every prepared file of the project, by path: an adoption landing
-        // on one would write over another frame's reviewed file and leave
-        // its row naming a published frame's landing.
-        let prepared_at: HashMap<std::path::PathBuf, i64> =
-            crate::db::collab_prepare::list_prepared(&conn, project_id)
-                .map_err(|e| {
-                    tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the prepared frames failed");
-                    internal(e)
-                })?
-                .into_iter()
-                .filter_map(|r| {
-                    r.calibrated_path
-                        .map(|p| (std::path::PathBuf::from(p), r.source_frame_id))
-                })
-                .collect();
-        // Frames whose prepared name the run cannot use (stale — back to
-        // Ready, the next calibrate picks a free name).
-        let mut name_taken: Vec<i64> = Vec::new();
-        let mut targeted: Vec<(
-            PublishCandidate,
-            PublishKind,
-            bool,
-            Option<std::path::PathBuf>,
-            Option<(std::path::PathBuf, String)>,
-        )> = Vec::with_capacity(split.len());
-        for (cand, kind, osc, external) in split {
-            let target = if external.is_some() {
-                None
-            } else {
-                match &kind {
-                    PublishKind::New => None,
-                    PublishKind::Update(row) => match &row.landed_path {
-                        // C1: a row whose landed_path is not this
-                        // publisher's own-dir landing — or whose recipe is
-                        // external-shaped (fix round 2 belt-and-braces) —
-                        // was an attested original (or is otherwise stale):
-                        // never reuse it as a generation target; defer to
-                        // pass 3's fresh-name picker exactly like a New
-                        // frame.
-                        Some(p)
-                            if is_own_dir_landing(Path::new(p), &own_dir)
-                                && !was_external_recipe(row) =>
-                        {
-                            Some(std::path::PathBuf::from(p))
-                        }
-                        Some(p) => {
-                            tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = %p, "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
-                            None
-                        }
-                        None => {
-                            tracing::error!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, "publish: own frame has no landed path");
-                            held_back.push(held(
-                                cand.frame_id,
-                                &cand.filename,
-                                "own frame has no file path".into(),
-                            ));
-                            continue;
-                        }
-                    },
-                    PublishKind::Adopt(row) => {
-                        let landing = adopt_landing(row, &own_dir);
-                        if landing.is_none() {
-                            tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = row.landed_path.as_deref().unwrap_or(""), "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
-                        }
-                        landing
-                    }
-                }
-            };
-            if let (PublishKind::Adopt(_), Some(t)) = (&kind, &target) {
-                // Another frame's prepared file sits where this adoption
-                // lands: that frame goes back to Ready (row and file) before
-                // the adoption writes there.
-                if let Some(&other) = prepared_at.get(t).filter(|&&o| o != cand.frame_id) {
-                    tracing::info!(project_id, frame_id = other, path = %t.display(), "publish: a prepared file sits on an adoption's landing; back to ready");
-                    name_taken.push(other);
-                }
-            }
-            if let Some(t) = &target {
-                claimed.insert(t.clone());
-            }
-            targeted.push((cand, kind, osc, target, external));
-        }
+        let (mut taken_names, mut name_taken, targeted) = publish_split_targets(
+            &conn,
+            project_id,
+            account_id,
+            own_dir,
+            split,
+            &mut claimed,
+            held_back,
+        )?;
         // Pass 3: new frames — their manifest fields checked against the
         // hub's per-frame rules (M1: one bad frame refuses a whole atomic
         // batch), then a free landing name. F5: an external candidate never
@@ -7622,6 +7532,141 @@ fn publish_split(
         refused_new,
         stale,
     })
+}
+
+/// A candidate after pass 1: its kind, whether the light is a one-shot colour
+/// frame, and the attested original with its recipe, when it has one.
+type SplitEntry = (
+    PublishCandidate,
+    PublishKind,
+    bool,
+    Option<(std::path::PathBuf, String)>,
+);
+
+/// A candidate after pass 2: as `SplitEntry`, with the landing path an update
+/// or adoption already holds between the kind and the attested original.
+type TargetEntry = (
+    PublishCandidate,
+    PublishKind,
+    bool,
+    Option<std::path::PathBuf>,
+    Option<(std::path::PathBuf, String)>,
+);
+
+/// Pass 2 of the split (final review I1): every update and adoption target is
+/// reserved before any new frame picks its name. Returns the publisher's taken
+/// file names, the frames whose prepared name the run cannot use, and the
+/// targeted candidates.
+fn publish_split_targets(
+    conn: &Connection,
+    project_id: &str,
+    account_id: &str,
+    own_dir: &Path,
+    split: Vec<SplitEntry>,
+    claimed: &mut HashSet<std::path::PathBuf>,
+    held_back: &mut Vec<HeldBackFrame>,
+) -> Result<(HashSet<String>, Vec<i64>, Vec<TargetEntry>), ApiError> {
+    use crate::db::collab_frames as frames_db;
+    // Pass 2 (final review I1): every update and adoption target is
+    // reserved BEFORE any new frame picks its name — an adoption without
+    // a recorded path lands at `<own>/<fileName>`, which no row
+    // references yet, so a new frame could otherwise pick the same file.
+    // F5: an external candidate's target is always deferred to pass 3
+    // (its own CURRENT catalog path, dedup-checked there) regardless of
+    // kind — never the previous own row's `landed_path`, which for a
+    // frame attested after an earlier generated publish would still name
+    // the old calibrated file, not the original.
+    let taken_names = if account_id.is_empty() {
+        HashSet::new()
+    } else {
+        frames_db::file_names_of_publisher(&conn, project_id, &account_id).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the publisher's file names failed");
+            internal(e)
+        })?
+    };
+    // Every prepared file of the project, by path: an adoption landing
+    // on one would write over another frame's reviewed file and leave
+    // its row naming a published frame's landing.
+    let prepared_at: HashMap<std::path::PathBuf, i64> =
+        crate::db::collab_prepare::list_prepared(&conn, project_id)
+            .map_err(|e| {
+                tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the prepared frames failed");
+                internal(e)
+            })?
+            .into_iter()
+            .filter_map(|r| {
+                r.calibrated_path
+                    .map(|p| (std::path::PathBuf::from(p), r.source_frame_id))
+            })
+            .collect();
+    // Frames whose prepared name the run cannot use (stale — back to
+    // Ready, the next calibrate picks a free name).
+    let mut name_taken: Vec<i64> = Vec::new();
+    let mut targeted: Vec<(
+        PublishCandidate,
+        PublishKind,
+        bool,
+        Option<std::path::PathBuf>,
+        Option<(std::path::PathBuf, String)>,
+    )> = Vec::with_capacity(split.len());
+    for (cand, kind, osc, external) in split {
+        let target = if external.is_some() {
+            None
+        } else {
+            match &kind {
+                PublishKind::New => None,
+                PublishKind::Update(row) => match &row.landed_path {
+                    // C1: a row whose landed_path is not this
+                    // publisher's own-dir landing — or whose recipe is
+                    // external-shaped (fix round 2 belt-and-braces) —
+                    // was an attested original (or is otherwise stale):
+                    // never reuse it as a generation target; defer to
+                    // pass 3's fresh-name picker exactly like a New
+                    // frame.
+                    Some(p)
+                        if is_own_dir_landing(Path::new(p), &own_dir)
+                            && !was_external_recipe(row) =>
+                    {
+                        Some(std::path::PathBuf::from(p))
+                    }
+                    Some(p) => {
+                        tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = %p, "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
+                        None
+                    }
+                    None => {
+                        tracing::error!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, "publish: own frame has no landed path");
+                        held_back.push(held(
+                            cand.frame_id,
+                            &cand.filename,
+                            "own frame has no file path".into(),
+                        ));
+                        continue;
+                    }
+                },
+                PublishKind::Adopt(row) => {
+                    let landing = adopt_landing(row, &own_dir);
+                    if landing.is_none() {
+                        tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = row.landed_path.as_deref().unwrap_or(""), "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
+                    }
+                    landing
+                }
+            }
+        };
+        if let (PublishKind::Adopt(_), Some(t)) = (&kind, &target) {
+            // Another frame's prepared file sits where this adoption
+            // lands: that frame goes back to Ready (row and file) before
+            // the adoption writes there.
+            if let Some(&other) = prepared_at.get(t).filter(|&&o| o != cand.frame_id) {
+                tracing::info!(project_id, frame_id = other, path = %t.display(), "publish: a prepared file sits on an adoption's landing; back to ready");
+                name_taken.push(other);
+            }
+        }
+        if let Some(t) = &target {
+            claimed.insert(t.clone());
+        }
+        targeted.push((cand, kind, osc, target, external));
+    }
+    Ok((taken_names, name_taken, targeted))
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
