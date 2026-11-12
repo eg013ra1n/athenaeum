@@ -205,7 +205,8 @@ fn shape_of_header_bytes(zip: &str, entry: &str, bytes: &[u8]) -> Option<(usize,
 /// With a manifest `bayerpat` the frame is colour, and the file is probed
 /// only when `debayerOsc` is off (`osc_or_cfa`); without one the file's own
 /// plane count decides (three planes are `osc`, anything else `mono`), so the
-/// file is always probed.
+/// file is always probed. An unreadable file is a debug line and bumps
+/// `unreadable`; the caller writes one warn per grouping pass.
 fn color_token(
     conn: &Connection,
     shapes: &ZipShapes,
@@ -214,6 +215,7 @@ fn color_token(
     meta: &ProjectFrameMeta,
     landed: &Path,
     debayer_osc: bool,
+    unreadable: &mut usize,
 ) -> &'static str {
     if meta.bayerpat.is_none() {
         // No manifest bayerpat: the file's own plane count decides, as for an
@@ -223,7 +225,8 @@ fn color_token(
             Some((_, _, 3)) => "osc",
             Some(_) => "mono",
             None => {
-                tracing::warn!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token falls back to the manifest (mono)");
+                tracing::debug!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token falls back to the manifest (mono)");
+                *unreadable += 1;
                 "mono"
             }
         };
@@ -231,7 +234,8 @@ fn color_token(
     match osc_or_cfa(conn, shapes, landed, debayer_osc) {
         Some(token) => token,
         None => {
-            tracing::warn!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token assumed cfa");
+            tracing::debug!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token assumed cfa");
+            *unreadable += 1;
             "cfa"
         }
     }
@@ -260,9 +264,10 @@ fn osc_or_cfa(
 /// The colour token of an attested frame set's light (spec §13, plan 6b-2
 /// C13): a catalog BAYERPAT means colour (then [`osc_or_cfa`]); without one
 /// the file's own header decides: three planes are `osc`, anything else
-/// `mono`. An unreadable file warns and follows the project rule with the
+/// `mono`. An unreadable file follows the project rule with the
 /// shape unknown: `cfa` under a catalog BAYERPAT, `mono` without one. Prepare
-/// excludes the unreadable file anyway.
+/// excludes the unreadable file anyway. The fallback is a debug line and bumps
+/// `unreadable`; the caller writes one warn per grouping pass.
 pub(crate) fn attested_color_token(
     conn: &Connection,
     shapes: &ZipShapes,
@@ -271,15 +276,17 @@ pub(crate) fn attested_color_token(
     catalog_bayerpat: bool,
     path: &Path,
     debayer_osc: bool,
+    unreadable: &mut usize,
 ) -> &'static str {
     if catalog_bayerpat {
         return osc_or_cfa(conn, shapes, path, debayer_osc).unwrap_or_else(|| {
-            tracing::warn!(
+            tracing::debug!(
                 set_id = frames_set_id,
                 frame_id,
                 path = %path.display(),
                 "file shape unreadable; colour token assumed cfa"
             );
+            *unreadable += 1;
             "cfa"
         });
     }
@@ -287,12 +294,13 @@ pub(crate) fn attested_color_token(
         Some((_, _, 3)) => "osc",
         Some(_) => "mono",
         None => {
-            tracing::warn!(
+            tracing::debug!(
                 set_id = frames_set_id,
                 frame_id,
                 path = %path.display(),
                 "file shape unreadable; colour token falls back to the catalog (mono)"
             );
+            *unreadable += 1;
             "mono"
         }
     }
@@ -379,6 +387,7 @@ pub fn project_frame_source(
     );
     let mut origins: HashMap<i64, FrameOrigin> = HashMap::with_capacity(stackable.len());
     let mut buckets: BTreeMap<(&'static str, String), Vec<Member>> = BTreeMap::new();
+    let mut unreadable_shapes = 0usize;
     for (idx, row, meta, stamp) in stackable {
         let handle = *handles.get(&row.frame_uuid).ok_or_else(|| {
             ApiError::Internal(format!(
@@ -411,6 +420,7 @@ pub fn project_frame_source(
             &meta,
             Path::new(&landed),
             cfg.calibration.debayer_osc,
+            &mut unreadable_shapes,
         );
         // The Frames row agrees with the group's colour token.
         frames[idx].color_mode = if token == "mono" {
@@ -467,6 +477,14 @@ pub fn project_frame_source(
                 instrume: meta.instrume.clone(),
                 f_ratio: f_ratio(meta.focal_len, meta.aperture),
             });
+    }
+
+    if unreadable_shapes > 0 {
+        tracing::warn!(
+            project_id,
+            count = unreadable_shapes,
+            "project frames with an unreadable file shape; colour token fell back"
+        );
     }
 
     let mut groups = Vec::new();
@@ -704,6 +722,44 @@ mod tests {
                 ("d", Some("being re-staged"), false),
                 ("e", Some("unreadable size:mtime stamp"), false),
             ]
+        );
+    }
+
+    /// The colour-token fallback of unreadable files is one warning per grouping pass, with the count; the
+    /// per-file lines are debug.
+    #[test]
+    fn project_colour_token_warns_once_for_unreadable_files() {
+        let conn = test_conn();
+        insert_test_project(&conn, "p1");
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<std::path::PathBuf> = ["m1", "m2", "m3"]
+            .iter()
+            .map(|u| add_project_frame(&conn, dir.path(), "p1", &project_frame_spec(u)))
+            .collect();
+        std::fs::remove_file(&paths[0]).unwrap();
+        std::fs::remove_file(&paths[1]).unwrap();
+
+        let (_, log) = crate::stacking::telemetry::capture_logs(|| {
+            project_frame_source(&conn, "p1", &StackingConfig::default()).unwrap()
+        });
+        let warns: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(" WARN ") && l.contains("colour token fell back"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{log}");
+        assert!(warns[0].contains("count=2"), "{}", warns[0]);
+        let debug = log
+            .lines()
+            .filter(|l| {
+                l.contains(" DEBUG ")
+                    && l.contains("file shape unreadable; colour token falls back to the manifest (mono)")
+            })
+            .count();
+        assert_eq!(debug, 2, "one debug line per unreadable file: {log}");
+        assert!(
+            !log.lines()
+                .any(|l| l.contains(" WARN ") && l.contains("file shape unreadable; colour token")),
+            "no per-file warn: {log}"
         );
     }
 
