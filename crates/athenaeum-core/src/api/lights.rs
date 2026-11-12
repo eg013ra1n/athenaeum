@@ -212,39 +212,7 @@ pub fn offset_gain_text(t: &FlatOnlyTally) -> String {
     )
 }
 
-pub(crate) fn card_text(name: &str, values: &[Option<f64>]) -> String {
-    let mut recorded: Vec<f64> = values
-        .iter()
-        .flatten()
-        .copied()
-        .filter(|v| v.is_finite())
-        .collect();
-    recorded.sort_by(f64::total_cmp);
-    recorded.dedup();
-    let partial = if values.iter().any(|v| v.is_none()) {
-        " (not recorded on some)"
-    } else {
-        ""
-    };
-    match recorded.as_slice() {
-        [] => format!("{name} not recorded"),
-        [v] => format!("{name} {}{partial}", card_number(*v)),
-        [lo, .., hi] => format!(
-            "{name} {}\u{2013}{}{partial}",
-            card_number(*lo),
-            card_number(*hi)
-        ),
-    }
-}
-
-fn card_number(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        let s = format!("{v:.2}");
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    }
-}
+pub(crate) use crate::calibration::manual::card_text;
 
 /// Two significant figures: 2.4, 12, 120.
 fn two_significant(x: f64) -> String {

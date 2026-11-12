@@ -500,6 +500,43 @@ fn most_common_option(values: &[Option<String>]) -> Option<String> {
         .map(|(v, _)| v.clone())
 }
 
+/// A header card's values as text for a warning: one value, a range, or "not
+/// recorded". Here, not in `api::lights`, because that module is behind the
+/// `render` feature and the manual-link warning is not.
+pub(crate) fn card_text(name: &str, values: &[Option<f64>]) -> String {
+    let mut recorded: Vec<f64> = values
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    recorded.sort_by(f64::total_cmp);
+    recorded.dedup();
+    let partial = if values.iter().any(|v| v.is_none()) {
+        " (not recorded on some)"
+    } else {
+        ""
+    };
+    match recorded.as_slice() {
+        [] => format!("{name} not recorded"),
+        [v] => format!("{name} {}{partial}", card_number(*v)),
+        [lo, .., hi] => format!(
+            "{name} {}\u{2013}{}{partial}",
+            card_number(*lo),
+            card_number(*hi)
+        ),
+    }
+}
+
+fn card_number(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{v:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
 pub(crate) fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
     let mut counts: HashMap<String, (f64, usize)> = HashMap::new();
     for v in values.iter().flatten() {

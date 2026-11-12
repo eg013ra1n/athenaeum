@@ -480,8 +480,7 @@ fn warn_on_level_difference(
     calibration_type: &str,
     count: usize,
 ) {
-    use crate::api::lights::card_text;
-    use crate::calibration::manual::{level_check, most_common_f64, set_levels};
+    use crate::calibration::manual::{card_text, level_check, most_common_f64, set_levels};
     let (set_gain, set_offset) = match set_levels(conn, calibration_set_id) {
         Ok(levels) => levels,
         Err(error) => {
