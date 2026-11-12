@@ -16,6 +16,7 @@ use crate::models::{FindNewFramesResult, MergeReport, SplitSelection};
 use crate::services::ServiceContext;
 use crate::sessions::{ReconcileOutcome, RederiveSummary};
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A frame set's own center in degrees, parsed from its stored
@@ -521,13 +522,45 @@ fn failed<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> ApiErro
     move |e| ApiError::Internal(format!("Failed to {what}: {e}"))
 }
 
+/// The ids sorted ascending with repeats removed.
+fn sorted_unique(mut ids: Vec<i64>) -> Vec<i64> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Refuse a split selection (`kind` = "night", "session" or "frame") that holds
+/// an id outside the source set, or that is the whole source set. `ids` is
+/// de-duplicated.
+fn check_selection_inside(
+    kind: &str,
+    ids: &[i64],
+    source: &HashSet<i64>,
+    source_set_id: i64,
+) -> Result<(), ApiError> {
+    if let Some(id) = ids.iter().find(|id| !source.contains(id)) {
+        tracing::warn!(source_set_id, "split refused: selection not in the source set");
+        return Err(ApiError::Invalid(format!(
+            "Cannot split: {kind} {id} is not in this frame set"
+        )));
+    }
+    if ids.len() >= source.len() {
+        tracing::warn!(source_set_id, "split refused: selection would empty the source set");
+        return Err(ApiError::Invalid(
+            "Cannot split: operation would leave the source frame set empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Split the selected nights, sessions or frames of `source_set_id` into a new
 /// custom frame set named `new_name`, re-detect the new set's nights and
 /// sessions, take the split items out of the source and refresh the source's
 /// metadata (marked custom). Returns the new set's id; each host builds the
-/// returned detail from it. A split that would leave the source empty, or that
-/// selects no frames, is refused with `Invalid`. No transaction: the statements
-/// run one by one on the catalog connection, as they always did.
+/// returned detail from it. The selection must lie inside the source set: a
+/// night, session or frame of another set is refused with `Invalid`, as is a
+/// split that would leave the source empty or that selects no frames. One
+/// BEGIN IMMEDIATE transaction; any error rolls the whole split back.
 pub fn split_frame_set(
     ctx: &ServiceContext,
     source_set_id: i64,
@@ -537,61 +570,61 @@ pub fn split_frame_set(
     tracing::info!(source_set_id, new_name = %new_name, "splitting frame set");
 
     let db = crate::api::db(ctx)?;
-    let conn = db.conn();
-
-    // Validate that split won't leave source empty (inline to avoid nested locks)
-    let all_nights =
-        db::get_imaging_nights_for_set(&conn, source_set_id).map_err(failed("get nights"))?;
-
-    let can_split_result = match &selection {
-        SplitSelection::Nights { ids } => {
-            // Check if we're splitting all nights
-            ids.len() < all_nights.len()
-        }
-        SplitSelection::Sessions { ids } => {
-            // Count total sessions in the set
-            let mut total_sessions = 0;
-            for night in &all_nights {
-                if let Some(night_id) = night.id {
-                    let sessions = db::get_sessions_for_night(&conn, night_id)
-                        .map_err(failed("get sessions"))?;
-                    total_sessions += sessions.len();
-                }
-            }
-
-            // Can split if not all sessions are selected
-            ids.len() < total_sessions
-        }
-        SplitSelection::Frames { ids } => {
-            // Count total frames in the set
-            let total_frames: i64 = conn
-                .query_row(
-                    "SELECT COUNT(DISTINCT sm.frame_id)
-                     FROM session_members sm
-                     JOIN sessions s ON sm.session_id = s.id
-                     JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
-                     WHERE in_tbl.frames_set_id = ?1",
-                    [source_set_id],
-                    |row| row.get(0),
-                )
-                .map_err(failed("count frames"))?;
-
-            // Can split if not all frames are selected
-            ids.len() < total_frames as usize
-        }
-    };
-
-    if !can_split_result {
-        return Err(ApiError::Invalid(
-            "Cannot split: operation would leave the source frame set empty".to_string(),
-        ));
-    }
+    let mut conn = db.conn();
 
     // Get session gap threshold from settings
     let gap_threshold_hours: f64 = ctx
         .settings
         .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(failed("begin transaction"))?;
+    let conn: &Connection = &tx;
+
+    // Each arm's ids sorted and de-duplicated: a repeated id must neither
+    // inflate the count nor be applied twice.
+    let selection = match selection {
+        SplitSelection::Nights { ids } => SplitSelection::Nights {
+            ids: sorted_unique(ids),
+        },
+        SplitSelection::Sessions { ids } => SplitSelection::Sessions {
+            ids: sorted_unique(ids),
+        },
+        SplitSelection::Frames { ids } => SplitSelection::Frames {
+            ids: sorted_unique(ids),
+        },
+    };
+
+    // The selection must lie inside the source set and must not be all of it.
+    let all_nights =
+        db::get_imaging_nights_for_set(conn, source_set_id).map_err(failed("get nights"))?;
+
+    match &selection {
+        SplitSelection::Nights { ids } => {
+            let source: HashSet<i64> = all_nights.iter().filter_map(|n| n.id).collect();
+            check_selection_inside("night", ids, &source, source_set_id)?;
+        }
+        SplitSelection::Sessions { ids } => {
+            let mut source: HashSet<i64> = HashSet::new();
+            for night in &all_nights {
+                if let Some(night_id) = night.id {
+                    let sessions =
+                        db::get_sessions_for_night(conn, night_id).map_err(failed("get sessions"))?;
+                    source.extend(sessions.iter().filter_map(|s| s.id));
+                }
+            }
+            check_selection_inside("session", ids, &source, source_set_id)?;
+        }
+        SplitSelection::Frames { ids } => {
+            let source: HashSet<i64> = db::get_frame_ids_for_frame_set(conn, source_set_id)
+                .map_err(failed("get frames"))?
+                .into_iter()
+                .collect();
+            check_selection_inside("frame", ids, &source, source_set_id)?;
+        }
+    }
 
     // Collect frame IDs based on selection type
     let frame_ids: Vec<i64> = match &selection {
@@ -622,7 +655,7 @@ pub fn split_frame_set(
             // Get all frames from selected sessions
             let mut frames = Vec::new();
             for session_id in ids {
-                let session_frames = db::get_frame_ids_for_session(&conn, *session_id)
+                let session_frames = db::get_frame_ids_for_session(conn, *session_id)
                     .map_err(failed("get session frames"))?;
                 frames.extend(session_frames);
             }
@@ -641,12 +674,12 @@ pub fn split_frame_set(
     }
 
     // Calculate metadata for new frame set
-    let metadata = crate::frames_set_metadata::calculate_metadata_from_frame_ids(&frame_ids, &conn)
+    let metadata = crate::frames_set_metadata::calculate_metadata_from_frame_ids(&frame_ids, conn)
         .map_err(failed("calculate metadata"))?;
 
     // Create new frame set (always custom)
     let new_set_id = db::create_frames_set(
-        &conn,
+        conn,
         Some(new_name),
         true, // Always custom after split
         metadata.date_obs_start.as_deref(),
@@ -664,7 +697,7 @@ pub fn split_frame_set(
 
     // Get frames with file info for session detection
     let frames =
-        db::get_frames_with_files_by_ids(&conn, &frame_ids).map_err(failed("get frames"))?;
+        db::get_frames_with_files_by_ids(conn, &frame_ids).map_err(failed("get frames"))?;
 
     // Detect nights for new frame set
     let detected_nights = crate::sessions::detect_sessions(frames, gap_threshold_hours)
@@ -677,12 +710,12 @@ pub fn split_frame_set(
 
     // Create nights and sessions for new frame set
     for night in detected_nights {
-        let night_id = db::create_imaging_night(&conn, new_set_id, &night.start_time, &night.end_time)
+        let night_id = db::create_imaging_night(conn, new_set_id, &night.start_time, &night.end_time)
             .map_err(failed("create night"))?;
 
         for session in night.sessions {
             let session_id = db::create_session(
-                &conn,
+                conn,
                 night_id,
                 &session.instrume,
                 session.frame_ids.len() as i32,
@@ -690,7 +723,7 @@ pub fn split_frame_set(
             )
             .map_err(failed("create session"))?;
 
-            db::insert_session_members(&conn, session_id, &session.frame_ids)
+            db::insert_session_members(conn, session_id, &session.frame_ids)
                 .map_err(failed("insert session members"))?;
         }
     }
@@ -732,11 +765,11 @@ pub fn split_frame_set(
     // Recalculate metadata for source frame set and mark as custom
     tracing::debug!(source_set_id, "recalculating metadata for source frame set");
     let source_metadata =
-        crate::frames_set_metadata::calculate_metadata_for_frame_set(source_set_id, &conn)
+        crate::frames_set_metadata::calculate_metadata_for_frame_set(source_set_id, conn)
             .map_err(failed("calculate source metadata"))?;
 
     db::update_frames_set_metadata(
-        &conn,
+        conn,
         source_set_id,
         source_metadata.date_obs_start.as_deref(),
         source_metadata.date_obs_end.as_deref(),
@@ -750,6 +783,8 @@ pub fn split_frame_set(
     )
     .map_err(failed("update source metadata"))?;
 
+    tx.commit().map_err(failed("commit split"))?;
+
     tracing::info!(source_set_id, new_set_id, "split completed successfully");
 
     Ok(new_set_id)
@@ -758,7 +793,7 @@ pub fn split_frame_set(
 /// Create a custom frame set from a list of frame ids: metadata from the
 /// frames, nights and sessions detected with the session-gap setting, or one
 /// single night with an "Unknown" session when detection finds none. Returns the
-/// new set's id. No transaction, as before.
+/// new set's id. One BEGIN IMMEDIATE transaction; any error rolls it all back.
 pub fn create_frame_set_from_selection(
     ctx: &ServiceContext,
     name: &str,
@@ -766,15 +801,25 @@ pub fn create_frame_set_from_selection(
 ) -> Result<i64, ApiError> {
     tracing::info!(name = %name, count = frame_ids.len(), "creating frame set from selection");
 
-    let db = crate::api::db(ctx)?;
-    let conn = db.conn();
-    let conn: &Connection = &conn;
-
     if frame_ids.is_empty() {
         return Err(ApiError::Internal(
             "Cannot create frame set with no frames".to_string(),
         ));
     }
+
+    let db = crate::api::db(ctx)?;
+    let mut conn = db.conn();
+
+    // Session gap threshold, read before the transaction opens.
+    let gap_threshold_hours: f64 = ctx
+        .settings
+        .get_session_gap_threshold_hours(&conn)
+        .unwrap_or(6.0);
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(failed("begin transaction"))?;
+    let conn: &Connection = &tx;
 
     // Calculate metadata from frame IDs
     let metadata = crate::frames_set_metadata::calculate_metadata_from_frame_ids(frame_ids, conn)
@@ -812,11 +857,6 @@ pub fn create_frame_set_from_selection(
         db::get_frames_with_files_by_ids(conn, frame_ids).map_err(failed("get frames"))?;
 
     // Detect nights from selected frames using gap threshold
-    let gap_threshold_hours: f64 = ctx
-        .settings
-        .get_session_gap_threshold_hours(conn)
-        .unwrap_or(6.0);
-
     tracing::debug!(
         count = frames.len(),
         gap_threshold_hours,
@@ -882,6 +922,8 @@ pub fn create_frame_set_from_selection(
 
         tracing::debug!(name = %name, set_id, nights = detected_nights.len(), frames = frame_ids.len(), "created custom frame set");
     }
+
+    tx.commit().map_err(failed("commit frame set"))?;
 
     Ok(set_id)
 }
@@ -1475,6 +1517,168 @@ mod tests {
         );
         drop(conn);
         assert!(create_frame_set_from_selection(&ctx, "Empty", &[]).is_err());
+    }
+
+    /// Set 1 = night N1 {10, 11} + night N2 {12}; set 2 = night N3 {20, 21}.
+    /// Returns `(N1, N2, N3)` night ids.
+    fn seed_two_sets_for_split(conn: &Connection) -> (i64, i64, i64) {
+        seed_light_at(conn, 10, "2025-09-13T21:55:00Z");
+        seed_light_at(conn, 11, "2025-09-13T22:10:00Z");
+        seed_light_at(conn, 12, "2025-09-15T21:00:00Z");
+        seed_light_at(conn, 20, "2025-09-20T21:00:00Z");
+        seed_light_at(conn, 21, "2025-09-20T21:20:00Z");
+        seed_set_with_night(
+            conn,
+            1,
+            "2025-09-13T21:55:00Z",
+            "2025-09-13T22:10:00Z",
+            &[10, 11],
+        );
+        let night2 = db::create_imaging_night(conn, 1, "2025-09-15T21:00:00Z", "2025-09-15T21:00:00Z")
+            .unwrap();
+        let session2 = db::create_session(conn, night2, "CamA", 1, None).unwrap();
+        db::insert_session_members(conn, session2, &[12]).unwrap();
+        seed_set_with_night(
+            conn,
+            2,
+            "2025-09-20T21:00:00Z",
+            "2025-09-20T21:20:00Z",
+            &[20, 21],
+        );
+        let night_of = |set_id: i64, first: bool| -> i64 {
+            let order = if first { "ASC" } else { "DESC" };
+            count(
+                conn,
+                &format!(
+                    "SELECT id FROM imaging_nights WHERE frames_set_id = {set_id}
+                     ORDER BY id {order} LIMIT 1"
+                ),
+            )
+        };
+        (night_of(1, true), night_of(1, false), night_of(2, true))
+    }
+
+    fn members_of_set(conn: &Connection, set_id: i64) -> i64 {
+        count(
+            conn,
+            &format!(
+                "SELECT COUNT(*) FROM session_members m JOIN sessions s ON s.id = m.session_id
+                 JOIN imaging_nights n ON n.id = s.imaging_night_id WHERE n.frames_set_id = {set_id}"
+            ),
+        )
+    }
+
+    /// A night, session or frame id that belongs to ANOTHER set is refused as
+    /// `Invalid`, and the refusal leaves both sets exactly as they were.
+    #[test]
+    fn split_frame_set_refuses_ids_of_another_set_and_changes_nothing() {
+        let (_tmp, ctx) = test_ctx();
+        let (n3, s3) = {
+            let conn = ctx.db.get().unwrap().conn();
+            let (_n1, _n2, n3) = seed_two_sets_for_split(&conn);
+            let s3 = count(
+                &conn,
+                &format!("SELECT id FROM sessions WHERE imaging_night_id = {n3}"),
+            );
+            (n3, s3)
+        };
+
+        let selections = [
+            SplitSelection::Nights { ids: vec![n3] },
+            SplitSelection::Sessions { ids: vec![s3] },
+            SplitSelection::Frames { ids: vec![10, 20] },
+        ];
+        for selection in selections {
+            let label = format!("{selection:?}");
+            let result = split_frame_set(&ctx, 1, selection, "Cut");
+            assert!(
+                matches!(result, Err(ApiError::Invalid(_))),
+                "{label}: expected Invalid, got {result:?}"
+            );
+
+            let conn = ctx.db.get().unwrap().conn();
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames_set"), 2, "{label}");
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 2"),
+                1,
+                "{label}"
+            );
+            assert_eq!(members_of_set(&conn, 2), 2, "{label}");
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 1"),
+                2,
+                "{label}"
+            );
+            assert_eq!(members_of_set(&conn, 1), 3, "{label}");
+            assert_eq!(
+                count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"),
+                0,
+                "{label}"
+            );
+        }
+    }
+
+    /// A step that fails after the new set was written (here the delete of the
+    /// split night) undoes the whole split: no new set, the source untouched.
+    #[test]
+    fn split_frame_set_rolls_back_when_a_step_fails() {
+        let (_tmp, ctx) = test_ctx();
+        let n2 = {
+            let conn = ctx.db.get().unwrap().conn();
+            let (_n1, n2, _n3) = seed_two_sets_for_split(&conn);
+            conn.execute_batch(
+                "CREATE TRIGGER injected_split_failure BEFORE DELETE ON imaging_nights
+                 BEGIN SELECT RAISE(ABORT, 'injected split failure'); END",
+            )
+            .unwrap();
+            n2
+        };
+
+        let result = split_frame_set(&ctx, 1, SplitSelection::Nights { ids: vec![n2] }, "Cut");
+        assert!(
+            matches!(result, Err(ApiError::Internal(_))),
+            "expected Internal, got {result:?}"
+        );
+
+        let conn = ctx.db.get().unwrap().conn();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM frames_set WHERE name = 'Cut'"),
+            0
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames_set"), 2);
+        assert_eq!(members_of_set(&conn, 1), 3);
+        assert_eq!(
+            count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"),
+            0
+        );
+    }
+
+    /// A step that fails while the new set's members are written leaves no
+    /// frame set, night or session behind.
+    #[test]
+    fn create_frame_set_from_selection_rolls_back_when_a_step_fails() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            seed_light_at(&conn, 10, "2025-09-13T21:55:00Z");
+            seed_light_at(&conn, 11, "2025-09-13T22:10:00Z");
+            conn.execute_batch(
+                "CREATE TRIGGER injected_create_failure BEFORE INSERT ON session_members
+                 BEGIN SELECT RAISE(ABORT, 'injected create failure'); END",
+            )
+            .unwrap();
+        }
+
+        let result = create_frame_set_from_selection(&ctx, "Mine", &[10, 11]);
+        assert!(
+            matches!(result, Err(ApiError::Internal(_))),
+            "expected Internal, got {result:?}"
+        );
+
+        let conn = ctx.db.get().unwrap().conn();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames_set"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM imaging_nights"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 0);
     }
 
     /// (d) An archived set is skipped outright: `Unchanged`, and its
