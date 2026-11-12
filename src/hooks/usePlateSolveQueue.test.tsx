@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { usePlateSolveQueue } from './usePlateSolveQueue';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import type { PlateSolveProgressEvent } from '../types/helpers';
 
 vi.mock('../contexts/NotificationContext', () => ({
@@ -17,10 +18,7 @@ describe('usePlateSolveQueue', () => {
       return Promise.resolve(() => {});
     }) as never);
     // The batch stays running until the test is done with it.
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      cmd === 'get_catalog_status'
-        ? Promise.resolve([{ installed: true }])
-        : new Promise(() => {})) as never);
+    routeInvoke({ get_catalog_status: [{ installed: true }] }, () => new Promise(() => {}));
 
     const { result } = renderHook(() => usePlateSolveQueue());
     await waitFor(() => expect(handlers['plate-solve-progress']).toBeDefined());
@@ -56,8 +54,7 @@ describe('usePlateSolveQueue', () => {
       handlers[ev] = cb;
       return Promise.resolve(() => {});
     }) as never);
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      Promise.resolve(cmd === 'get_catalog_status' ? [{ installed: true }] : undefined)) as never);
+    routeInvoke({ get_catalog_status: [{ installed: true }] }, () => undefined);
 
     const { result } = renderHook(() => usePlateSolveQueue());
     await waitFor(() => expect(handlers['plate-solve-complete']).toBeDefined());

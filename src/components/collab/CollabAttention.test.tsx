@@ -5,6 +5,7 @@ import { NotificationProvider } from '../../contexts/NotificationContext';
 import { ToastStack } from '../Toast';
 import CollabAttention from './CollabAttention';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { CollabAttention as Attention, CollabAttentionChanged, LastCopyView } from '../../types/models';
 
 vi.mock('../../api');
@@ -33,18 +34,11 @@ beforeEach(() => {
       ? Promise.resolve({ trashed: false })
       : Promise.reject(new Error('trash_unavailable: the system trash is not available — confirm to delete the changed file'));
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { confirmedDelete: boolean }) => {
-    switch (cmd) {
-      case 'list_collab_attention':
-        return Promise.resolve(attention);
-      case 'preview_collab_stop_keeping':
-        return Promise.resolve(preview);
-      case 'resolve_collab_changed_file':
-        return changedFile(args ?? { confirmedDelete: false });
-      default:
-        return Promise.resolve(1);
-    }
-  }) as never);
+  routeInvoke({
+    list_collab_attention: () => attention,
+    preview_collab_stop_keeping: () => preview,
+    resolve_collab_changed_file: (args?: { confirmedDelete: boolean }) => changedFile(args ?? { confirmedDelete: false }),
+  }, () => 1);
   vi.mocked(api.listen).mockImplementation(((name: string, h: (p: CollabAttentionChanged) => void) => {
     if (name === 'collab-attention-changed') emitAttention = h;
     return Promise.resolve(() => {});
@@ -118,8 +112,7 @@ describe('CollabAttention', () => {
       notKept: [...attention.notKept, { frameUuid: 'u6', fileName: 'c_f.fits', contentVersion: 2 }],
       otherFiles: attention.otherFiles,
     };
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      Promise.resolve(cmd === 'list_collab_attention' ? two : 1)) as never);
+    routeInvoke({ list_collab_attention: two }, () => 1);
     renderIt();
     await screen.findByText('Changed files');
     const names = screen.getAllByRole('button').map((b) => b.getAttribute('aria-label') ?? b.textContent ?? '');
@@ -169,11 +162,10 @@ describe('CollabAttention', () => {
       return { frameUuid: `m${n}`, fileName: `c_${n}.fits`, holdersOnline: 0, holdersTotal: 1, atRisk: true };
     });
     preview = many;
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'list_collab_attention') return Promise.resolve({ ...empty, awaitingChoice: many });
-      if (cmd === 'preview_collab_stop_keeping') return Promise.resolve(preview);
-      return Promise.resolve(1);
-    }) as never);
+    routeInvoke({
+      list_collab_attention: () => ({ ...empty, awaitingChoice: many }),
+      preview_collab_stop_keeping: () => preview,
+    }, () => 1);
     renderIt();
     fireEvent.click(await screen.findByRole('button', { name: 'Stop keeping all' }));
     const message = await screen.findByText(/fewer than 2 other copies/);
@@ -274,11 +266,10 @@ describe('CollabAttention', () => {
   });
 
   it('a failed action is one warning notification', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'list_collab_attention') return Promise.resolve(attention);
-      if (cmd === 'keep_collab_frames_again') return Promise.reject('collaboration project refused');
-      return Promise.resolve(1);
-    }) as never);
+    routeInvoke({
+      list_collab_attention: () => attention,
+      keep_collab_frames_again: () => Promise.reject('collaboration project refused'),
+    }, () => 1);
     renderIt();
     fireEvent.click(await screen.findByRole('button', { name: 'Keep all again' }));
     const toasts = await screen.findAllByRole('status');

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { CollabExchangeProvider } from '../../../contexts/CollabExchangeContext';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import ExchangeTab from './ExchangeTab';
 import type {
   ExchangeSnapshot,
@@ -78,16 +79,10 @@ beforeEach(() => {
   exchangeSnapshot = EMPTY_SNAPSHOT;
   receiveSessions = [];
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    switch (command) {
-      case 'get_collab_exchange':
-        return Promise.resolve(exchangeSnapshot);
-      case 'list_collab_receive_sessions':
-        return Promise.resolve(receiveSessions);
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    get_collab_exchange: () => exchangeSnapshot,
+    list_collab_receive_sessions: () => receiveSessions,
+  });
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
     (listeners[event] ??= []).push(cb as unknown as (p: unknown) => void);

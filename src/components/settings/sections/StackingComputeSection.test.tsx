@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { StackingComputeSection } from './StackingComputeSection';
 import { SettingsDefaultsProvider, type SettingsDefaults } from '../../../settings/SettingsDefaultsContext';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 
 vi.mock('../../../api');
 
@@ -13,26 +14,13 @@ vi.mock('../../../contexts/NotificationContext', () => ({
 
 const DEFAULTS_FIXTURE = { kv: { 'compute.memory_budget_mb': '0' } } as unknown as SettingsDefaults;
 
-function mockInvoke(command: string): Promise<unknown> {
-  switch (command) {
-    case 'get_settings_defaults':
-      return Promise.resolve(DEFAULTS_FIXTURE);
-    case 'get_setting':
-      return Promise.resolve('0');
-    case 'set_setting':
-      return Promise.resolve(undefined);
-    default:
-      return Promise.resolve(null);
-  }
-}
-
 function setCalls() {
   return vi.mocked(api.invoke).mock.calls.filter(([cmd]) => cmd === 'set_setting');
 }
 
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(mockInvoke as never);
+  routeInvoke({ get_settings_defaults: DEFAULTS_FIXTURE, get_setting: '0', set_setting: undefined });
   vi.mocked(api.listen).mockResolvedValue(() => {});
 });
 

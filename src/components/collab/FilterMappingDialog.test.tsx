@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import FilterMappingDialog from './FilterMappingDialog';
 import { api } from '../../api';
+import { routeInvoke, unexpectedCommand } from '../../test/apiMock';
 import type { FilterMappingSheet, GateReport } from '../../types/models';
 
 vi.mock('../../api');
@@ -26,11 +27,7 @@ const report: GateReport = { projectId: 'p', total: 4, publishable: 4, rows: [],
 
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'get_collab_filter_mapping_sheet') return Promise.resolve(sheet);
-    if (command === 'set_collab_filter_mappings') return Promise.resolve(report);
-    return Promise.reject(new Error(`unexpected ${command}`));
-  }) as typeof api.invoke);
+  routeInvoke({ get_collab_filter_mapping_sheet: sheet, set_collab_filter_mappings: report }, unexpectedCommand);
 });
 
 describe('FilterMappingDialog', () => {
@@ -132,10 +129,7 @@ describe('FilterMappingDialog', () => {
 
   it('Escape does not close while a save is running', async () => {
     let release: (r: GateReport) => void = () => {};
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_filter_mapping_sheet') return Promise.resolve(sheet);
-      return new Promise<GateReport>((res) => { release = res; });
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_filter_mapping_sheet: sheet }, () => new Promise<GateReport>((res) => { release = res; }));
     const onClose = vi.fn();
     render(<FilterMappingDialog projectId="p" onClose={onClose} onSaved={vi.fn()} />);
     await waitFor(() => expect(screen.getAllByRole('combobox')).toHaveLength(4));

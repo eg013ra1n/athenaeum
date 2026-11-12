@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { SessionStateProvider } from '../../../contexts/SessionStateContext';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import ModerationTab from './ModerationTab';
 import type { ModerationFrameView, ProjectFrameView } from '../../../types/models';
 import type { FrameVM } from './frames';
@@ -68,10 +69,7 @@ beforeEach(() => {
   moderationItems = [];
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'list_collab_moderation') return Promise.resolve(moderationItems);
-    return Promise.resolve(null);
-  }) as never);
+  routeInvoke({ list_collab_moderation: () => moderationItems });
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
 });
 
@@ -132,18 +130,16 @@ function restoreCalls(): { projectId: string; frameUuid: string }[] {
 
 describe('ModerationTab — visibility (P10)', () => {
   it('canRemap only: renders just the Filters section', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_filter_buckets')
-        return Promise.resolve({
-          projectId: 'proj-1',
-          dictionary: [{ canonical: 'L', aliases: [], kind: 'mono' }],
-          buckets: [
-            { publisherAccountId: 'acc-1', publisher: 'Alice', instrume: 'ASI', filterRaw: 'Red', canonical: 'L', frameUuids: ['u-1'] },
-          ],
-          running: null,
-        });
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collab_filter_buckets: {
+        projectId: 'proj-1',
+        dictionary: [{ canonical: 'L', aliases: [], kind: 'mono' }],
+        buckets: [
+          { publisherAccountId: 'acc-1', publisher: 'Alice', instrume: 'ASI', filterRaw: 'Red', canonical: 'L', frameUuids: ['u-1'] },
+        ],
+        running: null,
+      },
+    });
     renderTab(null, { canModerate: false, canRemap: true });
     expect(await screen.findByText('Filters')).toBeInTheDocument();
     expect(await screen.findByText('Red')).toBeInTheDocument();
@@ -294,16 +290,15 @@ describe('ModerationTab — Reject', () => {
       mod({ frameUuid: 'u1', fileName: 'a.fits' }),
       mod({ frameUuid: 'u2', fileName: 'b.fits' }),
     ];
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'list_collab_moderation') return Promise.resolve(moderationItems);
-      if (command === 'reject_collab_frame') {
+    routeInvoke({
+      list_collab_moderation: () => moderationItems,
+      reject_collab_frame: () => {
         if (rejectCalls().length >= 1) {
           return Promise.reject(new Error('This frame was already decided — refresh the queue.'));
         }
-        return Promise.resolve(null);
-      }
-      return Promise.resolve(null);
-    }) as never);
+        return null;
+      },
+    });
 
     const { onDecided } = renderTab();
     await screen.findByText('a.fits');
@@ -460,15 +455,14 @@ describe('ModerationTab — Excluded frames', () => {
   it('a failure on the second of two stops the batch and reads "Restored 1 of 2 — …"', async () => {
     const excludedA = excludedFrame({ frameUuid: 'e-1', fileName: 'bad1.fits' });
     const excludedB = excludedFrame({ frameUuid: 'e-2', fileName: 'bad2.fits' });
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'list_collab_moderation') return Promise.resolve(moderationItems);
-      if (command === 'restore_collab_frame') {
+    routeInvoke({
+      list_collab_moderation: () => moderationItems,
+      restore_collab_frame: () => {
         const n = restoreCalls().length;
         if (n === 2) return Promise.reject(new Error('offline'));
-        return Promise.resolve(null);
-      }
-      return Promise.resolve(null);
-    }) as never);
+        return null;
+      },
+    });
 
     const { onDecided } = renderTab([excludedA, excludedB], { requireApproval: false });
     await screen.findByText('bad1.fits');

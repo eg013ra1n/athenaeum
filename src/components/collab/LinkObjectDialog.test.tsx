@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import LinkObjectDialog from './LinkObjectDialog';
 import { api } from '../../api';
+import { routeInvoke, unexpectedCommand } from '../../test/apiMock';
 import type { LinkSuggestion, LinkedSetView } from '../../types/models';
 
 vi.mock('../../api');
@@ -14,11 +15,10 @@ const suggestion = (o: Partial<LinkSuggestion> = {}): LinkSuggestion => ({
 }) as LinkSuggestion;
 
 function mock(list: unknown, link?: () => Promise<unknown>) {
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'list_collab_link_suggestions') return Promise.resolve(list);
-    if (command === 'set_collab_link') return link ? link() : Promise.resolve(null);
-    return Promise.reject(new Error(`unexpected ${command}`));
-  }) as typeof api.invoke);
+  routeInvoke({
+    list_collab_link_suggestions: list,
+    set_collab_link: () => (link ? link() : null),
+  }, unexpectedCommand);
 }
 
 const renderDialog = (links: LinkedSetView[] = [], onClose = vi.fn()) =>

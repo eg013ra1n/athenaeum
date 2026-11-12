@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { NotificationProvider } from '../../../contexts/NotificationContext';
 import { ToastStack } from '../../Toast';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import type { BlinkViewerProps } from '../../blink/types';
 import type { CollabBlinkEntry, FileWithFrame } from '../../../types/models';
 import { fromLibrary, fromOwn, type FrameVM } from './frames';
@@ -70,10 +71,7 @@ describe('ProjectBlink', () => {
   it("own To review: Don't publish confirms, writes withheld, and the reload turns the badge to withheld under the same key", async () => {
     const vm = fromOwn(own({ frameId: 1, segment: 'review', calibratedPath: '/c/c_a.fits' }));
     const onChanged = vi.fn();
-    vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
-      if (cmd === 'get_collab_blink_frames') return [entry('f1', 'calibrated')];
-      return 1;
-    }) as never);
+    routeInvoke({ get_collab_blink_frames: () => [entry('f1', 'calibrated')] }, () => 1);
     const { rerender } = render(tree({ table: 'review', vms: [vm], onChanged }));
     await waitFor(() => expect(blink).not.toBeNull());
 
@@ -130,10 +128,7 @@ describe('ProjectBlink', () => {
   it('a moderator in Library gets Exclude from project; it opens ExcludeDialog over Blink with the matching rows', async () => {
     const vm = fromLibrary(lib(), new Map());
     const onChanged = vi.fn();
-    vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
-      if (cmd === 'get_collab_blink_frames') return [entry('u1', 'replica')];
-      return null;
-    }) as never);
+    routeInvoke({ get_collab_blink_frames: () => [entry('u1', 'replica')] });
     render(tree({ table: 'library', vms: [vm], canModerate: true, onChanged }));
     await waitFor(() => expect(blink).not.toBeNull());
     const exclude = blink!.actions!.find((a) => a.id === 'exclude')!;
@@ -152,10 +147,7 @@ describe('ProjectBlink', () => {
     const vm = fromOwn(own({ frameId: 1, frameUuid: 'u1', segment: 'published', pubState: 'published', localState: 'own_held' }));
     const onChanged = vi.fn();
     const onExcluded = vi.fn();
-    vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
-      if (cmd === 'get_collab_blink_frames') return [entry('f1', 'calibrated')];
-      return null;
-    }) as never);
+    routeInvoke({ get_collab_blink_frames: () => [entry('f1', 'calibrated')] });
     render(tree({ table: 'published', vms: [vm], canModerate: true, onChanged, onExcluded }));
     await waitFor(() => expect(blink).not.toBeNull());
     act(() => { void blink!.actions!.find((a) => a.id === 'exclude')!.run([blink!.frames[0]]); });

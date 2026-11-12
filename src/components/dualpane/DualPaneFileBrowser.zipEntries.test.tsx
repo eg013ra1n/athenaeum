@@ -5,6 +5,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { ScanRootWithAvailability } from '../../types/helpers';
 import DualPaneFileBrowser from './DualPaneFileBrowser';
 
@@ -33,48 +34,40 @@ beforeEach(() => {
   URL.createObjectURL = vi.fn(() => 'blob:preview');
   URL.revokeObjectURL = vi.fn();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { entry?: string; innerDir?: string }) => {
-    switch (cmd) {
-      case 'get_directory_contents':
-        return Promise.resolve({
-          subdirectories: [],
-          files: [],
-          zips: [{ path: ZIP, size: 1_000_000, frameEntries: 4, createdByOperation: null, inBlackHole: false }],
-        });
-      case 'list_zip_entries':
-        return Promise.resolve({
-          subdirectories: [],
-          files: [
-            {
-              file: { id: 5, path: `${ZIP}/top.fits`, filename: 'top.fits', size: 2048, format: 'FITS' },
-              frame: { id: 5, imagetyp: 'LIGHT', object: 'M31', date_obs: '2025-10-12T20:00:00', instrume: 'C', override_: false },
-            },
-          ],
-          otherEntries: [
-            { name: 'E_001.fits', size: 11, released: false, copyPath: null, readable: true },
-            { name: 'E_002.fits', size: 12, released: false, copyPath: null, readable: true },
-            { name: 'E_003.fits', size: 13, released: false, copyPath: null, readable: true },
-            { name: 'notes.txt', size: 5, released: false, copyPath: null, readable: false },
-          ],
-        });
-      case 'get_zip_entry_header':
-        return Promise.resolve({
-          entry: args?.entry,
-          frame: {
-            object: 'GAIA',
-            filter: 'L',
-            imagetyp: 'Light',
-            exptime: EXPOSURES[args?.entry ?? ''] ?? null,
-            date_obs: '2025-10-25T21:00:00',
-          },
-          header: 'SIMPLE  = T\nOBJECT  = GAIA',
-        });
-      case 'preview_zip_entry':
-        return Promise.resolve(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    get_directory_contents: () => ({
+      subdirectories: [],
+      files: [],
+      zips: [{ path: ZIP, size: 1_000_000, frameEntries: 4, createdByOperation: null, inBlackHole: false }],
+    }),
+    list_zip_entries: () => ({
+      subdirectories: [],
+      files: [
+        {
+          file: { id: 5, path: `${ZIP}/top.fits`, filename: 'top.fits', size: 2048, format: 'FITS' },
+          frame: { id: 5, imagetyp: 'LIGHT', object: 'M31', date_obs: '2025-10-12T20:00:00', instrume: 'C', override_: false },
+        },
+      ],
+      otherEntries: [
+        { name: 'E_001.fits', size: 11, released: false, copyPath: null, readable: true },
+        { name: 'E_002.fits', size: 12, released: false, copyPath: null, readable: true },
+        { name: 'E_003.fits', size: 13, released: false, copyPath: null, readable: true },
+        { name: 'notes.txt', size: 5, released: false, copyPath: null, readable: false },
+      ],
+    }),
+    get_zip_entry_header: (args?: { entry?: string }) => ({
+      entry: args?.entry,
+      frame: {
+        object: 'GAIA',
+        filter: 'L',
+        imagetyp: 'Light',
+        exptime: EXPOSURES[args?.entry ?? ''] ?? null,
+        date_obs: '2025-10-25T21:00:00',
+      },
+      header: 'SIMPLE  = T\nOBJECT  = GAIA',
+    }),
+    preview_zip_entry: () => new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+  });
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
 });
 

@@ -5,6 +5,7 @@ import { NotificationProvider } from '../../../contexts/NotificationContext';
 import { SessionStateProvider } from '../../../contexts/SessionStateContext';
 import { ToastStack } from '../../Toast';
 import { api } from '../../../api';
+import { routeInvoke } from '../../../test/apiMock';
 import type { OwnFrameRow } from '../../../types/models';
 import MyFramesTab, { type MyFramesTabProps } from './MyFramesTab';
 
@@ -190,12 +191,9 @@ describe('MyFramesTab — segments', () => {
   });
 
   it('the link dialog lists a linked set once, and Unlink sends linked:false', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      Promise.resolve(
-        cmd === 'list_collab_link_suggestions'
-          ? [{ framesSetId: 1, name: 'M31', lightCount: 40, withinRadius: true, distanceDeg: 0, alreadyLinked: true }]
-          : null,
-      )) as never);
+    routeInvoke({
+      list_collab_link_suggestions: [{ framesSetId: 1, name: 'M31', lightCount: 40, withinRadius: true, distanceDeg: 0, alreadyLinked: true }],
+    });
     renderTab({ links: [{ framesSetId: 1, name: 'M31', lightCount: 40, withinRadius: true }] as never });
     fireEvent.click(screen.getByRole('button', { name: '+ Link an object' }));
     await screen.findByRole('button', { name: 'Unlink' });
@@ -207,8 +205,7 @@ describe('MyFramesTab — segments', () => {
   });
 
   it('the link dialog lists the linked objects with their target state', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      Promise.resolve(cmd === 'list_collab_link_suggestions' ? [] : null)) as never);
+    routeInvoke({ list_collab_link_suggestions: [] });
     renderTab({
       links: [
         { framesSetId: 1, name: 'M31', lightCount: 40, withinRadius: true },
@@ -362,10 +359,7 @@ describe('MyFramesTab — Held back solve', () => {
 
   it('4a. the Reason group renders "Solve 1"; clicking starts a batch solve; completion here reloads once', async () => {
     const onReload = vi.fn();
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'plate_solve_batch') return Promise.resolve(undefined);
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({ plate_solve_batch: undefined });
     renderTab({ rows: [heldSolveRow(4, 'h1.fits')], segment: 'held', onReload });
 
     const btn = await screen.findByRole('button', { name: 'Solve 1' });
@@ -394,10 +388,7 @@ describe('MyFramesTab — Held back solve', () => {
 describe('MyFramesTab — Held back analyze', () => {
   it('5. Analyze on a two-set group opens a menu naming both sets; picking one analyzes it; completion reloads', async () => {
     const onReload = vi.fn();
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'analyze_frame_set') return Promise.resolve(undefined);
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({ analyze_frame_set: undefined });
     renderTab({
       rows: [
         own({
@@ -444,10 +435,7 @@ describe('MyFramesTab — Held back analyze', () => {
 
 describe('MyFramesTab — solve failure notifies', () => {
   it('6. a failed plate_solve_batch raises a warning notification titled "Could not start the solve"', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'plate_solve_batch') return Promise.reject(new Error('solver busy'));
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({ plate_solve_batch: () => Promise.reject(new Error('solver busy')) });
     renderTab({
       rows: [
         own({
@@ -530,8 +518,7 @@ describe('MyFramesTab — Published', () => {
   });
 
   it("8d. Blink's Exclude from project reports through onExcluded too", () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      cmd === 'get_collab_blink_frames' ? new Promise(() => {}) : Promise.resolve(null)) as never);
+    routeInvoke({ get_collab_blink_frames: new Promise(() => {}) });
     const onExcluded = vi.fn();
     const onDisk = exclusionFixture.map((r) => ({ ...r, localState: 'own_held' }));
     renderTab({ rows: onDisk, segment: 'published', canModerate: true, onExcluded });
@@ -588,10 +575,7 @@ describe('MyFramesTab — fix round 1, finding 1: the toolbar Analyze excludes a
 
 describe('MyFramesTab — fix round 1, finding 2: listeners subscribe once, not per render', () => {
   it('a rerender with a new inline onReload does not re-subscribe api.listen, and the LATEST onReload runs on completion', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'plate_solve_batch') return Promise.resolve(undefined);
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({ plate_solve_batch: undefined });
 
     const onReload1 = vi.fn();
     const props = defaultProps({
@@ -669,8 +653,7 @@ describe('MyFramesTab — Blink', () => {
   });
 
   it('a second Blink from another segment while the first resolve is in flight re-resolves with that table', () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      cmd === 'get_collab_blink_frames' ? new Promise(() => {}) : Promise.resolve(null)) as never);
+    routeInvoke({ get_collab_blink_frames: new Promise(() => {}) });
     const { rerender, props } = renderTab({
       rows: [
         own({ frameId: 1, fileName: 'a.fits', segment: 'ready' }),

@@ -3,6 +3,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import BlinkViewer from './BlinkViewer';
 import { DialogShell } from './ui';
 import type { BlinkAction, BlinkFrame } from './blink/types';
@@ -45,14 +46,14 @@ const invoked = (cmd: string) => vi.mocked(api.invoke).mock.calls.filter(([c]) =
 beforeEach(() => {
   drawn.length = 0;
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
-    if (cmd === 'get_blink_threads_max') return 2;
-    if (cmd === 'get_setting') return '';
-    if (cmd === 'get_collab_frame_image' || cmd === 'read_fits_image_rustafits' || cmd === 'get_stacking_aligned_image') {
-      return new Uint8Array([0xff, 0xd8]);
-    }
-    if (cmd === 'get_blackholed_file_ids') return [];
-    return null;
+  const jpegBytes = () => new Uint8Array([0xff, 0xd8]);
+  routeInvoke({
+    get_blink_threads_max: 2,
+    get_setting: '',
+    get_collab_frame_image: jpegBytes,
+    read_fits_image_rustafits: jpegBytes,
+    get_stacking_aligned_image: jpegBytes,
+    get_blackholed_file_ids: () => [],
   });
 });
 afterEach(() => vi.restoreAllMocks());
@@ -276,13 +277,12 @@ describe('BlinkViewer — existing callers', () => {
   });
 
   it('a frame whose zip is in the Black Hole shows as rejected and offers neither Blackhole nor Restore', async () => {
-    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === 'get_blink_threads_max') return 2;
-      if (cmd === 'get_setting') return '';
-      if (cmd === 'read_fits_image_rustafits') return new Uint8Array([0xff, 0xd8]);
-      if (cmd === 'get_blackholed_file_ids') return [];
-      if (cmd === 'get_zip_blackholed_file_ids') return [7];
-      return null;
+    routeInvoke({
+      get_blink_threads_max: 2,
+      get_setting: '',
+      read_fits_image_rustafits: () => new Uint8Array([0xff, 0xd8]),
+      get_blackholed_file_ids: () => [],
+      get_zip_blackholed_file_ids: () => [7],
     });
     const inZip = { id: 7, path: '/z/night.zip/L/a.fits', filename: 'a.fits', format: 'FITS', archive_zip_path: '/z/night.zip', archive_path_in_zip: 'L/a.fits', archived_in_operation: null } as unknown as CatalogFile;
     renderBlink({ frames: [entry(1, { imageRef: undefined, key: undefined, file: inZip })] });
@@ -314,12 +314,13 @@ describe('BlinkViewer — frame navigation keys', () => {
   const counter = () => screen.getByText(/^\/ \d+$/).parentElement!.textContent;
 
   it('the arrow keys step frames while every image is still caching; left / right set the speed', async () => {
-    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === 'get_blink_threads_max') return 2;
-      if (cmd === 'get_setting') return '';
-      if (cmd === 'get_blackholed_file_ids') return [];
-      if (cmd === 'read_fits_image_rustafits' || cmd === 'get_frame_preview') return new Promise(() => {}); // never cached
-      return null;
+    const neverCached = () => new Promise(() => {});
+    routeInvoke({
+      get_blink_threads_max: 2,
+      get_setting: '',
+      get_blackholed_file_ids: () => [],
+      read_fits_image_rustafits: neverCached,
+      get_frame_preview: neverCached,
     });
     renderBlink({ frames: three() });
     await waitFor(() => expect(invoked('read_fits_image_rustafits').length).toBeGreaterThan(0));
@@ -408,12 +409,11 @@ describe('BlinkViewer — aligned frames of a stacking run', () => {
   it('a load of the other variant that lands after the toggle is dropped', async () => {
     const sized = (n: number) => new Uint8Array(n);
     let landLate: () => void = () => {};
-    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === 'get_blink_threads_max') return 2;
-      if (cmd === 'get_setting') return '';
-      if (cmd === 'get_stacking_aligned_image') return new Promise((r) => { landLate = () => r(sized(3)); });
-      if (cmd === 'read_fits_image_rustafits') return sized(2);
-      return null;
+    routeInvoke({
+      get_blink_threads_max: 2,
+      get_setting: '',
+      get_stacking_aligned_image: () => new Promise((r) => { landLate = () => r(sized(3)); }),
+      read_fits_image_rustafits: () => sized(2),
     });
     const created = vi.mocked(URL.createObjectURL);
     created.mockClear();
@@ -504,12 +504,11 @@ describe('BlinkViewer — a decode in flight when the aligned switch flips', () 
     });
     // The blob URL tells the variants apart: the aligned image is 3 bytes, the original 2.
     vi.mocked(URL.createObjectURL).mockImplementation((b) => `blob:${(b as Blob).size}`);
-    vi.mocked(api.invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === 'get_blink_threads_max') return 2;
-      if (cmd === 'get_setting') return '';
-      if (cmd === 'get_stacking_aligned_image') return new Uint8Array(3);
-      if (cmd === 'read_fits_image_rustafits') return new Uint8Array(2);
-      return null;
+    routeInvoke({
+      get_blink_threads_max: 2,
+      get_setting: '',
+      get_stacking_aligned_image: () => new Uint8Array(3),
+      read_fits_image_rustafits: () => new Uint8Array(2),
     });
   });
   afterEach(() => {

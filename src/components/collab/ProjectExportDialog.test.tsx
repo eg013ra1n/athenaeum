@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import ProjectExportDialog from './ProjectExportDialog';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 
 vi.mock('../../api');
 vi.mock('../../api/desktop', () => ({ pickDirectory: vi.fn().mockResolvedValue('/out') }));
@@ -64,13 +65,12 @@ describe('ProjectExportDialog', () => {
   });
 
   it('shows the non-zero result counts after a successful export', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      cmd === 'export_collab_project'
-        ? Promise.resolve({
-            success: true, filesOrganized: 3, linked: 1, copied: 0, rewritten: 2, failed: 0,
-            outputDir: '/o', warnings: ['Failed to export a.fits: boom'], scriptsGenerated: [], error: null,
-          })
-        : Promise.resolve(null)) as never);
+    routeInvoke({
+      export_collab_project: {
+        success: true, filesOrganized: 3, linked: 1, copied: 0, rewritten: 2, failed: 0,
+        outputDir: '/o', warnings: ['Failed to export a.fits: boom'], scriptsGenerated: [], error: null,
+      },
+    });
     render(<ProjectExportDialog projectId="p" onClose={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /Browse/ }));
     await waitFor(() => expect(screen.getByRole('button', { name: /Export$/ })).not.toBeDisabled());

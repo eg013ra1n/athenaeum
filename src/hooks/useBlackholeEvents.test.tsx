@@ -3,6 +3,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import { useBlackholeEvents } from './useBlackholeEvents';
 
 vi.mock('../api');
@@ -17,11 +18,10 @@ beforeEach(() => {
   fileLevel = [1];
   zipLevel = [3];
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
-    if (cmd === 'get_blackholed_file_ids') return fileLevel;
-    if (cmd === 'get_zip_blackholed_file_ids') return zipLevel;
-    return null;
-  }) as never);
+  routeInvoke({
+    get_blackholed_file_ids: () => fileLevel,
+    get_zip_blackholed_file_ids: () => zipLevel,
+  });
   vi.mocked(api.listen).mockImplementation(((name: string, cb: (p: unknown) => void) => {
     listeners.set(name, cb);
     return Promise.resolve(() => { listeners.delete(name); });

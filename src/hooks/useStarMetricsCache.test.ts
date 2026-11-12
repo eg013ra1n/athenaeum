@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderHook, waitFor } from '@testing-library/react';
 import { useStarMetricsCache, type StarSource } from './useStarMetricsCache';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import type { StarMetricsResponse } from '../types/models';
 
 vi.mock('../api');
@@ -12,9 +13,7 @@ const PROJECT_REF = { projectId: 'p1', frame: { frameId: null, frameUuid: 'u1' }
 
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(async (command: string) =>
-    (command === 'get_frame_star_metrics' ? answer(1) : answer(2)) as never,
-  );
+  routeInvoke({ get_frame_star_metrics: () => answer(1) }, () => answer(2));
 });
 
 afterEach(() => vi.restoreAllMocks());

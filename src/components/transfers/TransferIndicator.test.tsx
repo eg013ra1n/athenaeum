@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { CollabExchangeProvider } from '../../contexts/CollabExchangeContext';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import { TransferIndicator } from './TransferIndicator';
 import type { ExchangeSnapshot, FlowView, ProjectFlows, SyncStatus } from '../../types/models';
 
@@ -75,10 +76,7 @@ beforeEach(() => {
   mockVisible = true;
   snapshot = { projects: [], names: [] };
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'get_collab_exchange') return Promise.resolve(snapshot);
-    return Promise.resolve(null);
-  }) as never);
+  routeInvoke({ get_collab_exchange: () => snapshot });
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
 });

@@ -12,6 +12,7 @@ import { advance, PAST_THE_DEBOUNCE_MS } from '../../test/fakeClock';
 import { SettingsDefaultsProvider } from '../../settings/SettingsDefaultsContext';
 import { PlateSolveSettingsPanel } from './PlateSolveSettingsPanel';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { PlateSolveConfig } from '../../types/plate-solve';
 
 vi.mock('../../api');
@@ -38,26 +39,15 @@ const PLATE_SOLVE_CONFIG_FIXTURE: PlateSolveConfig = {
   bright_cache_path: null,
 } as unknown as PlateSolveConfig;
 
-function mockInvoke(command: string, _args?: Record<string, unknown>): Promise<unknown> {
-  switch (command) {
-    case 'get_settings_defaults':
-      return Promise.resolve({ kv: {}, plateSolve: PLATE_SOLVE_CONFIG_FIXTURE });
-    case 'get_plate_solve_config':
-      return Promise.resolve(PLATE_SOLVE_CONFIG_FIXTURE);
-    case 'get_catalog_status':
-      return Promise.resolve([]);
-    case 'get_index_status':
-      return Promise.resolve([]);
-    case 'set_plate_solve_config':
-      return Promise.resolve(undefined);
-    default:
-      return Promise.resolve(null);
-  }
-}
-
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(mockInvoke as never);
+  routeInvoke({
+    get_settings_defaults: { kv: {}, plateSolve: PLATE_SOLVE_CONFIG_FIXTURE },
+    get_plate_solve_config: PLATE_SOLVE_CONFIG_FIXTURE,
+    get_catalog_status: [],
+    get_index_status: [],
+    set_plate_solve_config: undefined,
+  });
   vi.mocked(api.listen).mockResolvedValue(() => {});
   notifyMock.mockClear();
   vi.useFakeTimers();

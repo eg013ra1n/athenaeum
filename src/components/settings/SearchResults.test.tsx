@@ -4,6 +4,7 @@ import { render, screen } from '@testing-library/react';
 import { SearchResults } from './SearchResults';
 import { SettingsDefaultsProvider, type SettingsDefaults } from '../../settings/SettingsDefaultsContext';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 
 vi.mock('../../api');
 
@@ -26,22 +27,9 @@ const DEFAULTS_FIXTURE = {
   },
 } as unknown as SettingsDefaults;
 
-function mockInvoke(command: string): Promise<unknown> {
-  switch (command) {
-    case 'get_settings_defaults':
-      return Promise.resolve(DEFAULTS_FIXTURE);
-    case 'get_setting':
-      return Promise.resolve('');
-    case 'get_blink_threads_max':
-      return Promise.resolve(8);
-    default:
-      return Promise.resolve(null);
-  }
-}
-
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(mockInvoke as never);
+  routeInvoke({ get_settings_defaults: DEFAULTS_FIXTURE, get_setting: '', get_blink_threads_max: 8 });
   vi.mocked(api.listen).mockResolvedValue(() => {});
 });
 

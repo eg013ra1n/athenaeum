@@ -16,6 +16,7 @@ import { advance, PAST_THE_DEBOUNCE_MS } from '../../test/fakeClock';
 import { SettingsDefaultsProvider } from '../../settings/SettingsDefaultsContext';
 import { AnalysisSettingsPanel } from './AnalysisSettingsPanel';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { AnalysisConfig } from '../../types/analysis-config';
 
 vi.mock('../../api');
@@ -32,27 +33,17 @@ const ANALYSIS_CONFIG_FIXTURE: AnalysisConfig = {
   batch_concurrency: 0,
 };
 
-function mockInvoke(command: string, _args?: Record<string, unknown>): Promise<unknown> {
-  switch (command) {
-    case 'get_settings_defaults':
-      return Promise.resolve({ kv: {}, analysis: ANALYSIS_CONFIG_FIXTURE });
-    case 'get_analysis_config':
-      return Promise.resolve(ANALYSIS_CONFIG_FIXTURE);
-    case 'get_setting':
-      // A valid stored value per key: nothing saved for the rejection
-      // thresholds (the empty JSON blob), `px` for the FWHM unit.
-      return Promise.resolve(_args?.key === 'analysis.fwhm_default_unit' ? 'px' : '');
-    case 'set_analysis_config':
-    case 'delete_setting':
-      return Promise.resolve(undefined);
-    default:
-      return Promise.resolve(null);
-  }
-}
-
 beforeEach(() => {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(mockInvoke as never);
+  routeInvoke({
+    get_settings_defaults: { kv: {}, analysis: ANALYSIS_CONFIG_FIXTURE },
+    get_analysis_config: ANALYSIS_CONFIG_FIXTURE,
+    // A valid stored value per key: nothing saved for the rejection
+    // thresholds (the empty JSON blob), `px` for the FWHM unit.
+    get_setting: (args?: { key?: string }) => (args?.key === 'analysis.fwhm_default_unit' ? 'px' : ''),
+    set_analysis_config: undefined,
+    delete_setting: undefined,
+  });
   vi.mocked(api.listen).mockResolvedValue(() => {});
   notifyMock.mockClear();
   vi.useFakeTimers();

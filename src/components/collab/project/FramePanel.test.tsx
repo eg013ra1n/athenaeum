@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router-dom';
 import FramePanel from './FramePanel';
 import { api } from '../../../api';
+import { routeInvoke, unexpectedCommand } from '../../../test/apiMock';
 import type { FrameHolderView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
 import type { FrameVM } from './frames';
 
@@ -161,10 +162,7 @@ function fire(event: string, payload: unknown) {
 beforeEach(() => {
   for (const k of Object.keys(listeners)) delete listeners[k];
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'get_collab_frame_holders') return Promise.resolve([] as FrameHolderView[]);
-    return Promise.reject(new Error(`unexpected ${command}`));
-  }) as typeof api.invoke);
+  routeInvoke({ get_collab_frame_holders: [] as FrameHolderView[] }, unexpectedCommand);
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
     (listeners[event] ??= []).push(cb as unknown as (payload: unknown) => void);
@@ -256,10 +254,7 @@ describe('FramePanel', () => {
         contentVersion: 1,
       },
     ];
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return Promise.resolve(holders);
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: holders }, unexpectedCommand);
 
     renderPanel(baseFrame());
 
@@ -272,10 +267,7 @@ describe('FramePanel', () => {
 
   it('(e) a failed holders call shows an inline error', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return Promise.reject(new Error('offline'));
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: () => Promise.reject(new Error('offline')) }, unexpectedCommand);
 
     renderPanel(baseFrame());
 
@@ -343,11 +335,7 @@ describe('FramePanel', () => {
 
   it('(h) canModerate sees Restore on an excluded frame, which restores and calls onChanged; without canModerate there is no button', async () => {
     const onChanged = vi.fn();
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return Promise.resolve([]);
-      if (command === 'restore_collab_frame') return Promise.resolve(undefined);
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: [], restore_collab_frame: undefined }, unexpectedCommand);
     const frame = baseFrame({ excluded: true, acceptedReason: 'trailed', pubState: 'published' });
 
     const { unmount } = renderPanel(frame, { canModerate: true, onChanged });
@@ -376,10 +364,7 @@ describe('FramePanel', () => {
         contentVersion: 1,
       },
     ];
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return Promise.resolve(first);
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: first }, unexpectedCommand);
 
     renderPanel(baseFrame());
     await waitFor(() => expect(screen.getByText('Kostya')).toBeInTheDocument());
@@ -388,10 +373,7 @@ describe('FramePanel', () => {
     const second = new Promise<FrameHolderView[]>((resolve) => {
       resolveSecond = resolve;
     });
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return second;
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: second }, unexpectedCommand);
 
     fire('collab-peers-changed', { projectId: 'p' });
 
@@ -434,10 +416,7 @@ describe('FramePanel', () => {
         contentVersion: 1,
       },
     ];
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return Promise.resolve(first);
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: first }, unexpectedCommand);
     renderPanel(baseFrame());
     await waitFor(() => expect(screen.getByText('Kostya')).toBeInTheDocument());
     const before = vi
@@ -456,10 +435,7 @@ describe('FramePanel', () => {
   function lib() { return baseLib(); }
   function own(overrides: Partial<OwnFrameRow> = {}) { return baseOwn(overrides); }
   function holdersAnswer(rows: FrameHolderView[]) {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_frame_holders') return Promise.resolve(rows);
-      return Promise.reject(new Error(`unexpected ${command}`));
-    }) as typeof api.invoke);
+    routeInvoke({ get_collab_frame_holders: rows }, unexpectedCommand);
   }
 
   it('title block: mono file name and status chips', () => {

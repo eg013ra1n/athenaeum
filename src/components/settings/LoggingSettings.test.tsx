@@ -9,6 +9,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import LoggingSettings from './LoggingSettings';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { LoggingConfigResponse } from '../../types/models';
 
 vi.mock('../../api');
@@ -41,11 +42,7 @@ async function flush() {
 }
 
 function mockGetLoggingConfig(resp: LoggingConfigResponse) {
-  vi.mocked(api.invoke).mockImplementation((command: string) => {
-    if (command === 'get_logging_config') return Promise.resolve(resp);
-    if (command === 'set_logging_config') return Promise.resolve(undefined);
-    return Promise.resolve(undefined);
-  });
+  routeInvoke({ get_logging_config: resp, set_logging_config: undefined }, () => undefined);
 }
 
 beforeEach(() => {

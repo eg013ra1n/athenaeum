@@ -7,6 +7,7 @@ import { advance } from '../../test/fakeClock';
 import { QuadIndexBlock } from './QuadIndexBlock';
 import { getIndexStatusText } from './useIndexPacks';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { IndexStatusInfo, IndexDownloadProgress } from '../../types/helpers';
 
 vi.mock('../../api');
@@ -37,10 +38,7 @@ beforeEach(() => {
   status = [base, narrow];
   progressCb = undefined;
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-    if (cmd === 'get_index_status') return Promise.resolve(status);
-    return Promise.resolve('ok');
-  }) as never);
+  routeInvoke({ get_index_status: () => status }, () => 'ok');
   vi.mocked(api.listen).mockReset();
   vi.mocked(api.listen).mockImplementation(((_evt: string, cb: (p: IndexDownloadProgress) => void) => {
     progressCb = cb;

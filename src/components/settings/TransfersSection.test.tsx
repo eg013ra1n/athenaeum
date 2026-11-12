@@ -7,6 +7,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { SettingsDefaultsProvider } from '../../settings/SettingsDefaultsContext';
 import TransfersSection from './TransfersSection';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 
 vi.mock('../../api');
 vi.mock('../../api/desktop', () => ({ pickDirectory: vi.fn() }));
@@ -26,19 +27,12 @@ const KV: Record<string, string> = {
 beforeEach(() => {
   notifyMock.mockReset();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { key?: string }) => {
-    switch (cmd) {
-      case 'get_settings_defaults':
-        return Promise.resolve({ kv: KV });
-      case 'get_setting':
-        return Promise.resolve(KV[args?.key ?? ''] ?? '');
-      case 'get_transfer_paths':
-      case 'get_transfer_storage':
-        return Promise.reject('not in this test');
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  routeInvoke({
+    get_settings_defaults: { kv: KV },
+    get_setting: (args?: { key?: string }) => KV[args?.key ?? ''] ?? '',
+    get_transfer_paths: () => Promise.reject('not in this test'),
+    get_transfer_storage: () => Promise.reject('not in this test'),
+  });
   vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
 });
 
@@ -93,21 +87,13 @@ describe('TransfersSection — collaboration streams', () => {
   });
 
   it('a refused write is one notification, no banner', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string, args?: { key?: string }) => {
-      switch (cmd) {
-        case 'get_settings_defaults':
-          return Promise.resolve({ kv: KV });
-        case 'get_setting':
-          return Promise.resolve(KV[args?.key ?? ''] ?? '');
-        case 'set_collab_max_upload_streams':
-          return Promise.reject('collab.max_upload_streams must be 1..=64');
-        case 'get_transfer_paths':
-        case 'get_transfer_storage':
-          return Promise.reject('not in this test');
-        default:
-          return Promise.resolve(null);
-      }
-    }) as never);
+    routeInvoke({
+      get_settings_defaults: { kv: KV },
+      get_setting: (args?: { key?: string }) => KV[args?.key ?? ''] ?? '',
+      set_collab_max_upload_streams: () => Promise.reject('collab.max_upload_streams must be 1..=64'),
+      get_transfer_paths: () => Promise.reject('not in this test'),
+      get_transfer_storage: () => Promise.reject('not in this test'),
+    });
     renderIt();
     const input = await inputFor('Simultaneous collaboration uploads');
     fireEvent.change(input, { target: { value: '16' } });

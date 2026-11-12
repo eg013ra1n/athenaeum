@@ -6,6 +6,7 @@ import { ToastStack } from '../Toast';
 import CollabLiveStatus, { dotState, liveStatusLabel, pillLabel, SYNC_WAIT_MS } from './CollabLiveStatus';
 import DeviceReplaceDialog, { DeviceReplaceProvider } from './DeviceReplaceDialog';
 import { api } from '../../api';
+import { routeInvoke } from '../../test/apiMock';
 import type { CollabLiveStatus as Status, CollabStorageStatus } from '../../types/models';
 import { advance } from '../../test/fakeClock';
 
@@ -37,8 +38,7 @@ beforeEach(() => {
   emit = undefined;
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-    cmd === 'get_collab_live_status' ? Promise.resolve(base) : Promise.resolve(null)) as never);
+  routeInvoke({ get_collab_live_status: base });
   vi.mocked(api.listen).mockImplementation(((name: string, h: (p: Status) => void) => {
     if (name === 'collab-live-status') emit = h;
     return Promise.resolve(() => {});
@@ -120,20 +120,16 @@ describe('CollabLiveStatus', () => {
   });
 
   it('says when changes are seen by periodic check only', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-      cmd === 'get_collab_live_status'
-        ? Promise.resolve({ ...base, watcherDegraded: true })
-        : Promise.resolve(null)) as never);
+    routeInvoke({ get_collab_live_status: { ...base, watcherDegraded: true } });
     renderIt();
     expect(await screen.findByText('Changes are seen by periodic check only')).toBeInTheDocument();
   });
 
   it('a failed Sync now is a warning notification', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'get_collab_live_status') return Promise.resolve(base);
-      if (cmd === 'collab_sync_now') return Promise.reject('The live exchange is not running');
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collab_live_status: base,
+      collab_sync_now: () => Promise.reject('The live exchange is not running'),
+    });
     renderIt();
     fireEvent.click(await screen.findByRole('button', { name: 'Sync now' }));
     const toasts = await screen.findAllByRole('status');
@@ -151,27 +147,24 @@ describe('CollabLiveStatus', () => {
   });
 
   it('offers "Replace a device…" when the folder belongs to another device, and it opens the dialog', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'get_collab_live_status')
-        return Promise.resolve({ ...base, storage: 'unavailable', storageReason: 'other_device' });
-      if (cmd === 'get_collab_storage_status')
-        return Promise.resolve({
-          ...storageOk,
-          state: 'unavailable',
-          reason: 'other_device',
-          replace: {
-            deviceId: 'old-id',
-            deviceName: 'Old laptop',
-            lastSeenAt: '2026-09-22T00:00:00Z',
-            offlineDays: 3,
-            prompt: false,
-            proposeRetire: false,
-            path: '/c',
-            markerMismatch: false,
-          },
-        });
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collab_live_status: { ...base, storage: 'unavailable', storageReason: 'other_device' },
+      get_collab_storage_status: {
+        ...storageOk,
+        state: 'unavailable',
+        reason: 'other_device',
+        replace: {
+          deviceId: 'old-id',
+          deviceName: 'Old laptop',
+          lastSeenAt: '2026-09-22T00:00:00Z',
+          offlineDays: 3,
+          prompt: false,
+          proposeRetire: false,
+          path: '/c',
+          markerMismatch: false,
+        },
+      },
+    });
     render(
       <MemoryRouter>
         <NotificationProvider>
@@ -195,8 +188,7 @@ const NOW = '2026-09-29T10:00:00Z';
 
 /** Sets `get_collab_live_status`'s answer; every other command answers null. */
 function mockStatus(s: Status) {
-  vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
-    cmd === 'get_collab_live_status' ? Promise.resolve(s) : Promise.resolve(null)) as never);
+  routeInvoke({ get_collab_live_status: s });
 }
 
 /** The pill in the providers the component needs (notifications for a
@@ -265,11 +257,10 @@ describe('CollabLiveStatus pill variant', () => {
 
   it('reads "Syncing…" while the sync runs, then its label again', async () => {
     let finish: (() => void) | undefined;
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'get_collab_live_status') return Promise.resolve({ ...base, state: 'connecting' });
-      if (cmd === 'collab_sync_now') return new Promise<void>((r) => { finish = r; });
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collab_live_status: { ...base, state: 'connecting' },
+      collab_sync_now: () => new Promise<void>((r) => { finish = r; }),
+    });
     renderPill();
     fireEvent.click(await screen.findByRole('button', { name: 'Connecting…' }));
     expect(await screen.findByRole('button', { name: 'Syncing…' })).toBeDisabled();
@@ -284,11 +275,10 @@ describe('CollabLiveStatus pill variant', () => {
   });
 
   it('a failed Sync from the pill is a warning notification', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'get_collab_live_status') return Promise.resolve(base);
-      if (cmd === 'collab_sync_now') return Promise.reject('The live exchange is not running');
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collab_live_status: base,
+      collab_sync_now: () => Promise.reject('The live exchange is not running'),
+    });
     renderPill();
     fireEvent.click(await screen.findByRole('button', { name: /^Live · synced/ }));
     const toasts = await screen.findAllByRole('status');
@@ -305,13 +295,10 @@ describe('CollabLiveStatus pill variant', () => {
   });
 
   it('keeps the folder-owner link after the pill, as a link button', async () => {
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'get_collab_live_status')
-        return Promise.resolve({ ...base, storage: 'unavailable', storageReason: 'other_device' });
-      if (cmd === 'get_collab_storage_status')
-        return Promise.resolve({ ...storageOk, state: 'unavailable', reason: 'other_device' });
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collab_live_status: { ...base, storage: 'unavailable', storageReason: 'other_device' },
+      get_collab_storage_status: { ...storageOk, state: 'unavailable', reason: 'other_device' },
+    });
     render(
       <MemoryRouter>
         <NotificationProvider>
@@ -405,11 +392,10 @@ describe('CollabLiveStatus pill — fix round 1', () => {
 
   it('onSynced does not run after a failed Sync', async () => {
     const onSynced = vi.fn();
-    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
-      if (cmd === 'get_collab_live_status') return Promise.resolve(base);
-      if (cmd === 'collab_sync_now') return Promise.reject('The live exchange is not running');
-      return Promise.resolve(null);
-    }) as never);
+    routeInvoke({
+      get_collab_live_status: base,
+      collab_sync_now: () => Promise.reject('The live exchange is not running'),
+    });
     renderPill(NOW, onSynced);
     fireEvent.click(await screen.findByRole('button', { name: /^Live · synced/ }));
     expect(await screen.findByText('Sync now failed')).toBeInTheDocument();

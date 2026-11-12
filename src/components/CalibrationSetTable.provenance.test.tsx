@@ -3,6 +3,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { api } from '../api';
+import { routeInvoke } from '../test/apiMock';
 import { MasterProvenanceBlock } from './CalibrationSetTable';
 import type { MasterProvenanceInfo } from '../types/models';
 
@@ -26,7 +27,7 @@ const base: MasterProvenanceInfo = {
 
 function provide(p: MasterProvenanceInfo) {
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation((async (cmd: string) => (cmd === 'get_master_provenance' ? p : null)) as never);
+  routeInvoke({ get_master_provenance: p });
 }
 
 describe('MasterProvenanceBlock — originals line', () => {
