@@ -5426,27 +5426,7 @@ async fn run_publish(
         display,
     } = publish_link(&pass, &project).await?;
 
-    // A6: one publishing device per (project, account). When the cached
-    // binding names another device (in service — a revoked one reads as
-    // unbound), no new frame is generated or announced here: the hub would
-    // refuse it. Versions of this device's own frames still go out.
-    let me = crate::api::account::own_device_id(ctx).map_err(|e| {
-        tracing::error!(project_id, error = %e, "publish: this device's key is unavailable");
-        e
-    })?;
-    // Fix round 2 (M3): a binding naming a device THIS device replaced is
-    // not "elsewhere" (that device is retired; the hub reads it unbound).
-    let replaced = {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        crate::db::collab_live::replaced_devices(&conn).map_err(|e| {
-            tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the replaced devices failed");
-            internal(e)
-        })?
-    };
-    let bound_elsewhere: Option<Option<String>> = binding
-        .filter(|b| b.device_id != me && !replaced.contains_key(&b.device_id))
-        .map(|b| b.name);
+    let bound_elsewhere = publish_bound_elsewhere(ctx, project_id, binding)?;
     let mut refused_new = 0usize;
 
     // Spec §4.1 step 5: stale prepared frames go back to Ready — only now,
@@ -7482,6 +7462,37 @@ async fn publish_link(
         account_id,
         display,
     })
+}
+
+/// A6: the name of the other device the project is bound to, when there is
+/// one. The own device is read before the replaced devices.
+fn publish_bound_elsewhere(
+    ctx: &ServiceContext,
+    project_id: &str,
+    binding: Option<crate::db::collab::PublishingDevice>,
+) -> Result<Option<Option<String>>, ApiError> {
+    // A6: one publishing device per (project, account). When the cached
+    // binding names another device (in service — a revoked one reads as
+    // unbound), no new frame is generated or announced here: the hub would
+    // refuse it. Versions of this device's own frames still go out.
+    let me = crate::api::account::own_device_id(ctx).map_err(|e| {
+        tracing::error!(project_id, error = %e, "publish: this device's key is unavailable");
+        e
+    })?;
+    // Fix round 2 (M3): a binding naming a device THIS device replaced is
+    // not "elsewhere" (that device is retired; the hub reads it unbound).
+    let replaced = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab_live::replaced_devices(&conn).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the replaced devices failed");
+            internal(e)
+        })?
+    };
+    let bound_elsewhere: Option<Option<String>> = binding
+        .filter(|b| b.device_id != me && !replaced.contains_key(&b.device_id))
+        .map(|b| b.name);
+    Ok(bound_elsewhere)
 }
 
 // ── Moderation (wave 2 Task 11): per-frame review queue + approve/reject ──────
