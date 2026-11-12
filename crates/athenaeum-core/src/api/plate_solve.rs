@@ -117,6 +117,54 @@ pub async fn download_catalog_layers(
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
+/// Download and install the named quad-index packs into the app-data directory
+/// (the catalog database's parent) and return the index root path. Runs the
+/// download on a blocking thread; progress rides the `index-download-progress`
+/// event through `emitter`, and a failure is also emitted as an `error`
+/// progress event before it is returned. Already-installed packs are skipped.
+/// The cancel flag is local to the call and registered nowhere.
+pub async fn download_index_packs(
+    ctx: &ServiceContext,
+    emitter: Arc<dyn ProgressEmitter>,
+    names: Vec<String>,
+) -> Result<String, ApiError> {
+    use crate::catalog::index_prebuilt::{self, IndexProgressMapper};
+    let app_data_dir = db(ctx)?
+        .path()
+        .to_path_buf()
+        .parent()
+        .ok_or_else(|| ApiError::Internal("Cannot determine app data directory".into()))?
+        .to_path_buf();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mapper = Arc::new(IndexProgressMapper::new());
+    let (emitter_progress, mapper_progress) = (emitter.clone(), mapper.clone());
+
+    let result = tokio::task::spawn_blocking(move || {
+        index_prebuilt::download_index_packs(&app_data_dir, &names, cancel_flag, &|progress| {
+            emit_event(
+                emitter_progress.as_ref(),
+                "index-download-progress",
+                &mapper_progress.map(progress),
+            );
+        })
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("download task panicked: {e}")))?;
+
+    match result {
+        Ok(p) => Ok(p.display().to_string()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            emit_event(
+                emitter.as_ref(),
+                "index-download-progress",
+                &mapper.error(msg.clone()),
+            );
+            Err(ApiError::Internal(msg))
+        }
+    }
+}
+
 // ========== Batch solve ==========
 
 // snake_case on the wire (no `rename_all`): the UI reads `frame_id`,
