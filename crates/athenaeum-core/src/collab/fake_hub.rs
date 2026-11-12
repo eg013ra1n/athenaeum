@@ -11,8 +11,13 @@
 //! hub through its HTTP routes (as the app does) and reach into its state
 //! directly (as a portal admin or another member would).
 //!
-//! The responders implement the hub rules the app depends on (hub `main`
-//! 6127951, `routes/frames.rs` / `routes/holders.rs`, amended for the v3
+//! The hub's own recorded answers are the reference: `fake_hub_contract`
+//! replays them against this fake, and the hub commit they were copied from
+//! is in `tests/fixtures/hub_contract/HUB_COMMIT`. Where this fake and a
+//! recorded answer differ, the fake is wrong.
+//!
+//! The responders implement the hub rules the app depends on
+//! (`routes/frames.rs` / `routes/holders.rs`, amended for the v3
 //! live-exchange wire contract):
 //!
 //! - `gateVersion` must equal the current thresholds version (0 when none):
@@ -32,11 +37,11 @@
 //! - a claim the hub writes itself (announce, accepted version) is
 //!   implicit: a `full: true` report keeps it unless it lists the frame under
 //!   `remove` (allowed beside `full`), and any report write clears the mark
-//!   (hub 06198cc, migration 0025); a report is validated with the hub's
+//!   (hub migration 0025); a report is validated with the hub's
 //!   rules and words (`validate_report`, the 100 000-item cap);
 //! - the holders snapshot names a device by the DEVICE's own registry name
-//!   (hub b485578, `COALESCE(d.name, '')`): a device with no name reads `""`,
-//!   never its member's name;
+//!   (`COALESCE(d.name, '')`): a device with no name reads `""`,
+//!   never its member's name, and lists the devices sorted by public key;
 //! - every manifest-visible change bumps the project version and stamps the
 //!   touched rows' `manifestVersion` with it, and every visible claim change
 //!   bumps the project's `holderSeq` once per commit;
@@ -3274,6 +3279,9 @@ fn holders_snapshot(st: &FakeHubState, acct: &FakeAccount, pid: &str) -> Respons
             }));
         }
     }
+
+    // The hub lists the devices by public key, whatever the member order.
+    devices.sort_by(|a, b| a["device"].as_str().cmp(&b["device"].as_str()));
 
     ok(json!({
         "epoch": st.epoch,
