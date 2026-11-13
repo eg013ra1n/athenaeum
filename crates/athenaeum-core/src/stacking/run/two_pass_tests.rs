@@ -527,7 +527,7 @@ fn two_pass_decision_is_cached_on_the_second_run() {
     );
 }
 
-/// One member recalibrated (its source file's catalog size moved, so its calibration hash and with it its
+/// One member recalibrated (its source file's pixels changed, so its calibration hash and with it its
 /// registration hash against the candidate move): the key moves, the row is stale, the dry pass runs again and
 /// the row is rewritten under the new key.
 #[test]
@@ -536,14 +536,7 @@ fn two_pass_cache_misses_when_a_member_changes() {
     let rc1 = rig.run(Arc::new(NullEmitter));
     let key1 = rig.decision_row(&rc1).unwrap().config_hash;
 
-    rig.fixture
-        .conn
-        .execute(
-            "UPDATE files SET size = size + 1000 WHERE id = \
-                 (SELECT file_id FROM frames WHERE id = ?1)",
-            rusqlite::params![rig.light_ids[2]],
-        )
-        .unwrap();
+    rewrite_light_pixels(&rig.fixture.conn, rig.light_ids[2]);
     let (rc2, logs2) =
         crate::stacking::telemetry::capture_logs(|| rig.run(Arc::new(NullEmitter)));
     assert!(!logs2.contains("two-pass decision reused"), "{logs2}");

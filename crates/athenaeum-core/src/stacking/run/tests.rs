@@ -711,6 +711,16 @@ impl Pass1Rig {
     /// Stage 1 only (Calibrate, or Prepare for an attested set) at `cfg`, in a fresh run context on this rig's
     /// working tree. The frame ids of the group, in the order its jobs run, are `plan_groups[0].frames`.
     pub(super) fn try_stage_one(&self, cfg: &StackingConfig) -> Result<(), RunError> {
+        let mut rc = self.run_context(cfg, Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>);
+        stage_calibrate(&mut rc)
+    }
+
+    /// A fresh run context (new run row, unresolved book) on this rig's working tree, reporting to `emitter`.
+    pub(super) fn run_context(
+        &self,
+        cfg: &StackingConfig,
+        emitter: Arc<dyn ProgressEmitter>,
+    ) -> RunContext {
         let (run_id, group_ids) = seed_run_and_groups(
             &self.fixture.conn,
             self.fixture.set_id,
@@ -720,7 +730,7 @@ impl Pass1Rig {
         );
         let mut rc = test_context(
             self.ctx.clone(),
-            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            emitter,
             run_id,
             self.fixture.set_id,
             SET_NAME,
@@ -732,10 +742,10 @@ impl Pass1Rig {
         );
         if let Some(origins) = &self.origins {
             // The memo carries the origins too: an attested set's rows must carry the hash the gate computes.
-            rc.memo = HashMemo::new(origins.clone());
+            rc.memo = HashMemo::for_run(origins.clone());
             rc.origins = origins.clone();
         }
-        stage_calibrate(&mut rc)
+        rc
     }
 
     /// Stage 1 at `cfg` with the stage-one worker of `frame_id` (writing under `dir`) ended `Cancelled` without
@@ -789,7 +799,7 @@ impl Pass1Rig {
         rc.rerun_from = rerun_from;
         if let Some(origins) = &self.origins {
             // The memo carries the origins too: an attested set's rows must carry the hash the gate computes.
-            rc.memo = HashMemo::new(origins.clone());
+            rc.memo = HashMemo::for_run(origins.clone());
             rc.origins = origins.clone();
         }
         if let Some(n) = cancel_after {
@@ -2246,6 +2256,33 @@ pub(super) fn make_lights_three_plane(
             )
             .unwrap();
     }
+}
+
+/// Change one light's pixels in place (one byte of the corner pixel, in the data unit: same size, time moved ahead,
+/// no star touched), leaving its catalog row as the scanner last saw it: a later run finds the row no longer
+/// describes the file and samples the file itself (FI-1). The file-identity stand-in of "this light was touched"
+/// for a test of the cascade.
+pub(super) fn rewrite_light_pixels(conn: &rusqlite::Connection, frame_id: i64) {
+    let path: String = conn
+        .query_row(
+            "SELECT path FROM files WHERE id = (SELECT file_id FROM frames WHERE id = ?1)",
+            [frame_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    // The data unit starts at the first 2880-byte block after the END card.
+    let end_card = (0..bytes.len() / 80)
+        .find(|i| &bytes[i * 80..i * 80 + 8] == b"END     ")
+        .expect("a FITS header ends with END");
+    let data_start = (end_card + 1) * 80;
+    let data_start = data_start.div_ceil(2880) * 2880;
+    bytes[data_start + 1] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_modified(before.modified().unwrap() + std::time::Duration::from_secs(5))
+        .unwrap();
 }
 
 pub(super) fn handle_of(rc: &RunContext, file_name: &str) -> i64 {

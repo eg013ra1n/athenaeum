@@ -46,6 +46,9 @@ use crate::stacking::paths::{self, EstimateInputs};
 use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
+use crate::stacking::source_identity::{
+    BookMiss, InputIdentity, SourceSamples, NOT_IN_CATALOG,
+};
 
 /// One pipeline stage (spec §10.2's `stage` enum, minus the `Ok`-only
 /// distinction between "never run" and "cached"). [`Self::as_str`] is the
@@ -399,73 +402,89 @@ pub struct StackingPlan {
 // "fresh" from identical inputs, or a run would immediately invalidate its
 // own output the next time the plan is built.
 
-/// Format one resolved master file's identity for stage-1 hashing:
-/// `"<path>|<size>|<modified_at>"`. A metadata read failure (the master went
-/// missing between the readiness check and this one) is logged and folded
-/// into the string as `"<path>|missing"` rather than propagated. That token
-/// is a CONSTANT, not a changing one — it keeps the hash *defined* (so a
-/// caller can still store/compare it) rather than panicking or aborting the
-/// whole plan; it is the `masterFiles` blocker, not this string, that does
-/// the actual refusing while the file stays gone.
-fn master_identity(path: &Path) -> String {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let modified_at = meta
-                .modified()
-                .map(|m| chrono::DateTime::<chrono::Utc>::from(m).to_rfc3339())
-                .unwrap_or_default();
-            format!("{}|{}|{modified_at}", path.display(), meta.len())
-        }
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "stacking: master file metadata read failed while hashing stage 1"
-            );
-            format!("{}|missing", path.display())
+/// Why a stage-1 hash could not be formed. A `NotSampled` input is the common, expected case
+/// (the gate has no banked sample; the run could not read the file): the gate reads it as stale
+/// quietly, the run excludes the frame with its text. Everything else is a real failure.
+#[derive(Debug)]
+pub(crate) enum StageOneError {
+    /// An input of the frame has no identity; `why` is one of the `source_identity` reasons.
+    NotSampled { path: String, why: &'static str },
+    Other(ApiError),
+}
+
+impl std::fmt::Display for StageOneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSampled { path, why } => write!(f, "{path}: {why}"),
+            Self::Other(e) => write!(f, "{e}"),
         }
     }
 }
 
-/// [`master_identity`] for a catalog master that may live inside a zip: such a row has no file to stat
-/// at its catalog path, so its identity is the entry's cataloged size plus its CRC32 (the entry's
-/// modified time when no CRC32 was recorded yet). A master that changes inside a rewritten zip changes
-/// the stage-1 hash, like a rewritten disk file does. Any other path is [`master_identity`].
-fn master_identity_in(conn: &Connection, path: &Path) -> String {
-    let row: rusqlite::Result<Option<(i64, Option<i64>, String)>> = conn
-        .query_row(
-            "SELECT size, archive_entry_crc32, modified_at FROM files
-             WHERE path = ?1 AND archive_zip_path IS NOT NULL AND archive_path_in_zip IS NOT NULL",
-            [path.to_string_lossy().as_ref()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional();
-    match row {
-        Ok(Some((size, crc, modified_at))) => {
-            let token = crc.map_or_else(|| modified_at, |c| format!("{:08x}", c as u32));
-            format!("{}|{size}|zip:{token}", path.display())
-        }
-        Ok(None) => master_identity(path),
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "stacking: master zip markers unreadable while hashing stage 1");
-            master_identity(path)
-        }
+impl From<ApiError> for StageOneError {
+    fn from(e: ApiError) -> Self {
+        Self::Other(e)
     }
+}
+
+impl From<StageOneError> for ApiError {
+    fn from(e: StageOneError) -> Self {
+        ApiError::Internal(e.to_string())
+    }
+}
+
+/// The identity of one input out of the book, with a miss turned into the error the stage-1 hash
+/// reports: the path and the frame id are known here, not in the book. Mapped at the two call
+/// sites that need it; there is no blanket `From<BookMiss>`.
+fn book_identity(
+    conn: &Connection,
+    samples: &mut SourceSamples,
+    path: &str,
+    frame_id: i64,
+) -> Result<InputIdentity, StageOneError> {
+    samples.identity(conn, path).map_err(|miss| match miss {
+        BookMiss::NotInCatalog => StageOneError::NotSampled {
+            path: path.to_string(),
+            why: NOT_IN_CATALOG,
+        },
+        BookMiss::OutsideRun => StageOneError::Other(ApiError::Internal(format!(
+            "{path} is outside the run's inputs"
+        ))),
+        BookMiss::Unresolved => StageOneError::Other(ApiError::Internal(format!(
+            "the run's inputs were not checked before frame {frame_id} was hashed"
+        ))),
+    })
+}
+
+/// A light's source for the hash: its `files.id`, size and sample, read through the book.
+fn light_source_of(
+    conn: &Connection,
+    samples: &mut SourceSamples,
+    frame: &GroupFrame,
+) -> Result<SourceIdentity, StageOneError> {
+    book_identity(conn, samples, &frame.path, frame.frame_id)?
+        .light_source(frame.file_id)
+        .map_err(|why| StageOneError::NotSampled {
+            path: frame.path.clone(),
+            why,
+        })
 }
 
 /// Stage 1's hash for an ATTESTED light (spec §13, plan 6b-2 C11): the
-/// Prepare subtree and the light's own `files` identity, with no master
-/// upstream, because an attested light is never calibrated.
-pub(crate) fn prepare_hash_for_catalog(cfg: &StackingConfig, frame: &GroupFrame) -> String {
-    stage_hash(
+/// Prepare subtree and the light's own identity (its size and sampled hash, FI-1), with no
+/// master upstream, because an attested light is never calibrated.
+pub(crate) fn prepare_hash_for_catalog(
+    conn: &Connection,
+    cfg: &StackingConfig,
+    frame: &GroupFrame,
+    samples: &mut SourceSamples,
+) -> Result<String, StageOneError> {
+    let source = light_source_of(conn, samples, frame)?;
+    Ok(stage_hash(
         &crate::stacking::config::prepare_subtree(cfg),
         &[],
-        &[SourceIdentity {
-            file_id: frame.file_id,
-            size: frame.size,
-            modified_at: frame.modified_at.clone(),
-        }],
-    )
+        &[source],
+    ))
 }
 
 /// Stage 1's hash for a prepared PROJECT frame (spec §5.1, plan 6b-2 C12):
@@ -480,7 +499,7 @@ pub(crate) fn prepare_hash_for_project(
     stage_hash(
         &crate::stacking::config::prepare_subtree(cfg),
         &[&format!("blake3:{blake3}")],
-        &[SourceIdentity {
+        &[SourceIdentity::Project {
             file_id: 0,
             size: byte_size,
             modified_at: String::new(),
@@ -489,11 +508,16 @@ pub(crate) fn prepare_hash_for_project(
 }
 
 /// Stage 1 (calibration) config-hash for one LIGHT frame (spec §9.3):
-/// `calibration_subtree(cfg)` + the identity of every master path this
+/// `calibration_subtree(cfg)` + the identity of every master this
 /// frame would actually apply ([`applied_master_paths`]: the catalog's links
 /// under the generator's own applicability rules, no file read — so a master
-/// inside a zip needs no extraction to be named) + the light's own `files`
-/// identity.
+/// inside a zip needs no extraction to be named) + the light's own identity.
+///
+/// Every identity comes out of `samples` (FI-1, FI-3): a master is named by its size and sampled
+/// hash, never by its path (a moved or rescanned master names the same bytes), a light by its
+/// `files.id`, size and sampled hash; a zip entry by its CRC. A rebuilt master has its
+/// `content_hash` NULLed and is sampled again, so it reads as the new file it is. An input the
+/// book has no identity for is [`StageOneError::NotSampled`], never papered over.
 ///
 /// `_divisors` is kept for the callers' signature: the hash no longer
 /// resolves the flat-normalization divisor (the calibrate stage's own
@@ -506,24 +530,29 @@ pub(crate) fn calibration_hash_for(
     conn: &Connection,
     cfg: &StackingConfig,
     frame: &GroupFrame,
+    samples: &mut SourceSamples,
     _divisors: &mut DivisorCache,
-) -> Result<String, ApiError> {
+) -> Result<String, StageOneError> {
     // The masters are named from the catalog alone: the hash needs their identity, never their pixels or
     // the flat-normalization divisor (the run's own resolve reads those, through the zip cache for a master
     // inside a zip). The same applicability rules as the resolve, so a light it would refuse is refused here.
-    let master_paths = applied_master_paths(conn, frame.frame_id, &cfg.calibration)?;
+    let master_paths = applied_master_paths(conn, frame.frame_id, &cfg.calibration)
+        .map_err(|e| StageOneError::Other(ApiError::from(e)))?;
 
-    let upstream: Vec<String> = master_paths
-        .iter()
-        .map(|p| master_identity_in(conn, p))
-        .collect();
+    let mut upstream: Vec<String> = Vec::with_capacity(master_paths.len());
+    for p in &master_paths {
+        let path = p.to_string_lossy();
+        let token = book_identity(conn, samples, &path, frame.frame_id)?
+            .master_token()
+            .map_err(|why| StageOneError::NotSampled {
+                path: path.to_string(),
+                why,
+            })?;
+        upstream.push(token);
+    }
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
 
-    let sources = [SourceIdentity {
-        file_id: frame.file_id,
-        size: frame.size,
-        modified_at: frame.modified_at.clone(),
-    }];
+    let sources = [light_source_of(conn, samples, frame)?];
 
     Ok(stage_hash(
         &calibration_subtree(cfg),
@@ -549,15 +578,41 @@ pub(crate) struct HashMemo {
     /// Where each frame comes from; the stage-1 hash dispatches on it. A
     /// frame with no origin is an error, never a silent catalog read.
     origins: FrameOrigins,
+    /// The identity of every input file: a catalog-only book for the plan gate, the run's own
+    /// book (filled once before stage 1) for a run. The stage-1 hash reads every identity from it.
+    samples: SourceSamples,
 }
 
 impl HashMemo {
-    pub(crate) fn new(origins: FrameOrigins) -> Self {
+    /// The plan gate's memo: its book resolves inputs from the catalog alone, no file I/O.
+    pub(crate) fn for_gate(origins: FrameOrigins) -> Self {
         HashMemo {
             divisors: DivisorCache::new(),
             by_frame: HashMap::new(),
             origins,
+            samples: SourceSamples::catalog_only(),
         }
+    }
+
+    /// A run's memo: its book is empty until the run samples its inputs
+    /// ([`Self::set_run_samples`]).
+    pub(crate) fn for_run(origins: FrameOrigins) -> Self {
+        HashMemo {
+            divisors: DivisorCache::new(),
+            by_frame: HashMap::new(),
+            origins,
+            samples: SourceSamples::for_run(),
+        }
+    }
+
+    /// The book has been filled (always true for the gate's).
+    pub(crate) fn samples_resolved(&self) -> bool {
+        self.samples.is_resolved()
+    }
+
+    /// Replace the book with the run's filled one.
+    pub(crate) fn set_run_samples(&mut self, book: SourceSamples) {
+        self.samples = book;
     }
 
     /// The stage-1 hash of one frame, dispatched by its origin.
@@ -566,13 +621,15 @@ impl HashMemo {
         conn: &Connection,
         cfg: &StackingConfig,
         frame: &GroupFrame,
-    ) -> Result<String, ApiError> {
+    ) -> Result<String, StageOneError> {
         match origin_of(&self.origins, frame.frame_id)? {
             FrameOrigin::Catalog {
                 attested: false, ..
-            } => calibration_hash_for(conn, cfg, frame, &mut self.divisors),
+            } => calibration_hash_for(conn, cfg, frame, &mut self.samples, &mut self.divisors),
             // Spec §13 (R3): an attested light is prepared, never calibrated.
-            FrameOrigin::Catalog { attested: true, .. } => Ok(prepare_hash_for_catalog(cfg, frame)),
+            FrameOrigin::Catalog { attested: true, .. } => {
+                prepare_hash_for_catalog(conn, cfg, frame, &mut self.samples)
+            }
             FrameOrigin::Project {
                 blake3, byte_size, ..
             } => Ok(prepare_hash_for_project(cfg, blake3, *byte_size)),
@@ -581,7 +638,9 @@ impl HashMemo {
 
     /// This frame's current stage-1 hash, memoized. The plan treats "can't
     /// tell" the same as "stale" rather than failing the whole build over a
-    /// frame the masters/links blocker already reports as unresolvable.
+    /// frame the masters/links blocker already reports as unresolvable. An input the gate has no
+    /// sample of is the expected "stale" (logged at `debug!`, the run samples it); any other
+    /// failure warns.
     fn calibration_hash(
         &mut self,
         conn: &Connection,
@@ -593,7 +652,16 @@ impl HashMemo {
         }
         let result = match self.hash_by_origin(conn, cfg, frame) {
             Ok(hash) => Some(hash),
-            Err(error) => {
+            Err(StageOneError::NotSampled { path, why }) => {
+                tracing::debug!(
+                    frame_id = frame.frame_id,
+                    path,
+                    reason = why,
+                    "stacking: stage-1 input not sampled; treating as stale"
+                );
+                None
+            }
+            Err(StageOneError::Other(error)) => {
                 tracing::warn!(
                     frame_id = frame.frame_id,
                     %error,
@@ -628,7 +696,7 @@ impl HashMemo {
         let result = self.hash_by_origin(conn, cfg, frame);
         self.by_frame
             .insert(frame.frame_id, result.as_ref().ok().cloned());
-        result
+        result.map_err(ApiError::from)
     }
 
     /// The memo's own [`DivisorCache`], for a caller (Task 6's calibrate
@@ -3540,7 +3608,7 @@ pub fn build_plan(
     // resolves every frame through, and memoizes each frame's own stage-1
     // hash so this loop and `compute_register_stale` below never resolve
     // the same frame twice.
-    let mut memo = HashMemo::new(origins.clone());
+    let mut memo = HashMemo::for_gate(origins.clone());
     let mut plan_groups = Vec::with_capacity(groups.len());
     let mut calibrate_stale = false;
     let mut measure_stale = false;
@@ -4428,7 +4496,7 @@ mod tests {
         let handles =
             crate::db::stacking::project_frame_handles(&f.conn, "p1", &["r1", "r2", "r3", "o1"])
                 .unwrap();
-        let mut memo = HashMemo::new(origins.clone());
+        let mut memo = HashMemo::for_gate(origins.clone());
 
         // Cases: (reference uuid, artifact keyed composed?) -> stale?
         let mut stale_for = |reference_uuid: &str, composed: bool| -> bool {
@@ -6239,8 +6307,8 @@ mod tests {
     }
 
     /// Masters kept inside a zip are not missing while the zip lists them: no
-    /// `masterFiles` / `masters` blocker, nothing to rebuild, and the stage-1 hash
-    /// follows the entry (its CRC32), not a constant "missing" token.
+    /// `masterFiles` / `masters` blocker and nothing to rebuild (the stage-1 token of such a master:
+    /// `a_zip_master_token_is_its_size_and_crc`).
     #[test]
     fn stacking_plan_has_no_master_blocker_when_masters_are_zip_resident() {
         use crate::zip_store::test_support::{zip_files, Shape};
@@ -6288,24 +6356,48 @@ mod tests {
         );
         assert_eq!(plan.readiness.missing_master_files, 0);
         assert!(plan.readiness.masters_unrebuildable.is_empty());
-        // The zip row's identity is its entry's and moves with the entry's CRC32 (a master
-        // rewritten inside its zip is a changed master, not a constant "missing" token).
-        let before = master_identity_in(
+    }
+
+    /// A zip-resident master's token is its cataloged size plus the entry's CRC32 (never a path, FI-3),
+    /// and moves with the CRC32: a master rewritten inside its zip is a changed master, not a constant
+    /// "missing" token.
+    #[test]
+    fn a_zip_master_token_is_its_size_and_crc() {
+        use crate::zip_store::test_support::{zip_files, Shape};
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, _flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let master_id = master_file_id(&f.conn, dark_set);
+        zip_files(
             &f.conn,
-            Path::new(&master_path_of(&f.conn, master_ids[0])),
+            &[master_id],
+            &f.dir.path().join("masters.zip"),
+            Shape::Foreign,
         );
+        let path = master_path_of(&f.conn, master_id);
+        let token = || {
+            SourceSamples::catalog_only()
+                .identity(&f.conn, &path)
+                .unwrap()
+                .master_token()
+                .unwrap()
+        };
+        let before = token();
         assert!(before.contains("|zip:"), "{before}");
+        assert!(!before.contains(&path), "a master is named by its bytes, not its path: {before}");
         f.conn
             .execute(
                 "UPDATE files SET archive_entry_crc32 = archive_entry_crc32 + 1 WHERE id = ?1",
-                [master_ids[0]],
+                [master_id],
             )
             .unwrap();
-        let after = master_identity_in(
-            &f.conn,
-            Path::new(&master_path_of(&f.conn, master_ids[0])),
-        );
+        let after = token();
         assert_ne!(before, after);
+        assert!(!after.contains(&path), "{after}");
     }
 
     fn master_path_of(conn: &Connection, file_id: i64) -> String {
@@ -6702,6 +6794,7 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
 
         let cfg = StackingConfig::default();
         let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
@@ -6709,7 +6802,7 @@ mod tests {
         let frame = groups[0].frames[0].clone();
 
         let mut divisors = DivisorCache::new();
-        let hash = calibration_hash_for(&f.conn, &cfg, &frame, &mut divisors).unwrap();
+        let hash = calibration_hash_for(&f.conn, &cfg, &frame, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
 
         // `path: None` — the hash matches, but there is no file to trust.
         crate::db::stacking::upsert_artifact(
@@ -6791,6 +6884,7 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
 
         let mut cfg_seconds = StackingConfig::default();
         cfg_seconds.grouping.exposure_mode = crate::stacking::config::ExposureMode::Seconds;
@@ -6802,7 +6896,7 @@ mod tests {
 
         let mut divisors = DivisorCache::new();
         for gf in &groups_seconds[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg_seconds, gf, &mut divisors).unwrap();
+            let hash = calibration_hash_for(&f.conn, &cfg_seconds, gf, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
             let cal_path = f.dir.path().join(format!("calibrated_{}.fits", gf.frame_id));
             std::fs::write(&cal_path, [0u8]).unwrap();
             crate::db::stacking::upsert_artifact(
@@ -6992,6 +7086,7 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
         (f, ids)
     }
 
@@ -7007,7 +7102,7 @@ mod tests {
         let mut divisors = DivisorCache::new();
         let mut calib_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, cfg, gf, &mut divisors).unwrap();
+            let hash = calibration_hash_for(&f.conn, cfg, gf, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
             calib_hashes.insert(gf.frame_id, hash);
         }
         (groups[0].key.clone(), calib_hashes)
@@ -7209,6 +7304,7 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
 
         let _folders = set_stacking_folders(&f.conn);
 
@@ -7227,7 +7323,7 @@ mod tests {
         // C-17: the LN hash folds the frame's measurement hash in too.
         let mut metrics_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
             calib_hashes.insert(gf.frame_id, hash);
         }
 
@@ -7706,6 +7802,7 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
 
         let _folders = set_stacking_folders(&f.conn);
 
@@ -7723,7 +7820,7 @@ mod tests {
         // C-17: the LN hash folds the frame's measurement hash in too.
         let mut metrics_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
             calib_hashes.insert(gf.frame_id, hash);
         }
 
@@ -7974,6 +8071,7 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
 
         let _folders = set_stacking_folders(&f.conn);
 
@@ -7995,7 +8093,7 @@ mod tests {
         // C-17: the LN hash folds the frame's measurement hash in too.
         let mut metrics_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
-            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
             calib_hashes.insert(gf.frame_id, hash);
         }
 
@@ -8313,6 +8411,7 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
         let settings = SettingsManager::new();
 
         let finished_run = |cleanup: CleanupPolicy, status: &str| {
@@ -8400,7 +8499,7 @@ mod tests {
             let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
             let gf = &groups[0].frames[0];
             let mut divisors = DivisorCache::new();
-            let calib_hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            let calib_hash = calibration_hash_for(&f.conn, &cfg, gf, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
@@ -8770,15 +8869,12 @@ mod tests {
             ("maximumQuality", preset(StackingPreset::MaximumQuality)),
             ("custom", custom),
         ];
-        let masters = [
-            "/m/dark.fits|100|2026-01-01T00:00:00+00:00",
-            "/m/flat.fits|200|2026-01-01T00:00:00+00:00",
-        ];
+        let masters = ["100|sample:00000000000000d1", "200|sample:00000000000000f1"];
         let src = || {
-            [SourceIdentity {
+            [SourceIdentity::Sampled {
                 file_id: 42,
                 size: 123_456,
-                modified_at: "2026-01-01T00:00:00Z".into(),
+                sample: "0000000000004242".into(),
             }]
         };
         let calib_k = crate::stacking::ln::SeedsCalibration {
@@ -8831,13 +8927,14 @@ mod tests {
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1 joins the registration subtree): reg and ln move on every line, the fastPreview line included (was default reg=efe8758fbdc4bbbd ln=532bfea1cac2d7b4; fastPreview reg=a038dcae26c2392a ln=4110659e2116091d; maximumQuality reg=bc4925cc6681db3a ln=b88fd0bd410fb46c; custom reg=916582f203cecefc ln=88cef42f95ee4e58); calib, meas, ln_ref and ln_cal are UNCHANGED (ln_ref's call passes the literals "r1,r2" / "m1,m2" and ln_cal folds ln_ref, so neither reads reg).
         // 2026-11-08 frame-level cache Task 1 (spec §5.2): the calibration hash writes a constant grouping tolerance (2.0), so the `custom` line (tolerance 5.0) moves calib, meas, reg and ln (was calib=2b725e5e99c87f49 meas=17be943a8f9c2671 reg=be7daf8c36663781 ln=d182aadf14a27b04); every other line and ln_ref, ln_cal are UNCHANGED.
         // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): measurement.maxStars default 24576 -> 9000 moves meas, reg, ln_ref, ln and ln_cal on every line (no line sets maxStars; calib is UNCHANGED). Was default: meas=cc923a65f1b367d7 reg=511225ffae14780f ln_ref=782cf447acae6ace ln=eda6a3f8d83f669c ln_cal=23f55e28c19f3459; fastPreview: meas=cc923a65f1b367d7 reg=f7e86b4f84ea0e62 ln_ref=500204de9b22c23d ln=3212a35f2a771db1 ln_cal=1ed2edc9d7ff5dcb; maximumQuality: meas=cc923a65f1b367d7 reg=cb8b5afc0aaeb3b4 ln_ref=364ed4c8ffba6878 ln=ec1a338d219d6364 ln_cal=86f453747dcafe8b; custom: meas=cc923a65f1b367d7 reg=c93dfd9d2706c88a ln_ref=364ed4c8ffba6878 ln=0a21b864ed61cc65 ln_cal=86f453747dcafe8b.
+        // 2026-11-13 file identity T4b (FI-1, FI-3): the stage-1 hash folds the light's sample (`Sampled { file_id: 42, size: 123_456, sample: "0000000000004242" }`) and the masters' `<size>|sample:<hash>` (`100|sample:00000000000000d1`, `200|sample:00000000000000f1`), no path and no modification time - calib, meas, reg and ln move on all four lines; ln_ref and ln_cal are UNCHANGED (their calls feed no calibration hash). Was default: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=9ac6df63dfa5ae4e ln=849de3ee29964d01; fastPreview: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=17e61b01965e78e7 ln=72bb3c10827ed22d; maximumQuality: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=09b2251a3179e3cb ln=461c9d22cc1aebf4; custom: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=04d832dd79a15511 ln=27c111578b301060.
         assert_eq!(
             got,
             vec![
-                "default: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=9ac6df63dfa5ae4e ln_ref=caec6041e0b648d2 ln=849de3ee29964d01 ln_cal=8936f0c89b6aa4fc",
-                "fastPreview: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=17e61b01965e78e7 ln_ref=1758b268745bb40f ln=72bb3c10827ed22d ln_cal=1d604dd931ee4992",
-                "maximumQuality: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=09b2251a3179e3cb ln_ref=0c672a29f5110c04 ln=461c9d22cc1aebf4 ln_cal=94dac0d536f3b975",
-                "custom: calib=f3cf4be2b2178358 meas=5756f9b3d472fa3d reg=04d832dd79a15511 ln_ref=0c672a29f5110c04 ln=27c111578b301060 ln_cal=94dac0d536f3b975",
+                "default: calib=b97f2367124df347 meas=ef39603a2fcbfabd reg=06e83acd94f47150 ln_ref=caec6041e0b648d2 ln=fb1839b30a95cbc5 ln_cal=8936f0c89b6aa4fc",
+                "fastPreview: calib=b97f2367124df347 meas=ef39603a2fcbfabd reg=e02b51bf4eee8407 ln_ref=1758b268745bb40f ln=d0d8958bb371a269 ln_cal=1d604dd931ee4992",
+                "maximumQuality: calib=b97f2367124df347 meas=ef39603a2fcbfabd reg=f3a8eb9773eafd3f ln_ref=0c672a29f5110c04 ln=e632ac38c6d1c157 ln_cal=94dac0d536f3b975",
+                "custom: calib=b97f2367124df347 meas=ef39603a2fcbfabd reg=4a285d1528435c11 ln_ref=0c672a29f5110c04 ln=8da6b7e103b70be4 ln_cal=94dac0d536f3b975",
             ]
         );
         // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
@@ -8870,14 +8967,11 @@ mod tests {
             calibration_subtree, resolve_config, stage_hash, SourceIdentity,
         };
         let line = |cfg: &StackingConfig| {
-            let masters = [
-                "/m/dark.fits|100|2026-01-01T00:00:00+00:00",
-                "/m/flat.fits|200|2026-01-01T00:00:00+00:00",
-            ];
-            let src = [SourceIdentity {
+            let masters = ["100|sample:00000000000000d1", "200|sample:00000000000000f1"];
+            let src = [SourceIdentity::Sampled {
                 file_id: 42,
                 size: 123_456,
-                modified_at: "2026-01-01T00:00:00Z".into(),
+                sample: "0000000000004242".into(),
             }];
             let calib_k = crate::stacking::ln::SeedsCalibration {
                 frame_ids: vec![11, 22],
@@ -8907,15 +9001,18 @@ mod tests {
         assert_eq!(line(&absent), line(&StackingConfig::default()));
         let (meas, reg, ln) = line(&at_max);
         // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): maxStars 9000 moves meas, reg and ln (was meas "cc923a65f1b367d7").
-        assert_eq!(meas, "5756f9b3d472fa3d");
+        // 2026-11-13 file identity T4b: the stage-1 hash folds samples, not times (was meas "5756f9b3d472fa3d").
+        assert_eq!(meas, "ef39603a2fcbfabd");
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "efe8758fbdc4bbbd"); meas did not move.
         // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): was "511225ffae14780f".
-        assert_eq!(reg, "9ac6df63dfa5ae4e");
+        // 2026-11-13 file identity T4b: was "9ac6df63dfa5ae4e".
+        assert_eq!(reg, "06e83acd94f47150");
         // 2026-11-01 pcores Task 1 (OD-1a): `ln` moved with the rejection default (was "affdd0e2d03f312e"); meas and reg did not.
         // 2026-11-02 Plan D DF-a: the merge of Plan D's meas / reg (MEASURE_VERSION 8, FITS_ARTIFACT_VERSION 3) with that default; was "f6fe01073ccedcca" on plan-d before the merge.
         // 2026-11-03 re-recorded, robust quad seed RQ-5 (ALIGN_VERSION 1; was "532bfea1cac2d7b4"): `ln` is computed from `reg`.
         // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): was "eda6a3f8d83f669c".
-        assert_eq!(ln, "849de3ee29964d01");
+        // 2026-11-13 file identity T4b: was "849de3ee29964d01".
+        assert_eq!(ln, "fb1839b30a95cbc5");
     }
 
     #[test]
@@ -8963,7 +9060,7 @@ mod tests {
     #[test]
     fn pass1_hash_is_never_a_metrics_key() {
         let cfg = StackingConfig::default();
-        let calib = "f3cf4be2b2178358";
+        let calib = "b97f2367124df347";
         let key = pass1_hash_for(&cfg, calib);
         for b in [1.5, 3.3066, 4.0] {
             assert_ne!(key, measurement_hash_for(&cfg, calib, Some(b)), "beta {b}");
@@ -8988,7 +9085,8 @@ mod tests {
         );
         // GOLDEN: recorded 2026-10-13, Plan A Task 11c (PASS1_ARTIFACT_VERSION 1, MEASURE_VERSION 4); re-recorded 2026-10-23, Plan B B4 (MEASURE_VERSION 5; was 3c734a7e6da780d3); re-recorded 2026-10-24, Plan C R-PC-10 (MEASURE_VERSION 6; was 50aca72a1f8efde0); re-recorded 2026-10-25, Plan C R-PC-10b (MEASURE_VERSION 7; was b34624fbf21f1f5f); re-recorded 2026-11-01, Plan D D2 (MEASURE_VERSION 8; was 5020355fd05d9c71). re-recorded 2026-11-02, Plan D D2c r1 (FITS_ARTIFACT_VERSION 3 folded into the measurement subtree; was d1feba185a3e9a76).
         // 2026-11-08 frame-level cache Task 11 (spec §5.8, owner ruling; no truth bar run): maxStars 9000 moves the first-pass key (was "66145a91b19774d5").
-        assert_eq!(key, "888cfb7cd6acb72f");
+        // 2026-11-13 file identity T4b: the calibration hash it keys on is the new default `calib` (b97f2367124df347; was f3cf4be2b2178358), so the key moves (was "888cfb7cd6acb72f").
+        assert_eq!(key, "448890454ab2a038");
     }
 
     /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over
@@ -9007,21 +9105,25 @@ mod tests {
             ids.push(id);
         }
         let (dark_set, flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
 
-        let mut master_paths: Vec<std::path::PathBuf> = Vec::new();
+        // The identities as the catalog holds them (size and banked sample), read independently of the
+        // book `calibration_hash_for` reads through.
+        let identity_of = |sql: &str, id: i64| -> (i64, String) {
+            f.conn
+                .query_row(sql, [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        let mut identities: Vec<String> = Vec::new();
         for set_id in [dark_set, flat_set] {
-            let path: String = f
-                .conn
-                .query_row(
-                    "SELECT fi.path FROM calibration_set_frames csf
-                     JOIN frames fr ON fr.id = csf.frame_id
-                     JOIN files fi ON fi.id = fr.file_id
-                     WHERE csf.set_id = ?1",
-                    [set_id],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            master_paths.push(std::path::PathBuf::from(path));
+            let (size, sample) = identity_of(
+                "SELECT fi.size, fi.content_hash FROM calibration_set_frames csf
+                 JOIN frames fr ON fr.id = csf.frame_id
+                 JOIN files fi ON fi.id = fr.file_id
+                 WHERE csf.set_id = ?1",
+                set_id,
+            );
+            identities.push(format!("{size}|sample:{sample}"));
         }
 
         let cfg = StackingConfig::default();
@@ -9029,21 +9131,163 @@ mod tests {
         assert_eq!(groups.len(), 1, "one group expected for this fixture");
         let frame = &groups[0].frames[0];
 
-        let identities: Vec<String> = master_paths.iter().map(|p| master_identity(p)).collect();
         let identity_refs: Vec<&str> = identities.iter().map(String::as_str).collect();
+        let (size, sample) = identity_of(
+            "SELECT size, content_hash FROM files WHERE id = ?1",
+            frame.file_id,
+        );
         let expected = stage_hash(
             &calibration_subtree(&cfg),
             &identity_refs,
-            &[SourceIdentity {
+            &[SourceIdentity::Sampled {
                 file_id: frame.file_id,
-                size: frame.size,
-                modified_at: frame.modified_at.clone(),
+                size,
+                sample,
             }],
         );
         let mut divisors = DivisorCache::new();
         assert_eq!(
-            calibration_hash_for(&f.conn, &cfg, frame, &mut divisors).unwrap(),
+            calibration_hash_for(&f.conn, &cfg, frame, &mut SourceSamples::catalog_only(), &mut divisors).unwrap(),
             expected
+        );
+    }
+
+    /// FI-3: a master is named by its size and sample, never its path. Moving the master row's path, then
+    /// relinking the master frame to a copy of its row under another root (what a rescan of a moved folder
+    /// leaves), changes no light's stage-1 hash.
+    #[test]
+    fn a_relocated_master_keeps_every_lights_stage_one_hash() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, _flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
+        let cfg = StackingConfig::default();
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        let hashes = |conn: &Connection| -> Vec<String> {
+            groups[0]
+                .frames
+                .iter()
+                .map(|gf| {
+                    calibration_hash_for(
+                        conn,
+                        &cfg,
+                        gf,
+                        &mut SourceSamples::catalog_only(),
+                        &mut DivisorCache::new(),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        let before = hashes(&f.conn);
+
+        // The master row's path moves (a relocation through Missing files).
+        let master_file = master_file_id(&f.conn, dark_set);
+        let old_path = master_path_of(&f.conn, master_file);
+        f.conn
+            .execute(
+                "UPDATE files SET path = '/relocated/root/' || filename WHERE id = ?1",
+                [master_file],
+            )
+            .unwrap();
+        assert_eq!(hashes(&f.conn), before, "a moved master names the same bytes");
+
+        // A rescan of the moved folder: a copy of the row under another root, the master frame relinked to it.
+        f.conn
+            .execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, content_hash)
+                 SELECT '/rescanned/root/' || filename, filename, size, modified_at, format, content_hash
+                   FROM files WHERE id = ?1",
+                [master_file],
+            )
+            .unwrap();
+        let copy = f.conn.last_insert_rowid();
+        f.conn
+            .execute("UPDATE frames SET file_id = ?1 WHERE file_id = ?2", [copy, master_file])
+            .unwrap();
+        assert_ne!(master_path_of(&f.conn, copy), old_path);
+        assert_eq!(hashes(&f.conn), before, "a relinked copy of the row names the same bytes");
+    }
+
+    /// The gate reads no file: a light whose row carries no sample reads as "stale", quietly (one debug
+    /// line naming the frame, the path and the reason), never as a warning. The run samples it.
+    #[test]
+    fn the_gate_reads_an_unsampled_input_as_stale_quietly() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
+        let cfg = StackingConfig::default();
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        let mut divisors = DivisorCache::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(
+                &f.conn,
+                &cfg,
+                gf,
+                &mut SourceSamples::catalog_only(),
+                &mut divisors,
+            )
+            .unwrap();
+            let cal_path = f.dir.path().join(format!("calibrated_{}.fits", gf.frame_id));
+            std::fs::write(&cal_path, [0u8]).unwrap();
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &StackSubject::FrameSet(f.set_id),
+                    frame_id: Some(gf.frame_id),
+                    group_key: "",
+                    kind: ArtifactKind::Calibrated,
+                    path: Some(cal_path.to_str().unwrap()),
+                    config_hash: &hash,
+                    size: Some(1),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
+        let settings = SettingsManager::new();
+        let plan_of = || {
+            build_plan(
+                &f.conn,
+                &settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(f.set_id),
+                Some(cfg.clone()),
+            )
+            .unwrap()
+        };
+        let fresh = plan_of();
+        assert!(!fresh.stale_stages.contains(&Stage::Calibrate), "{:?}", fresh.stale_stages);
+
+        let victim = &groups[0].frames[0];
+        f.conn
+            .execute("UPDATE files SET content_hash = NULL WHERE id = ?1", [victim.file_id])
+            .unwrap();
+        let (plan, logs) = crate::stacking::telemetry::capture_logs(plan_of);
+        assert!(plan.stale_stages.contains(&Stage::Calibrate), "{:?}", plan.stale_stages);
+        assert_eq!(plan.groups[0].calibrated_cached, plan.groups[0].frame_count - 1);
+        let line = logs
+            .lines()
+            .find(|l| l.contains("stage-1 input not sampled"))
+            .unwrap_or_else(|| panic!("no debug line: {logs}"));
+        assert!(line.contains("DEBUG"), "{line}");
+        assert!(line.contains("not sampled yet"), "{line}");
+        assert!(line.contains(&victim.path), "{line}");
+        assert!(
+            !logs.lines().any(|l| l.contains("WARN") && l.contains("stage-1")),
+            "an unsampled input is not a warning: {logs}"
         );
     }
 
@@ -9121,15 +9365,16 @@ mod tests {
             ids.push(id);
         }
         test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
         let cfg = StackingConfig::default();
         let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
         let frame = groups[0].frames[0].clone();
 
         let mut divisors = DivisorCache::new();
-        let expected = calibration_hash_for(&f.conn, &cfg, &frame, &mut divisors).unwrap();
+        let expected = calibration_hash_for(&f.conn, &cfg, &frame, &mut SourceSamples::catalog_only(), &mut divisors).unwrap();
 
         // No origin: an error naming the frame, never a silent catalog read.
-        let mut memo = HashMemo::new(std::sync::Arc::new(HashMap::new()));
+        let mut memo = HashMemo::for_gate(std::sync::Arc::new(HashMap::new()));
         let err = memo
             .calibration_hash_checked(&f.conn, &cfg, &frame)
             .unwrap_err();
@@ -9151,7 +9396,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let mut memo = HashMemo::new(origins);
+        let mut memo = HashMemo::for_gate(origins);
         assert_eq!(
             memo.calibration_hash_checked(&f.conn, &cfg, &frame)
                 .unwrap(),
@@ -9267,6 +9512,7 @@ mod tests {
                 [f.set_id],
             )
             .unwrap();
+        test_fixtures::bank_samples(&f.conn);
         let cfg = StackingConfig::default();
         let (groups, origins) =
             frame_source(&f.conn, &StackSubject::FrameSet(f.set_id), &cfg).unwrap();
@@ -9274,14 +9520,25 @@ mod tests {
         let expected = stage_hash(
             &prepare_subtree(&cfg),
             &[],
-            &[SourceIdentity {
+            &[SourceIdentity::Sampled {
                 file_id: frame.file_id,
                 size: frame.size,
-                modified_at: frame.modified_at.clone(),
+                sample: f
+                    .conn
+                    .query_row(
+                        "SELECT content_hash FROM files WHERE id = ?1",
+                        [frame.file_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap(),
             }],
         );
-        assert_eq!(prepare_hash_for_catalog(&cfg, &frame), expected);
-        let mut memo = HashMemo::new(origins);
+        assert_eq!(
+            prepare_hash_for_catalog(&f.conn, &cfg, &frame, &mut SourceSamples::catalog_only())
+                .unwrap(),
+            expected
+        );
+        let mut memo = HashMemo::for_gate(origins);
         assert_eq!(
             memo.calibration_hash_checked(&f.conn, &cfg, &frame)
                 .unwrap(),
@@ -9306,13 +9563,19 @@ mod tests {
         let expected = stage_hash(
             &prepare_subtree(&cfg),
             &[&format!("blake3:{blake3}")],
-            &[SourceIdentity {
+            &[SourceIdentity::Project {
                 file_id: 0,
                 size: 4096,
                 modified_at: String::new(),
             }],
         );
         assert_eq!(prepare_hash_for_project(&cfg, &blake3, 4096), expected);
+        // Recorded 2026-11-13 before the stage-1 hash moved to samples (FI-4): a project keeps its caches,
+        // so this literal must never move with that change.
+        assert_eq!(
+            prepare_hash_for_project(&cfg, &"ab".repeat(32), 4096),
+            "1667e6eddd094612"
+        );
         let mut other = cfg.clone();
         other.registration.distortion = crate::stacking::register::DistortionChoice::Tps;
         assert_eq!(prepare_hash_for_project(&other, &blake3, 4096), expected);
@@ -11150,6 +11413,7 @@ mod tests {
         }
         let all_ids: Vec<i64> = mono_ids.iter().chain(osc_ids.iter()).copied().collect();
         test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+        test_fixtures::bank_samples(&f.conn);
         let reference_id = mono_ids[0];
         set_frame_set_reference(&f.conn, f.set_id, reference_id).unwrap();
 
@@ -11162,7 +11426,7 @@ mod tests {
         let subject = StackSubject::FrameSet(f.set_id);
         let (groups, origins) = frame_source(&f.conn, &subject, &cfg).unwrap();
         assert_eq!(groups.len(), 2, "one mono group, one OSC group");
-        let mut memo = HashMemo::new(origins.clone());
+        let mut memo = HashMemo::for_gate(origins.clone());
         let calib: HashMap<i64, String> = all_ids
             .iter()
             .map(|&id| {
@@ -11287,7 +11551,7 @@ mod tests {
             on_disk: true,
         };
         let stale_under = |cfg: &StackingConfig, betas: &HashMap<String, f64>| -> bool {
-            let mut memo = HashMemo::new(origins.clone());
+            let mut memo = HashMemo::for_gate(origins.clone());
             compute_register_stale(
                 &f.conn, cfg, &subject, &groups, &reference, &mut memo, &origins, None, betas,
             )
@@ -11424,6 +11688,18 @@ mod tests {
             // Three planes on disk: an `osc__` group, not a `cfa__` one.
             crate::fits_writer::write_fits_f32(&path, 64, 48, 3, &vec![0.5f32; 64 * 48 * 3], &[])
                 .unwrap();
+            // The catalog row describes the file as written, so its sample can be banked.
+            let meta = std::fs::metadata(&path).unwrap();
+            f.conn
+                .execute(
+                    "UPDATE files SET size = ?1, modified_at = ?2 WHERE id = (SELECT file_id FROM frames WHERE id = ?3)",
+                    rusqlite::params![
+                        meta.len() as i64,
+                        chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()).to_rfc3339(),
+                        id
+                    ],
+                )
+                .unwrap();
             ids.push(id);
         }
         f.conn
@@ -11432,6 +11708,7 @@ mod tests {
                 [f.set_id],
             )
             .unwrap();
+        test_fixtures::bank_samples(&f.conn);
         let _folders = set_stacking_folders(&f.conn);
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
@@ -11468,7 +11745,8 @@ mod tests {
         let mut calib: HashMap<i64, String> = HashMap::new();
         let mut metrics: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
-            let c = prepare_hash_for_catalog(&cfg, gf);
+            let c = prepare_hash_for_catalog(&f.conn, &cfg, gf, &mut SourceSamples::catalog_only())
+                .unwrap();
             let m = measurement_hash_for(&cfg, &c, None);
             up(ArtifactKind::Metrics, Some(gf.frame_id), &m, None, Some("{}"));
             calib.insert(gf.frame_id, c);

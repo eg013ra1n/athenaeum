@@ -1147,6 +1147,106 @@ fn warn_flat_only_group(
     ));
 }
 
+/// The one progress message of the input check.
+pub(super) const INPUTS_MESSAGE: &str = "checking the inputs";
+
+/// Every path the run reads as an input: each catalog light of the plan groups (a manually excluded
+/// one too: it is still a member of the plan, and a later regroup may include it) and, for a light
+/// that is calibrated, every master applied to it. A project's frames give nothing. Sorted, once each.
+fn run_input_paths(rc: &RunContext, conn: &rusqlite::Connection) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for frame in rc.plan_groups.iter().flat_map(|g| g.frames.iter()) {
+        let Some(origin) = rc.origins.get(&frame.frame_id) else {
+            continue;
+        };
+        let attested = match origin {
+            FrameOrigin::Catalog { attested, .. } => *attested,
+            FrameOrigin::Project { .. } => continue,
+        };
+        paths.push(frame.path.clone());
+        if attested {
+            continue;
+        }
+        match crate::export::applied_master_paths(conn, frame.frame_id, &rc.config.calibration) {
+            Ok(masters) => paths.extend(masters.into_iter().map(|p| p.to_string_lossy().into_owned())),
+            // The stage-1 hash reports it for the frame.
+            Err(error) => tracing::debug!(
+                frame_id = frame.frame_id,
+                %error,
+                "masters of a frame cannot be named for the input check"
+            ),
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Sample every input of the run ONCE, before any stage-1 hash (spec 4.4): read the rows under the
+/// connection, stat and read the files WITHOUT it, bank what may be banked under it in one
+/// transaction. Idempotent: a run whose book is filled returns at once. Runs after `stage_masters`, so
+/// a master rebuilt in the run is sampled after its build.
+///
+/// Progress is ONE Calibrate event at `current = 0`; a tick per file would reach 100 % and the stage's
+/// own first event would put the row back to 0.
+pub(super) fn ensure_source_samples(rc: &mut RunContext) -> Result<(), RunError> {
+    use crate::stacking::source_identity::{InputIdentity, SourceSamples};
+
+    if rc.memo.samples_resolved() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let rows = {
+        let conn = db(&rc.ctx)?.conn();
+        let inputs = run_input_paths(rc, &conn);
+        SourceSamples::read_rows(&conn, &inputs).map_err(|e| {
+            tracing::error!(run_id = rc.run_id, error = %e, "stacking inputs cannot be read");
+            RunError::Other(format!("{e:#}"))
+        })?
+    };
+    let count = rows.len();
+    if count > 0 {
+        rc.progress(
+            Stage::Calibrate,
+            None,
+            0,
+            count,
+            0,
+            0,
+            None,
+            Some(INPUTS_MESSAGE.to_string()),
+        );
+    }
+    let samplings = SourceSamples::sample_rows(rows, &rc.cancel);
+    rc.check_cancel()?;
+    let sampled = samplings
+        .iter()
+        .filter(|(_, s)| !matches!(s.identity, InputIdentity::NotSampled(_)))
+        .count();
+    let banked = {
+        let mut conn = db(&rc.ctx)?.conn();
+        match SourceSamples::bank(&mut conn, &samplings) {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::warn!(run_id = rc.run_id, %error, "input samples not banked; the run goes on");
+                0
+            }
+        }
+    };
+    let mut book = SourceSamples::for_run();
+    book.fill_run(samplings);
+    rc.memo.set_run_samples(book);
+    tracing::info!(
+        run_id = rc.run_id,
+        count,
+        sampled,
+        banked,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "stacking inputs checked"
+    );
+    Ok(())
+}
+
 /// Stage 1: calibrate every non-manually-excluded LIGHT frame, reusing a
 /// fresh `calibrated` artifact when one exists. Ruling 4's "sequentially,
 /// exactly as the calibrated-lights export does today" is retired as of
@@ -1183,6 +1283,7 @@ pub(super) fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
 /// [`stage_calibrate`] with the cross-group queue decision overridable (`Some(true)` = always one queue,
 /// `Some(false)` = always per group; tests pin the two against each other).
 fn stage_calibrate_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<(), RunError> {
+    ensure_source_samples(rc)?;
     // Plan 6b-2 C11, C12: a project, or an attested set, prepares instead.
     if stage_one_kind(rc)? == StageOneKind::Prepare {
         return stage_prepare(rc);

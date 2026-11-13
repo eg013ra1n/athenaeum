@@ -2717,6 +2717,7 @@ fn process_group_output(
 /// finalized uncropped ([`finalize_unfinished_crop`]) so no master is left
 /// only in scratch.
 pub(super) fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
+    super::calibrate::ensure_source_samples(rc)?;
     let result = stage_output_groups(rc);
     if result.is_err() {
         finalize_unfinished_crop(rc);

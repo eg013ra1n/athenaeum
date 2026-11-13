@@ -1056,7 +1056,7 @@ fn an_attested_light_contradicting_its_group_is_excluded() {
         group_ids,
     );
     rc.origins = origins;
-    rc.memo = HashMemo::new(rc.origins.clone());
+    rc.memo = HashMemo::for_run(rc.origins.clone());
     stage_calibrate(&mut rc).unwrap();
     let odd = rc.plan_groups[0]
         .frames
@@ -1117,7 +1117,7 @@ fn a_run_mixing_prepared_and_calibrated_frames_is_refused() {
         },
     );
     rc.origins = Arc::new(origins);
-    rc.memo = HashMemo::new(rc.origins.clone());
+    rc.memo = HashMemo::for_run(rc.origins.clone());
     let err = stage_calibrate(&mut rc).unwrap_err();
     assert!(
         matches!(err, RunError::Other(ref m) if m.contains("cannot mix prepared and calibrated frames")),

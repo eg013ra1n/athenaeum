@@ -14,9 +14,6 @@
 //! both before and after the read: a wrong value there would let Duplicates offer a unique file
 //! for deletion and let sync skip a file.
 
-// No production caller yet: the run's book (T4a) and the stage-1 hash (T4b) consume this module.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +23,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::duplicates::backfill::metadata_matches_row;
 use crate::duplicates::compute_xxhash;
+use crate::stacking::config::SourceIdentity;
 
 /// How an input is read: the run touches the disk, the plan gate never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +52,8 @@ pub(crate) struct InputRow {
     pub zip_entry: Option<ZipEntryStamp>,
 }
 
-/// An input's identity; the hash's token strings are built from it elsewhere (T4b).
+/// An input's identity; [`master_token`](Self::master_token) and
+/// [`light_source`](Self::light_source) render it for the stage-1 hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InputIdentity {
     /// A file on disk: its size and its three-part sample.
@@ -63,6 +62,37 @@ pub(crate) enum InputIdentity {
     Zip { size: i64, token: String },
     /// No identity could be had; the reason is one of the fixed strings below.
     NotSampled(&'static str),
+}
+
+impl InputIdentity {
+    /// A master's token in the stage-1 hash: its size and its sample, never its path (FI-3: a
+    /// master that moved, or was relinked after a rescan, names the same bytes). A zip entry's
+    /// token is its CRC (or the entry's time when no CRC was recorded).
+    pub(crate) fn master_token(&self) -> Result<String, &'static str> {
+        match self {
+            Self::Sampled { size, sample } => Ok(format!("{size}|sample:{sample}")),
+            Self::Zip { size, token } => Ok(format!("{size}|zip:{token}")),
+            Self::NotSampled(why) => Err(why),
+        }
+    }
+
+    /// A light's source in the stage-1 hash: the frame's `files.id`, the size and the sample. A
+    /// zip entry's sample is `"zip:<token>"`, which no 16-hex disk sample can equal.
+    pub(crate) fn light_source(&self, file_id: i64) -> Result<SourceIdentity, &'static str> {
+        match self {
+            Self::Sampled { size, sample } => Ok(SourceIdentity::Sampled {
+                file_id,
+                size: *size,
+                sample: sample.clone(),
+            }),
+            Self::Zip { size, token } => Ok(SourceIdentity::Sampled {
+                file_id,
+                size: *size,
+                sample: format!("zip:{token}"),
+            }),
+            Self::NotSampled(why) => Err(why),
+        }
+    }
 }
 
 /// `NotSampled` reasons; the stage-1 error text and the tests read these.

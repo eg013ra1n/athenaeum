@@ -1921,6 +1921,7 @@ pub(super) fn delivered_dims(rc: &RunContext, native: (usize, usize)) -> (usize,
 /// reference). Both passes live inside ONE `Stage::Register` timing and
 /// share ONE progress total. A `Manual` reference never moves.
 pub(super) fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
+    super::calibrate::ensure_source_samples(rc)?;
     let stage_start = Instant::now();
     let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Register, None);
     let cfg = rc.config.clone();

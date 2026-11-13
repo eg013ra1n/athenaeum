@@ -591,6 +591,45 @@ fn file_identity(path: &Path) -> (i64, String) {
     (meta.len() as i64, modified_at)
 }
 
+/// The content index's effect on a fixture catalog, for a test that forms a stage-1 hash before any
+/// run: every non-zip row with a NULL `content_hash` gets `compute_xxhash(path)` when its file matches
+/// the row, and `"unwritten-<file_id>"` when no file exists. Returns the rows written. A RUN rig never
+/// calls this: a run samples and banks its own inputs, and that path must stay exercised.
+pub(crate) fn bank_samples(conn: &Connection) -> usize {
+    let rows: Vec<(i64, String, i64, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, size, modified_at FROM files
+                  WHERE content_hash IS NULL AND archive_zip_path IS NULL",
+            )
+            .expect("prepare the unbanked rows");
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query the unbanked rows")
+            .map(|r| r.expect("read an unbanked row"))
+            .collect()
+    };
+    let mut written = 0;
+    for (id, path, size, modified_at) in rows {
+        let value = match std::fs::metadata(&path) {
+            Ok(meta) => {
+                if !crate::duplicates::backfill::metadata_matches_row(&meta, size, &modified_at) {
+                    continue;
+                }
+                crate::duplicates::compute_xxhash(Path::new(&path)).expect("sample a fixture file")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("unwritten-{id}"),
+            Err(e) => panic!("stat a fixture file: {e}"),
+        };
+        written += conn
+            .execute(
+                "UPDATE files SET content_hash = ?1 WHERE id = ?2 AND content_hash IS NULL",
+                params![value, id],
+            )
+            .expect("bank a fixture sample");
+    }
+    written
+}
+
 fn link_calibration(conn: &Connection, frame_id: i64, set_id: i64, cal_type: &str) {
     conn.execute(
         "INSERT INTO calibration_set_to_frames

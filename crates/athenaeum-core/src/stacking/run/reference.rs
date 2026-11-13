@@ -288,6 +288,7 @@ fn group_reference_idx(
 /// plan gate and the results header show — and [`resolve_group_geometry`]
 /// then resolves each group's own reference from it.
 pub(super) fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
+    super::calibrate::ensure_source_samples(rc)?;
     let stage_start = Instant::now();
     let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Reference, None);
     let cfg = rc.config.clone();

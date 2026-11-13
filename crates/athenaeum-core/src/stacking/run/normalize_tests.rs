@@ -729,71 +729,78 @@ fn local_normalization_sidecars_are_cached_on_the_second_run() {
     );
 }
 
-/// Frame-level cache spec §7 (Task 12): one debayered-OSC fixture of two exposure classes (60 s and 90 s, three
-/// frames each) stacked under `seconds` (two groups), `stops` (one group), and `seconds` with a 200 s tolerance (one group),
-/// co-registered geometry, local normalization on, a Manual reference. After the first run nothing keyed on a
-/// frame is recomputed: calibrate, pass 1, pass 2 and registration fan out over 0 items, no registered row or
-/// file moves, the plan gate reads Calibrate, Measure and Register fresh before each regroup, and the
-/// group-level stages (LN, rejection, the master) run for the new group.
-///
-/// The reference is pinned on purpose. Under Auto the reference is picked again from the new grouping's weights
-/// and a different pick re-registers every frame by `ref:<id>` (observed on this fixture: frame 4 under
-/// `seconds`, frame 6 under `stops`), as under Native geometry; with `reference.twoPass` the dry pass is a
-/// group-level decision keyed on the membership, so a regroup is a miss and registers the new group once more
-/// without persisting (README, "Frame-level cache").
-#[test]
-fn regroup_reuses_every_frame_level_stage() {
-    use crate::stacking::config::ExposureMode;
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("catalog.db");
-    let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-    let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
-    let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
-    let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0), (2.0, 2.0), (1.0, 0.0)];
-    let mut light_ids = Vec::new();
-    for (i, &(dx, dy)) in shifts.iter().enumerate() {
-        let date_obs = date_obs_at(i);
-        let stem = format!("f{i}");
-        let spec = LightSpec {
-            exptime: if i < 3 { 60.0 } else { 90.0 },
-            // A debayered OSC set, as set 270: its registration reads no Measure output, so neither its own
-            // group nor its reference's group enters the registration hash and a merge cannot move it.
-            bayerpat: Some("RGGB"),
-            ..star_light_spec(&stem, &date_obs)
-        };
-        // A Moffat field whose true beta (1.2) lies below `BETA_BOUNDS`' floor: every fit pegs at the floor, so
-        // every frame, every exposure class and the merged group read the same group beta (as set 270's 1.5).
-        // Without it the lower median of the fitted betas moves with the membership and pass 2 re-runs.
-        let (id, _) = test_fixtures::add_light_with_moffat_field(
-            &fixture,
-            &spec,
-            &ln_shifted_stars(dx, dy),
-            3.4,
-            1.2,
-            600.0,
-            5.0,
-            100 + i as u64,
-        );
-        light_ids.push(id);
-    }
-    test_fixtures::add_master_dark_and_flat(
-        &fixture,
-        &light_ids,
-        STAR_FIELD_WIDTH,
-        STAR_FIELD_HEIGHT,
-    );
-    crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, light_ids[0]).unwrap();
-    let working = tempfile::tempdir().unwrap();
-    let output = tempfile::tempdir().unwrap();
-    for (key, dir) in [
-        (crate::settings::keys::STACKING_WORKING_DIR, working.path()),
-        (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
-    ] {
-        crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
-    }
-    let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+/// The regroup fixture as a rig (frame-level cache spec §7; file identity T4c): six Moffat lights (beta 1.2) of two
+/// exposure classes (60 s and 90 s, three each), a master dark and flat, a Manual reference `light_ids[0]`, the
+/// working folder `<tmp>/w1` and the output `<tmp>/out` under one tempdir (a test may rename the working folder).
+/// A run samples and banks its own inputs: the rig never calls `bank_samples`.
+pub(super) struct RegroupRig {
+    pub(super) tmp: tempfile::TempDir,
+    pub(super) ctx: Arc<ServiceContext>,
+    pub(super) fixture: test_fixtures::Fixture,
+    pub(super) light_ids: Vec<i64>,
+    pub(super) working: PathBuf,
+    pub(super) output: PathBuf,
+    pub(super) layout: WorkingLayout,
+}
 
-    let cfg_for = |mode: ExposureMode, tolerance: f64| {
+impl RegroupRig {
+    /// `bayerpat` `Some("RGGB")` seeds a debayered OSC set (as set 270: its registration reads no Measure
+    /// output, so neither its own group nor its reference's group enters the registration hash and a merge cannot
+    /// move it); `None` seeds mono lights.
+    pub(super) fn new(bayerpat: Option<&'static str>) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0), (2.0, 2.0), (1.0, 0.0)];
+        let mut light_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let spec = LightSpec {
+                exptime: if i < 3 { 60.0 } else { 90.0 },
+                bayerpat,
+                ..star_light_spec(&stem, &date_obs)
+            };
+            // A Moffat field whose true beta (1.2) lies below `BETA_BOUNDS`' floor: every fit pegs at the floor,
+            // so every frame, every exposure class and the merged group read the same group beta (as set 270's
+            // 1.5). Without it the lower median of the fitted betas moves with the membership and pass 2 re-runs.
+            let (id, _) = test_fixtures::add_light_with_moffat_field(
+                &fixture,
+                &spec,
+                &ln_shifted_stars(dx, dy),
+                3.4,
+                1.2,
+                600.0,
+                5.0,
+                100 + i as u64,
+            );
+            light_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, light_ids[0]).unwrap();
+        let working = tmp.path().join("w1");
+        let output = tmp.path().join("out");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, &working),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, &output),
+        ] {
+            crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let layout = WorkingLayout::new(&working, &set_slug(SET_NAME));
+        RegroupRig { tmp, ctx, fixture, light_ids, working, output, layout }
+    }
+
+    /// The config of the regroup tests: Manual reference, local normalization on.
+    pub(super) fn cfg(&self, mode: crate::stacking::config::ExposureMode, tolerance: f64) -> StackingConfig {
         let mut cfg = StackingConfig::default();
         cfg.grouping.exposure_mode = mode;
         cfg.grouping.exposure_tolerance_sec = tolerance;
@@ -809,38 +816,42 @@ fn regroup_reuses_every_frame_level_stage() {
             saturation: 1.0,
         };
         cfg
-    };
-    let stale_stages = |cfg: &StackingConfig| {
+    }
+
+    /// The stages the plan gate reads stale under `cfg` (no file read, no sample read).
+    pub(super) fn stale(&self, cfg: &StackingConfig) -> Vec<Stage> {
         crate::stacking::plan::build_plan(
-            &fixture.conn,
-            &ctx.settings,
+            &self.fixture.conn,
+            &self.ctx.settings,
             &PathPolicy::AllowAll,
-            &StackSubject::FrameSet(fixture.set_id),
+            &StackSubject::FrameSet(self.fixture.set_id),
             Some(cfg.clone()),
         )
         .expect("the plan should build")
         .stale_stages
-    };
-    // One run through Output under `cfg`; returns the run and the captured logs.
-    let run = |cfg: &StackingConfig| {
+    }
+
+    /// One run through Output under `cfg`; returns the groups, the run context and the captured logs.
+    pub(super) fn run(&self, cfg: &StackingConfig) -> (Vec<IntegrationGroup>, RunContext, String) {
+        let fixture = &self.fixture;
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         let (run_id, group_ids) = seed_run_and_groups(
             &fixture.conn,
             fixture.set_id,
             &plan_groups,
-            working.path(),
-            output.path(),
+            &self.working,
+            &self.output,
         );
         let mut rc = test_context(
-            ctx.clone(),
+            self.ctx.clone(),
             Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
             run_id,
             fixture.set_id,
             SET_NAME,
             cfg.clone(),
             plan_groups.clone(),
-            layout.clone(),
-            output.path().to_path_buf(),
+            self.layout.clone(),
+            self.output.clone(),
             group_ids,
         );
         let (res, logs) = crate::stacking::telemetry::capture_logs(|| {
@@ -857,7 +868,66 @@ fn regroup_reuses_every_frame_level_stage() {
             )
             .unwrap();
         (plan_groups, rc, logs)
-    };
+    }
+
+    /// Every cataloged file (the lights and the masters), as the catalog spells them.
+    pub(super) fn catalog_files(&self) -> Vec<PathBuf> {
+        let mut stmt = self.fixture.conn.prepare("SELECT path FROM files ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|p| PathBuf::from(p.unwrap()))
+            .collect()
+    }
+
+    /// Every file under the working folder (the calibrated, measured, registered and normalized files).
+    pub(super) fn working_files(&self) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.working, &mut out);
+        out
+    }
+}
+
+/// Move the modification time of every file in `paths` by `f` (the catalog rows are left as the scanner wrote them:
+/// a copy onto a filesystem of coarser time, not a rescan).
+pub(super) fn set_times(paths: &[PathBuf], f: impl Fn(std::time::SystemTime) -> std::time::SystemTime) {
+    for path in paths {
+        let before = std::fs::metadata(path).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(f(before)).unwrap();
+    }
+}
+
+/// Frame-level cache spec §7 (Task 12): one debayered-OSC fixture of two exposure classes (60 s and 90 s, three
+/// frames each) stacked under `seconds` (two groups), `stops` (one group), and `seconds` with a 200 s tolerance (one group),
+/// co-registered geometry, local normalization on, a Manual reference. After the first run nothing keyed on a
+/// frame is recomputed: calibrate, pass 1, pass 2 and registration fan out over 0 items, no registered row or
+/// file moves, the plan gate reads Calibrate, Measure and Register fresh before each regroup, and the
+/// group-level stages (LN, rejection, the master) run for the new group.
+///
+/// The reference is pinned on purpose. Under Auto the reference is picked again from the new grouping's weights
+/// and a different pick re-registers every frame by `ref:<id>` (observed on this fixture: frame 4 under
+/// `seconds`, frame 6 under `stops`), as under Native geometry; with `reference.twoPass` the dry pass is a
+/// group-level decision keyed on the membership, so a regroup is a miss and registers the new group once more
+/// without persisting (README, "Frame-level cache").
+#[test]
+fn regroup_reuses_every_frame_level_stage() {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(Some("RGGB"));
+    let fixture = &rig.fixture;
+    let light_ids = &rig.light_ids;
+    let cfg_for = |mode: ExposureMode, tolerance: f64| rig.cfg(mode, tolerance);
+    let stale_stages = |cfg: &StackingConfig| rig.stale(cfg);
+    let run = |cfg: &StackingConfig| rig.run(cfg);
 
     let cfg1 = cfg_for(ExposureMode::Seconds, 2.0);
     let (groups1, rc1, logs1) = run(&cfg1);
@@ -931,6 +1001,150 @@ fn regroup_reuses_every_frame_level_stage() {
         assert_eq!(rows.len(), 6, "{kind}: {rows:?}");
         assert!(rows.values().all(|r| r.group_key.is_empty()), "{kind}: {rows:?}");
     }
+}
+
+/// `0` over each of the four frame-level fan-outs, asserted on one run's logs.
+fn assert_nothing_recomputed(logs: &str, what: &str) {
+    for (stage, pass) in [
+        ("calibrate", "calibrate"),
+        ("measure", "pass1"),
+        ("measure", "pass2"),
+        ("register", "align"),
+    ] {
+        assert_eq!(
+            fan_out_items(logs, stage, pass),
+            0,
+            "{what} redid {stage}/{pass}: {logs}"
+        );
+    }
+}
+
+/// The file-identity cycle's first regression: a copy of the working tree, the lights and the masters on a filesystem
+/// of coarser time (whole seconds, then 100 ns steps) changes no identity. Nothing a frame owns is recomputed, and the
+/// gate reads Calibrate, Measure and Register fresh before each run. The run samples and banks its own inputs (no
+/// helper does it): before run 1 no light or master row has a `content_hash`, after it the gate reads the stages fresh
+/// from the banked samples. The catalog rows keep the times the scanner wrote; a run whose row no longer matches
+/// the file samples it again and finds the same sample.
+#[test]
+fn coarser_times_reuse_every_frame_level_stage() {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(Some("RGGB"));
+    let unbanked: i64 = rig
+        .fixture
+        .conn
+        .query_row("SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unbanked, 0, "premise: no light or master row carries a sample before run 1");
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    let (_, _, logs1) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+    assert_eq!(fan_out_items(&logs1, "measure", "pass1"), 6, "{logs1}");
+    assert_eq!(fan_out_items(&logs1, "register", "align"), 6, "{logs1}");
+    let banked: Vec<String> = {
+        // The raw dark and flat subs the masters stand for are no input of a run: they stay unsampled.
+        let mut stmt = rig
+            .fixture
+            .conn
+            .prepare(
+                "SELECT f.path FROM files f JOIN frames fr ON fr.file_id = f.id
+                  WHERE f.content_hash IS NULL AND (fr.is_master = 1 OR fr.imagetyp = 'Light')",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(|p| p.unwrap()).collect()
+    };
+    let with_sample: i64 = rig
+        .fixture
+        .conn
+        .query_row("SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(with_sample, 6 + 2, "the six lights and the two masters carry a sample");
+    assert_eq!(banked, Vec::<String>::new(), "run 1 banked every light and master");
+    let stale = rig.stale(&cfg);
+    for stage in [Stage::Calibrate, Stage::Measure, Stage::Register] {
+        assert!(!stale.contains(&stage), "the gate reads {stage:?} stale after run 1: {stale:?}");
+    }
+
+    let mut files = rig.catalog_files();
+    files.extend(rig.working_files());
+    assert!(
+        rig.working.starts_with(rig.tmp.path()) && rig.output.starts_with(rig.tmp.path()),
+        "the working folder and the output sit under the rig's one tempdir"
+    );
+    assert!(files.len() > 6 * 2, "the lights, the masters and the working files: {}", files.len());
+
+    let whole_seconds = |t: std::time::SystemTime| {
+        let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(d.as_secs())
+    };
+    let hundred_ns = |t: std::time::SystemTime| {
+        let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+        std::time::UNIX_EPOCH
+            + std::time::Duration::new(d.as_secs(), (d.subsec_nanos() / 100) * 100 + 100)
+    };
+    for (what, truncate) in [
+        ("whole seconds", &whole_seconds as &dyn Fn(std::time::SystemTime) -> std::time::SystemTime),
+        ("100 ns steps", &hundred_ns),
+    ] {
+        set_times(&files, truncate);
+        let stale = rig.stale(&cfg);
+        for stage in [Stage::Calibrate, Stage::Measure, Stage::Register] {
+            assert!(
+                !stale.contains(&stage),
+                "the gate reads {stage:?} stale at {what}: {stale:?}"
+            );
+        }
+        let (_, _, logs) = rig.run(&cfg);
+        assert_nothing_recomputed(&logs, what);
+    }
+}
+
+/// The residual the sample accepts, pinned so it stays visible: one byte changed at the middle of a light (the size
+/// the same, the time moved by 5 s, no rescan) is read by the gate as fresh (the gate reads no file), and the run that
+/// samples the file again finds the new bytes and recomputes exactly that frame: one calibrate, one first pass.
+#[test]
+fn an_in_window_edit_is_a_miss() {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(Some("RGGB"));
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    rig.run(&cfg);
+
+    let victim: String = rig
+        .fixture
+        .conn
+        .query_row(
+            "SELECT path FROM files WHERE id = (SELECT file_id FROM frames WHERE id = ?1)",
+            [rig.light_ids[4]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let before = std::fs::metadata(&victim).unwrap();
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&victim).unwrap();
+        let middle = before.len() / 2;
+        let mut byte = [0u8; 1];
+        file.seek(SeekFrom::Start(middle)).unwrap();
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x01;
+        file.seek(SeekFrom::Start(middle)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.set_modified(before.modified().unwrap() + std::time::Duration::from_secs(5))
+            .unwrap();
+    }
+    let after = std::fs::metadata(&victim).unwrap();
+    assert_eq!(after.len(), before.len(), "a same-size edit");
+    assert_ne!(after.modified().unwrap(), before.modified().unwrap());
+
+    let stale = rig.stale(&cfg);
+    for stage in [Stage::Calibrate, Stage::Measure, Stage::Register] {
+        assert!(
+            !stale.contains(&stage),
+            "the gate reads no file: {stage:?} reads fresh before the run samples the edit: {stale:?}"
+        );
+    }
+    let (_, _, logs) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs, "calibrate", "calibrate"), 1, "{logs}");
+    assert_eq!(fan_out_items(&logs, "measure", "pass1"), 1, "{logs}");
 }
 
 /// Ruling R6 I1 (the registration half of Task 4's review focus 1): a regroup that merges two mono exposure
@@ -1404,8 +1618,8 @@ fn a_run_warns_once_when_its_ln_scale_differs_from_the_plan() {
 /// reference that no longer matches it. A direct SQL flip of
 /// `registration_results.config_hash` would just get silently
 /// re-derived (and reverted) by the second run's own stage 5, so this
-/// forces a REAL registration change the established way (touch a
-/// source file's `size` in the catalog, same technique
+/// forces a REAL registration change the established way (change a
+/// source file's pixels, same technique
 /// `calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones`
 /// uses): recalibration cascades into a genuinely different calibration
 /// hash for that one frame, which cascades into a genuinely different
@@ -1444,17 +1658,9 @@ fn local_normalization_sidecars_all_rebuild_when_a_reference_members_registratio
     let mut rc1 = rig.context(cfg.clone(), plan_groups);
     run_register_and_output(&mut rc1);
 
-    // Touch light_ids[0]'s catalog `size` — forces recalibration (and,
-    // downstream, re-registration) of that ONE frame on the next run,
-    // without changing the actual pixels on disk at all.
-    rig.fixture
-        .conn
-        .execute(
-            "UPDATE files SET size = size + 1000 WHERE id = \
-                 (SELECT file_id FROM frames WHERE id = ?1)",
-            rusqlite::params![rig.light_ids[0]],
-        )
-        .unwrap();
+    // Change light_ids[0]'s pixels (one byte; the catalog row stays as scanned) — forces recalibration (and,
+    // downstream, re-registration) of that ONE frame on the next run.
+    rewrite_light_pixels(&rig.fixture.conn, rig.light_ids[0]);
 
     let plan_groups2 = rig.plan_groups(&cfg);
     let mut rc2 = rig.context(cfg, plan_groups2);

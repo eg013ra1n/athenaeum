@@ -32,14 +32,17 @@ use super::*;
 /// `build_master_inline` itself observes mid-build) unwinds through
 /// `RunError::Cancelled`, same as every other stage.
 ///
-/// A rebuilt master's file changes size/mtime on disk, which the stage-1
-/// hash (`calibration_hash_for`) reads straight back via `applied_master_paths`
-/// — a light whose calibration plan resolves to a master this stage just
-/// rebuilt therefore computes a DIFFERENT stage-1 hash than any previous
-/// run recorded, so its `calibrated` artifact (if any existed) reads as
-/// stale automatically and stage 1 regenerates it. By design: a rebuilt
-/// master's pixels really did change, so anything calibrated against the
-/// old ones must not be reused as if nothing happened.
+/// A master is named in the stage-1 hash by its size and its sampled content
+/// hash, never by its path (FI-3: a moved or rescanned master names the same
+/// bytes). A rebuilt master has no banked `content_hash` (a new row) or a row
+/// that no longer matches its file, so the run samples the new file once,
+/// after this stage (`ensure_source_samples`), and `calibration_hash_for` reads the new token
+/// back via `applied_master_paths` — a light whose calibration plan resolves
+/// to a master this stage just rebuilt therefore computes a DIFFERENT stage-1
+/// hash than any previous run recorded, so its `calibrated` artifact (if any
+/// existed) reads as stale automatically and stage 1 regenerates it. By
+/// design: a rebuilt master's pixels really did change, so anything
+/// calibrated against the old ones must not be reused as if nothing happened.
 pub(super) fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
     let items = rc.masters_to_build.clone();
     if items.is_empty() {

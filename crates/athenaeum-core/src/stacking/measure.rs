@@ -1970,13 +1970,12 @@ impl FramePass1 {
     /// A stored first pass read back (Task 11c, R11c-1 / R11c-4): the heads rebuilt from `opts`, the plane index, the
     /// plane count and the stored gain through the ONE [`module_options`] builder, the read guard seeded with the
     /// identity of `calibrated` NOW, whose length must equal the stored stamp's ([`Pass1ArtifactError::Stale`]
-    /// otherwise; the mtime too under `strict_mtime`, see [`check_stamp_len`]).
+    /// otherwise, see [`check_stamp_len`]).
     pub(crate) fn from_record(
         head: Pass1Head,
         body: Pass1Body,
         calibrated: &Path,
         opts: &MeasureOptions,
-        strict_mtime: bool,
     ) -> Result<FramePass1, Pass1ArtifactError> {
         let n = head.beta_own.len();
         if n == 0 || body.planes.len() != n || body.read_ms.len() != n {
@@ -1988,7 +1987,7 @@ impl FramePass1 {
             )));
         }
         let now = FileIdentity::of(calibrated)?;
-        check_stamp_len(head.source, now, strict_mtime)?;
+        check_stamp_len(head.source, now)?;
         let detector = resolve_detector(SeedOverride::Fast, opts);
         let colour = n == 3;
         let mut heads = Vec::with_capacity(n);
@@ -2099,14 +2098,13 @@ impl Pass1Body {
 }
 
 /// Whether a stored head describes `calibrated` as it is now (the controller's check in step (0), Plan A Task 11c,
-/// R11c-5): the stamp equals the file's now ([`Pass1ArtifactError::Stale`] otherwise; [`check_stamp_len`], the length
-/// only unless `strict_mtime`) and the geometry and the plane count are the file's own (a header probe, no pixel read).
+/// R11c-5): the stamp's length equals the file's now ([`Pass1ArtifactError::Stale`] otherwise; [`check_stamp_len`]) and
+/// the geometry and the plane count are the file's own (a header probe, no pixel read).
 pub(crate) fn check_pass1_head(
     head: &Pass1Head,
     calibrated: &Path,
-    strict_mtime: bool,
 ) -> Result<(), Pass1ArtifactError> {
-    check_stamp_len(head.source, FileIdentity::of(calibrated)?, strict_mtime)?;
+    check_stamp_len(head.source, FileIdentity::of(calibrated)?)?;
     let reader = PlaneReader::open(calibrated).map_err(|e| {
         Pass1ArtifactError::Io(std::io::Error::other(format!("the calibrated file: {e}")))
     })?;
@@ -2125,20 +2123,17 @@ pub(crate) fn check_pass1_head(
 }
 
 /// The one validity check of a stored stamp against `calibrated` now (frame-level cache spec §5.3). The LENGTH must
-/// equal the stored one ([`Pass1ArtifactError::Stale`] otherwise). The modification time is compared only under
-/// `strict_mtime`: for a calibrated or prepared file Athenaeum writes (under the working folder's `calibrated/` or
-/// `prepared/`) a first pass is valid for as long as the calibration hash in its artifact's key is, and a
-/// recalibration with the same hash reproduces the pixels to the bit (pinned by
-/// `recalibration_reproduces_the_planes_bit_for_bit`) while writing a file with a new mtime. A file Athenaeum never
-/// rewrites (an attested light or a project replica used in place) moves its mtime only when someone else edited
-/// it, so there the mtime is compared too. A stamp without a recorded source never matches.
+/// equal the stored one ([`Pass1ArtifactError::Stale`] otherwise); the modification time is never compared. A first
+/// pass is valid for as long as the calibration hash in its artifact's key is: a recalibration with the same hash
+/// reproduces the pixels to the bit (pinned by `recalibration_reproduces_the_planes_bit_for_bit`) while writing a
+/// file with a new mtime, and the key covers an in-place foreign file (an attested light's sample is in the prepare
+/// hash; a replica has blake3 and `landed_unchanged`). A stamp without a recorded source never matches.
 fn check_stamp_len(
     stored: Option<SourceStamp>,
     now: FileIdentity,
-    strict_mtime: bool,
 ) -> Result<(), Pass1ArtifactError> {
     match stored {
-        Some(s) if s.len == now.len && (!strict_mtime || s.modified_ns == stamp_of(now).modified_ns) => Ok(()),
+        Some(s) if s.len == now.len => Ok(()),
         _ => Err(Pass1ArtifactError::Stale {
             stored,
             now: Some(stamp_of(now)),
@@ -3988,7 +3983,7 @@ background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
             let fresh = measure_frame_pass1(&path, &opts, None, &cancel).unwrap();
             let artifact = dir.path().join(format!("{name}.athm"));
             write_pass1(&artifact, &fresh).unwrap();
-            let back = read_pass1(&artifact, &path, &opts, false).unwrap();
+            let back = read_pass1(&artifact, &path, &opts).unwrap();
             let beta = back.beta_own()[0];
             measure_frame_pass2(&path, back, &[beta], &opts, None, &cancel)
                 .unwrap()
