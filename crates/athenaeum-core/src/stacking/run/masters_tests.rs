@@ -144,3 +144,74 @@ fn deleted_masters_are_rebuilt_by_stage_masters() {
         assert!(Path::new(&m.path).exists(), "{m:?}");
     }
 }
+
+/// A master the run rebuilds is sampled after its build (file identity, spec 4.4): the old `content_hash`
+/// is NULLed by the rebuild's resync, and the run's book, which runs after stage 0.5, banks the new file's
+/// sample. A book moved before the build would keep the stale value.
+#[test]
+fn a_master_rebuilt_in_the_run_is_sampled_after_the_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("catalog.db");
+    let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+    let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+    let noise = [5.0f32; 4];
+    let (fixture, light_ids, _working, _output) =
+        seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+    let (dark_set, flat_set) = test_fixtures::add_master_dark_and_flat(
+        &fixture,
+        &light_ids,
+        STAR_FIELD_WIDTH,
+        STAR_FIELD_HEIGHT,
+    );
+    let master_path = |set_id: i64| -> String {
+        fixture
+            .conn
+            .query_row(
+                "SELECT fi.path FROM calibration_set_frames csf
+                     JOIN frames fr ON fr.id = csf.frame_id
+                     JOIN files fi ON fi.id = fr.file_id
+                     WHERE csf.set_id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let paths = [master_path(dark_set), master_path(flat_set)];
+    for path in &paths {
+        fixture
+            .conn
+            .execute(
+                "UPDATE files SET content_hash = 'before-the-rebuild' WHERE path = ?1",
+                [path],
+            )
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    let started = start_stacking(
+        ctx.clone(),
+        Arc::new(Recording::new()),
+        &PathPolicy::AllowAll,
+        "test".to_string(),
+        StackSubject::FrameSet(fixture.set_id),
+        None,
+        None,
+    )
+    .expect("start should succeed");
+    wait_for_run(&ctx, started.run_id);
+    let run_row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run_row.status, "done", "{run_row:?}");
+
+    for path in &paths {
+        let banked: Option<String> = fixture
+            .conn
+            .query_row("SELECT content_hash FROM files WHERE path = ?1", [path], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            banked.as_deref(),
+            Some(crate::duplicates::compute_xxhash(Path::new(path)).unwrap().as_str()),
+            "{path}: the sample is of the rebuilt file"
+        );
+    }
+}

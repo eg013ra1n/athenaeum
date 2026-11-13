@@ -599,6 +599,7 @@ mod tests {
             .unwrap();
             crate::stacking::test_fixtures::seed_plate_solve_scale(&conn, *h, 9.9);
         }
+        crate::stacking::test_fixtures::bank_samples(&conn);
         let cfg = StackingConfig::default();
         let source = project_frame_source(&conn, "p1", &cfg).unwrap();
         assert_eq!(source.groups.len(), 1, "{:?}", source.groups);
@@ -632,7 +633,7 @@ mod tests {
         }
 
         // The dispatchers a run reads through never touch the decoy rows.
-        let mut memo = crate::stacking::plan::HashMemo::new(source.origins.clone());
+        let mut memo = crate::stacking::plan::HashMemo::for_gate(source.origins.clone());
         for f in &g.frames {
             let origin = source.origins.get(&f.frame_id).unwrap();
             assert_eq!(

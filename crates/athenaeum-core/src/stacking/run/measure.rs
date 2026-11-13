@@ -123,6 +123,7 @@ pub(crate) fn measure_working_set_bytes(w: u64, h: u64) -> u64 {
 /// is marked `status = "skipped"` and excluded from later stages; a run
 /// with no viable group fails outright.
 pub(super) fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
+    super::calibrate::ensure_source_samples(rc)?;
     stage_measure_with(rc, None)
 }
 
@@ -1141,12 +1142,6 @@ struct Pass2Failed {
     message: String,
     written: bool,
 }
-/// Whether `calibrated` is a file Athenaeum writes and replaces itself: under the layout's `calibrated/` or `prepared/`
-/// root. A first pass keeps its stamp's modification time out of the comparison for those only (R12 (a)); a path
-/// spelled differently from the roots compares as not owned, the safe side.
-fn owns_calibrated_file(layout: &WorkingLayout, calibrated: &Path) -> bool {
-    calibrated.starts_with(layout.calibrated_root()) || calibrated.starts_with(layout.prepared_root())
-}
 /// One frame of the group on its way through the two passes.
 struct MeasureMember {
     idx: usize,
@@ -1167,9 +1162,6 @@ struct MeasureMember {
     /// The artifact's key ([`pass1_hash_for`]).
     pass1_key: String,
     source: Pass1Source,
-    /// The calibrated file is not one Athenaeum writes (not under the layout's `calibrated/` or `prepared/`: an attested
-    /// light or a project replica used in place), so its modification time is part of the first pass's stamp (R12 (a)).
-    strict_mtime: bool,
     /// A fresh artifact row exists but its head is not validated yet: the member's own β came from its `metrics`
     /// row, so the artifact is only validated once the member is known to need pass 2 (R11c-5 (3)).
     spill_pending: bool,
@@ -1185,10 +1177,9 @@ fn validate_pass1_spill(
     frame_id: i64,
     spill: &Path,
     path: &Path,
-    strict_mtime: bool,
 ) -> Option<Pass1Head> {
     let usable = read_pass1_head(spill)
-        .and_then(|head| check_pass1_head(&head, path, strict_mtime).map(|()| head));
+        .and_then(|head| check_pass1_head(&head, path).map(|()| head));
     match usable {
         Ok(head) => Some(head),
         // Found stale before use: the calibrated file is not the one the artifact was read from.
@@ -1327,7 +1318,6 @@ fn measure_two_pass_prepare(
         let mut member = MeasureMember {
             idx,
             frame,
-            strict_mtime: !owns_calibrated_file(&rc.layout, &path),
             path,
             spill: rc.layout.measured_path(&stem),
             layout_spill: rc.layout.measured_path(&stem),
@@ -1400,7 +1390,6 @@ fn measure_two_pass_prepare(
                         member.frame.frame_id,
                         &member.spill,
                         &member.path,
-                        member.strict_mtime,
                     ) {
                         member.source = Pass1Source::Artifact;
                         member.own = Some(head.beta_own);
@@ -1717,7 +1706,6 @@ fn measure_two_pass_rest(
                 members[i].frame.frame_id,
                 &members[i].spill,
                 &members[i].path,
-                members[i].strict_mtime,
             )
             .is_some()
             {
@@ -1746,7 +1734,7 @@ fn measure_two_pass_rest(
     }
     // Per job: the frame, its calibrated file, the artifact it reads, the layout path a re-run first pass writes,
     // where its first pass comes from, and whether its first half was already ticked by phase 1.
-    let jobs: Vec<(i64, PathBuf, PathBuf, PathBuf, Pass1Source, bool, bool)> = need_pass2
+    let jobs: Vec<(i64, PathBuf, PathBuf, PathBuf, Pass1Source, bool)> = need_pass2
         .iter()
         .map(|&i| {
             (
@@ -1756,7 +1744,6 @@ fn measure_two_pass_rest(
                 members[i].layout_spill.clone(),
                 members[i].source,
                 need_pass1.contains(&i),
-                members[i].strict_mtime,
             )
         })
         .collect();
@@ -1779,11 +1766,11 @@ fn measure_two_pass_rest(
         &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
         FanOutLabel::new(rc, Stage::Measure, Some(&group.key), "pass2"),
         cancel_ref,
-        move |(frame_id, path, spill, layout_spill, source, first_half_ticked, strict_mtime)| {
+        move |(frame_id, path, spill, layout_spill, source, first_half_ticked)| {
             // The first pass: the artifact (the checksum, the stamp), else pass 1 here — which also writes the
             // artifact — for a member owed it or whose artifact is refused now.
             let from_artifact = match source {
-                Pass1Source::Artifact => match read_pass1(&spill, &path, opts, strict_mtime) {
+                Pass1Source::Artifact => match read_pass1(&spill, &path, opts) {
                     Ok(p) => Some(p),
                     Err(e) => {
                         tracing::warn!(

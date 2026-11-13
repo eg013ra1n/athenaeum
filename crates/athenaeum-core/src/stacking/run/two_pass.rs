@@ -204,7 +204,7 @@ fn two_pass_lookup(
 ) -> Result<TwoPassLookup, RunError> {
     let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
     let reference_measurement_hash =
-        reference_measurement_term(rc, group, reference_frame_id, reference_hash, prepare_path)?;
+        reference_measurement_term(rc, reference_frame_id, reference_hash, prepare_path)?;
     let members: Vec<GroupFrame> = rc
         .measured
         .get(&group.key)

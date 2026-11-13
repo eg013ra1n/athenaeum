@@ -5223,9 +5223,10 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   (`compute_weights`); no fit reads those fields. A changed reference (re-picked by weight) still re-registers through `ref:<id>`.
 - **The registration fold rule.** `registration_hash_for` folds `measure:<hash>` only for a frame whose registration READS Measure's `fits.0`
   (`register_reads_measure_fits`: `stage_one_planes == 1`, mono or an OSC set calibrated with `debayerOsc` off); a debayered OSC frame keeps its
-  luminance detection, which reads `cfg.registration` only, so the group beta no longer re-registers it. A frame whose reference lives in
-  ANOTHER group also folds `ref_measure:<h>` (`reference_measurement_fold`: the reference's own fold, its group's config and beta), because
-  its star list comes from the reference's `fits.0`; same group folds nothing, so a single-group set keeps its hashes. The run and the gate
+  luminance detection, which reads `cfg.registration` only, so the group beta no longer re-registers it. Every frame whose reference's
+  group reads `fits.0` (a one-plane reference) also folds `ref_measure:<h>` (`reference_measurement_fold`: the reference's own fold, its
+  group's config and beta), whatever group the frame is in (file-identity FI-6), because its star list comes from the reference's `fits.0`;
+  a debayered-OSC reference folds nothing. The run and the gate
   take both folds from the same helpers (`registration_measurement_fold`, `reference_measurement_fold`); `resolve_register_fits` returns None
   unless `register_reads_measure_fits` holds. The group beta stays a VALUE in the pass-2 hash (`measure_beta:{:.6}`), never in the key: the
   same beta is a hit, another beta re-runs pass 2 only (pass 1 is keyed on the calibration hash and the measurement options).
@@ -5282,10 +5283,9 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   Native geometry. The plan gate reads the last run's reference, so it can say Register is cached when the pick will move (the
   weighting-edit residual below is the same mechanism). A Manual reference is stable across regroups; the acceptance test pins one.
   (2) With `reference.twoPass` the dry pass runs once over the new group (it persists nothing; the real pass is all hits). (3) A MONO frame
-  folds `ref_measure:` only when its reference sits in another group (above), so a regroup that merges or splits the reference's group
-  flips that term for the frames of the other group and they re-register once, even at an equal beta. Not pinned by a test: on a mono
-  fixture the gate read Register stale before a `stops` regroup that left the beta at 1.5. A debayered-OSC set (set 270) folds neither
-  term and is unaffected. (4) A merged group's beta is the lower median of the members' own betas, so it differs from the source groups'
+  folds `ref_measure:` whatever group it is in (above), so a regroup that keeps the reference frame and its group's beta keeps every
+  registration (`mono_regroup_keeps_every_registration_when_the_reference_stays`); a moved reference-group beta moves the term, by design.
+  A debayered-OSC set (set 270) folds neither term and is unaffected. (4) A merged group's beta is the lower median of the members' own betas, so it differs from the source groups'
   unless they agree; pass 2 re-runs then (set 270: 1.5 everywhere, the fit's floor, so it never does).
 - **Known residuals.** After a weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by
   weight and re-registers: the run is correct, the gate under-reports. A frame-level file is shared by the dev and the release build when

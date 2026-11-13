@@ -743,15 +743,21 @@ fn calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones() {
         "a fresh artifact must not be rewritten"
     );
 
-    // Touch one source file's size in `files` — only that frame regenerates.
-    fixture
+    // Change one source file's pixels (the file is far under the sample's windows, so the whole file is
+    // sampled) — only that frame regenerates. The catalog row still describes the old file, so the run
+    // reads the file itself.
+    let touched_path: String = fixture
         .conn
-        .execute(
-            "UPDATE files SET size = size + 1000 WHERE id = \
-                 (SELECT file_id FROM frames WHERE id = ?1)",
+        .query_row(
+            "SELECT path FROM files WHERE id = (SELECT file_id FROM frames WHERE id = ?1)",
             rusqlite::params![light_ids[0]],
+            |r| r.get(0),
         )
         .unwrap();
+    let mut bytes = std::fs::read(&touched_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&touched_path, &bytes).unwrap();
     let plan_groups_touched =
         group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
     let mut rc3 = build(3, plan_groups_touched);
@@ -1264,6 +1270,9 @@ fn calibrate_one_queue_across_groups_matches_per_group_queues() {
         // Both runs share one catalog: regenerate rather than reuse the other run's rows.
         rc.rerun_from = Some(Stage::Calibrate);
         if mode == 2 {
+            // The run's book is filled once for the whole plan; a lookup outside it is an error, so the
+            // single-group calls below must find every input of every group already sampled.
+            ensure_source_samples(&mut rc).unwrap();
             for g in &plan_groups {
                 rc.plan_groups = vec![g.clone()];
                 stage_calibrate_with(&mut rc, Some(false)).unwrap();
@@ -1972,4 +1981,160 @@ fn a_same_named_sets_run_retires_the_other_sets_rows() {
     let other_rows = rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated);
     assert!(other_rows.is_empty(), "the other set keeps rows over rewritten files: {other_rows:?}");
     assert_eq!(rig.rows(ArtifactKind::Calibrated).len(), 4, "the writer's own rows are back");
+}
+
+// ── The run's book (file identity T4a): every input sampled once, before stage 1 ──
+
+/// The `content_hash` of each INPUT row of the rig (the four lights and the two masters; the master's raw
+/// sub-frames are not inputs of a run), by path.
+fn banked_hashes(rig: &Pass1Rig) -> Vec<(String, Option<String>)> {
+    let mut stmt = rig
+        .fixture
+        .conn
+        .prepare("SELECT path, content_hash FROM files ORDER BY path")
+        .unwrap();
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows.into_iter()
+        .filter(|(p, _)| {
+            let name = Path::new(p).file_name().unwrap().to_string_lossy().into_owned();
+            name.starts_with("master") || (name.starts_with('f') && name[1..2].chars().all(|c| c.is_ascii_digit()))
+        })
+        .collect()
+}
+
+fn reads_under(dir: &Path) -> usize {
+    crate::stacking::source_identity::SAMPLE_READ_LOG
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.starts_with(dir))
+        .count()
+}
+
+/// A run samples its inputs itself and banks what the rows vouch for: four lights and two masters, each
+/// `content_hash` the file's three-part sample, and the one log line says how many.
+#[test]
+fn a_run_banks_the_samples_of_its_inputs() {
+    let rig = Pass1Rig::new();
+    let before = banked_hashes(&rig);
+    assert_eq!(before.len(), 6, "four lights and two masters: {before:?}");
+    assert!(before.iter().all(|(_, h)| h.is_none()), "premise: nothing is banked yet: {before:?}");
+
+    let mut rc = rig.run_context(&rig.cfg, Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>);
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc));
+    res.unwrap();
+
+    for (path, hash) in banked_hashes(&rig) {
+        assert_eq!(
+            hash.as_deref(),
+            Some(crate::duplicates::compute_xxhash(Path::new(&path)).unwrap().as_str()),
+            "{path}"
+        );
+    }
+    let line = logs
+        .lines()
+        .find(|l| l.contains("stacking inputs checked"))
+        .unwrap_or_else(|| panic!("no input check line: {logs}"));
+    assert!(line.contains("count=6"), "{line}");
+    assert!(line.contains("banked=6"), "{line}");
+    assert!(line.contains("sampled=6"), "{line}");
+}
+
+/// Once banked, a second run reads no input at all.
+#[test]
+fn a_second_run_reads_no_input() {
+    let rig = Pass1Rig::new();
+    let dir = rig.fixture.dir.path().to_path_buf();
+    let start = reads_under(&dir);
+    rig.try_stage_one(&rig.cfg).unwrap();
+    let after_one = reads_under(&dir);
+    assert_eq!(after_one - start, 6, "run 1 reads the four lights and the two masters");
+    rig.try_stage_one(&rig.cfg).unwrap();
+    assert_eq!(reads_under(&dir), after_one, "run 2 trusts the banked samples");
+}
+
+/// The check is announced once, at 0 %, before the stage's own first event; a cancel before it ends the run
+/// with nothing banked.
+#[test]
+fn the_input_check_says_so_and_stops_on_cancel() {
+    let rig = Pass1Rig::new();
+    let rec = Arc::new(Recording::new());
+    let mut rc = rig.run_context(&rig.cfg, rec.clone() as Arc<dyn ProgressEmitter>);
+    stage_calibrate(&mut rc).unwrap();
+    let events: Vec<serde_json::Value> = rec
+        .events(STACKING_PROGRESS_EVENT)
+        .into_iter()
+        .filter(|e| e["stage"] == Stage::Calibrate.as_str())
+        .collect();
+    let checks: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["message"] == INPUTS_MESSAGE)
+        .collect();
+    assert_eq!(checks.len(), 1, "one input-check event: {events:?}");
+    assert_eq!(checks[0]["current"], 0);
+    assert_eq!(checks[0]["total"], 6);
+    assert!(
+        std::ptr::eq(checks[0], &events[0]),
+        "the check precedes the stage's own first event: {events:?}"
+    );
+
+    // A cancelled run: nothing banked, nothing sampled into the book.
+    let rig = Pass1Rig::new();
+    let mut rc = rig.run_context(&rig.cfg, Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>);
+    rc.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let res = stage_calibrate(&mut rc);
+    assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+    assert!(!rc.memo.samples_resolved(), "a cancelled check leaves the book unfilled");
+    assert!(
+        banked_hashes(&rig).iter().all(|(_, h)| h.is_none()),
+        "nothing is banked by a cancelled check"
+    );
+}
+
+/// An input that changed while the run sampled it is never trusted (FI-1): its frame is excluded with the reason
+/// ("changed while it was sampled"), the run still ends `done`, and the other three frames stack.
+#[test]
+fn an_input_changed_while_sampled_excludes_its_frame_and_the_rest_stack() {
+    let rig = Pass1Rig::new();
+    let frames = rig.plan_groups[0].frames.clone();
+    assert_eq!(frames.len(), 4);
+    let (reference, victim) = (frames[0].clone(), frames[3].clone());
+    crate::registration::db::set_frame_set_reference(&rig.fixture.conn, rig.fixture.set_id, reference.frame_id)
+        .unwrap();
+    let mut cfg = StackingConfig::default();
+    cfg.reference.mode = crate::stacking::config::ReferenceMode::Manual;
+
+    let touched = PathBuf::from(&victim.path);
+    crate::stacking::source_identity::SAMPLE_TOUCH_AFTER_READ.lock().unwrap().push(touched.clone());
+    let started = start_stacking(
+        rig.ctx.clone(),
+        Arc::new(Recording::new()),
+        &PathPolicy::AllowAll,
+        "test".to_string(),
+        StackSubject::FrameSet(rig.fixture.set_id),
+        Some(cfg),
+        None,
+    )
+    .expect("start should succeed");
+    wait_for_run(&rig.ctx, started.run_id);
+    crate::stacking::source_identity::SAMPLE_TOUCH_AFTER_READ.lock().unwrap().retain(|d| d != &touched);
+
+    let row = crate::db::stacking::get_run(&rig.fixture.conn, started.run_id).unwrap().unwrap();
+    assert_eq!(row.status, "done", "{row:?}");
+    let frame_rows = crate::db::stacking::list_frame_rows(&rig.fixture.conn, started.run_id).unwrap();
+    let victim_row = frame_rows.iter().find(|r| r.frame_id == victim.frame_id).expect("the frame's row");
+    assert!(!victim_row.included, "{victim_row:?}");
+    let reason = victim_row.exclusion_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("changed while it was sampled"), "{reason}");
+    assert!(reason.contains(&victim.path), "the reason names the file: {reason}");
+    let included: Vec<i64> = frame_rows.iter().filter(|r| r.included).map(|r| r.frame_id).collect();
+    assert_eq!(included.len(), 3, "{frame_rows:?}");
+    assert!(!included.contains(&victim.frame_id));
+    let groups = crate::db::stacking::list_groups(&rig.fixture.conn, started.run_id).unwrap();
+    assert_eq!(groups[0].included_count, 3, "{:?}", groups[0]);
+    assert!(groups[0].master_path.as_deref().is_some_and(|p| Path::new(p).exists()), "{:?}", groups[0]);
 }

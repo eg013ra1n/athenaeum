@@ -352,15 +352,22 @@ pub fn run_content_index_yielding(
 /// A missing file or unreadable mtime counts as "does not match".
 pub(crate) fn disk_matches_row(path: &std::path::Path, size: i64, modified_at: &str) -> bool {
     match std::fs::metadata(path) {
-        Ok(m) => {
-            let on_disk_mtime = m
-                .modified()
-                .ok()
-                .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
-            m.len() as i64 == size && on_disk_mtime.as_deref() == Some(modified_at)
-        }
+        Ok(m) => metadata_matches_row(&m, size, modified_at),
         Err(_) => false,
     }
+}
+
+/// [`disk_matches_row`] on a stat the caller already holds: the file's size
+/// and RFC 3339 modification time, as the scanner records them, equal the
+/// row's. An unreadable mtime counts as "does not match". Split out so a
+/// caller that stats twice around a read (the stacking input sampler) judges
+/// both stats by one rule.
+pub(crate) fn metadata_matches_row(meta: &std::fs::Metadata, size: i64, modified_at: &str) -> bool {
+    let on_disk_mtime = meta
+        .modified()
+        .ok()
+        .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
+    meta.len() as i64 == size && on_disk_mtime.as_deref() == Some(modified_at)
 }
 
 pub fn fill_master_strong_hashes(

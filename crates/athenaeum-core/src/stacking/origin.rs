@@ -739,6 +739,10 @@ mod tests {
                 "the subject dispatch to the two plan arms, and its per-subject log line",
             ),
             (
+                "run_input_paths",
+                "the run's input check: a project's frames name no catalog file, an attested light no master",
+            ),
+            (
                 "test_context",
                 "#[cfg(test)] constructor of a frame-set run",
             ),

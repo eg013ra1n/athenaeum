@@ -1158,7 +1158,7 @@ pub(crate) fn start_stacking_with_solver(
         summary,
         last_emit: Instant::now(),
         rerun_from,
-        memo: HashMemo::new(origins.clone()),
+        memo: HashMemo::for_run(origins.clone()),
         origins,
         solver,
         wcs_rule: None,
@@ -1794,7 +1794,7 @@ pub(crate) fn test_context(
         summary,
         last_emit: Instant::now(),
         rerun_from: None,
-        memo: HashMemo::new(origins.clone()),
+        memo: HashMemo::for_run(origins.clone()),
         origins,
         solver,
         wcs_rule: None,
@@ -1851,7 +1851,7 @@ pub(crate) fn project_test_context(
         group_ids,
     );
     rc.subject = StackSubject::Project(project_id.to_string());
-    rc.memo = HashMemo::new(origins.clone());
+    rc.memo = HashMemo::for_run(origins.clone());
     rc.origins = origins;
     rc.summary.set_id = None;
     rc.summary.project_id = Some(project_id.to_string());

@@ -878,25 +878,14 @@ fn a_failed_fits_write_leaves_no_row() {
     }
 }
 
-/// Ruling R12 (a): a file Athenaeum never rewrites (an attested light used in place) keeps its modification time in
-/// the first pass's stamp. A same-size pixel edit by someone else (a new mtime, the catalog row refreshed as a
-/// rescan does) makes THAT frame's first pass stale; it re-runs, the others do not, nothing is excluded. Without
-/// the mtime the edit would be silently reused (the length is the same).
-#[test]
-fn measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one() {
-    let rig = Pass1Rig::attested();
-    let first = rig.run("run 1", None);
-    assert_eq!(first.logged.len(), 4);
-    let ids = rig.sorted_ids();
-    assert_eq!(ids.len(), 4);
-    for id in &ids {
-        let p = rig.calibrated_path(*id);
-        assert!(
-            !p.starts_with(rig.layout.calibrated_root()) && !p.starts_with(rig.layout.prepared_root()),
-            "{p:?} is used in place"
-        );
-    }
-    let edited = rig.calibrated_path(ids[2]);
+/// A same-size pixel edit by someone else of an in-place calibrated file (an attested light) at the middle of the file,
+/// a new time (+5 s), `calibrated`'s file returned. Returns the edited path.
+fn edit_in_place_light_same_size(rig: &Pass1Rig, id: i64) -> PathBuf {
+    let edited = rig.calibrated_path(id);
+    assert!(
+        !edited.starts_with(rig.layout.calibrated_root()) && !edited.starts_with(rig.layout.prepared_root()),
+        "{edited:?} is used in place"
+    );
     let before = std::fs::metadata(&edited).unwrap();
     {
         use std::io::{Seek, SeekFrom, Write};
@@ -910,14 +899,46 @@ fn measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one() {
     let after = std::fs::metadata(&edited).unwrap();
     assert_eq!(after.len(), before.len(), "a same-size edit");
     assert_ne!(after.modified().unwrap(), before.modified().unwrap());
+    edited
+}
+
+/// Ruling R12 (a) as the file identity reads it: a file Athenaeum never rewrites (an attested light used in place) is
+/// judged by the key, and the key holds the light's sample. A same-size pixel edit by someone else (a new mtime, the
+/// catalog row refreshed and its `content_hash` NULLed as a rescan's re-parse does) makes THAT frame's first pass
+/// stale; it re-runs, the others do not, nothing is excluded. Without the `content_hash = NULL` the banked sample
+/// would be trusted: the row's size and time match the file.
+#[test]
+fn measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one() {
+    let rig = Pass1Rig::attested();
+    let first = rig.run("run 1", None);
+    assert_eq!(first.logged.len(), 4);
+    let ids = rig.sorted_ids();
+    assert_eq!(ids.len(), 4);
+    let edited = edit_in_place_light_same_size(&rig, ids[2]);
     let (size, modified_at) = file_identity(&edited).unwrap();
     rig.fixture
         .conn
         .execute(
-            "UPDATE files SET size = ?1, modified_at = ?2 WHERE path = ?3",
+            "UPDATE files SET size = ?1, modified_at = ?2, content_hash = NULL WHERE path = ?3",
             rusqlite::params![size, modified_at, edited.to_str().unwrap()],
         )
         .unwrap();
+    rig.delete_rows(&[ArtifactKind::Metrics, ArtifactKind::Fits(0)]);
+    let second = rig.run("run 2", None);
+    assert_eq!(second.logged, vec![edited], "only the edited file re-ran pass 1");
+    assert_eq!(second.excluded, 0);
+    assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
+}
+
+/// The same edit with the catalog row untouched (no rescan): the row's time no longer matches the file's, so the run
+/// samples the file again, finds the edited bytes, and only that frame's first pass re-runs.
+#[test]
+fn measure_pass1_artifact_of_an_edited_in_place_source_without_a_rescan_reruns_pass_one() {
+    let rig = Pass1Rig::attested();
+    let first = rig.run("run 1", None);
+    assert_eq!(first.logged.len(), 4);
+    let ids = rig.sorted_ids();
+    let edited = edit_in_place_light_same_size(&rig, ids[2]);
     rig.delete_rows(&[ArtifactKind::Metrics, ArtifactKind::Fits(0)]);
     let second = rig.run("run 2", None);
     assert_eq!(second.logged, vec![edited], "only the edited file re-ran pass 1");

@@ -598,13 +598,13 @@ const REGISTER_MESSAGE_CHECKING: &str = "checking the reference";
 const REGISTER_MESSAGE_ALIGNING: &str = "aligning";
 
 /// The reference's term of every member's registration hash (ruling R3 (a), [`reference_measurement_fold`]): its own
-/// Measure output when it lives in a group other than `group`, `""` otherwise. `reference_hash` is the reference's
-/// calibration hash. The one place the run, the gate and the two-pass key resolve it.
+/// Measure output whenever its group reads `fits.0`, whatever group the member is in, `""` for a debayered OSC
+/// reference. `reference_hash` is the reference's calibration hash. The one place the run, the gate and the two-pass
+/// key resolve it.
 ///
 /// [`reference_measurement_fold`]: crate::stacking::plan::reference_measurement_fold
 pub(super) fn reference_measurement_term(
     rc: &RunContext,
-    group: &IntegrationGroup,
     reference_frame_id: i64,
     reference_hash: &str,
     prepare_path: bool,
@@ -620,7 +620,6 @@ pub(super) fn reference_measurement_term(
         })?;
     Ok(crate::stacking::plan::reference_measurement_fold(
         &rc.config,
-        group,
         reference_group,
         prepare_path,
         reference_hash,
@@ -784,10 +783,10 @@ pub(super) fn register_group_pass(
     // Frame-level cache spec §5.5: the measurement hash is folded only for a frame whose registration reads
     // `fits.0`; the gate derives the same flag (`plan::compute_register_stale`).
     let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
-    // Ruling R3 (a): the reference's own Measure output, when its fits seed the reference stars and its group is not
-    // this one (`plan::reference_measurement_fold`; the gate resolves the same value).
+    // Ruling R3 (a), FI-6: the reference's own Measure output, whenever its fits seed the reference stars, whatever
+    // group this is (`plan::reference_measurement_fold`; the gate resolves the same value).
     let reference_measurement_hash =
-        reference_measurement_term(rc, group, reference_frame_id, reference_hash, prepare_path)?;
+        reference_measurement_term(rc, reference_frame_id, reference_hash, prepare_path)?;
     for (idx, frame, path, is_reference) in snapshot {
         let (frame_hash, expected_hash) = member_registration_hash(
             rc,
@@ -1921,6 +1920,7 @@ pub(super) fn delivered_dims(rc: &RunContext, native: (usize, usize)) -> (usize,
 /// reference). Both passes live inside ONE `Stage::Register` timing and
 /// share ONE progress total. A `Manual` reference never moves.
 pub(super) fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
+    super::calibrate::ensure_source_samples(rc)?;
     let stage_start = Instant::now();
     let meter = crate::stacking::telemetry::StageMeter::start(rc, Stage::Register, None);
     let cfg = rc.config.clone();

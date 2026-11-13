@@ -915,18 +915,55 @@ pub fn config_hash(cfg: &StackingConfig) -> String {
 /// order instead).
 ///
 /// **Order-insensitive on both inputs.** `upstream` is sorted lexically and
-/// `sources` by `(file_id, size, modified_at)` before hashing, so a caller
+/// `sources` by `(file_id, size, third field)` before hashing, so a caller
 /// that assembles either from an unordered source (a `HashMap`, a query
 /// with no `ORDER BY`) still gets the same hash every run — an
 /// order-sensitive hash would make every artifact look stale and get
 /// silently recomputed. Duplicate entries are kept, not deduped: a
 /// duplicate is the caller's bug, and a stable hash for it is still the
 /// right answer.
+///
+/// A source is named by its content, never by a modification time (FI-1): a catalog light by its
+/// file id, size and sampled hash ([`SourceIdentity::Sampled`]); a prepared project frame keeps its
+/// old shape ([`SourceIdentity::Project`]: the frame's own byte size and no time), so a project's
+/// caches do not move.
 #[derive(Serialize)]
-pub struct SourceIdentity {
-    pub file_id: i64,
-    pub size: i64,
-    pub modified_at: String,
+#[serde(untagged)]
+pub enum SourceIdentity {
+    /// A catalog light: its `files.id`, size and the sample (`"zip:<token>"` for a zip entry).
+    Sampled {
+        file_id: i64,
+        size: i64,
+        sample: String,
+    },
+    /// A prepared project frame: no catalog identity (`file_id` 0, empty time), its byte size.
+    Project {
+        file_id: i64,
+        size: i64,
+        modified_at: String,
+    },
+}
+
+impl SourceIdentity {
+    fn file_id(&self) -> i64 {
+        match self {
+            Self::Sampled { file_id, .. } | Self::Project { file_id, .. } => *file_id,
+        }
+    }
+
+    fn size(&self) -> i64 {
+        match self {
+            Self::Sampled { size, .. } | Self::Project { size, .. } => *size,
+        }
+    }
+
+    /// The field that follows the size in the sort: the sample, or the project's (empty) time.
+    fn third(&self) -> &str {
+        match self {
+            Self::Sampled { sample, .. } => sample,
+            Self::Project { modified_at, .. } => modified_at,
+        }
+    }
 }
 
 pub fn stage_hash(
@@ -939,10 +976,10 @@ pub fn stage_hash(
 
     let mut sorted_sources: Vec<&SourceIdentity> = sources.iter().collect();
     sorted_sources.sort_by(|a, b| {
-        a.file_id
-            .cmp(&b.file_id)
-            .then(a.size.cmp(&b.size))
-            .then_with(|| a.modified_at.cmp(&b.modified_at))
+        a.file_id()
+            .cmp(&b.file_id())
+            .then(a.size().cmp(&b.size()))
+            .then_with(|| a.third().cmp(b.third()))
     });
 
     let payload = serde_json::json!({
@@ -1870,13 +1907,38 @@ mod tests {
         );
     }
 
+    /// A project frame's source keeps the bytes of the struct it replaced (the hash goes through a
+    /// `serde_json::Value`, whose map is sorted), so a project keeps its caches; a catalog light's is
+    /// the three fields of its identity.
+    #[test]
+    fn a_sources_two_shapes_serialize_as_pinned() {
+        let project = SourceIdentity::Project {
+            file_id: 0,
+            size: 4096,
+            modified_at: String::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&serde_json::to_value(&project).unwrap()).unwrap(),
+            r#"{"file_id":0,"modified_at":"","size":4096}"#
+        );
+        let sampled = SourceIdentity::Sampled {
+            file_id: 42,
+            size: 7,
+            sample: "0000000000004242".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&serde_json::to_value(&sampled).unwrap()).unwrap(),
+            r#"{"file_id":42,"sample":"0000000000004242","size":7}"#
+        );
+    }
+
     #[test]
     fn stage_hash_is_stable_and_sensitive() {
         let cfg = StackingConfig::default();
-        let src = [SourceIdentity {
+        let src = [SourceIdentity::Sampled {
             file_id: 1,
             size: 10,
-            modified_at: "t".into(),
+            sample: "t".into(),
         }];
         let a = stage_hash(&calibration_subtree(&cfg), &["up"], &src);
         assert_eq!(a, stage_hash(&calibration_subtree(&cfg), &["up"], &src));
@@ -1887,10 +1949,10 @@ mod tests {
             stage_hash(
                 &calibration_subtree(&cfg),
                 &["up"],
-                &[SourceIdentity {
+                &[SourceIdentity::Sampled {
                     file_id: 1,
                     size: 11,
-                    modified_at: "t".into(),
+                    sample: "t".into(),
                 }]
             )
         );
@@ -2288,32 +2350,13 @@ mod tests {
     fn stage_hash_is_order_insensitive() {
         let cfg = StackingConfig::default();
         let subtree = calibration_subtree(&cfg);
-        let s1 = SourceIdentity {
-            file_id: 1,
-            size: 10,
-            modified_at: "t".into(),
+        let src = |file_id: i64, size: i64, sample: &str| SourceIdentity::Sampled {
+            file_id,
+            size,
+            sample: sample.into(),
         };
-        let s2 = SourceIdentity {
-            file_id: 2,
-            size: 20,
-            modified_at: "u".into(),
-        };
-        let forward = stage_hash(
-            &subtree,
-            &["a", "b"],
-            &[
-                SourceIdentity {
-                    file_id: s1.file_id,
-                    size: s1.size,
-                    modified_at: s1.modified_at.clone(),
-                },
-                SourceIdentity {
-                    file_id: s2.file_id,
-                    size: s2.size,
-                    modified_at: s2.modified_at.clone(),
-                },
-            ],
-        );
+        let (s1, s2) = (src(1, 10, "t"), src(2, 20, "u"));
+        let forward = stage_hash(&subtree, &["a", "b"], &[src(1, 10, "t"), src(2, 20, "u")]);
         let reversed = stage_hash(&subtree, &["b", "a"], &[s2, s1]);
         assert_eq!(
             forward, reversed,
@@ -2324,16 +2367,8 @@ mod tests {
             &subtree,
             &["a", "b"],
             &[
-                SourceIdentity {
-                    file_id: 3,
-                    size: 10,
-                    modified_at: "t".into(),
-                },
-                SourceIdentity {
-                    file_id: 2,
-                    size: 20,
-                    modified_at: "u".into(),
-                },
+                src(3, 10, "t"),
+                src(2, 20, "u"),
             ],
         );
         assert_ne!(forward, changed, "a changed file_id still changes the hash");
