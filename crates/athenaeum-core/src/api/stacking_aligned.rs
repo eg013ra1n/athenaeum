@@ -7,7 +7,9 @@
 //! row, while a later run that finds the file fresh reuses it and leaves both alone. So a run's aligned frame is offered
 //! while nothing has replaced it: no later run holds its group, its row was not written after the run finished, and the
 //! file is still the one the row recorded. Its location is the artifact row's absolute `path` - never a path rebuilt from
-//! the subject's current name, which a rename changes.
+//! the subject's current name, which a rename changes. After the working folder moved, the row still names the old
+//! place until the next run rebases it: the handlers read the rows through a read-only [`RebaseView`] (file identity
+//! §4.10), so the frame is shown from the new place at once and nothing is written.
 //!
 //! Two handlers: [`get_stacking_aligned_frames`] says, per frame, whether the aligned frame is available and, if not,
 //! why; [`resolve_stacking_aligned_path`] gives the file to render. The hosts render it with the same pipeline as the
@@ -23,6 +25,7 @@ use crate::api::{db, ApiError};
 use crate::db::stacking::{find_artifact, get_run, ArtifactKind, StackSubject, StackingRunRow};
 use crate::services::ServiceContext;
 use crate::stacking::plan::{file_matches_identity, registered_status};
+use crate::stacking::rebase::RebaseView;
 
 /// Whether a run's aligned frame can be shown for one frame, and why not when it cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -163,7 +166,12 @@ fn file_exists(path: &Path, run_id: i64, frame_id: i64) -> bool {
 ///    instead - the group rule alone misses both, since a regroup names other groups;
 /// 5. anything else (`skipped`: cut before Register): `NotRegistered`. Such a frame may still have an artifact row, from
 ///    an earlier run that registered it; that file is not this run's.
-fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Resolved>, ApiError> {
+fn resolve(
+    conn: &Connection,
+    run_id: i64,
+    frame_ids: &[i64],
+    view: &RebaseView,
+) -> Result<Vec<Resolved>, ApiError> {
     let run = get_run(conn, run_id)?
         .ok_or_else(|| ApiError::NotFound(format!("stacking run {run_id} not found")))?;
     let subject = run.subject();
@@ -204,13 +212,13 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
             ));
             continue;
         }
-        let artifact = find_artifact(
+        let artifact = view.apply(find_artifact(
             conn,
             &subject,
             &row.group_key,
             ArtifactKind::Registered,
             Some(frame_id),
-        )?;
+        )?);
         // Both timestamps are RFC 3339 UTC with milliseconds from one `now()`, so they compare as strings. A run still
         // going has no `finished_at`: nothing can have replaced its files yet, and the group rule has no say either.
         if artifact.as_ref().is_some_and(|a| {
@@ -251,6 +259,37 @@ fn resolve(conn: &Connection, run_id: i64, frame_ids: &[i64]) -> Result<Vec<Reso
     Ok(out)
 }
 
+/// The read-only view of a working folder that moved since the run's rows were written (file-identity §4.10): the
+/// `registered` rows of `frame_ids` as the next run's trigger would leave them, so a moved folder's aligned frames are
+/// shown from the new place before that run. Needs the subject's current working folder to exist; without one, or with
+/// a catalog read that fails (a `warn!`), the rows read as stored. Writes nothing.
+fn rebase_view(ctx: &ServiceContext, conn: &Connection, run_id: i64, frame_ids: &[i64]) -> RebaseView {
+    let result = (|| -> Result<Option<RebaseView>, ApiError> {
+        let run = get_run(conn, run_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("stacking run {run_id} not found")))?;
+        let subject = run.subject();
+        let Some(working) = super::stacking::current_working_dir(conn, &ctx.settings, &subject)? else {
+            return Ok(None);
+        };
+        if !working.is_dir() {
+            return Ok(None);
+        }
+        let layout = crate::stacking::paths::subject_layout(conn, &working, &subject)
+            .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        let view = RebaseView::for_registered(conn, &subject, &layout.root, frame_ids)
+            .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        Ok(Some(view))
+    })();
+    match result {
+        Ok(Some(view)) => view,
+        Ok(None) => RebaseView::none(),
+        Err(error) => {
+            tracing::warn!(run_id, %error, "working folder rows not read for the aligned frames' rebase view; rows read as stored");
+            RebaseView::none()
+        }
+    }
+}
+
 /// For each frame of a run (ids in the run's namespace: catalog frame ids for a frame set, project-frame handles for a
 /// project), whether its aligned frame is available. One call per Blink open.
 pub fn get_stacking_aligned_frames(
@@ -260,7 +299,8 @@ pub fn get_stacking_aligned_frames(
 ) -> Result<Vec<AlignedFrameStatus>, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
-    Ok(resolve(&conn, run_id, frame_ids)?
+    let view = rebase_view(ctx, &conn, run_id, frame_ids);
+    Ok(resolve(&conn, run_id, frame_ids, &view)?
         .into_iter()
         .map(|r| AlignedFrameStatus {
             frame_id: r.frame_id,
@@ -278,7 +318,8 @@ pub fn resolve_stacking_aligned_path(
 ) -> Result<PathBuf, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
-    let resolved = resolve(&conn, run_id, &[frame_id])?
+    let view = rebase_view(ctx, &conn, run_id, &[frame_id]);
+    let resolved = resolve(&conn, run_id, &[frame_id], &view)?
         .pop()
         .ok_or_else(|| ApiError::Internal("aligned frame lookup returned nothing".into()))?;
     match resolved.path {
@@ -501,6 +542,54 @@ mod tests {
             resolve_stacking_aligned_path(&s.ctx, run_id, 987_654),
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    /// File identity §4.10 (RB-3): Blink reads the `registered` rows through the rebase view, so a moved working
+    /// folder's aligned frames are shown from the new place before the next run rebases anything. Nothing is written.
+    #[test]
+    fn blink_shows_a_moved_folders_frames_before_the_next_run() {
+        let s = seeded(&[4.0; 4], 0);
+        let run_id = run_once(&s, &config());
+        assert_eq!(states(&s, run_id), vec![AlignedState::Available; 4]);
+        let w1 = s._working.path().to_path_buf();
+        let rows_before: Vec<(i64, Option<String>)> =
+            crate::db::stacking::list_artifacts(&s.fixture.conn, &StackSubject::FrameSet(s.fixture.set_id), None)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.path))
+                .collect();
+        let w1_as_run_spells_it = crate::stacking::paths::run_spelled_working(&w1).unwrap();
+        assert!(
+            rows_before
+                .iter()
+                .any(|(_, p)| p.as_deref().is_some_and(|p| Path::new(p).starts_with(&w1_as_run_spells_it))),
+            "premise: the rows name W1: {rows_before:?}"
+        );
+
+        // The folder moves; the setting still names the old one: the files are nowhere the rows say.
+        let w2 = s._tmp.path().join("w2");
+        std::fs::rename(&w1, &w2).unwrap();
+        assert_eq!(states(&s, run_id), vec![AlignedState::Missing; 4], "premise: the old folder is gone");
+
+        crate::db::set_setting(
+            &s.fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            w2.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(states(&s, run_id), vec![AlignedState::Available; 4]);
+        let path = resolve_stacking_aligned_path(&s.ctx, run_id, s.ids[1]).unwrap();
+        assert!(path.is_file(), "{path:?}");
+        let current = crate::stacking::paths::run_spelled_working(&w2).unwrap();
+        assert!(path.starts_with(&current), "{path:?} is under the current folder {current:?}");
+
+        let rows_after: Vec<(i64, Option<String>)> =
+            crate::db::stacking::list_artifacts(&s.fixture.conn, &StackSubject::FrameSet(s.fixture.set_id), None)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.path))
+                .collect();
+        assert_eq!(rows_after, rows_before, "Blink wrote no row: the rows still name W1");
     }
 
     #[test]

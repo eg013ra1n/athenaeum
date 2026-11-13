@@ -120,6 +120,7 @@ use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
 use crate::stacking::psf_signal;
+use crate::stacking::rebase::RebaseView;
 use crate::stacking::register::align::{self, SeedKind, SeedPolicy};
 use crate::stacking::register::detect::stars_from_fits;
 use crate::stacking::register::frame::{

@@ -20,15 +20,16 @@
 //! A row of the user's own file (an in-place `calibrated` row, which names the light itself), a payload-only row
 //! (no path, size or time) and another subject's row are never candidates.
 //!
-//! Callers: the run's trigger (`run::calibrate::rebase_working_rows`) and, later, the gate's read-only view.
+//! Callers: the run's trigger (`run::calibrate::rebase_working_rows`) and the read-only [`RebaseView`] of the plan gate
+//! and Blink, which judge the same candidates with the same [`check`] and commit nothing.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::collab::storage::sweep::MTIME_TOLERANCE_SECS;
-use crate::db::stacking::StackSubject;
+use crate::db::stacking::{StackSubject, StackingArtifactRow};
 
 /// The progress message of the step that looks for the moved files, one event as the input check's.
 pub(crate) const REBASE_MESSAGE: &str = "finding the cached files";
@@ -94,7 +95,9 @@ pub(crate) fn old_roots(
         tracing::warn!(error = %format!("{e:#}"), "the subject's recorded working folders not read");
         e
     })?;
-    let current_canonical = canonical_plain(current_root);
+    // Resolved only when a recorded folder differs by spelling: the steady state (every run used the current folder)
+    // costs no file system call here.
+    let mut current_canonical: Option<Option<PathBuf>> = None;
     let mut roots: Vec<PathBuf> = Vec::new();
     for dir in dirs.iter().filter(|d| !d.is_empty()) {
         let layout = crate::stacking::paths::subject_layout(conn, Path::new(dir), subject)
@@ -106,7 +109,8 @@ pub(crate) fn old_roots(
         if root == current_root {
             continue;
         }
-        if let (Some(a), Some(b)) = (&current_canonical, canonical_plain(&root)) {
+        let current = current_canonical.get_or_insert_with(|| canonical_plain(current_root));
+        if let (Some(a), Some(b)) = (current.as_ref(), canonical_plain(&root)) {
             if *a == b {
                 continue;
             }
@@ -135,6 +139,8 @@ fn canonical_plain(path: &Path) -> Option<PathBuf> {
 pub(crate) struct Candidate {
     pub row_id: i64,
     pub kind: String,
+    /// The frame the row belongs to (`None` for a group-level row).
+    pub frame_id: Option<i64>,
     pub old_path: String,
     pub old_root: PathBuf,
     pub mapped: PathBuf,
@@ -153,12 +159,22 @@ pub(crate) fn candidates(
     current_root: &Path,
 ) -> anyhow::Result<Vec<Candidate>> {
     let roots = old_roots(conn, subject, current_root)?;
+    candidates_under(conn, subject, &roots, current_root)
+}
+
+/// [`candidates`] over the old roots the caller already read ([`old_roots`]).
+fn candidates_under(
+    conn: &Connection,
+    subject: &StackSubject,
+    roots: &[PathBuf],
+    current_root: &Path,
+) -> anyhow::Result<Vec<Candidate>> {
     if roots.is_empty() {
         return Ok(Vec::new());
     }
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, path, size, modified_at FROM stacking_artifacts
+            "SELECT id, kind, path, size, modified_at, frame_id FROM stacking_artifacts
              WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
                AND path >= ?3 AND (?4 IS NULL OR path < ?4)
                AND size IS NOT NULL AND modified_at IS NOT NULL",
@@ -169,7 +185,7 @@ pub(crate) fn candidates(
         })?;
     let mut seen: HashSet<i64> = HashSet::new();
     let mut out = Vec::new();
-    for root in &roots {
+    for root in roots {
         let Some(root_str) = root.to_str() else {
             tracing::debug!(path = %root.display(), "an old working root is not valid UTF-8; its rows stay where they are");
             continue;
@@ -194,6 +210,7 @@ pub(crate) fn candidates(
                         r.get::<_, String>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
                     ))
                 },
             )?
@@ -202,11 +219,11 @@ pub(crate) fn candidates(
                 tracing::warn!(path = %lower, error = %e, "the rebase candidates were not read");
                 e
             })?;
-        for (row_id, kind, old_path, size, modified_at) in rows {
+        for (row_id, kind, old_path, size, modified_at, frame_id) in rows {
             if seen.contains(&row_id) {
                 continue;
             }
-            let Some((idx, mapped)) = map_row(&kind, Path::new(&old_path), &roots, current_root)
+            let Some((idx, mapped)) = map_row(&kind, Path::new(&old_path), roots, current_root)
             else {
                 continue;
             };
@@ -218,6 +235,7 @@ pub(crate) fn candidates(
             out.push(Candidate {
                 row_id,
                 kind,
+                frame_id,
                 old_path,
                 old_root: roots[idx].clone(),
                 mapped,
@@ -245,6 +263,28 @@ pub(crate) enum Check {
     NotAFile,
     /// The place cannot be inspected (permissions, a dropped mount); the text is the OS error.
     Unreadable(String),
+}
+
+impl Check {
+    /// Why a candidate was left where it is, as the logs say it; `None` for [`Check::Moved`]. The run's trigger and
+    /// the gate's view read the same words.
+    pub(crate) fn left_reason(&self) -> Option<&'static str> {
+        match self {
+            Check::Moved => None,
+            Check::Missing => Some("missing"),
+            Check::OtherSize => Some("another size"),
+            Check::OtherTime => Some("another time"),
+            Check::NotAFile => Some("not a file"),
+            Check::Unreadable(_) => Some("unreadable"),
+        }
+    }
+}
+
+/// Whether a candidate that was left is nowhere: its file is not at the old place either (the row's own size is the
+/// one identity, as every own working file's). Only such a row is counted in [`left_warning`]; one whose file is still
+/// at the old place is read there. One stat. The run's trigger and the gate's view count with this one rule.
+pub(crate) fn is_gone_at_old_place(c: &Candidate) -> bool {
+    !crate::stacking::plan::file_matches_identity(Path::new(&c.old_path), Some(c.size))
 }
 
 /// One `std::fs::metadata` of the mapped place and the three comparisons, in the order size, kind, time. Reads no
@@ -314,6 +354,117 @@ pub(crate) fn commit(conn: &mut Connection, moved: &[&Candidate]) -> anyhow::Res
         tracing::warn!(count = moved.len(), error = %format!("{e:#}"), "the rebased paths were not committed");
         e
     })
+}
+
+/// What the plan gate and Blink read instead of committing the rebase: the candidates of [`candidates`] judged by
+/// [`check`], held in memory. A row [`Check::Moved`] reads, through [`RebaseView::apply`], as the run's trigger would
+/// have left it (its path at the mapped place); every other row reads where it is. Nothing is written, no probe file
+/// is made, and a subject with no row outside the current root costs no stat. Built under the reader's own
+/// connection; the verdicts are the run's ([`check`], [`is_gone_at_old_place`]), so the plan before a run and the run
+/// agree unless a file changes between them.
+#[derive(Debug, Default)]
+pub(crate) struct RebaseView {
+    /// Row id to (the path the row names now, the path it would have): applied only while the row still names the
+    /// first, so a row a writer re-recorded since the candidates were read is not touched.
+    by_row: HashMap<i64, (String, String)>,
+    old_roots: Vec<PathBuf>,
+    left_gone: usize,
+}
+
+impl RebaseView {
+    /// The view of no move: every row reads as it is stored. What a run's own callers pass (the run rebases first).
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+
+    /// The view of `subject` over `current_root` (the root of the working folder the next run would use, in the
+    /// spelling a run records): phases one and two of the run's trigger ([`candidates`], then one [`check`] per
+    /// candidate, one more stat per candidate that was left), under the caller's connection, with no progress and no
+    /// commit. An `Err` is a catalog read that failed (already logged); the caller reads the rows as they are.
+    pub(crate) fn for_gate(
+        conn: &Connection,
+        subject: &StackSubject,
+        current_root: &Path,
+    ) -> anyhow::Result<Self> {
+        Self::read(conn, subject, current_root, |_| true)
+    }
+
+    /// The view Blink reads: only the `registered` rows of `frame_ids`, so a request for one frame stats one file,
+    /// not every file of the subject. The verdicts are [`RebaseView::for_gate`]'s.
+    pub(crate) fn for_registered(
+        conn: &Connection,
+        subject: &StackSubject,
+        current_root: &Path,
+        frame_ids: &[i64],
+    ) -> anyhow::Result<Self> {
+        let kind = crate::db::stacking::ArtifactKind::Registered.as_db_str();
+        Self::read(conn, subject, current_root, |c| {
+            c.kind == kind && c.frame_id.is_some_and(|id| frame_ids.contains(&id))
+        })
+    }
+
+    fn read(
+        conn: &Connection,
+        subject: &StackSubject,
+        current_root: &Path,
+        keep: impl Fn(&Candidate) -> bool,
+    ) -> anyhow::Result<Self> {
+        let old_roots = old_roots(conn, subject, current_root)?;
+        let mut found = candidates_under(conn, subject, &old_roots, current_root)?;
+        found.retain(|c| keep(c));
+        let mut view = Self {
+            old_roots,
+            ..Self::default()
+        };
+        for c in &found {
+            let check = check(c);
+            if check == Check::Moved {
+                // `candidates_under` keeps only candidates whose mapped path is valid UTF-8.
+                if let Some(mapped) = c.mapped.to_str() {
+                    view.by_row.insert(c.row_id, (c.old_path.clone(), mapped.to_string()));
+                }
+            } else if is_gone_at_old_place(c) {
+                view.left_gone += 1;
+            }
+        }
+        if !found.is_empty() {
+            tracing::debug!(
+                new_root = %current_root.display(),
+                moved = view.by_row.len(),
+                left = found.len() - view.by_row.len(),
+                "working folder rows read through the rebase view"
+            );
+        }
+        Ok(view)
+    }
+
+    /// `row` as the run's trigger would leave it: a row judged [`Check::Moved`] comes back with its path at the mapped
+    /// place, any other row as it is.
+    pub(crate) fn apply(&self, row: Option<StackingArtifactRow>) -> Option<StackingArtifactRow> {
+        let mut row = row?;
+        if let Some((old, mapped)) = self.by_row.get(&row.id) {
+            if row.path.as_deref() == Some(old.as_str()) {
+                row.path = Some(mapped.clone());
+            }
+        }
+        Some(row)
+    }
+
+    /// The subject roots its earlier runs used ([`old_roots`]), as the view read them.
+    pub(crate) fn old_roots(&self) -> &[PathBuf] {
+        &self.old_roots
+    }
+
+    /// How many candidates were left and are nowhere either: the count of [`left_warning`].
+    pub(crate) fn left_gone(&self) -> usize {
+        self.left_gone
+    }
+
+    /// How many rows read through the view as moved.
+    #[cfg(test)]
+    pub(crate) fn moved(&self) -> usize {
+        self.by_row.len()
+    }
 }
 
 /// The warning for the rows that were not found where the old folder had them: said once per run (T8b) and once per
@@ -444,6 +595,7 @@ mod tests {
         Candidate {
             row_id: 1,
             kind: "calibrated".into(),
+            frame_id: Some(1),
             old_path: "/gone/M31/calibrated/c.fits".into(),
             old_root: pb("/gone/M31"),
             mapped: mapped.to_path_buf(),
@@ -779,6 +931,120 @@ mod tests {
         w.f.conn.execute("DELETE FROM stacking_artifacts WHERE id = ?1", [id]).unwrap();
         assert_eq!(commit(&mut w.f.conn, &moved).unwrap(), 0);
         assert_eq!(commit(&mut w.f.conn, &[]).unwrap(), 0);
+    }
+
+    /// The view judges every candidate as the run's trigger does and writes nothing: a moved row reads at its mapped
+    /// place, a left one where it is, a left one that is nowhere is counted for the warning.
+    #[test]
+    fn a_rebase_view_reads_a_moved_row_at_its_mapped_place_and_writes_nothing() {
+        let w = World::new();
+        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000);
+        let old = |kind: &str, name: &str| w.old_root().join(kind).join(name);
+        let new = |kind: &str, name: &str| w.new_root().join(kind).join(name);
+
+        // Moved: the copy at the new place has the size and the time.
+        let old_cal = old("calibrated", "c_a_f1.fits");
+        write_file(&old_cal, 40);
+        set_time(&old_cal, t);
+        w.add_real_row(ArtifactKind::Calibrated, 1, &old_cal);
+        write_file(&new("calibrated", "c_a_f1.fits"), 40);
+        set_time(&new("calibrated", "c_a_f1.fits"), t);
+        let old_reg2 = old("registered", "r_a_f2.fits");
+        write_file(&old_reg2, 60);
+        set_time(&old_reg2, t);
+        w.add_real_row(ArtifactKind::Registered, 2, &old_reg2);
+        write_file(&new("registered", "r_a_f2.fits"), 60);
+        set_time(&new("registered", "r_a_f2.fits"), t + Duration::from_millis(900));
+        // Left, and still at the old place: another size at the new one.
+        let old_reg1 = old("registered", "r_a_f1.fits");
+        write_file(&old_reg1, 70);
+        w.add_real_row(ArtifactKind::Registered, 1, &old_reg1);
+        write_file(&new("registered", "r_a_f1.fits"), 71);
+        // Left and nowhere: the old file is gone and the new place holds nothing.
+        let old_athm = old("measured", "a_f2.athm");
+        write_file(&old_athm, 30);
+        w.add_real_row(ArtifactKind::Measured, 2, &old_athm);
+        std::fs::remove_file(&old_athm).unwrap();
+
+        let paths = |conn: &Connection| -> Vec<(i64, Option<String>)> {
+            crate::db::stacking::list_artifacts(conn, &w.subject, None)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.path))
+                .collect()
+        };
+        let rows_before = paths(&w.f.conn);
+        let walk_before = (walk(&w.old_wd), walk(&w.new_wd));
+        let row = |kind: ArtifactKind, frame: i64| {
+            crate::db::stacking::find_artifact(&w.f.conn, &w.subject, "g", kind, Some(frame)).unwrap()
+        };
+
+        let view = RebaseView::for_gate(&w.f.conn, &w.subject, &w.new_root()).unwrap();
+        assert_eq!(view.moved(), 2);
+        assert_eq!(view.left_gone(), 1, "only the row whose file is nowhere is counted");
+        assert_eq!(view.old_roots(), [w.old_root()]);
+        assert_eq!(
+            view.apply(row(ArtifactKind::Calibrated, 1)).unwrap().path.unwrap(),
+            new("calibrated", "c_a_f1.fits").to_str().unwrap()
+        );
+        assert_eq!(
+            view.apply(row(ArtifactKind::Registered, 2)).unwrap().path.unwrap(),
+            new("registered", "r_a_f2.fits").to_str().unwrap()
+        );
+        assert_eq!(
+            view.apply(row(ArtifactKind::Registered, 1)).unwrap().path.unwrap(),
+            old_reg1.to_str().unwrap(),
+            "a row left where it is reads there"
+        );
+        assert_eq!(
+            view.apply(row(ArtifactKind::Measured, 2)).unwrap().path.unwrap(),
+            old_athm.to_str().unwrap()
+        );
+        assert!(view.apply(None).is_none());
+        // A row a writer re-recorded elsewhere since the candidates were read is not touched.
+        let mut moved_since = row(ArtifactKind::Calibrated, 1).unwrap();
+        moved_since.path = Some("/elsewhere/c.fits".into());
+        assert_eq!(view.apply(Some(moved_since)).unwrap().path.unwrap(), "/elsewhere/c.fits");
+
+        // Blink's view: the `registered` rows of the asked frames only.
+        let blink = RebaseView::for_registered(&w.f.conn, &w.subject, &w.new_root(), &[2]).unwrap();
+        assert_eq!((blink.moved(), blink.left_gone()), (1, 0));
+        let blink = RebaseView::for_registered(&w.f.conn, &w.subject, &w.new_root(), &[1]).unwrap();
+        assert_eq!((blink.moved(), blink.left_gone()), (0, 0), "frame 1's file is still at the old place");
+        assert_eq!(
+            RebaseView::for_registered(&w.f.conn, &w.subject, &w.new_root(), &[]).unwrap().moved(),
+            0
+        );
+
+        // Nothing was written: not a row, not a file.
+        assert_eq!(paths(&w.f.conn), rows_before);
+        assert_eq!((walk(&w.old_wd), walk(&w.new_wd)), walk_before);
+
+        // The empty view reads every row as stored; so does the view of a subject whose runs all used the current
+        // folder (no candidate, no stat).
+        let none = RebaseView::none();
+        assert_eq!(
+            none.apply(row(ArtifactKind::Calibrated, 1)).unwrap().path.unwrap(),
+            old_cal.to_str().unwrap()
+        );
+        assert!((none.moved(), none.left_gone(), none.old_roots().len()) == (0, 0, 0));
+        let lone = crate::stacking::test_fixtures::frame_set("Lone");
+        let lone_subject = StackSubject::FrameSet(lone.set_id);
+        insert_run(
+            &lone.conn,
+            &NewRun {
+                subject: &lone_subject,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: w.new_wd.to_str().unwrap(),
+                output_dir: "",
+            },
+        )
+        .unwrap();
+        let view = RebaseView::for_gate(&lone.conn, &lone_subject, &w.new_wd.join("Lone")).unwrap();
+        assert!((view.moved(), view.left_gone(), view.old_roots().len()) == (0, 0, 0));
     }
 
     #[test]

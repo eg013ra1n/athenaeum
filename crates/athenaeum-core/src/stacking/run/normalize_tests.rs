@@ -832,8 +832,8 @@ impl RegroupRig {
         cfg
     }
 
-    /// The stages the plan gate reads stale under `cfg` (no file read, no sample read).
-    pub(super) fn stale(&self, cfg: &StackingConfig) -> Vec<Stage> {
+    /// The plan gate's answer under `cfg` (no file read, no sample read).
+    pub(super) fn plan(&self, cfg: &StackingConfig) -> crate::stacking::plan::StackingPlan {
         crate::stacking::plan::build_plan(
             &self.fixture.conn,
             &self.ctx.settings,
@@ -842,7 +842,11 @@ impl RegroupRig {
             Some(cfg.clone()),
         )
         .expect("the plan should build")
-        .stale_stages
+    }
+
+    /// The stages the plan gate reads stale under `cfg` (no file read, no sample read).
+    pub(super) fn stale(&self, cfg: &StackingConfig) -> Vec<Stage> {
+        self.plan(cfg).stale_stages
     }
 
     /// One run through Output under `cfg`; returns the groups, the run context and the captured logs.
@@ -1145,12 +1149,37 @@ fn a_moved_working_folder_reuses_every_frame_level_stage() {
     rig.point_at(&w2);
     set_times(&rig.working_files(), whole_seconds);
 
+    // The gate reads through the move: every stage a run reuses reads cached, and it writes nothing (the rows still
+    // name W1 after the plan).
+    let stale = rig.stale(&cfg);
+    for stage in [Stage::Calibrate, Stage::Measure, Stage::Register, Stage::Normalize] {
+        assert!(!stale.contains(&stage), "the plan reads {stage:?} stale after the move: {stale:?}");
+    }
+    assert_eq!(artifact_files(&rig), rows1, "the plan wrote no row");
+    assert!(
+        rig.plan(&cfg).warnings.iter().all(|w| !w.contains("cached files were not found")),
+        "a moved folder is nothing to warn about"
+    );
+
     let (_, _, logs2) = rig.run(&cfg);
     assert_nothing_recomputed_with_ln(&logs2, "a moved working folder");
     let rows2 = artifact_files(&rig);
     assert_eq!(rows2.len(), rows1.len(), "no row was added or lost: {rows2:?}");
     assert!(rows2.iter().all(|(_, p)| p.starts_with(&w2)), "every file row names W2: {rows2:?}");
     assert!(!w1.exists(), "the old folder was not recreated");
+
+    // The run rebased the rows: the gate has no candidate left and reads the same, with nothing to warn about.
+    let subject = StackSubject::FrameSet(rig.fixture.set_id);
+    let view = crate::stacking::rebase::RebaseView::for_gate(&rig.fixture.conn, &subject, &rig.layout.root).unwrap();
+    assert_eq!((view.moved(), view.left_gone()), (0, 0), "the rebased rows leave the view empty");
+    assert!(crate::stacking::rebase::candidates(&rig.fixture.conn, &subject, &rig.layout.root)
+        .unwrap()
+        .is_empty());
+    let stale = rig.stale(&cfg);
+    assert!(
+        ![Stage::Calibrate, Stage::Measure, Stage::Register, Stage::Normalize].iter().any(|s| stale.contains(s)),
+        "{stale:?}"
+    );
 }
 
 /// A COPY of the working folder (times kept) is used at its new place and the original is left exactly as it was;
@@ -1239,6 +1268,22 @@ fn a_diverged_copy_is_recomputed_not_read() {
             .unwrap()
     };
     assert!(left > 6, "premise: B's rows name W2: {left}");
+
+    // The gate says the same before the run: Calibrate is owed and the warning counts the rows it left. The gate
+    // spells the current folder as a run records it, the rig's layout as configured.
+    let plan_c = rig.plan(&cfg_b);
+    assert!(plan_c.stale_stages.contains(&Stage::Calibrate), "{:?}", plan_c.stale_stages);
+    let gate_root = WorkingLayout::new(
+        &crate::stacking::paths::run_spelled_working(&w1).unwrap_or_else(|| w1.clone()),
+        &set_slug(SET_NAME),
+    )
+    .root;
+    let plan_warning = crate::stacking::rebase::left_warning(left as usize, &gate_root);
+    assert!(
+        plan_c.warnings.contains(&plan_warning),
+        "the plan says how many rows it left ({plan_warning}): {:?}",
+        plan_c.warnings
+    );
 
     let (_, rc_c, logs_c) = rig.run(&cfg_b);
     assert_eq!(fan_out_items(&logs_c, "calibrate", "calibrate"), 6, "{logs_c}");

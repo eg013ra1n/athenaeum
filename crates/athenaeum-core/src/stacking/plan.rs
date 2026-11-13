@@ -44,6 +44,7 @@ use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::origin::{origin_of, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{self, EstimateInputs};
 use crate::stacking::psf_signal::PsfModel;
+use crate::stacking::rebase::RebaseView;
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
 use crate::stacking::source_identity::{
@@ -1207,6 +1208,7 @@ pub(crate) fn fits_artifact_fresh(
     frame_id: i64,
     metrics_payload: Option<&str>,
     expected_hash: &str,
+    view: &RebaseView,
 ) -> Result<bool, ApiError> {
     let Some(planes) = metrics_payload
         .and_then(|json| serde_json::from_str::<FrameMeasurement>(json).ok())
@@ -1214,7 +1216,7 @@ pub(crate) fn fits_artifact_fresh(
     else {
         return Ok(false);
     };
-    fits_artifact_fresh_for_planes(conn, subject, frame_id, planes, expected_hash)
+    fits_artifact_fresh_for_planes(conn, subject, frame_id, planes, expected_hash, view)
 }
 
 /// [`fits_artifact_fresh`]'s own per-plane freshness loop, with the plane
@@ -1224,13 +1226,15 @@ pub(crate) fn fits_artifact_fresh(
 /// `resolve_register_fits` in `stacking::run`, from `MeasuredFrame::planes`
 /// — never from a stored JSON payload) can reuse the EXACT freshness rule
 /// the plan gate applies, rather than a hand-rolled `find_artifact` +
-/// `is_fresh` pair that could quietly drift from it.
+/// `is_fresh` pair that could quietly drift from it. `view` is the plan gate's read of a moved working folder
+/// ([`RebaseView`]); a run passes [`RebaseView::none()`], its trigger having rebased the rows already.
 pub(crate) fn fits_artifact_fresh_for_planes(
     conn: &Connection,
     subject: &StackSubject,
     frame_id: i64,
     planes: usize,
     expected_hash: &str,
+    view: &RebaseView,
 ) -> Result<bool, ApiError> {
     if planes == 0 {
         return Ok(false);
@@ -1238,14 +1242,9 @@ pub(crate) fn fits_artifact_fresh_for_planes(
     for plane in 0..planes {
         let kind = ArtifactKind::Fits(plane);
         // A frame-level kind: its rows sit under the empty key, whatever group the frame is in now.
-        let plane_fresh = find_artifact(
-            conn,
-            subject,
-            "",
-            kind,
-            Some(frame_id),
-        )?
-        .is_some_and(|row| is_fresh(&row, expected_hash));
+        let plane_fresh = view
+            .apply(find_artifact(conn, subject, "", kind, Some(frame_id))?)
+            .is_some_and(|row| is_fresh(&row, expected_hash));
         if !plane_fresh {
             return Ok(false);
         }
@@ -1973,6 +1972,7 @@ fn compute_register_stale(
     origins: &FrameOrigins,
     grid: Option<&crate::collab::grid::CanonicalGrid>,
     measure_betas: &HashMap<String, f64>,
+    view: &RebaseView,
 ) -> Result<bool, ApiError> {
     // Ruling R9: the latest run that HAS frame rows. A run cancelled before the end of Register wrote none (they are
     // written once the stage is done), and reading it would judge no frame at all and call Register fresh while the
@@ -2143,13 +2143,13 @@ fn compute_register_stale(
                 None => return Ok(true),
             },
         };
-        let artifact = find_artifact(
+        let artifact = view.apply(find_artifact(
             conn,
             subject,
             &group.key,
             ArtifactKind::Registered,
             Some(frame_id),
-        )?;
+        )?);
         if !artifact.is_some_and(|row| is_fresh(&row, &artifact_hash)) {
             return Ok(true);
         }
@@ -3537,6 +3537,32 @@ pub fn build_plan(
         }
     }
 
+    // A working folder that moved or was copied since the rows were written: the rows are read as the next run's
+    // trigger would leave them (file-identity §4.10), and the gate writes nothing. No existing folder, or a catalog
+    // read that fails (logged by the view): the rows read as stored.
+    let rebase_view = match working_dir
+        .as_deref()
+        .map(Path::new)
+        .and_then(paths::run_spelled_working)
+    {
+        Some(spelled) => match paths::subject_layout(conn, &spelled, subject)
+            .and_then(|layout| RebaseView::for_gate(conn, subject, &layout.root).map(|v| (layout, v)))
+        {
+            Ok((layout, view)) => {
+                if view.left_gone() > 0 {
+                    warnings.push(crate::stacking::rebase::left_warning(view.left_gone(), &layout.root));
+                }
+                tracing::debug!(count = view.old_roots().len(), "plan read through the rebase view");
+                view
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "working folder rows not read for the plan's rebase view; rows read as stored");
+                RebaseView::none()
+            }
+        },
+        None => RebaseView::none(),
+    };
+
     // The estimate counts only IN-SCOPE frames — a manually excluded frame
     // is never calibrated/registered/integrated, so it must not inflate the
     // footprint a run would actually leave behind.
@@ -3778,7 +3804,7 @@ pub fn build_plan(
         let ln_reference_info: Option<LnReferencePayload> = if local_normalization_active {
             // Ruling R10 M4: the run reuses the reference only while its file is the one its row recorded
             // (`is_fresh` on the payload's own hash); a deleted or replaced file reads as no reference.
-            find_artifact(conn, subject, &g.key, ArtifactKind::LnReference, None)?
+            rebase_view.apply(find_artifact(conn, subject, &g.key, ArtifactKind::LnReference, None)?)
                 .and_then(|row| {
                     let payload = serde_json::from_str::<LnReferencePayload>(
                         row.payload_json.as_deref()?,
@@ -3870,13 +3896,13 @@ pub fn build_plan(
             }
 
             // Frame-level rows sit under the empty key (spec §5.1), so a regroup finds them.
-            let calib_artifact = find_artifact(
+            let calib_artifact = rebase_view.apply(find_artifact(
                 conn,
                 subject,
                 &g.key,
                 ArtifactKind::Calibrated,
                 Some(f.frame_id),
-            )?;
+            )?);
             let metrics_artifact = find_artifact(
                 conn,
                 subject,
@@ -3922,13 +3948,13 @@ pub fn build_plan(
             // the calibrated half already passed, so a group without Bayer
             // drizzle costs no extra query at all.
             let calib_fresh = if calib_fresh && group_wants_mosaic {
-                let mosaic_artifact = find_artifact(
+                let mosaic_artifact = rebase_view.apply(find_artifact(
                     conn,
                     subject,
                     &g.key,
                     ArtifactKind::CalibratedMosaic,
                     Some(f.frame_id),
-                )?;
+                )?);
                 match (&mosaic_artifact, &current_calib_hash) {
                     (Some(row), Some(hash)) => is_fresh(row, hash) && names_input(row),
                     _ => false,
@@ -3976,6 +4002,7 @@ pub fn build_plan(
                     expected_measurement_hash
                         .as_deref()
                         .expect("metrics_fresh implies a resolved hash"),
+                    &rebase_view,
                 )?
             } else {
                 false
@@ -4043,7 +4070,8 @@ pub fn build_plan(
                 let ln_fresh = match &expected_ln {
                     None => false,
                     Some(expected) => {
-                        find_artifact(conn, subject, &g.key, ArtifactKind::Ln, Some(f.frame_id))?
+                        rebase_view
+                            .apply(find_artifact(conn, subject, &g.key, ArtifactKind::Ln, Some(f.frame_id))?)
                             .is_some_and(|row| is_fresh(&row, expected))
                             // Plan 6b-3 D7: a member that keeps global
                             // normalization (under 25 % overlap) is cached
@@ -4166,6 +4194,7 @@ pub fn build_plan(
         &origins,
         project_grid.as_ref(),
         &measure_betas,
+        &rebase_view,
     )?;
 
     let mut stale_stages = Vec::new();
@@ -4609,6 +4638,7 @@ mod tests {
                 &origins,
                 Some(&grid),
                 &HashMap::new(),
+                &RebaseView::none(),
             )
             .unwrap()
         };
@@ -7234,7 +7264,7 @@ mod tests {
         );
         assert_ne!(current, earlier, "premise: the two versions key apart");
         let fresh = |planes: usize| {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, planes, &current)
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, planes, &current, &RebaseView::none())
                 .unwrap()
         };
         for plane in 0..3 {
@@ -7261,7 +7291,7 @@ mod tests {
             seed_fits_artifact(&f, group_key, frame_id, plane, hash);
         }
         let fresh = || {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, 3, hash)
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, 3, hash, &RebaseView::none())
                 .unwrap()
         };
         assert!(fresh(), "premise");
@@ -11570,6 +11600,7 @@ mod tests {
             let mut memo = HashMemo::for_gate(origins.clone());
             compute_register_stale(
                 &f.conn, cfg, &subject, &groups, &reference, &mut memo, &origins, None, betas,
+                &RebaseView::none(),
             )
             .unwrap()
         };

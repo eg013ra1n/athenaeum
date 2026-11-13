@@ -1192,7 +1192,7 @@ fn run_input_paths(rc: &RunContext, conn: &rusqlite::Connection) -> Vec<String> 
 /// Progress is ONE Calibrate event at `current = 0`, as the input check's: a tick per file would reach 100 % and
 /// the stage's own first event would put the row back to 0.
 pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
-    use crate::stacking::rebase::{self, Check};
+    use crate::stacking::rebase;
 
     let candidates = {
         let conn = db(&rc.ctx)?.conn();
@@ -1225,17 +1225,10 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
     let mut gone = 0usize;
     for c in &candidates {
         rc.check_cancel()?;
-        let reason = match rebase::check(c) {
-            Check::Moved => {
-                moved.push(c);
-                continue;
-            }
-            Check::Missing => "missing",
-            Check::OtherSize => "another size",
-            Check::OtherTime => "another time",
-            Check::NotAFile => "not a file",
-            // `check` already warned with the OS error; the row is judged where it is.
-            Check::Unreadable(_) => "unreadable",
+        let check = rebase::check(c);
+        let Some(reason) = check.left_reason() else {
+            moved.push(c);
+            continue;
         };
         tracing::debug!(
             path = %c.mapped.display(),
@@ -1244,7 +1237,7 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
             "cached file not rebased"
         );
         // A row whose file is still at the old place is read there; only one that is nowhere is counted as gone.
-        if !crate::stacking::plan::file_matches_identity(Path::new(&c.old_path), Some(c.size)) {
+        if rebase::is_gone_at_old_place(c) {
             gone += 1;
         }
     }

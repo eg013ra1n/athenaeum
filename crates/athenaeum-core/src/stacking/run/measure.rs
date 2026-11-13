@@ -698,6 +698,7 @@ fn measure_group_finish(
                                         frame.frame_id,
                                         Some(payload.as_str()),
                                         &expected_hash,
+                                        &RebaseView::none(),
                                     )?
                                 };
                                 if fits_fresh {
@@ -1661,6 +1662,7 @@ fn measure_two_pass_rest(
                         members[i].frame.frame_id,
                         m.channels.len(),
                         &expected,
+                        &RebaseView::none(),
                     )?
                 };
                 if fresh {
