@@ -1795,7 +1795,7 @@ fn resolve_register_fits_floors_below_min_inliers_and_admits_at_it() {
                 path: Some(path.to_str().unwrap()),
                 config_hash: &expected_hash,
                 size: Some(size),
-                modified_at: None,
+                modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&path)),
                 payload_json: None,
             },
         )
@@ -1936,7 +1936,7 @@ fn resolve_register_fits_is_none_for_a_group_that_does_not_read_fits() {
             path: Some(path.to_str().unwrap()),
             config_hash: &expected_hash,
             size: Some(size),
-            modified_at: None,
+            modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&path)),
             payload_json: None,
         },
     )

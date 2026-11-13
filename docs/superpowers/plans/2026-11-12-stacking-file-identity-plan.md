@@ -792,4 +792,4 @@ Merged on local `main`, each merge after its review and fixes; this branch (`fi/
 | `e8f59465` M3 | T8a-c | no false move; a project gap and a warning that stayed (fixed) |
 | `f2c3e967` | T6, the whole-branch review's fixes | the zip adoption door (fixed in `3cfd980e`) |
 
-Acceptance (2026-11-13, real data, `docs/stacking/README.md`): every leg passed; it found the SMB share's refused full sync, fixed in `9f404957`. One owner call stays open: whether an own working file also needs a time within 2 s of its row (`docs/superpowers/open-items.md`, "Awaiting a call from the owner").
+Acceptance (2026-11-13, real data, `docs/stacking/README.md`): every leg passed; it found the SMB share's refused full sync, fixed in `9f404957`. The one open owner call, whether an own working file also needs a time within 2 s of its row, is closed by FI-11 (2026-11-13; spec §2 and §12).

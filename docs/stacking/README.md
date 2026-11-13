@@ -1895,13 +1895,14 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     meridian-flipped frame (`aligned_flipped`) has its aligned frame too.
   - A frame cut by the weight floor after Register keeps `reg_status = aligned` and stays `available`. A `skipped` frame is
     `notRegistered` even when an earlier run left an artifact for it: that file is not this run's.
-  - A cached file counts as fresh only while its row's hash is current and the file has the size the row recorded
-    (`stacking::plan::file_matches_identity`, one stat; the modification time is never compared, file identity FI-2), so
-    the gate and every cache hit in the run agree, and Blink uses the same helper. A row without a size never matches.
+  - A cached file counts as fresh only while its row's hash is current, the file has the size the row recorded and its
+    modification time is within 2 s of the row's (`stacking::plan::file_matches_identity`, one stat; file identity FI-2
+    amended by FI-11), so the gate and every cache hit in the run agree, and Blink uses the same helper. A row without a
+    size or a time never matches.
     Every writer deletes the rows that name a file before it replaces the file (the write order, under "Identity check"
     below), so a run cancelled right after a fan-out rewrote files leaves no row over them: Blink reads such a frame
     `missing` (or `replaced` by the group rule), and the next run rewrites it. An outside edit of a cached file that keeps
-    its size is not seen: Athenaeum's own working files get no content check.
+    its size and its time within 2 s is not seen: Athenaeum's own working files get no content check.
   - The group row of a later run exists from that run's first moment, so a later run that got no further than planning
     already marks the group `replaced`. This is the safe side: never offer pixels a later run may have replaced.
   - The file is the artifact row's absolute `path`, never a path rebuilt from the subject's current name (a rename changes
@@ -3838,7 +3839,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
         validity follows the calibration hash in the row's key, because a recalibration reproduces the planes to the bit
         (`recalibration_reproduces_the_planes_bit_for_bit`), so "Delete intermediates" plus a rerun keeps the first pass.
         Ruling R12 (a) limited that to a file Athenaeum writes; since the file identity (2026-11-13) the key covers a
-        calibrated file used in place too, and the mtime is compared for no file: an attested light's sampled hash is in
+        calibrated file used in place too, and the stamp's mtime is compared for no file: an attested light's sampled hash is in
         its prepare hash, a project replica's blake3 is in its key and `landed_unchanged` excludes a replica edited in
         place. Pins: `measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one` (a rescan NULLed the sample)
         and `…_without_a_rescan_reruns_pass_one` (the run samples the light again because its time moved).
@@ -5241,13 +5242,22 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   attested light's sampled hash is in its prepare hash, and a project replica's blake3 is in its key while `landed_unchanged` excludes a
   replica edited in place. The `.athm` head still stores the source's `modified_ns`; nothing reads it, so `PASS1_ARTIFACT_VERSION` did not
   move. Pass 2 still reads the pixels.
-- **Identity check.** A cached file is judged by its key and its size, never by its time (file identity FI-2: nobody edits Athenaeum's
-  working files). `plan::file_matches_identity(path, size)` is one stat: the file matches when its length equals the row's `size`; a row
-  without a size never matches, NotFound is the ordinary stale, and any other stat error is a `warn!`. `plan::is_fresh` holds when the
-  hash is equal, the row has a path and the file matches. It covers every own-file kind (`calibrated`, `calibrated_mosaic`, `measured`,
-  `fits.<plane>`, `registered`, `ln`, `ln_reference`) for the gate and the run at once. `file_identity` still records `modified_at` in the
-  row; only the working-folder rebase reads it (below). Blink reports an aligned frame `Replaced` when its `registered` row is newer than
-  the run's `finished_at` or its file has another size than the row recorded (the group rule stays). The gate judges Register on the
+- **Identity check.** A cached file of Athenaeum's own is judged by its key, its size and a modification time within 2 s of its row's, at
+  full precision (file identity FI-2, amended by FI-11 on 2026-11-13: the dev and the release build share a working folder and keep two
+  catalogs, so a row of the other catalog over a file this build rewrote at the same size must not read fresh). `plan::file_matches_identity(path,
+  size, modified_at)` is one stat: the file matches when its length equals the row's `size` and `rebase::within_tolerance` (the one time
+  comparison, shared with the rebase below) accepts its time against the row's `modified_at`. A row without a size, without a time or with a
+  time that does not parse never matches; NotFound is the ordinary stale; any other stat error, or a file whose time cannot be read, is a
+  `warn!`; a size that matches with another time is a `debug!` (`recorded`, `current`). `plan::is_fresh` holds when the hash is equal, the
+  row has a path and the file matches. It covers every own-file kind (`calibrated`, `calibrated_mosaic`, `measured`, `fits.<plane>`,
+  `registered`, `ln`, `ln_reference`) for the gate and the run at once; every writer records the file's time after its last write and
+  rename (`run::file_identity`). **The exemption:** a row that names the frame's INPUT in place (a light or a project replica Athenaeum did
+  not write; Prepare's `InPlace` action, or the kept float mosaic) is judged by `plan::is_fresh_in_place`: key + size, no time. The input's
+  identity is in the key (size + content sample), and a light copied with another time recomputes nothing. A row under the subject's own
+  `prepared/` or `calibrated/` folders is an own file and gets the time. The cost: a working folder copied onto its own path by a tool that
+  resets the file times recomputes every frame once. Blink reports an aligned frame `Replaced` when its `registered` row is newer than
+  the run's `finished_at` or, when the row recorded a size, its file does not match (size and time); a row without a size keeps the
+  existence check (the group rule stays). The gate judges Register on the
   latest run that HAS included frame rows (a run cancelled inside Register has none).
   - **The write order replaces the time** (ruling R7 b: a file and a row that disagree after a cancel). Every writer that replaces a
     frame-level file (1) reads the old row; (2) deletes it (`db::stacking::delete_artifact`, a point delete on `find_artifact`'s key) and
@@ -5364,10 +5374,10 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   subject's own file (kinds with a subtree: `calibrated`, `calibrated_mosaic`, `measured`, `registered`, `ln`, `ln_reference`, `fits.<plane>`)
   that lies under an OLD subject root (the root of a working folder one of the subject's runs recorded) is a candidate; it is pointed at
   the same place under the CURRENT root (`stacking::rebase::map_row`, by path components, onto the kind's own subtree) only when the file
-  there is a regular file of the recorded size whose time is within 2 s of the recorded one, at full precision (`rebase::check`). The 2 s
-  rule is the whole price of leaving the time out of the identity inside a folder: a copy made by a tool that keeps times (Finder, `cp -p`,
-  a move) is reused at once on any volume, a copy that resets times is not adopted, because an older diverged copy passes key + size alone
-  and only the time tells it from the copy a row was recorded over. A row left where it is is read there while its file is at the old
+  there is a regular file of the recorded size whose time is within 2 s of the recorded one, at full precision (`rebase::check`). The same
+  2 s rule judges a file inside a folder (FI-11): a copy made by a tool that keeps times (Finder, `cp -p`, a move) is reused at once on
+  any volume, a copy that resets times is not adopted, because an older diverged copy passes key + size alone and only the time tells it
+  from the copy a row was recorded over. A row left where it is is read there while its file is at the old
   place; one whose file is nowhere (not at the mapped place and not at the old one) AND is read by a stage is counted, and the plan and the
   run say so once, counting FRAMES (the distinct frames among the counted rows, so the plan and the run say the same number for the same
   situation): "The cached files of N frames from an earlier working folder were not found in <folder> (missing, another size, or a time
@@ -5399,9 +5409,10 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   A frame-set rename (the slug folder changes) is not covered (open-items, RB-2).
 - **Known residuals.** After a weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by
   weight and re-registers: the run is correct, the gate under-reports. A frame-level file is shared by the dev and the release build when
-  both use one working folder: a run in either build deletes only its own catalog's rows before it rewrites a file, and with key + size
-  the other catalog's row over that file reads fresh at its own key when the size is equal, so under two configs the other build can
-  reuse pixels it did not make (before the file identity the time made that row stale), see open-items. The gate and the
+  both use one working folder: a run in either build deletes only its own catalog's rows before it rewrites a file. Since FI-11
+  the other catalog's row over that file reads fresh only when the rewrite is within 2 s of the row's time at the same size, so under two
+  configs the other build recomputes instead of reusing pixels it did not make (a rewrite within 2 s of the row's time is not expected
+  between two builds' runs), see open-items. The gate and the
   run take a group's β from their own sources (`measure_betas` vs `rc.measured_groups`): for a group the run does not measure (fewer
   than 3 included) the run folds None where the gate may fold Some — the gate then over-reports Register stale, never a false hit; do not
   re-flag it. Remaining gates: `docs/superpowers/open-items.md`.

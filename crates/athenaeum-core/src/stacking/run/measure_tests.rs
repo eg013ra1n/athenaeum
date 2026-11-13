@@ -1122,7 +1122,8 @@ fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
         assert!(
             crate::stacking::plan::file_matches_identity(
                 Path::new(row.path.as_deref().unwrap()),
-                row.size
+                row.size,
+                row.modified_at.as_deref()
             ),
             "frame {id}: the rewritten artifact's row describes another file"
         );

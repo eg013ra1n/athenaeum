@@ -584,6 +584,10 @@ pub(crate) fn add_raw_linked_calibration_with_count(
 /// (`db::bank_strong_hash`) both compare against these two columns, so a
 /// fixture that fakes them would pass generation today and silently stop
 /// meaning anything the moment either of those checks the fixture.
+pub(crate) fn modified_at_of(path: &Path) -> String {
+    file_identity(path).1
+}
+
 fn file_identity(path: &Path) -> (i64, String) {
     let meta = std::fs::metadata(path).expect("fixture file exists after writing");
     let modified = meta.modified().expect("fixture filesystem supports mtime");

@@ -212,13 +212,20 @@ fn resolve_prepare_job(
             .as_deref()
             .is_none_or(|input| row.path.as_deref().is_some_and(|p| Path::new(p) == input))
     };
+    // FI-11: a row that must name the input (an expectation) and does is judged in place, key + size and no time, the
+    // input not being a file Athenaeum wrote; every other row is an own file and gets the time too.
+    let row_fresh = |row: &crate::db::stacking::StackingArtifactRow, expected: &Option<PathBuf>| {
+        if expected.is_some() {
+            names_expected(row, expected) && is_fresh_in_place(row, &hash)
+        } else {
+            is_fresh(row, &hash)
+        }
+    };
     if rc.rerun_from != Some(Stage::Calibrate) {
         let mosaic_fresh = !keep_mosaic
-            || mosaic_row.as_ref().is_some_and(|row| {
-                is_fresh(row, &hash) && names_expected(row, &expected_mosaic)
-            });
+            || mosaic_row.as_ref().is_some_and(|row| row_fresh(row, &expected_mosaic));
         if let Some(row) = &existing {
-            if is_fresh(row, &hash) && names_expected(row, &expected_calibrated) && mosaic_fresh {
+            if row_fresh(row, &expected_calibrated) && mosaic_fresh {
                 return Ok(PrepareResolved::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
                 });

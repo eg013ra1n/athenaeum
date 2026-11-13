@@ -10,8 +10,9 @@
 //! 2. the first component below that root is the row's kind's own subtree ([`kind_subtrees`]);
 //! 3. the file at the mapped place is a regular file whose length equals the row's `size` and whose time is within
 //!    [`MTIME_TOLERANCE_SECS`] of the row's `modified_at`, both at FULL precision (`check_with`; this is not the collab
-//!    landing stamp's whole-second rule). A second, older copy of the folder passes key + size alone; the time is
-//!    what tells it from the copy the row was recorded over, and a false "moved" stacks a master from the wrong
+//!    landing stamp's whole-second rule). It is the comparison `plan::file_matches_identity` makes for every own
+//!    file (FI-11), through the one function `within_tolerance`. A second, older copy of the folder passes key + size
+//!    alone; the time is what tells it from the copy the row was recorded over, and a false "moved" stacks a master from the wrong
 //!    frames under a new key, while a row left where it was costs a recompute. When in doubt the answer is "not
 //!    moved";
 //! 4. the UPDATE still finds the row at its old path ([`commit_rows`], over
@@ -558,8 +559,9 @@ fn list_folder(folder: &Path, quiet: bool) -> Listing {
 }
 
 /// Whether `live` is within [`MTIME_TOLERANCE_SECS`] of the recorded RFC 3339 time, both at full precision (the
-/// difference is not rounded to a second first). An unparsable recorded time is "no".
-fn within_tolerance(live: std::time::SystemTime, recorded: &str) -> bool {
+/// difference is not rounded to a second first). An unparsable recorded time is "no". The one time comparison of
+/// the module and of [`crate::stacking::plan::file_matches_identity`] (FI-11).
+pub(crate) fn within_tolerance(live: std::time::SystemTime, recorded: &str) -> bool {
     let Ok(recorded) = chrono::DateTime::parse_from_rfc3339(recorded) else {
         return false;
     };

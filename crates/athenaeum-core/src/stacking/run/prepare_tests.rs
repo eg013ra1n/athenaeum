@@ -1354,6 +1354,58 @@ fn an_in_place_row_at_another_path_than_its_light_is_stale() {
     assert_eq!(cached(&rig), 4);
 }
 
+/// FI-11's exemption: a row that names the frame's INPUT in place (a file Athenaeum did not write) keeps key + size and
+/// no time check. The light's identity is in the key (size + content sample); a copy of it with another time (here
+/// an hour later, the same bytes) is the same light, so the gate still reads it cached and stage 1 reuses every row.
+#[test]
+fn an_in_place_row_is_reused_when_its_input_has_another_time() {
+    let rig = Pass1Rig::attested();
+    let output = tempfile::tempdir().unwrap();
+    for (key, dir) in [
+        (crate::settings::keys::STACKING_WORKING_DIR, rig.working.path()),
+        (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+    ] {
+        crate::db::set_setting(&rig.fixture.conn, key, dir.to_str().unwrap()).unwrap();
+    }
+    let cached = |rig: &Pass1Rig| {
+        crate::stacking::plan::build_plan(
+            &rig.fixture.conn,
+            &rig.ctx.settings,
+            &crate::api::PathPolicy::AllowAll,
+            &rig.subject,
+            Some(rig.cfg.clone()),
+        )
+        .expect("the plan should build")
+        .groups[0]
+            .calibrated_cached
+    };
+    let first = rig.run("run 1", None);
+    assert_eq!(first.logged.len(), 4, "premise: run 1 measured every light");
+    let rows = rig.rows(ArtifactKind::Calibrated);
+    let lights: Vec<PathBuf> = rig.plan_groups[0].frames.iter().map(|f| PathBuf::from(&f.path)).collect();
+    for (frame, light) in rig.plan_groups[0].frames.iter().zip(&lights) {
+        assert_eq!(
+            Path::new(rows[&frame.frame_id].path.as_deref().unwrap()),
+            light,
+            "premise: the row names the light in place"
+        );
+    }
+    assert_eq!(cached(&rig), 4, "premise: the gate reads every in-place row as cached");
+
+    let before: Vec<Vec<u8>> = lights.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    for light in &lights {
+        let moved = std::fs::metadata(light).unwrap().modified().unwrap() + std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new().write(true).open(light).unwrap().set_modified(moved).unwrap();
+    }
+    let after: Vec<Vec<u8>> = lights.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert_eq!(before, after, "premise: only the time moved");
+
+    assert_eq!(cached(&rig), 4, "the gate does not compare an input's time");
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&rig.cfg));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs, "calibrate", "prepare"), 0, "stage 1 reused every in-place row: {logs}");
+}
+
 /// Review F2 (file-identity §4.1): a Prepare subject's own files written in a previous working folder stay fresh in
 /// the gate, as they do in the run (a `Write` action has no path expectation). The run recorded W1; the setting then
 /// moves to W2; the gate counts every frame cached (the rows sit under a folder the subject's runs recorded) and the

@@ -109,7 +109,7 @@ use crate::stacking::paths::{
     LN_REFERENCE_SATURATION_FILE,
 };
 use crate::stacking::plan::{
-    build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
+    build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh, is_fresh_in_place,
     measurement_hash_for, normalization_hash_for, pass1_hash_for, pass1_own_betas,
     registration_hash_for,
     registration_row_is_fresh, seeds_calibration_hash_for, store_registration,
@@ -619,9 +619,10 @@ pub(crate) fn group_anchor_geometry(g: &IntegrationGroup) -> (Option<i64>, Optio
 /// `(size, modified_at)` for a just-written file, in the scanner's own shape
 /// (`scanner/mod.rs`'s `modified_dt.to_rfc3339()`) — the same identity
 /// [`crate::stacking::plan::calibration_hash_for`] reads back off a
-/// `stacking_artifacts` row's `size`/`modified_at`. Only the size decides freshness
-/// ([`crate::stacking::plan::file_matches_identity`]); the time is what the working-folder rebase compares (size and
-/// time within a tolerance, [`crate::stacking::rebase`]) to recognise a moved folder's file, so it is still recorded.
+/// `stacking_artifacts` row's `size`/`modified_at`. Both decide freshness
+/// ([`crate::stacking::plan::file_matches_identity`]: the size and a time within 2 s, FI-11) and the working-folder rebase
+/// ([`crate::stacking::rebase`]) compares them to recognise a moved folder's file. A writer calls this AFTER the file's
+/// last write and rename, so the recorded time is the one the next stat sees.
 fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
     let meta = std::fs::metadata(path)?;
     let modified_at = crate::stacking::plan::render_modified_at(meta.modified()?);

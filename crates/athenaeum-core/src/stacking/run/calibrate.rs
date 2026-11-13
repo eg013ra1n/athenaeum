@@ -440,8 +440,8 @@ fn resolve_calibrate_job(
     // land on the options it resolves from, not on a later copy.
     calibration_opts.format = crate::fits_writer::OutputFormat::Fits;
     // Perf tier 1 Task 6: this file is regenerable — the `stacking_artifacts`
-    // row above keys on the config hash plus the size, so a file a
-    // crash truncates is a size miss on the next run, never a wrong answer.
+    // row above keys on the config hash, the size and a time within
+    // 2 s, so a file a crash truncates is a size miss on the next run, never a wrong answer.
     // Skipping the fsync still keeps the write atomic (tmp + rename).
     calibration_opts.skip_fsync = true;
 
