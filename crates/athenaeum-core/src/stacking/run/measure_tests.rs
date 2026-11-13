@@ -792,8 +792,8 @@ fn measure_pass1_from_the_artifact_after_a_lost_pass_two() {
 }
 
 /// Plan A Task 11c (R11c-4), amended by the frame-level cache (spec §5.3) and the file identity (FI-2): a calibrated
-/// file whose mtime moved since the artifact was written is reused, not recalibrated (an own file is judged by key +
-/// size), and the first pass survives: validity follows the calibration hash, not the mtime. Nothing is excluded.
+/// file whose mtime moved since the artifact was written does not cost the first pass: validity follows the
+/// calibration hash (an own file is judged by key + size), not the mtime. Nothing is excluded.
 #[test]
 fn measure_pass1_artifact_survives_a_touched_source() {
     let rig = Pass1Rig::new();

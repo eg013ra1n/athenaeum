@@ -1953,3 +1953,23 @@ fn a_debayer_off_run_retires_the_mosaic_row_it_overwrites() {
     assert_eq!(fan_out_items(&logs, "calibrate", "calibrate"), 4, "{logs}");
     assert_eq!(rig.rows(ArtifactKind::CalibratedMosaic).len(), 4);
 }
+
+/// Review F1 (file-identity §4.2): the writer retires every row that NAMES the file it replaces, of any subject. Set
+/// 2 has the same name as set 1, so the same working root; it keeps a row of its own over each calibrated file of set
+/// 1. Set 1's run B (`flat_norm` flipped) rewrites those files, and set 2's rows go with them: with no modification
+/// time in the identity, a row left over a rewritten file of the same size would read fresh.
+#[test]
+fn a_same_named_sets_run_retires_the_other_sets_rows() {
+    let mut rig = Pass1Rig::new();
+    rig.run("run A", None);
+    let other = same_named_set_with_copies_of_the_calibrated_rows(&rig);
+    assert_eq!(rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated).len(), 4, "premise: the copies stand");
+
+    rig.cfg.calibration.flat_norm = !rig.cfg.calibration.flat_norm;
+    let cfg_b = rig.cfg.clone();
+    rig.try_stage_one(&cfg_b).unwrap();
+
+    let other_rows = rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated);
+    assert!(other_rows.is_empty(), "the other set keeps rows over rewritten files: {other_rows:?}");
+    assert_eq!(rig.rows(ArtifactKind::Calibrated).len(), 4, "the writer's own rows are back");
+}

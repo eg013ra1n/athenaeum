@@ -1040,8 +1040,8 @@ pub(crate) fn seeds_calibration_hash_for(
 
 /// A file's modification time in the scanner's own shape (`scanner/mod.rs`'s
 /// `modified_dt.to_rfc3339()`): what every writer in this module family stores in
-/// `stacking_artifacts.modified_at`, and what [`file_matches_identity`] compares
-/// against. One rendering, so a stored identity and a live one can be equal.
+/// `stacking_artifacts.modified_at`. The column is recorded for display and for the scanner's own rows; an own working
+/// file's freshness never compares it ([`file_matches_identity`] checks the size alone).
 pub(crate) fn render_modified_at(modified: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339()
 }
@@ -1067,16 +1067,33 @@ pub(crate) fn file_matches_identity(path: &Path, size: Option<i64>) -> bool {
 
 /// The in-place rule's gate half (file-identity §4.1): whether a Prepare subject's `calibrated` (or mosaic) row names
 /// the frame's CURRENT input. A row either names the input itself (a light or replica used in place) or a file under
-/// one of the subject's own `prepared/` and `calibrated/` folders (`roots`: the subject roots, one per spelling of the
-/// working folder). A row at any other path names a light's old location, where another file of the same size may sit
-/// now, and is stale: the run re-points it.
-pub(crate) fn prepare_row_names_its_input(row_path: &Path, input: &Path, roots: &[PathBuf]) -> bool {
-    row_path == input
-        || roots.iter().any(|root| {
-            let layout = crate::stacking::paths::WorkingLayout { root: root.clone() };
-            row_path.starts_with(layout.prepared_root())
-                || row_path.starts_with(layout.calibrated_root())
-        })
+/// one of the subject's own `prepared/` and `calibrated/` folders: `<wd>/<one component>/(prepared|calibrated)/…`, or
+/// the same under `<wd>/_projects/`, where `<wd>` is any of `working_dirs` (the current working folder in each
+/// spelling, and every folder the subject's runs recorded). "One component" and not the current slug covers a set
+/// renamed since the row was written. A row at any other path names a light's old location, where another file of
+/// the same size may sit now, and is stale: the run re-points it.
+pub(crate) fn prepare_row_names_its_input(row_path: &Path, input: &Path, working_dirs: &[PathBuf]) -> bool {
+    use std::path::Component;
+    if row_path == input {
+        return true;
+    }
+    let own_folder = |rest: &Path| {
+        let mut parts = rest.components();
+        let Some(Component::Normal(_slug)) = parts.next() else {
+            return false;
+        };
+        matches!(
+            parts.next(),
+            Some(Component::Normal(name)) if name == "prepared" || name == "calibrated"
+        ) && parts.next().is_some()
+    };
+    working_dirs.iter().any(|wd| {
+        let Ok(rest) = row_path.strip_prefix(wd) else {
+            return false;
+        };
+        let projects = rest.strip_prefix(crate::stacking::paths::PROJECTS_DIR).ok();
+        own_folder(rest) || projects.is_some_and(own_folder)
+    })
 }
 
 /// The `calibrated`-artifact reuse contract (spec §9.3): a row is reusable
@@ -2047,7 +2064,7 @@ fn compute_register_stale(
         // means the alignment itself does not need to be redone — perf
         // tier A Task 6a's materialized `registered` artifact is a
         // separate on-disk file the run rewrites per frame whenever it is
-        // missing or stale (`registered_artifact_is_fresh` in `run/register.rs`;
+        // missing or stale (`is_fresh` over `registered_row` in `run/register.rs`;
         // same rule, mirrored here so the plan and the run can never
         // disagree about what "cached" means). Without this, an existing
         // catalog's first run after Task 6a — real registration rows, zero
@@ -3369,8 +3386,8 @@ pub fn build_plan(
     let mut free_bytes: Option<u64> = None;
     let mut working_dir: Option<String> = None;
     let mut output_dir: Option<String> = None;
-    // The subject roots a Prepare row may legitimately sit under (the in-place rule); empty without a working folder
-    // and for a subject that calibrates.
+    // The working folders a Prepare row may legitimately sit under (the in-place rule); empty for a subject that
+    // calibrates.
     let mut prepare_roots: Vec<PathBuf> = Vec::new();
     match (resolved_dirs.working, resolved_dirs.output) {
         (Some(working), Some(output)) => {
@@ -3432,20 +3449,26 @@ pub fn build_plan(
         }
     }
 
-    // The in-place rule's roots: the subject root under the validated working folder as configured, plus the one under
-    // the spelling a run records (rows carry the run's spelling in the app, the configured one in tests).
+    // The in-place rule's working folders: the validated one as configured, the one under the spelling a run records
+    // (rows carry the run's spelling in the app, the configured one in tests), and every folder the subject's runs
+    // recorded (a row a run wrote stays under that run's folder after the setting moves).
     let prepare_gate = crate::stacking::origin::subject_prepares(subject, &origins);
     if prepare_gate {
         if let Some(working) = working_dir.as_deref().map(Path::new) {
-            let spellings = std::iter::once(working.to_path_buf())
-                .chain(paths::run_spelled_working(working).filter(|spelled| spelled != working));
-            for spelling in spellings {
-                match paths::subject_layout(conn, &spelling, subject) {
-                    Ok(layout) => prepare_roots.push(layout.root),
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "working root of the subject not resolved; rows over it read as stale");
+            prepare_roots.push(working.to_path_buf());
+            prepare_roots.extend(paths::run_spelled_working(working).filter(|spelled| spelled != working));
+        }
+        match crate::db::stacking::subject_working_dirs(conn, subject) {
+            Ok(recorded) => {
+                for dir in recorded {
+                    let dir = PathBuf::from(dir);
+                    if !prepare_roots.contains(&dir) {
+                        prepare_roots.push(dir);
                     }
                 }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the subject's recorded working folders not read; rows over them read as stale");
             }
         }
     }
@@ -6931,7 +6954,7 @@ mod tests {
     /// registration hash the caller already computed for this frame
     /// (`registration_hash_for`) — the registered artifact's freshness
     /// rides the registration row's own hash, exactly as `run/`'s
-    /// `registered_artifact_is_fresh` call site does.
+    /// Register stage (`is_fresh` over `registered_row`) does.
     fn seed_registered_artifact(
         f: &test_fixtures::Fixture,
         group_key: &str,

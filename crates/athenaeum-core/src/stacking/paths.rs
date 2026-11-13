@@ -71,20 +71,21 @@ pub(crate) fn subject_layout(
 
 /// The working folder spelled the way a run records it (canonical, the platform's plain spelling), for the gate to
 /// recognise a row a run wrote. `None` when the folder does not exist (nothing a run wrote can be under it) or cannot
-/// be resolved (a `warn!`, then the configured spelling alone is used). Reads the filesystem, writes nothing.
+/// be resolved (a `debug!`: the folders gate already reports an unusable folder and this runs on every plan; the
+/// configured spelling alone is used then). Reads the filesystem, writes nothing.
 pub(crate) fn run_spelled_working(working: &Path) -> Option<PathBuf> {
     match working.try_exists() {
         Ok(true) => {}
         Ok(false) => return None,
         Err(e) => {
-            tracing::warn!(path = %working.display(), error = %e, "working folder not inspectable; the configured spelling is used");
+            tracing::debug!(path = %working.display(), error = %e, "working folder not inspectable; the configured spelling is used");
             return None;
         }
     }
     match working.canonicalize() {
         Ok(canonical) => Some(crate::api::scan_roots::normalize_path(&canonical)),
         Err(e) => {
-            tracing::warn!(path = %working.display(), error = %e, "working folder not resolvable; the configured spelling is used");
+            tracing::debug!(path = %working.display(), error = %e, "working folder not resolvable; the configured spelling is used");
             None
         }
     }

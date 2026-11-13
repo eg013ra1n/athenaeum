@@ -914,7 +914,7 @@ fn process_group_output(
             // disk).
             //
             // Deliberately HASH-ONLY, not the full [`is_fresh`] disk check
-            // stage 5's own [`registered_artifact_is_fresh`] uses to decide
+            // stage 5's own [`is_fresh`] over `registered_row` uses to decide
             // whether a REWRITE is needed: the actual "is the file usable
             // right now" question belongs to
             // `RegisteredSource::open_materialized`'s own `PlaneReader::open`

@@ -1080,6 +1080,11 @@ pub(super) fn run_group_normalization(
                 ArtifactKind::Ln,
                 Some(members[i].frame_id),
             )?;
+            // Any other subject's row over this sidecar goes too (two sets with one name share a root).
+            crate::db::stacking::delete_artifacts_naming_path(
+                &conn,
+                &sidecar_paths[i].to_string_lossy(),
+            )?;
         }
     }
 
@@ -1789,7 +1794,9 @@ fn build_and_write_ln_reference(
             .map_err(|e| RunError::Other(format!("building LN reference cards: {e}")))?,
     ];
     // The write order (file-identity spec §4.2): the old row is gone before its file is replaced. A failed delete
-    // stops the run; the new row is upserted below, on this thread, with no cancel point in between.
+    // stops the run. The new row is upserted after the saturation map, which honours a cancel in between; the row is
+    // already gone then, so a cancel leaves none. Any other subject's row over the reference or its map goes too
+    // (two sets with one name share a root).
     {
         let conn = db(&rc.ctx)?.conn();
         crate::db::stacking::delete_artifact(
@@ -1798,6 +1805,11 @@ fn build_and_write_ln_reference(
             &group.key,
             ArtifactKind::LnReference,
             None,
+        )?;
+        crate::db::stacking::delete_artifacts_naming_path(&conn, &reference_path.to_string_lossy())?;
+        crate::db::stacking::delete_artifacts_naming_path(
+            &conn,
+            &rc.layout.ln_reference_saturation_path(&group.key).to_string_lossy(),
         )?;
     }
     write_reference(&built, &reference_path, &cards)

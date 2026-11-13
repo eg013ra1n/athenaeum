@@ -8,8 +8,7 @@
 //! own doc for the write side. Fix round 1 (ruling R-TA-5) moved the write
 //! itself INTO the register fan-out's own worker closures — both the
 //! align-and-write one and the cache-hit rewrite-only one
-//! (`stacking::run::write_one_registered_frame`,
-//! `stacking::run::registered_artifact_is_fresh`) — since a full-frame warp
+//! (`stacking::run::write_one_registered_frame`) — since a full-frame warp
 //! is exactly the CPU cost the fan-out's admission exists to parallelize.
 
 use std::path::Path;
@@ -196,7 +195,7 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
 /// gave the calibrated intermediate itself (`Durability::Volatile`'s own
 /// doc: "a cache miss, not a wrong answer"). A registered artifact carries
 /// the identical guarantee — the Register-stage freshness check
-/// (`stacking::run::registered_artifact_is_fresh`) heals a torn or missing
+/// (`is_fresh` over `registered_row` in `stacking::run::register`) heals a torn or missing
 /// file the same way a stale calibrated artifact heals, by rewriting it —
 /// so it does not need the `fsync`-before-rename cost every master/export
 /// write still pays.

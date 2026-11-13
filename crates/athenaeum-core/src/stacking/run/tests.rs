@@ -559,6 +559,35 @@ pub(super) fn rows_of_kind(
         .collect()
 }
 
+/// Another frame set with the SAME NAME as the rig's (two sets may share a name, so one working root), carrying a copy
+/// of every `Calibrated` row of the rig's set: the rows a second subject keeps over files the first subject writes.
+pub(super) fn same_named_set_with_copies_of_the_calibrated_rows(rig: &Pass1Rig) -> i64 {
+    rig.fixture
+        .conn
+        .execute("INSERT INTO frames_set (name) VALUES (?1)", [SET_NAME])
+        .unwrap();
+    let other = rig.fixture.conn.last_insert_rowid();
+    let subject = StackSubject::FrameSet(other);
+    for (frame_id, row) in rig.rows(ArtifactKind::Calibrated) {
+        crate::db::stacking::upsert_artifact(
+            &rig.fixture.conn,
+            &crate::db::stacking::NewArtifact {
+                subject: &subject,
+                frame_id: Some(frame_id),
+                group_key: &row.group_key,
+                kind: ArtifactKind::Calibrated,
+                path: row.path.as_deref(),
+                config_hash: &row.config_hash,
+                size: row.size,
+                modified_at: row.modified_at.as_deref(),
+                payload_json: row.payload_json.as_deref(),
+            },
+        )
+        .unwrap();
+    }
+    other
+}
+
 /// Plan A Task 11c: four mono frames of `seed_star_group` measured one Measure stage at a time on the test pool's
 /// one thread (admission 1), with what the Step 1 tests count.
 pub(super) struct Pass1Rig {

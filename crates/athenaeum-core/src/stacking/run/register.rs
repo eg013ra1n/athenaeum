@@ -902,6 +902,12 @@ pub(super) fn register_group_pass(
                     // The write order: the row is gone before the file is replaced. A failed read still queues the
                     // rewrite, so the delete runs by key all the same (a point delete needs no row) and nothing is
                     // carried; a failed delete stops the job.
+                    let planes = rc
+                        .measured
+                        .get(&group.key)
+                        .and_then(|v| v.get(idx))
+                        .map(|e| e.planes)
+                        .unwrap_or(1);
                     {
                         let conn = db(&rc.ctx)?.conn();
                         crate::db::stacking::delete_artifact(
@@ -911,16 +917,15 @@ pub(super) fn register_group_pass(
                             ArtifactKind::Registered,
                             Some(frame.frame_id),
                         )?;
+                        // Any other subject's row over the file goes too (two sets with one name share a root).
+                        crate::db::stacking::delete_artifacts_naming_path(
+                            &conn,
+                            &registered_out_path(rc, &frame, planes).to_string_lossy(),
+                        )?;
                     }
                     if let Some(row) = row {
                         old_registered.insert(frame.frame_id, row);
                     }
-                    let planes = rc
-                        .measured
-                        .get(&group.key)
-                        .and_then(|v| v.get(idx))
-                        .map(|e| e.planes)
-                        .unwrap_or(1);
                     needs_artifact_rewrite.push(ArtifactRewriteItem {
                         frame_id: frame.frame_id,
                         calibrated: path.clone(),
@@ -999,6 +1004,10 @@ pub(super) fn register_group_pass(
                     &group.key,
                     ArtifactKind::Registered,
                     Some(frame.frame_id),
+                )?;
+                crate::db::stacking::delete_artifacts_naming_path(
+                    &conn,
+                    &registered_out_path(rc, &frame, planes).to_string_lossy(),
                 )?;
                 if let Some(old) = old {
                     old_registered.insert(frame.frame_id, old);
@@ -2238,6 +2247,15 @@ fn registered_row(
         ArtifactKind::Registered,
         Some(frame_id),
     )
+}
+
+/// The path a frame's registered file is written to: the registered folder and [`registered_file_name`] of its
+/// frame-level stem. The one spelling of what the Register write sites join by hand, so a writer can retire every
+/// row that names it before it writes.
+fn registered_out_path(rc: &RunContext, frame: &GroupFrame, planes: usize) -> PathBuf {
+    rc.layout
+        .registered_dir()
+        .join(registered_file_name(&frame_file_stem(frame), planes == 3))
 }
 
 /// `r_<stem>[_d].fits` for the SAME frame-only `stem`

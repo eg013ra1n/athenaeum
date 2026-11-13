@@ -295,6 +295,11 @@ fn resolve_prepare_job(
                 Some(frame.frame_id),
             )?;
         }
+        // Any other subject's row over a file this job writes goes too (two sets with one name share a root). Both
+        // outputs lie under `prepared/`; the user's own file, used in place, is never one of them.
+        for written in [&converted_out, &debayered_out] {
+            crate::db::stacking::delete_artifacts_naming_path(&conn, &written.to_string_lossy())?;
+        }
     }
     Ok(PrepareResolved::Job(Box::new(PrepareRunJob {
         frame_id: frame.frame_id,

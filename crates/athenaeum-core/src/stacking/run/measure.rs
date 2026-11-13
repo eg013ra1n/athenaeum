@@ -1435,7 +1435,10 @@ fn measure_two_pass_prepare(
     {
         let conn = db(&rc.ctx)?.conn();
         for member in &members {
-            if member.source == Pass1Source::Owed && !member.spill_pending && member.old_measured.is_some() {
+            if member.source != Pass1Source::Owed || member.spill_pending {
+                continue;
+            }
+            if member.old_measured.is_some() {
                 crate::db::stacking::delete_artifact(
                     &conn,
                     &rc.subject,
@@ -1444,6 +1447,11 @@ fn measure_two_pass_prepare(
                     Some(member.frame.frame_id),
                 )?;
             }
+            // Any other subject's row over the file pass 1 writes goes too (two sets with one name share a root).
+            crate::db::stacking::delete_artifacts_naming_path(
+                &conn,
+                &member.layout_spill.to_string_lossy(),
+            )?;
         }
     }
     Ok(TwoPassState {
@@ -1984,6 +1992,8 @@ fn persist_measurement(
                 kind,
                 Some(frame.frame_id),
             )?;
+            // Any other subject's row over this plane's file goes too (two sets with one name share a root).
+            crate::db::stacking::delete_artifacts_naming_path(&conn, &fits_path.to_string_lossy())?;
             old
         };
         let timed = tracing::enabled!(tracing::Level::DEBUG);

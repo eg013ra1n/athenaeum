@@ -1292,3 +1292,60 @@ fn an_in_place_row_at_another_path_than_its_light_is_stale() {
     assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
     assert_eq!(cached(&rig), 4);
 }
+
+/// Review F2 (file-identity §4.1): a Prepare subject's own files written in a previous working folder stay fresh in
+/// the gate, as they do in the run (a `Write` action has no path expectation). The run recorded W1; the setting then
+/// moves to W2; the gate counts every frame cached (the rows sit under a folder the subject's runs recorded) and the
+/// next run prepares none.
+#[test]
+fn a_previous_working_folders_prepared_rows_stay_fresh_in_the_gate() {
+    let rig = Pass1Rig::attested_16bit();
+    let cfg = rig.cfg.clone();
+    rig.try_stage_one(&cfg).unwrap();
+    let rows = rig.rows(ArtifactKind::Calibrated);
+    assert_eq!(rows.len(), 4, "premise: the run prepared every frame");
+    for (frame_id, row) in &rows {
+        let path = Path::new(row.path.as_deref().unwrap());
+        assert!(path.starts_with(rig.layout.prepared_root()), "frame {frame_id}: {path:?}");
+    }
+
+    let output = tempfile::tempdir().unwrap();
+    let moved = tempfile::tempdir().unwrap();
+    for (key, dir) in [
+        (crate::settings::keys::STACKING_WORKING_DIR, moved.path()),
+        (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+    ] {
+        crate::db::set_setting(&rig.fixture.conn, key, dir.to_str().unwrap()).unwrap();
+    }
+    let plan = crate::stacking::plan::build_plan(
+        &rig.fixture.conn,
+        &rig.ctx.settings,
+        &crate::api::PathPolicy::AllowAll,
+        &rig.subject,
+        Some(cfg.clone()),
+    )
+    .expect("the plan should build");
+    assert_eq!(plan.groups[0].calibrated_cached, 4, "the gate reads the previous folder's rows as cached");
+
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&cfg));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs, "calibrate", "prepare"), 0, "{logs}");
+}
+
+/// Review F1 (file-identity §4.2), at Prepare: the other same-named set's rows over the `prepared/` files this run
+/// rewrites (`debayer_osc` flipped, which moves the prepare hash) are retired with the writer's own.
+#[test]
+fn a_same_named_sets_prepare_retires_the_other_sets_rows() {
+    let rig = Pass1Rig::attested_16bit();
+    let cfg_a = rig.cfg.clone();
+    rig.try_stage_one(&cfg_a).unwrap();
+    let other = same_named_set_with_copies_of_the_calibrated_rows(&rig);
+    assert_eq!(rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated).len(), 4, "premise: the copies stand");
+
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.calibration.debayer_osc = !cfg_b.calibration.debayer_osc;
+    rig.try_stage_one(&cfg_b).unwrap();
+
+    let other_rows = rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated);
+    assert!(other_rows.is_empty(), "the other set keeps rows over rewritten files: {other_rows:?}");
+}

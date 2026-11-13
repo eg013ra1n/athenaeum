@@ -587,6 +587,11 @@ fn resolve_calibrate_job(
                 Some(frame.frame_id),
             )?;
         }
+        // Any other subject's row over a file this job writes goes too (two sets with one name share a root).
+        crate::db::stacking::delete_artifacts_naming_path(&conn, &out.to_string_lossy())?;
+        if let Some(mosaic_out) = &mosaic_out {
+            crate::db::stacking::delete_artifacts_naming_path(&conn, &mosaic_out.to_string_lossy())?;
+        }
     }
 
     Ok(CalibrateResolved::Job(Box::new(CalibrateJob {
