@@ -862,6 +862,124 @@ mod tests {
         assert_eq!(states(&s, first), vec![AlignedState::Replaced; 5]);
     }
 
+    /// File identity §4.10 (RB-3) for a PROJECT: its frames are project-frame handles, so a candidate's frame is read
+    /// from `project_frame` (the raw `frame_id` column is always NULL for a project). A moved project working folder's
+    /// aligned frames are shown from the new place before the next run.
+    #[test]
+    fn blink_shows_a_moved_project_folders_frames_before_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let db_handle = db(&ctx).unwrap();
+        let conn = db_handle.conn();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let handles = project_frame_handles(&conn, "p1", &["u-a", "u-b"]).unwrap();
+        let (a, b) = (handles["u-a"], handles["u-b"]);
+        let subject = StackSubject::Project("p1".to_string());
+        let w1 = tmp.path().join("w1");
+        std::fs::create_dir_all(&w1).unwrap();
+        let w1 = crate::stacking::paths::run_spelled_working(&w1).unwrap();
+        let run_id = insert_run(
+            &conn,
+            &NewRun {
+                subject: &subject,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: w1.to_str().unwrap(),
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        let group_id = insert_group(
+            &conn,
+            &NewGroup {
+                run_id,
+                group_key: "mono__NoFilter__bin1__60s",
+                instrume: None,
+                color_mode: "mono",
+                filter: None,
+                binning: Some(1),
+                width: None,
+                height: None,
+                exposure: None,
+                exposure_class: None,
+                frame_count: 2,
+                included_count: 2,
+            },
+        )
+        .unwrap();
+        let root = crate::stacking::paths::subject_layout(&conn, &w1, &subject).unwrap().root;
+        for handle in [a, b] {
+            upsert_frame_row(
+                &conn,
+                &subject,
+                &NewFrameRow {
+                    run_id,
+                    group_id,
+                    frame_id: handle,
+                    included: true,
+                    exclusion_reason: None,
+                    weight: None,
+                    weight_channels_json: None,
+                    metrics_json: None,
+                    reg_status: Some("aligned"),
+                    reg_model: None,
+                    reg_rms_px: None,
+                    reg_inliers: None,
+                    reg_inlier_ratio: None,
+                    reg_flipped: None,
+                    rejected_fraction: None,
+                },
+            )
+            .unwrap();
+            let file = root.join("registered").join(format!("r_{handle}.fits"));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"SIMPLE").unwrap();
+            let stamp = crate::stacking::plan::render_modified_at(std::fs::metadata(&file).unwrap().modified().unwrap());
+            upsert_artifact(
+                &conn,
+                &NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(handle),
+                    group_key: "",
+                    kind: ArtifactKind::Registered,
+                    path: file.to_str(),
+                    config_hash: "h",
+                    size: Some(6),
+                    modified_at: Some(&stamp),
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
+        crate::db::set_setting(&conn, crate::settings::keys::STACKING_WORKING_DIR, w1.to_str().unwrap()).unwrap();
+        drop(conn);
+        let states = |ctx: &ServiceContext| {
+            get_stacking_aligned_frames(ctx, run_id, &[a, b])
+                .unwrap()
+                .into_iter()
+                .map(|r| r.state)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(states(&ctx), vec![AlignedState::Available; 2], "premise: the files are where the rows say");
+
+        // The folder moves and the setting follows it.
+        let w2 = tmp.path().join("w2");
+        std::fs::rename(&w1, &w2).unwrap();
+        assert_eq!(states(&ctx), vec![AlignedState::Missing; 2], "premise: the old folder is gone");
+        crate::db::set_setting(
+            &db_handle.conn(),
+            crate::settings::keys::STACKING_WORKING_DIR,
+            w2.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(states(&ctx), vec![AlignedState::Available; 2]);
+        let path = resolve_stacking_aligned_path(&ctx, run_id, a).unwrap();
+        let current = crate::stacking::paths::run_spelled_working(&w2).unwrap();
+        assert!(path.is_file() && path.starts_with(&current), "{path:?} is under {current:?}");
+    }
+
     /// A project's frames are project-frame handles: the lookups read the `project_frame` columns, not `frame_id`.
     #[test]
     fn aligned_project_frames_are_looked_up_by_their_handle() {

@@ -1182,12 +1182,70 @@ fn run_input_paths(rc: &RunContext, conn: &rusqlite::Connection) -> Vec<String> 
     paths
 }
 
+/// Whether a stage of THIS run reads the cached row a rebase candidate stands for: the one rule that decides which
+/// rows the "not found" warning counts (a row no stage reads is not "recomputed", and counting it would keep the
+/// warning for ever). A frame-level row counts when its frame is a member of a plan group and is not manually
+/// excluded; the calibrated mosaic only when its group keeps one ([`wants_cfa_mosaic`]); an LN row only when local
+/// normalization is on, for a member of the row's own group, and the LN reference when that group is in the plan.
+/// This may count fewer rows than the plan gate does (it never reads a row the run does not), never more.
+struct RunReads {
+    ln_active: bool,
+    /// Group key to (whether the group keeps a CFA mosaic, its frames that are not manually excluded).
+    groups: HashMap<String, (bool, HashSet<i64>)>,
+    frames: HashSet<i64>,
+}
+
+impl RunReads {
+    fn of(rc: &RunContext) -> Self {
+        let mut groups = HashMap::new();
+        let mut frames = HashSet::new();
+        for g in &rc.plan_groups {
+            let members: HashSet<i64> = g
+                .frames
+                .iter()
+                .map(|f| f.frame_id)
+                .filter(|id| !rc.excluded.contains(id))
+                .collect();
+            frames.extend(members.iter().copied());
+            groups.insert(g.key.clone(), (wants_cfa_mosaic(&rc.config, g), members));
+        }
+        Self {
+            ln_active: rc.config.normalization.local.enabled
+                || rc.config.normalization.rejection == RejectionNormalization::Local,
+            groups,
+            frames,
+        }
+    }
+
+    fn reads(&self, c: &crate::stacking::rebase::Candidate) -> bool {
+        let Some(frame) = c.frame_id else {
+            // The one group-level row with a file: the LN reference.
+            return c.kind == ArtifactKind::LnReference.as_db_str()
+                && self.ln_active
+                && self.groups.contains_key(&c.group_key);
+        };
+        if c.kind == ArtifactKind::Ln.as_db_str() {
+            return self.ln_active
+                && self.groups.get(&c.group_key).is_some_and(|(_, members)| members.contains(&frame));
+        }
+        if c.kind == ArtifactKind::LnReference.as_db_str() {
+            return self.ln_active && self.groups.contains_key(&c.group_key);
+        }
+        if c.kind == ArtifactKind::CalibratedMosaic.as_db_str() {
+            return self.groups.values().any(|(mosaic, members)| *mosaic && members.contains(&frame));
+        }
+        self.frames.contains(&frame)
+    }
+}
+
 /// Point the subject's cached rows at the CURRENT working folder when their files moved with it (file identity
 /// §4.10), once per run, before the inputs are sampled and before the stage-1 dispatch. The three phases of the
-/// input check: the candidates are read under the connection, every mapped file is stat-ed WITHOUT it (cancel
-/// checked per file) and the rows that passed are committed in one transaction. Nothing on disk is moved, copied or
-/// deleted. A failure to read the candidates or to commit is logged and the run goes on: a row left where it is
-/// costs a recompute, never a wrong file.
+/// input check: the candidates are read under the connection, every mapped file is probed WITHOUT it (one listing
+/// per mapped folder, then one stat per listed file; cancel checked per file) and the rows that passed are committed
+/// in one transaction. Nothing on disk is moved, copied or deleted. A failure to read the candidates or to commit is
+/// logged and the run goes on: a row left where it is costs a recompute, never a wrong file. A row whose file is
+/// still at the old place is read there; the warning counts the rows left AND nowhere, and only those a stage of this
+/// run reads ([`RunReads`]).
 ///
 /// Progress is ONE Calibrate event at `current = 0`, as the input check's: a tick per file would reach 100 % and
 /// the stage's own first event would put the row back to 0.
@@ -1221,11 +1279,12 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
         None,
         Some(rebase::REBASE_MESSAGE.to_string()),
     );
+    let mut prober = rebase::Prober::new(&candidates, false);
     let mut moved: Vec<&rebase::Candidate> = Vec::new();
-    let mut gone = 0usize;
+    let mut left: Vec<&rebase::Candidate> = Vec::new();
     for c in &candidates {
         rc.check_cancel()?;
-        let check = rebase::check(c);
+        let check = prober.check(c);
         let Some(reason) = check.left_reason() else {
             moved.push(c);
             continue;
@@ -1236,21 +1295,24 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
             reason,
             "cached file not rebased"
         );
-        // A row whose file is still at the old place is read there; only one that is nowhere is counted as gone.
-        if rebase::is_gone_at_old_place(c) {
-            gone += 1;
-        }
+        left.push(c);
     }
     rc.check_cancel()?;
+    let mut changed: HashSet<i64> = HashSet::new();
     if !moved.is_empty() {
         let mut conn = db(&rc.ctx)?.conn();
-        if let Err(error) = rebase::commit(&mut conn, &moved) {
-            tracing::warn!(
-                run_id = rc.run_id,
-                error = %format!("{error:#}"),
-                "working folder rows not rebased; the run goes on"
-            );
-            moved.clear();
+        match rebase::commit_rows(&mut conn, &moved) {
+            Ok(rows) => changed = rows,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    count = moved.len(),
+                    error = %format!("{error:#}"),
+                    "working folder rows not rebased; the run goes on"
+                );
+                // Their files are at the old place still, as every other left row's.
+                left.append(&mut moved);
+            }
         }
     }
     let mut roots: Vec<&Path> = Vec::new();
@@ -1261,7 +1323,10 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
     }
     for root in roots {
         let of_root = candidates.iter().filter(|c| c.old_root == root).count();
-        let moved_here = moved.iter().filter(|c| c.old_root == root).count();
+        let moved_here = candidates
+            .iter()
+            .filter(|c| c.old_root == root && changed.contains(&c.row_id))
+            .count();
         tracing::info!(
             run_id = rc.run_id,
             old_root = %root.display(),
@@ -1270,6 +1335,16 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
             left = of_root - moved_here,
             "working folder rows rebased"
         );
+    }
+    // A row whose file is still at the old place is read there; only one that is nowhere, and that a stage of this
+    // run reads, is counted. One stat each, for those rows alone.
+    let reads = RunReads::of(rc);
+    let mut gone = 0usize;
+    for c in left {
+        rc.check_cancel()?;
+        if reads.reads(c) && rebase::is_gone_at_old_place(c, false) {
+            gone += 1;
+        }
     }
     if gone > 0 {
         rc.warnings.push(rebase::left_warning(gone, &rc.layout.root));

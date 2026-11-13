@@ -9,22 +9,27 @@
 //! 1. its path lies under an old subject root by path components ([`map_row`]; `/w/M310` is not under `/w/M31`);
 //! 2. the first component below that root is the row's kind's own subtree ([`kind_subtrees`]);
 //! 3. the file at the mapped place is a regular file whose length equals the row's `size` and whose time is within
-//!    [`MTIME_TOLERANCE_SECS`] of the row's `modified_at`, both at FULL precision ([`check`]; this is not the collab
+//!    [`MTIME_TOLERANCE_SECS`] of the row's `modified_at`, both at FULL precision (`check_with`; this is not the collab
 //!    landing stamp's whole-second rule). A second, older copy of the folder passes key + size alone; the time is
 //!    what tells it from the copy the row was recorded over, and a false "moved" stacks a master from the wrong
 //!    frames under a new key, while a row left where it was costs a recompute. When in doubt the answer is "not
 //!    moved";
-//! 4. the UPDATE still finds the row at its old path ([`commit`], over
+//! 4. the UPDATE still finds the row at its old path ([`commit_rows`], over
 //!    [`crate::db::stacking::rebase_artifact_path`]).
 //!
 //! A row of the user's own file (an in-place `calibrated` row, which names the light itself), a payload-only row
 //! (no path, size or time) and another subject's row are never candidates.
 //!
+//! The files are probed by folder ([`Prober`]): a mapped folder holding two or more candidates is listed once and a
+//! candidate whose name is not listed is `Missing` with no stat, so a kept old folder costs a listing per folder, not
+//! a stat per row. The verdicts are exactly the stat-per-row ones.
+//!
 //! Callers: the run's trigger (`run::calibrate::rebase_working_rows`) and the read-only [`RebaseView`] of the plan gate
-//! and Blink, which judge the same candidates with the same [`check`] and commit nothing.
+//! and Blink, which judge the same candidates with the same verdicts and commit nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 use rusqlite::{params, Connection, TransactionBehavior};
 
@@ -83,9 +88,9 @@ pub(crate) fn map_row(
 
 /// The subject roots its earlier runs used, other than the current one: `subject_layout` of every working folder the
 /// subject's runs recorded ([`crate::db::stacking::subject_working_dirs`], the current slug), without the current
-/// root (equal by spelling, or after `canonicalize` + `normalize_path` when both exist, so an old folder that is the
-/// current one through a symlink is not an old root), deduplicated, longest first. A recorded folder that is empty
-/// is skipped.
+/// root BY SPELLING, deduplicated, longest first. A recorded folder that is empty is skipped. A root that is the
+/// current one through a symlink is not resolved here (that is a file system call a stale mount can stall on):
+/// [`candidates_under`] resolves a root only when rows lie under it.
 pub(crate) fn old_roots(
     conn: &Connection,
     subject: &StackSubject,
@@ -95,9 +100,6 @@ pub(crate) fn old_roots(
         tracing::warn!(error = %format!("{e:#}"), "the subject's recorded working folders not read");
         e
     })?;
-    // Resolved only when a recorded folder differs by spelling: the steady state (every run used the current folder)
-    // costs no file system call here.
-    let mut current_canonical: Option<Option<PathBuf>> = None;
     let mut roots: Vec<PathBuf> = Vec::new();
     for dir in dirs.iter().filter(|d| !d.is_empty()) {
         let layout = crate::stacking::paths::subject_layout(conn, Path::new(dir), subject)
@@ -108,12 +110,6 @@ pub(crate) fn old_roots(
         let root = layout.root;
         if root == current_root {
             continue;
-        }
-        let current = current_canonical.get_or_insert_with(|| canonical_plain(current_root));
-        if let (Some(a), Some(b)) = (current.as_ref(), canonical_plain(&root)) {
-            if *a == b {
-                continue;
-            }
         }
         if !roots.contains(&root) {
             roots.push(root);
@@ -133,14 +129,17 @@ fn canonical_plain(path: &Path) -> Option<PathBuf> {
         .map(|c| crate::api::scan_roots::normalize_path(&c))
 }
 
-/// One row that lay under an old root and has a place under the current one: what [`check`] stats and [`commit`]
+/// One row that lay under an old root and has a place under the current one: what [`Prober`] probes and [`commit_rows`]
 /// updates.
 #[derive(Debug, Clone)]
 pub(crate) struct Candidate {
     pub row_id: i64,
     pub kind: String,
-    /// The frame the row belongs to (`None` for a group-level row).
+    /// The frame the row belongs to: a catalog frame id for a frame set, the project-frame handle for a project
+    /// (`None` for a group-level row).
     pub frame_id: Option<i64>,
+    /// The group key the row is stored under (`""` for a frame-level kind).
+    pub group_key: String,
     pub old_path: String,
     pub old_root: PathBuf,
     pub mapped: PathBuf,
@@ -148,43 +147,69 @@ pub(crate) struct Candidate {
     pub modified_at: String,
 }
 
+/// What a caller wants of the candidate query, applied in the SQL: one kind and, when there are few, the frames.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CandidateFilter<'a> {
+    pub kind: Option<&'a str>,
+    pub frame_ids: Option<&'a [i64]>,
+}
+
+/// More frame ids than this are not put in the SQL (the caller filters what comes back).
+const MAX_FRAME_IDS_IN_SQL: usize = 200;
+
 /// The subject's rows whose path lies under an old root and maps onto the current one ([`map_row`]), read under the
-/// connection with no file I/O besides the old roots' canonicalisation. Per old root, one range query on
-/// `idx_stacking_artifacts_path` (`path >= root/` and `path < succ(root/)`); a row with no `size` or no
-/// `modified_at` (payload-only, or never recorded with a time) is not a candidate, since the check could not judge
-/// it. No old root, no query. A row in two ranges (nested roots) is listed once, under the longer root.
+/// connection with no file I/O besides the canonicalisation of an old root that has rows under it. Per old root, one
+/// range query (`path >= root/` and `path < succ(root/)`; the planner searches the subject key and applies the range
+/// per row); a row with no `size` or no `modified_at` (payload-only, or never recorded with a time) is not a
+/// candidate, since the check could not judge it. No old root, no query. A row in two ranges (nested roots) is
+/// listed once, under the longer root.
 pub(crate) fn candidates(
     conn: &Connection,
     subject: &StackSubject,
     current_root: &Path,
 ) -> anyhow::Result<Vec<Candidate>> {
     let roots = old_roots(conn, subject, current_root)?;
-    candidates_under(conn, subject, &roots, current_root)
+    candidates_under(conn, subject, &roots, current_root, CandidateFilter::default())
 }
 
-/// [`candidates`] over the old roots the caller already read ([`old_roots`]).
+type RawRow = (i64, String, String, String, i64, String, Option<i64>);
+
+/// [`candidates`] over the old roots the caller already read ([`old_roots`]), narrowed by `filter`.
 fn candidates_under(
     conn: &Connection,
     subject: &StackSubject,
     roots: &[PathBuf],
     current_root: &Path,
+    filter: CandidateFilter<'_>,
 ) -> anyhow::Result<Vec<Candidate>> {
     if roots.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, kind, path, size, modified_at, frame_id FROM stacking_artifacts
-             WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
-               AND path >= ?3 AND (?4 IS NULL OR path < ?4)
-               AND size IS NOT NULL AND modified_at IS NOT NULL",
-        )
-        .map_err(|e| {
-            tracing::warn!(error = %e, "the rebase candidates query did not prepare");
-            e
-        })?;
-    let mut seen: HashSet<i64> = HashSet::new();
-    let mut out = Vec::new();
+    let frames_sql = match filter.frame_ids {
+        Some(ids) if ids.len() <= MAX_FRAME_IDS_IN_SQL => {
+            let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+            format!(" AND COALESCE(frame_id, project_frame) IN ({})", list.join(","))
+        }
+        _ => String::new(),
+    };
+    // `COALESCE(frame_id, project_frame)` as the artifact reads use: a project's frame is in `project_frame`.
+    let sql = format!(
+        "SELECT id, kind, group_key, path, size, modified_at, COALESCE(frame_id, project_frame)
+         FROM stacking_artifacts
+         WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
+           AND path >= ?3 AND (?4 IS NULL OR path < ?4)
+           AND size IS NOT NULL AND modified_at IS NOT NULL
+           AND (?5 IS NULL OR kind = ?5){frames_sql}"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        tracing::warn!(error = %e, "the rebase candidates query did not prepare");
+        e
+    })?;
+    // Pass 1: the rows under each root. A root with rows is resolved against the current one (an old folder that is
+    // the current one through a symlink is no old root); a root with none costs no file system call.
+    let mut current_canonical: Option<Option<PathBuf>> = None;
+    let mut active: Vec<PathBuf> = Vec::new();
+    let mut found: Vec<Vec<RawRow>> = Vec::new();
     for root in roots {
         let Some(root_str) = root.to_str() else {
             tracing::debug!(path = %root.display(), "an old working root is not valid UTF-8; its rows stay where they are");
@@ -201,16 +226,18 @@ fn candidates_under(
                     subject.frame_set_id().unwrap_or(0),
                     subject.project_id().unwrap_or(""),
                     lower,
-                    upper
+                    upper,
+                    filter.kind
                 ],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
                     ))
                 },
             )?
@@ -219,11 +246,27 @@ fn candidates_under(
                 tracing::warn!(path = %lower, error = %e, "the rebase candidates were not read");
                 e
             })?;
-        for (row_id, kind, old_path, size, modified_at, frame_id) in rows {
+        if rows.is_empty() {
+            continue;
+        }
+        let current = current_canonical.get_or_insert_with(|| canonical_plain(current_root));
+        if let (Some(a), Some(b)) = (current.as_ref(), canonical_plain(root)) {
+            if *a == b {
+                continue;
+            }
+        }
+        active.push(root.clone());
+        found.push(rows);
+    }
+    // Pass 2: each row under the first (longest) active root it maps through.
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut out = Vec::new();
+    for rows in found {
+        for (row_id, kind, group_key, old_path, size, modified_at, frame_id) in rows {
             if seen.contains(&row_id) {
                 continue;
             }
-            let Some((idx, mapped)) = map_row(&kind, Path::new(&old_path), roots, current_root)
+            let Some((idx, mapped)) = map_row(&kind, Path::new(&old_path), &active, current_root)
             else {
                 continue;
             };
@@ -236,8 +279,9 @@ fn candidates_under(
                 row_id,
                 kind,
                 frame_id,
+                group_key,
                 old_path,
-                old_root: roots[idx].clone(),
+                old_root: active[idx].clone(),
                 mapped,
                 size,
                 modified_at,
@@ -247,7 +291,7 @@ fn candidates_under(
     Ok(out)
 }
 
-/// The answer of [`check`] for one candidate.
+/// The answer of `check_with` for one candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Check {
     /// A regular file of the recorded length and a time within the tolerance: the row's file moved with the folder.
@@ -280,21 +324,57 @@ impl Check {
     }
 }
 
-/// Whether a candidate that was left is nowhere: its file is not at the old place either (the row's own size is the
-/// one identity, as every own working file's). Only such a row is counted in [`left_warning`]; one whose file is still
-/// at the old place is read there. One stat. The run's trigger and the gate's view count with this one rule.
-pub(crate) fn is_gone_at_old_place(c: &Candidate) -> bool {
-    !crate::stacking::plan::file_matches_identity(Path::new(&c.old_path), Some(c.size))
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the `read_dir` listings and the `std::fs::metadata` stats this module made on this thread.
+    static LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// One `std::fs::metadata` of the mapped place and the three comparisons, in the order size, kind, time. Reads no
-/// pixels and needs no connection. Any doubt is not [`Check::Moved`].
-pub(crate) fn check(c: &Candidate) -> Check {
+fn count_listing() {
+    #[cfg(test)]
+    LISTINGS.with(|n| n.set(n.get() + 1));
+}
+
+fn count_stat() {
+    #[cfg(test)]
+    STATS.with(|n| n.set(n.get() + 1));
+}
+
+/// Whether a candidate that was left is nowhere: its file is not at the old place either (the row's own size is the
+/// one identity, as every own working file's). Only such a row is counted in [`left_warning`]; one whose file is still
+/// at the old place is read there. One stat; `quiet` logs an unreadable place at `debug!` (the gate), not `warn!`
+/// (the run). The run's trigger and the gate's view count with this one rule.
+pub(crate) fn is_gone_at_old_place(c: &Candidate, quiet: bool) -> bool {
+    count_stat();
+    match std::fs::metadata(&c.old_path) {
+        Ok(meta) => i64::try_from(meta.len()).map_or(true, |len| len != c.size),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            if quiet {
+                tracing::debug!(path = %c.old_path, error = %e, "cached file cannot be stat-ed; counted as gone");
+            } else {
+                tracing::warn!(path = %c.old_path, error = %e, "cached file cannot be stat-ed; counted as gone");
+            }
+            true
+        }
+    }
+}
+
+/// One `std::fs::metadata` of the mapped place and the three comparisons, in the order kind, size, time. Reads no
+/// pixels and needs no connection. Any doubt is not [`Check::Moved`]. `quiet` logs an inspection failure at `debug!`
+/// (the gate, spec §4.10), not `warn!` (the run).
+fn check_with(c: &Candidate, quiet: bool) -> Check {
+    count_stat();
     let meta = match std::fs::metadata(&c.mapped) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Check::Missing,
         Err(e) => {
-            tracing::warn!(path = %c.mapped.display(), error = %e, "cached file cannot be stat-ed; counted as not moved");
+            if quiet {
+                tracing::debug!(path = %c.mapped.display(), error = %e, "cached file cannot be stat-ed; counted as not moved");
+            } else {
+                tracing::warn!(path = %c.mapped.display(), error = %e, "cached file cannot be stat-ed; counted as not moved");
+            }
             return Check::Unreadable(e.to_string());
         }
     };
@@ -307,7 +387,11 @@ pub(crate) fn check(c: &Candidate) -> Check {
     let live = match meta.modified() {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(path = %c.mapped.display(), error = %e, "cached file has no modification time; counted as not moved");
+            if quiet {
+                tracing::debug!(path = %c.mapped.display(), error = %e, "cached file has no modification time; counted as not moved");
+            } else {
+                tracing::warn!(path = %c.mapped.display(), error = %e, "cached file has no modification time; counted as not moved");
+            }
             return Check::Unreadable(e.to_string());
         }
     };
@@ -316,6 +400,122 @@ pub(crate) fn check(c: &Candidate) -> Check {
     } else {
         Check::OtherTime
     }
+}
+
+/// [`check_with`] at the run's loudness: the verdict of one candidate.
+#[cfg(test)]
+pub(crate) fn check(c: &Candidate) -> Check {
+    check_with(c, false)
+}
+
+/// The names in one mapped folder, read once.
+enum Listing {
+    /// Every name the folder holds, exactly and lower-cased (a case-insensitive file system answers a stat for a name
+    /// that differs from the listed one in case only).
+    Names { exact: HashSet<std::ffi::OsString>, folded: HashSet<String> },
+    /// The folder could not be listed: its candidates are stat-ed one by one, as `check_with` does.
+    Unknown,
+}
+
+impl Listing {
+    /// Whether a stat of `name` could find a file: listed exactly, listed by case, or a name this comparison cannot
+    /// tell from a listed one (a non-ASCII name: a file system may fold the Unicode form). Only a name that is not
+    /// listed under any of these is [`Check::Missing`] with no stat.
+    fn may_hold(&self, name: &std::ffi::OsStr) -> bool {
+        match self {
+            Listing::Unknown => true,
+            Listing::Names { exact, folded } => {
+                if exact.contains(name) {
+                    return true;
+                }
+                match name.to_str() {
+                    Some(s) if s.is_ascii() => folded.contains(&s.to_ascii_lowercase()),
+                    _ => true,
+                }
+            }
+        }
+    }
+}
+
+/// The verdicts of a set of candidates, with ONE listing per mapped folder that holds two or more of them instead of
+/// one stat per candidate: a candidate whose file name the folder does not list is [`Check::Missing`] with no stat,
+/// and a listed one gets the one-stat verdict of [`check_with`]. The listing only ever short-cuts `Missing` (the
+/// answer of a stat of a name that is not there), so the verdicts are exactly the stat-per-row ones. A folder that is
+/// not there is an empty listing; one that cannot be listed falls back to the stat; a folder with one candidate is
+/// stat-ed (a stat is cheaper than a listing of a large folder).
+pub(crate) struct Prober {
+    quiet: bool,
+    per_parent: HashMap<PathBuf, usize>,
+    listings: HashMap<PathBuf, Listing>,
+}
+
+impl Prober {
+    /// A prober over `candidates` (their folders are counted here); `quiet` is the gate's debug-only logging.
+    pub(crate) fn new(candidates: &[Candidate], quiet: bool) -> Self {
+        let mut per_parent: HashMap<PathBuf, usize> = HashMap::new();
+        for c in candidates {
+            if let Some(parent) = c.mapped.parent() {
+                *per_parent.entry(parent.to_path_buf()).or_insert(0) += 1;
+            }
+        }
+        Self { quiet, per_parent, listings: HashMap::new() }
+    }
+
+    /// The verdict of `c`: `check`'s, with the folder listing in front of the stat.
+    pub(crate) fn check(&mut self, c: &Candidate) -> Check {
+        if let (Some(parent), Some(name)) = (c.mapped.parent(), c.mapped.file_name()) {
+            if self.per_parent.get(parent).copied().unwrap_or(0) >= 2 {
+                let quiet = self.quiet;
+                let listing = self
+                    .listings
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| list_folder(parent, quiet));
+                if !listing.may_hold(name) {
+                    return Check::Missing;
+                }
+            }
+        }
+        check_with(c, self.quiet)
+    }
+}
+
+/// One `read_dir` of `folder`, names only. A folder that is not there is an empty listing; any other failure is
+/// logged and answers [`Listing::Unknown`].
+fn list_folder(folder: &Path, quiet: bool) -> Listing {
+    count_listing();
+    let unknown = |what: &str, e: &std::io::Error| {
+        if quiet {
+            tracing::debug!(path = %folder.display(), error = %e, "{what}");
+        } else {
+            tracing::warn!(path = %folder.display(), error = %e, "{what}");
+        }
+        Listing::Unknown
+    };
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path = %folder.display(), "a mapped working folder is not there; its files are not found");
+            return Listing::Names { exact: HashSet::new(), folded: HashSet::new() };
+        }
+        Err(e) => return unknown("a mapped working folder cannot be listed; its files are stat-ed one by one", &e),
+    };
+    let mut exact = HashSet::new();
+    let mut folded = HashSet::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let name = entry.file_name();
+                if let Some(s) = name.to_str() {
+                    if s.is_ascii() {
+                        folded.insert(s.to_ascii_lowercase());
+                    }
+                }
+                exact.insert(name);
+            }
+            Err(e) => return unknown("a mapped working folder was listed in part; its files are stat-ed one by one", &e),
+        }
+    }
+    Listing::Names { exact, folded }
 }
 
 /// Whether `live` is within [`MTIME_TOLERANCE_SECS`] of the recorded RFC 3339 time, both at full precision (the
@@ -330,45 +530,50 @@ fn within_tolerance(live: std::time::SystemTime, recorded: &str) -> bool {
 
 /// Points every candidate of `moved` at its mapped place, in ONE `BEGIN IMMEDIATE` transaction of point updates
 /// ([`crate::db::stacking::rebase_artifact_path`]); a row that is no longer at its old path is left as it is.
-/// Returns how many rows changed. Nothing on disk is touched. The caller passes only candidates [`check`] answered
-/// [`Check::Moved`]; the connection is not held across any file I/O here.
-pub(crate) fn commit(conn: &mut Connection, moved: &[&Candidate]) -> anyhow::Result<usize> {
+/// Returns the ids of the rows that changed. Nothing on disk is touched. The caller passes only candidates judged
+/// [`Check::Moved`] and logs a failure (once); the connection is not held across any file I/O here.
+pub(crate) fn commit_rows(conn: &mut Connection, moved: &[&Candidate]) -> anyhow::Result<HashSet<i64>> {
     if moved.is_empty() {
-        return Ok(0);
+        return Ok(HashSet::new());
     }
-    let result = (|| -> anyhow::Result<usize> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut changed = 0;
-        for c in moved {
-            let new = c.mapped.to_str().ok_or_else(|| {
-                anyhow::anyhow!("{}: the mapped path is not valid UTF-8", c.mapped.display())
-            })?;
-            if crate::db::stacking::rebase_artifact_path(&tx, c.row_id, &c.old_path, new)? {
-                changed += 1;
-            }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut changed = HashSet::new();
+    for c in moved {
+        let new = c.mapped.to_str().ok_or_else(|| {
+            anyhow::anyhow!("{}: the mapped path is not valid UTF-8", c.mapped.display())
+        })?;
+        if crate::db::stacking::rebase_artifact_path(&tx, c.row_id, &c.old_path, new)? {
+            changed.insert(c.row_id);
         }
-        tx.commit()?;
-        Ok(changed)
-    })();
-    result.map_err(|e| {
-        tracing::warn!(count = moved.len(), error = %format!("{e:#}"), "the rebased paths were not committed");
-        e
-    })
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// [`commit_rows`]'s count.
+#[cfg(test)]
+pub(crate) fn commit(conn: &mut Connection, moved: &[&Candidate]) -> anyhow::Result<usize> {
+    commit_rows(conn, moved).map(|changed| changed.len())
 }
 
 /// What the plan gate and Blink read instead of committing the rebase: the candidates of [`candidates`] judged by
-/// [`check`], held in memory. A row [`Check::Moved`] reads, through [`RebaseView::apply`], as the run's trigger would
-/// have left it (its path at the mapped place); every other row reads where it is. Nothing is written, no probe file
-/// is made, and a subject with no row outside the current root costs no stat. Built under the reader's own
-/// connection; the verdicts are the run's ([`check`], [`is_gone_at_old_place`]), so the plan before a run and the run
-/// agree unless a file changes between them.
+/// [`Prober`] (the verdicts of `check_with`), held in memory. A row [`Check::Moved`] reads, through [`RebaseView::apply`],
+/// as the run's trigger would have left it (its path at the mapped place); every other row reads where it is. Nothing
+/// is written, no probe file is made, and a subject with no row outside the current root costs no file system call.
+/// Built under the reader's own connection; the verdicts are the run's, so the plan before a run and the run agree
+/// unless a file changes between them. The view logs at `debug!` only.
+///
+/// The count of rows that were left and are nowhere either ([`RebaseView::left_gone`]) is of the rows `apply` was
+/// asked for: a row no stage reads cannot be "recomputed", and a stat of its old place is made only when it is asked.
 #[derive(Debug, Default)]
 pub(crate) struct RebaseView {
     /// Row id to (the path the row names now, the path it would have): applied only while the row still names the
     /// first, so a row a writer re-recorded since the candidates were read is not touched.
     by_row: HashMap<i64, (String, String)>,
-    old_roots: Vec<PathBuf>,
-    left_gone: usize,
+    /// The candidates that were left where they are, by row id.
+    left: HashMap<i64, Candidate>,
+    /// The ids of the left rows `apply` was asked for while the row still named its old path.
+    asked: Mutex<HashSet<i64>>,
 }
 
 impl RebaseView {
@@ -378,15 +583,15 @@ impl RebaseView {
     }
 
     /// The view of `subject` over `current_root` (the root of the working folder the next run would use, in the
-    /// spelling a run records): phases one and two of the run's trigger ([`candidates`], then one [`check`] per
-    /// candidate, one more stat per candidate that was left), under the caller's connection, with no progress and no
-    /// commit. An `Err` is a catalog read that failed (already logged); the caller reads the rows as they are.
+    /// spelling a run records): phases one and two of the run's trigger ([`candidates`], then one verdict per
+    /// candidate), under the caller's connection, with no progress and no commit. An `Err` is a catalog read that
+    /// failed (already logged); the caller reads the rows as they are.
     pub(crate) fn for_gate(
         conn: &Connection,
         subject: &StackSubject,
         current_root: &Path,
     ) -> anyhow::Result<Self> {
-        Self::read(conn, subject, current_root, |_| true)
+        Self::read(conn, subject, current_root, CandidateFilter::default(), |_| true)
     }
 
     /// The view Blink reads: only the `registered` rows of `frame_ids`, so a request for one frame stats one file,
@@ -398,7 +603,8 @@ impl RebaseView {
         frame_ids: &[i64],
     ) -> anyhow::Result<Self> {
         let kind = crate::db::stacking::ArtifactKind::Registered.as_db_str();
-        Self::read(conn, subject, current_root, |c| {
+        let filter = CandidateFilter { kind: Some(&kind), frame_ids: Some(frame_ids) };
+        Self::read(conn, subject, current_root, filter, |c| {
             c.kind == kind && c.frame_id.is_some_and(|id| frame_ids.contains(&id))
         })
     }
@@ -407,31 +613,30 @@ impl RebaseView {
         conn: &Connection,
         subject: &StackSubject,
         current_root: &Path,
+        filter: CandidateFilter<'_>,
         keep: impl Fn(&Candidate) -> bool,
     ) -> anyhow::Result<Self> {
         let old_roots = old_roots(conn, subject, current_root)?;
-        let mut found = candidates_under(conn, subject, &old_roots, current_root)?;
+        let mut found = candidates_under(conn, subject, &old_roots, current_root, filter)?;
         found.retain(|c| keep(c));
-        let mut view = Self {
-            old_roots,
-            ..Self::default()
-        };
-        for c in &found {
-            let check = check(c);
-            if check == Check::Moved {
+        let mut view = Self::default();
+        let mut prober = Prober::new(&found, true);
+        for c in found {
+            if prober.check(&c) == Check::Moved {
                 // `candidates_under` keeps only candidates whose mapped path is valid UTF-8.
                 if let Some(mapped) = c.mapped.to_str() {
                     view.by_row.insert(c.row_id, (c.old_path.clone(), mapped.to_string()));
                 }
-            } else if is_gone_at_old_place(c) {
-                view.left_gone += 1;
+            } else {
+                view.left.insert(c.row_id, c);
             }
         }
-        if !found.is_empty() {
+        let total = view.by_row.len() + view.left.len();
+        if total > 0 {
             tracing::debug!(
                 new_root = %current_root.display(),
                 moved = view.by_row.len(),
-                left = found.len() - view.by_row.len(),
+                left = view.left.len(),
                 "working folder rows read through the rebase view"
             );
         }
@@ -439,25 +644,34 @@ impl RebaseView {
     }
 
     /// `row` as the run's trigger would leave it: a row judged [`Check::Moved`] comes back with its path at the mapped
-    /// place, any other row as it is.
+    /// place, any other row as it is. A left row still at its old path is recorded as asked for ([`Self::left_gone`]).
     pub(crate) fn apply(&self, row: Option<StackingArtifactRow>) -> Option<StackingArtifactRow> {
         let mut row = row?;
         if let Some((old, mapped)) = self.by_row.get(&row.id) {
             if row.path.as_deref() == Some(old.as_str()) {
                 row.path = Some(mapped.clone());
             }
+        } else if let Some(c) = self.left.get(&row.id) {
+            if row.path.as_deref() == Some(c.old_path.as_str()) {
+                if let Ok(mut asked) = self.asked.lock() {
+                    asked.insert(row.id);
+                }
+            }
         }
         Some(row)
     }
 
-    /// The subject roots its earlier runs used ([`old_roots`]), as the view read them.
-    pub(crate) fn old_roots(&self) -> &[PathBuf] {
-        &self.old_roots
-    }
-
-    /// How many candidates were left and are nowhere either: the count of [`left_warning`].
+    /// How many of the rows `apply` was asked for were left and are nowhere either: the count of [`left_warning`].
+    /// Read it AFTER the reads it should cover; one stat per such row, none for a row nobody asked for.
     pub(crate) fn left_gone(&self) -> usize {
-        self.left_gone
+        let Ok(asked) = self.asked.lock() else {
+            return 0;
+        };
+        asked
+            .iter()
+            .filter_map(|id| self.left.get(id))
+            .filter(|c| is_gone_at_old_place(c, true))
+            .count()
     }
 
     /// How many rows read through the view as moved.
@@ -596,6 +810,7 @@ mod tests {
             row_id: 1,
             kind: "calibrated".into(),
             frame_id: Some(1),
+            group_key: String::new(),
             old_path: "/gone/M31/calibrated/c.fits".into(),
             old_root: pb("/gone/M31"),
             mapped: mapped.to_path_buf(),
@@ -820,8 +1035,19 @@ mod tests {
         std::fs::create_dir_all(w.new_root()).unwrap();
         w.record_run(&w.subject, &link);
 
-        let roots = old_roots(&w.f.conn, &w.subject, &w.new_root()).unwrap();
-        assert_eq!(roots, vec![w.old_root()], "the symlinked spelling of the current root is not an old root");
+        // The symlinked spelling is a recorded folder by spelling; it is resolved only because a row lies under it.
+        let through_link = link.join("M31").join("calibrated").join("c_a_f9.fits");
+        write_file(&w.new_root().join("calibrated").join("c_a_f9.fits"), 10);
+        w.add_real_row(ArtifactKind::Calibrated, 9, &through_link);
+        let old = w.old_root().join("calibrated").join("c_a_f1.fits");
+        write_file(&old, 10);
+        let want = w.add_real_row(ArtifactKind::Calibrated, 1, &old);
+        let got = candidates(&w.f.conn, &w.subject, &w.new_root()).unwrap();
+        assert_eq!(
+            got.iter().map(|c| c.row_id).collect::<Vec<_>>(),
+            vec![want],
+            "the symlinked spelling of the current root is not an old root: {got:?}"
+        );
     }
 
     fn walk(root: &Path) -> Vec<(PathBuf, Vec<u8>, SystemTime)> {
@@ -965,6 +1191,11 @@ mod tests {
         write_file(&old_athm, 30);
         w.add_real_row(ArtifactKind::Measured, 2, &old_athm);
         std::fs::remove_file(&old_athm).unwrap();
+        // Left and nowhere too, but no stage reads it: not counted.
+        let old_athm3 = old("measured", "a_f3.athm");
+        write_file(&old_athm3, 31);
+        w.add_real_row(ArtifactKind::Measured, 3, &old_athm3);
+        std::fs::remove_file(&old_athm3).unwrap();
 
         let paths = |conn: &Connection| -> Vec<(i64, Option<String>)> {
             crate::db::stacking::list_artifacts(conn, &w.subject, None)
@@ -981,8 +1212,7 @@ mod tests {
 
         let view = RebaseView::for_gate(&w.f.conn, &w.subject, &w.new_root()).unwrap();
         assert_eq!(view.moved(), 2);
-        assert_eq!(view.left_gone(), 1, "only the row whose file is nowhere is counted");
-        assert_eq!(view.old_roots(), [w.old_root()]);
+        assert_eq!(view.left_gone(), 0, "no row was asked for yet");
         assert_eq!(
             view.apply(row(ArtifactKind::Calibrated, 1)).unwrap().path.unwrap(),
             new("calibrated", "c_a_f1.fits").to_str().unwrap()
@@ -1001,6 +1231,11 @@ mod tests {
             old_athm.to_str().unwrap()
         );
         assert!(view.apply(None).is_none());
+        assert_eq!(
+            view.left_gone(),
+            1,
+            "of the rows asked for, only the one whose file is nowhere is counted; a row nobody asked for is not"
+        );
         // A row a writer re-recorded elsewhere since the candidates were read is not touched.
         let mut moved_since = row(ArtifactKind::Calibrated, 1).unwrap();
         moved_since.path = Some("/elsewhere/c.fits".into());
@@ -1027,7 +1262,7 @@ mod tests {
             none.apply(row(ArtifactKind::Calibrated, 1)).unwrap().path.unwrap(),
             old_cal.to_str().unwrap()
         );
-        assert!((none.moved(), none.left_gone(), none.old_roots().len()) == (0, 0, 0));
+        assert!((none.moved(), none.left_gone()) == (0, 0));
         let lone = crate::stacking::test_fixtures::frame_set("Lone");
         let lone_subject = StackSubject::FrameSet(lone.set_id);
         insert_run(
@@ -1044,7 +1279,138 @@ mod tests {
         )
         .unwrap();
         let view = RebaseView::for_gate(&lone.conn, &lone_subject, &w.new_wd.join("Lone")).unwrap();
-        assert!((view.moved(), view.left_gone(), view.old_roots().len()) == (0, 0, 0));
+        assert!((view.moved(), view.left_gone()) == (0, 0));
+    }
+
+    fn reset_counts() {
+        LISTINGS.with(|n| n.set(0));
+        STATS.with(|n| n.set(0));
+    }
+
+    /// `(listings, stats)` this thread made since [`reset_counts`].
+    fn counts() -> (usize, usize) {
+        (LISTINGS.with(|n| n.get()), STATS.with(|n| n.get()))
+    }
+
+    /// A working folder switched to a new path with the old one KEPT leaves every row a candidate on every plan. The
+    /// view lists each mapped folder once and stats nothing; a row nobody asked for costs no stat of its old place.
+    #[test]
+    fn a_kept_old_folder_costs_one_listing_per_folder_not_a_stat_per_row() {
+        let w = World::new();
+        for f in 1..=4 {
+            let old = w.old_root().join("calibrated").join(format!("c_a_f{f}.fits"));
+            write_file(&old, 10 + f);
+            w.add_real_row(ArtifactKind::Calibrated, f as i64, &old);
+        }
+        for f in 1..=3 {
+            let old = w.old_root().join("registered").join(format!("r_a_f{f}.fits"));
+            write_file(&old, 20 + f);
+            w.add_real_row(ArtifactKind::Registered, f as i64, &old);
+        }
+        // The new root does not exist yet: both mapped folders are missing.
+        assert!(!w.new_root().exists());
+
+        reset_counts();
+        let view = RebaseView::for_gate(&w.f.conn, &w.subject, &w.new_root()).unwrap();
+        assert_eq!(view.moved(), 0);
+        assert_eq!(counts(), (2, 0), "one listing per mapped folder (calibrated, registered), no file stat");
+
+        // Only the rows a reader asks for are looked at: their old place is still there, so none is gone.
+        let row = |kind: ArtifactKind, frame: i64| {
+            crate::db::stacking::find_artifact(&w.f.conn, &w.subject, "g", kind, Some(frame)).unwrap()
+        };
+        assert!(view.apply(row(ArtifactKind::Calibrated, 1)).is_some());
+        assert!(view.apply(row(ArtifactKind::Registered, 2)).is_some());
+        reset_counts();
+        assert_eq!(view.left_gone(), 0);
+        assert_eq!(counts(), (0, 2), "a stat for each of the two asked rows, none for the other five");
+
+        // The new root holds the folder but not the names: still one listing per folder, no stat.
+        std::fs::create_dir_all(w.new_root().join("calibrated")).unwrap();
+        std::fs::create_dir_all(w.new_root().join("registered")).unwrap();
+        write_file(&w.new_root().join("calibrated").join("unrelated.fits"), 1);
+        reset_counts();
+        let view = RebaseView::for_gate(&w.f.conn, &w.subject, &w.new_root()).unwrap();
+        assert_eq!((view.moved(), counts()), (0, (2, 0)));
+
+        // Blink's view of one frame: one candidate, so a stat and no listing of a folder that may be large.
+        reset_counts();
+        let blink = RebaseView::for_registered(&w.f.conn, &w.subject, &w.new_root(), &[2]).unwrap();
+        assert_eq!((blink.moved(), counts()), (0, (0, 1)));
+
+        // A subject with no candidate costs nothing.
+        let lone = crate::stacking::test_fixtures::frame_set("Lone");
+        let lone_subject = StackSubject::FrameSet(lone.set_id);
+        insert_run(
+            &lone.conn,
+            &NewRun {
+                subject: &lone_subject,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: w.new_wd.to_str().unwrap(),
+                output_dir: "",
+            },
+        )
+        .unwrap();
+        reset_counts();
+        let view = RebaseView::for_gate(&lone.conn, &lone_subject, &w.new_wd.join("Lone")).unwrap();
+        assert_eq!((view.moved(), view.left_gone(), counts()), (0, 0, (0, 0)));
+    }
+
+    /// The listing only short-cuts `Missing`: over a mapped folder that holds a moved file, one of another size, a
+    /// folder, a name that differs in case, and nothing for the rest, every verdict is the stat's.
+    #[test]
+    fn a_listed_folder_gives_the_same_verdicts_as_a_stat_per_row() {
+        let w = World::new();
+        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000);
+        let mut rows = Vec::new();
+        for f in 1..=6 {
+            let old = w.old_root().join("calibrated").join(format!("c_a_f{f}.fits"));
+            write_file(&old, 40);
+            set_time(&old, t);
+            rows.push(w.add_real_row(ArtifactKind::Calibrated, f as i64, &old));
+        }
+        let new = |name: &str| w.new_root().join("calibrated").join(name);
+        write_file(&new("c_a_f1.fits"), 40);
+        set_time(&new("c_a_f1.fits"), t);
+        write_file(&new("c_a_f2.fits"), 41);
+        std::fs::create_dir_all(new("c_a_f3.fits")).unwrap();
+        write_file(&new("c_a_f4.fits"), 40);
+        set_time(&new("c_a_f4.fits"), t + Duration::from_secs(60));
+        // f5 and f6 are not there.
+
+        let found = candidates(&w.f.conn, &w.subject, &w.new_root()).unwrap();
+        assert_eq!(found.len(), 6);
+        reset_counts();
+        let mut prober = Prober::new(&found, true);
+        for c in &found {
+            assert_eq!(prober.check(c), check(c), "{}", c.mapped.display());
+        }
+        let mut by_name: Vec<(String, Check)> = found
+            .iter()
+            .map(|c| (c.mapped.file_name().unwrap().to_string_lossy().into_owned(), check(c)))
+            .collect();
+        by_name.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            by_name.iter().map(|(_, c)| c.clone()).collect::<Vec<_>>(),
+            vec![
+                Check::Moved,
+                Check::OtherSize,
+                Check::NotAFile,
+                Check::OtherTime,
+                Check::Missing,
+                Check::Missing
+            ]
+        );
+        assert_eq!(counts().0, 1, "one listing served the six candidates");
+
+        // A name that differs in case only: the listing does not short-cut it; the stat decides, as it always did.
+        let mixed = Candidate { mapped: new("C_A_F1.FITS"), ..found[0].clone() };
+        let alone = [found[0].clone(), mixed.clone()];
+        let mut prober = Prober::new(&alone, true);
+        assert_eq!(prober.check(&mixed), check(&mixed));
     }
 
     #[test]

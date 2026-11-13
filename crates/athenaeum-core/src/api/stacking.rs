@@ -1296,7 +1296,8 @@ fn resolve_master_light(
             })?;
         // The cache lives under the subject's CURRENT working folder: after a move the run row still names the old
         // one, and a cache written there would recreate a folder the user moved away. The row's folder serves only
-        // a subject with none configured (or whose config cannot be read: the cache is an optimization).
+        // a subject with none configured (or whose config cannot be read: the cache is an optimization), and only
+        // while it exists.
         let subject = run_row.subject();
         let current = match current_working_dir(&conn, &ctx.settings, &subject) {
             Ok(dir) => dir,
@@ -1308,6 +1309,9 @@ fn resolve_master_light(
         let working = current.or_else(|| {
             (!run_row.working_dir.trim().is_empty()).then(|| PathBuf::from(&run_row.working_dir))
         });
+        // A folder that is not there (moved away while the setting or the run row still names it) gets no cache:
+        // `write_preview_cache` would create it, and the preview is rendered and not stored instead.
+        let working = working.and_then(|w| crate::stacking::paths::run_spelled_working(&w));
         let layout = match working {
             Some(working) => Some(layout_for(&conn, &working, &subject)?),
             None => None,
@@ -2704,6 +2708,68 @@ mod tests {
         let hit =
             cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
         assert_eq!(hit, Some(rendered), "the cache-only read finds it under W2");
+    }
+
+    /// File identity §4.10: the preview cache is an optimization and never creates a working folder. The folder moved
+    /// away while the setting (or, with none configured, the run row) still names it: the preview is rendered and not
+    /// stored, and the old path does not come back.
+    #[test]
+    fn a_preview_never_recreates_a_working_folder_that_is_gone() {
+        for configured in [true, false] {
+            let (tmp, ctx) = test_ctx();
+            let db_path = tmp.path().join("catalog.db");
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+            conn.execute("INSERT INTO frames_set (name) VALUES ('LDN 1272')", [])
+                .unwrap();
+            let set_id = conn.last_insert_rowid();
+            let w1 = tmp.path().join("w1");
+            if configured {
+                crate::db::set_setting(&conn, keys::STACKING_WORKING_DIR, w1.to_str().unwrap()).unwrap();
+            }
+            let run_id = crate::db::stacking::insert_run(
+                &conn,
+                &crate::db::stacking::NewRun {
+                    subject: &StackSubject::FrameSet(set_id),
+                    config_json: "{}",
+                    config_hash: "h",
+                    reference_frame_id: None,
+                    reference_mode: "auto",
+                    working_dir: w1.to_str().unwrap(),
+                    output_dir: tmp.path().to_str().unwrap(),
+                },
+            )
+            .unwrap();
+            let (width, height) = (32usize, 24usize);
+            let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+            let master = tmp.path().join("master_light.fits");
+            crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+            crate::db::stacking::insert_master_light(
+                &conn,
+                &crate::db::stacking::NewMasterLight {
+                    subject: &StackSubject::FrameSet(set_id),
+                    run_id,
+                    group_key: "g",
+                    kind: "master",
+                    path: master.to_str().unwrap(),
+                    format: "fits",
+                    width: width as i64,
+                    height: height as i64,
+                    channels: 1,
+                    frames: 3,
+                    total_exposure_s: None,
+                },
+            )
+            .unwrap();
+
+            let rendered =
+                render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+            assert!(!rendered.is_empty(), "the preview is still rendered (configured: {configured})");
+            assert!(!w1.exists(), "the folder that is gone was recreated (configured: {configured})");
+            let hit =
+                cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+            assert_eq!(hit, None, "nothing was stored (configured: {configured})");
+        }
     }
 
     /// Fix round 1, I1: `max_px` is clamped into

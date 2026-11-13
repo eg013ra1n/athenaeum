@@ -5296,17 +5296,26 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   rule is the whole price of leaving the time out of the identity inside a folder: a copy made by a tool that keeps times (Finder, `cp -p`,
   a move) is reused at once on any volume, a copy that resets times is not adopted, because an older diverged copy passes key + size alone
   and only the time tells it from the copy a row was recorded over. A row left where it is is read there while its file is at the old
-  place; one whose file is nowhere (not at the mapped place and not at the old one) is counted, and the plan and the run say so once:
-  "N cached files were not found in the working folder … as recorded", their frames are recomputed (`rebase::left_warning`). An in-place
-  `calibrated` row (a user's own file, outside the working root) is never a candidate. Nothing on disk is moved, copied or deleted: the
-  only write is one `BEGIN IMMEDIATE` transaction of path updates, and the old folder is left as it was.
+  place; one whose file is nowhere (not at the mapped place and not at the old one) AND is read by a stage is counted, and the plan and the
+  run say so once: "N cached files were not found in the working folder … as recorded", their frames are recomputed
+  (`rebase::left_warning`). A row no stage reads (a manually excluded frame, a frame out of the set, the mosaic with Bayer drizzle off, LN
+  files with LN off) is never counted, so the warning is gone after the one run that recomputed what it names: the plan counts the rows its
+  gate reads (`RebaseView::left_gone`, asked after the gate's reads), the run the rows of in-scope frames of a kind it reads with its config
+  (`RunReads`; it may count fewer than the plan, never more). An in-place `calibrated` row (a user's own file) is never a candidate: it
+  names no kind subtree of a working root (a path under `<root>/landed/` or outside the root maps to nothing). Nothing on disk is moved,
+  copied or deleted: the only write is one `BEGIN IMMEDIATE` transaction of path updates, and the old folder is left as it was.
   Who does it: the run's trigger (`rebase_working_rows`) rebases once at the top of stage 1, before the inputs are sampled; the plan gate and
-  Blink write nothing and read through `rebase::RebaseView` instead (candidates read under their connection, each checked with the same
-  `check`, one stat each; no candidate, no stat). The gate applies the view at its six row reads (`calibrated`, `calibrated_mosaic`,
+  Blink write nothing and read through `rebase::RebaseView` instead (candidates read under their connection and judged with the same
+  verdict as `check`; no candidate, no file system call). The files are probed by FOLDER, not by row (`rebase::Prober`): each mapped folder
+  that holds two or more candidates is listed once (`read_dir`, names only; a missing folder is an empty listing), a candidate whose name
+  is not listed is `Missing` with no stat, a listed one gets the one-stat `check`, so a kept old folder costs one listing per folder on a
+  plan, not a stat per row. The listing only ever short-cuts `Missing`. The gate logs at `debug!` only. The gate applies the view at its
+  six row reads (`calibrated`, `calibrated_mosaic`,
   `registered`, `ln_reference`, `ln`, `fits.<plane>`), so a moved folder's stages read cached BEFORE any run, and carries the same warning;
   Blink reads the `registered` rows of the frames it is asked about through it, so the aligned frames are shown from the new place. The
   master-light preview cache is laid out under the subject's current working folder (`api::stacking::current_working_dir`), never under the
-  run row's, so a moved folder is not recreated at the old path; the row's folder serves only a subject with none configured. The gate
+  run row's, so a moved folder is not recreated at the old path; the row's folder serves only a subject with none configured, and a
+  working folder that does not exist gets no cache at all (the preview is rendered and not stored). The gate
   and the run agree for every candidate (the same `check`) unless a file changes between them; after the run the view is empty.
   A frame-set rename (the slug folder changes) is not covered (open-items, RB-2).
 - **Known residuals.** After a weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by

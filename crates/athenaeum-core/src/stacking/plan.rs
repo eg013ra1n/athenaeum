@@ -3540,6 +3540,7 @@ pub fn build_plan(
     // A working folder that moved or was copied since the rows were written: the rows are read as the next run's
     // trigger would leave them (file-identity §4.10), and the gate writes nothing. No existing folder, or a catalog
     // read that fails (logged by the view): the rows read as stored.
+    let mut rebase_root: Option<PathBuf> = None;
     let rebase_view = match working_dir
         .as_deref()
         .map(Path::new)
@@ -3549,10 +3550,8 @@ pub fn build_plan(
             .and_then(|layout| RebaseView::for_gate(conn, subject, &layout.root).map(|v| (layout, v)))
         {
             Ok((layout, view)) => {
-                if view.left_gone() > 0 {
-                    warnings.push(crate::stacking::rebase::left_warning(view.left_gone(), &layout.root));
-                }
-                tracing::debug!(count = view.old_roots().len(), "plan read through the rebase view");
+                rebase_root = Some(layout.root);
+                tracing::debug!("plan read through the rebase view");
                 view
             }
             Err(e) => {
@@ -4196,6 +4195,15 @@ pub fn build_plan(
         &measure_betas,
         &rebase_view,
     )?;
+
+    // The cached files a stage read here was not found for: counted now that every read has been made, and only for
+    // the rows a stage asked for (a row nobody reads is not recomputed).
+    if let Some(root) = &rebase_root {
+        let left_gone = rebase_view.left_gone();
+        if left_gone > 0 {
+            warnings.push(crate::stacking::rebase::left_warning(left_gone, root));
+        }
+    }
 
     let mut stale_stages = Vec::new();
     if calibrate_stale {

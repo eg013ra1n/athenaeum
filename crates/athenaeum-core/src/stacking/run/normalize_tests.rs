@@ -1214,7 +1214,7 @@ fn a_copied_working_folder_is_used_and_the_original_is_untouched() {
 /// The defect the 2 s rule guards against: an older, diverged copy is never read. Run A fills W1; W2 is its copy;
 /// run B under W2 recalibrates with another setting (same sizes, other pixels); W1's times go an hour back; W2 is
 /// removed; run C at B's config under W1 finds W1's files of the right size but another time. Calibrate covers all 6
-/// frames, the run warns once with the number of rows it left, and the planes are B's, not A's.
+/// frames, the run warns once with the number of rows it left (the plan with the number its gate reads), and the planes are B's, not A's.
 #[test]
 fn a_diverged_copy_is_recomputed_not_read() {
     use crate::stacking::config::ExposureMode;
@@ -1278,11 +1278,19 @@ fn a_diverged_copy_is_recomputed_not_read() {
         &set_slug(SET_NAME),
     )
     .root;
-    let plan_warning = crate::stacking::rebase::left_warning(left as usize, &gate_root);
-    assert!(
-        plan_c.warnings.contains(&plan_warning),
-        "the plan says how many rows it left ({plan_warning}): {:?}",
-        plan_c.warnings
+    // The plan counts the left rows its gate reads (not the measured rows or the LN files, which it never judges), the
+    // run the rows its stages read: the plan's count is a lower bound of the run's, and both name the folder.
+    let plan_warning = plan_c
+        .warnings
+        .iter()
+        .find(|w| w.contains("cached files were not found"))
+        .unwrap_or_else(|| panic!("the plan says it left rows: {:?}", plan_c.warnings));
+    let plan_left: usize = plan_warning.split_whitespace().next().unwrap().parse().unwrap();
+    assert!((6..=left as usize).contains(&plan_left), "{plan_warning} of {left} rows");
+    assert_eq!(
+        *plan_warning,
+        crate::stacking::rebase::left_warning(plan_left, &gate_root),
+        "the plan names the folder as a run records it"
     );
 
     let (_, rc_c, logs_c) = rig.run(&cfg_b);
@@ -1294,6 +1302,68 @@ fn a_diverged_copy_is_recomputed_not_read() {
         rc_c.warnings
     );
     assert_eq!(calibrated(&rig), planes_b, "run C wrote B's planes, it did not read A's");
+}
+
+/// The "not found" warning goes away after one run: it counts only the rows a stage reads. Run 1 fills W1 with local
+/// normalization on; the folder is switched to an empty W2 and W1 is removed, and local normalization is turned off.
+/// The plan and run 2 warn about the files they read (the calibrated, measured, registered and plane files) and not
+/// about the LN files no stage reads now; run 2 recomputes; the next plan and run 3 carry no such warning, though the
+/// LN rows still name the removed W1.
+#[test]
+fn the_not_found_warning_is_gone_after_one_run() {
+    use crate::stacking::config::ExposureMode;
+    let mut rig = RegroupRig::new(Some("RGGB"));
+    let cfg_on = rig.cfg(ExposureMode::Seconds, 2.0);
+    let mut cfg = cfg_on.clone();
+    cfg.normalization.local.enabled = false;
+    cfg.normalization.rejection = crate::integration::stats::RejectionNormalization::None;
+    let w1 = rig.working.clone();
+    let (_, _, logs1) = rig.run(&cfg_on);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+    assert!(fan_out_items(&logs1, "normalize", "normalize") > 0, "run 1 normalizes: {logs1}");
+
+    let w2 = rig.tmp.path().join("w2");
+    rig.point_at(&w2);
+    std::fs::remove_dir_all(&w1).unwrap();
+    let under_w1 = format!("{}{}", w1.display(), std::path::MAIN_SEPARATOR);
+    let count_under_w1 = |ln: bool| -> usize {
+        rig.fixture
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM stacking_artifacts WHERE substr(path, 1, ?1) = ?2
+                   AND size IS NOT NULL AND modified_at IS NOT NULL
+                   AND (kind IN ('ln', 'ln_reference')) = ?3",
+                rusqlite::params![under_w1.len() as i64, under_w1, ln],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+    };
+    let (read_rows, ln_rows) = (count_under_w1(false), count_under_w1(true));
+    assert!(read_rows >= 6 && ln_rows > 0, "premise: {read_rows} files a stage reads, {ln_rows} LN files");
+
+    let not_found = |warnings: &[String]| -> Option<String> {
+        warnings.iter().find(|w| w.contains("cached files were not found")).cloned()
+    };
+    let leading_count = |w: &str| -> usize { w.split_whitespace().next().unwrap().parse().unwrap() };
+
+    let plan = rig.plan(&cfg);
+    let plan_warning = not_found(&plan.warnings).unwrap_or_else(|| panic!("the plan warns: {:?}", plan.warnings));
+    let n = leading_count(&plan_warning);
+    assert!((6..=read_rows).contains(&n), "the plan counts the rows its stages read, not the LN files: {plan_warning}");
+
+    let (_, rc2, logs2) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs2, "calibrate", "calibrate"), 6, "run 2 recomputes: {logs2}");
+    let run_warning =
+        not_found(&rc2.warnings).unwrap_or_else(|| panic!("run 2 warns: {:?}", rc2.warnings));
+    assert_eq!(run_warning, crate::stacking::rebase::left_warning(read_rows, &rig.layout.root));
+
+    // The LN rows still name the removed W1, and nothing reads them: no warning from now on.
+    assert_eq!(count_under_w1(true), ln_rows, "premise: the LN rows were left");
+    let plan3 = rig.plan(&cfg);
+    assert_eq!(not_found(&plan3.warnings), None, "{:?}", plan3.warnings);
+    let (_, rc3, logs3) = rig.run(&cfg);
+    assert_eq!(not_found(&rc3.warnings), None, "{:?}", rc3.warnings);
+    assert_nothing_recomputed(&logs3, "run 3");
 }
 
 /// Every file under `root`.
