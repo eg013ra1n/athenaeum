@@ -9448,7 +9448,9 @@ mod tests {
             .unwrap_or_else(|| panic!("no debug line: {logs}"));
         assert!(line.contains("DEBUG"), "{line}");
         assert!(line.contains("not sampled yet"), "{line}");
-        assert!(line.contains(&victim.path), "{line}");
+        // The captured line prints the field as a quoted string, so on Windows the path's backslashes are
+        // doubled: compare against the same quoted form, never the bare path.
+        assert!(line.contains(&format!("path={:?}", victim.path)), "{line}");
         assert!(
             !logs.lines().any(|l| l.contains("WARN") && l.contains("stage-1")),
             "an unsampled input is not a warning: {logs}"
