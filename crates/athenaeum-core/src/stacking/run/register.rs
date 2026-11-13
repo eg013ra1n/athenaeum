@@ -412,6 +412,7 @@ pub(super) fn resolve_register_fits(
             planes,
             &expected_hash,
             &RebaseView::none(),
+            true,
         )?)
     })();
     let fresh = match fresh {

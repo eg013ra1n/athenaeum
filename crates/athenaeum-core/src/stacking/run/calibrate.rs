@@ -1252,10 +1252,11 @@ impl RunReads {
 pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
     use crate::stacking::rebase;
 
-    let candidates = {
+    // The rows are read under the connection; the canonicalisation of the old roots runs after the guard is dropped.
+    let rows = {
         let conn = db(&rc.ctx)?.conn();
-        match rebase::candidates(&conn, &rc.subject, &rc.layout.root) {
-            Ok(c) => c,
+        match rebase::candidate_rows(&conn, &rc.subject, &rc.layout.root) {
+            Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(
                     run_id = rc.run_id,
@@ -1266,6 +1267,7 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
             }
         }
     };
+    let candidates = rebase::resolve_candidates(rows, &rc.layout.root);
     if candidates.is_empty() {
         return Ok(());
     }

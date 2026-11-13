@@ -1362,8 +1362,9 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     `ATH_PREP`, and never `CALSTAT`, `ATH_CSRC`, `ATH_PRJ` or `ATH_FILT`, so the
     scanner never catalogs one.
   - The hash is `prepare_subtree` (`debayerOsc`, `debayerMethod: "VNG"`,
-    `prepareVersion`) over `blake3` and byte size (a project) or the catalog
-    identity (an attested light).
+    `prepareVersion`) over `blake3` and byte size (a project) or the light's
+    `files.id`, size and sampled hash (an attested light; see "Input identity"
+    under the frame-level cache).
   - `prepared/` counts as calibrated bytes and goes with `Intermediates`.
 - **Solve** is the first thing Measure does. A project frame without `meta.wcs`
   is solved by `rc.solver`:
@@ -1885,7 +1886,7 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
   | ---- | ---- | ---- |
   | `notRegistered` | the run holds no row for the frame | `original — not registered in run #N` |
   | `registrationFailed` | the run row's `reg_status` is `failed` | `original — registration failed in run #N` |
-  | `replaced` | a later run of the subject holds the frame's group, or the artifact row's `created_at` is later than the run's `finished_at` (a later run re-registered the frame, whatever its grouping), or the file is no longer the one the row recorded (size and modification time) | `original — a later run replaced it` |
+  | `replaced` | a later run of the subject holds the frame's group, or the artifact row's `created_at` is later than the run's `finished_at` (a later run re-registered the frame, whatever its grouping), or the file no longer has the size the row recorded | `original — a later run replaced it` |
   | `available` | `reg_status` is `aligned`, `aligned_flipped` or `reference`, and the artifact row names a file on disk | none: the aligned frame is shown |
   | `missing` | the same `reg_status`, but the artifact row has no path or the file is gone | `original — not in the working folder any more` |
   | `notRegistered` | any other `reg_status` (`skipped`: the run cut the frame before Register) | `original — not registered in run #N` |
@@ -1894,11 +1895,13 @@ in the reference rules. The command count is 331 (three added: `clear_frame_set_
     meridian-flipped frame (`aligned_flipped`) has its aligned frame too.
   - A frame cut by the weight floor after Register keeps `reg_status = aligned` and stays `available`. A `skipped` frame is
     `notRegistered` even when an earlier run left an artifact for it: that file is not this run's.
-  - A cached file counts as fresh only while it is the file its row recorded (`stacking::plan::file_matches_identity`, a
-    stat only, ruling R7 b): `is_fresh` requires it whenever the row has a `modified_at`, so the gate and every cache hit in
-    the run agree, and Blink uses the same helper. A run cancelled right after a fan-out rewrote files, before it recorded
-    them, leaves the rows with the old identity: the next run finds the files stale and rewrites them. A row without a
-    `modified_at` keeps the size check. A test or tool that edits a cached file in place must record its new identity.
+  - A cached file counts as fresh only while its row's hash is current and the file has the size the row recorded
+    (`stacking::plan::file_matches_identity`, one stat; the modification time is never compared, file identity FI-2), so
+    the gate and every cache hit in the run agree, and Blink uses the same helper. A row without a size never matches.
+    Every writer deletes the rows that name a file before it replaces the file (the write order, under "Identity check"
+    below), so a run cancelled right after a fan-out rewrote files leaves no row over them: Blink reads such a frame
+    `missing` (or `replaced` by the group rule), and the next run rewrites it. An outside edit of a cached file that keeps
+    its size is not seen: Athenaeum's own working files get no content check.
   - The group row of a later run exists from that run's first moment, so a later run that got no further than planning
     already marks the group `replaced`. This is the safe side: never offer pixels a later run may have replaced.
   - The file is the artifact row's absolute `path`, never a path rebuilt from the subject's current name (a rename changes
@@ -3834,10 +3837,11 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
         re-runs pass 1 (never an exclusion). Since the frame-level cache (spec §5.3) the mtime is stored but not compared:
         validity follows the calibration hash in the row's key, because a recalibration reproduces the planes to the bit
         (`recalibration_reproduces_the_planes_bit_for_bit`), so "Delete intermediates" plus a rerun keeps the first pass.
-        Ruling R12 (a): that holds only for a file Athenaeum writes (under the layout's `calibrated/` or `prepared/`); a
-        calibrated file anywhere else (an attested light or a project replica used in place) is never rewritten by us, so
-        a moved mtime there means someone edited it and the mtime IS compared (`strict_mtime`; a path spelled differently
-        from the two roots falls back to strict). Pin: `measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one`.
+        Ruling R12 (a) limited that to a file Athenaeum writes; since the file identity (2026-11-13) the key covers a
+        calibrated file used in place too, and the mtime is compared for no file: an attested light's sampled hash is in
+        its prepare hash, a project replica's blake3 is in its key and `landed_unchanged` excludes a replica edited in
+        place. Pins: `measure_pass1_artifact_of_an_edited_in_place_source_reruns_pass_one` (a rescan NULLed the sample)
+        and `…_without_a_rescan_reruns_pass_one` (the run samples the light again because its time moved).
       - R11c-5 flow: validate on the controller, pass 1 fanned out and written inside the worker (records dropped
         there), the group β, then pass 2 from the artifact or, with none, pass 1 in the worker (the upgrade ripple).
         A write failure is a `warn!`, no row, pass 1 again in pass 2's worker: nothing is ever held.
@@ -5231,18 +5235,80 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   unless `register_reads_measure_fits` holds. The group beta stays a VALUE in the pass-2 hash (`measure_beta:{:.6}`), never in the key: the
   same beta is a hit, another beta re-runs pass 2 only (pass 1 is keyed on the calibration hash and the measurement options).
 - **Pass 1 and its stamp.** A pass-1 artifact is valid for as long as the calibration hash in its key is. Its source stamp compares the
-  calibrated file's LENGTH only when the file sits under the layout's `calibrated_root()` or `prepared_root()` (files Athenaeum writes: a
-  recalibration with the same hash reproduces the planes to the bit, pinned by `recalibration_reproduces_the_planes_bit_for_bit` for mono,
-  debayered OSC and Prepare outputs on a pool of more than one thread, aarch64 only), and the mtime TOO anywhere else (an attested light or a
-  project replica used in place: a moved mtime means someone else edited it; `strict_mtime` threaded to `check_pass1_head` / `read_pass1`).
-  A path spelled differently falls back to strict. Pass 2 still reads the pixels.
-- **Identity check.** `plan::file_matches_identity(path, size, modified_at)` (stat only, the RFC 3339 rendering `file_identity` uses) is
-  required by `plan::is_fresh` whenever the row records `modified_at`; rows without one keep the size check. It covers every file kind for
-  the gate and the run at once, and closes the cancelled-rewrite hole (a writer cancelled after rewriting a file but before recording its
-  identity). A size match with another mtime logs `debug!` (`path`, `recorded`, `current`: a copy tool that does not keep mtimes, or a
-  folder moved, explains "everything recomputed"); a stat error other than NotFound is a `warn!`. Blink reports an aligned frame
-  `Replaced` when its `registered` row is newer than the run's `finished_at` or its file no longer matches the row (the group rule stays).
-  The gate judges Register on the latest run that HAS included frame rows (a run cancelled inside Register has none).
+  calibrated file's LENGTH, for every calibrated file, and never its time (`measure::check_stamp_len`). A file Athenaeum writes is
+  reproduced to the bit by a recalibration with the same hash (pinned by `recalibration_reproduces_the_planes_bit_for_bit` for mono,
+  debayered OSC and Prepare outputs on a pool of more than one thread, aarch64 only). A file used in place is covered by the key: an
+  attested light's sampled hash is in its prepare hash, and a project replica's blake3 is in its key while `landed_unchanged` excludes a
+  replica edited in place. The `.athm` head still stores the source's `modified_ns`; nothing reads it, so `PASS1_ARTIFACT_VERSION` did not
+  move. Pass 2 still reads the pixels.
+- **Identity check.** A cached file is judged by its key and its size, never by its time (file identity FI-2: nobody edits Athenaeum's
+  working files). `plan::file_matches_identity(path, size)` is one stat: the file matches when its length equals the row's `size`; a row
+  without a size never matches, NotFound is the ordinary stale, and any other stat error is a `warn!`. `plan::is_fresh` holds when the
+  hash is equal, the row has a path and the file matches. It covers every own-file kind (`calibrated`, `calibrated_mosaic`, `measured`,
+  `fits.<plane>`, `registered`, `ln`, `ln_reference`) for the gate and the run at once. `file_identity` still records `modified_at` in the
+  row; only the working-folder rebase reads it (below). Blink reports an aligned frame `Replaced` when its `registered` row is newer than
+  the run's `finished_at` or its file has another size than the row recorded (the group rule stays). The gate judges Register on the
+  latest run that HAS included frame rows (a run cancelled inside Register has none).
+  - **The write order replaces the time** (ruling R7 b: a file and a row that disagree after a cancel). Every writer that replaces a
+    frame-level file (1) reads the old row; (2) deletes it (`db::stacking::delete_artifact`, a point delete on `find_artifact`'s key) and
+    every other row, of any subject and kind, that names the path it is about to write (`db::stacking::delete_artifacts_naming_path`, a
+    search on the index `idx_stacking_artifacts_path`: two frame sets with one name share a working root, and a kind's file can take
+    another kind's name); (3) replaces the file; (4) upserts the new row; (5) calls `replace_frame_level_file` with the old row. A fan-out
+    writer deletes on the run thread when it queues the job (a worker holds no connection), so a cancel leaves no row for any queued job,
+    and every queued job was a miss anyway. Before pass 1 the `measured` row of every member owed pass 1 without a fresh row goes, a member
+    whose β came from its `metrics` row included (pass 2's worker writes that member's pass 1 under another key). A failed delete stops
+    the job; it is never a warning followed by the write. The two-pass dry pass deletes nothing, because it persists nothing. Payload-only
+    rows (`metrics`, `registration`, `solve`, `ln_calibration`, `ln_global`, `two_pass`) name no file and are written as before. A failed
+    `.athf` write leaves no `fits.<plane>` row, and its readers fall back as for a missing row.
+- **Input identity** (file identity §4.3 to §4.6, `stacking/source_identity.rs`). A light or a master is judged by its size and its
+  sampled hash (`files.content_hash`, `duplicates::compute_xxhash`: the first, middle and last 512 KiB; a file under 1.5 MiB is read whole),
+  never by its time or its path. The stage-1 tokens: a light on disk is `SourceIdentity::Sampled { file_id, size, sample }` (a raw light in
+  `calibration_hash_for`, an attested light in `prepare_hash_for_catalog`); a master is `<size>|sample:<sample>` with no path, so a master
+  relocated through Missing files, or rescanned under another root and relinked, recomputes nothing (FI-3); a light or master inside a zip
+  is `<size>|zip:<crc32>`, or `<size>|zip:<the entry's time inside the zip>` when no CRC was recorded (`InputIdentity::master_token`,
+  `light_source`); a project replica keeps blake3 + size in the old bytes, so a project's stage 1 did not move.
+  - **The gate reads no file** (`SourceSamples::catalog_only`, one `files` query per input): this session's memo, then the banked
+    `content_hash`; with neither the input is "not sampled yet" and its frame reads stale (a `debug!`, not a warning).
+  - **The run samples once** (`run::calibrate::ensure_source_samples`), at the top of stage 1, after the working-folder rebase and after
+    `stage_masters`, so a master the run rebuilt is sampled as rebuilt. The Calibrate row says "checking the inputs"; the log line is
+    `info!` "stacking inputs checked" (`count`, `sampled`, `banked`). Three phases: the rows of every catalog light of the plan's groups
+    (manually excluded ones too) and of every master applied to a calibrated light are read under the connection; the files are stat-ed
+    and read without it, with cancel checked per file; the samples are banked in one `BEGIN IMMEDIATE` transaction. Per input: a zip
+    entry is its CRC, with no stat; a row whose `content_hash` is set and whose size and time still equal the file's is trusted with no
+    read; a file this session already read at the same size and time takes the memo's sample (process-wide, at most 65 536 entries,
+    never stored); anything else is read (1.5 MiB) and stat-ed again, and a file whose size or time moved during the read is "changed
+    while it was sampled". A stat that fails, for any reason, takes the catalog's answer, so an offline input keeps its last vouched
+    sample; with none its frame is excluded with "not found, and never sampled" (NotFound) or "unreadable" (any other error). A lookup
+    outside the run's book is an error, "<path>: linked after the run started; run again", never a silent read under the connection.
+  - **Banking** (`db::bank_content_hash`). Only a sample read over a row that matched the file at both stats, with a NULL
+    `content_hash`, is banked, and the UPDATE checks the row's `path`, `size` and `modified_at` again and skips a zip row: readers take
+    `content_hash` to mean "these bytes", and a wrong value would let Duplicates offer a unique file for deletion and sync skip a file. A
+    sample that cannot be banked (a relocated row, whose time no longer matches its file until a rescan) lives in the memo only, so that
+    input is read once per app session.
+  - **What resets a sample.** A scan re-parse NULLs `content_hash`, and so does the resync of a master the app rebuilt. The scanner's
+    move detection (a file at a new path linked to its old row by the header fingerprint) keeps `content_hash` only when the file's time
+    did not move; otherwise the sample goes and the next run reads the file again, so a rewritten time never vouches for bytes nobody
+    read. Missing files' relocate changes only the path.
+  - **A moved time with an equal sample is a hit.** The time keeps two jobs: it tells whether a banked sample still belongs to the file,
+    and it keys the memo. Accepted risk (FI-1, FI-8): a same-size edit outside the three windows that leaves the header as it was is not
+    seen, nor an edit that keeps both size and time. Residuals: after a scan re-parse the gate reads Calibrate stale until a run samples
+    again (FI-7); the gate trusts the catalog, so for a file changed since the catalog last saw it the gate can say cached while the run
+    recomputes that frame (never a false hit in the run, pinned by `an_in_window_edit_is_a_miss`); a light relocated before it was ever
+    sampled, onto a volume with coarser times, has no vouched sample while that volume is offline, so its frames are excluded until the
+    volume is back or its root is rescanned; a zip entry recorded without a CRC moves its token once when the CRC is recorded. Pins:
+    `coarser_times_reuse_every_frame_level_stage` (times cut to whole seconds, then to 100 ns: every frame-level stage fans out over 0).
+- **In-place rows** (file identity §4.1). An attested light or a project replica that Prepare uses as it is gets a `calibrated` row (or,
+  for a kept float mosaic, a `calibrated_mosaic` row) that names the user's own file, not a working-folder file. The key vouches for the
+  frame's current input (the light's sample, the replica's blake3), not for the row's path; after a relocate the row still names the old
+  path, where another file of the same size may sit now (a capture program that restarts its counter writes `Light_0001.fits` again). So
+  an in-place row is fresh only while it names the frame's current input (`origin::prepare_input`), in the gate and in the run. The run
+  decides "in place" from Prepare's action (`InPlace`, or the kept float mosaic, for a frame not in a zip) and re-points a row that fails,
+  with no write; Measure and later stay fresh because their keys did not move. The gate has no action: a Prepare subject's row is its own
+  file when it lies under `<wd>/<one component>/(prepared|calibrated)/…`, or the same under `<wd>/_projects/`, where `<wd>` is the
+  current working folder in both spellings or any folder the subject's runs recorded (`db::stacking::subject_working_dirs`); "one
+  component" and not the current slug covers a set renamed since the row was written. Any other row is in place and must name the
+  frame's current input (`plan::prepare_row_names_its_input`). Pin: `an_in_place_row_at_another_path_than_its_light_is_stale`. An
+  in-place row is never rebased (below).
 - **The two-pass decision.** With `reference.twoPass` and an Auto reference, the dry pass registers the reference's group with
   `persist = false` before the real one. Its decision is a group-level payload row (`two_pass`, `{"switchTo": <frame id> | null}`) keyed by
   `two_pass_key`: the registration subtree, `TWO_PASS_PICK_VERSION`, the candidate and its calibration hash, the FULL weight ranking, the
@@ -5277,7 +5343,13 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   recomputes Measure, Register and LN; a debayered-OSC frame's registration rows written with the old `measure:` fold read stale once
   and re-register (spec §5.5). The migration keeps the newest row per frame, so a set whose newest rows were written at a non-default
   tolerance (set 270: run 11 at 200 s) recalibrates once, because the constant tolerance hash no longer matches them. That cannot be
-  fixed in SQL, and it is said, not hidden. Everything else is reused from the first run on.
+  fixed in SQL, and it is said, not hidden. The file identity ships in the same release (FI-5) with no migration (FI-4), and it makes
+  every frame set recompute once anyway: the first run after the update re-runs Calibrate or Prepare, both measure passes, Register, LN
+  and Integrate, because the stage-1 tokens changed shape (a sample in place of the time, a master without its path). That run opens with
+  "checking the inputs" and reads 1.5 MiB of every light and master with no banked sample (about 0.13 s each on the owner's SMB share).
+  Before it the gate reads Calibrate or Prepare stale for every frame set, which is the run's verdict. Projects keep their Prepare and
+  Measure caches (a replica's stage-1 bytes are pinned by `the_prepare_subtree_and_the_project_hash_are_pinned`); a project with a
+  one-plane reference re-registers once (FI-6). That is one recompute in all; from the second run on everything is reused.
 - **What a regroup does not reuse.** (1) Under an Auto reference the pick is made again from the new grouping's weights, and a different
   frame re-registers every frame by `ref:<id>` (seen on the synthetic OSC fixture: frame 4 under `seconds`, frame 6 under `stops`), as under
   Native geometry. The plan gate reads the last run's reference, so it can say Register is cached when the pick will move (the
@@ -5312,7 +5384,8 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   plan, not a stat per row. The listing only ever short-cuts `Missing`. The gate logs at `debug!` only. The gate applies the view at its
   six row reads (`calibrated`, `calibrated_mosaic`,
   `registered`, `ln_reference`, `ln`, `fits.<plane>`), so a moved folder's stages read cached BEFORE any run, and carries the same warning;
-  Blink reads the `registered` rows of the frames it is asked about through it, so the aligned frames are shown from the new place. The
+  Blink reads the `registered` rows of the frames it is asked about through it (`RebaseView::for_registered`, a project's frames too), so
+  the aligned frames are shown from the new place. The
   master-light preview cache is laid out under the subject's current working folder (`api::stacking::current_working_dir`), never under the
   run row's, so a moved folder is not recreated at the old path; the row's folder serves only a subject with none configured, and a
   working folder that does not exist gets no cache at all (the preview is rendered and not stored). The gate
@@ -5320,7 +5393,9 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   A frame-set rename (the slug folder changes) is not covered (open-items, RB-2).
 - **Known residuals.** After a weighting edit the plan gate can report Register / Normalize cached while the run re-picks the reference by
   weight and re-registers: the run is correct, the gate under-reports. A frame-level file is shared by the dev and the release build when
-  both use one working folder: the first run in either build makes the other's rows stale (a recompute), see open-items. The gate and the
+  both use one working folder: a run in either build deletes only its own catalog's rows before it rewrites a file, and with key + size
+  the other catalog's row over that file reads fresh at its own key when the size is equal, so under two configs the other build can
+  reuse pixels it did not make (before the file identity the time made that row stale), see open-items. The gate and the
   run take a group's β from their own sources (`measure_betas` vs `rc.measured_groups`): for a group the run does not measure (fewer
   than 3 included) the run folds None where the gate may fold Some — the gate then over-reports Register stale, never a false hit; do not
   re-flag it. Remaining gates: `docs/superpowers/open-items.md`.
@@ -5341,7 +5416,7 @@ In-app light stacking — the frame set's own master light(s) from its matched c
 - **The plan gate** (`stacking::plan::build_plan`, DB + cheap FS probes, no pixel I/O) returns groups (camera-agnostic: colour mode/filter/binning/exposure), the resolved config + hash, the reference, folder/space state and ordered blockers (`masters | links | masterFiles | reference | folders | space | frames | unsupported`); it reuses the calibrated-export readiness gate so the two features can never disagree. `links` also carries the calibration-geometry blocker (a linked set of another frame size, `ExportReadiness.geometry_mismatches`, 2026-10-20) — so a run with a cropped dark is refused up front instead of dying in Masters or Calibrate. A link at the same size but another recorded sub-frame origin (a manual choice, G-7) is a plan WARNING (`geometry_warnings`), never a blocker. A pixel-scale spread is a WARNING, never a blocker.
 - **A light in the Black Hole is not stacked** (2026-10-25, release blocker): `groups::load_group_members` — the one light source of a frame set's plan AND run — skips a light whose file has a `black_hole` row, so the plan's counts and the run's frames agree with the frame-set views, which already list such a light apart. Restoring the file brings it back. Found on set 182 (164 lights, 25 blackholed; its run 8 had stacked 11 of them). Checked 2026-10-31 on a copy of the owner's catalog through the release web build: the plan reads 62 / 30 / 27 / 20 = 139, and so does the Objects card (`member_count`). Transfer dedup still counts a blackholed file as present (an owner ruling of 2026-07-22); that rule is not this one.
 - **A frame held twice is stacked once** (2026-10-29): `groups::load_group_members` also splices `db::frame_is_used_copy_sql`, so of two copies of one raw frame in the set (two disk copies, or a disk copy and a zip entry; the Duplicates page's header identity) only the used one enters the plan and the run — disk before zip, then present, then the lowest id (`docs/frame_sets/README.md`). Before, both entered with double weight (dev set 271: 24 lights for 12 frames). The fragment only removes rows and the query keeps its `ORDER BY`, so a set without duplicates plans and stacks exactly as before.
-- **Frames and masters inside a zip** (2026-10-28, zip plan Task 8): a catalog row with `archive_zip_path` + `archive_path_in_zip` is read through `zip_store::materialize`, never opened by its catalog path. The plan gate extracts nothing: a master is "missing" only when `zip_store::presence::catalog_path_is_present` says it is on neither disk nor in a zip (so the `masterFiles` blocker reads "{n} master file(s) missing on disk and in zip files"), the manual reference's `onDisk` uses the same rule, and a zip master's stage-1 identity is its entry's size + CRC32 (`master_identity_in`). Prepare (attested sets, projects) classifies a zip-resident frame from its entry's header bytes (`prepare::probe_zip_entry`, the same verdict `probe_file` gives the extracted file) and decides stage-1 freshness BEFORE extracting, so a re-run whose artifacts are all fresh reads nothing out of the zip; only a frame that needs real work is extracted (`resolve_prepare_job`, on the run's cancel flag), and the cache pin stays in the job until the group's fan-out ends (a copy that fails leaves no partial in `prepared/`); a float light that would be used IN PLACE (or a mosaic kept as `calibrated_mosaic`) is copied into `prepared/` first (`detach_zip_source`), because a `calibrated` artifact must never name a cache file the cache may evict. Group colour for a zipped attested light comes from the entry's header bytes (`project_source::ZipShapes`: one directory read per zip per grouping pass), not an extraction. A project plan does not probe a zipped landed file (the run does, after extracting it). `solve.rs` reads the stage-1 artifact, so it needed no change. A master that lives in a zip is never rebuilt in place, whether or not its zip is reachable: a rebuild writes at the row's `files.path`, which for a zip-resident row is `<zip>/<entry>` (or the pre-zip original), never ours to create. `masters::zip_resident_master_block` is asked by the readiness split (`classify_master_rebuildability`: the master is `masters_unrebuildable`, so the `masterFiles` blocker reads "... cannot be rebuilt: master is inside X.zip, which is not reachable"), by `resolve_rebuild_target`, and by `run_build`'s Rebuild branch as the last guard. Master builds (`run_build`) extract the member frames and a zip pre-calibration master in one batch and release the pins once every band is read.
+- **Frames and masters inside a zip** (2026-10-28, zip plan Task 8): a catalog row with `archive_zip_path` + `archive_path_in_zip` is read through `zip_store::materialize`, never opened by its catalog path. The plan gate extracts nothing: a master is "missing" only when `zip_store::presence::catalog_path_is_present` says it is on neither disk nor in a zip (so the `masterFiles` blocker reads "{n} master file(s) missing on disk and in zip files"), the manual reference's `onDisk` uses the same rule, and a zip master's stage-1 identity is its entry's size + CRC32 (`InputIdentity::master_token`, `<size>|zip:<crc32>`; the entry's time inside the zip when no CRC was recorded). Prepare (attested sets, projects) classifies a zip-resident frame from its entry's header bytes (`prepare::probe_zip_entry`, the same verdict `probe_file` gives the extracted file) and decides stage-1 freshness BEFORE extracting, so a re-run whose artifacts are all fresh reads nothing out of the zip; only a frame that needs real work is extracted (`resolve_prepare_job`, on the run's cancel flag), and the cache pin stays in the job until the group's fan-out ends (a copy that fails leaves no partial in `prepared/`); a float light that would be used IN PLACE (or a mosaic kept as `calibrated_mosaic`) is copied into `prepared/` first (`detach_zip_source`), because a `calibrated` artifact must never name a cache file the cache may evict. Group colour for a zipped attested light comes from the entry's header bytes (`project_source::ZipShapes`: one directory read per zip per grouping pass), not an extraction. A project plan does not probe a zipped landed file (the run does, after extracting it). `solve.rs` reads the stage-1 artifact, so it needed no change. A master that lives in a zip is never rebuilt in place, whether or not its zip is reachable: a rebuild writes at the row's `files.path`, which for a zip-resident row is `<zip>/<entry>` (or the pre-zip original), never ours to create. `masters::zip_resident_master_block` is asked by the readiness split (`classify_master_rebuildability`: the master is `masters_unrebuildable`, so the `masterFiles` blocker reads "... cannot be rebuilt: master is inside X.zip, which is not reachable"), by `resolve_rebuild_target`, and by `run_build`'s Rebuild branch as the last guard. Master builds (`run_build`) extract the member frames and a zip pre-calibration master in one batch and release the pins once every band is read.
 - **The PSF-family weight reads a frame-common star set** (Plan D, 2026-11-02; PD-1, PD-3, PD-32, PD-19 b; R-OSP-18): under `PsfSignalWeight` / `PsfSnr` the weight's flux term (`commonTflux`, `commonTmeanFlux`) is summed over stars every included frame holds unclipped, never over a frame's own accepted fits, so a clipped star and the blur's extrapolated light no longer drive it. The set is built per (group, plane) after the persisting registration pass (`stacking/common_set.rs`, called from `run/reweigh.rs::reweigh_groups` at the end of stage 5, from the `.athf` fits through the stored registration maps, no pixel read): the anchor is the lowest-FWHM member at or above the median star count, candidates are its in-statistic fits (unsaturated, not extended; on 3 planes PD-9's sibling-rescued too), isolated (a fit carrying `BLEND_NEIGHBOUR` is not, PD-36), with SNR ≥ 20, a star is a member when ≥ 90 % of the included aligned members hold it (≥ 20 stars, `COMMON_MIN_STARS`), and each frame's flux is a paired ratio to the anchor's. On a 3-plane image each star is read as the sum within 3 ring FWHM (`ap_sum`, `.athf` v3: the β-floor plane's model misses the wings) and PD-9's rescued stars join the set (`StarFlags::SIBLING_POINT`); on a 1- or 2-plane image it is model × `c`. Everything before the set exists (stage 3's selection, the run reference, the two-pass pick) keeps the Measure-time weight, the registration reference stays on it (PD-11), and `min_weight_fraction` is applied to the common-set weight (a frame is never re-admitted). A plane under 20 stars, or with a member lacking a fresh `.athf`, falls back whole (every member keeps its Measure-time inputs: one `warn!` and a run warning; PD-6); a set under 0.6 of the anchor's candidates warns in the log that the anchor's registration map may be wrong (PD-44). **The set is built in every weight mode** (PD-19 b), for the SNR gain: outside the PSF family nothing but the gain, the run warnings and `rc.common_stars` changes, and the weights, `psfSnr`, `psf_signal_weight` and the stored `metrics` are bit-identical to stage 3's. `MEASURE_VERSION` 8 carries `c`'s colour sample (PD-9) and the Blend refusal on the stacking Measure (PD-10) with it: the first stack after the update re-measures every set once. Method rule for a change to this weight: a stage floor is not transitive, so the bars are read at master level against the pre-change base AND stage by stage (R-OSP-18).
 - **SNR gain is an SNR factor, measured like for like** (2026-10-25): `GroupStats.snr_gain` = `√(PSF SNR master / PSF SNR best sub)` from `integrate::paired_snr_gain` — the best sub read through the same registration source the master integrated (registered artifact or on-the-fly warp) and both measured with the master's options on the largest rectangle where both are finite. PSF SNR is TFlux²/σ² (a power ratio), and the smoothing cubic B-spline lowers every warped frame's noise, so the old `master_psf_snr / best_sub_psf_snr` (raw sub) read 751.98× and 777.33× on set 109 (208 / 160 frames); eight equal synthetic frames now read ≈ 0.9 √N where the old figure read 54.8. `master_psf_snr` / `best_sub_psf_snr` stay each image's own measurement. Cost: one extra frame read + two measurements per plane per group. Runs stored before the fix keep their old figure, but it no longer passes for the new metric: `GroupStats.snr_gain_version` (`integrate::SNR_GAIN_VERSION`, 1 at v0.7.0 and 2 since Plan D, `#[serde(default)]`) marks a gain measured now, a pre-v0.7.0 `stats_json` has no key and reads 0, and the Results panel (`src/components/stacking/snrGain.ts`) shows "SNR gain —" with the tooltip "measured before v0.7.0 — re-run to get the SNR gain" for it. **On real data** (2026-10-31, set 109 re-stacked on a copy of the owner's catalog through the release web build at 549e20a5, run 9, 19 min): mono 208 frames 7.08× (√N 14.42), OSC 160 frames R / G / B 7.41 / 7.99 / 7.86× (√N 12.65) — bounded by √N, the 752× gone. It reads low on this set because PSF SNR carries the tflux width dependence (open-items → Plan D → the stacking weight): per-frame PSF SNR grows ≈ FWHM² across the mono group, and the best sub by weight (`…_0071.fits`) is one of the widest frames, 4.88 px against the master's 2.96 px; scaled by that law the mono gain is near 11.7×. **Plan D (2026-11-02; D1b, DF-c): the gain is read over the group's frame-common star set (`SNR_GAIN_VERSION` 2).** TFlux is summed over the stars matched and usable in BOTH crops, so a clipped star or a wider PSF's extra flux no longer moves the figure, and the best sub (the top frame by the weight) is a sharp one (set 109 mono: 1.65 px against a group median 2.61); a v1 gain shows "SNR gain —" with "measured with an older formula — re-run to get the SNR gain", a colour group shows every plane ("SNR gain 7.41 / 7.99 / 7.86×", an unmeasured plane "—"), and the set is built in every weight mode, so a gain of 0 reads "not measured for this group" whatever the mode. **PD-35:** the stored `masterPsfSnr` is a set-total (∝ (Σ signal)²), so it is comparable within one (plane, set) only, never across planes or sets and never as a gain; the paired `snrGain` is the figure. **PD-48:** the figure's ceiling is the run's own weighted-mean prediction, not √N: per plane, measured `snrGain` ≤ Σ w · SNR / (√Σ w² · SNR_b) (SNR = √`psfSnr`, w the plane's weight, b = `best_by_weight`'s frame; √N and RMS(SNR) / SNR_b are printed beside, and "above run 9's" stands). √N presumes the top-weight frame is a top-SNR frame; it is not where the sharpest frame sits under bright sky (set 109 OSC: the sharpest frame is under the Moon, so G's 13.45 above √160 = 12.65 is correct; over the max-SNR sub the same master reads 8.40 / 9.17 / 9.29). A ratio above 1 (correlated noise, a wrong N) is a defect and stops. Set 109 at f899a691: mono 8.05 (run 9: 7.08), OSC 10.66 / 13.45 / 10.76 (7.41 / 7.99 / 7.86), realized / predicted 0.79 / 0.81 / 0.78 (OSC) / 0.79 (mono).
 - **The run** (`stacking::run`): one `stacking-run-<id>` thread admitted through the shared `ComputeQueue` (the sidebar's `ComputeQueueIndicator` lists it — no separate widget), cooperative cancel via `ServiceContext::active_stacks`, `heal_interrupted_runs` from every API entry point, `stacking-progress` throttled 300 ms (`FanOutTicker` inside the fan-out stages), exactly one `stacking-complete` from the single exit path.

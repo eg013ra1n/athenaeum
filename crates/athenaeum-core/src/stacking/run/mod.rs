@@ -620,7 +620,8 @@ pub(crate) fn group_anchor_geometry(g: &IntegrationGroup) -> (Option<i64>, Optio
 /// (`scanner/mod.rs`'s `modified_dt.to_rfc3339()`) — the same identity
 /// [`crate::stacking::plan::calibration_hash_for`] reads back off a
 /// `stacking_artifacts` row's `size`/`modified_at`. Only the size decides freshness
-/// ([`crate::stacking::plan::file_matches_identity`]); the time is recorded for display.
+/// ([`crate::stacking::plan::file_matches_identity`]); the time is what the working-folder rebase compares (size and
+/// time within a tolerance, [`crate::stacking::rebase`]) to recognise a moved folder's file, so it is still recorded.
 fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
     let meta = std::fs::metadata(path)?;
     let modified_at = crate::stacking::plan::render_modified_at(meta.modified()?);

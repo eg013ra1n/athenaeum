@@ -163,13 +163,32 @@ const MAX_FRAME_IDS_IN_SQL: usize = 200;
 /// per row); a row with no `size` or no `modified_at` (payload-only, or never recorded with a time) is not a
 /// candidate, since the check could not judge it. No old root, no query. A row in two ranges (nested roots) is
 /// listed once, under the longer root.
+#[cfg(test)]
 pub(crate) fn candidates(
     conn: &Connection,
     subject: &StackSubject,
     current_root: &Path,
 ) -> anyhow::Result<Vec<Candidate>> {
+    let rows = candidate_rows(conn, subject, current_root)?;
+    Ok(resolve_candidates(rows, current_root))
+}
+
+/// The catalog half of [`candidates`]: the old roots and the rows under each, read under the connection with no file
+/// system call. A caller that holds a pooled connection reads this, drops the guard, then calls
+/// [`resolve_candidates`] (which canonicalises) without it.
+pub(crate) fn candidate_rows(
+    conn: &Connection,
+    subject: &StackSubject,
+    current_root: &Path,
+) -> anyhow::Result<RootRows> {
     let roots = old_roots(conn, subject, current_root)?;
-    candidates_under(conn, subject, &roots, current_root, CandidateFilter::default())
+    candidate_rows_under(conn, subject, &roots, CandidateFilter::default())
+}
+
+/// The rows [`candidate_rows`] read, per old root that has rows under it (longest root first).
+#[derive(Debug, Default)]
+pub(crate) struct RootRows {
+    found: Vec<(PathBuf, Vec<RawRow>)>,
 }
 
 type RawRow = (i64, String, String, String, i64, String, Option<i64>);
@@ -182,8 +201,20 @@ fn candidates_under(
     current_root: &Path,
     filter: CandidateFilter<'_>,
 ) -> anyhow::Result<Vec<Candidate>> {
+    let rows = candidate_rows_under(conn, subject, roots, filter)?;
+    Ok(resolve_candidates(rows, current_root))
+}
+
+/// [`candidate_rows`] over the old roots the caller already read, narrowed by `filter`: the one range query per root,
+/// no file system call.
+fn candidate_rows_under(
+    conn: &Connection,
+    subject: &StackSubject,
+    roots: &[PathBuf],
+    filter: CandidateFilter<'_>,
+) -> anyhow::Result<RootRows> {
     if roots.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RootRows::default());
     }
     let frames_sql = match filter.frame_ids {
         Some(ids) if ids.len() <= MAX_FRAME_IDS_IN_SQL => {
@@ -205,11 +236,7 @@ fn candidates_under(
         tracing::warn!(error = %e, "the rebase candidates query did not prepare");
         e
     })?;
-    // Pass 1: the rows under each root. A root with rows is resolved against the current one (an old folder that is
-    // the current one through a symlink is no old root); a root with none costs no file system call.
-    let mut current_canonical: Option<Option<PathBuf>> = None;
-    let mut active: Vec<PathBuf> = Vec::new();
-    let mut found: Vec<Vec<RawRow>> = Vec::new();
+    let mut found: Vec<(PathBuf, Vec<RawRow>)> = Vec::new();
     for root in roots {
         let Some(root_str) = root.to_str() else {
             tracing::debug!(path = %root.display(), "an old working root is not valid UTF-8; its rows stay where they are");
@@ -246,16 +273,28 @@ fn candidates_under(
                 tracing::warn!(path = %lower, error = %e, "the rebase candidates were not read");
                 e
             })?;
-        if rows.is_empty() {
-            continue;
+        if !rows.is_empty() {
+            found.push((root.clone(), rows));
         }
+    }
+    Ok(RootRows { found })
+}
+
+/// The file system half of [`candidates`]: each old root that has rows is resolved against the current one (an old
+/// folder that is the current one through a symlink is no old root), then each row is mapped under the first (longest)
+/// active root it maps through. Touches no connection; a root with no rows costs no file system call.
+pub(crate) fn resolve_candidates(rows: RootRows, current_root: &Path) -> Vec<Candidate> {
+    let mut current_canonical: Option<Option<PathBuf>> = None;
+    let mut active: Vec<PathBuf> = Vec::new();
+    let mut found: Vec<Vec<RawRow>> = Vec::new();
+    for (root, rows) in rows.found {
         let current = current_canonical.get_or_insert_with(|| canonical_plain(current_root));
-        if let (Some(a), Some(b)) = (current.as_ref(), canonical_plain(root)) {
+        if let (Some(a), Some(b)) = (current.as_ref(), canonical_plain(&root)) {
             if *a == b {
                 continue;
             }
         }
-        active.push(root.clone());
+        active.push(root);
         found.push(rows);
     }
     // Pass 2: each row under the first (longest) active root it maps through.
@@ -288,7 +327,7 @@ fn candidates_under(
             });
         }
     }
-    Ok(out)
+    out
 }
 
 /// The answer of `check_with` for one candidate.
@@ -646,15 +685,22 @@ impl RebaseView {
     /// `row` as the run's trigger would leave it: a row judged [`Check::Moved`] comes back with its path at the mapped
     /// place, any other row as it is. A left row still at its old path is recorded as asked for ([`Self::left_gone`]).
     pub(crate) fn apply(&self, row: Option<StackingArtifactRow>) -> Option<StackingArtifactRow> {
+        self.apply_recording(row, true)
+    }
+
+    /// [`Self::apply`] with `asked` false for a row no run will rewrite (a manually excluded frame's): the same
+    /// reading, but a left row is not recorded as asked for, so [`Self::left_gone`] never counts a file nothing will
+    /// recompute.
+    pub(crate) fn apply_recording(&self, row: Option<StackingArtifactRow>, asked: bool) -> Option<StackingArtifactRow> {
         let mut row = row?;
         if let Some((old, mapped)) = self.by_row.get(&row.id) {
             if row.path.as_deref() == Some(old.as_str()) {
                 row.path = Some(mapped.clone());
             }
         } else if let Some(c) = self.left.get(&row.id) {
-            if row.path.as_deref() == Some(c.old_path.as_str()) {
-                if let Ok(mut asked) = self.asked.lock() {
-                    asked.insert(row.id);
+            if asked && row.path.as_deref() == Some(c.old_path.as_str()) {
+                if let Ok(mut recorded) = self.asked.lock() {
+                    recorded.insert(row.id);
                 }
             }
         }

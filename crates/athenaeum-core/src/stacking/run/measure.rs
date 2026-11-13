@@ -699,6 +699,7 @@ fn measure_group_finish(
                                         Some(payload.as_str()),
                                         &expected_hash,
                                         &RebaseView::none(),
+                                        true,
                                     )?
                                 };
                                 if fits_fresh {
@@ -1663,6 +1664,7 @@ fn measure_two_pass_rest(
                         m.channels.len(),
                         &expected,
                         &RebaseView::none(),
+                        true,
                     )?
                 };
                 if fresh {
@@ -1715,6 +1717,23 @@ fn measure_two_pass_rest(
             } else {
                 // Refused or stale: pass 1 re-runs here and writes the current layout's path.
                 members[i].spill = members[i].layout_spill.clone();
+                // The write order, on the run thread (a worker holds no connection): this member kept its row at the
+                // step-0 delete (`spill_pending`) and its worker now writes the file, so its keyed row and every row
+                // of any subject naming the file go first. A failed delete stops the job.
+                let conn = db(&rc.ctx)?.conn();
+                if members[i].old_measured.is_some() {
+                    crate::db::stacking::delete_artifact(
+                        &conn,
+                        &rc.subject,
+                        &group.key,
+                        ArtifactKind::Measured,
+                        Some(members[i].frame.frame_id),
+                    )?;
+                }
+                crate::db::stacking::delete_artifacts_naming_path(
+                    &conn,
+                    &members[i].layout_spill.to_string_lossy(),
+                )?;
             }
         }
     }

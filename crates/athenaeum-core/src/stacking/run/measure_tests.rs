@@ -719,6 +719,29 @@ fn a_refused_spill_is_rewritten_at_the_layout_path() {
     assert!(kept.is_file());
 }
 
+/// Review F4 (file-identity, Minor 1): a member whose own beta is on its `metrics` row keeps its `measured` row until
+/// pass 2 needs it; its artifact is then refused and the worker writes the file. The other set's row over that file
+/// (a same-named set shares the working root) goes before the write, like every other frame-level writer's.
+#[test]
+fn a_refused_pending_spill_retires_the_other_sets_row() {
+    let rig = Pass1Rig::new();
+    rig.run("run 1", None);
+    let ids = rig.sorted_ids();
+    let other = same_named_set_with_copies_of_rows(&rig.fixture.conn, rig.fixture.set_id, ArtifactKind::Measured);
+    assert_eq!(rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Measured).len(), 4, "premise: the copies stand");
+    let moved = move_rows_to_legacy_folder(&rig, ArtifactKind::Measured, &rig.measured_root(), ".athm");
+    let mut bytes = std::fs::read(&moved[&ids[0]]).unwrap();
+    bytes[crate::stacking::pass1_artifact::PREFIX_LEN] ^= 0x5a;
+    std::fs::write(&moved[&ids[0]], &bytes).unwrap();
+    // Pass 2 is owed for all four, and the first member's `metrics` row stays: its artifact is validated only now.
+    rig.delete_rows(&[ArtifactKind::Fits(0)]);
+
+    let second = rig.run("run 2", None);
+    assert_eq!(second.logged, vec![rig.calibrated_path(ids[0])], "only the refused artifact re-ran pass 1");
+    let left = rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Measured);
+    assert!(!left.contains_key(&ids[0]), "the other set keeps a row over the file the worker rewrote: {left:?}");
+}
+
 /// Ruling R6 M2 (Task 7): stale `fits.0` and `measured` rows pointing into `fits/<old_key>/` and
 /// `measured/<old_key>/`, `rerun_from = Measure`: the old files are gone and the new ones sit at
 /// `<stem>_f<id>` in the flat folders.
