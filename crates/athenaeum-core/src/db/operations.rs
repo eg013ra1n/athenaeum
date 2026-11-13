@@ -7573,9 +7573,9 @@ pub fn bank_strong_hash(conn: &Connection, file_id: i64, hash: &str) -> Result<u
 /// `files.content_hash`, only over the row that still describes the sampled
 /// bytes.
 ///
-/// The row is checked in the statement's own `WHERE`: its `size` and
+/// The row is checked in the statement's own `WHERE`: its `path`, `size` and
 /// `modified_at` must still be the ones the caller saw on the file before AND
-/// after the read, its `content_hash` must be NULL (a value is never
+/// after the read (a relocate that changed the path refuses the sample), its `content_hash` must be NULL (a value is never
 /// overwritten), and it must not be a zip row (a zip entry's identity is its
 /// CRC, never a sample of the zip). A scan re-parse that lands between the
 /// read and this call changes `modified_at` and nothing is written. Readers
@@ -7585,15 +7585,16 @@ pub fn bank_strong_hash(conn: &Connection, file_id: i64, hash: &str) -> Result<u
 pub fn bank_content_hash(
     conn: &Connection,
     file_id: i64,
+    path: &str,
     size: i64,
     modified_at: &str,
     hash: &str,
 ) -> Result<bool> {
     let n = conn.execute(
-        "UPDATE files SET content_hash = ?4
-          WHERE id = ?1 AND size = ?2 AND modified_at = ?3
+        "UPDATE files SET content_hash = ?5
+          WHERE id = ?1 AND path = ?2 AND size = ?3 AND modified_at = ?4
             AND content_hash IS NULL AND archive_zip_path IS NULL",
-        params![file_id, size, modified_at, hash],
+        params![file_id, path, size, modified_at, hash],
     )?;
     Ok(n > 0)
 }
@@ -9171,18 +9172,19 @@ mod bank_content_hash_tests {
     fn bank_content_hash_writes_only_over_a_matching_null_row() {
         let conn = db();
         let t = "2026-01-01T00:00:00+00:00";
+        const P: &str = "/t/a.fits";
 
         // A size or a time that is not the row's writes nothing.
-        assert!(!bank_content_hash(&conn, 1, 101, t, "h0").unwrap());
-        assert!(!bank_content_hash(&conn, 1, 100, "2026-01-01T00:00:01+00:00", "h0").unwrap());
+        assert!(!bank_content_hash(&conn, 1, P, 101, t, "h0").unwrap());
+        assert!(!bank_content_hash(&conn, 1, P, 100, "2026-01-01T00:00:01+00:00", "h0").unwrap());
         assert_eq!(hash_of(&conn, 1), None);
 
         // The matching NULL row takes it, once.
-        assert!(bank_content_hash(&conn, 1, 100, t, "h1").unwrap());
+        assert!(bank_content_hash(&conn, 1, P, 100, t, "h1").unwrap());
         assert_eq!(hash_of(&conn, 1).as_deref(), Some("h1"));
 
         // Never over a value.
-        assert!(!bank_content_hash(&conn, 1, 100, t, "h2").unwrap());
+        assert!(!bank_content_hash(&conn, 1, P, 100, t, "h2").unwrap());
         assert_eq!(hash_of(&conn, 1).as_deref(), Some("h1"));
 
         // A re-parse-like UPDATE of the time (and a cleared hash) refuses the
@@ -9192,9 +9194,19 @@ mod bank_content_hash_tests {
             [],
         )
         .unwrap();
-        assert!(!bank_content_hash(&conn, 1, 100, t, "h3").unwrap());
+        assert!(!bank_content_hash(&conn, 1, P, 100, t, "h3").unwrap());
         assert_eq!(hash_of(&conn, 1), None);
-        assert!(bank_content_hash(&conn, 1, 100, "2026-01-02T00:00:00+00:00", "h4").unwrap());
+        assert!(bank_content_hash(&conn, 1, P, 100, "2026-01-02T00:00:00+00:00", "h4").unwrap());
+
+        // Not after a relocate that changed the path.
+        conn.execute(
+            "UPDATE files SET path = '/t/moved/a.fits', content_hash = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(!bank_content_hash(&conn, 1, P, 100, "2026-01-02T00:00:00+00:00", "h4b").unwrap());
+        assert_eq!(hash_of(&conn, 1), None);
+        assert!(bank_content_hash(&conn, 1, "/t/moved/a.fits", 100, "2026-01-02T00:00:00+00:00", "h4c").unwrap());
 
         // Not a zip row.
         conn.execute(
@@ -9203,10 +9215,10 @@ mod bank_content_hash_tests {
             [],
         )
         .unwrap();
-        assert!(!bank_content_hash(&conn, 2, 50, t, "h5").unwrap());
+        assert!(!bank_content_hash(&conn, 2, "/t/z/b.fits", 50, t, "h5").unwrap());
         assert_eq!(hash_of(&conn, 2), None);
 
         // No such id.
-        assert!(!bank_content_hash(&conn, 99, 100, t, "h6").unwrap());
+        assert!(!bank_content_hash(&conn, 99, P, 100, t, "h6").unwrap());
     }
 }

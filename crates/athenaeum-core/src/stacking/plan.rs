@@ -448,7 +448,7 @@ fn book_identity(
             why: NOT_IN_CATALOG,
         },
         BookMiss::OutsideRun => StageOneError::Other(ApiError::Internal(format!(
-            "{path} is outside the run's inputs"
+            "{path}: linked after the run started; run again"
         ))),
         BookMiss::Unresolved => StageOneError::Other(ApiError::Internal(format!(
             "the run's inputs were not checked before frame {frame_id} was hashed"

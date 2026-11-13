@@ -99,6 +99,7 @@ impl InputIdentity {
 pub(crate) const NOT_SAMPLED_YET: &str = "not sampled yet";
 pub(crate) const CHANGED_WHILE_SAMPLED: &str = "changed while it was sampled";
 pub(crate) const UNREADABLE: &str = "unreadable";
+pub(crate) const OFFLINE_NEVER_SAMPLED: &str = "not found, and never sampled";
 pub(crate) const NOT_IN_CATALOG: &str = "not in the catalog";
 pub(crate) const CANCELLED: &str = "cancelled";
 
@@ -106,6 +107,7 @@ pub(crate) const CANCELLED: &str = "cancelled";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BankSample {
     pub file_id: i64,
+    pub path: String,
     pub size: i64,
     pub modified_at: String,
     pub sample: String,
@@ -243,11 +245,25 @@ fn catalog_only_sampling(row: &InputRow) -> Sampling {
 fn disk_sampling(row: &InputRow, cancel: &AtomicBool) -> Sampling {
     let before = match std::fs::metadata(&row.path) {
         Ok(m) => m,
-        // An offline input keeps its last vouched sample.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return catalog_only_sampling(row),
+        // An offline or unreachable input keeps its last vouched sample (the catalog's answer);
+        // with none, the reason says what happened.
         Err(e) => {
-            tracing::warn!(path = %row.path.display(), error = %e, "input file cannot be stat-ed");
-            return Sampling::not_sampled(UNREADABLE);
+            let never_sampled = if e.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %row.path.display(), "input file not found; using its last sample");
+                OFFLINE_NEVER_SAMPLED
+            } else {
+                tracing::warn!(
+                    path = %row.path.display(),
+                    error = %e,
+                    "input file cannot be stat-ed; using its last sample"
+                );
+                UNREADABLE
+            };
+            let answer = catalog_only_sampling(row);
+            return match answer.identity {
+                InputIdentity::NotSampled(_) => Sampling::not_sampled(never_sampled),
+                _ => answer,
+            };
         }
     };
     let Some(time_before) = live_time(&before) else {
@@ -327,6 +343,7 @@ fn disk_sampling(row: &InputRow, cancel: &AtomicBool) -> Sampling {
         && row.content_hash.is_none())
     .then(|| BankSample {
         file_id: row.file_id,
+        path: row.path.to_string_lossy().into_owned(),
         size: row.size,
         modified_at: row.modified_at.clone(),
         sample: sample.clone(),
@@ -468,7 +485,7 @@ impl SourceSamples {
             .inspect_err(|e| tracing::warn!(error = %e, "input samples cannot be banked"))?;
         let mut written = 0;
         for (path, b) in pending {
-            match crate::db::bank_content_hash(&tx, b.file_id, b.size, &b.modified_at, &b.sample) {
+            match crate::db::bank_content_hash(&tx, b.file_id, &b.path, b.size, &b.modified_at, &b.sample) {
                 Ok(true) => written += 1,
                 Ok(false) => {
                     tracing::debug!(path, file_id = b.file_id, "input sample not banked: the row moved")
@@ -657,9 +674,42 @@ mod tests {
         );
         assert_eq!(
             input_identity(&rq, SampleRead::Disk, &no_cancel()).identity,
-            InputIdentity::NotSampled(NOT_SAMPLED_YET)
+            InputIdentity::NotSampled(OFFLINE_NEVER_SAMPLED)
         );
         assert_eq!(reads_of(&p) + reads_of(&q), 0);
+    }
+
+    /// A stat error other than NotFound (here a path with a NUL byte, `InvalidInput`) answers as an
+    /// offline input does: the banked sample, or "unreadable" when there is none.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_input_with_a_banked_sample_keeps_it() {
+        let conn = catalog();
+        let bad = "/nonexistent-dir/a\0b.fits";
+        assert_eq!(
+            std::fs::metadata(bad).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "premise: a stat error that is not NotFound"
+        );
+        for (id, hash) in [(1, Some("banked")), (2, None)] {
+            let path = format!("/nonexistent-dir/a{id}\0b.fits");
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, content_hash)
+                 VALUES (?1, ?2, 'x.fits', 11, '2026-01-01T00:00:00+00:00', 'FITS', ?3)",
+                rusqlite::params![id, path, hash],
+            )
+            .unwrap();
+        }
+        let r1 = input_row(&conn, "/nonexistent-dir/a1\0b.fits").unwrap().unwrap();
+        let r2 = input_row(&conn, "/nonexistent-dir/a2\0b.fits").unwrap().unwrap();
+        assert_eq!(
+            input_identity(&r1, SampleRead::Disk, &no_cancel()).identity,
+            InputIdentity::Sampled { size: 11, sample: "banked".into() }
+        );
+        assert_eq!(
+            input_identity(&r2, SampleRead::Disk, &no_cancel()).identity,
+            InputIdentity::NotSampled(UNREADABLE)
+        );
     }
 
     #[test]

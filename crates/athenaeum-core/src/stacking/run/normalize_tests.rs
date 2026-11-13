@@ -1141,6 +1141,64 @@ fn coarser_times_reuse_every_frame_level_stage() {
     }
 }
 
+/// The lights' part of the coarser-time case. A copy of the lights and masters onto coarser times, then a scan
+/// re-parse of the copies: every row takes the file's new time and loses its sample (`content_hash = NULL`), as the
+/// scanner writes it. The gate reads no file, so it reads Calibrate stale until a run has sampled again (FI-7, the
+/// residual stays visible). The run samples every light and master again, finds the same samples, recomputes
+/// nothing at calibrate, pass 1, pass 2 or align, and banks the samples over the rows once more; the gate is fresh
+/// after it.
+#[test]
+fn a_reparse_of_copied_lights_reuses_every_frame_level_stage() {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(Some("RGGB"));
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    let (_, _, logs1) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+    let with_sample = |rig: &RegroupRig| -> i64 {
+        rig.fixture
+            .conn
+            .query_row("SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(with_sample(&rig), 6 + 2, "run 1 banked the six lights and the two masters");
+
+    let mut files = rig.catalog_files();
+    files.extend(rig.working_files());
+    let whole_seconds = |t: std::time::SystemTime| {
+        let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(d.as_secs() + 1)
+    };
+    set_times(&files, whole_seconds);
+    // The re-parse: each catalog row takes its file's new time and drops its sample.
+    for path in rig.catalog_files() {
+        let live = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let time = chrono::DateTime::<chrono::Utc>::from(live).to_rfc3339();
+        let n = rig
+            .fixture
+            .conn
+            .execute(
+                "UPDATE files SET modified_at = ?1, content_hash = NULL WHERE path = ?2",
+                rusqlite::params![time, path.to_str().unwrap()],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the row of {}", path.display());
+    }
+    assert_eq!(with_sample(&rig), 0, "the re-parse left no sample");
+
+    let stale = rig.stale(&cfg);
+    assert!(
+        stale.contains(&Stage::Calibrate),
+        "FI-7: the gate reads no file, so it reads Calibrate stale before the run samples again: {stale:?}"
+    );
+    let (_, _, logs2) = rig.run(&cfg);
+    assert_nothing_recomputed(&logs2, "a re-parse of copied lights");
+    assert_eq!(with_sample(&rig), 6 + 2, "the run banked the six lights and the two masters again");
+    let stale = rig.stale(&cfg);
+    for stage in [Stage::Calibrate, Stage::Measure, Stage::Register] {
+        assert!(!stale.contains(&stage), "the gate reads {stage:?} stale after the run: {stale:?}");
+    }
+}
+
 /// The residual the sample accepts, pinned so it stays visible: one byte changed at the middle of a light (the size
 /// the same, the time moved by 5 s, no rescan) is read by the gate as fresh (the gate reads no file), and the run that
 /// samples the file again finds the new bytes and recomputes exactly that frame: one calibrate, one first pass.

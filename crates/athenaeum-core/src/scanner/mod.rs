@@ -657,8 +657,15 @@ fn process_file(
                 "moved file detected"
             );
 
+            // A move reads none of the file's bytes: the banked sample (the stacking cache's
+            // identity) stays only while the time is the one it was read at; a copy that
+            // changed the time loses it, and the next stacking run reads it again. The
+            // right-hand sides of one UPDATE see the OLD row, so `modified_at` below is the old time.
             conn.execute(
-                "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
+                "UPDATE files SET path = ?1,
+                        content_hash = CASE WHEN modified_at = ?2 THEN content_hash END,
+                        modified_at = ?2
+                 WHERE id = ?3",
                 rusqlite::params![current_path, modified_dt.to_rfc3339(), file_id],
             )?;
 
@@ -2220,8 +2227,15 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
 
             if let Some((file_id, old_path)) = existing_file {
                 // Old file no longer exists - this is a MOVE, update path
+                // A move reads none of the file's bytes: the banked sample (the stacking cache's
+                // identity) stays only while the time is the one it was read at; a copy that
+                // changed the time loses it, and the next stacking run reads it again. The
+                // right-hand sides of one UPDATE see the OLD row, so `modified_at` below is the old time.
                 if let Err(e) = conn.execute(
-                    "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
+                    "UPDATE files SET path = ?1,
+                        content_hash = CASE WHEN modified_at = ?2 THEN content_hash END,
+                        modified_at = ?2
+                 WHERE id = ?3",
                     rusqlite::params![
                         file_result.file.path,
                         file_result.file.modified_at.to_rfc3339(),
@@ -3690,6 +3704,90 @@ mod moved_file_guard_tests {
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total_files, 1, "no duplicate row should be inserted for a genuine move");
+    }
+
+    /// A header-fingerprint move: the old row (a banked sample, the time `old_secs`) is linked to a copy of
+    /// the fixture whose file time is `new_secs`, by `process_file` (`via` 0), the sequential walker (1) or
+    /// the parallel one (2). Returns the row's `(path, content_hash, modified_at)` afterwards and the new time.
+    fn move_a_sampled_row(
+        via: u8,
+        old_secs: u64,
+        new_secs: u64,
+    ) -> (String, Option<String>, String, String) {
+        let tmp = TempDir::new().unwrap();
+        let old_root = tmp.path().join("root-a");
+        let new_root = tmp.path().join("root-b");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [old_root.to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (2, ?1)", [new_root.to_str().unwrap()]).unwrap();
+        let (_frame, header_text) = parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let old_time = chrono::DateTime::<Utc>::from(at(old_secs)).to_rfc3339();
+        let old_path = old_root.join("L_001.fits");
+        seed_fake_old_row(&conn, 910, old_path.to_str().unwrap(), &header_text);
+        conn.execute(
+            "UPDATE files SET modified_at = ?1, content_hash = 'banked-sample' WHERE id = 910",
+            params![old_time],
+        )
+        .unwrap();
+
+        let new_path = new_root.join("L_001.fits");
+        std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
+        std::fs::File::options().write(true).open(&new_path).unwrap().set_modified(at(new_secs)).unwrap();
+        let new_time = chrono::DateTime::<Utc>::from(at(new_secs)).to_rfc3339();
+
+        match via {
+            0 => {
+                let result = process_file(&new_path, &conn, false, 2).unwrap();
+                assert!(result.is_none(), "the fixture is a genuine move");
+            }
+            1 => {
+                scan_directory(&new_root, &conn, None, false, 2);
+            }
+            _ => {
+                scan_directory_parallel(
+                    &new_root,
+                    2,
+                    &conn,
+                    &crate::events::NullEmitter,
+                    Arc::new(AtomicBool::new(false)),
+                    false,
+                );
+            }
+        }
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 1, "via {via}: a move adds no row");
+        let (path, hash, time): (String, Option<String>, String) = conn
+            .query_row("SELECT path, content_hash, modified_at FROM files WHERE id = 910", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(path, new_path.to_str().unwrap());
+        (path, hash, time, new_time)
+    }
+
+    /// A plain `mv` keeps the file time: the banked sample still describes the bytes at the new path.
+    #[test]
+    fn a_moved_file_with_the_same_time_keeps_its_content_hash() {
+        for via in 0..3 {
+            let (_path, hash, time, new_time) = move_a_sampled_row(via, 1_700_000_000, 1_700_000_000);
+            assert_eq!(time, new_time, "via {via}");
+            assert_eq!(hash.as_deref(), Some("banked-sample"), "via {via}: an unchanged time keeps the sample");
+        }
+    }
+
+    /// A move that changed the file time read none of the bytes: the banked sample must not survive it
+    /// (a pixel-edited copy with the same header and size would otherwise reuse every cached stage).
+    #[test]
+    fn a_moved_file_with_another_time_loses_its_content_hash() {
+        for via in 0..3 {
+            let (_path, hash, time, new_time) = move_a_sampled_row(via, 1_700_000_000, 1_700_000_500);
+            assert_eq!(time, new_time, "via {via}: the row takes the new file's time");
+            assert_eq!(hash, None, "via {via}: a changed time drops the sample; the next run reads it again");
+        }
     }
 
     /// A zip-resident row (Move and ZIP's, markers set, original path gone) must
