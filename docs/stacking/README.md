@@ -5411,6 +5411,35 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   then 0/0/0/0 (LN and Integrate only), then 0/0/0/0 with every LN sidecar reused; mono set 185 (67 lights; the merged β moves, L 3.49 →
   3.30) 67/67/67/67, then 0/0/67/67 twice (pass 2 and the mono registration follow the β, by design). The plan gate before the third
   run reported Normalize stale while the run reused LN (open-items: the gate reads only the latest run's group β).
+- **Acceptance of the file identity (2026-11-13, headless, real data).** The release `athenaeum-web` on a copy of the dev catalog, Manual
+  reference, set 163 trimmed to 16 OSC lights (300 s + 600 s), set 185 (67 mono lights); items are the `fan-out finished` counts calibrate
+  / pass1 / pass2 / align. Every leg passed.
+
+  | Leg | Set | Result |
+  | ---- | ---- | ---- |
+  | A0, run 1 then run 2 | 163, 185 | run 1 computes every frame (16, 67); run 2 0 / 0 / 0 / 0, the plan stale `[]` |
+  | A3, regroup `stops`, `seconds`, `none`, `seconds` (Moffat4) | 185 | align 0 on every regroup run; the plan read Register cached before each |
+  | The update over existing rows | 182 | every stage once (its rows name a folder absent on the dev Mac: `moved=0 left=164`), then 0 / 0 / 0 / 9 |
+  | A1, in place on the SMB share | 163 | 0 / 0 / 0 / 0 twice after a `rerunFrom: calibrate`, also with the local folder removed |
+  | A2, lights and a master copied with their times, the working folder bounced to the same path; share, then exFAT | 163 | 0 / 0 / 0 / 0 on each |
+  | A2b, the working folder copied to the exFAT drive, the share copy kept | 163 | the plan reads Calibrate, Measure, Register cached; 0 / 0 / 0 / 0, `moved=96 left=0`; the old copy unwritten |
+  | A2b, the share unmounted; then the folder copied back to the share | 163 | 0 / 0 / 0 / 0, 16 of 16 lights, no warning; back: 0 / 0 / 0 / 0, `moved=114 left=0` |
+  | A2c, a copy without times: the source kept, then removed | 163 | kept: read at the source, nothing recomputed, no warning; removed: one warning, the 16 frames recomputed once, then 0 / 0 / 0 / 0 |
+
+  Set 182's 9 are frames whose registration fails on every run (a failed registration is not cached). On 185 `stops` merges nothing (10 s
+  and 180 s are more than a stop apart) but renames the groups, so LN and Integrate re-run; the switch to Moffat4 re-registered each mono
+  frame once (its measurement is in its registration key). Time differences, copy against original (`stat -f '%Fm'`): `cp -p` to the
+  share 0 to 62 ns (100 ns steps), to the exFAT drive up to 1.52 ms (10 ms steps); the working folder share → exFAT up to 9.57 ms, exFAT →
+  share 0; a copy without `-p` 1533 to 1596 s. The input check took 149 ms for 347 inputs on set 163's first run (every light of the
+  plan's groups, excluded ones too, and the masters), because every row of that catalog already had a banked sample (40 535 of 40 535);
+  `banked` counted only the masters the runs built. Plan times 0.17 to 0.53 s in every state.
+  The defect the share showed: an SMB share refuses a full sync (os error 45), so the LN reference, the saturation map, the per-frame LN
+  files and the output master could not be written there, and every run on the share warned and redid normalization. Every writer now
+  falls back (`sync_best_effort`, above; `9f404957`). After the fix a run on the share writes 16 `ln` rows and both masters, the second
+  run is 0 / 0 / 0 / 0 with LN reused (normalize 8 s against 35 s), and the masters equal the local ones in every data byte (one header
+  card differs, `ATH_STKI`, the run id). A2c also showed the plan and the run counting the missing files differently (35 against 114);
+  the warning now counts frames. Not run: set 185 on the share; a project, and a project through a moved folder; a hung share mount;
+  names with non-ASCII letters; the first-run sampling cost on a catalog with no banked samples; a library master built onto a share.
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
