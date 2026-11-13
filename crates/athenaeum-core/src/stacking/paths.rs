@@ -69,6 +69,28 @@ pub(crate) fn subject_layout(
     }
 }
 
+/// The working folder spelled the way a run records it (canonical, the platform's plain spelling), for the gate to
+/// recognise a row a run wrote. `None` when the folder does not exist (nothing a run wrote can be under it) or cannot
+/// be resolved (a `debug!`: the folders gate already reports an unusable folder and this runs on every plan; the
+/// configured spelling alone is used then). Reads the filesystem, writes nothing.
+pub(crate) fn run_spelled_working(working: &Path) -> Option<PathBuf> {
+    match working.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            tracing::debug!(path = %working.display(), error = %e, "working folder not inspectable; the configured spelling is used");
+            return None;
+        }
+    }
+    match working.canonicalize() {
+        Ok(canonical) => Some(crate::api::scan_roots::normalize_path(&canonical)),
+        Err(e) => {
+            tracing::debug!(path = %working.display(), error = %e, "working folder not resolvable; the configured spelling is used");
+            None
+        }
+    }
+}
+
 /// Plan 6b-2 C6: a project's working root must not overlap any scan root —
 /// the Collaboration root is one — because cleanup removes whole subtrees
 /// under it, and a landed replica must never be in one. `Some(sentence)` is

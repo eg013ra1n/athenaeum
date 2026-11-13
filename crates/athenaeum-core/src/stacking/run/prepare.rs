@@ -191,11 +191,34 @@ fn resolve_prepare_job(
         )?;
         (existing, mosaic_row)
     };
+    // The in-place rule (file-identity §4.1): a row that names the user's own light (or a project replica), not a
+    // working-folder file, is fresh only while it names THIS frame's current input. After a relocate the row can
+    // name the light's old path, where another file of the same size may now sit; a miss is a Job, which re-points
+    // the row. A zip frame used in place is detached into `prepared/`, an own file, so it has no expectation.
+    let expected_calibrated = (zip_markers.is_none() && matches!(action, PrepareAction::InPlace))
+        .then(|| catalog_path.clone());
+    let expected_mosaic = (zip_markers.is_none()
+        && keep_mosaic
+        && matches!(
+            action,
+            PrepareAction::Write {
+                read: crate::stacking::prepare::PrepareRead::InPlaceFits,
+                ..
+            }
+        ))
+    .then(|| catalog_path.clone());
+    let names_expected = |row: &crate::db::stacking::StackingArtifactRow, expected: &Option<PathBuf>| {
+        expected
+            .as_deref()
+            .is_none_or(|input| row.path.as_deref().is_some_and(|p| Path::new(p) == input))
+    };
     if rc.rerun_from != Some(Stage::Calibrate) {
-        let mosaic_fresh =
-            !keep_mosaic || mosaic_row.as_ref().is_some_and(|row| is_fresh(row, &hash));
+        let mosaic_fresh = !keep_mosaic
+            || mosaic_row.as_ref().is_some_and(|row| {
+                is_fresh(row, &hash) && names_expected(row, &expected_mosaic)
+            });
         if let Some(row) = &existing {
-            if is_fresh(row, &hash) && mosaic_fresh {
+            if is_fresh(row, &hash) && names_expected(row, &expected_calibrated) && mosaic_fresh {
                 return Ok(PrepareResolved::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
                 });
@@ -244,6 +267,40 @@ fn resolve_prepare_job(
                     ..
                 }
         );
+    // The write order (a row is gone before the file it names is replaced): a cancelled or killed run then leaves no
+    // row of this hash over another config's file. `Reused` and `Excluded` returned above and delete nothing. The
+    // mosaic row goes too when the run keeps a mosaic or its file is one this job overwrites.
+    {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::stacking::delete_artifact(
+            &conn,
+            &rc.subject,
+            &group.key,
+            ArtifactKind::Calibrated,
+            Some(frame.frame_id),
+        )?;
+        let mosaic_names_output = mosaic_row
+            .as_ref()
+            .and_then(|row| row.path.as_deref())
+            .is_some_and(|path| {
+                let path = Path::new(path);
+                path == converted_out.as_path() || path == debayered_out.as_path()
+            });
+        if keep_mosaic || mosaic_names_output {
+            crate::db::stacking::delete_artifact(
+                &conn,
+                &rc.subject,
+                &group.key,
+                ArtifactKind::CalibratedMosaic,
+                Some(frame.frame_id),
+            )?;
+        }
+        // Any other subject's row over a file this job writes goes too (two sets with one name share a root). Both
+        // outputs lie under `prepared/`; the user's own file, used in place, is never one of them.
+        for written in [&converted_out, &debayered_out] {
+            crate::db::stacking::delete_artifacts_naming_path(&conn, &written.to_string_lossy())?;
+        }
+    }
     Ok(PrepareResolved::Job(Box::new(PrepareRunJob {
         frame_id: frame.frame_id,
         group_key: group.key.clone(),
@@ -525,6 +582,12 @@ pub(super) fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
             FanOutLabel::new(rc, Stage::Calibrate, Some(&group.key), "prepare"),
             cancel_ref,
             move |job: &PrepareRunJob| {
+                if stage_one_job_cancelled(&job.job.converted_out, job.frame_id)
+                    || stage_one_job_cancelled(&job.job.debayered_out, job.frame_id)
+                {
+                    ticker_ref.tick(Some(job.frame_id));
+                    return Err(CANCELLED_MARKER.to_string());
+                }
                 let out = detach_zip_source(job)
                     .and_then(|prepared_job| {
                         crate::stacking::prepare::execute_prepare(

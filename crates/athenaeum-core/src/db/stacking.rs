@@ -716,6 +716,20 @@ pub fn get_run(conn: &Connection, run_id: i64) -> Result<Option<StackingRunRow>>
         .optional()?)
 }
 
+/// The distinct working folders the subject's runs recorded (`stacking_runs.working_dir`), newest run first. A row a
+/// run wrote sits under the folder that run used, which may no longer be the configured one.
+pub fn subject_working_dirs(conn: &Connection, subject: &StackSubject) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT working_dir FROM stacking_runs
+         WHERE frames_set_id IS ?1 AND project_id IS ?2
+         GROUP BY working_dir ORDER BY MAX(id) DESC",
+    )?;
+    let dirs = stmt
+        .query_map(params![subject.frame_set_id(), subject.project_id()], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(dirs)
+}
+
 /// Runs for a subject, newest first.
 pub fn list_runs(
     conn: &Connection,
@@ -1055,6 +1069,51 @@ pub fn find_artifact(
         )
         .optional()?)
 }
+
+/// The SQL of [`delete_artifact`], on the same six key expressions as [`find_artifact_sql`].
+const DELETE_ARTIFACT_SQL: &str = "DELETE FROM stacking_artifacts
+     WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
+       AND group_key = ?3 AND kind = ?4
+       AND COALESCE(frame_id, 0) = ?5 AND COALESCE(project_frame, 0) = ?6";
+
+/// Delete the one artifact row [`find_artifact`] would return for the same arguments (a point delete on the unique
+/// key, `kind.group_key(group_key)` included). Returns whether a row went. A writer that is about to replace a
+/// frame-level file calls this BEFORE it writes, so a cancelled or killed run leaves no row over another config's
+/// file; a failed delete stops the job (`?`), it is never a warning followed by the write.
+pub fn delete_artifact(
+    conn: &Connection,
+    subject: &StackSubject,
+    group_key: &str,
+    kind: ArtifactKind,
+    frame_id: Option<i64>,
+) -> Result<bool> {
+    let (fid, pf) = subject.frame_columns(frame_id);
+    let n = conn.execute(
+        DELETE_ARTIFACT_SQL,
+        params![
+            subject.frame_set_id().unwrap_or(0),
+            subject.project_id().unwrap_or(""),
+            kind.group_key(group_key),
+            kind.as_db_str(),
+            fid.unwrap_or(0),
+            pf.unwrap_or(0),
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// Deletes EVERY artifact row, of any subject and any kind, whose `path` is `path`; returns how many went. A writer
+/// that is about to replace a frame-level file calls this next to [`delete_artifact`], for each path it will write.
+/// The keyed delete removes only the writer's own row; but two frame sets with one name share a working root, so
+/// another subject's row can name the same file, and a kind's file can take another kind's name. With no
+/// modification time to compare, such a row would read fresh over the new bytes. A failed delete stops the job
+/// (`?`), it is never a warning followed by the write.
+pub fn delete_artifacts_naming_path(conn: &Connection, path: &str) -> Result<usize> {
+    Ok(conn.execute(DELETE_ARTIFACTS_NAMING_PATH_SQL, [path])?)
+}
+
+/// The SQL of [`delete_artifacts_naming_path`]: a search on `idx_stacking_artifacts_path`.
+const DELETE_ARTIFACTS_NAMING_PATH_SQL: &str = "DELETE FROM stacking_artifacts WHERE path = ?1";
 
 pub fn list_artifacts(
     conn: &Connection,
@@ -2380,6 +2439,124 @@ mod tests {
         .unwrap()
         .expect("the legacy row is found through the new key");
         assert_eq!((row.id, row.config_hash.as_str()), (legacy_id, "c1"));
+    }
+
+    #[test]
+    fn delete_artifact_is_a_point_delete_on_the_artifacts_key() {
+        let c = conn();
+        let set_a = seed_set(&c);
+        c.execute("INSERT INTO frames_set (id, name) VALUES (8, 'M 31')", []).unwrap();
+        seed_frame(&c, 1);
+        seed_frame(&c, 2);
+        let a = StackSubject::FrameSet(set_a);
+        let b = StackSubject::FrameSet(8);
+        let put = |subject: &StackSubject, kind: ArtifactKind, group_key: &str, frame_id: Option<i64>| {
+            upsert_artifact(
+                &c,
+                &NewArtifact {
+                    subject,
+                    frame_id,
+                    group_key,
+                    kind,
+                    path: Some("/p"),
+                    config_hash: "h",
+                    size: Some(1),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        };
+        let has = |subject: &StackSubject, kind: ArtifactKind, frame_id: Option<i64>| {
+            find_artifact(&c, subject, "g", kind, frame_id).unwrap().is_some()
+        };
+        for subject in [&a, &b] {
+            for frame in [1, 2] {
+                put(subject, ArtifactKind::Calibrated, "g", Some(frame));
+            }
+        }
+        put(&a, ArtifactKind::Ln, "g", Some(1));
+
+        // A frame-level kind is keyed on the frame whatever group key comes with it.
+        assert!(delete_artifact(&c, &a, "any_key", ArtifactKind::Calibrated, Some(1)).unwrap());
+        assert!(!has(&a, ArtifactKind::Calibrated, Some(1)));
+        assert!(has(&a, ArtifactKind::Calibrated, Some(2)), "another frame is untouched");
+        assert!(has(&b, ArtifactKind::Calibrated, Some(1)), "another subject is untouched");
+        assert!(has(&a, ArtifactKind::Ln, Some(1)), "another kind is untouched");
+        assert!(!delete_artifact(&c, &a, "any_key", ArtifactKind::Calibrated, Some(1)).unwrap());
+
+        // A group-level kind goes only under its own group key.
+        assert!(!delete_artifact(&c, &a, "other", ArtifactKind::Ln, Some(1)).unwrap());
+        assert!(has(&a, ArtifactKind::Ln, Some(1)));
+        assert!(delete_artifact(&c, &a, "g", ArtifactKind::Ln, Some(1)).unwrap());
+        assert!(!has(&a, ArtifactKind::Ln, Some(1)));
+    }
+
+    #[test]
+    fn delete_artifact_is_a_search_on_the_artifacts_key() {
+        let c = conn();
+        let plan = plan_details(&c, DELETE_ARTIFACT_SQL, &[&7_i64, &"", &"g", &"calibrated", &5_i64, &0_i64]);
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH") && d.contains("stacking_artifacts_subject_key")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn delete_artifacts_naming_path_retires_every_subjects_row_and_only_that_path() {
+        let c = conn();
+        let set_a = seed_set(&c);
+        c.execute("INSERT INTO frames_set (id, name) VALUES (8, 'M 31')", []).unwrap();
+        seed_frame(&c, 1);
+        let a = StackSubject::FrameSet(set_a);
+        let b = StackSubject::FrameSet(8);
+        let put = |subject: &StackSubject, kind: ArtifactKind, path: &str| {
+            upsert_artifact(
+                &c,
+                &NewArtifact {
+                    subject,
+                    frame_id: Some(1),
+                    group_key: "g",
+                    kind,
+                    path: Some(path),
+                    config_hash: "h",
+                    size: Some(1),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        };
+        let has = |subject: &StackSubject, kind: ArtifactKind| {
+            find_artifact(&c, subject, "g", kind, Some(1)).unwrap().is_some()
+        };
+        put(&a, ArtifactKind::Calibrated, "/w/m31/calibrated/c_x_f1.fits");
+        put(&b, ArtifactKind::Calibrated, "/w/m31/calibrated/c_x_f1.fits");
+        // A kind whose file takes another kind's name.
+        put(&b, ArtifactKind::CalibratedMosaic, "/w/m31/calibrated/c_x_f1.fits");
+        put(&a, ArtifactKind::Registered, "/w/m31/registered/r_x_f1.fits");
+        put(&b, ArtifactKind::Ln, "/w/m31/ln/g/x_f1.fits");
+
+        let gone = delete_artifacts_naming_path(&c, "/w/m31/calibrated/c_x_f1.fits").unwrap();
+        assert_eq!(gone, 3);
+        assert!(!has(&a, ArtifactKind::Calibrated));
+        assert!(!has(&b, ArtifactKind::Calibrated));
+        assert!(!has(&b, ArtifactKind::CalibratedMosaic));
+        assert!(has(&a, ArtifactKind::Registered), "another path is untouched");
+        assert!(has(&b, ArtifactKind::Ln), "another path is untouched");
+        assert_eq!(delete_artifacts_naming_path(&c, "/w/m31/calibrated/c_x_f1.fits").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_artifacts_naming_path_is_a_search_on_the_path_index() {
+        let c = conn();
+        let plan = plan_details(&c, DELETE_ARTIFACTS_NAMING_PATH_SQL, &[&"/p"]);
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH") && d.contains("idx_stacking_artifacts_path")),
+            "{plan:?}"
+        );
     }
 
     #[test]

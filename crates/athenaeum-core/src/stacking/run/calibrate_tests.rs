@@ -1833,3 +1833,143 @@ fn the_plan_reports_the_mosaics_a_bayer_run_still_owes() {
     assert_eq!(group_of(&plan_after, true).calibrated_cached, 4);
     assert_eq!(group_of(&plan_after, false).calibrated_cached, 4);
 }
+
+/// The file-identity write order (§4.2) at Calibrate: a row is gone before the file it names is replaced. Run B
+/// (`flat_norm` flipped, so every plane moves) is cut short at its second frame: the loop returns `Cancelled` there,
+/// but the later jobs already wrote their files. Without the delete those frames would keep run A's row (A's hash,
+/// the size of the file B wrote) over B's pixels; with the time out of the identity nothing else tells them apart.
+#[test]
+fn a_cancelled_recalibration_leaves_no_row_over_its_files() {
+    let mut rig = Pass1Rig::new();
+    rig.run("run A", None);
+    let frames: Vec<i64> = rig.plan_groups[0].frames.iter().map(|f| f.frame_id).collect();
+    assert_eq!(frames.len(), 4);
+    let rows_a = rig.rows(ArtifactKind::Calibrated);
+    assert_eq!(rows_a.len(), 4, "premise: run A calibrated every frame");
+    let bits_a = calibrated_plane_bits(&rig);
+    let cfg_a = rig.cfg.clone();
+
+    rig.cfg.calibration.flat_norm = !rig.cfg.calibration.flat_norm;
+    let cfg_b = rig.cfg.clone();
+    let res = rig.try_stage_one_with_job_cancelled(&cfg_b, rig.layout.calibrated_root(), frames[1]);
+    assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+
+    let rows_b = rig.rows(ArtifactKind::Calibrated);
+    let first_b = rows_b.get(&frames[0]).expect("frame 1 was committed before the cancelled job");
+    assert_ne!(first_b.config_hash, rows_a[&frames[0]].config_hash, "frame 1 carries run B's hash");
+    for (pos, frame_id) in frames.iter().enumerate().skip(1) {
+        let old = &rows_a[frame_id];
+        let path = Path::new(old.path.as_deref().unwrap());
+        assert!(path.is_file(), "frame {frame_id}'s file is still there");
+        assert!(
+            !rows_b.contains_key(frame_id),
+            "frame {frame_id} keeps a row over a file it may have been rewritten: {:?}",
+            rows_b.get(frame_id)
+        );
+        if pos >= 2 {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().len() as i64,
+                old.size.unwrap(),
+                "premise: frame {frame_id}'s new file has the size A's row recorded, so only the pixels tell them apart"
+            );
+            assert_ne!(
+                file_plane_bits(path),
+                bits_a[pos].1,
+                "premise: run B's planes of frame {frame_id} differ from run A's"
+            );
+        }
+    }
+
+    let gate = |cfg: &StackingConfig| {
+        crate::stacking::plan::build_plan(
+            &rig.fixture.conn,
+            &rig.ctx.settings,
+            &PathPolicy::AllowAll,
+            &rig.subject,
+            Some(cfg.clone()),
+        )
+        .unwrap()
+        .groups[0]
+            .calibrated_cached
+    };
+    assert_eq!(gate(&cfg_a), 0, "the gate at A's config trusted a file another run overwrote");
+
+    rig.cfg = cfg_a.clone();
+    let (_, logs) = crate::stacking::telemetry::capture_logs(|| rig.run("run A again", None));
+    assert_eq!(fan_out_items(&logs, "calibrate", "calibrate"), 4, "{logs}");
+    assert_eq!(calibrated_plane_bits(&rig), bits_a, "a recalibration at A's config did not reproduce A's planes");
+}
+
+/// The mosaic row of a frame whose calibrated file takes the mosaic's name (§4.2, correction 2). With the debayer
+/// off an OSC frame's calibrated file is `c_<stem>.fits`, the name run A gave its CFA mosaic; run B overwrites it
+/// with another config's pixels, so a `calibrated_mosaic` row left at run A's hash would read fresh over them in a
+/// later Bayer run. Run B deletes it.
+#[test]
+fn a_debayer_off_run_retires_the_mosaic_row_it_overwrites() {
+    let rig = Pass1Rig::build(1, true);
+    let drizzle_bayer = |bayer: bool| {
+        let mut cfg = StackingConfig::default();
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 1;
+        cfg.drizzle.bayer = bayer;
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+        cfg
+    };
+    let cfg_a = drizzle_bayer(true);
+    rig.try_stage_one(&cfg_a).unwrap();
+    let calibrated_a = rig.rows(ArtifactKind::Calibrated);
+    let mosaics_a = rig.rows(ArtifactKind::CalibratedMosaic);
+    assert_eq!((calibrated_a.len(), mosaics_a.len()), (4, 4), "premise: run A kept a mosaic per frame");
+    for (frame_id, row) in &calibrated_a {
+        assert!(row.path.as_deref().unwrap().ends_with("_d.fits"), "frame {frame_id}: {row:?}");
+        assert!(!mosaics_a[frame_id].path.as_deref().unwrap().ends_with("_d.fits"));
+    }
+
+    let mut cfg_b = drizzle_bayer(true);
+    cfg_b.calibration.debayer_osc = false;
+    cfg_b.calibration.flat_norm = !cfg_b.calibration.flat_norm;
+    rig.try_stage_one(&cfg_b).unwrap();
+    for (frame_id, row) in rig.rows(ArtifactKind::Calibrated) {
+        let mosaic_a = &mosaics_a[&frame_id];
+        assert_eq!(
+            row.path, mosaic_a.path,
+            "premise: with the debayer off frame {frame_id}'s calibrated file takes the mosaic's name"
+        );
+        assert_eq!(
+            std::fs::metadata(row.path.as_deref().unwrap()).unwrap().len() as i64,
+            mosaic_a.size.unwrap(),
+            "premise: the overwriting file has the size A's mosaic row recorded"
+        );
+    }
+    let left = rig.rows(ArtifactKind::CalibratedMosaic);
+    assert!(left.is_empty(), "a mosaic row is left over the file run B overwrote: {left:?}");
+
+    // Run C: A's calibration, no Bayer drizzle: it writes the debayered files and keeps no mosaic.
+    rig.try_stage_one(&drizzle_bayer(false)).unwrap();
+    assert!(rig.rows(ArtifactKind::CalibratedMosaic).is_empty());
+    // Run D: A's config again; every frame owes its mosaic, so every frame is calibrated.
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&cfg_a));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs, "calibrate", "calibrate"), 4, "{logs}");
+    assert_eq!(rig.rows(ArtifactKind::CalibratedMosaic).len(), 4);
+}
+
+/// Review F1 (file-identity §4.2): the writer retires every row that NAMES the file it replaces, of any subject. Set
+/// 2 has the same name as set 1, so the same working root; it keeps a row of its own over each calibrated file of set
+/// 1. Set 1's run B (`flat_norm` flipped) rewrites those files, and set 2's rows go with them: with no modification
+/// time in the identity, a row left over a rewritten file of the same size would read fresh.
+#[test]
+fn a_same_named_sets_run_retires_the_other_sets_rows() {
+    let mut rig = Pass1Rig::new();
+    rig.run("run A", None);
+    let other = same_named_set_with_copies_of_the_calibrated_rows(&rig);
+    assert_eq!(rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated).len(), 4, "premise: the copies stand");
+
+    rig.cfg.calibration.flat_norm = !rig.cfg.calibration.flat_norm;
+    let cfg_b = rig.cfg.clone();
+    rig.try_stage_one(&cfg_b).unwrap();
+
+    let other_rows = rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated);
+    assert!(other_rows.is_empty(), "the other set keeps rows over rewritten files: {other_rows:?}");
+    assert_eq!(rig.rows(ArtifactKind::Calibrated).len(), 4, "the writer's own rows are back");
+}

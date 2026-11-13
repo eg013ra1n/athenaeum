@@ -778,6 +778,9 @@ pub(super) fn register_group_pass(
     // registrations whose artifact needs (re)writing — see the `reused`
     // branch below.
     let mut needs_artifact_rewrite: Vec<ArtifactRewriteItem> = Vec::new();
+    // The `registered` row each queued write replaces, read and deleted when the frame was queued (the write order,
+    // file-identity spec §4.2) and carried to `record_registered_artifact`.
+    let mut old_registered: HashMap<i64, crate::db::stacking::StackingArtifactRow> = HashMap::new();
     // Frame-level cache spec §5.5: the measurement hash is folded only for a frame whose registration reads
     // `fits.0`; the gate derives the same flag (`plan::compute_register_stale`).
     let prepare_path = crate::stacking::origin::subject_prepares(&rc.subject, &rc.origins);
@@ -884,24 +887,45 @@ pub(super) fn register_group_pass(
             } = &outcome
             {
                 let hash = registered_hash.as_str();
-                let fresh = registered_artifact_is_fresh(rc, &group.key, frame.frame_id, hash)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            run_id = rc.run_id,
-                            frame_id = frame.frame_id,
-                            error = ?e,
-                            "failed to check the registered artifact's freshness; rewriting it"
-                        );
-                        false
-                    });
+                let row = registered_row(rc, &group.key, frame.frame_id).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        frame_id = frame.frame_id,
+                        error = ?e,
+                        "failed to check the registered artifact's freshness; rewriting it"
+                    );
+                    None
+                });
+                let fresh = row.as_ref().is_some_and(|row| is_fresh(row, hash));
                 if !fresh {
                     needs_rewrite = true;
+                    // The write order: the row is gone before the file is replaced. A failed read still queues the
+                    // rewrite, so the delete runs by key all the same (a point delete needs no row) and nothing is
+                    // carried; a failed delete stops the job.
                     let planes = rc
                         .measured
                         .get(&group.key)
                         .and_then(|v| v.get(idx))
                         .map(|e| e.planes)
                         .unwrap_or(1);
+                    {
+                        let conn = db(&rc.ctx)?.conn();
+                        crate::db::stacking::delete_artifact(
+                            &conn,
+                            &rc.subject,
+                            &group.key,
+                            ArtifactKind::Registered,
+                            Some(frame.frame_id),
+                        )?;
+                        // Any other subject's row over the file goes too (two sets with one name share a root).
+                        crate::db::stacking::delete_artifacts_naming_path(
+                            &conn,
+                            &registered_out_path(rc, &frame, planes).to_string_lossy(),
+                        )?;
+                    }
+                    if let Some(row) = row {
+                        old_registered.insert(frame.frame_id, row);
+                    }
                     needs_artifact_rewrite.push(ArtifactRewriteItem {
                         frame_id: frame.frame_id,
                         calibrated: path.clone(),
@@ -964,6 +988,31 @@ pub(super) fn register_group_pass(
                 .and_then(|v| v.get(idx))
                 .map(|e| e.planes)
                 .unwrap_or(1);
+            // The write order, only for a pass that writes: a dry pass persists nothing and deletes nothing.
+            if persist {
+                let conn = db(&rc.ctx)?.conn();
+                let old = crate::db::stacking::find_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group.key,
+                    ArtifactKind::Registered,
+                    Some(frame.frame_id),
+                )?;
+                crate::db::stacking::delete_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group.key,
+                    ArtifactKind::Registered,
+                    Some(frame.frame_id),
+                )?;
+                crate::db::stacking::delete_artifacts_naming_path(
+                    &conn,
+                    &registered_out_path(rc, &frame, planes).to_string_lossy(),
+                )?;
+                if let Some(old) = old {
+                    old_registered.insert(frame.frame_id, old);
+                }
+            }
             to_register.push(PendingRegistration {
                 idx,
                 frame,
@@ -1137,6 +1186,7 @@ pub(super) fn register_group_pass(
                         frame_id,
                         &registered_hash,
                         &out_path,
+                        old_registered.get(&frame_id),
                     ) {
                         tracing::warn!(
                             run_id = rc.run_id,
@@ -1517,6 +1567,7 @@ pub(super) fn register_group_pass(
                                     frame.frame_id,
                                     &registered_hash,
                                     out_path,
+                                    old_registered.get(&frame.frame_id),
                                 ) {
                                     tracing::warn!(
                                         run_id = rc.run_id,
@@ -2151,17 +2202,12 @@ fn record_registered_artifact(
     frame_id: i64,
     registered_hash: &str,
     out: &Path,
+    old: Option<&crate::db::stacking::StackingArtifactRow>,
 ) -> anyhow::Result<()> {
     let (size, modified_at) = file_identity(out)?;
     let conn = db(&rc.ctx)?.conn();
-    // The row this write replaces, read BEFORE the upsert (see `replace_frame_level_file`).
-    let old = crate::db::stacking::find_artifact(
-        &conn,
-        &rc.subject,
-        group_key,
-        ArtifactKind::Registered,
-        Some(frame_id),
-    )?;
+    // `old` is the row the queue site read and deleted BEFORE the file was replaced (the write order, file-identity
+    // spec §4.2); it only tells `replace_frame_level_file` which legacy file to retire.
     upsert_artifact(
         &conn,
         &NewArtifact {
@@ -2176,31 +2222,40 @@ fn record_registered_artifact(
             payload_json: None,
         },
     )?;
-    replace_frame_level_file(&conn, &rc.layout.registered_root(), old.as_ref(), out);
+    replace_frame_level_file(&conn, &rc.layout.registered_root(), old, out);
     Ok(())
 }
 
 /// Perf tier A Task 6a fix round 1: the CHEAP half of what used to be
-/// `ensure_registered_artifact` — a `find_artifact` SELECT + [`is_fresh`]
-/// (a disk `stat`, no pixel I/O) — called from `register_group_pass`'s
-/// cache-hit branch to decide whether a frame needs queuing into
-/// `needs_artifact_rewrite`. The expensive half (warp + write) now runs in
-/// that batch's own fan-out, not here.
-fn registered_artifact_is_fresh(
+/// `ensure_registered_artifact` — a `find_artifact` SELECT, judged by the
+/// caller with [`is_fresh`] (a disk `stat`, no pixel I/O) — called from
+/// `register_group_pass`'s cache-hit branch to decide whether a frame needs
+/// queuing into `needs_artifact_rewrite`. The expensive half (warp + write)
+/// now runs in that batch's own fan-out, not here. The row comes back so a
+/// queued rewrite can carry it to `record_registered_artifact` after the
+/// delete of its key (file-identity spec §4.2).
+fn registered_row(
     rc: &RunContext,
     group_key: &str,
     frame_id: i64,
-    hash: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<crate::db::stacking::StackingArtifactRow>> {
     let conn = db(&rc.ctx)?.conn();
-    Ok(crate::db::stacking::find_artifact(
+    crate::db::stacking::find_artifact(
         &conn,
         &rc.subject,
         group_key,
         ArtifactKind::Registered,
         Some(frame_id),
-    )?
-    .is_some_and(|row| is_fresh(&row, hash)))
+    )
+}
+
+/// The path a frame's registered file is written to: the registered folder and [`registered_file_name`] of its
+/// frame-level stem. The one spelling of what the Register write sites join by hand, so a writer can retire every
+/// row that names it before it writes.
+fn registered_out_path(rc: &RunContext, frame: &GroupFrame, planes: usize) -> PathBuf {
+    rc.layout
+        .registered_dir()
+        .join(registered_file_name(&frame_file_stem(frame), planes == 3))
 }
 
 /// `r_<stem>[_d].fits` for the SAME frame-only `stem`

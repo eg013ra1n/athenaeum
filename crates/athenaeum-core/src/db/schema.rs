@@ -541,6 +541,9 @@ fn create_stacking_indexes(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_project ON stacking_artifacts(project_id)",
         "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_frame ON stacking_artifacts(frame_id)",
         "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_project_frame ON stacking_artifacts(project_frame)",
+        // A writer retires every row that names the file it is about to replace (`delete_artifacts_naming_path`), and
+        // `replace_frame_level_file` asks whether a row still names an old file: both search on `path`.
+        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_path ON stacking_artifacts(path)",
         "CREATE UNIQUE INDEX IF NOT EXISTS stacking_artifacts_subject_key ON stacking_artifacts(
            COALESCE(frames_set_id, 0), COALESCE(project_id, ''), group_key, kind,
            COALESCE(frame_id, 0), COALESCE(project_frame, 0))",

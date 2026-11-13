@@ -150,6 +150,10 @@ fn calibrate_queue(
         label,
         cancel_ref,
         move |g: usize, job: &CalibrateJob| {
+            if stage_one_job_cancelled(&job.out, job.frame_id) {
+                tickers[g].tick(Some(job.frame_id));
+                return Err(CANCELLED_MARKER.to_string());
+            }
             let mut local_maps = hot_maps_snapshot.clone();
             let out = execute_generation(
                 &job.spec,
@@ -396,17 +400,15 @@ fn resolve_calibrate_job(
             ArtifactKind::Calibrated,
             Some(frame.frame_id),
         )?;
-        let mosaic_row = if want_mosaic {
-            crate::db::stacking::find_artifact(
-                &conn,
-                &rc.subject,
-                group_key,
-                ArtifactKind::CalibratedMosaic,
-                Some(frame.frame_id),
-            )?
-        } else {
-            None
-        };
+        // Read for every frame, not only under `want_mosaic`: with the debayer off an OSC frame's calibrated file
+        // takes the mosaic's name, and a mosaic row left over that file would read fresh over the new pixels.
+        let mosaic_row = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            group_key,
+            ArtifactKind::CalibratedMosaic,
+            Some(frame.frame_id),
+        )?;
         (existing, mosaic_row)
     };
     if rc.rerun_from != Some(Stage::Calibrate) {
@@ -438,8 +440,8 @@ fn resolve_calibrate_job(
     // land on the options it resolves from, not on a later copy.
     calibration_opts.format = crate::fits_writer::OutputFormat::Fits;
     // Perf tier 1 Task 6: this file is regenerable — the `stacking_artifacts`
-    // row above keys on the config hash plus (size, mtime), so a file a
-    // crash truncates is a cache miss on the next run, never a wrong answer.
+    // row above keys on the config hash plus the size, so a file a
+    // crash truncates is a size miss on the next run, never a wrong answer.
     // Skipping the fsync still keeps the write atomic (tmp + rename).
     calibration_opts.skip_fsync = true;
 
@@ -559,6 +561,38 @@ fn resolve_calibrate_job(
                 crate::fits_writer::OutputFormat::Fits,
             ))
     });
+
+    // The write order (a row is gone before the file it names is replaced): a cancelled or killed run then leaves no
+    // row of this hash over another config's file. `Reused` and `Excluded` returned above and delete nothing. The
+    // mosaic row goes too when the run wants a mosaic or its file is the one `out` overwrites.
+    {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::stacking::delete_artifact(
+            &conn,
+            &rc.subject,
+            group_key,
+            ArtifactKind::Calibrated,
+            Some(frame.frame_id),
+        )?;
+        let mosaic_names_out = mosaic_row
+            .as_ref()
+            .and_then(|row| row.path.as_deref())
+            .is_some_and(|path| Path::new(path) == out.as_path());
+        if want_mosaic || mosaic_names_out {
+            crate::db::stacking::delete_artifact(
+                &conn,
+                &rc.subject,
+                group_key,
+                ArtifactKind::CalibratedMosaic,
+                Some(frame.frame_id),
+            )?;
+        }
+        // Any other subject's row over a file this job writes goes too (two sets with one name share a root).
+        crate::db::stacking::delete_artifacts_naming_path(&conn, &out.to_string_lossy())?;
+        if let Some(mosaic_out) = &mosaic_out {
+            crate::db::stacking::delete_artifacts_naming_path(&conn, &mosaic_out.to_string_lossy())?;
+        }
+    }
 
     Ok(CalibrateResolved::Job(Box::new(CalibrateJob {
         frame_id: frame.frame_id,
@@ -885,6 +919,26 @@ pub(crate) const CALIBRATE_PLANES_RESIDENT_OSC: u64 = 5;
 /// this string, since [`RunError::Cancelled`] is handled before it would be
 /// formatted.
 pub(super) const CANCELLED_MARKER: &str = "__cancelled__";
+
+/// Test hook: a stage-1 worker (Calibrate or Prepare) whose output lies under a listed directory and whose frame id
+/// matches returns [`CANCELLED_MARKER`] without work, the shape of "the first unfinished job" in the commit loop. The
+/// cancel flag stays clear, so the later jobs still write their files.
+#[cfg(test)]
+pub(super) static STAGE_ONE_JOB_CANCELLED: std::sync::Mutex<Vec<(PathBuf, i64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn stage_one_job_cancelled(out: &Path, frame_id: i64) -> bool {
+    STAGE_ONE_JOB_CANCELLED
+        .lock()
+        .map(|hooks| hooks.iter().any(|(dir, id)| *id == frame_id && out.starts_with(dir)))
+        .unwrap_or(false)
+}
+
+#[cfg(not(test))]
+pub(super) fn stage_one_job_cancelled(_out: &Path, _frame_id: i64) -> bool {
+    false
+}
 
 /// Said once per run when Bayer drizzle is asked for but the OSC debayer is
 /// off, so stage 1 keeps no calibrated CFA mosaic (both stage-1 kinds).

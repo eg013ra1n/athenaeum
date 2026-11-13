@@ -1169,3 +1169,183 @@ fn prepare_uses_a_three_plane_replica_without_a_manifest_bayerpat_in_an_osc_grou
         }
     }
 }
+
+/// The file-identity write order (§4.2) at Prepare: a row is gone before the file it names is replaced. Run B
+/// (`debayer_osc` flipped, which moves the prepare hash) is cut short at its second frame; the later jobs already
+/// rewrote their `prepared/` files, so without the delete they would keep run A's row over them. The files of a mono
+/// light come out byte-equal whatever the flip, so this proves the delete order, not wrong pixels.
+#[test]
+fn a_cancelled_prepare_leaves_no_row_over_its_files() {
+    let rig = Pass1Rig::attested_16bit();
+    let frames: Vec<i64> = rig.plan_groups[0].frames.iter().map(|f| f.frame_id).collect();
+    assert_eq!(frames.len(), 4);
+    let cfg_a = StackingConfig::default();
+    rig.try_stage_one(&cfg_a).unwrap();
+    let rows_a = rig.rows(ArtifactKind::Calibrated);
+    assert_eq!(rows_a.len(), 4, "premise: run A prepared every frame");
+    for (frame_id, row) in &rows_a {
+        let path = Path::new(row.path.as_deref().unwrap());
+        assert!(path.starts_with(rig.layout.prepared_root()), "frame {frame_id}: {path:?}");
+    }
+
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.calibration.debayer_osc = !cfg_b.calibration.debayer_osc;
+    let res = rig.try_stage_one_with_job_cancelled(&cfg_b, rig.layout.prepared_root(), frames[1]);
+    assert!(matches!(res, Err(RunError::Cancelled)), "{res:?}");
+
+    let rows_b = rig.rows(ArtifactKind::Calibrated);
+    let first_b = rows_b.get(&frames[0]).expect("frame 1 was committed before the cancelled job");
+    assert_ne!(first_b.config_hash, rows_a[&frames[0]].config_hash, "frame 1 carries run B's hash");
+    for frame_id in &frames[1..] {
+        let old = &rows_a[frame_id];
+        assert!(Path::new(old.path.as_deref().unwrap()).is_file(), "frame {frame_id}'s file is still there");
+        assert!(
+            !rows_b.contains_key(frame_id),
+            "frame {frame_id} keeps a row over a file it may have been rewritten: {:?}",
+            rows_b.get(frame_id)
+        );
+    }
+
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&cfg_a));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs, "calibrate", "prepare"), 4, "{logs}");
+    for (frame_id, row) in rig.rows(ArtifactKind::Calibrated) {
+        assert_eq!(row.config_hash, rows_a[&frame_id].config_hash, "frame {frame_id} is back at A's hash");
+    }
+}
+
+/// The in-place rule (file-identity §4.1): a `calibrated` row that names the user's own light is fresh only while it
+/// names THIS frame's current input. After a relocate the row names the light's old path, where another file of the
+/// same size and the recorded time now sits: the gate counts that frame stale, and the run re-points the row without
+/// writing a byte under `prepared/` and without reading the pixels of pass 1 again.
+#[test]
+fn an_in_place_row_at_another_path_than_its_light_is_stale() {
+    let mut rig = Pass1Rig::attested();
+    let output = tempfile::tempdir().unwrap();
+    for (key, dir) in [
+        (crate::settings::keys::STACKING_WORKING_DIR, rig.working.path()),
+        (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+    ] {
+        crate::db::set_setting(&rig.fixture.conn, key, dir.to_str().unwrap()).unwrap();
+    }
+    let cached = |rig: &Pass1Rig| {
+        crate::stacking::plan::build_plan(
+            &rig.fixture.conn,
+            &rig.ctx.settings,
+            &crate::api::PathPolicy::AllowAll,
+            &rig.subject,
+            Some(rig.cfg.clone()),
+        )
+        .expect("the plan should build")
+        .groups[0]
+            .calibrated_cached
+    };
+
+    let first = rig.run("run 1", None);
+    assert_eq!(first.logged.len(), 4, "premise: run 1 measured every light");
+    let frame = rig.plan_groups[0].frames[0].clone();
+    let old_path = PathBuf::from(&frame.path);
+    let row = rig.rows(ArtifactKind::Calibrated)[&frame.frame_id].clone();
+    assert_eq!(Path::new(row.path.as_deref().unwrap()), old_path, "premise: the row names the light in place");
+    let n = cached(&rig);
+    assert_eq!(n, 4, "premise: the gate reads every in-place row as cached");
+
+    // The light moves: a copy that keeps its time, the catalog row follows (as a relocate does), and another file of
+    // the same size carrying the recorded time is left at the old path.
+    let mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+    let new_path = old_path.with_file_name("moved_f0.fits");
+    std::fs::copy(&old_path, &new_path).unwrap();
+    let stamp = |path: &Path| {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(mtime).unwrap();
+    };
+    stamp(&new_path);
+    let mut bytes = std::fs::read(&old_path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&old_path, &bytes).unwrap();
+    stamp(&old_path);
+    assert_eq!(std::fs::metadata(&old_path).unwrap().len(), row.size.unwrap() as u64, "premise: the decoy has the recorded size");
+    assert_eq!(std::fs::metadata(&old_path).unwrap().modified().unwrap(), mtime, "premise: and the recorded time");
+    rig.fixture
+        .conn
+        .execute(
+            "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
+            rusqlite::params![new_path.to_str().unwrap(), "moved_f0.fits", old_path.to_str().unwrap()],
+        )
+        .unwrap();
+    assert_eq!(cached(&rig), 3, "the row at the old path is not this frame's input");
+
+    // The run takes `GroupFrame.path` from the plan groups: recompute them.
+    let (groups, origins) =
+        frame_source(&rig.fixture.conn, &rig.subject, &rig.cfg).unwrap();
+    assert_eq!(groups[0].frames.iter().find(|f| f.frame_id == frame.frame_id).unwrap().path, new_path.to_string_lossy());
+    rig.plan_groups = groups;
+    rig.set_origins(origins);
+    let second = rig.run("run 2", None);
+
+    let prepared = rig.layout.prepared_root();
+    let written = std::fs::read_dir(&prepared).map_or(0, |entries| entries.count());
+    assert_eq!(written, 0, "an in-place frame writes nothing under prepared/");
+    let row_after = rig.rows(ArtifactKind::Calibrated)[&frame.frame_id].clone();
+    assert_eq!(Path::new(row_after.path.as_deref().unwrap()), new_path, "the row is re-pointed at the current input");
+    assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
+    assert_eq!(cached(&rig), 4);
+}
+
+/// Review F2 (file-identity §4.1): a Prepare subject's own files written in a previous working folder stay fresh in
+/// the gate, as they do in the run (a `Write` action has no path expectation). The run recorded W1; the setting then
+/// moves to W2; the gate counts every frame cached (the rows sit under a folder the subject's runs recorded) and the
+/// next run prepares none.
+#[test]
+fn a_previous_working_folders_prepared_rows_stay_fresh_in_the_gate() {
+    let rig = Pass1Rig::attested_16bit();
+    let cfg = rig.cfg.clone();
+    rig.try_stage_one(&cfg).unwrap();
+    let rows = rig.rows(ArtifactKind::Calibrated);
+    assert_eq!(rows.len(), 4, "premise: the run prepared every frame");
+    for (frame_id, row) in &rows {
+        let path = Path::new(row.path.as_deref().unwrap());
+        assert!(path.starts_with(rig.layout.prepared_root()), "frame {frame_id}: {path:?}");
+    }
+
+    let output = tempfile::tempdir().unwrap();
+    let moved = tempfile::tempdir().unwrap();
+    for (key, dir) in [
+        (crate::settings::keys::STACKING_WORKING_DIR, moved.path()),
+        (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+    ] {
+        crate::db::set_setting(&rig.fixture.conn, key, dir.to_str().unwrap()).unwrap();
+    }
+    let plan = crate::stacking::plan::build_plan(
+        &rig.fixture.conn,
+        &rig.ctx.settings,
+        &crate::api::PathPolicy::AllowAll,
+        &rig.subject,
+        Some(cfg.clone()),
+    )
+    .expect("the plan should build");
+    assert_eq!(plan.groups[0].calibrated_cached, 4, "the gate reads the previous folder's rows as cached");
+
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&cfg));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs, "calibrate", "prepare"), 0, "{logs}");
+}
+
+/// Review F1 (file-identity §4.2), at Prepare: the other same-named set's rows over the `prepared/` files this run
+/// rewrites (`debayer_osc` flipped, which moves the prepare hash) are retired with the writer's own.
+#[test]
+fn a_same_named_sets_prepare_retires_the_other_sets_rows() {
+    let rig = Pass1Rig::attested_16bit();
+    let cfg_a = rig.cfg.clone();
+    rig.try_stage_one(&cfg_a).unwrap();
+    let other = same_named_set_with_copies_of_the_calibrated_rows(&rig);
+    assert_eq!(rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated).len(), 4, "premise: the copies stand");
+
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.calibration.debayer_osc = !cfg_b.calibration.debayer_osc;
+    rig.try_stage_one(&cfg_b).unwrap();
+
+    let other_rows = rows_of_kind(&rig.fixture.conn, other, ArtifactKind::Calibrated);
+    assert!(other_rows.is_empty(), "the other set keeps rows over rewritten files: {other_rows:?}");
+}

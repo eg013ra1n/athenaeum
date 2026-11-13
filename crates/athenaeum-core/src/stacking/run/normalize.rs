@@ -1067,6 +1067,27 @@ pub(super) fn run_group_normalization(
         }
     }
 
+    // The write order (file-identity spec §4.2): a member's `ln` row is gone before its sidecar is rewritten, so a
+    // cancelled or killed run leaves no row of the old hash over a file of another config. `ln_global` is
+    // payload-only (no file) and stays.
+    if !needs_normalize.is_empty() {
+        let conn = db(&rc.ctx)?.conn();
+        for &i in &needs_normalize {
+            crate::db::stacking::delete_artifact(
+                &conn,
+                &rc.subject,
+                &group.key,
+                ArtifactKind::Ln,
+                Some(members[i].frame_id),
+            )?;
+            // Any other subject's row over this sidecar goes too (two sets with one name share a root).
+            crate::db::stacking::delete_artifacts_naming_path(
+                &conn,
+                &sidecar_paths[i].to_string_lossy(),
+            )?;
+        }
+    }
+
     let total = members.len();
     // Members plus the seeds-calibration frames counted above: the units the
     // Normalize row climbs through, in order, without a reset.
@@ -1135,6 +1156,15 @@ pub(super) fn run_group_normalization(
     let ticker_ref = &ticker;
     let member_ids: Vec<i64> = members.iter().map(|m| m.frame_id).collect();
     let member_ids_ref: &[i64] = &member_ids;
+    #[cfg(test)]
+    {
+        let listed = LN_CANCEL_BEFORE_FAN_OUT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if listed.iter().any(|dir| rc.layout.root.starts_with(dir)) {
+            rc.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     let results = fan_out(
         needs_normalize.clone(),
         &AdmissionGate::budgeted(rc, working_set_bytes, 0, admission_n),
@@ -1763,6 +1793,25 @@ fn build_and_write_ln_reference(
         Card::new("ATH_STKG", CardValue::Str(group.key.clone()))
             .map_err(|e| RunError::Other(format!("building LN reference cards: {e}")))?,
     ];
+    // The write order (file-identity spec §4.2): the old row is gone before its file is replaced. A failed delete
+    // stops the run. The new row is upserted after the saturation map, which honours a cancel in between; the row is
+    // already gone then, so a cancel leaves none. Any other subject's row over the reference or its map goes too
+    // (two sets with one name share a root).
+    {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::stacking::delete_artifact(
+            &conn,
+            &rc.subject,
+            &group.key,
+            ArtifactKind::LnReference,
+            None,
+        )?;
+        crate::db::stacking::delete_artifacts_naming_path(&conn, &reference_path.to_string_lossy())?;
+        crate::db::stacking::delete_artifacts_naming_path(
+            &conn,
+            &rc.layout.ln_reference_saturation_path(&group.key).to_string_lossy(),
+        )?;
+    }
     write_reference(&built, &reference_path, &cards)
         .map_err(|e| RunError::Other(format!("writing LN reference: {e:#}")))?;
 
@@ -1885,6 +1934,12 @@ fn build_and_write_ln_reference(
 
     Ok((built, masks))
 }
+
+/// Test hook: when the run's working root lies under a listed directory, the cancel flag is set right before the
+/// normalize fan-out, after the stale members' `ln` rows were deleted and before any sidecar is written.
+#[cfg(test)]
+pub(super) static LN_CANCEL_BEFORE_FAN_OUT: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 #[path = "normalize_tests.rs"]

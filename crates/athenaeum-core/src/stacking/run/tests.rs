@@ -559,11 +559,40 @@ pub(super) fn rows_of_kind(
         .collect()
 }
 
+/// Another frame set with the SAME NAME as the rig's (two sets may share a name, so one working root), carrying a copy
+/// of every `Calibrated` row of the rig's set: the rows a second subject keeps over files the first subject writes.
+pub(super) fn same_named_set_with_copies_of_the_calibrated_rows(rig: &Pass1Rig) -> i64 {
+    rig.fixture
+        .conn
+        .execute("INSERT INTO frames_set (name) VALUES (?1)", [SET_NAME])
+        .unwrap();
+    let other = rig.fixture.conn.last_insert_rowid();
+    let subject = StackSubject::FrameSet(other);
+    for (frame_id, row) in rig.rows(ArtifactKind::Calibrated) {
+        crate::db::stacking::upsert_artifact(
+            &rig.fixture.conn,
+            &crate::db::stacking::NewArtifact {
+                subject: &subject,
+                frame_id: Some(frame_id),
+                group_key: &row.group_key,
+                kind: ArtifactKind::Calibrated,
+                path: row.path.as_deref(),
+                config_hash: &row.config_hash,
+                size: row.size,
+                modified_at: row.modified_at.as_deref(),
+                payload_json: row.payload_json.as_deref(),
+            },
+        )
+        .unwrap();
+    }
+    other
+}
+
 /// Plan A Task 11c: four mono frames of `seed_star_group` measured one Measure stage at a time on the test pool's
 /// one thread (admission 1), with what the Step 1 tests count.
 pub(super) struct Pass1Rig {
     _tmp: tempfile::TempDir,
-    ctx: Arc<ServiceContext>,
+    pub(super) ctx: Arc<ServiceContext>,
     pub(super) fixture: test_fixtures::Fixture,
     pub(super) working: tempfile::TempDir,
     output: tempfile::TempDir,
@@ -656,6 +685,74 @@ impl Pass1Rig {
         rig
     }
 
+    /// Replace the run's frame origins (a test that recomputes `plan_groups` after the catalog moved a light).
+    pub(super) fn set_origins(&mut self, origins: FrameOrigins) {
+        self.origins = Some(origins);
+    }
+
+    /// As [`Self::attested`], but the lights stay the fixture's 16-bit mono files: Prepare converts them into the
+    /// unit domain under `prepared/` (the rig of a Prepare write-order test).
+    pub(super) fn attested_16bit() -> Pass1Rig {
+        let mut rig = Pass1Rig::new();
+        rig.fixture
+            .conn
+            .execute(
+                "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                [rig.fixture.set_id],
+            )
+            .unwrap();
+        let (groups, origins) = frame_source(&rig.fixture.conn, &rig.subject, &rig.cfg).unwrap();
+        rig.group_key = groups[0].key.clone();
+        rig.plan_groups = groups;
+        rig.origins = Some(origins);
+        rig
+    }
+
+    /// Stage 1 only (Calibrate, or Prepare for an attested set) at `cfg`, in a fresh run context on this rig's
+    /// working tree. The frame ids of the group, in the order its jobs run, are `plan_groups[0].frames`.
+    pub(super) fn try_stage_one(&self, cfg: &StackingConfig) -> Result<(), RunError> {
+        let (run_id, group_ids) = seed_run_and_groups(
+            &self.fixture.conn,
+            self.fixture.set_id,
+            &self.plan_groups,
+            self.working.path(),
+            self.output.path(),
+        );
+        let mut rc = test_context(
+            self.ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            self.fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            self.plan_groups.clone(),
+            self.layout.clone(),
+            self.output.path().to_path_buf(),
+            group_ids,
+        );
+        if let Some(origins) = &self.origins {
+            // The memo carries the origins too: an attested set's rows must carry the hash the gate computes.
+            rc.memo = HashMemo::new(origins.clone());
+            rc.origins = origins.clone();
+        }
+        stage_calibrate(&mut rc)
+    }
+
+    /// Stage 1 at `cfg` with the stage-one worker of `frame_id` (writing under `dir`) ended `Cancelled` without
+    /// work, the way "the first unfinished job" ends in the commit loop; the cancel flag stays clear, so the
+    /// later jobs still write their files.
+    pub(super) fn try_stage_one_with_job_cancelled(
+        &self,
+        cfg: &StackingConfig,
+        dir: PathBuf,
+        frame_id: i64,
+    ) -> Result<(), RunError> {
+        STAGE_ONE_JOB_CANCELLED.lock().unwrap().push((dir.clone(), frame_id));
+        let result = self.try_stage_one(cfg);
+        STAGE_ONE_JOB_CANCELLED.lock().unwrap().retain(|(d, id)| !(d == &dir && *id == frame_id));
+        result
+    }
+
     pub(super) fn run(&self, label: &str, rerun_from: Option<Stage>) -> Pass1Out {
         self.try_run(rerun_from, None)
             .unwrap_or_else(|e| panic!("{label}: {e:?}"))
@@ -691,6 +788,8 @@ impl Pass1Rig {
         );
         rc.rerun_from = rerun_from;
         if let Some(origins) = &self.origins {
+            // The memo carries the origins too: an attested set's rows must carry the hash the gate computes.
+            rc.memo = HashMemo::new(origins.clone());
             rc.origins = origins.clone();
         }
         if let Some(n) = cancel_after {
