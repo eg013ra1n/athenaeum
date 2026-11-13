@@ -1115,6 +1115,18 @@ pub fn delete_artifacts_naming_path(conn: &Connection, path: &str) -> Result<usi
 /// The SQL of [`delete_artifacts_naming_path`]: a search on `idx_stacking_artifacts_path`.
 const DELETE_ARTIFACTS_NAMING_PATH_SQL: &str = "DELETE FROM stacking_artifacts WHERE path = ?1";
 
+/// Points the artifact row `row_id` at `new` when it still names `old`: a point update on the row's id that changes
+/// nothing else. Returns whether a row changed; `false` is a row that went or moved since it was read (a concurrent
+/// writer re-recorded it), which the caller leaves as it is. Used by [`crate::stacking::rebase`] when a working folder
+/// moved and the file is found at the mapped place; the file itself is never touched here.
+pub fn rebase_artifact_path(conn: &Connection, row_id: i64, old: &str, new: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE stacking_artifacts SET path = ?3 WHERE id = ?1 AND path = ?2",
+        params![row_id, old, new],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn list_artifacts(
     conn: &Connection,
     subject: &StackSubject,
