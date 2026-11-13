@@ -144,7 +144,7 @@ fn stamp_and_sync(tmp: &Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     let f = fs::File::open(tmp)?;
     f.set_modified(std::time::SystemTime::now())?;
-    f.sync_all()
+    crate::zip_store::fs::sync_best_effort(&f, tmp)
 }
 
 /// Refuse a placement whose destination resolves to the source itself (an

@@ -5369,13 +5369,19 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   a move) is reused at once on any volume, a copy that resets times is not adopted, because an older diverged copy passes key + size alone
   and only the time tells it from the copy a row was recorded over. A row left where it is is read there while its file is at the old
   place; one whose file is nowhere (not at the mapped place and not at the old one) AND is read by a stage is counted, and the plan and the
-  run say so once: "N cached files were not found in the working folder … as recorded", their frames are recomputed
-  (`rebase::left_warning`). A row no stage reads (a manually excluded frame, a frame out of the set, the mosaic with Bayer drizzle off, LN
-  files with LN off) is never counted, so the warning is gone after the one run that recomputed what it names: the plan counts the rows its
-  gate reads (`RebaseView::left_gone`, asked after the gate's reads), the run the rows of in-scope frames of a kind it reads with its config
+  run say so once, counting FRAMES (the distinct frames among the counted rows, so the plan and the run say the same number for the same
+  situation): "The cached files of N frames from an earlier working folder were not found in <folder> (missing, another size, or a time
+  more than 2 s off); those frames are recomputed." (group-level files, such as the LN reference, are named only when no frame is counted:
+  "N cached group files …; they are rebuilt") (`rebase::left_warning`, input `rebase::LeftGone`). A row no stage reads (a manually excluded frame, a frame out of the set, the mosaic with Bayer drizzle off, LN
+  files with LN off) is never counted, so the warning is gone after the one run that recomputed what it names: the plan counts the frames of the rows its
+  gate reads (`RebaseView::left_gone`, asked after the gate's reads), the run the frames of in-scope rows of a kind it reads with its config
   (`RunReads`; it may count fewer than the plan, never more). An in-place `calibrated` row (a user's own file) is never a candidate: it
   names no kind subtree of a working root (a path under `<root>/landed/` or outside the root maps to nothing). Nothing on disk is moved,
   copied or deleted: the only write is one `BEGIN IMMEDIATE` transaction of path updates, and the old folder is left as it was.
+  A working or output folder may sit on a network share that refuses a full sync (SMB: `fcntl(F_FULLFSYNC)` answers `ENOTSUP`, which is
+  what `File::sync_all` asks for on macOS): every writer of the FITS/XISF/`.athln` family and the header patchers flush through
+  `zip_store::fs::sync_best_effort`, which falls back to a plain `fsync` and, failing that, leaves the file to the file system, one `debug!`
+  each; any other sync error (EIO, ENOSPC) is still an error. Found on the first real-share acceptance, when the LN reference was never written.
   Who does it: the run's trigger (`rebase_working_rows`) rebases once at the top of stage 1, before the inputs are sampled; the plan gate and
   Blink write nothing and read through `rebase::RebaseView` instead (candidates read under their connection and judged with the same
   verdict as `check`; no candidate, no file system call). The files are probed by FOLDER, not by row (`rebase::Prober`): each mapped folder

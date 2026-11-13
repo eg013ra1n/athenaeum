@@ -145,7 +145,7 @@ pub fn write_fits_f32_with(
         if durability == Durability::Durable {
             // Power-loss durability: data must be on disk before the rename
             // makes the file visible under its final name.
-            w.get_ref().sync_all()?;
+            crate::zip_store::fs::sync_best_effort(w.get_ref(), &tmp)?;
         }
         Ok(())
     })();
@@ -287,7 +287,7 @@ pub fn write_fits_f32_streaming_with(
         write_fits_f32_streaming_to(&mut w, width, height, channels, cards, &mut plane)?;
         w.flush()?;
         if durability == Durability::Durable {
-            w.get_ref().sync_all()?;
+            crate::zip_store::fs::sync_best_effort(w.get_ref(), &tmp)?;
         }
         Ok(())
     })();

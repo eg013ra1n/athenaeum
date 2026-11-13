@@ -410,7 +410,7 @@ pub fn write_xisf_f32_with(
         if durability == Durability::Durable {
             // Power-loss durability: data must be on disk before the rename
             // makes the file visible under its final name.
-            w.get_ref().sync_all()?;
+            crate::zip_store::fs::sync_best_effort(w.get_ref(), &tmp)?;
         }
         Ok(())
     })();

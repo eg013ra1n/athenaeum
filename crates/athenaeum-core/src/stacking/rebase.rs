@@ -707,17 +707,18 @@ impl RebaseView {
         Some(row)
     }
 
-    /// How many of the rows `apply` was asked for were left and are nowhere either: the count of [`left_warning`].
-    /// Read it AFTER the reads it should cover; one stat per such row, none for a row nobody asked for.
-    pub(crate) fn left_gone(&self) -> usize {
+    /// The rows `apply` was asked for that were left and are nowhere either, counted as [`LeftGone`] (the input of
+    /// [`left_warning`]). Read it AFTER the reads it should cover; one stat per such row, none for a row nobody asked
+    /// for.
+    pub(crate) fn left_gone(&self) -> LeftGone {
+        let mut gone = LeftGone::default();
         let Ok(asked) = self.asked.lock() else {
-            return 0;
+            return gone;
         };
-        asked
-            .iter()
-            .filter_map(|id| self.left.get(id))
-            .filter(|c| is_gone_at_old_place(c, true))
-            .count()
+        for c in asked.iter().filter_map(|id| self.left.get(id)).filter(|c| is_gone_at_old_place(c, true)) {
+            gone.add(c);
+        }
+        gone
     }
 
     /// How many rows read through the view as moved.
@@ -727,13 +728,74 @@ impl RebaseView {
     }
 }
 
-/// The warning for the rows that were not found where the old folder had them: said once per run (T8b) and once per
-/// gate (T8c), never per file.
-pub(crate) fn left_warning(n: usize, root: &Path) -> String {
-    format!(
-        "{n} cached files were not found in the working folder {} as recorded (missing, another size, or a time more than 2 s off); their frames are recomputed.",
-        root.display()
-    )
+/// The cached files that were left at an earlier working folder and are nowhere either, counted the way an
+/// astrophotographer counts: frames, not files. A frame owns several files (calibrated, measured, registered, LN), so
+/// a file count would differ between the plan, which reads some kinds, and the run, which rewrites all of them; the
+/// distinct frames do not. A group-level file (the LN reference) has no frame and is counted apart.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LeftGone {
+    frames: std::collections::HashSet<i64>,
+    group_files: usize,
+    rows: usize,
+}
+
+impl LeftGone {
+    /// Counts one left row that is gone.
+    pub(crate) fn add(&mut self, c: &Candidate) {
+        self.rows += 1;
+        match c.frame_id {
+            Some(frame) => {
+                self.frames.insert(frame);
+            }
+            None => self.group_files += 1,
+        }
+    }
+
+    /// The distinct frames among the counted rows.
+    pub(crate) fn frames(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// A count of `n` distinct frames, for a test that asserts the warning's text.
+    #[cfg(test)]
+    pub(crate) fn of_frames(n: usize) -> Self {
+        Self { frames: (0..n as i64).collect(), group_files: 0, rows: n }
+    }
+
+    /// The counted rows with no frame.
+    pub(crate) fn group_files(&self) -> usize {
+        self.group_files
+    }
+
+    /// Every counted row, whatever it belongs to.
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// The warning for the files that were not found where an earlier working folder had them: said once per run (T8b)
+/// and once per gate (T8c), never per file. It names frames; group-level files are named only when no frame is
+/// counted. `None` when nothing is counted.
+pub(crate) fn left_warning(gone: &LeftGone, root: &Path) -> Option<String> {
+    const WHY: &str = "(missing, another size, or a time more than 2 s off)";
+    let root = root.display();
+    let frames = gone.frames();
+    if frames > 0 {
+        let (noun, tail) = if frames == 1 { ("frame", "that frame is") } else { ("frames", "those frames are") };
+        return Some(format!(
+            "The cached files of {frames} {noun} from an earlier working folder were not found in {root} {WHY}; {tail} recomputed."
+        ));
+    }
+    let n = gone.group_files();
+    if n > 0 {
+        let (noun, verb, tail) =
+            if n == 1 { ("file", "was", "it is") } else { ("files", "were", "they are") };
+        return Some(format!(
+            "{n} cached group {noun} from an earlier working folder {verb} not found in {root} {WHY}; {tail} rebuilt."
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1258,7 +1320,7 @@ mod tests {
 
         let view = RebaseView::for_gate(&w.f.conn, &w.subject, &w.new_root()).unwrap();
         assert_eq!(view.moved(), 2);
-        assert_eq!(view.left_gone(), 0, "no row was asked for yet");
+        assert_eq!(view.left_gone().rows(), 0, "no row was asked for yet");
         assert_eq!(
             view.apply(row(ArtifactKind::Calibrated, 1)).unwrap().path.unwrap(),
             new("calibrated", "c_a_f1.fits").to_str().unwrap()
@@ -1278,10 +1340,11 @@ mod tests {
         );
         assert!(view.apply(None).is_none());
         assert_eq!(
-            view.left_gone(),
+            view.left_gone().rows(),
             1,
             "of the rows asked for, only the one whose file is nowhere is counted; a row nobody asked for is not"
         );
+        assert_eq!(view.left_gone().frames(), 1, "the one row belongs to frame 2");
         // A row a writer re-recorded elsewhere since the candidates were read is not touched.
         let mut moved_since = row(ArtifactKind::Calibrated, 1).unwrap();
         moved_since.path = Some("/elsewhere/c.fits".into());
@@ -1289,9 +1352,9 @@ mod tests {
 
         // Blink's view: the `registered` rows of the asked frames only.
         let blink = RebaseView::for_registered(&w.f.conn, &w.subject, &w.new_root(), &[2]).unwrap();
-        assert_eq!((blink.moved(), blink.left_gone()), (1, 0));
+        assert_eq!((blink.moved(), blink.left_gone().rows()), (1, 0));
         let blink = RebaseView::for_registered(&w.f.conn, &w.subject, &w.new_root(), &[1]).unwrap();
-        assert_eq!((blink.moved(), blink.left_gone()), (0, 0), "frame 1's file is still at the old place");
+        assert_eq!((blink.moved(), blink.left_gone().rows()), (0, 0), "frame 1's file is still at the old place");
         assert_eq!(
             RebaseView::for_registered(&w.f.conn, &w.subject, &w.new_root(), &[]).unwrap().moved(),
             0
@@ -1308,7 +1371,7 @@ mod tests {
             none.apply(row(ArtifactKind::Calibrated, 1)).unwrap().path.unwrap(),
             old_cal.to_str().unwrap()
         );
-        assert!((none.moved(), none.left_gone()) == (0, 0));
+        assert!((none.moved(), none.left_gone().rows()) == (0, 0));
         let lone = crate::stacking::test_fixtures::frame_set("Lone");
         let lone_subject = StackSubject::FrameSet(lone.set_id);
         insert_run(
@@ -1325,7 +1388,7 @@ mod tests {
         )
         .unwrap();
         let view = RebaseView::for_gate(&lone.conn, &lone_subject, &w.new_wd.join("Lone")).unwrap();
-        assert!((view.moved(), view.left_gone()) == (0, 0));
+        assert!((view.moved(), view.left_gone().rows()) == (0, 0));
     }
 
     fn reset_counts() {
@@ -1368,7 +1431,7 @@ mod tests {
         assert!(view.apply(row(ArtifactKind::Calibrated, 1)).is_some());
         assert!(view.apply(row(ArtifactKind::Registered, 2)).is_some());
         reset_counts();
-        assert_eq!(view.left_gone(), 0);
+        assert_eq!(view.left_gone().rows(), 0);
         assert_eq!(counts(), (0, 2), "a stat for each of the two asked rows, none for the other five");
 
         // The new root holds the folder but not the names: still one listing per folder, no stat.
@@ -1402,7 +1465,7 @@ mod tests {
         .unwrap();
         reset_counts();
         let view = RebaseView::for_gate(&lone.conn, &lone_subject, &w.new_wd.join("Lone")).unwrap();
-        assert_eq!((view.moved(), view.left_gone(), counts()), (0, 0, (0, 0)));
+        assert_eq!((view.moved(), view.left_gone().rows(), counts()), (0, 0, (0, 0)));
     }
 
     /// The listing only short-cuts `Missing`: over a mapped folder that holds a moved file, one of another size, a
@@ -1459,11 +1522,61 @@ mod tests {
         assert_eq!(prober.check(&mixed), check(&mixed));
     }
 
+    fn gone_row(frame_id: Option<i64>, kind: ArtifactKind) -> Candidate {
+        Candidate {
+            row_id: 1,
+            kind: kind.as_db_str().to_string(),
+            frame_id,
+            group_key: "g".into(),
+            old_path: "/w/M31/x".into(),
+            old_root: pb("/w/M31"),
+            mapped: pb("/n/M31/x"),
+            size: 1,
+            modified_at: String::new(),
+        }
+    }
+
+    /// The warning counts distinct frames (a frame owns several files), names the earlier folder, and names group
+    /// files only when no frame is counted.
     #[test]
-    fn rebase_left_warning_counts_the_files_and_names_the_folder() {
-        let s = left_warning(3, Path::new("/w/M31"));
-        assert!(s.starts_with("3 cached files were not found in the working folder "));
-        assert!(s.contains("M31"));
-        assert!(s.ends_with("their frames are recomputed."));
+    fn rebase_left_warning_counts_the_frames_and_names_the_folder() {
+        let root = Path::new("/w/M31");
+        let mut gone = LeftGone::default();
+        assert_eq!(left_warning(&gone, root), None);
+
+        gone.add(&gone_row(None, ArtifactKind::LnReference));
+        let s = left_warning(&gone, root).unwrap();
+        assert!(s.starts_with("1 cached group file from an earlier working folder was not found in "), "{s}");
+        assert!(s.ends_with("; it is rebuilt."), "{s}");
+
+        for (frame, kind) in [
+            (1, ArtifactKind::Calibrated),
+            (1, ArtifactKind::Registered),
+            (1, ArtifactKind::Ln),
+            (2, ArtifactKind::Calibrated),
+            (3, ArtifactKind::Measured),
+        ] {
+            gone.add(&gone_row(Some(frame), kind));
+        }
+        assert_eq!((gone.rows(), gone.frames(), gone.group_files()), (6, 3, 1));
+        let s = left_warning(&gone, root).unwrap();
+        assert!(s.starts_with("The cached files of 3 frames from an earlier working folder were not found in "), "{s}");
+        assert!(s.contains("M31"), "{s}");
+        assert!(s.contains("(missing, another size, or a time more than 2 s off)"), "{s}");
+        assert!(s.ends_with("; those frames are recomputed."), "{s}");
+
+        let mut one = LeftGone::default();
+        one.add(&gone_row(Some(7), ArtifactKind::Calibrated));
+        one.add(&gone_row(Some(7), ArtifactKind::Registered));
+        let s = left_warning(&one, root).unwrap();
+        assert!(s.starts_with("The cached files of 1 frame from an earlier working folder were not found in "), "{s}");
+        assert!(s.ends_with("; that frame is recomputed."), "{s}");
+
+        let mut groups = LeftGone::default();
+        groups.add(&gone_row(None, ArtifactKind::LnReference));
+        groups.add(&gone_row(None, ArtifactKind::LnReference));
+        let s = left_warning(&groups, root).unwrap();
+        assert!(s.starts_with("2 cached group files from an earlier working folder were not found in "), "{s}");
+        assert!(s.ends_with("; they are rebuilt."), "{s}");
     }
 }
