@@ -584,15 +584,16 @@ pub(crate) fn add_raw_linked_calibration_with_count(
 /// (`db::bank_strong_hash`) both compare against these two columns, so a
 /// fixture that fakes them would pass generation today and silently stop
 /// meaning anything the moment either of those checks the fixture.
-pub(crate) fn modified_at_of(path: &Path) -> String {
-    file_identity(path).1
-}
-
 fn file_identity(path: &Path) -> (i64, String) {
     let meta = std::fs::metadata(path).expect("fixture file exists after writing");
     let modified = meta.modified().expect("fixture filesystem supports mtime");
     let modified_at = chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339();
     (meta.len() as i64, modified_at)
+}
+
+/// The `modified_at` half of [`file_identity`]: a fixture file's time as the scanner stores it.
+pub(crate) fn modified_at_of(path: &Path) -> String {
+    file_identity(path).1
 }
 
 /// The content index's effect on a fixture catalog, for a test that forms a stage-1 hash before any

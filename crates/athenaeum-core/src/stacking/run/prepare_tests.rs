@@ -1445,6 +1445,66 @@ fn a_previous_working_folders_prepared_rows_stay_fresh_in_the_gate() {
     assert_eq!(fan_out_items(&logs, "calibrate", "prepare"), 0, "{logs}");
 }
 
+/// FI-11's own-file side for a Prepare subject: a `prepared/` file is Athenaeum's own, so it is fresh only while its
+/// modification time is within 2 s of its row's, unlike the user's light that a row names in place. After run 1 one
+/// converted file is rewritten with other bytes of the same size and a time 10 s later (what another catalog's build
+/// leaves over this one's file); the gate counts one frame fewer cached, the run prepares exactly that frame, and the
+/// file holds run 1's bytes again. Pins both choosers: the run's `row_fresh` and the gate's.
+#[test]
+fn a_prepared_file_another_catalog_rewrote_is_not_read_as_fresh() {
+    let rig = Pass1Rig::attested_16bit();
+    let output = tempfile::tempdir().unwrap();
+    for (key, dir) in [
+        (crate::settings::keys::STACKING_WORKING_DIR, rig.working.path()),
+        (crate::settings::keys::STACKING_OUTPUT_DIR, output.path()),
+    ] {
+        crate::db::set_setting(&rig.fixture.conn, key, dir.to_str().unwrap()).unwrap();
+    }
+    let cached = |rig: &Pass1Rig| {
+        crate::stacking::plan::build_plan(
+            &rig.fixture.conn,
+            &rig.ctx.settings,
+            &crate::api::PathPolicy::AllowAll,
+            &rig.subject,
+            Some(rig.cfg.clone()),
+        )
+        .expect("the plan should build")
+        .groups[0]
+            .calibrated_cached
+    };
+    let cfg = rig.cfg.clone();
+    let (res, logs1) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&cfg));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs1, "calibrate", "prepare"), 4, "premise: run 1 prepared every frame: {logs1}");
+    let rows = rig.rows(ArtifactKind::Calibrated);
+    assert_eq!(rows.len(), 4, "premise: one row per frame");
+    assert_eq!(cached(&rig), 4, "premise: the gate reads every prepared row as cached");
+
+    let frame = rig.plan_groups[0].frames[0].clone();
+    let path = PathBuf::from(rows[&frame.frame_id].path.clone().unwrap());
+    assert!(path.starts_with(rig.layout.prepared_root()), "premise: a converted file under prepared/: {path:?}");
+    let original = std::fs::read(&path).unwrap();
+    let recorded = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let mut planted = original.clone();
+    let middle = planted.len() / 2;
+    planted[middle] ^= 0xFF;
+    std::fs::write(&path, &planted).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(recorded + std::time::Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), rows[&frame.frame_id].size.unwrap() as u64, "premise: the recorded size");
+
+    assert_eq!(cached(&rig), 3, "the gate reads the rewritten prepared file as not cached");
+    let (res, logs2) = crate::stacking::telemetry::capture_logs(|| rig.try_stage_one(&cfg));
+    res.unwrap();
+    assert_eq!(fan_out_items(&logs2, "calibrate", "prepare"), 1, "the run prepares exactly the rewritten frame: {logs2}");
+    assert_eq!(std::fs::read(&path).unwrap(), original, "the file holds run 1's bytes again");
+    assert_eq!(cached(&rig), 4, "the gate reads every row as cached after the run");
+}
+
 /// Review F1 (file-identity §4.2), at Prepare: the other same-named set's rows over the `prepared/` files this run
 /// rewrites (`debayer_osc` flipped, which moves the prepare hash) are retired with the writer's own.
 #[test]

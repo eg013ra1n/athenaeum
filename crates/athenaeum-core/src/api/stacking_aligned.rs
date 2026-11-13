@@ -805,6 +805,8 @@ mod tests {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             file.write_all(b"x").unwrap();
+            // The append moved the time too: put it back, so this step tests the size alone.
+            file.set_modified(recorded).unwrap();
         }
         assert_eq!(states(&s, run_id), expected);
         assert!(matches!(

@@ -381,14 +381,19 @@ fn count_stat() {
     STATS.with(|n| n.set(n.get() + 1));
 }
 
-/// Whether a candidate that was left is nowhere: its file is not at the old place either (the row's own size is the
-/// one identity, as every own working file's). Only such a row is counted in [`left_warning`]; one whose file is still
-/// at the old place is read there. One stat; `quiet` logs an unreadable place at `debug!` (the gate), not `warn!`
-/// (the run). The run's trigger and the gate's view count with this one rule.
+/// Whether a candidate that was left is nowhere: its file is not at the old place either, judged as every own working
+/// file is (FI-11): the row's size AND a time within the tolerance of the row's. A same-size file with another time is
+/// not the file the row recorded (`is_fresh` refuses it and the frame is recomputed), so it counts as gone here and
+/// the warning is shown. Only such a row is counted in [`left_warning`]; one whose file is still at the old place is
+/// read there. One stat; `quiet` logs an unreadable place at `debug!` (the gate), not `warn!` (the run). The run's
+/// trigger and the gate's view count with this one rule.
 pub(crate) fn is_gone_at_old_place(c: &Candidate, quiet: bool) -> bool {
     count_stat();
     match std::fs::metadata(&c.old_path) {
-        Ok(meta) => i64::try_from(meta.len()).map_or(true, |len| len != c.size),
+        Ok(meta) => {
+            let same_size = i64::try_from(meta.len()).is_ok_and(|len| len == c.size);
+            !(same_size && meta.modified().is_ok_and(|live| within_tolerance(live, &c.modified_at)))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
             if quiet {
@@ -1296,6 +1301,14 @@ mod tests {
         write_file(&old_reg1, 70);
         w.add_real_row(ArtifactKind::Registered, 1, &old_reg1);
         write_file(&new("registered", "r_a_f1.fits"), 71);
+        // Left, and at the old place a file of the recorded size but another time (another catalog's rewrite): it is
+        // not the file the row recorded, so it is counted as gone like a missing one.
+        let old_reg3 = old("registered", "r_a_f3.fits");
+        write_file(&old_reg3, 80);
+        set_time(&old_reg3, t);
+        w.add_real_row(ArtifactKind::Registered, 3, &old_reg3);
+        set_time(&old_reg3, t + Duration::from_secs(3600));
+        write_file(&new("registered", "r_a_f3.fits"), 81);
         // Left and nowhere: the old file is gone and the new place holds nothing.
         let old_athm = old("measured", "a_f2.athm");
         write_file(&old_athm, 30);
@@ -1347,6 +1360,16 @@ mod tests {
             "of the rows asked for, only the one whose file is nowhere is counted; a row nobody asked for is not"
         );
         assert_eq!(view.left_gone().frames(), 1, "the one row belongs to frame 2");
+        assert_eq!(
+            view.apply(row(ArtifactKind::Registered, 3)).unwrap().path.unwrap(),
+            old_reg3.to_str().unwrap(),
+            "a left row reads where it is"
+        );
+        assert_eq!(
+            (view.left_gone().rows(), view.left_gone().frames()),
+            (2, 2),
+            "a file of the recorded size with another time at the old place is gone too (frame 3)"
+        );
         // A row a writer re-recorded elsewhere since the candidates were read is not touched.
         let mut moved_since = row(ArtifactKind::Calibrated, 1).unwrap();
         moved_since.path = Some("/elsewhere/c.fits".into());

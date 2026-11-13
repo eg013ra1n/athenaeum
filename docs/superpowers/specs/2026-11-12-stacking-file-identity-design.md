@@ -276,7 +276,7 @@ The gate's over-report in the regroup finding's item (3) goes away.
   - (c) **whose row does not match its file** (relocated, not rescanned): once per app session, not banked.
 - **Never paid:** in the gate, for a zip entry, for a project frame, for an own file.
 - **Stat:** one per light and master per run. Today the run does not stat lights.
-- **The time keeps two jobs.** It sits inside `disk_matches_row`, where it decides whether a banked sample still belongs to the file, and it keys the memo, where it decides whether to read again. It is never a verdict: a moved time with an equal sample is a hit.
+- **The time keeps two jobs.** It sits inside `disk_matches_row`, where it decides whether a banked sample still belongs to the file, and it keys the memo, where it decides whether to read again. It is never a verdict on a SAMPLE or on an input: a moved time with an equal sample is a hit. The one verdict the time gives is on an own working file (FI-11): there it is part of freshness, size + a time within 2 s of the row's.
 
 ### 4.10 A working folder at another path (FI-9)
 
@@ -422,7 +422,7 @@ Lines in `docs/superpowers/open-items.md`:
 - **"Known gap, a landed file edited under a cached first pass" (`:410`):**
   - The first half is closed in the run, for an edit that changes the size or a window. The run stats every input and samples again when the time moved.
   - The gate still presumes the catalog and can report cached for such a frame. That is a new residual; record it.
-  - The second half (a change between Calibrate and Measure of one run) stays open. It is within one run, and the file is either Athenaeum's own (FI-2) or an in-place foreign file guarded only by `ReadGuard`. The suggested closer becomes a size check.
+  - The second half (a change between Calibrate and Measure of one run) stays open. It is within one run, and the file is either Athenaeum's own (FI-2) or an in-place foreign file guarded only by `ReadGuard`. The suggested closer becomes a size + time check (the own-file rule, FI-11).
 - **"Finding, what a regroup still re-registers" (`:408`):** the owner call is decided (FI-6), and item (3) is closed and pinned (§8). Items (1), (2) and (4) stay by design (§4.8). Rewrite the line.
 - **"Owed before the release: the upgrade on real data" (`:403`):** the expectation changes to "the first run after the update recomputes every set (FI-4); the second reuses everything" (§9 A0).
 - **New residuals to record:**
@@ -464,7 +464,7 @@ Every gate is `cargo test -p athenaeum-core --all-targets`.
 - `db`:
   - `bank_content_hash` writes only over a matching NULL row: not after a re-parse-like UPDATE, not over a value, not on a zip row;
   - `delete_artifact` is a point delete, like `find_artifact_is_a_point_lookup_on_the_artifacts_key` (`db/stacking.rs:2386`).
-- `identity_refusal_by_mtime_says_why` (`stacking/plan.rs:4194`), rewritten: a same-size file with a later time matches, another size does not, `NotFound` is silent and a stat error warns.
+- `identity_refusal_by_mtime_says_why` became `identity_is_the_size_and_a_time_within_two_seconds` (`stacking/plan.rs`, FI-11): a same-size file whose time is within 2 s of the row's (at full precision) matches, 2.001 s either side does not and the debug line says why, another size does not, a row without a time or with one that does not parse never matches, `NotFound` is silent and a stat error warns. `an_in_place_row_has_no_time_check` pins the exemption of a row that names the input.
 - The strict pins in `stacking/measure.rs:2225` and `stacking/pass1_artifact.rs:635-650` now pin that a moved time never makes a stamp stale.
 - `registration_hash_folds_the_reference_measurement_across_groups_only` (`stacking/plan.rs:10984`) becomes `…_whatever_its_group`. Its `:11014` assertion flips. The debayered-OSC reference still folds nothing, and `register_stale_follows_the_reference_measurement_for_an_osc_frame` (`:11045`) stays green.
 
@@ -486,7 +486,7 @@ Every gate is `cargo test -p athenaeum-core --all-targets`.
 - `a_cancelled_rewrite_does_not_leave_another_runs_pixels_fresh` (`stacking/run/register_tests.rs:824`) keeps its scenario and its end: the gate reads stale, the re-run rewrites 4 frames, and the master is bit-identical to run A's. Its premise becomes: after run B's cancel, the four `registered` rows are gone.
 - New in `stacking/run/calibrate_tests.rs`: run B, with another calibration option, is cancelled after Calibrate's fan-out. The frames written after the first unfinished job have no row. They recalibrate at run A's config, and the planes equal run A's, compared as `recalibration_reproduces_the_planes_bit_for_bit` (`:1096`) does.
 - `.athf`: with `FITS_WRITE_FAILURE_LOG` (`stacking/run/measure.rs:1972`), a failed write leaves no row.
-- Blink: `aligned_file_that_is_not_the_recorded_one_is_replaced` (`api/stacking_aligned.rs:697`) becomes: a same-size file with a later time is `Available`; another size is `Replaced`; a deleted row is `Missing`.
+- Blink: `aligned_file_that_is_not_the_recorded_one_is_replaced` (`api/stacking_aligned.rs:697`) became `aligned_file_is_judged_by_its_size_and_time` (FI-11): a time cut to the second or within 2 s is `Available`, a time moved by an hour is `Replaced`, another size is `Replaced` (the time put back, so the size alone decides), a row a later run deleted is `Missing`.
 
 **Regroup:**
 

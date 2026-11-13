@@ -5378,7 +5378,7 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   2 s rule judges a file inside a folder (FI-11): a copy made by a tool that keeps times (Finder, `cp -p`, a move) is reused at once on
   any volume, a copy that resets times is not adopted, because an older diverged copy passes key + size alone and only the time tells it
   from the copy a row was recorded over. A row left where it is is read there while its file is at the old
-  place; one whose file is nowhere (not at the mapped place and not at the old one) AND is read by a stage is counted, and the plan and the
+  place with the recorded size and a time within 2 s of the recorded one (an own file's rule, FI-11: another size or another time is not the row's file); one whose file is nowhere in that sense (not at the mapped place and not at the old one) AND is read by a stage is counted, and the plan and the
   run say so once, counting FRAMES (the distinct frames among the counted rows, so the plan and the run say the same number for the same
   situation): "The cached files of N frames from an earlier working folder were not found in <folder> (missing, another size, or a time
   more than 2 s off); those frames are recomputed." (group-level files, such as the LN reference, are named only when no frame is counted:

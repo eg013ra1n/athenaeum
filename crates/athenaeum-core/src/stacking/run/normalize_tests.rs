@@ -1369,7 +1369,9 @@ fn a_file_another_catalog_rewrote_is_not_read_as_fresh() {
     assert_eq!(fan_out_items(&logs2, "register", "align"), 0, "{logs2}");
     for (i, (path, _)) in files.iter().enumerate() {
         let planted = &bytes[(i + 1) % bytes.len()];
-        assert_ne!(&std::fs::read(path).unwrap(), planted, "{path:?} still holds the other build's pixels");
+        let now = std::fs::read(path).unwrap();
+        assert_ne!(&now, planted, "{path:?} still holds the other build's pixels");
+        assert_eq!(now, bytes[i], "{path:?} holds the pixels run 1 wrote again");
     }
 }
 
@@ -1411,7 +1413,7 @@ fn a_working_folder_that_lost_its_times_recomputes_once() {
     // Every frame is measured again: pass 1's spill files are rejected too, so pass 2 measures them (its fallback),
     // and its fits files are rewritten.
     assert_eq!(fan_out_items(&logs2, "measure", "pass2"), 6, "{logs2}");
-    // The registrations are DB rows keyed on the pixels' identity and stay; the registered files are written again.
+    // The registrations are DB rows keyed on the calibration hash (config + input samples) and stay; the registered files are written again.
     assert_eq!(fan_out_items(&logs2, "register", "rewrite"), 6, "{logs2}");
     assert!(fan_out_items(&logs2, "normalize", "normalize") > 0, "{logs2}");
 
