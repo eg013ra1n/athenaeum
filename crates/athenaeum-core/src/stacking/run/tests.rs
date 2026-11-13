@@ -901,6 +901,22 @@ pub(super) fn widest_admission(logs: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// A copy of the folder tree `src` at `dst` that keeps every file's modification time.
+pub(super) fn copy_tree_keeping_times(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let from = entry.unwrap().path();
+        let to = dst.join(from.file_name().unwrap());
+        if from.is_dir() {
+            copy_tree_keeping_times(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).unwrap();
+            let time = std::fs::metadata(&from).unwrap().modified().unwrap();
+            std::fs::OpenOptions::new().write(true).open(&to).unwrap().set_modified(time).unwrap();
+        }
+    }
+}
+
 /// Every plane of one FITS file, as bit patterns.
 pub(super) fn file_plane_bits(path: &Path) -> Vec<Vec<u32>> {
     let reader = PlaneReader::open(path).unwrap();

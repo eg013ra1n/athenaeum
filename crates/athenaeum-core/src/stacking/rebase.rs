@@ -20,8 +20,7 @@
 //! A row of the user's own file (an in-place `calibrated` row, which names the light itself), a payload-only row
 //! (no path, size or time) and another subject's row are never candidates.
 //!
-//! Callers: the run's trigger (T8b) and the gate's read-only view (T8c). Neither exists yet, so every item here
-//! carries its own `allow(dead_code)` naming the task that will call it.
+//! Callers: the run's trigger (`run::calibrate::rebase_working_rows`) and, later, the gate's read-only view.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -32,13 +31,11 @@ use crate::collab::storage::sweep::MTIME_TOLERANCE_SECS;
 use crate::db::stacking::StackSubject;
 
 /// The progress message of the step that looks for the moved files, one event as the input check's.
-#[allow(dead_code)] // T8b (the run's progress event) and T8c (the gate's message) consume it.
 pub(crate) const REBASE_MESSAGE: &str = "finding the cached files";
 
 /// The working-folder subtrees a kind's files are written under: the first component below the subject root.
 /// `calibrated` and `calibrated_mosaic` also live under `prepared` (Prepare's converted copies); a kind with no file
 /// of its own (the payload kinds) has none, so none of its rows maps.
-#[allow(dead_code)] // T8a: reached through `map_row`, which T8b and T8c call.
 fn kind_subtrees(kind: &str) -> &'static [&'static str] {
     match kind {
         "calibrated" | "calibrated_mosaic" => &["calibrated", "prepared"],
@@ -55,7 +52,6 @@ fn kind_subtrees(kind: &str) -> &'static [&'static str] {
 /// kind's subtrees, with the remainder re-rooted at `current_root`. A legacy `fits/<group_key>/…` sub-folder is part
 /// of the remainder and is kept. A remainder that is only the subtree (no file) or holds a `.`/`..` component maps
 /// to nothing.
-#[allow(dead_code)] // T8b and T8c call it (through `candidates` and the gate's view).
 pub(crate) fn map_row(
     kind: &str,
     path: &Path,
@@ -89,7 +85,6 @@ pub(crate) fn map_row(
 /// root (equal by spelling, or after `canonicalize` + `normalize_path` when both exist, so an old folder that is the
 /// current one through a symlink is not an old root), deduplicated, longest first. A recorded folder that is empty
 /// is skipped.
-#[allow(dead_code)] // T8b and T8c call it.
 pub(crate) fn old_roots(
     conn: &Connection,
     subject: &StackSubject,
@@ -128,7 +123,6 @@ pub(crate) fn old_roots(
 
 /// The path as the OS resolves it, in the platform's plain spelling; `None` when it does not exist or cannot be
 /// resolved (the caller then compares spellings only).
-#[allow(dead_code)] // T8a: reached through `old_roots`.
 fn canonical_plain(path: &Path) -> Option<PathBuf> {
     path.canonicalize()
         .ok()
@@ -138,7 +132,6 @@ fn canonical_plain(path: &Path) -> Option<PathBuf> {
 /// One row that lay under an old root and has a place under the current one: what [`check`] stats and [`commit`]
 /// updates.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // T8b and T8c consume it; the fields are read by `check`, `commit` and the callers.
 pub(crate) struct Candidate {
     pub row_id: i64,
     pub kind: String,
@@ -154,7 +147,6 @@ pub(crate) struct Candidate {
 /// `idx_stacking_artifacts_path` (`path >= root/` and `path < succ(root/)`); a row with no `size` or no
 /// `modified_at` (payload-only, or never recorded with a time) is not a candidate, since the check could not judge
 /// it. No old root, no query. A row in two ranges (nested roots) is listed once, under the longer root.
-#[allow(dead_code)] // T8b and T8c call it.
 pub(crate) fn candidates(
     conn: &Connection,
     subject: &StackSubject,
@@ -239,7 +231,6 @@ pub(crate) fn candidates(
 
 /// The answer of [`check`] for one candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // T8b and T8c match on it.
 pub(crate) enum Check {
     /// A regular file of the recorded length and a time within the tolerance: the row's file moved with the folder.
     Moved,
@@ -258,7 +249,6 @@ pub(crate) enum Check {
 
 /// One `std::fs::metadata` of the mapped place and the three comparisons, in the order size, kind, time. Reads no
 /// pixels and needs no connection. Any doubt is not [`Check::Moved`].
-#[allow(dead_code)] // T8b and T8c call it.
 pub(crate) fn check(c: &Candidate) -> Check {
     let meta = match std::fs::metadata(&c.mapped) {
         Ok(meta) => meta,
@@ -290,7 +280,6 @@ pub(crate) fn check(c: &Candidate) -> Check {
 
 /// Whether `live` is within [`MTIME_TOLERANCE_SECS`] of the recorded RFC 3339 time, both at full precision (the
 /// difference is not rounded to a second first). An unparsable recorded time is "no".
-#[allow(dead_code)] // T8a: reached through `check`.
 fn within_tolerance(live: std::time::SystemTime, recorded: &str) -> bool {
     let Ok(recorded) = chrono::DateTime::parse_from_rfc3339(recorded) else {
         return false;
@@ -303,7 +292,6 @@ fn within_tolerance(live: std::time::SystemTime, recorded: &str) -> bool {
 /// ([`crate::db::stacking::rebase_artifact_path`]); a row that is no longer at its old path is left as it is.
 /// Returns how many rows changed. Nothing on disk is touched. The caller passes only candidates [`check`] answered
 /// [`Check::Moved`]; the connection is not held across any file I/O here.
-#[allow(dead_code)] // T8b calls it.
 pub(crate) fn commit(conn: &mut Connection, moved: &[&Candidate]) -> anyhow::Result<usize> {
     if moved.is_empty() {
         return Ok(0);
@@ -330,7 +318,6 @@ pub(crate) fn commit(conn: &mut Connection, moved: &[&Candidate]) -> anyhow::Res
 
 /// The warning for the rows that were not found where the old folder had them: said once per run (T8b) and once per
 /// gate (T8c), never per file.
-#[allow(dead_code)] // T8b and T8c call it.
 pub(crate) fn left_warning(n: usize, root: &Path) -> String {
     format!(
         "{n} cached files were not found in the working folder {} as recorded (missing, another size, or a time more than 2 s off); their frames are recomputed.",

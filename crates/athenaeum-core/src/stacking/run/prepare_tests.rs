@@ -331,6 +331,67 @@ fn converting_an_in_place_frame_keeps_its_landed_file_inside_the_working_folder(
     }
 }
 
+/// File-identity §4.10, "never touched": a row that names the user's own file (here a landed file INSIDE the working
+/// folder) is not a working file of its folder, so a copy of the folder never takes it over. The trigger maps a row
+/// only when the first component below the old root is its kind's own subtree (`calibrated`, `prepared`, ...);
+/// `landed` is none, so the in-place rows keep naming the first folder's landed files even though a copy of them
+/// sits at the same place under the new folder with the same size and time.
+#[test]
+fn an_in_place_row_inside_the_working_root_is_never_rebased() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("catalog.db");
+    let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+    let conn = project_conn(&db_path);
+    crate::db::stacking::insert_test_project(&conn, "p1");
+    let working = tmp.path().join("work");
+    let subject = StackSubject::Project("p1".to_string());
+    let landed = subject_layout(&conn, &working, &subject).unwrap().root.join("landed");
+    for u in ["o1", "o2"] {
+        let mut spec = test_fixtures::project_frame_spec(u);
+        spec.file = test_fixtures::ProjectFile::Mosaic32;
+        spec.bayerpat = Some("RGGB");
+        test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+    }
+    let out = tmp.path().join("out");
+    let mut off = StackingConfig::default();
+    off.calibration.debayer_osc = false;
+    let mut rc = project_rc(&ctx, &conn, "p1", off.clone(), &working, &out);
+    stage_calibrate(&mut rc).unwrap();
+    let frames = rc.plan_groups[0].frames.clone();
+    assert_eq!(frames.len(), 2);
+    let row_path = |rc: &RunContext, frame_id: i64| -> String {
+        crate::db::stacking::find_artifact(&conn, &rc.subject, "", ArtifactKind::Calibrated, Some(frame_id))
+            .unwrap()
+            .unwrap()
+            .path
+            .unwrap()
+    };
+    for f in &frames {
+        assert_eq!(row_path(&rc, f.frame_id), f.path, "used in place");
+        assert!(Path::new(&f.path).starts_with(&rc.layout.root.join("landed")), "{}", f.path);
+    }
+
+    // The whole working folder, landed files included, copied with its times; the next run points at the copy.
+    let working2 = tmp.path().join("work2");
+    copy_tree_keeping_times(&working, &working2);
+    let mut rc2 = project_rc(&ctx, &conn, "p1", off, &working2, &out);
+    assert_ne!(rc2.layout.root, rc.layout.root);
+    for f in &frames {
+        let copy = rc2.layout.root.join(Path::new(&f.path).strip_prefix(&rc.layout.root).unwrap());
+        assert!(copy.is_file(), "the copy of the landed file sits at the same place under W2: {copy:?}");
+    }
+    // The rows are no candidates at all: the in-place rule of Prepare would re-point a rebased row at its light on
+    // this very run, so the end state alone could not tell a rebase from none.
+    let found = crate::stacking::rebase::candidates(&conn, &rc2.subject, &rc2.layout.root).unwrap();
+    assert!(found.is_empty(), "an in-place row is no candidate: {found:?}");
+    let (res, logs) = crate::stacking::telemetry::capture_logs(|| stage_calibrate(&mut rc2));
+    res.unwrap();
+    assert!(!logs.contains("working folder rows rebased"), "nothing was rebased: {logs}");
+    for f in &frames {
+        assert_eq!(row_path(&rc2, f.frame_id), f.path, "the in-place row still names W1's landed file");
+    }
+}
+
 /// Plan 6b-2 C12: an XISF replica and a 16-bit FITS are converted into
 /// float32 FITS under `prepared/`, in the unit domain. The 16-bit file
 /// becomes exactly its physical values ÷ 65535. A float FITS beside them

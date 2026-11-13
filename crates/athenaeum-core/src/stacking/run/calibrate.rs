@@ -1182,6 +1182,108 @@ fn run_input_paths(rc: &RunContext, conn: &rusqlite::Connection) -> Vec<String> 
     paths
 }
 
+/// Point the subject's cached rows at the CURRENT working folder when their files moved with it (file identity
+/// §4.10), once per run, before the inputs are sampled and before the stage-1 dispatch. The three phases of the
+/// input check: the candidates are read under the connection, every mapped file is stat-ed WITHOUT it (cancel
+/// checked per file) and the rows that passed are committed in one transaction. Nothing on disk is moved, copied or
+/// deleted. A failure to read the candidates or to commit is logged and the run goes on: a row left where it is
+/// costs a recompute, never a wrong file.
+///
+/// Progress is ONE Calibrate event at `current = 0`, as the input check's: a tick per file would reach 100 % and
+/// the stage's own first event would put the row back to 0.
+pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
+    use crate::stacking::rebase::{self, Check};
+
+    let candidates = {
+        let conn = db(&rc.ctx)?.conn();
+        match rebase::candidates(&conn, &rc.subject, &rc.layout.root) {
+            Ok(c) => c,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    error = %format!("{error:#}"),
+                    "working folder rows not read for the rebase; the run goes on"
+                );
+                return Ok(());
+            }
+        }
+    };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    rc.progress(
+        Stage::Calibrate,
+        None,
+        0,
+        candidates.len(),
+        0,
+        0,
+        None,
+        Some(rebase::REBASE_MESSAGE.to_string()),
+    );
+    let mut moved: Vec<&rebase::Candidate> = Vec::new();
+    let mut gone = 0usize;
+    for c in &candidates {
+        rc.check_cancel()?;
+        let reason = match rebase::check(c) {
+            Check::Moved => {
+                moved.push(c);
+                continue;
+            }
+            Check::Missing => "missing",
+            Check::OtherSize => "another size",
+            Check::OtherTime => "another time",
+            Check::NotAFile => "not a file",
+            // `check` already warned with the OS error; the row is judged where it is.
+            Check::Unreadable(_) => "unreadable",
+        };
+        tracing::debug!(
+            path = %c.mapped.display(),
+            kind = %c.kind,
+            reason,
+            "cached file not rebased"
+        );
+        // A row whose file is still at the old place is read there; only one that is nowhere is counted as gone.
+        if !crate::stacking::plan::file_matches_identity(Path::new(&c.old_path), Some(c.size)) {
+            gone += 1;
+        }
+    }
+    rc.check_cancel()?;
+    if !moved.is_empty() {
+        let mut conn = db(&rc.ctx)?.conn();
+        if let Err(error) = rebase::commit(&mut conn, &moved) {
+            tracing::warn!(
+                run_id = rc.run_id,
+                error = %format!("{error:#}"),
+                "working folder rows not rebased; the run goes on"
+            );
+            moved.clear();
+        }
+    }
+    let mut roots: Vec<&Path> = Vec::new();
+    for c in &candidates {
+        if !roots.contains(&c.old_root.as_path()) {
+            roots.push(c.old_root.as_path());
+        }
+    }
+    for root in roots {
+        let of_root = candidates.iter().filter(|c| c.old_root == root).count();
+        let moved_here = moved.iter().filter(|c| c.old_root == root).count();
+        tracing::info!(
+            run_id = rc.run_id,
+            old_root = %root.display(),
+            new_root = %rc.layout.root.display(),
+            moved = moved_here,
+            left = of_root - moved_here,
+            "working folder rows rebased"
+        );
+    }
+    if gone > 0 {
+        rc.warnings.push(rebase::left_warning(gone, &rc.layout.root));
+    }
+    Ok(())
+}
+
 /// Sample every input of the run ONCE, before any stage-1 hash (spec 4.4): read the rows under the
 /// connection, stat and read the files WITHOUT it, bank what may be banked under it in one
 /// transaction. Idempotent: a run whose book is filled returns at once. Runs after `stage_masters`, so
@@ -1283,6 +1385,7 @@ pub(super) fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
 /// [`stage_calibrate`] with the cross-group queue decision overridable (`Some(true)` = always one queue,
 /// `Some(false)` = always per group; tests pin the two against each other).
 fn stage_calibrate_with(rc: &mut RunContext, force_merge: Option<bool>) -> Result<(), RunError> {
+    rebase_working_rows(rc)?;
     ensure_source_samples(rc)?;
     // Plan 6b-2 C11, C12: a project, or an attested set, prepares instead.
     if stage_one_kind(rc)? == StageOneKind::Prepare {
