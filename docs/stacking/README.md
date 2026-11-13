@@ -5451,6 +5451,23 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   card differs, `ATH_STKI`, the run id). A2c also showed the plan and the run counting the missing files differently (35 against 114);
   the warning now counts frames. Not run: set 185 on the share; a project, and a project through a moved folder; a hung share mount;
   names with non-ASCII letters; the first-run sampling cost on a catalog with no banked samples; a library master built onto a share.
+- **Acceptance again after FI-11 (2026-11-13, the same setup, set 163's 16 lights, `c89cb673`).** An own working file is now judged by
+  its time too, so the legs that judge own files ran again, with the leg the rule exists for. Every leg passed. "Row time against the
+  file" is the largest difference between a row's `modified_at` and its file's own time, over the set's 114 rows.
+
+  | Leg | Result | Row time against the file |
+  | ---- | ---- | ---- |
+  | Local, run 1 then run 2 | run 2 0 / 0 / 0 / 0, LN reused | 0 |
+  | The working folder copied onto its own path without its times | the plan lists every stage stale; one run recalibrates the 16 frames (measurements and registrations are reused, their files are written again); the next run 0 / 0 / 0 / 0 | 181.5 s before the run |
+  | Two catalogs over one working folder: catalog A changes `pedestalDn` 0 to 8 and runs; catalog B, the old setting, runs after it | B's plan lists Calibrate stale for 16; B recalibrates 16; B's masters equal the local run's in every data byte (A's differ in 165 million); B's second run 0 / 0 / 0 / 0 | 175.2 s before B's run, 0 after |
+  | The SMB share in place, after a `rerunFrom: calibrate` | 0 / 0 / 0 / 0, LN reused; the same after an unmount and a mount; the master equals the local one in every data byte | 0 to the nanosecond, before and after the remount |
+  | The share's folder bounced through the exFAT drive to the same path | the plan stale `[]`; 0 / 0 / 0 / 0 | 9.5 ms |
+  | The share's folder copied to the exFAT drive, the share copy kept | the plan reads every stage cached, no warning; 0 / 0 / 0 / 0, `moved=114 left=0`; a second run 0 / 0 / 0 / 0 | 9.5 ms |
+  | The exFAT drive in place, after a `rerunFrom: calibrate` | 0 / 0 / 0 / 0 | 0 (the row records the time as the drive keeps it, 10 ms steps) |
+
+  The `debug` line "cached file has the recorded size but another modification time" was written only in the two legs where a file's
+  time had moved, and never for a file on the share or on the exFAT drive. In those two legs nothing tells the user why the frames are
+  recomputed: the plan lists the stages stale and the line is in the log only (open item). Not run: a FAT32 volume; a project.
 
 ## Detail moved from CLAUDE.md (2026-10-20) - Stacking rules
 
