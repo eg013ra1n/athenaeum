@@ -55,7 +55,7 @@ value, a default or render code. Two consumers read it: the search index
 
 | Tab | Section ids (`SETTINGS_SECTIONS`) |
 | ---- | ---- |
-| General | `general.updates` `general.grouping` `general.sessions` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.dataLocations` `general.logging` |
+| General | `general.updates` `general.grouping` `general.sessions` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.compute` `general.dataLocations` `general.logging` |
 | Blink | `blink.viewer` `blink.flatContour` `blink.annotations` |
 | Analysis | `analysis.detection` `analysis.measurement` `analysis.batch` `analysis.rejection` |
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
@@ -70,6 +70,13 @@ under `analysis.measurement`) and `batch_concurrency`; the old detection / PSF-f
 `analysis.psf` section are gone. `analysis.rejection`'s `trailed` field reads "Reject unusable frames" (the stored
 threshold key stays `trail`). `plateSolving.inputGate` is the one switch `input_gate_enabled` — a frame whose own
 analysis marks it Trailed is refused before solving; the eccentricity / R² pair was removed with C7.
+
+`general.compute` (owner, 2026-11-13) is one KV number, `compute.max_concurrent` ("Heavy jobs at the same time",
+`ComputeQueueSection`, `SettingNumber` with `intCodec(1, 8)`, default `"1"` in `defaults::all()`). It is read through
+the generic `get_setting` and written through its own command, `set_compute_max_concurrent`, which also resizes the
+live queue (`ComputeQueue::set_max_concurrent`), so a change applies at once; the generic `set_setting` would store
+the value and leave the running queue as it was. The range is the one `api::compute::validate_max_concurrent`
+enforces. Running jobs share the memory budgets (`integration.band_budget_mb` is divided by this value).
 
 `stacking.compute` (Task 13c) is one KV number, `compute.memory_budget_mb` ("Frame memory budget (MB)",
 `StackingComputeSection`, `SettingNumber` with `intCodec(0, 1048576)`, generic `get_setting` / `set_setting`, default

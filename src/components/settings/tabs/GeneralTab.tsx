@@ -16,6 +16,7 @@ import { MonitoringSection } from '../sections/MonitoringSection';
 import { AutoMergeSection } from '../sections/AutoMergeSection';
 import { ContentIndexSection } from '../sections/ContentIndexSection';
 import { ArchiveSection } from '../sections/ArchiveSection';
+import { ComputeQueueSection } from '../sections/ComputeQueueSection';
 import { DataLocationsSection } from '../sections/DataLocationsSection';
 import LoggingSettings from '../LoggingSettings';
 import { renderTabSections, type TabSectionEntry } from './tabSectionEntry';
@@ -28,6 +29,7 @@ export const GENERAL_SECTIONS: TabSectionEntry[] = [
   { sectionId: 'general.autoMerge', element: <AutoMergeSection /> },
   { sectionId: 'general.contentIndex', element: <ContentIndexSection /> },
   { sectionId: 'general.archive', element: <ArchiveSection /> },
+  { sectionId: 'general.compute', element: <ComputeQueueSection /> },
   { sectionId: 'general.dataLocations', element: <DataLocationsSection /> },
   { sectionId: 'general.logging', element: <LoggingSettings /> },
 ];

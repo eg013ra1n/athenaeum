@@ -206,6 +206,21 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     ],
   },
   {
+    id: 'general.compute',
+    tab: 'general',
+    title: 'Heavy jobs',
+    description:
+      'Analysis, master builds, calibrated-light export, the content index and stacking runs share one queue.',
+    fields: [
+      {
+        id: 'maxConcurrent',
+        label: 'Heavy jobs at the same time',
+        help: 'How many of these jobs run at once; the rest wait in the queue. Each job already uses every processor core, and running jobs share the memory budgets, so a value above 1 needs more memory. 1 suits most computers. A change applies at once.',
+        keywords: ['compute.max_concurrent', 'set_compute_max_concurrent', 'queue', 'parallel', 'concurrency'],
+      },
+    ],
+  },
+  {
     id: 'general.dataLocations',
     tab: 'general',
     title: 'Data file locations',
