@@ -436,7 +436,7 @@ impl LnFrameGrids {
             w.flush()?;
             // Power-loss durability: bytes on disk before the rename makes
             // the file visible under its final name.
-            w.get_ref().sync_all()?;
+            crate::zip_store::fs::sync_best_effort(w.get_ref(), &tmp)?;
             Ok(())
         })();
 

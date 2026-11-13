@@ -4202,9 +4202,8 @@ pub fn build_plan(
     // The cached files a stage read here was not found for: counted now that every read has been made, and only for
     // the rows a stage asked for (a row nobody reads is not recomputed).
     if let Some(root) = &rebase_root {
-        let left_gone = rebase_view.left_gone();
-        if left_gone > 0 {
-            warnings.push(crate::stacking::rebase::left_warning(left_gone, root));
+        if let Some(warning) = crate::stacking::rebase::left_warning(&rebase_view.left_gone(), root) {
+            warnings.push(warning);
         }
     }
 

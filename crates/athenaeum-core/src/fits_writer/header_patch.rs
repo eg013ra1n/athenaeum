@@ -349,7 +349,8 @@ pub fn patch_cards(
             std::io::copy(&mut f, &mut w)?;
         }
         w.flush()?;
-        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        crate::zip_store::fs::sync_best_effort(&f, &tmp)?;
         Ok(grown)
     })();
     match written {

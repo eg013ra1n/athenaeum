@@ -368,7 +368,7 @@ pub fn patch_xisf_keywords(
         f.seek(SeekFrom::Start(copy_from))?;
         std::io::copy(&mut f, &mut w)?;
         w.flush()?;
-        w.get_ref().sync_all()?;
+        crate::zip_store::fs::sync_best_effort(w.get_ref(), &tmp)?;
         Ok(())
     })();
     match written {

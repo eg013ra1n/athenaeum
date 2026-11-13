@@ -1341,15 +1341,15 @@ pub(super) fn rebase_working_rows(rc: &mut RunContext) -> Result<(), RunError> {
     // A row whose file is still at the old place is read there; only one that is nowhere, and that a stage of this
     // run reads, is counted. One stat each, for those rows alone.
     let reads = RunReads::of(rc);
-    let mut gone = 0usize;
+    let mut gone = rebase::LeftGone::default();
     for c in left {
         rc.check_cancel()?;
         if reads.reads(c) && rebase::is_gone_at_old_place(c, false) {
-            gone += 1;
+            gone.add(c);
         }
     }
-    if gone > 0 {
-        rc.warnings.push(rebase::left_warning(gone, &rc.layout.root));
+    if let Some(warning) = rebase::left_warning(&gone, &rc.layout.root) {
+        rc.warnings.push(warning);
     }
     Ok(())
 }

@@ -780,3 +780,16 @@ Closed on 2026-11-13: the owner approved the plan with RB-1 as written («Ок, 
 Reviewed on 2026-11-12 by an independent reviewer on the most capable model, against the spec and `main` at `0df147a7`: approve with changes. All six required and all eight
 recommended changes are taken in above (the mosaic row, the `metrics`-β member, one progress event, `?` on every delete, no run rig banks, T8 after M2; the test premises, the T4
 cut, the T8 split, the gates, `map_err`, two tests, the A0 note, three comments). Review: `.superpowers/sdd/2026-11-12-file-identity/plan-review-fable.md`.
+
+## Outcome
+
+Merged on local `main`, each merge after its review and fixes; this branch (`fi/acceptance`, T7 with the sync fix `9f404957`) is the last.
+
+| Merge | Tasks | What its review found |
+| ---- | ---- | ---- |
+| `9214a07d` M1 | T1a, T1b, T2 | another subject's row over a replaced file (fixed: `delete_artifacts_naming_path`) |
+| `97a5843e` M2 | T3, T4a-c, T5 | the scanner's move detection kept a sample over a rewritten time (fixed) |
+| `e8f59465` M3 | T8a-c | no false move; a project gap and a warning that stayed (fixed) |
+| `f2c3e967` | T6, the whole-branch review's fixes | the zip adoption door (fixed in `3cfd980e`) |
+
+Acceptance (2026-11-13, real data, `docs/stacking/README.md`): every leg passed; it found the SMB share's refused full sync, fixed in `9f404957`. One owner call stays open: whether an own working file also needs a time within 2 s of its row (`docs/superpowers/open-items.md`, "Awaiting a call from the owner").

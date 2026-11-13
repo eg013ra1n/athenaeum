@@ -1172,7 +1172,7 @@ fn a_moved_working_folder_reuses_every_frame_level_stage() {
     }
     assert_eq!(artifact_files(&rig), rows1, "the plan wrote no row");
     assert!(
-        rig.plan(&cfg).warnings.iter().all(|w| !w.contains("cached files were not found")),
+        rig.plan(&cfg).warnings.iter().all(|w| !w.contains("from an earlier working folder")),
         "a moved folder is nothing to warn about"
     );
 
@@ -1186,7 +1186,7 @@ fn a_moved_working_folder_reuses_every_frame_level_stage() {
     // The run rebased the rows: the gate has no candidate left and reads the same, with nothing to warn about.
     let subject = StackSubject::FrameSet(rig.fixture.set_id);
     let view = crate::stacking::rebase::RebaseView::for_gate(&rig.fixture.conn, &subject, &rig.layout.root).unwrap();
-    assert_eq!((view.moved(), view.left_gone()), (0, 0), "the rebased rows leave the view empty");
+    assert_eq!((view.moved(), view.left_gone().rows()), (0, 0), "the rebased rows leave the view empty");
     assert!(crate::stacking::rebase::candidates(&rig.fixture.conn, &subject, &rig.layout.root)
         .unwrap()
         .is_empty());
@@ -1229,7 +1229,7 @@ fn a_copied_working_folder_is_used_and_the_original_is_untouched() {
 /// The defect the 2 s rule guards against: an older, diverged copy is never read. Run A fills W1; W2 is its copy;
 /// run B under W2 recalibrates with another setting (same sizes, other pixels); W1's times go an hour back; W2 is
 /// removed; run C at B's config under W1 finds W1's files of the right size but another time. Calibrate covers all 6
-/// frames, the run warns once with the number of rows it left (the plan with the number its gate reads), and the planes are B's, not A's.
+/// frames, the plan and the run each warn once with the same number of frames, and the planes are B's, not A's.
 #[test]
 fn a_diverged_copy_is_recomputed_not_read() {
     use crate::stacking::config::ExposureMode;
@@ -1293,27 +1293,24 @@ fn a_diverged_copy_is_recomputed_not_read() {
         &set_slug(SET_NAME),
     )
     .root;
-    // The plan counts the left rows its gate reads (not the measured rows or the LN files, which it never judges), the
-    // run the rows its stages read: the plan's count is a lower bound of the run's, and both name the folder.
-    let plan_warning = plan_c
-        .warnings
-        .iter()
-        .find(|w| w.contains("cached files were not found"))
-        .unwrap_or_else(|| panic!("the plan says it left rows: {:?}", plan_c.warnings));
-    let plan_left: usize = plan_warning.split_whitespace().next().unwrap().parse().unwrap();
-    assert!((6..=left as usize).contains(&plan_left), "{plan_warning} of {left} rows");
-    assert_eq!(
-        *plan_warning,
-        crate::stacking::rebase::left_warning(plan_left, &gate_root),
-        "the plan names the folder as a run records it"
+    // The warning counts frames, not files: the plan reads some kinds of file and the run rewrites all of them, but
+    // both see the same six frames, so both say six, and both name the folder as a run records it.
+    let frames_warning = |root: &Path| {
+        crate::stacking::rebase::left_warning(&crate::stacking::rebase::LeftGone::of_frames(6), root).unwrap()
+    };
+    let plan_warning = frames_warning(&gate_root);
+    assert!(
+        plan_c.warnings.contains(&plan_warning),
+        "the plan says it left the files of six frames ({plan_warning}): {:?}",
+        plan_c.warnings
     );
 
     let (_, rc_c, logs_c) = rig.run(&cfg_b);
     assert_eq!(fan_out_items(&logs_c, "calibrate", "calibrate"), 6, "{logs_c}");
-    let warning = crate::stacking::rebase::left_warning(left as usize, &rig.layout.root);
+    let warning = frames_warning(&rig.layout.root);
     assert!(
         rc_c.warnings.contains(&warning),
-        "the run says how many rows it left ({warning}): {:?}",
+        "the run says the same six frames ({warning}): {:?}",
         rc_c.warnings
     );
     assert_eq!(calibrated(&rig), planes_b, "run C wrote B's planes, it did not read A's");
@@ -1377,23 +1374,30 @@ fn the_not_found_warning_is_gone_after_one_run() {
     let stacked_rows = read_rows - excluded_rows;
 
     let not_found = |warnings: &[String]| -> Option<String> {
-        warnings.iter().find(|w| w.contains("cached files were not found")).cloned()
+        warnings.iter().find(|w| w.contains("from an earlier working folder")).cloned()
     };
-    let leading_count = |w: &str| -> usize { w.split_whitespace().next().unwrap().parse().unwrap() };
+    // "The cached files of N frames from an earlier ...": the N.
+    let frames_in = |w: &str| -> usize {
+        w.strip_prefix("The cached files of ").and_then(|r| r.split_whitespace().next()).unwrap().parse().unwrap()
+    };
 
     let plan = rig.plan(&cfg);
     let plan_warning = not_found(&plan.warnings).unwrap_or_else(|| panic!("the plan warns: {:?}", plan.warnings));
-    let n = leading_count(&plan_warning);
-    assert!(
-        (5..=stacked_rows).contains(&n),
-        "the plan counts the rows its stages read for the stacked frames, not the LN files nor the excluded frame's: {plan_warning} (stacked {stacked_rows}, excluded frame's {excluded_rows})"
-    );
+    // The warning counts frames: the plan and the run each see the five frames still stacked, not the sixth (excluded)
+    // and not the file count (`stacked_rows`) either.
+    assert_eq!(frames_in(&plan_warning), 5, "the plan counts the frames its stages read: {plan_warning}");
 
     let (_, rc2, logs2) = rig.run(&cfg);
     assert_eq!(fan_out_items(&logs2, "calibrate", "calibrate"), 5, "run 2 recomputes the five stacked frames: {logs2}");
     let run_warning =
         not_found(&rc2.warnings).unwrap_or_else(|| panic!("run 2 warns: {:?}", rc2.warnings));
-    assert_eq!(run_warning, crate::stacking::rebase::left_warning(stacked_rows, &rig.layout.root));
+    assert_eq!(frames_in(&run_warning), frames_in(&plan_warning), "the plan and the run say the same number");
+    assert!(stacked_rows > 5, "premise: the file count differs from the frame count ({stacked_rows} files)");
+    assert_eq!(
+        run_warning,
+        crate::stacking::rebase::left_warning(&crate::stacking::rebase::LeftGone::of_frames(5), &rig.layout.root)
+            .unwrap()
+    );
 
     // The LN rows and the excluded frame's rows still name the removed W1, and nothing reads them: no warning from
     // now on.
