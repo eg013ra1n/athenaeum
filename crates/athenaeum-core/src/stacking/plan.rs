@@ -1110,8 +1110,10 @@ pub(crate) fn seeds_calibration_hash_for(
 
 /// A file's modification time in the scanner's own shape (`scanner/mod.rs`'s
 /// `modified_dt.to_rfc3339()`): what every writer in this module family stores in
-/// `stacking_artifacts.modified_at`. The column is recorded for display and for the scanner's own rows; an own working
-/// file's freshness never compares it ([`file_matches_identity`] checks the size alone).
+/// `stacking_artifacts.modified_at`. An own working file's freshness never compares the column
+/// ([`file_matches_identity`] checks the size alone), but the working-folder rebase does: it finds a moved folder's
+/// file by its size and this time within a tolerance ([`crate::stacking::rebase`]), so the column must keep being
+/// written by every writer; dropping it would stop every rebase.
 pub(crate) fn render_modified_at(modified: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339()
 }
@@ -1209,6 +1211,7 @@ pub(crate) fn fits_artifact_fresh(
     metrics_payload: Option<&str>,
     expected_hash: &str,
     view: &RebaseView,
+    asked: bool,
 ) -> Result<bool, ApiError> {
     let Some(planes) = metrics_payload
         .and_then(|json| serde_json::from_str::<FrameMeasurement>(json).ok())
@@ -1216,7 +1219,7 @@ pub(crate) fn fits_artifact_fresh(
     else {
         return Ok(false);
     };
-    fits_artifact_fresh_for_planes(conn, subject, frame_id, planes, expected_hash, view)
+    fits_artifact_fresh_for_planes(conn, subject, frame_id, planes, expected_hash, view, asked)
 }
 
 /// [`fits_artifact_fresh`]'s own per-plane freshness loop, with the plane
@@ -1227,7 +1230,8 @@ pub(crate) fn fits_artifact_fresh(
 /// — never from a stored JSON payload) can reuse the EXACT freshness rule
 /// the plan gate applies, rather than a hand-rolled `find_artifact` +
 /// `is_fresh` pair that could quietly drift from it. `view` is the plan gate's read of a moved working folder
-/// ([`RebaseView`]); a run passes [`RebaseView::none()`], its trigger having rebased the rows already.
+/// ([`RebaseView`]); a run passes [`RebaseView::none()`], its trigger having rebased the rows already. `asked` is
+/// false for a frame no run rewrites (a manually excluded one): its rows are read but not counted as left and gone.
 pub(crate) fn fits_artifact_fresh_for_planes(
     conn: &Connection,
     subject: &StackSubject,
@@ -1235,6 +1239,7 @@ pub(crate) fn fits_artifact_fresh_for_planes(
     planes: usize,
     expected_hash: &str,
     view: &RebaseView,
+    asked: bool,
 ) -> Result<bool, ApiError> {
     if planes == 0 {
         return Ok(false);
@@ -1243,7 +1248,7 @@ pub(crate) fn fits_artifact_fresh_for_planes(
         let kind = ArtifactKind::Fits(plane);
         // A frame-level kind: its rows sit under the empty key, whatever group the frame is in now.
         let plane_fresh = view
-            .apply(find_artifact(conn, subject, "", kind, Some(frame_id))?)
+            .apply_recording(find_artifact(conn, subject, "", kind, Some(frame_id))?, asked)
             .is_some_and(|row| is_fresh(&row, expected_hash));
         if !plane_fresh {
             return Ok(false);
@@ -1973,6 +1978,7 @@ fn compute_register_stale(
     grid: Option<&crate::collab::grid::CanonicalGrid>,
     measure_betas: &HashMap<String, f64>,
     view: &RebaseView,
+    excluded: &HashSet<i64>,
 ) -> Result<bool, ApiError> {
     // Ruling R9: the latest run that HAS frame rows. A run cancelled before the end of Register wrote none (they are
     // written once the stage is done), and reading it would judge no frame at all and call Register fresh while the
@@ -2143,13 +2149,11 @@ fn compute_register_stale(
                 None => return Ok(true),
             },
         };
-        let artifact = view.apply(find_artifact(
-            conn,
-            subject,
-            &group.key,
-            ArtifactKind::Registered,
-            Some(frame_id),
-        )?);
+        // A frame excluded since that run is read but not counted as asked for: no run rewrites its row.
+        let artifact = view.apply_recording(
+            find_artifact(conn, subject, &group.key, ArtifactKind::Registered, Some(frame_id))?,
+            !excluded.contains(&frame_id),
+        );
         if !artifact.is_some_and(|row| is_fresh(&row, &artifact_hash)) {
             return Ok(true);
         }
@@ -3895,13 +3899,13 @@ pub fn build_plan(
             }
 
             // Frame-level rows sit under the empty key (spec §5.1), so a regroup finds them.
-            let calib_artifact = rebase_view.apply(find_artifact(
-                conn,
-                subject,
-                &g.key,
-                ArtifactKind::Calibrated,
-                Some(f.frame_id),
-            )?);
+            // A manually excluded frame's rows are read through the view but never counted as asked for: no run
+            // rewrites them, so the "not found" warning would never clear.
+            let asked = !is_excluded;
+            let calib_artifact = rebase_view.apply_recording(
+                find_artifact(conn, subject, &g.key, ArtifactKind::Calibrated, Some(f.frame_id))?,
+                asked,
+            );
             let metrics_artifact = find_artifact(
                 conn,
                 subject,
@@ -3947,13 +3951,10 @@ pub fn build_plan(
             // the calibrated half already passed, so a group without Bayer
             // drizzle costs no extra query at all.
             let calib_fresh = if calib_fresh && group_wants_mosaic {
-                let mosaic_artifact = rebase_view.apply(find_artifact(
-                    conn,
-                    subject,
-                    &g.key,
-                    ArtifactKind::CalibratedMosaic,
-                    Some(f.frame_id),
-                )?);
+                let mosaic_artifact = rebase_view.apply_recording(
+                    find_artifact(conn, subject, &g.key, ArtifactKind::CalibratedMosaic, Some(f.frame_id))?,
+                    asked,
+                );
                 match (&mosaic_artifact, &current_calib_hash) {
                     (Some(row), Some(hash)) => is_fresh(row, hash) && names_input(row),
                     _ => false,
@@ -4002,6 +4003,7 @@ pub fn build_plan(
                         .as_deref()
                         .expect("metrics_fresh implies a resolved hash"),
                     &rebase_view,
+                    asked,
                 )?
             } else {
                 false
@@ -4070,7 +4072,7 @@ pub fn build_plan(
                     None => false,
                     Some(expected) => {
                         rebase_view
-                            .apply(find_artifact(conn, subject, &g.key, ArtifactKind::Ln, Some(f.frame_id))?)
+                            .apply_recording(find_artifact(conn, subject, &g.key, ArtifactKind::Ln, Some(f.frame_id))?, asked)
                             .is_some_and(|row| is_fresh(&row, expected))
                             // Plan 6b-3 D7: a member that keeps global
                             // normalization (under 25 % overlap) is cached
@@ -4194,6 +4196,7 @@ pub fn build_plan(
         project_grid.as_ref(),
         &measure_betas,
         &rebase_view,
+        &excluded_set,
     )?;
 
     // The cached files a stage read here was not found for: counted now that every read has been made, and only for
@@ -4647,6 +4650,7 @@ mod tests {
                 Some(&grid),
                 &HashMap::new(),
                 &RebaseView::none(),
+                &HashSet::new(),
             )
             .unwrap()
         };
@@ -7272,7 +7276,7 @@ mod tests {
         );
         assert_ne!(current, earlier, "premise: the two versions key apart");
         let fresh = |planes: usize| {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, planes, &current, &RebaseView::none())
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, planes, &current, &RebaseView::none(), true)
                 .unwrap()
         };
         for plane in 0..3 {
@@ -7299,7 +7303,7 @@ mod tests {
             seed_fits_artifact(&f, group_key, frame_id, plane, hash);
         }
         let fresh = || {
-            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, 3, hash, &RebaseView::none())
+            fits_artifact_fresh_for_planes(&f.conn, &subject, frame_id, 3, hash, &RebaseView::none(), true)
                 .unwrap()
         };
         assert!(fresh(), "premise");
@@ -11608,7 +11612,7 @@ mod tests {
             let mut memo = HashMemo::for_gate(origins.clone());
             compute_register_stale(
                 &f.conn, cfg, &subject, &groups, &reference, &mut memo, &origins, None, betas,
-                &RebaseView::none(),
+                &RebaseView::none(), &HashSet::new(),
             )
             .unwrap()
         };

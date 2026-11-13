@@ -562,20 +562,25 @@ pub(super) fn rows_of_kind(
 /// Another frame set with the SAME NAME as the rig's (two sets may share a name, so one working root), carrying a copy
 /// of every `Calibrated` row of the rig's set: the rows a second subject keeps over files the first subject writes.
 pub(super) fn same_named_set_with_copies_of_the_calibrated_rows(rig: &Pass1Rig) -> i64 {
-    rig.fixture
-        .conn
-        .execute("INSERT INTO frames_set (name) VALUES (?1)", [SET_NAME])
-        .unwrap();
-    let other = rig.fixture.conn.last_insert_rowid();
+    same_named_set_with_copies_of_rows(&rig.fixture.conn, rig.fixture.set_id, ArtifactKind::Calibrated)
+}
+
+/// Another frame set with the SAME NAME as `set_id`'s, carrying a copy of every row of `kind` that set has (a
+/// frame-level row keeps its frame, a group-level one has none): the rows a second subject keeps over files the first
+/// subject writes.
+pub(super) fn same_named_set_with_copies_of_rows(conn: &rusqlite::Connection, set_id: i64, kind: ArtifactKind) -> i64 {
+    conn.execute("INSERT INTO frames_set (name) SELECT name FROM frames_set WHERE id = ?1", [set_id]).unwrap();
+    let other = conn.last_insert_rowid();
     let subject = StackSubject::FrameSet(other);
-    for (frame_id, row) in rig.rows(ArtifactKind::Calibrated) {
+    let rows = crate::db::stacking::list_artifacts(conn, &StackSubject::FrameSet(set_id), Some(kind)).unwrap();
+    for row in rows {
         crate::db::stacking::upsert_artifact(
-            &rig.fixture.conn,
+            conn,
             &crate::db::stacking::NewArtifact {
                 subject: &subject,
-                frame_id: Some(frame_id),
+                frame_id: row.frame_id,
                 group_key: &row.group_key,
-                kind: ArtifactKind::Calibrated,
+                kind,
                 path: row.path.as_deref(),
                 config_hash: &row.config_hash,
                 size: row.size,

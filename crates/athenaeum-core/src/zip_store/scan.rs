@@ -365,9 +365,14 @@ fn adopt_into_zip(conn: &Connection, a: &ZipAdoption) -> Result<Option<String>> 
             params![zip_str, entry_path, crc, file_id],
         )?;
     } else {
+        // The row takes the entry's size and time without a read of the entry's pixels, and a stacking run trusts a
+        // banked sample whenever the row's size and time equal the file's: the sample of the old disk file must
+        // not outlive the take-over (an unpack would make the row a disk row again, with the sample). The next
+        // run samples the unpacked file and banks it; a zip row's own identity is its CRC.
         conn.execute(
             "UPDATE files SET path = ?1, filename = ?2, size = ?3, modified_at = ?4,
-                    archive_zip_path = ?5, archive_path_in_zip = ?6, archive_entry_crc32 = ?7
+                    archive_zip_path = ?5, archive_path_in_zip = ?6, archive_entry_crc32 = ?7,
+                    content_hash = NULL
              WHERE id = ?8",
             params![vpath, filename, size, modified.to_rfc3339(), zip_str, entry_path, crc, file_id],
         )?;
@@ -1369,6 +1374,31 @@ mod scan_tests {
 
         // A second pass over the changed-stat-free zip is a skip, and the entry is now known.
         assert!(scan_zip(&conn, &zip, 1, false).unwrap().skipped_unchanged);
+    }
+
+    #[test]
+    fn an_adopted_disk_row_loses_its_content_hash() {
+        // The row takes the zip entry's size and time without a read of the entry's pixels: a sample banked
+        // from the old file would vouch for bytes nobody read once the row is a disk row again (unpack).
+        let tmp = TempDir::new().unwrap();
+        let scan_root = tmp.path().join("scan");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&scan_root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let conn = db(&scan_root);
+        let bytes = light(7);
+        let (disk, id) = catalog_disk_frame(&conn, &scan_root, "L_001.fits", &bytes);
+        conn.execute("UPDATE files SET content_hash = 'banked-sample', strong_hash = 'kept-strong' WHERE id = ?1", params![id]).unwrap();
+
+        std::fs::remove_file(&disk).unwrap();
+        let zip = make_zip(&elsewhere, "n.zip", &[("Lights/L_001.fits", bytes)], ArchiveCompression::Store);
+        assert_eq!(scan_zip(&conn, &zip, 1, false).unwrap().adopted, 1);
+
+        let (content, strong): (Option<String>, Option<String>) = conn
+            .query_row("SELECT content_hash, strong_hash FROM files WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(content, None, "the adopted row's sample is dropped");
+        assert_eq!(strong.as_deref(), Some("kept-strong"), "the strong hash is not this rule's");
     }
 
     #[test]

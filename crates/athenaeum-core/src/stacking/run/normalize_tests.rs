@@ -741,6 +741,8 @@ pub(super) struct RegroupRig {
     pub(super) working: PathBuf,
     pub(super) output: PathBuf,
     pub(super) layout: WorkingLayout,
+    /// The frames on the set's manual exclusion list (`exclude`); a run hands them to its stages as the plan would.
+    pub(super) excluded: Vec<i64>,
 }
 
 impl RegroupRig {
@@ -796,7 +798,7 @@ impl RegroupRig {
             crate::db::set_setting(&fixture.conn, key, dir.to_str().unwrap()).unwrap();
         }
         let layout = WorkingLayout::new(&working, &set_slug(SET_NAME));
-        RegroupRig { tmp, ctx, fixture, light_ids, working, output, layout }
+        RegroupRig { tmp, ctx, fixture, light_ids, working, output, layout, excluded: Vec::new() }
     }
 
     /// Make `working` the working folder of the next run: the setting and the layout (the folder is created when it
@@ -811,6 +813,18 @@ impl RegroupRig {
         .unwrap();
         self.working = working.to_path_buf();
         self.layout = WorkingLayout::new(working, &set_slug(SET_NAME));
+    }
+
+    /// Put `frame_id` on the set's manual exclusion list: stored as the plan reads it, and handed to the next runs.
+    pub(super) fn exclude(&mut self, frame_id: i64, cfg: &StackingConfig) {
+        self.excluded.push(frame_id);
+        crate::db::stacking::set_set_config(
+            &self.fixture.conn,
+            self.fixture.set_id,
+            &serde_json::to_string(cfg).unwrap(),
+            &self.excluded,
+        )
+        .unwrap();
     }
 
     /// The config of the regroup tests: Manual reference, local normalization on.
@@ -872,6 +886,7 @@ impl RegroupRig {
             self.output.clone(),
             group_ids,
         );
+        rc.excluded = self.excluded.clone();
         let (res, logs) = crate::stacking::telemetry::capture_logs(|| {
             run_stages_for_test(&mut rc, Stage::Register)?;
             stage_output(&mut rc)
@@ -1313,7 +1328,8 @@ fn a_diverged_copy_is_recomputed_not_read() {
 fn the_not_found_warning_is_gone_after_one_run() {
     use crate::stacking::config::ExposureMode;
     let mut rig = RegroupRig::new(Some("RGGB"));
-    let cfg_on = rig.cfg(ExposureMode::Seconds, 2.0);
+    // One exposure class (a 40 s tolerance), so excluding one frame leaves a group of five that a run still stacks.
+    let cfg_on = rig.cfg(ExposureMode::Seconds, 40.0);
     let mut cfg = cfg_on.clone();
     cfg.normalization.local.enabled = false;
     cfg.normalization.rejection = crate::integration::stats::RejectionNormalization::None;
@@ -1321,6 +1337,11 @@ fn the_not_found_warning_is_gone_after_one_run() {
     let (_, _, logs1) = rig.run(&cfg_on);
     assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
     assert!(fan_out_items(&logs1, "normalize", "normalize") > 0, "run 1 normalizes: {logs1}");
+
+    // A frame the user excludes after run 1 keeps its rows, and no run rewrites them: the warning counts only the
+    // files a stage reads for the frames that are still stacked.
+    let excluded_frame = rig.light_ids[5];
+    rig.exclude(excluded_frame, &cfg);
 
     let w2 = rig.tmp.path().join("w2");
     rig.point_at(&w2);
@@ -1339,7 +1360,21 @@ fn the_not_found_warning_is_gone_after_one_run() {
             .unwrap() as usize
     };
     let (read_rows, ln_rows) = (count_under_w1(false), count_under_w1(true));
+    let excluded_rows: usize = rig
+        .fixture
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM stacking_artifacts WHERE substr(path, 1, ?1) = ?2
+               AND size IS NOT NULL AND modified_at IS NOT NULL
+               AND kind NOT IN ('ln', 'ln_reference') AND frame_id = ?3",
+            rusqlite::params![under_w1.len() as i64, under_w1, excluded_frame],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as usize;
+    assert!(excluded_rows >= 1, "premise: the excluded frame owns files a stage would read: {excluded_rows}");
     assert!(read_rows >= 6 && ln_rows > 0, "premise: {read_rows} files a stage reads, {ln_rows} LN files");
+    // What a run reads: every file of the frames still stacked.
+    let stacked_rows = read_rows - excluded_rows;
 
     let not_found = |warnings: &[String]| -> Option<String> {
         warnings.iter().find(|w| w.contains("cached files were not found")).cloned()
@@ -1349,21 +1384,81 @@ fn the_not_found_warning_is_gone_after_one_run() {
     let plan = rig.plan(&cfg);
     let plan_warning = not_found(&plan.warnings).unwrap_or_else(|| panic!("the plan warns: {:?}", plan.warnings));
     let n = leading_count(&plan_warning);
-    assert!((6..=read_rows).contains(&n), "the plan counts the rows its stages read, not the LN files: {plan_warning}");
+    assert!(
+        (5..=stacked_rows).contains(&n),
+        "the plan counts the rows its stages read for the stacked frames, not the LN files nor the excluded frame's: {plan_warning} (stacked {stacked_rows}, excluded frame's {excluded_rows})"
+    );
 
     let (_, rc2, logs2) = rig.run(&cfg);
-    assert_eq!(fan_out_items(&logs2, "calibrate", "calibrate"), 6, "run 2 recomputes: {logs2}");
+    assert_eq!(fan_out_items(&logs2, "calibrate", "calibrate"), 5, "run 2 recomputes the five stacked frames: {logs2}");
     let run_warning =
         not_found(&rc2.warnings).unwrap_or_else(|| panic!("run 2 warns: {:?}", rc2.warnings));
-    assert_eq!(run_warning, crate::stacking::rebase::left_warning(read_rows, &rig.layout.root));
+    assert_eq!(run_warning, crate::stacking::rebase::left_warning(stacked_rows, &rig.layout.root));
 
-    // The LN rows still name the removed W1, and nothing reads them: no warning from now on.
+    // The LN rows and the excluded frame's rows still name the removed W1, and nothing reads them: no warning from
+    // now on.
     assert_eq!(count_under_w1(true), ln_rows, "premise: the LN rows were left");
     let plan3 = rig.plan(&cfg);
     assert_eq!(not_found(&plan3.warnings), None, "{:?}", plan3.warnings);
     let (_, rc3, logs3) = rig.run(&cfg);
     assert_eq!(not_found(&rc3.warnings), None, "{:?}", rc3.warnings);
     assert_nothing_recomputed(&logs3, "run 3");
+}
+
+/// Review F1 (file-identity §4.2) on the regroup rig: set 2 has the same name as the rig's set, so the same working
+/// root; it keeps a row of `kind` over each file set 1 has a row for. Run 2 of set 1 under `rewrite`'s config
+/// rewrites those files, and set 2's rows go with them: with no modification time in the identity, a row left over a
+/// rewritten file of the same size would read fresh. Returns set 1's `kind` config hashes before and after run 2, so
+/// a caller can tell the rewrite ran.
+fn a_rewrite_retires_the_other_sets_rows(
+    kind: ArtifactKind,
+    rewrite: impl FnOnce(&mut StackingConfig),
+) -> (Vec<String>, Vec<String>) {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(Some("RGGB"));
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    let hashes = |set_id: i64| -> Vec<String> {
+        let mut h: Vec<String> =
+            crate::db::stacking::list_artifacts(&rig.fixture.conn, &StackSubject::FrameSet(set_id), Some(kind))
+                .unwrap()
+                .into_iter()
+                .map(|row| row.config_hash)
+                .collect();
+        h.sort();
+        h
+    };
+    rig.run(&cfg);
+    let before = hashes(rig.fixture.set_id);
+    assert!(!before.is_empty(), "premise: run 1 wrote {kind:?} rows");
+    let other = same_named_set_with_copies_of_rows(&rig.fixture.conn, rig.fixture.set_id, kind);
+    assert_eq!(hashes(other).len(), before.len(), "premise: the copies stand");
+
+    let mut cfg2 = cfg.clone();
+    rewrite(&mut cfg2);
+    rig.run(&cfg2);
+    let left = hashes(other);
+    assert!(left.is_empty(), "the other set keeps {kind:?} rows over rewritten files: {left:?}");
+    let after = hashes(rig.fixture.set_id);
+    assert_eq!(after.len(), before.len(), "the writer's own rows are back");
+    (before, after)
+}
+
+/// The `registered` file of a frame is replaced by Register's write: the other set's row over it goes first.
+#[test]
+fn a_same_named_sets_register_retires_the_other_sets_rows() {
+    let (before, after) = a_rewrite_retires_the_other_sets_rows(ArtifactKind::Registered, |cfg| {
+        cfg.registration.max_stars = 50;
+    });
+    assert_ne!(before, after, "premise: Register rewrote the files under the new config");
+}
+
+/// The group's LN reference file is rebuilt: the other set's row over it goes first.
+#[test]
+fn a_same_named_sets_ln_reference_retires_the_other_sets_row() {
+    let (before, after) = a_rewrite_retires_the_other_sets_rows(ArtifactKind::LnReference, |cfg| {
+        cfg.normalization.local.star_selection.max_stars = 4000;
+    });
+    assert_ne!(before, after, "premise: the reference was rebuilt under the new config");
 }
 
 /// Every file under `root`.
