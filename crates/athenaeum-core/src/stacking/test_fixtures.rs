@@ -591,6 +591,11 @@ fn file_identity(path: &Path) -> (i64, String) {
     (meta.len() as i64, modified_at)
 }
 
+/// The `modified_at` half of [`file_identity`]: a fixture file's time as the scanner stores it.
+pub(crate) fn modified_at_of(path: &Path) -> String {
+    file_identity(path).1
+}
+
 /// The content index's effect on a fixture catalog, for a test that forms a stage-1 hash before any
 /// run: every non-zip row with a NULL `content_hash` gets `compute_xxhash(path)` when its file matches
 /// the row, and `"unwritten-<file_id>"` when no file exists. Returns the rows written. A RUN rig never

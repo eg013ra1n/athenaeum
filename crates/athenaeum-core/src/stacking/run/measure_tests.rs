@@ -814,15 +814,18 @@ fn measure_pass1_from_the_artifact_after_a_lost_pass_two() {
     );
 }
 
-/// Plan A Task 11c (R11c-4), amended by the frame-level cache (spec §5.3) and the file identity (FI-2): a calibrated
-/// file whose mtime moved since the artifact was written does not cost the first pass: validity follows the
-/// calibration hash (an own file is judged by key + size), not the mtime. Nothing is excluded.
+/// Plan A Task 11c (R11c-4), amended by the frame-level cache (spec §5.3), the file identity (FI-2) and FI-11: the
+/// first pass's validity follows the calibration hash, not the calibrated file's time. A calibrated file whose time
+/// moved by 10 s is no longer fresh since FI-11 (an own file is judged by key + size + a time within 2 s), so run 2
+/// RECALIBRATES that frame and rewrites its row; the frame's pass-1 artifact, keyed on the calibration hash and not
+/// on the file's time, is still kept and no first pass re-runs. Nothing is excluded.
 #[test]
 fn measure_pass1_artifact_survives_a_touched_source() {
     let rig = Pass1Rig::new();
     rig.run("run 1", None);
     let ids = rig.sorted_ids();
     let touched = rig.calibrated_path(ids[2]);
+    let recorded = rig.rows(ArtifactKind::Calibrated)[&ids[2]].modified_at.clone();
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&touched)
@@ -832,6 +835,11 @@ fn measure_pass1_artifact_survives_a_touched_source() {
     drop(file);
     rig.delete_rows(&[ArtifactKind::Fits(0)]);
     let second = rig.run("run 2", None);
+    assert_ne!(
+        rig.rows(ArtifactKind::Calibrated)[&ids[2]].modified_at,
+        recorded,
+        "the touched frame was recalibrated: its row records the rewritten file's time"
+    );
     assert!(second.logged.is_empty(), "pass 1 re-ran for {:?}", second.logged);
     assert_eq!(second.excluded, 0);
     assert_eq!(rig.rows(ArtifactKind::Metrics).len(), 4);
@@ -1122,7 +1130,8 @@ fn measure_pass1_rewritten_inside_a_failing_pass_two_records_its_row() {
         assert!(
             crate::stacking::plan::file_matches_identity(
                 Path::new(row.path.as_deref().unwrap()),
-                row.size
+                row.size,
+                row.modified_at.as_deref()
             ),
             "frame {id}: the rewritten artifact's row describes another file"
         );

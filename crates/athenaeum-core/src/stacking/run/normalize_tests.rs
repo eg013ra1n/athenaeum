@@ -1316,6 +1316,115 @@ fn a_diverged_copy_is_recomputed_not_read() {
     assert_eq!(calibrated(&rig), planes_b, "run C wrote B's planes, it did not read A's");
 }
 
+/// FI-11, the regression that fails before the change: the dev build and the release build share one working folder
+/// and keep two catalogs, and a writer retires only its own catalog's rows. After run 1 the other build runs at
+/// another config: it replaces every calibrated file with other pixels of the same size and leaves this catalog's
+/// rows alone. The rows' key and size still match, and only the modification time (10 s later) says the file is not
+/// the one the row recorded. The gate lists Calibrate stale and the run recalibrates every frame. The measure and
+/// register rows name files nobody rewrote, so they stay fresh (their keys do not fold a calibrated file's bytes).
+#[test]
+fn a_file_another_catalog_rewrote_is_not_read_as_fresh() {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(Some("RGGB"));
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    let (_, _, logs1) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+    assert!(
+        !rig.stale(&cfg).contains(&Stage::Calibrate),
+        "premise: the gate reads Calibrate fresh after run 1"
+    );
+
+    let rows = rows_of_kind(&rig.fixture.conn, rig.fixture.set_id, ArtifactKind::Calibrated);
+    let mut files: Vec<(PathBuf, std::time::SystemTime)> = rows
+        .values()
+        .map(|r| {
+            let path = PathBuf::from(r.path.clone().unwrap());
+            let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+            (path, time)
+        })
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 6);
+    // The other build's output: every file takes the bytes of the next one (other pixels, the same size) and a time
+    // 10 s after the file this catalog's row recorded.
+    let bytes: Vec<Vec<u8>> = files.iter().map(|(p, _)| std::fs::read(p).unwrap()).collect();
+    for (i, (path, recorded)) in files.iter().enumerate() {
+        let other = &bytes[(i + 1) % bytes.len()];
+        assert_eq!(other.len(), bytes[i].len(), "premise: the calibrated files have one size");
+        assert_ne!(other, &bytes[i], "premise: the pixels differ");
+        std::fs::write(path, other).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(*recorded + std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    let stale = rig.stale(&cfg);
+    assert!(stale.contains(&Stage::Calibrate), "the gate reads the rewritten files as stale: {stale:?}");
+    let (_, _, logs2) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs2, "calibrate", "calibrate"), 6, "every frame is recalibrated: {logs2}");
+    assert!(
+        logs2.contains("cached file has the recorded size but another modification time; counted as changed"),
+        "the log says why: {logs2}"
+    );
+    assert_eq!(fan_out_items(&logs2, "measure", "pass1"), 0, "{logs2}");
+    assert_eq!(fan_out_items(&logs2, "register", "align"), 0, "{logs2}");
+    for (i, (path, _)) in files.iter().enumerate() {
+        let planted = &bytes[(i + 1) % bytes.len()];
+        let now = std::fs::read(path).unwrap();
+        assert_ne!(&now, planted, "{path:?} still holds the other build's pixels");
+        assert_eq!(now, bytes[i], "{path:?} holds the pixels run 1 wrote again");
+    }
+}
+
+/// FI-11's cost: a working folder copied onto its own path by a tool that does not keep file times (here a plain copy
+/// out and back, the times then an hour off the recorded ones) recomputes every frame once. The files are right but
+/// nothing proves it, so each own file is rewritten (calibrated, measured, registered, LN); the registrations are
+/// DB rows and stay. The next run recomputes nothing.
+#[test]
+fn a_working_folder_that_lost_its_times_recomputes_once() {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(Some("RGGB"));
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    let (_, _, logs1) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+
+    fn plain_copy(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let from = entry.unwrap().path();
+            let to = dst.join(from.file_name().unwrap());
+            if from.is_dir() {
+                plain_copy(&from, &to);
+            } else {
+                std::fs::copy(&from, &to).unwrap();
+            }
+        }
+    }
+    let aside = rig.tmp.path().join("aside");
+    plain_copy(&rig.working, &aside);
+    std::fs::remove_dir_all(&rig.working).unwrap();
+    plain_copy(&aside, &rig.working);
+    std::fs::remove_dir_all(&aside).unwrap();
+    set_times(&tree_files(&rig.working), |t| t + std::time::Duration::from_secs(3600));
+
+    let stale = rig.stale(&cfg);
+    assert!(stale.contains(&Stage::Calibrate), "the gate reads Calibrate stale: {stale:?}");
+    let (_, _, logs2) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs2, "calibrate", "calibrate"), 6, "{logs2}");
+    // Every frame is measured again: pass 1's spill files are rejected too, so pass 2 measures them (its fallback),
+    // and its fits files are rewritten.
+    assert_eq!(fan_out_items(&logs2, "measure", "pass2"), 6, "{logs2}");
+    // The registrations are DB rows keyed on the calibration hash (config + input samples) and stay; the registered files are written again.
+    assert_eq!(fan_out_items(&logs2, "register", "rewrite"), 6, "{logs2}");
+    assert!(fan_out_items(&logs2, "normalize", "normalize") > 0, "{logs2}");
+
+    let stale = rig.stale(&cfg);
+    for stage in [Stage::Calibrate, Stage::Measure, Stage::Register, Stage::Normalize] {
+        assert!(!stale.contains(&stage), "the gate reads {stage:?} stale after the recompute: {stale:?}");
+    }
+    let (_, _, logs3) = rig.run(&cfg);
+    assert_nothing_recomputed_with_ln(&logs3, "the run after the recompute");
+}
+
 /// The "not found" warning goes away after one run: it counts only the rows a stage reads. Run 1 fills W1 with local
 /// normalization on; the folder is switched to an empty W2 and W1 is removed, and local normalization is turned off.
 /// The plan and run 2 warn about the files they read (the calibrated, measured, registered and plane files) and not

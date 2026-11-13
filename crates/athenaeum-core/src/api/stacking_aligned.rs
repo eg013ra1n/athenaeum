@@ -238,13 +238,15 @@ fn resolve(
             );
         }
         let size = artifact.as_ref().and_then(|a| a.size);
+        let modified_at = artifact.as_ref().and_then(|a| a.modified_at.clone());
         let path = artifact
             .and_then(|artifact| artifact.path)
             .map(PathBuf::from)
             .filter(|p| file_exists(p, run_id, frame_id));
         out.push(match path {
-            // A row that recorded a size is judged by it (key + size); one without keeps the existence check alone.
-            Some(path) if size.is_some() && !file_matches_identity(&path, size) =>
+            // A row that recorded a size is judged by it and its time (key + size + a time within 2 s, FI-11); one
+            // without keeps the existence check alone.
+            Some(path) if size.is_some() && !file_matches_identity(&path, size, modified_at.as_deref()) =>
             {
                 Resolved::without_file(frame_id, AlignedState::Replaced)
             }
@@ -775,26 +777,37 @@ mod tests {
         ));
     }
 
-    /// An aligned file is judged by its size, not its time (FI-2): a later time is the same file; a file of another
-    /// size is not the run's aligned frame whatever the groups say; a row a later run deleted reads as missing.
+    /// An aligned file is judged by its size and its time (FI-2 amended by FI-11): a time moved by an hour is a
+    /// replaced file, a time cut to the second is the same one; a file of another size is not the run's aligned frame
+    /// whatever the groups say; a row a later run deleted reads as missing.
     #[test]
-    fn aligned_file_is_judged_by_its_size_not_its_time() {
+    fn aligned_file_is_judged_by_its_size_and_time() {
         let s = seeded(&[4.0; 4], 0);
         let run_id = run_once(&s, &config());
         let path = resolve_stacking_aligned_path(&s.ctx, run_id, s.ids[2]).unwrap();
         let recorded = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_modified(recorded + std::time::Duration::from_secs(5)).unwrap();
-        drop(file);
+        let set_time = |t: std::time::SystemTime| {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(t).unwrap();
+        };
+        let since = recorded.duration_since(std::time::UNIX_EPOCH).unwrap();
+        set_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(since.as_secs()));
+        assert_eq!(states(&s, run_id), vec![AlignedState::Available; 4], "a time cut to the second");
+
+        set_time(recorded + std::time::Duration::from_secs(3600));
+        let mut expected = vec![AlignedState::Available; 4];
+        expected[2] = AlignedState::Replaced;
+        assert_eq!(states(&s, run_id), expected, "a time moved by an hour");
+        set_time(recorded);
         assert_eq!(states(&s, run_id), vec![AlignedState::Available; 4]);
 
         {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             file.write_all(b"x").unwrap();
+            // The append moved the time too: put it back, so this step tests the size alone.
+            file.set_modified(recorded).unwrap();
         }
-        let mut expected = vec![AlignedState::Available; 4];
-        expected[2] = AlignedState::Replaced;
         assert_eq!(states(&s, run_id), expected);
         assert!(matches!(
             resolve_stacking_aligned_path(&s.ctx, run_id, s.ids[2]),
@@ -1067,7 +1080,7 @@ mod tests {
                     path: path.to_str(),
                     config_hash: "h",
                     size: Some(6),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(path)),
                     payload_json: None,
                 },
             )

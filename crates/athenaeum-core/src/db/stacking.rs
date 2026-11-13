@@ -1105,8 +1105,9 @@ pub fn delete_artifact(
 /// Deletes EVERY artifact row, of any subject and any kind, whose `path` is `path`; returns how many went. A writer
 /// that is about to replace a frame-level file calls this next to [`delete_artifact`], for each path it will write.
 /// The keyed delete removes only the writer's own row; but two frame sets with one name share a working root, so
-/// another subject's row can name the same file, and a kind's file can take another kind's name. With no
-/// modification time to compare, such a row would read fresh over the new bytes. A failed delete stops the job
+/// another subject's row can name the same file, and a kind's file can take another kind's name. Such a
+/// row would read fresh over the new bytes whenever the rewrite lands within 2 s of its time (the time check, FI-11,
+/// catches the rest), so the delete is what makes it certain. A failed delete stops the job
 /// (`?`), it is never a warning followed by the write.
 pub fn delete_artifacts_naming_path(conn: &Connection, path: &str) -> Result<usize> {
     Ok(conn.execute(DELETE_ARTIFACTS_NAMING_PATH_SQL, [path])?)

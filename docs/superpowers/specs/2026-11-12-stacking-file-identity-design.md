@@ -1,6 +1,6 @@
 # Stacking file identity without the modification time: design
 
-Date: 2026-11-12. Status: implemented and accepted on 2026-11-13 (acceptance: `docs/stacking/README.md`). Approved by the owner on 2026-11-12 («одобряю спеку, перепривязку включай»). This spec starts from `docs/superpowers/research/2026-11-08-stacking-file-identity-without-mtime.md`. It changes the cache of `docs/superpowers/specs/2026-11-08-stacking-frame-level-cache-design.md`, including that cache's ruling R7 b. The rulings are FI-1 to FI-10 (§2).
+Date: 2026-11-12. Status: implemented and accepted on 2026-11-13 (acceptance: `docs/stacking/README.md`); FI-11 added on 2026-11-13. Approved by the owner on 2026-11-12 («одобряю спеку, перепривязку включай»). This spec starts from `docs/superpowers/research/2026-11-08-stacking-file-identity-without-mtime.md`. It changes the cache of `docs/superpowers/specs/2026-11-08-stacking-frame-level-cache-design.md`, including that cache's ruling R7 b. The rulings are FI-1 to FI-11 (§2).
 
 Code paths are under `crates/athenaeum-core/src/` unless they start with `docs/`. Line numbers are taken from `main` at 484fa75f.
 
@@ -32,6 +32,7 @@ The change: a file's identity is its size plus a content sample, never its time.
 | FI-8 | 2026-11-12, with the approval | No full read of a master rewritten in place with its header kept; the risk of §6 is accepted (§11, point 2). |
 | FI-9 | 2026-11-12, «перепривязку включай» | A working folder that now lives at another path reuses its cache: the path rebase is part of this cycle (§4.10; §11, point 3). |
 | FI-10 | 2026-11-13, «Ок, начинай» (the plan's approval) | RB-1 of §4.10 stands: a copied or moved working folder is reused only when its files kept their times within 2 s. A content sample per working file is a follow-up only if a tool the owner uses drops times. |
+| FI-11 | 2026-11-13, «Включай» | A file Athenaeum wrote under a working folder is the row's file when the key is equal, the size is equal AND the file's modification time is within 2 s of the row's `modified_at`, both at full precision. It amends FI-2 (key + size alone) and is the rule FI-10 already uses for a moved folder. A row that names the frame's INPUT in place (a file Athenaeum did not write) keeps key + size and no time check. |
 
 The "accept ±2 s" remedy stays dropped (open-items, backlog line).
 
@@ -73,14 +74,15 @@ Corrections to the research note, from the code:
 
 ## 4. Design
 
-### 4.1 Own files: key + size (FI-2)
+### 4.1 Own files: key + size + a time within 2 s (FI-2, amended by FI-11)
 
-- New signature: `file_matches_identity(path: &Path, size: Option<i64>) -> bool` (`stacking/plan.rs`). It is one stat: the length equals the row's size. `NotFound` is the ordinary stale. Any other stat error stays a `warn!`, and a row without a size never matches. The `debug!` for "recorded size, another time" goes.
-- `is_fresh` keeps its rule: the hash is equal, the row has a path, and the file matches.
-- `file_identity` still writes `modified_at` into the artifact row. Nothing compares it any more. No schema change.
-- Blink (`api/stacking_aligned.rs:240-245`): `Replaced` when `size.is_some() && !file_matches_identity(path, size)`.
+- Signature: `file_matches_identity(path: &Path, size: Option<i64>, modified_at: Option<&str>) -> bool` (`stacking/plan.rs`). It is one stat: the length equals the row's size AND the file's time is within 2 s of the row's `modified_at`, both at full precision (`within_tolerance`, the function the rebase of §4.10 uses; `MTIME_TOLERANCE_SECS`). `NotFound` is the ordinary stale. Any other stat error stays a `warn!`. A row without a size, without a time, or with a time that does not parse never matches ("we do not know" is stale). A file whose time cannot be read is a `warn!` and does not match. A size that matches with a time outside the 2 s is a `debug!` ("cached file has the recorded size but another modification time; counted as changed", fields `path`, `recorded`, `current`).
+- `is_fresh` passes the row's `modified_at`: the hash is equal, the row has a path, and the file matches.
+- `file_identity` writes `modified_at` into the artifact row after the file's last write and rename; every writer does. No schema change.
+- Blink (`api/stacking_aligned.rs`): `Replaced` when the row recorded a size and `!file_matches_identity(path, size, modified_at)`. A row without a size keeps the existence check.
+- **Why the time came back (FI-11).** The dev build and the release build share one working folder on purpose and keep two catalogs. A writer retires only its own catalog's rows, so the other catalog's row, at its own key and the same size, read fresh over a file the first build rewrote under another config. The 2 s window costs nothing on the owner's disks: a copy that keeps its times moves a file's time by at most 9.57 ms (exFAT) and 62 ns (the SMB share).
 - This covers `calibrated`, `calibrated_mosaic`, `measured`, `fits.<plane>`, `registered`, `ln` and `ln_reference`, for the gate and the run alike.
-- An in-place foreign `calibrated` row (#6) is judged by key + size too. Its key now carries the foreign file's sample (§4.3).
+- An in-place foreign `calibrated` row (#6) is judged by key + size, with NO time check (`is_fresh_in_place`): the file is not Athenaeum's, its identity is in the key (size + content sample, §4.3), and a light copied with another time must recompute nothing. A row under one of the subject's own `prepared/` or `calibrated/` folders is an own file and gets the time.
 - **An in-place row must name the frame's current input.** The key vouches for the file at `files.path` (or the replica's landed path), not for the row's path. After a relocate the row still names the old path (`stacking/run/prepare.rs:339`), and another file of the same size there (a capture program that restarts its counter writes `Light_0001.fits` again) would read fresh by key + size. So an in-place row is fresh only when its path equals the frame's current input path (`origin::prepare_input`, `stacking/origin.rs:79-91`), in the gate and in the run. A row that fails this is stale: the run uses the file in place again, with no write, and re-points the row; Measure and later stay fresh because their keys did not move.
 
 ### 4.2 The write order that replaces the time (R7 b)
@@ -274,7 +276,7 @@ The gate's over-report in the regroup finding's item (3) goes away.
   - (c) **whose row does not match its file** (relocated, not rescanned): once per app session, not banked.
 - **Never paid:** in the gate, for a zip entry, for a project frame, for an own file.
 - **Stat:** one per light and master per run. Today the run does not stat lights.
-- **The time keeps two jobs.** It sits inside `disk_matches_row`, where it decides whether a banked sample still belongs to the file, and it keys the memo, where it decides whether to read again. It is never a verdict: a moved time with an equal sample is a hit.
+- **The time keeps two jobs.** It sits inside `disk_matches_row`, where it decides whether a banked sample still belongs to the file, and it keys the memo, where it decides whether to read again. It is never a verdict on a SAMPLE or on an input: a moved time with an equal sample is a hit. The one verdict the time gives is on an own working file (FI-11): there it is part of freshness, size + a time within 2 s of the row's.
 
 ### 4.10 A working folder at another path (FI-9)
 
@@ -290,7 +292,7 @@ Added after the approval, from the design note of 2026-11-12. Line numbers in th
 3. `<current root>/<same tail>` is a regular file, its length equals the row's `size`, and its time is within 2 s of the row's `modified_at` (`collab::storage::sweep::Stamp::matches`, `collab/storage/sweep.rs:10`, `:52-57`, the landing check's rule). A row without `size` or `modified_at` is never rebased;
 4. the UPDATE still finds the row at its old path.
 
-**Why the time, here only.** Inside one folder the write order (§4.2) makes a row's file the row's own write, so key + size is enough (FI-2). Across two copies nothing does. A frame recomputed in copy 1 keeps its size (calibrated and registered files usually do, whatever the settings), so copy 2's older file would pass key + size. The time says "the same write, copied"; exFAT, FAT and SMB rounding stay within 2 s. It is never a freshness verdict: after the rebase the row is judged by key + size (§4.1).
+**Why the time.** Across two copies nothing but the time tells which file is the row's own write. A frame recomputed in copy 1 keeps its size (calibrated and registered files usually do, whatever the settings), so copy 2's older file would pass key + size. The time says "the same write, copied"; exFAT, FAT and SMB rounding stay within 2 s. Since FI-11 the time is compared in both places, by one function: the freshness check of §4.1 compares the file at the row's path, and the rebase compares the file at the MAPPED path (the current root plus the same tail) before it re-points the row. After the rebase the row is judged by key + size + time like any other (§4.1), which the copy passes because it was judged by the same time.
 
 **Triggers.**
 - **The run**, once, at the top of `stage_calibrate_with` (`stacking/run/calibrate.rs:1131`), before the Prepare dispatch and before the book of §4.4. It uses the book's three phases: read the old roots and the candidates under the connection; stat without it, with cancel checked per file; commit one transaction of point updates. It is idempotent: a second call finds no candidate.
@@ -399,7 +401,7 @@ The risk: a same-size edit outside the three windows, with the header unchanged.
 | Catalog master on disk | The same. Details below. |
 | Light or master inside a zip | Nothing new: the CRC32 covers the whole entry. An entry without a CRC is judged by its time recorded in the zip. |
 | Project replica | Nothing new: blake3, and `landed_unchanged` excludes an in-place edit. |
-| Own files (FI-2) | An outside edit of a cached file at equal size. |
+| Own files (FI-2, FI-11) | An outside edit of a cached file at equal size that also keeps the time within 2 s. |
 
 **The master-header check.** A FITS master that the app builds carries no build date.
 
@@ -420,7 +422,7 @@ Lines in `docs/superpowers/open-items.md`:
 - **"Known gap, a landed file edited under a cached first pass" (`:410`):**
   - The first half is closed in the run, for an edit that changes the size or a window. The run stats every input and samples again when the time moved.
   - The gate still presumes the catalog and can report cached for such a frame. That is a new residual; record it.
-  - The second half (a change between Calibrate and Measure of one run) stays open. It is within one run, and the file is either Athenaeum's own (FI-2) or an in-place foreign file guarded only by `ReadGuard`. The suggested closer becomes a size check.
+  - The second half (a change between Calibrate and Measure of one run) stays open. It is within one run, and the file is either Athenaeum's own (FI-2) or an in-place foreign file guarded only by `ReadGuard`. The suggested closer becomes a size + time check (the own-file rule, FI-11).
 - **"Finding, what a regroup still re-registers" (`:408`):** the owner call is decided (FI-6), and item (3) is closed and pinned (§8). Items (1), (2) and (4) stay by design (§4.8). Rewrite the line.
 - **"Owed before the release: the upgrade on real data" (`:403`):** the expectation changes to "the first run after the update recomputes every set (FI-4); the second reuses everything" (§9 A0).
 - **New residuals to record:**
@@ -462,7 +464,7 @@ Every gate is `cargo test -p athenaeum-core --all-targets`.
 - `db`:
   - `bank_content_hash` writes only over a matching NULL row: not after a re-parse-like UPDATE, not over a value, not on a zip row;
   - `delete_artifact` is a point delete, like `find_artifact_is_a_point_lookup_on_the_artifacts_key` (`db/stacking.rs:2386`).
-- `identity_refusal_by_mtime_says_why` (`stacking/plan.rs:4194`), rewritten: a same-size file with a later time matches, another size does not, `NotFound` is silent and a stat error warns.
+- `identity_refusal_by_mtime_says_why` became `identity_is_the_size_and_a_time_within_two_seconds` (`stacking/plan.rs`, FI-11): a same-size file whose time is within 2 s of the row's (at full precision) matches, 2.001 s either side does not and the debug line says why, another size does not, a row without a time or with one that does not parse never matches, `NotFound` is silent and a stat error warns. `an_in_place_row_has_no_time_check` pins the exemption of a row that names the input.
 - The strict pins in `stacking/measure.rs:2225` and `stacking/pass1_artifact.rs:635-650` now pin that a moved time never makes a stamp stale.
 - `registration_hash_folds_the_reference_measurement_across_groups_only` (`stacking/plan.rs:10984`) becomes `…_whatever_its_group`. Its `:11014` assertion flips. The debayered-OSC reference still folds nothing, and `register_stale_follows_the_reference_measurement_for_an_osc_frame` (`:11045`) stays green.
 
@@ -484,7 +486,7 @@ Every gate is `cargo test -p athenaeum-core --all-targets`.
 - `a_cancelled_rewrite_does_not_leave_another_runs_pixels_fresh` (`stacking/run/register_tests.rs:824`) keeps its scenario and its end: the gate reads stale, the re-run rewrites 4 frames, and the master is bit-identical to run A's. Its premise becomes: after run B's cancel, the four `registered` rows are gone.
 - New in `stacking/run/calibrate_tests.rs`: run B, with another calibration option, is cancelled after Calibrate's fan-out. The frames written after the first unfinished job have no row. They recalibrate at run A's config, and the planes equal run A's, compared as `recalibration_reproduces_the_planes_bit_for_bit` (`:1096`) does.
 - `.athf`: with `FITS_WRITE_FAILURE_LOG` (`stacking/run/measure.rs:1972`), a failed write leaves no row.
-- Blink: `aligned_file_that_is_not_the_recorded_one_is_replaced` (`api/stacking_aligned.rs:697`) becomes: a same-size file with a later time is `Available`; another size is `Replaced`; a deleted row is `Missing`.
+- Blink: `aligned_file_that_is_not_the_recorded_one_is_replaced` (`api/stacking_aligned.rs:697`) became `aligned_file_is_judged_by_its_size_and_time` (FI-11): a time cut to the second or within 2 s is `Available`, a time moved by an hour is `Replaced`, another size is `Replaced` (the time put back, so the size alone decides), a row a later run deleted is `Missing`.
 
 **Regroup:**
 
@@ -604,3 +606,12 @@ The plan `docs/superpowers/plans/2026-11-12-stacking-file-identity-plan.md` re-v
 - **§9 A3.** On set 185 `stops` merges no group (10 s and 180 s are more than a stop apart) and only renames the keys; the merge and the split ran as `none` and back to `seconds`. Align reported 0 on every regroup run.
 - **§9 A2c and §4.10, the warning.** The not-found warning counts frames, not files (the plan and the run counted files differently, 35 against 114), and says the files are "from an earlier working folder" (it named the current folder as the one "recorded").
 - **Outside this spec's scope, found by its acceptance.** An SMB share refuses a full sync (`F_FULLFSYNC`, os error 45), so the LN reference and the other durable writes could not be made in a working or output folder on a share. Every writer now flushes through `zip_store::fs::sync_best_effort` (`9f404957`).
+
+**After the acceptance: FI-11 (2026-11-13).** Where this block and an earlier section disagree, this block holds.
+
+- **The rule.** An own working file is fresh by key, size AND a modification time within 2 s of its row's (§4.1). An in-place foreign row keeps key + size and no time check. This amends FI-2 and the "Why the time, here only" argument of §4.10: the time is compared in both places now.
+- **The reason.** The dev build and the release build share one working folder on purpose, with two catalogs. A writer retires only its own catalog's rows (`delete_artifact`, `delete_artifacts_naming_path`). The other catalog's row at its own key and the same size read fresh over a file the first build rewrote under another config. Before the file identity the exact time made that row stale.
+- **The measure.** On the owner's disks a copy that keeps its times moves a file's time by at most 9.57 ms (exFAT) and 62 ns (the SMB share), so 2 s costs nothing there.
+- **The cost.** A working folder copied onto its own path by a tool that resets the file times recomputes every frame once, and the next run recomputes nothing. A copy that keeps its times, to another place or onto the same one, is not affected.
+- **What stays open.** Two writes of one file within 2 s of each other by two builds, at the same size, still read fresh. Not expected between two builds' runs.
+- **Accepted (2026-11-13, `docs/stacking/README.md`, "Acceptance again after FI-11").** A file written on the SMB share or on the exFAT drive keeps the time its row recorded (difference 0, on the share also after a remount); a copy that keeps its times is within 9.5 ms; a second catalog over the same working folder recalibrates and its masters equal a clean run's in every data byte. A recompute caused by another time is not explained to the user yet (open item).

@@ -1108,33 +1108,67 @@ pub(crate) fn seeds_calibration_hash_for(
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
 
+/// The one stat of a cached file. A file that is not there is the ordinary "stale"; any other failure (permissions,
+/// a dropped mount) is not, and is logged before it is read as "not the recorded file".
+fn stat_cached_file(path: &Path) -> Option<std::fs::Metadata> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Some(meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cached file cannot be stat-ed; counted as changed");
+            None
+        }
+    }
+}
+
 /// A file's modification time in the scanner's own shape (`scanner/mod.rs`'s
 /// `modified_dt.to_rfc3339()`): what every writer in this module family stores in
-/// `stacking_artifacts.modified_at`. An own working file's freshness never compares the column
-/// ([`file_matches_identity`] checks the size alone), but the working-folder rebase does: it finds a moved folder's
-/// file by its size and this time within a tolerance ([`crate::stacking::rebase`]), so the column must keep being
-/// written by every writer; dropping it would stop every rebase.
+/// `stacking_artifacts.modified_at`, read AFTER the file's last write and rename. An own working file's freshness
+/// compares the column ([`file_matches_identity`]: the size and a time within 2 s, FI-11), and so does the
+/// working-folder rebase ([`crate::stacking::rebase`]); a writer that dropped it would make every own file stale.
 pub(crate) fn render_modified_at(modified: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339()
 }
 
-/// Whether the file at `path` is still the file a row recorded: a stat only, no pixel I/O. Its length equals `size`;
-/// a row without `size` never matches. Athenaeum's own working files are judged by key + size, never by the
-/// modification time (FI-2): a copy or a restore that rounds the time is still the same file. The write order (a
-/// writer deletes the row before it replaces the file, then upserts the new one) closes ruling R7 b, a file and a
-/// row that disagree after a cancel, so no row over another config's file exists for this check to catch.
-pub(crate) fn file_matches_identity(path: &Path, size: Option<i64>) -> bool {
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        // A file that is not there is the ordinary "stale"; any other failure (permissions, a dropped mount) is not,
-        // and is logged before it is read as "not the recorded file".
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+/// Whether the file at `path` is still the file a row recorded: a stat only, no pixel I/O. Its length equals `size`
+/// AND its modification time is within 2 s of `modified_at`, both at full precision
+/// ([`crate::stacking::rebase::within_tolerance`], the one time comparison the rebase uses too). A row without
+/// `size` or without `modified_at`, or with a time that does not parse, never matches: "we do not know" is stale.
+/// Athenaeum's own working files are judged by key + size + this time (FI-2 amended by FI-11): the dev build and the
+/// release build share one working folder and keep two catalogs, so another catalog's row can stand, at its own key
+/// and the same size, over a file this build rewrote; only the time tells. A copy that keeps the times (or rounds
+/// them within 2 s) is still the same file. The write order (a writer deletes the row before it replaces the file,
+/// then upserts the new one) closes ruling R7 b, a file and a row that disagree after a cancel.
+pub(crate) fn file_matches_identity(path: &Path, size: Option<i64>, modified_at: Option<&str>) -> bool {
+    let Some(meta) = stat_cached_file(path) else {
+        return false;
+    };
+    if size != Some(meta.len() as i64) {
+        return false;
+    }
+    let Some(recorded) = modified_at else {
+        return false;
+    };
+    let live = match meta.modified() {
+        Ok(modified) => modified,
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "cached file cannot be stat-ed; counted as changed");
+            tracing::warn!(path = %path.display(), error = %e, "cached file has no modification time; counted as changed");
             return false;
         }
     };
-    size == Some(meta.len() as i64)
+    if crate::stacking::rebase::within_tolerance(live, recorded) {
+        return true;
+    }
+    // The size matches and the time does not: the one case where a file looks right and is refused. Say why, once per
+    // look, so "everything recomputed after I copied the folder" is explained by the log (a copy tool that does not
+    // keep mtimes, or another build that rewrote the file).
+    tracing::debug!(
+        path = %path.display(),
+        recorded,
+        current = %render_modified_at(live),
+        "cached file has the recorded size but another modification time; counted as changed"
+    );
+    false
 }
 
 /// The in-place rule's gate half (file-identity §4.1): whether a Prepare subject's `calibrated` (or mosaic) row names
@@ -1172,7 +1206,7 @@ pub(crate) fn prepare_row_names_its_input(row_path: &Path, input: &Path, working
 /// only when ALL of these hold — its `config_hash` equals the frame's
 /// CURRENT stage-1 hash, its `path` is `Some`, its `size` is `Some`, AND a
 /// live `std::fs::metadata` read of that path reports exactly that size
-/// ([`file_matches_identity`]: key + size, never the time). A
+/// ([`file_matches_identity`]: key + size + a time within 2 s, FI-11). A
 /// row missing `path`/`size` (an artifact recorded before the pixel phase
 /// ever wrote anything, or one some other kind stores without a path) is
 /// NEVER assumed fresh — "we don't know" is "stale", not "trust the hash
@@ -1191,7 +1225,20 @@ pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bo
         && artifact
             .path
             .as_deref()
-            .is_some_and(|p| file_matches_identity(Path::new(p), artifact.size))
+            .is_some_and(|p| file_matches_identity(Path::new(p), artifact.size, artifact.modified_at.as_deref()))
+}
+
+/// The in-place rule's freshness (FI-11's exemption): the row's hash is current, it has a path and a size, and the
+/// file at the path has that size. NO time check, for a row that names the frame's INPUT in place (a light or a
+/// project replica Athenaeum did not write, [`prepare_row_names_its_input`]): the input's identity is in the key (its
+/// size and content sample), and a light copied with another time must recompute nothing. The caller has already
+/// established that the row's path is the frame's current input; a row under the subject's own folders is an own file
+/// and goes through [`is_fresh`].
+pub(crate) fn is_fresh_in_place(artifact: &StackingArtifactRow, current_hash: &str) -> bool {
+    artifact.config_hash == current_hash
+        && artifact.path.as_deref().is_some_and(|p| {
+            stat_cached_file(Path::new(p)).is_some_and(|meta| artifact.size == Some(meta.len() as i64))
+        })
 }
 
 /// Whether every one of a frame's `fits.<plane>` rows is fresh against
@@ -3941,8 +3988,20 @@ pub fn build_plan(
                 (Some(_), None) => false,
                 (None, _) => !prepare_gate,
             };
+            // A row that names the input itself is judged in place (key + size); a row under the subject's own folders
+            // is an own file and gets the time too (FI-11).
+            let row_fresh = |row: &StackingArtifactRow, hash: &str| {
+                let in_place = prepare_input_path
+                    .as_deref()
+                    .is_some_and(|input| row.path.as_deref().is_some_and(|p| Path::new(p) == input));
+                if in_place {
+                    is_fresh_in_place(row, hash)
+                } else {
+                    is_fresh(row, hash)
+                }
+            };
             let calib_fresh = match (&calib_artifact, &current_calib_hash) {
-                (Some(row), Some(hash)) => is_fresh(row, hash) && names_input(row),
+                (Some(row), Some(hash)) => row_fresh(row, hash) && names_input(row),
                 _ => false,
             };
             // The mosaic half of stage 1's freshness — the same rule
@@ -3956,7 +4015,7 @@ pub fn build_plan(
                     asked,
                 );
                 match (&mosaic_artifact, &current_calib_hash) {
-                    (Some(row), Some(hash)) => is_fresh(row, hash) && names_input(row),
+                    (Some(row), Some(hash)) => row_fresh(row, hash) && names_input(row),
                     _ => false,
                 }
             } else {
@@ -4333,45 +4392,107 @@ mod tests {
         );
     }
 
-    /// FI-2: an own working file is judged by its size, never by its time: a later time, a time cut to whole seconds
-    /// and a copy that kept nothing are all the same file; one byte more is not; a missing file is the ordinary stale
-    /// and logs nothing; a stat failure that is not "not found" is a warn.
+    /// FI-11 (amending FI-2): an own working file is judged by its size AND a modification time within 2 s of the
+    /// row's, at full precision: the same time, a time cut to whole seconds, 1.999 s later and exactly 2 s are the
+    /// same file; 2.001 s is not, and the debug line says why; one byte more is not; a row without a time or with a
+    /// time that does not parse never matches; a missing file is the ordinary stale and logs nothing; a stat failure
+    /// that is not "not found" is a warn.
     #[test]
-    fn identity_is_the_size_never_the_time() {
+    fn identity_is_the_size_and_a_time_within_two_seconds() {
         use std::time::{Duration, UNIX_EPOCH};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         std::fs::write(&path, b"12345678").unwrap();
-        let recorded = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let recorded_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let recorded = render_modified_at(recorded_time);
         let set_time = |t: std::time::SystemTime| {
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.set_modified(t).unwrap();
         };
 
-        set_time(recorded + Duration::from_secs(5));
-        let (later, quiet) =
-            crate::stacking::telemetry::capture_logs(|| file_matches_identity(&path, Some(8)));
-        assert!(later, "a later time is the same file");
-        assert!(quiet.trim().is_empty(), "no line for a time: {quiet}");
+        let (same, quiet) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(8), Some(&recorded))
+        });
+        assert!(same, "the recorded time");
+        assert!(quiet.trim().is_empty(), "no line for a match: {quiet}");
 
-        let whole = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        set_time(whole);
-        assert!(file_matches_identity(&path, Some(8)), "a time cut to whole seconds");
+        // Whole seconds: the file's time is cut, so it is up to a second off the recorded one, within the 2 s.
+        let since = recorded_time.duration_since(UNIX_EPOCH).unwrap();
+        set_time(UNIX_EPOCH + Duration::from_secs(since.as_secs()));
+        assert!(file_matches_identity(&path, Some(8), Some(&recorded)), "a time cut to whole seconds");
 
-        assert!(!file_matches_identity(&path, Some(9)), "one byte more");
-        assert!(!file_matches_identity(&path, None), "a row without a size never matches");
+        set_time(recorded_time + Duration::from_millis(1_999));
+        assert!(file_matches_identity(&path, Some(8), Some(&recorded)), "1.999 s later");
+        set_time(recorded_time + Duration::from_secs(2));
+        assert!(file_matches_identity(&path, Some(8), Some(&recorded)), "exactly 2 s later");
+        set_time(recorded_time - Duration::from_secs(2));
+        assert!(file_matches_identity(&path, Some(8), Some(&recorded)), "exactly 2 s earlier");
+
+        set_time(recorded_time + Duration::from_millis(2_001));
+        let (late, text) = crate::stacking::telemetry::capture_logs(|| {
+            file_matches_identity(&path, Some(8), Some(&recorded))
+        });
+        assert!(!late, "2.001 s later is another file");
+        assert!(
+            text.contains("DEBUG")
+                && text.contains("cached file has the recorded size but another modification time; counted as changed")
+                && text.contains("recorded")
+                && text.contains("current"),
+            "{text}"
+        );
+        set_time(recorded_time - Duration::from_millis(2_001));
+        assert!(!file_matches_identity(&path, Some(8), Some(&recorded)), "2.001 s earlier");
+
+        set_time(recorded_time);
+        assert!(!file_matches_identity(&path, Some(9), Some(&recorded)), "one byte more");
+        assert!(!file_matches_identity(&path, None, Some(&recorded)), "a row without a size never matches");
+        assert!(!file_matches_identity(&path, Some(8), None), "a row without a time never matches");
+        assert!(
+            !file_matches_identity(&path, Some(8), Some("yesterday")),
+            "a time that does not parse never matches"
+        );
 
         let (gone, quiet) = crate::stacking::telemetry::capture_logs(|| {
-            file_matches_identity(&dir.path().join("nope.bin"), Some(8))
+            file_matches_identity(&dir.path().join("nope.bin"), Some(8), Some(&recorded))
         });
         assert!(!gone);
         assert!(quiet.trim().is_empty(), "a missing file is the ordinary stale: {quiet}");
 
         let (broken, text) = crate::stacking::telemetry::capture_logs(|| {
-            file_matches_identity(Path::new("a\0b"), Some(8))
+            file_matches_identity(Path::new("a\0b"), Some(8), Some(&recorded))
         });
         assert!(!broken);
         assert!(text.contains("WARN") && text.contains("cannot be stat-ed"), "{text}");
+    }
+
+    /// FI-11's exemption at function level: a row that names the input in place is fresh by key + size whatever
+    /// the file's time; an own-file row of the same size and the same moved time is not.
+    #[test]
+    fn an_in_place_row_has_no_time_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("light.fits");
+        std::fs::write(&path, b"12345678").unwrap();
+        let recorded = render_modified_at(std::fs::metadata(&path).unwrap().modified().unwrap());
+        let later = std::fs::metadata(&path).unwrap().modified().unwrap() + std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        let row = |hash: &str, size: Option<i64>| StackingArtifactRow {
+            id: 1,
+            subject: StackSubject::FrameSet(1),
+            frame_id: Some(1),
+            group_key: String::new(),
+            kind: "calibrated".to_string(),
+            path: Some(path.to_string_lossy().into_owned()),
+            config_hash: hash.to_string(),
+            size,
+            modified_at: Some(recorded.clone()),
+            payload_json: None,
+            created_at: String::new(),
+        };
+        assert!(is_fresh_in_place(&row("h", Some(8)), "h"), "key + size, no time");
+        assert!(!is_fresh(&row("h", Some(8)), "h"), "an own file with that time is stale");
+        assert!(!is_fresh_in_place(&row("h", Some(9)), "h"), "another size");
+        assert!(!is_fresh_in_place(&row("h", None), "h"), "no size");
+        assert!(!is_fresh_in_place(&row("g", Some(8)), "h"), "another key");
     }
 
     /// Plan 6b-3 D6: a frame set's LN upstream is its registration hash,
@@ -4626,7 +4747,7 @@ mod tests {
                         path: Some(path.to_str().unwrap()),
                         config_hash: &artifact_hash,
                         size: Some(1),
-                        modified_at: None,
+                        modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&path)),
                         payload_json: None,
                     },
                 )
@@ -6887,7 +7008,7 @@ mod tests {
                 path: Some(path.to_str().unwrap()),
                 config_hash: &hash,
                 size: Some(999),
-                modified_at: None,
+                modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&path)),
                 payload_json: None,
             },
         )
@@ -6946,7 +7067,7 @@ mod tests {
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(1),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&cal_path)),
                     payload_json: None,
                 },
             )
@@ -7105,7 +7226,7 @@ mod tests {
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
                 size: Some(size),
-                modified_at: None,
+                modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&path)),
                 payload_json: None,
             },
         )
@@ -7242,7 +7363,7 @@ mod tests {
                 path: Some(path.to_str().unwrap()),
                 config_hash: hash,
                 size: Some(size),
-                modified_at: None,
+                modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&path)),
                 payload_json: None,
             },
         )
@@ -7389,7 +7510,7 @@ mod tests {
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(size),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&cal_path)),
                     payload_json: None,
                 },
             )
@@ -7886,7 +8007,7 @@ mod tests {
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(size),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&cal_path)),
                     payload_json: None,
                 },
             )
@@ -7989,7 +8110,7 @@ mod tests {
                 path: Some(reference_path.to_str().unwrap()),
                 config_hash: &reference_hash,
                 size: Some(reference_size),
-                modified_at: None,
+                modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&reference_path)),
                 payload_json: Some(&reference_payload),
             },
         )
@@ -8026,7 +8147,7 @@ mod tests {
                     path: Some(sidecar_path.to_str().unwrap()),
                     config_hash: &frame_hash,
                     size: Some(size),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&sidecar_path)),
                     payload_json: None,
                 },
             )
@@ -8163,7 +8284,7 @@ mod tests {
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(size),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&cal_path)),
                     payload_json: None,
                 },
             )
@@ -8314,7 +8435,7 @@ mod tests {
                 path: Some(reference_path.to_str().unwrap()),
                 config_hash: &reference_hash,
                 size: Some(reference_size),
-                modified_at: None,
+                modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&reference_path)),
                 payload_json: Some(&reference_payload),
             },
         )
@@ -8350,7 +8471,7 @@ mod tests {
                     path: Some(sidecar_path.to_str().unwrap()),
                     config_hash: &frame_hash,
                     size: Some(size),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&sidecar_path)),
                     payload_json: None,
                 },
             )
@@ -9294,7 +9415,7 @@ mod tests {
                     path: Some(cal_path.to_str().unwrap()),
                     config_hash: &hash,
                     size: Some(1),
-                    modified_at: None,
+                    modified_at: Some(&crate::stacking::test_fixtures::modified_at_of(&cal_path)),
                     payload_json: None,
                 },
             )
@@ -11784,6 +11905,7 @@ mod tests {
                   path: Option<&str>,
                   payload: Option<&str>| {
             let size = path.map(|p| std::fs::metadata(p).unwrap().len() as i64);
+            let modified_at = path.map(|p| crate::stacking::test_fixtures::modified_at_of(Path::new(p)));
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
@@ -11794,7 +11916,7 @@ mod tests {
                     path,
                     config_hash: hash,
                     size,
-                    modified_at: None,
+                    modified_at: modified_at.as_deref(),
                     payload_json: payload,
                 },
             )
