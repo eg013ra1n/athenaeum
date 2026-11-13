@@ -2546,3 +2546,17 @@ Known gap: republishing an `own_missing` frame that regenerates identical bytes 
 
 Everything listed here up to v0.7.1 was paid in the v0.7.1 notes (2026-11-07). A cycle that
 lands adds its user-facing lines here, in engineering wording; the next release translates them for users.
+
+- **Stacking, file identity (2026-11-13).** A copy of the lights, the masters or the working folder onto an exFAT
+  drive or an SMB share no longer recomputes a stack: a file is known by its size and content sample, a cached
+  working file by its key and size, never by its modification time. A working folder moved or copied to another
+  path (with the file times kept) keeps its cache, and the plan and Blink show it before the next run. A moved
+  master recomputes nothing. Merging or splitting mono groups keeps the registrations while the reference stays.
+  Once after the update every frame set recomputes; a run then starts with "checking the inputs".
+- **Stacking on a network share (2026-11-13).** With the working or output folder on an SMB share, local
+  normalization was not computed and the normalization files, and possibly the master, could not be written (the
+  share refuses a full sync). They are written now; a stack made on a share equals the one made on a local disk.
+- **Stacking warnings (2026-11-12).** A run and the manual-link dialog say when a dark, bias or dark-flat does not
+  fit the lights (another gain or offset; most pixels at zero after the subtraction); a group that produced no
+  master says why on its result card and in the completion notification.
+- **Missing files on the web (2026-11-12).** Locate works in the web build, through the folder browser's file mode.
