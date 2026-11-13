@@ -87,6 +87,7 @@ pub mod rej;
 pub use crate::star_measure::robust;
 pub mod run;
 pub mod solve;
+pub(crate) mod source_identity;
 #[cfg(test)]
 mod star_measure_identity;
 pub mod structure;

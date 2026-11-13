@@ -7569,6 +7569,35 @@ pub fn bank_strong_hash(conn: &Connection, file_id: i64, hash: &str) -> Result<u
     )
 }
 
+/// Record a file's three-part sampled xxh3 (`duplicates::compute_xxhash`) as
+/// `files.content_hash`, only over the row that still describes the sampled
+/// bytes.
+///
+/// The row is checked in the statement's own `WHERE`: its `size` and
+/// `modified_at` must still be the ones the caller saw on the file before AND
+/// after the read, its `content_hash` must be NULL (a value is never
+/// overwritten), and it must not be a zip row (a zip entry's identity is its
+/// CRC, never a sample of the zip). A scan re-parse that lands between the
+/// read and this call changes `modified_at` and nothing is written. Readers
+/// take `content_hash` to mean "these bytes": a wrong value would let
+/// Duplicates offer a unique file for deletion and sync skip a file. Returns
+/// whether a row was written.
+pub fn bank_content_hash(
+    conn: &Connection,
+    file_id: i64,
+    size: i64,
+    modified_at: &str,
+    hash: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE files SET content_hash = ?4
+          WHERE id = ?1 AND size = ?2 AND modified_at = ?3
+            AND content_hash IS NULL AND archive_zip_path IS NULL",
+        params![file_id, size, modified_at, hash],
+    )?;
+    Ok(n > 0)
+}
+
 /// Task 9 (calibration_library scan-root kind) — DB-level coverage for
 /// `upsert_scan_root`'s INSERT-only kind semantics and the
 /// `count_scan_roots_of_kind` uniqueness-guard helper. The code-level
@@ -9113,5 +9142,71 @@ mod used_copy_tests {
         assert_eq!(used(&conn, 1), vec![1]);
         assert_eq!(used(&conn, 2), vec![2]);
         assert!(get_frames_set_duplicate_counts(&conn).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bank_content_hash_tests {
+    use super::bank_content_hash;
+    use rusqlite::Connection;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1, '/t/a.fits', 'a.fits', 100, '2026-01-01T00:00:00+00:00', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn hash_of(conn: &Connection, id: i64) -> Option<String> {
+        conn.query_row("SELECT content_hash FROM files WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn bank_content_hash_writes_only_over_a_matching_null_row() {
+        let conn = db();
+        let t = "2026-01-01T00:00:00+00:00";
+
+        // A size or a time that is not the row's writes nothing.
+        assert!(!bank_content_hash(&conn, 1, 101, t, "h0").unwrap());
+        assert!(!bank_content_hash(&conn, 1, 100, "2026-01-01T00:00:01+00:00", "h0").unwrap());
+        assert_eq!(hash_of(&conn, 1), None);
+
+        // The matching NULL row takes it, once.
+        assert!(bank_content_hash(&conn, 1, 100, t, "h1").unwrap());
+        assert_eq!(hash_of(&conn, 1).as_deref(), Some("h1"));
+
+        // Never over a value.
+        assert!(!bank_content_hash(&conn, 1, 100, t, "h2").unwrap());
+        assert_eq!(hash_of(&conn, 1).as_deref(), Some("h1"));
+
+        // A re-parse-like UPDATE of the time (and a cleared hash) refuses the
+        // sample read under the old time.
+        conn.execute(
+            "UPDATE files SET modified_at = '2026-01-02T00:00:00+00:00', content_hash = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(!bank_content_hash(&conn, 1, 100, t, "h3").unwrap());
+        assert_eq!(hash_of(&conn, 1), None);
+        assert!(bank_content_hash(&conn, 1, 100, "2026-01-02T00:00:00+00:00", "h4").unwrap());
+
+        // Not a zip row.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
+             VALUES (2, '/t/z/b.fits', 'b.fits', 50, '2026-01-01T00:00:00+00:00', 'FITS', '/t/z.zip', 'b.fits')",
+            [],
+        )
+        .unwrap();
+        assert!(!bank_content_hash(&conn, 2, 50, t, "h5").unwrap());
+        assert_eq!(hash_of(&conn, 2), None);
+
+        // No such id.
+        assert!(!bank_content_hash(&conn, 99, 100, t, "h6").unwrap());
     }
 }
