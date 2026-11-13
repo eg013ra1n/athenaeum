@@ -79,6 +79,7 @@ pub mod prepare;
 pub mod project_source;
 pub mod provenance;
 pub mod psf_signal;
+pub(crate) mod rebase;
 pub mod register;
 pub mod rej;
 // Robust Chauvenet Rejection moved to the star-measurement module with the

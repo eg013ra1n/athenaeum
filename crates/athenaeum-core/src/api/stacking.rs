@@ -1090,6 +1090,34 @@ fn project_working_dir(
     Ok(resolve_dirs(conn, settings, &cfg.paths).working)
 }
 
+/// The working folder the subject's NEXT run would use: the subject's own config (a frame set's stored override or the
+/// global default, a project's document) resolved to its `paths.workingDir`, spelled as a run records it
+/// ([`crate::stacking::paths::run_spelled_working`]) when the folder exists and as configured when it does not.
+/// `None` when no working folder is configured. Reads the settings and the file system, writes nothing: the readers of
+/// a moved folder (Blink, the master-light preview cache) lay their paths out under it, not under the folder a run
+/// row recorded.
+pub(crate) fn current_working_dir(
+    conn: &Connection,
+    settings: &SettingsManager,
+    subject: &StackSubject,
+) -> Result<Option<PathBuf>, ApiError> {
+    let working = match subject {
+        StackSubject::FrameSet(set_id) => {
+            let set_row = get_set_config(conn, *set_id)?;
+            let cfg = resolve_set_stacking_config(conn, settings, set_row.as_ref())?;
+            resolve_dirs(conn, settings, &cfg.paths).working
+        }
+        StackSubject::Project(project_id) => project_working_dir(conn, settings, project_id)?,
+    };
+    let Some(working) = working.map(|w| w.trim().to_string()).filter(|w| !w.is_empty()) else {
+        return Ok(None);
+    };
+    let configured = PathBuf::from(working);
+    Ok(Some(
+        crate::stacking::paths::run_spelled_working(&configured).unwrap_or(configured),
+    ))
+}
+
 /// A project's working-layout byte usage, as for a set. No working folder
 /// reads as all zeros.
 pub fn get_project_stacking_work_usage(
@@ -1266,14 +1294,27 @@ fn resolve_master_light(
                     kind.as_db_str()
                 ))
             })?;
-        let layout = if run_row.working_dir.trim().is_empty() {
-            None
-        } else {
-            Some(layout_for(
-                &conn,
-                Path::new(&run_row.working_dir),
-                &run_row.subject(),
-            )?)
+        // The cache lives under the subject's CURRENT working folder: after a move the run row still names the old
+        // one, and a cache written there would recreate a folder the user moved away. The row's folder serves only
+        // a subject with none configured (or whose config cannot be read: the cache is an optimization), and only
+        // while it exists.
+        let subject = run_row.subject();
+        let current = match current_working_dir(&conn, &ctx.settings, &subject) {
+            Ok(dir) => dir,
+            Err(error) => {
+                tracing::warn!(run_id, %error, "current working folder not resolved; the run's own folder is used for the preview cache");
+                None
+            }
+        };
+        let working = current.or_else(|| {
+            (!run_row.working_dir.trim().is_empty()).then(|| PathBuf::from(&run_row.working_dir))
+        });
+        // A folder that is not there (moved away while the setting or the run row still names it) gets no cache:
+        // `write_preview_cache` would create it, and the preview is rendered and not stored instead.
+        let working = working.and_then(|w| crate::stacking::paths::run_spelled_working(&w));
+        let layout = match working {
+            Some(working) => Some(layout_for(&conn, &working, &subject)?),
+            None => None,
         };
         // The cache path is built from the ROW's own `group_key`, not the
         // caller's argument — the two are equal by construction (the lookup
@@ -2600,6 +2641,135 @@ mod tests {
             Some(rendered),
             "a warm cache must match the render exactly"
         );
+    }
+
+    /// File identity §4.10: the preview cache lives under the subject's CURRENT working folder. A run row that
+    /// names the folder the user moved away must not make the cache recreate it.
+    #[test]
+    fn a_moved_working_folder_caches_previews_in_the_current_one() {
+        let (tmp, ctx) = test_ctx();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('LDN 1272')", [])
+            .unwrap();
+        let set_id = conn.last_insert_rowid();
+        // The run wrote under W1; the folder was moved to W2 and the setting points at it.
+        let w1 = tmp.path().join("w1");
+        let w2 = tmp.path().join("w2");
+        std::fs::create_dir_all(&w2).unwrap();
+        crate::db::set_setting(&conn, keys::STACKING_WORKING_DIR, w2.to_str().unwrap()).unwrap();
+        let run_id = crate::db::stacking::insert_run(
+            &conn,
+            &crate::db::stacking::NewRun {
+                subject: &StackSubject::FrameSet(set_id),
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: w1.to_str().unwrap(),
+                output_dir: tmp.path().to_str().unwrap(),
+            },
+        )
+        .unwrap();
+        let (width, height) = (32usize, 24usize);
+        let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+        let master = tmp.path().join("master_light.fits");
+        crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+        crate::db::stacking::insert_master_light(
+            &conn,
+            &crate::db::stacking::NewMasterLight {
+                subject: &StackSubject::FrameSet(set_id),
+                run_id,
+                group_key: "g",
+                kind: "master",
+                path: master.to_str().unwrap(),
+                format: "fits",
+                width: width as i64,
+                height: height as i64,
+                channels: 1,
+                frames: 3,
+                total_exposure_s: None,
+            },
+        )
+        .unwrap();
+
+        let rendered =
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+        let current = crate::stacking::paths::run_spelled_working(&w2).unwrap();
+        let cache = WorkingLayout::new(&current, &set_slug("LDN 1272")).preview_path(
+            run_id,
+            "g",
+            "master",
+            "thumbnail",
+        );
+        assert_eq!(std::fs::read(&cache).unwrap(), rendered, "the cache is under W2: {cache:?}");
+        assert!(!w1.exists(), "the folder the run row names was not recreated");
+        let hit =
+            cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+        assert_eq!(hit, Some(rendered), "the cache-only read finds it under W2");
+    }
+
+    /// File identity §4.10: the preview cache is an optimization and never creates a working folder. The folder moved
+    /// away while the setting (or, with none configured, the run row) still names it: the preview is rendered and not
+    /// stored, and the old path does not come back.
+    #[test]
+    fn a_preview_never_recreates_a_working_folder_that_is_gone() {
+        for configured in [true, false] {
+            let (tmp, ctx) = test_ctx();
+            let db_path = tmp.path().join("catalog.db");
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+            conn.execute("INSERT INTO frames_set (name) VALUES ('LDN 1272')", [])
+                .unwrap();
+            let set_id = conn.last_insert_rowid();
+            let w1 = tmp.path().join("w1");
+            if configured {
+                crate::db::set_setting(&conn, keys::STACKING_WORKING_DIR, w1.to_str().unwrap()).unwrap();
+            }
+            let run_id = crate::db::stacking::insert_run(
+                &conn,
+                &crate::db::stacking::NewRun {
+                    subject: &StackSubject::FrameSet(set_id),
+                    config_json: "{}",
+                    config_hash: "h",
+                    reference_frame_id: None,
+                    reference_mode: "auto",
+                    working_dir: w1.to_str().unwrap(),
+                    output_dir: tmp.path().to_str().unwrap(),
+                },
+            )
+            .unwrap();
+            let (width, height) = (32usize, 24usize);
+            let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+            let master = tmp.path().join("master_light.fits");
+            crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+            crate::db::stacking::insert_master_light(
+                &conn,
+                &crate::db::stacking::NewMasterLight {
+                    subject: &StackSubject::FrameSet(set_id),
+                    run_id,
+                    group_key: "g",
+                    kind: "master",
+                    path: master.to_str().unwrap(),
+                    format: "fits",
+                    width: width as i64,
+                    height: height as i64,
+                    channels: 1,
+                    frames: 3,
+                    total_exposure_s: None,
+                },
+            )
+            .unwrap();
+
+            let rendered =
+                render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+            assert!(!rendered.is_empty(), "the preview is still rendered (configured: {configured})");
+            assert!(!w1.exists(), "the folder that is gone was recreated (configured: {configured})");
+            let hit =
+                cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+            assert_eq!(hit, None, "nothing was stored (configured: {configured})");
+        }
     }
 
     /// Fix round 1, I1: `max_px` is clamped into

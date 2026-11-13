@@ -799,6 +799,20 @@ impl RegroupRig {
         RegroupRig { tmp, ctx, fixture, light_ids, working, output, layout }
     }
 
+    /// Make `working` the working folder of the next run: the setting and the layout (the folder is created when it
+    /// does not exist; a test that moved or copied the old one has made it already).
+    pub(super) fn point_at(&mut self, working: &Path) {
+        std::fs::create_dir_all(working).unwrap();
+        crate::db::set_setting(
+            &self.fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.to_str().unwrap(),
+        )
+        .unwrap();
+        self.working = working.to_path_buf();
+        self.layout = WorkingLayout::new(working, &set_slug(SET_NAME));
+    }
+
     /// The config of the regroup tests: Manual reference, local normalization on.
     pub(super) fn cfg(&self, mode: crate::stacking::config::ExposureMode, tolerance: f64) -> StackingConfig {
         let mut cfg = StackingConfig::default();
@@ -818,8 +832,8 @@ impl RegroupRig {
         cfg
     }
 
-    /// The stages the plan gate reads stale under `cfg` (no file read, no sample read).
-    pub(super) fn stale(&self, cfg: &StackingConfig) -> Vec<Stage> {
+    /// The plan gate's answer under `cfg` (no file read, no sample read).
+    pub(super) fn plan(&self, cfg: &StackingConfig) -> crate::stacking::plan::StackingPlan {
         crate::stacking::plan::build_plan(
             &self.fixture.conn,
             &self.ctx.settings,
@@ -828,7 +842,11 @@ impl RegroupRig {
             Some(cfg.clone()),
         )
         .expect("the plan should build")
-        .stale_stages
+    }
+
+    /// The stages the plan gate reads stale under `cfg` (no file read, no sample read).
+    pub(super) fn stale(&self, cfg: &StackingConfig) -> Vec<Stage> {
+        self.plan(cfg).stale_stages
     }
 
     /// One run through Output under `cfg`; returns the groups, the run context and the captured logs.
@@ -1060,6 +1078,297 @@ fn assert_nothing_recomputed(logs: &str, what: &str) {
             "{what} redid {stage}/{pass}: {logs}"
         );
     }
+}
+
+/// Every file under `root`: path, bytes and modification time, sorted by path (a folder's walk before and after).
+fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+                out.push((path.clone(), std::fs::read(&path).unwrap(), time));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `(kind, path)` of every catalog row that names a file, by path.
+fn artifact_files(rig: &RegroupRig) -> Vec<(String, PathBuf)> {
+    let mut stmt = rig
+        .fixture
+        .conn
+        .prepare("SELECT kind, path FROM stacking_artifacts WHERE path IS NOT NULL ORDER BY path")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, PathBuf::from(r.get::<_, String>(1)?))))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// The five frame-level fan-outs of one run, each over 0 items: the four of `assert_nothing_recomputed` and LN.
+fn assert_nothing_recomputed_with_ln(logs: &str, what: &str) {
+    assert_nothing_recomputed(logs, what);
+    assert_eq!(
+        fan_out_items(logs, "normalize", "normalize"),
+        0,
+        "{what} redid the local normalization: {logs}"
+    );
+}
+
+fn whole_seconds(t: std::time::SystemTime) -> std::time::SystemTime {
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(d.as_secs())
+}
+
+/// File-identity §4.10 (FI-9), the regression that fails before the change: a working folder renamed to another path
+/// (its files kept, their times rounded to whole seconds as on a coarser disk) is reused where it now is. Run 2 under
+/// the new folder recomputes nothing at calibrate, pass 1, pass 2, align or LN, every file row names the new folder
+/// and the old one is never recreated.
+#[test]
+fn a_moved_working_folder_reuses_every_frame_level_stage() {
+    use crate::stacking::config::ExposureMode;
+    let mut rig = RegroupRig::new(Some("RGGB"));
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    let w1 = rig.working.clone();
+    let (_, _, logs1) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+    assert!(fan_out_items(&logs1, "normalize", "normalize") > 0, "run 1 normalizes: {logs1}");
+    let rows1 = artifact_files(&rig);
+    assert!(rows1.len() > 6 * 3, "calibrated, measured, registered and LN rows: {rows1:?}");
+    assert!(rows1.iter().all(|(_, p)| p.starts_with(&w1)), "run 1 wrote under W1: {rows1:?}");
+
+    let w2 = rig.tmp.path().join("w2");
+    std::fs::rename(&w1, &w2).unwrap();
+    rig.point_at(&w2);
+    set_times(&rig.working_files(), whole_seconds);
+
+    // The gate reads through the move: every stage a run reuses reads cached, and it writes nothing (the rows still
+    // name W1 after the plan).
+    let stale = rig.stale(&cfg);
+    for stage in [Stage::Calibrate, Stage::Measure, Stage::Register, Stage::Normalize] {
+        assert!(!stale.contains(&stage), "the plan reads {stage:?} stale after the move: {stale:?}");
+    }
+    assert_eq!(artifact_files(&rig), rows1, "the plan wrote no row");
+    assert!(
+        rig.plan(&cfg).warnings.iter().all(|w| !w.contains("cached files were not found")),
+        "a moved folder is nothing to warn about"
+    );
+
+    let (_, _, logs2) = rig.run(&cfg);
+    assert_nothing_recomputed_with_ln(&logs2, "a moved working folder");
+    let rows2 = artifact_files(&rig);
+    assert_eq!(rows2.len(), rows1.len(), "no row was added or lost: {rows2:?}");
+    assert!(rows2.iter().all(|(_, p)| p.starts_with(&w2)), "every file row names W2: {rows2:?}");
+    assert!(!w1.exists(), "the old folder was not recreated");
+
+    // The run rebased the rows: the gate has no candidate left and reads the same, with nothing to warn about.
+    let subject = StackSubject::FrameSet(rig.fixture.set_id);
+    let view = crate::stacking::rebase::RebaseView::for_gate(&rig.fixture.conn, &subject, &rig.layout.root).unwrap();
+    assert_eq!((view.moved(), view.left_gone()), (0, 0), "the rebased rows leave the view empty");
+    assert!(crate::stacking::rebase::candidates(&rig.fixture.conn, &subject, &rig.layout.root)
+        .unwrap()
+        .is_empty());
+    let stale = rig.stale(&cfg);
+    assert!(
+        ![Stage::Calibrate, Stage::Measure, Stage::Register, Stage::Normalize].iter().any(|s| stale.contains(s)),
+        "{stale:?}"
+    );
+}
+
+/// A COPY of the working folder (times kept) is used at its new place and the original is left exactly as it was;
+/// once the original is removed the next run still reuses the copy.
+#[test]
+fn a_copied_working_folder_is_used_and_the_original_is_untouched() {
+    use crate::stacking::config::ExposureMode;
+    let mut rig = RegroupRig::new(Some("RGGB"));
+    let cfg = rig.cfg(ExposureMode::Seconds, 2.0);
+    let w1 = rig.working.clone();
+    let (_, _, logs1) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+
+    let w2 = rig.tmp.path().join("w2");
+    copy_tree_keeping_times(&w1, &w2);
+    let original = tree_snapshot(&w1);
+    assert!(!original.is_empty());
+    rig.point_at(&w2);
+
+    let (_, _, logs2) = rig.run(&cfg);
+    assert_nothing_recomputed_with_ln(&logs2, "a copied working folder");
+    let rows = artifact_files(&rig);
+    assert!(rows.iter().all(|(_, p)| p.starts_with(&w2)), "every file row names W2: {rows:?}");
+    assert_eq!(tree_snapshot(&w1), original, "the original folder is untouched");
+
+    std::fs::remove_dir_all(&w1).unwrap();
+    let (_, _, logs3) = rig.run(&cfg);
+    assert_nothing_recomputed_with_ln(&logs3, "the copy after the original was removed");
+    assert!(!w1.exists(), "the removed folder was not recreated");
+}
+
+/// The defect the 2 s rule guards against: an older, diverged copy is never read. Run A fills W1; W2 is its copy;
+/// run B under W2 recalibrates with another setting (same sizes, other pixels); W1's times go an hour back; W2 is
+/// removed; run C at B's config under W1 finds W1's files of the right size but another time. Calibrate covers all 6
+/// frames, the run warns once with the number of rows it left (the plan with the number its gate reads), and the planes are B's, not A's.
+#[test]
+fn a_diverged_copy_is_recomputed_not_read() {
+    use crate::stacking::config::ExposureMode;
+    let mut rig = RegroupRig::new(Some("RGGB"));
+    let cfg_a = rig.cfg(ExposureMode::Seconds, 2.0);
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.calibration.flat_norm = !cfg_b.calibration.flat_norm;
+    let w1 = rig.working.clone();
+    let (_, _, logs_a) = rig.run(&cfg_a);
+    assert_eq!(fan_out_items(&logs_a, "calibrate", "calibrate"), 6, "{logs_a}");
+    let calibrated = |rig: &RegroupRig| -> Vec<(i64, u64, Vec<Vec<u32>>)> {
+        let mut rows: Vec<_> = rows_of_kind(&rig.fixture.conn, rig.fixture.set_id, ArtifactKind::Calibrated)
+            .into_values()
+            .map(|r| {
+                let path = PathBuf::from(r.path.unwrap());
+                (r.frame_id.unwrap(), std::fs::metadata(&path).unwrap().len(), file_plane_bits(&path))
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let planes_a = calibrated(&rig);
+    assert_eq!(planes_a.len(), 6);
+
+    let w2 = rig.tmp.path().join("w2");
+    copy_tree_keeping_times(&w1, &w2);
+    rig.point_at(&w2);
+    let (_, _, logs_b) = rig.run(&cfg_b);
+    assert_eq!(fan_out_items(&logs_b, "calibrate", "calibrate"), 6, "B recalibrates: {logs_b}");
+    let planes_b = calibrated(&rig);
+    assert_eq!(planes_b.len(), 6);
+    for (a, b) in planes_a.iter().zip(&planes_b) {
+        assert_eq!(a.1, b.1, "premise: the calibrated sizes are equal");
+        assert_ne!(a.2, b.2, "premise: the two settings give other pixels");
+    }
+
+    // W1 now holds run A's files, an hour older than anything a row of B's recorded.
+    set_times(&tree_files(&w1), |t| t - std::time::Duration::from_secs(3600));
+    std::fs::remove_dir_all(&w2).unwrap();
+    rig.point_at(&w1);
+    let left: i64 = {
+        let under_w2 = format!("{}{}", w2.display(), std::path::MAIN_SEPARATOR);
+        rig.fixture
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM stacking_artifacts WHERE substr(path, 1, ?1) = ?2
+                   AND size IS NOT NULL AND modified_at IS NOT NULL",
+                rusqlite::params![under_w2.len() as i64, under_w2],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert!(left > 6, "premise: B's rows name W2: {left}");
+
+    // The gate says the same before the run: Calibrate is owed and the warning counts the rows it left. The gate
+    // spells the current folder as a run records it, the rig's layout as configured.
+    let plan_c = rig.plan(&cfg_b);
+    assert!(plan_c.stale_stages.contains(&Stage::Calibrate), "{:?}", plan_c.stale_stages);
+    let gate_root = WorkingLayout::new(
+        &crate::stacking::paths::run_spelled_working(&w1).unwrap_or_else(|| w1.clone()),
+        &set_slug(SET_NAME),
+    )
+    .root;
+    // The plan counts the left rows its gate reads (not the measured rows or the LN files, which it never judges), the
+    // run the rows its stages read: the plan's count is a lower bound of the run's, and both name the folder.
+    let plan_warning = plan_c
+        .warnings
+        .iter()
+        .find(|w| w.contains("cached files were not found"))
+        .unwrap_or_else(|| panic!("the plan says it left rows: {:?}", plan_c.warnings));
+    let plan_left: usize = plan_warning.split_whitespace().next().unwrap().parse().unwrap();
+    assert!((6..=left as usize).contains(&plan_left), "{plan_warning} of {left} rows");
+    assert_eq!(
+        *plan_warning,
+        crate::stacking::rebase::left_warning(plan_left, &gate_root),
+        "the plan names the folder as a run records it"
+    );
+
+    let (_, rc_c, logs_c) = rig.run(&cfg_b);
+    assert_eq!(fan_out_items(&logs_c, "calibrate", "calibrate"), 6, "{logs_c}");
+    let warning = crate::stacking::rebase::left_warning(left as usize, &rig.layout.root);
+    assert!(
+        rc_c.warnings.contains(&warning),
+        "the run says how many rows it left ({warning}): {:?}",
+        rc_c.warnings
+    );
+    assert_eq!(calibrated(&rig), planes_b, "run C wrote B's planes, it did not read A's");
+}
+
+/// The "not found" warning goes away after one run: it counts only the rows a stage reads. Run 1 fills W1 with local
+/// normalization on; the folder is switched to an empty W2 and W1 is removed, and local normalization is turned off.
+/// The plan and run 2 warn about the files they read (the calibrated, measured, registered and plane files) and not
+/// about the LN files no stage reads now; run 2 recomputes; the next plan and run 3 carry no such warning, though the
+/// LN rows still name the removed W1.
+#[test]
+fn the_not_found_warning_is_gone_after_one_run() {
+    use crate::stacking::config::ExposureMode;
+    let mut rig = RegroupRig::new(Some("RGGB"));
+    let cfg_on = rig.cfg(ExposureMode::Seconds, 2.0);
+    let mut cfg = cfg_on.clone();
+    cfg.normalization.local.enabled = false;
+    cfg.normalization.rejection = crate::integration::stats::RejectionNormalization::None;
+    let w1 = rig.working.clone();
+    let (_, _, logs1) = rig.run(&cfg_on);
+    assert_eq!(fan_out_items(&logs1, "calibrate", "calibrate"), 6, "{logs1}");
+    assert!(fan_out_items(&logs1, "normalize", "normalize") > 0, "run 1 normalizes: {logs1}");
+
+    let w2 = rig.tmp.path().join("w2");
+    rig.point_at(&w2);
+    std::fs::remove_dir_all(&w1).unwrap();
+    let under_w1 = format!("{}{}", w1.display(), std::path::MAIN_SEPARATOR);
+    let count_under_w1 = |ln: bool| -> usize {
+        rig.fixture
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM stacking_artifacts WHERE substr(path, 1, ?1) = ?2
+                   AND size IS NOT NULL AND modified_at IS NOT NULL
+                   AND (kind IN ('ln', 'ln_reference')) = ?3",
+                rusqlite::params![under_w1.len() as i64, under_w1, ln],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+    };
+    let (read_rows, ln_rows) = (count_under_w1(false), count_under_w1(true));
+    assert!(read_rows >= 6 && ln_rows > 0, "premise: {read_rows} files a stage reads, {ln_rows} LN files");
+
+    let not_found = |warnings: &[String]| -> Option<String> {
+        warnings.iter().find(|w| w.contains("cached files were not found")).cloned()
+    };
+    let leading_count = |w: &str| -> usize { w.split_whitespace().next().unwrap().parse().unwrap() };
+
+    let plan = rig.plan(&cfg);
+    let plan_warning = not_found(&plan.warnings).unwrap_or_else(|| panic!("the plan warns: {:?}", plan.warnings));
+    let n = leading_count(&plan_warning);
+    assert!((6..=read_rows).contains(&n), "the plan counts the rows its stages read, not the LN files: {plan_warning}");
+
+    let (_, rc2, logs2) = rig.run(&cfg);
+    assert_eq!(fan_out_items(&logs2, "calibrate", "calibrate"), 6, "run 2 recomputes: {logs2}");
+    let run_warning =
+        not_found(&rc2.warnings).unwrap_or_else(|| panic!("run 2 warns: {:?}", rc2.warnings));
+    assert_eq!(run_warning, crate::stacking::rebase::left_warning(read_rows, &rig.layout.root));
+
+    // The LN rows still name the removed W1, and nothing reads them: no warning from now on.
+    assert_eq!(count_under_w1(true), ln_rows, "premise: the LN rows were left");
+    let plan3 = rig.plan(&cfg);
+    assert_eq!(not_found(&plan3.warnings), None, "{:?}", plan3.warnings);
+    let (_, rc3, logs3) = rig.run(&cfg);
+    assert_eq!(not_found(&rc3.warnings), None, "{:?}", rc3.warnings);
+    assert_nothing_recomputed(&logs3, "run 3");
+}
+
+/// Every file under `root`.
+fn tree_files(root: &Path) -> Vec<PathBuf> {
+    tree_snapshot(root).into_iter().map(|(p, _, _)| p).collect()
 }
 
 /// The file-identity cycle's first regression: a copy of the working tree, the lights and the masters on a filesystem

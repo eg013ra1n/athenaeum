@@ -411,6 +411,7 @@ pub(super) fn resolve_register_fits(
             frame_id,
             planes,
             &expected_hash,
+            &RebaseView::none(),
         )?)
     })();
     let fresh = match fresh {
