@@ -871,11 +871,12 @@ fn gate_measure_betas(
 /// `cfg.registration` (already in `registration_subtree`), so its caller
 /// passes `""` and the group's beta no longer re-registers it.
 ///
-/// `reference_measurement_hash` (ruling R3 (a)): any frame whose reference lives in ANOTHER group (the native-geometry
-/// fallback included) is registered against star lists built from the REFERENCE's `fits.0` when the reference is one
-/// plane, which is Measure output the frame's own `measure:` term does not cover (it holds the frame's group's config
-/// and beta). The caller passes [`reference_measurement_fold`], folded here as `ref_measure:<h>`; `""` (nothing
-/// folded) when the reference is in the frame's own group, so a single-group set keeps its hashes.
+/// `reference_measurement_hash` (ruling R3 (a), file-identity FI-6): every frame of a set whose reference is one plane
+/// is registered against star lists built from the REFERENCE's `fits.0`, which is Measure output the frame's own
+/// `measure:` term does not cover when the reference sits in another group (it holds the frame's group's config and
+/// beta). The caller passes [`reference_measurement_fold`], folded here as `ref_measure:<h>`, for every frame whatever
+/// its group, so a merge or a split of a mono group leaves the term of every frame as it was; `""` (nothing folded)
+/// when the reference's registration reads no `fits.0` (a debayered OSC reference).
 pub(crate) fn registration_hash_for(
     cfg: &StackingConfig,
     reference_frame_id: i64,
@@ -1338,29 +1339,25 @@ pub(crate) fn registration_measurement_fold(
     }
 }
 
-/// The `reference_measurement_hash` a caller hands [`registration_hash_for`] (ruling R3 (a)): the reference's own
-/// [`registration_measurement_fold`] (its group's config and beta, its calibration hash) when the reference lives in a
-/// group other than the frame's, `""` when both share a group (the frame's own `measure:` term already covers config
-/// and beta, and the reference's calibration hash is folded). The one place the run and the gate decide it.
+/// The `reference_measurement_hash` a caller hands [`registration_hash_for`] (ruling R3 (a), file-identity FI-6): the
+/// reference's own [`registration_measurement_fold`] (its group's config and beta, its calibration hash) whenever the
+/// reference's group reads `fits.0`, whatever group the frame is in; `""` for a debayered OSC reference. The frame's
+/// group is no input: a regroup that keeps the reference frame and its group's beta keeps the term. The one place the
+/// run, the gate and the two-pass key decide it.
 pub(crate) fn reference_measurement_fold(
     cfg: &StackingConfig,
-    frame_group: &IntegrationGroup,
     reference_group: &IntegrationGroup,
     prepare_path: bool,
     reference_calibrated_hash: &str,
     reference_group_beta: Option<f64>,
 ) -> String {
-    if reference_group.key == frame_group.key {
-        String::new()
-    } else {
-        registration_measurement_fold(
-            cfg,
-            reference_group,
-            prepare_path,
-            reference_calibrated_hash,
-            reference_group_beta,
-        )
-    }
+    registration_measurement_fold(
+        cfg,
+        reference_group,
+        prepare_path,
+        reference_calibrated_hash,
+        reference_group_beta,
+    )
 }
 
 // ── build_plan ──────────────────────────────────────────────────────────────
@@ -2108,7 +2105,6 @@ fn compute_register_stale(
         };
         let reference_measurement_hash = reference_measurement_fold(
             cfg,
-            group,
             reference_group,
             prepare_path,
             reference_calib_hash,
@@ -4558,7 +4554,7 @@ mod tests {
                     &reference_calib,
                     &frame_calib,
                     &measurement_hash_for(&cfg, &frame_calib, None),
-                    "",
+                    &reference_measurement_fold(&cfg, group, false, &reference_calib, None),
                 );
                 store_registration(&f.conn, &subject, |set_id| RegistrationRecord {
                     frames_set_id: set_id,
@@ -7128,7 +7124,13 @@ mod tests {
                 &reference_hash,
                 frame_hash,
                 &frame_measurement_hash,
-                "",
+                &reference_measurement_fold(
+                    cfg,
+                    &registration_test_group(group_key, ColorMode::Mono),
+                    false,
+                    &reference_hash,
+                    None,
+                ),
             );
             let is_reference = frame_id == reference_id;
             let rec = RegistrationRecord {
@@ -7391,7 +7393,7 @@ mod tests {
                 &reference_hash,
                 frame_hash,
                 frame_measurement_hash,
-                "",
+                &reference_measurement_fold(&cfg, &groups[0], false, &reference_hash, Some(0.0)),
             );
             let is_reference = gf.frame_id == ids[0];
             let rec = RegistrationRecord {
@@ -7881,7 +7883,7 @@ mod tests {
                 &reference_calib_hash,
                 frame_hash,
                 frame_measurement_hash,
-                "",
+                &reference_measurement_fold(&cfg, &groups[0], false, &reference_calib_hash, None),
             );
             registration_hashes.insert(gf.frame_id, expected.clone());
             let is_reference = gf.frame_id == ids[0];
@@ -8208,7 +8210,7 @@ mod tests {
                 &reference_calib_hash,
                 frame_hash,
                 &frame_measurement_hash,
-                "",
+                &reference_measurement_fold(&cfg, &groups[0], false, &reference_calib_hash, None),
             );
             registration_hashes.insert(frame_id, expected.clone());
             let is_reference = frame_id == ids[0];
@@ -11318,12 +11320,12 @@ mod tests {
         );
     }
 
-    /// Ruling R3 (a), the hash level: a frame registered against a reference of ANOTHER group folds the reference's
-    /// own Measure output (its group's config and beta), so a moved `measurement.maxStars` or a moved reference beta
-    /// moves the hash of a debayered OSC frame too; a reference in the frame's own group folds nothing, so a
-    /// single-group set keeps the hashes it had.
+    /// Ruling R3 (a), FI-6, the hash level: every frame registered against a one-plane reference folds the reference's
+    /// own Measure output (its group's config and beta), whatever group the frame is in, so a moved
+    /// `measurement.maxStars` or a moved reference beta moves the hash of a debayered OSC frame and of a mono frame
+    /// of the reference's own group alike. A reference that reads no `fits.0` (a debayered OSC group) folds nothing.
     #[test]
-    fn registration_hash_folds_the_reference_measurement_across_groups_only() {
+    fn registration_hash_folds_the_reference_measurement_whatever_its_group() {
         let cfg = StackingConfig::default();
         let mono = registration_test_group("mono__L__bin1__300s", ColorMode::Mono);
         let osc = registration_test_group("osc__None__bin1__300s", ColorMode::Osc);
@@ -11334,50 +11336,65 @@ mod tests {
                 "ref-calib",
                 "frame-calib",
                 &registration_measurement_fold(cfg, frame_group, false, "frame-calib", Some(1.5)),
-                &reference_measurement_fold(
-                    cfg,
-                    frame_group,
-                    &mono,
-                    false,
-                    "ref-calib",
-                    Some(ref_beta),
-                ),
+                &reference_measurement_fold(cfg, &mono, false, "ref-calib", Some(ref_beta)),
             )
         };
         let mut moved = cfg.clone();
         moved.measurement.max_stars = cfg.measurement.max_stars - 1000;
 
-        // A debayered OSC frame, mono reference of another group: the reference's measurement is folded.
-        assert_ne!(hash_of(&cfg, &osc, 2.0), hash_of(&moved, &osc, 2.0));
-        assert_ne!(hash_of(&cfg, &osc, 2.0), hash_of(&cfg, &osc, 2.5));
-
-        // A mono frame whose reference sits in its own group: nothing is folded, the hash is the pre-R3 one.
-        assert_eq!(
-            reference_measurement_fold(&cfg, &mono, &mono, false, "ref-calib", Some(2.0)),
-            ""
-        );
-        assert_eq!(
-            hash_of(&cfg, &mono, 2.0),
-            hash_of(&cfg, &mono, 2.5),
-            "the reference beta is the frame's own group beta here, already in `measure:`"
-        );
-        assert_eq!(
-            hash_of(&cfg, &mono, 2.0),
-            registration_hash_for(
-                &cfg,
-                7,
-                "ref-calib",
-                "frame-calib",
-                &registration_measurement_fold(&cfg, &mono, false, "frame-calib", Some(1.5)),
-                "",
-            )
+        // A debayered OSC frame, mono reference of another group, and a mono frame of the reference's own group:
+        // the reference's measurement is folded for both.
+        for frame_group in [&osc, &mono] {
+            assert_ne!(
+                hash_of(&cfg, frame_group, 2.0),
+                hash_of(&moved, frame_group, 2.0),
+                "{}",
+                frame_group.key
+            );
+            assert_ne!(
+                hash_of(&cfg, frame_group, 2.0),
+                hash_of(&cfg, frame_group, 2.5),
+                "{}",
+                frame_group.key
+            );
+        }
+        assert!(
+            !reference_measurement_fold(&cfg, &mono, false, "ref-calib", Some(2.0)).is_empty(),
+            "a one-plane reference folds its measurement for a frame of its own group too"
         );
 
-        // A reference that does not read `fits.0` (a debayered OSC group) contributes nothing across groups.
+        // A reference that does not read `fits.0` (a debayered OSC group) contributes nothing, whatever the frame.
         assert_eq!(
-            reference_measurement_fold(&cfg, &mono, &osc, false, "ref-calib", Some(2.0)),
+            reference_measurement_fold(&cfg, &osc, false, "ref-calib", Some(2.0)),
             ""
         );
+    }
+
+    /// FI-6: the registration hash of a mono frame of its one-plane reference's own group, on the golden calibration
+    /// hash and measurement hash of `stage_hashes_are_pinned_to_golden_literals`.
+    #[test]
+    fn a_same_group_mono_registration_hash_is_pinned() {
+        let cfg = StackingConfig::default();
+        let mono = registration_test_group("mono__L__bin1__300s", ColorMode::Mono);
+        let masters = ["100|sample:00000000000000d1", "200|sample:00000000000000f1"];
+        let src = [SourceIdentity::Sampled {
+            file_id: 42,
+            size: 123_456,
+            sample: "0000000000004242".into(),
+        }];
+        let calib = stage_hash(&calibration_subtree(&cfg), &masters, &src);
+        let meas = measurement_hash_for(&cfg, &calib, Some(1.5));
+        assert_eq!(calib, "b97f2367124df347", "the golden calibration hash");
+        assert_eq!(meas, "ef39603a2fcbfabd", "the golden measurement hash");
+        let reg = registration_hash_for(
+            &cfg,
+            7,
+            "ref-calib",
+            &calib,
+            &meas,
+            &reference_measurement_fold(&cfg, &mono, false, "ref-calib", Some(1.5)),
+        );
+        assert_eq!(reg, "6b1d840f53e860a9", "recorded 2026-11-13, file identity T5 (FI-6)");
     }
 
     /// Ruling R3 (c), the gate: a mixed mono + debayered-OSC set registered against a mono reference. Moving
@@ -11515,7 +11532,6 @@ mod tests {
                 ),
                 &reference_measurement_fold(
                     cfg,
-                    group,
                     reference_group,
                     false,
                     &calib[&reference_id],

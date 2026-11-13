@@ -1003,6 +1003,49 @@ fn regroup_reuses_every_frame_level_stage() {
     }
 }
 
+/// File-identity FI-6: a mono merge or split keeps every registration while the reference stays the same frame and the
+/// groups' betas stay (the fixture pegs every fit at the floor). The Manual reference sits in the 60 s class; under
+/// `stops` the 90 s frames join its group, and before the reference's measurement was folded for every one-plane frame
+/// that flipped their `ref_measure:` term and re-registered them. The gate reads Register fresh before each run and
+/// the run fans out over 0 items in every frame-level stage: the two sides fold the same term.
+#[test]
+fn mono_regroup_keeps_every_registration_when_the_reference_stays() {
+    use crate::stacking::config::ExposureMode;
+    let rig = RegroupRig::new(None);
+    let cfg_seconds = rig.cfg(ExposureMode::Seconds, 2.0);
+    let (groups1, rc1, logs1) = rig.run(&cfg_seconds);
+    assert_eq!(groups1.len(), 2, "one group per exposure class: {groups1:?}");
+    assert_eq!(rc1.reference_frame_id, Some(rig.light_ids[0]), "the pinned reference");
+    assert_eq!(fan_out_items(&logs1, "register", "align"), 6, "{logs1}");
+    let registered_rows = || {
+        let mut rows: Vec<_> =
+            rows_of_kind(&rig.fixture.conn, rig.fixture.set_id, ArtifactKind::Registered)
+                .into_values()
+                .map(|r| (r.frame_id, r.id, r.created_at, r.config_hash, r.path))
+                .collect();
+        rows.sort();
+        rows
+    };
+    let registered1 = registered_rows();
+    assert_eq!(registered1.len(), 6);
+
+    for (what, cfg, n_groups) in [
+        ("stops", rig.cfg(ExposureMode::Stops, 2.0), 1usize),
+        ("seconds again", cfg_seconds.clone(), 2usize),
+    ] {
+        let stale = rig.stale(&cfg);
+        assert!(
+            !stale.contains(&Stage::Register),
+            "the gate reads Register stale before the regroup to {what}: {stale:?}"
+        );
+        let (groups, rc, logs) = rig.run(&cfg);
+        assert_eq!(groups.len(), n_groups, "{what}: {groups:?}");
+        assert_eq!(rc.reference_frame_id, Some(rig.light_ids[0]), "{what}: the reference moved");
+        assert_nothing_recomputed(&logs, what);
+        assert_eq!(registered_rows(), registered1, "{what}: a registered row moved");
+    }
+}
+
 /// `0` over each of the four frame-level fan-outs, asserted on one run's logs.
 fn assert_nothing_recomputed(logs: &str, what: &str) {
     for (stage, pass) in [
