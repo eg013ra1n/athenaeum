@@ -160,8 +160,20 @@ fn insert_capture_frame(
 /// polls. A timeout names the line of the wait that missed (`#[track_caller]`), not this helper.
 #[track_caller]
 fn wait_until<F: FnMut() -> bool>(
+    pred: F,
+    timeout: Duration,
+) -> impl std::future::Future<Output = ()> {
+    wait_until_reporting(pred, timeout, String::new)
+}
+
+/// [`wait_until`] for a wait whose miss has to be explained: on a timeout the panic
+/// carries `report()`, read at that moment (the state of both sides, so a miss on a
+/// machine nobody can attach to says which half stood still).
+#[track_caller]
+fn wait_until_reporting<F: FnMut() -> bool, R: FnOnce() -> String>(
     mut pred: F,
     timeout: Duration,
+    report: R,
 ) -> impl std::future::Future<Output = ()> {
     // Captured here, in the synchronous part, where `#[track_caller]` still names the test's own line.
     let waiting_at = std::panic::Location::caller();
@@ -172,8 +184,10 @@ fn wait_until<F: FnMut() -> bool>(
                 return;
             }
             if Instant::now() >= deadline {
+                let report = report();
+                let sep = if report.is_empty() { "" } else { "\n" };
                 panic!(
-                    "wait_until timed out after {timeout:?} (waiting at {}:{})",
+                    "wait_until timed out after {timeout:?} (waiting at {}:{}){sep}{report}",
                     waiting_at.file(),
                     waiting_at.line()
                 );
@@ -3665,9 +3679,33 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
 
     // The receiver's in-flight fetch aborts and its row terminalizes `cancelled`
     // ("by sender") WITHIN the deadline — well under the uninterrupted fetch time.
-    wait_until(
+    // A miss here has been seen once, on the Windows CI runner (2026-11-10), with
+    // nothing to say which half stood still: the report reads both catalogs at the
+    // moment of the miss. No `revoke_sent` in the sender's journal = the sender never
+    // sent the revoke; `revoke_sent` with the receiver row still `fetching` = the
+    // revoke was not acted on; a receiver row `done` = the fetch ran to its end.
+    wait_until_reporting(
         || matches!(inbound_row(pdb, &wire), Some((s, _, _)) if s == "cancelled"),
         ABORT_DEADLINE,
+        || {
+            let staging = primary_dir.join("staging").join(&wire);
+            let staged = std::fs::read_dir(&staging).map(|d| d.count()).ok();
+            let in_id = inbound_id_of(pdb, &wire);
+            format!(
+                "  since the sender cancel: {:?}\n\
+                 \x20 sender row: state {:?}, journal {:?}\n\
+                 \x20 receiver row: {:?} (state, byte_size, bytes_done), last_error {:?}, journal {:?}\n\
+                 \x20 receiver staging dir: {} entries; receiver sync-finished events: {:?}",
+                fired.elapsed(),
+                outbound_state(cdb, out_id),
+                journal_kinds(cdb, "sent", out_id),
+                inbound_row(pdb, &wire),
+                inbound_last_error(pdb, &wire),
+                in_id.map(|id| journal_kinds(pdb, "received", id)),
+                staged.map_or("no".to_string(), |n| n.to_string()),
+                recorder.received_finished(),
+            )
+        },
     )
     .await;
     let elapsed = fired.elapsed();
