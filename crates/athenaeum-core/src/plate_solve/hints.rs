@@ -83,44 +83,75 @@ pub fn frame_fov_summary(conn: &Connection) -> rusqlite::Result<FovSummary> {
 
 /// Extract plate-solving hints from a frame's metadata.
 ///
-/// Priority for coordinates:
-/// 1. Sexagesimal objctra/objctdec — the *planned* target the user/sequencer
-///    aimed at. Reliable even when the mount mis-syncs.
-/// 2. Direct numeric ra/dec — the mount's *reported* pointing. Wrong on
-///    mis-synced mounts (e.g., dual-OTA setups where one NINA instance had
-///    a stale sync at the time the FITS was written).
-/// 3. Stored FITS-header WCS (`CRVAL1`/`CRVAL2`) — the file's own embedded
-///    astrometry (survey frames like SkyMapper ship with CTYPE/CRVAL/CD but
-///    no OBJCTRA/RA). Read from the `fits_header` blob via the existing
-///    snapshot path, so frames scanned before the scanner had CRVAL
-///    extraction don't need a rescan to get a position hint.
-/// 4. Nearby solved frame in the same directory.
-///
-/// In all branches, sentinel values (NULL, exact 0/0, or sexagesimal
-/// "00 00 00" / "+00 00 00" / "00:00:00") are rejected — they're FITS-pipeline
-/// placeholders, not actual sky positions.
+/// A saved successful solve takes precedence. For unmodified imported frames,
+/// stored headers are reinterpreted using explicit RA units before using their
+/// coordinates; this also corrects hints in catalogs imported by older versions.
+/// Manual overrides without a saved solve retain their catalog coordinates.
+/// Without either source, use sexagesimal coordinates, numeric coordinates,
+/// stored-header WCS and finally a nearby solved frame, in that order.
+/// Acquisition-header 0/0 sentinels are rejected; a verified saved solve can
+/// legitimately lie at 0/0. Outputs are decimal degrees.
 ///
 /// FOV and pixel scale always come from focallen + xpixsz + naxis1.
 pub fn extract_hints(frame: &Frame, conn: Option<&Connection>) -> SolveHints {
     let mut hints = SolveHints::default();
-
-    // Try sexagesimal OBJCTRA/OBJCTDEC first — reflects user intent, immune
-    // to mount-sync drift.
-    if let (Some(ref ra_str), Some(ref dec_str)) = (&frame.objctra, &frame.objctdec) {
-        if let (Ok(ra), Ok(dec)) = (parse_ra_sexagesimal(ra_str), parse_dec_sexagesimal(dec_str)) {
-            if !is_sentinel_position(ra, dec) {
-                hints.ra = Some(ra);
-                hints.dec = Some(dec);
+    let mut header_checked = false;
+    if let (Some(conn), Some(id)) = (conn, frame.id) {
+        match super::storage::get_plate_solve(conn, id) {
+            Ok(Some(solved)) => {
+                // Persisted astrometry wins over acquisition-header guesses.
+                hints.ra = Some(solved.crval1);
+                hints.dec = Some(solved.crval2);
+                header_checked = true;
+            }
+            Ok(None) if !frame.override_ => {
+                // Re-read stored metadata through the corrected unit resolver.
+                // This repairs old imported hints without rewriting catalog rows
+                // or touching user overrides and original image headers.
+                match crate::db::get_frame_metadata_originals(conn, &[id]) {
+                    Ok(rows) => {
+                        if let Some(original) = rows.first() {
+                            header_checked = true;
+                            if let (Some(ra), Some(dec)) = (original.ra, original.dec) {
+                                if !is_sentinel_position(ra, dec) {
+                                    hints.ra = Some(ra);
+                                    hints.dec = Some(dec);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(frame_id=id, %error, "could not refresh original coordinate hints")
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(frame_id=id, %error, "could not read saved solve coordinates")
             }
         }
     }
+    if !header_checked {
+        // Try sexagesimal OBJCTRA/OBJCTDEC first — reflects user intent, immune
+        // to mount-sync drift.
+        if let (Some(ref ra_str), Some(ref dec_str)) = (&frame.objctra, &frame.objctdec) {
+            if let (Ok(ra), Ok(dec)) =
+                (parse_ra_sexagesimal(ra_str), parse_dec_sexagesimal(dec_str))
+            {
+                if !is_sentinel_position(ra, dec) {
+                    hints.ra = Some(ra);
+                    hints.dec = Some(dec);
+                }
+            }
+        }
 
-    // Fall back to numeric RA/Dec from the mount.
-    if hints.ra.is_none() || hints.dec.is_none() {
-        if let (Some(ra), Some(dec)) = (frame.ra, frame.dec) {
-            if !is_sentinel_position(ra, dec) {
-                hints.ra = Some(ra);
-                hints.dec = Some(dec);
+        // Fall back to numeric RA/Dec from the mount.
+        if hints.ra.is_none() || hints.dec.is_none() {
+            if let (Some(ra), Some(dec)) = (frame.ra, frame.dec) {
+                if !is_sentinel_position(ra, dec) {
+                    hints.ra = Some(ra);
+                    hints.dec = Some(dec);
+                }
             }
         }
     }
@@ -514,5 +545,39 @@ mod tests {
         assert_eq!(s.computable_count, 0);
         assert_eq!(s.min_fov_deg, None);
         assert_eq!(s.narrowest_instrume, None);
+    }
+}
+
+#[cfg(test)]
+mod persisted_hint_tests {
+    use super::*;
+    #[test]
+    fn old_import_hints_refresh_but_overrides_remain() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO files(id,path,filename,size,modified_at,format) VALUES (1,'/m31.fits','m31.fits',0,'2026-09-09','FITS')",[]).unwrap();
+        conn.execute(
+            "INSERT INTO frames(id,file_id,ra,dec) VALUES (1,1,157.312575,40.815833)",
+            [],
+        )
+        .unwrap();
+        crate::db::insert_fits_header(&conn,1,"RA      = 10.487505 / Object Right Ascension in degrees\nDEC     = 40.815833 / degrees").unwrap();
+        let mut frame = Frame {
+            id: Some(1),
+            file_id: 1,
+            ra: Some(157.312575),
+            dec: Some(40.815833),
+            ..Frame::default()
+        };
+        assert_eq!(extract_hints(&frame, Some(&conn)).ra, Some(10.487505));
+        assert_eq!(
+            conn.query_row("SELECT ra FROM frames WHERE id=1", [], |r| r
+                .get::<_, f64>(0))
+                .unwrap(),
+            157.312575
+        );
+        frame.override_ = true;
+        frame.ra = Some(12.0);
+        assert_eq!(extract_hints(&frame, Some(&conn)).ra, Some(12.0));
     }
 }
