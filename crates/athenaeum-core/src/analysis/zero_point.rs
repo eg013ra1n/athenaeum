@@ -1,11 +1,14 @@
 //! A frame's photometric zero point from its fitted stars and the installed
 //! star catalogue (Gaia G), the number a transparency loss is later taken from.
 //!
-//! Pure: no database, no file, no logging. The caller passes the frame's stored
-//! star rows, its WCS, a catalogue cone and its exposure; this module projects
-//! the catalogue through the WCS, matches stars one to one, and returns the
-//! sigma-clipped median of `G + 2.5·log10(flux / exptime)` or a typed refusal
-//! (spec §5.1). Pixel positions on both sides are 0-based in file row order.
+//! No database and no logging. `measure_zero_point` reads no file: the caller
+//! passes the frame's stored star rows, its WCS, a catalogue cone and its
+//! exposure, and it projects the catalogue through the WCS, matches stars one
+//! to one, and returns the sigma-clipped median of
+//! `G + 2.5·log10(flux / exptime)` or a typed refusal (spec §5.1).
+//! `catalog_for_frame` is the one reader: it queries the catalogue layers
+//! (memory-mapped files). Pixel positions on both sides are 0-based in file
+//! row order.
 
 use std::collections::HashMap;
 
@@ -45,6 +48,10 @@ pub struct ZpParams {
     pub min_snr: f64,
     /// A second catalogue star within this many FWHM of a star makes a blend.
     pub blend_radius_fwhm: f64,
+    /// A second catalogue star inside the blend radius counts as a blend only
+    /// when it is at most this many magnitudes fainter than the matched star
+    /// (a neighbour 4 mag fainter adds 2.5 % of the flux).
+    pub blend_dmag: f64,
 }
 
 impl Default for ZpParams {
@@ -58,6 +65,7 @@ impl Default for ZpParams {
             bright_drop_fraction: 0.10,
             min_snr: 20.0,
             blend_radius_fwhm: 3.0,
+            blend_dmag: 4.0,
         }
     }
 }
@@ -185,6 +193,10 @@ impl Grid {
 
 /// Measure a frame's zero point (spec §5.1). Never panics; a frame it cannot
 /// measure comes back as a typed refusal with the counts behind it.
+///
+/// `input.catalog` must be a small cone around the frame (`catalog_for_frame`
+/// makes one): a star 90° or more from the tangent point projects to a
+/// mirrored position and would match a wrong analysis star.
 pub fn measure_zero_point(input: &ZpInput, params: &ZpParams) -> ZpMeasurement {
     // 1. Exposure.
     let exptime = match input.exptime_s {
@@ -211,6 +223,9 @@ pub fn measure_zero_point(input: &ZpInput, params: &ZpParams) -> ZpMeasurement {
     }
     let blend_r = (params.blend_radius_fwhm * input.median_fwhm_px).max(0.0);
     let blend_r = if blend_r.is_finite() { blend_r } else { 0.0 };
+    // Never below the match radius: a zero or NaN FWHM must not switch the
+    // blend rule off.
+    let blend_r = blend_r.max(params.match_radius_px);
     let grid = Grid::new(&cat, params.match_radius_px.max(blend_r).max(1.0));
 
     // 3. Analysis stars: central region, positive finite flux, enough SNR;
@@ -246,8 +261,11 @@ pub fn measure_zero_point(input: &ZpInput, params: &ZpParams) -> ZpMeasurement {
             }
         }
         let Some((ci, d)) = best else { continue };
+        let limit_mag = f64::from(cat[ci].2) + params.blend_dmag;
         let blended = grid.near(s.x, s.y).any(|cj| {
-            cj != ci && (cat[cj].0 - s.x).hypot(cat[cj].1 - s.y) <= blend_r
+            cj != ci
+                && f64::from(cat[cj].2) <= limit_mag
+                && (cat[cj].0 - s.x).hypot(cat[cj].1 - s.y) <= blend_r
         });
         if blended {
             continue;
@@ -337,7 +355,10 @@ pub fn catalog_for_frame(
     let (cx, cy) = ((width as f64 - 1.0) / 2.0, (height as f64 - 1.0) / 2.0);
     let (ra, dec) = wcs.pixel_to_sky(cx, cy);
     let region_px = central_fraction * 0.5 * (width as f64).hypot(height as f64);
-    let radius_deg = region_px * wcs.pixel_scale_arcsec() / 3600.0 * CONE_MARGIN;
+    // The larger CD column norm (deg/px): the cone must cover the long axis
+    // of an anisotropic pixel.
+    let scale_deg = (wcs.cd[0][0].hypot(wcs.cd[1][0])).max(wcs.cd[0][1].hypot(wcs.cd[1][1]));
+    let radius_deg = region_px * scale_deg * CONE_MARGIN;
     if !(ra.is_finite() && dec.is_finite() && radius_deg.is_finite() && radius_deg > 0.0) {
         bail!(
             "the WCS gives no usable cone (centre {ra}, {dec}, radius {radius_deg} deg)"
@@ -474,7 +495,10 @@ mod tests {
         for s in f.stars.iter_mut().take(10) {
             s.flux *= 0.5;
         }
-        let zp = measure(&f).result.expect("valid");
+        let m = measure(&f);
+        // 200 stars, the brightest 10 % (20) dropped: the halved ones go with them.
+        assert_eq!(m.matched, 180);
+        let zp = m.result.expect("valid");
         assert!((zp.zero_point - TRUE_ZP).abs() < 0.01, "zp {}", zp.zero_point);
     }
 
@@ -493,6 +517,70 @@ mod tests {
                 .any(|s| s.kept && (s.g_mag - 12.345).abs() < 1e-3),
             "the blended star was used"
         );
+    }
+
+    /// A G 12.0 star at a free spot of a 60-star field with one catalogue
+    /// neighbour 8 px away (inside the 12 px blend radius of FWHM 4).
+    fn field_with_neighbour(neighbour_g: f32) -> Field {
+        let mut f = field(60, TRUE_ZP, 0.0, 12);
+        let (x, y) = (1999.5, 1499.5 - 450.0);
+        f.stars.push(star(x, y, flux_for(12.0, TRUE_ZP)));
+        f.catalog.push(cat_at(&f.wcs, x, y, 12.0));
+        f.catalog.push(cat_at(&f.wcs, x + 8.0, y, neighbour_g));
+        f
+    }
+
+    fn used_at(m: &ZpMeasurement, g: f32) -> bool {
+        m.per_star.iter().any(|s| (s.g_mag - g).abs() < 1e-3)
+    }
+
+    #[test]
+    fn a_faint_neighbour_is_not_a_blend() {
+        let m = measure(&field_with_neighbour(19.0));
+        assert!(m.result.is_ok());
+        assert!(used_at(&m, 12.0), "a 7 mag fainter neighbour blocked the star");
+        assert!(m.per_star.iter().any(|s| s.kept && (s.g_mag - 12.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn a_bright_neighbour_is_a_blend() {
+        let m = measure(&field_with_neighbour(13.0));
+        assert!(m.result.is_ok());
+        assert!(!used_at(&m, 12.0), "the blended star was used");
+    }
+
+    #[test]
+    fn a_zero_fwhm_still_refuses_two_catalogue_stars_inside_the_match_radius() {
+        let mut f = field(60, TRUE_ZP, 0.0, 13);
+        let (x, y) = (1999.5, 1499.5 - 450.0);
+        f.stars.push(star(x, y, flux_for(12.5, TRUE_ZP)));
+        f.catalog.push(cat_at(&f.wcs, x + 0.5, y, 12.5));
+        f.catalog.push(cat_at(&f.wcs, x - 1.5, y, 12.7));
+        let i = ZpInput { median_fwhm_px: 0.0, ..input(&f, Some(EXPTIME)) };
+        let m = measure_zero_point(&i, &ZpParams::default());
+        assert!(m.result.is_ok());
+        assert!(!used_at(&m, 12.5) && !used_at(&m, 12.7), "a star with two candidates was used");
+    }
+
+    #[test]
+    fn a_star_below_the_snr_floor_is_not_used() {
+        let mut f = field(60, TRUE_ZP, 0.0, 14);
+        for (k, (snr, g)) in
+            [(Some(5.0), 11.111_f32), (None, 11.222_f32), (Some(100.0), 11.333_f32)]
+                .into_iter()
+                .enumerate()
+        {
+            let (x, y) = (1999.5 + k as f64 * 100.0, 1499.5 + 450.0);
+            let mut s = star(x, y, flux_for(f64::from(g), TRUE_ZP));
+            s.snr = snr;
+            f.stars.push(s);
+            f.catalog.push(cat_at(&f.wcs, x, y, g));
+        }
+        let m = measure(&f);
+        assert!(m.result.is_ok());
+        assert!(!used_at(&m, 11.111), "a star at SNR 5 was used");
+        assert!(!used_at(&m, 11.222), "a star without SNR was used");
+        assert!(used_at(&m, 11.333), "the good star beside them was not used");
     }
 
     #[test]
@@ -518,11 +606,13 @@ mod tests {
         let mut f = field(60, TRUE_ZP, 0.0, 5);
         let (x, y) = (1999.5, 1499.5 - 450.0);
         f.catalog.push(cat_at(&f.wcs, x, y, 12.5));
-        f.stars.push(star(x - 1.0, y, flux_for(12.5, TRUE_ZP)));
+        f.stars.push(star(x - 0.5, y, flux_for(12.5, TRUE_ZP)));
         f.stars.push(star(x + 1.0, y, flux_for(12.5, TRUE_ZP)));
         let m = measure(&f);
-        let at_12_5 = m.per_star.iter().filter(|s| (s.g_mag - 12.5).abs() < 1e-3).count();
-        assert_eq!(at_12_5, 1, "one catalogue star served {at_12_5} analysis stars");
+        let at_12_5: Vec<&ZpStar> =
+            m.per_star.iter().filter(|s| (s.g_mag - 12.5).abs() < 1e-3).collect();
+        assert_eq!(at_12_5.len(), 1, "one catalogue star served {} analysis stars", at_12_5.len());
+        assert!((at_12_5[0].match_px - 0.5).abs() < 1e-9, "match_px {}", at_12_5[0].match_px);
     }
 
     #[test]
@@ -540,7 +630,7 @@ mod tests {
 
     #[test]
     fn a_wide_scatter_of_few_stars_refuses() {
-        let f = field(16, TRUE_ZP, 1.0, 7);
+        let f = field(20, TRUE_ZP, 1.0, 7);
         let m = measure(&f);
         match m.result {
             Err(ZpRefusal::TooScattered { std_error, kept }) => {

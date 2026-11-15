@@ -146,6 +146,7 @@ impl Args {
             blend_radius_fwhm: self
                 .take_parsed("blend_radius_fwhm")?
                 .unwrap_or(d.blend_radius_fwhm),
+            blend_dmag: self.take_parsed("blend_dmag")?.unwrap_or(d.blend_dmag),
         })
     }
 
