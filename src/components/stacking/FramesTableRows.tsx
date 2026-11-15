@@ -4,6 +4,7 @@ import type { MouseEvent } from 'react';
 import { ChevronDown, ChevronRight, Star } from 'lucide-react';
 import { FilterDot } from '../ui/Dots';
 import { formatDuration, pluralize } from '../collab/format';
+import { formatTransparency } from '../collab/project/transparency';
 import { sortRows, type FrameRow, type Outcome, type SortKey } from './frameRows';
 import type { FrameGroupView, GroupHeaderInfo, GroupMode, OutlierFlags } from './frameView';
 
@@ -11,7 +12,7 @@ import type { FrameGroupView, GroupHeaderInfo, GroupMode, OutlierFlags } from '.
 export type TableSortKey = SortKey | 'reference';
 
 type ColumnId =
-  | 'file' | 'publisher' | 'focalLen' | 'weight' | 'fwhm' | 'ecc' | 'seeds'
+  | 'file' | 'publisher' | 'focalLen' | 'weight' | 'fwhm' | 'ecc' | 'seeds' | 'transparency'
   | 'regRms' | 'inliers' | 'model' | 'scale' | 'status' | 'reference';
 
 export interface FrameColumn {
@@ -32,6 +33,10 @@ const METRICS: FrameColumn[] = [
   { id: 'fwhm', label: 'FWHM', sortKey: 'fwhmPx', numeric: true },
   { id: 'ecc', label: 'Ecc', sortKey: 'eccentricity', numeric: true },
   { id: 'seeds', label: 'Seeds', sortKey: 'stars', numeric: true },
+  {
+    id: 'transparency', label: 'Transparency', sortKey: 'transparencyLoss', numeric: true,
+    title: 'Loss in magnitudes against the equipment’s clear sky',
+  },
 ];
 /** The Columns toggle's registration columns. */
 const REGISTRATION: FrameColumn[] = [
@@ -216,6 +221,16 @@ export function FrameTableRow({
         );
       case 'seeds':
         return <td key={c.id} className={`${TD} text-content-secondary tabular-nums`}>{fmtInt(row.stars)}</td>;
+      case 'transparency':
+        return (
+          <td
+            key={c.id}
+            className={`${TD} text-content-secondary tabular-nums`}
+            title={row.transparencyLoss == null ? (row.transparencyReason ?? undefined) : undefined}
+          >
+            {formatTransparency(row.transparencyLoss)}
+          </td>
+        );
       case 'regRms':
         return <td key={c.id} className={`${TD} text-content-secondary tabular-nums`}>{fmtNum(row.regRmsPx, 3, ' px')}</td>;
       case 'inliers':

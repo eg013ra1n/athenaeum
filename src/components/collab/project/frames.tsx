@@ -4,6 +4,7 @@ import { formatTimestamp } from '../../../utils/dateFormatting';
 import { Bar, Chip, FilterDot, MemberDot, ProgressBar, StatusDot, type ChipTone } from '../../ui';
 import { formatDurationPadded, formatSize } from '../format';
 import { useMemberColor } from './MemberColorsContext';
+import { formatTransparency } from './transparency';
 import {
   alphaOrder, filterOrder, HELD_KIND_ORDER, median, nightOrderDesc, reasonOrder, sum,
   type ColumnDef, type FacetAccess, type GroupDef,
@@ -39,6 +40,12 @@ export interface FrameVM {
   ecc: number | null;
   stars: number | null;
   snr: number | null;
+  /** Loss in magnitudes against the publisher's clear sky; `null` = no value (see `transparencyReason`). */
+  transparencyLoss: number | null;
+  transparencyReason: string | null;
+  zeroPoint: number | null;
+  zpStars: number | null;
+  zpSigma: number | null;
   failures: { kind: string; text: string }[];
   contentVersion: number | null;
   pubState: string | null; // pending | published | rejected
@@ -96,6 +103,11 @@ export function fromOwn(r: OwnFrameRow): FrameVM {
     ecc: r.eccentricity,
     stars: r.starsDetected,
     snr: r.medianSnr,
+    transparencyLoss: r.transparency.lossMag,
+    transparencyReason: r.transparency.reason,
+    zeroPoint: r.transparency.zeroPoint,
+    zpStars: r.transparency.zpStars,
+    zpSigma: r.transparency.zpSigma,
     failures: r.failures,
     contentVersion: r.contentVersion,
     pubState: r.pubState,
@@ -206,6 +218,11 @@ export function fromLibrary(r: ProjectFrameView, inFlight: ReadonlyMap<string, {
     ecc: r.eccentricity,
     stars: r.starsDetected,
     snr: r.medianSnr,
+    transparencyLoss: r.transparencyLoss,
+    transparencyReason: null,
+    zeroPoint: null,
+    zpStars: null,
+    zpSigma: null,
     failures: [],
     contentVersion: r.contentVersion,
     pubState: r.state,
@@ -251,6 +268,11 @@ export function fromModeration(m: ModerationFrameView, byUuid: ReadonlyMap<strin
     ecc: mirror?.eccentricity ?? null,
     stars: mirror?.starsDetected ?? null,
     snr: mirror?.medianSnr ?? null,
+    transparencyLoss: mirror?.transparencyLoss ?? null,
+    transparencyReason: null,
+    zeroPoint: null,
+    zpStars: null,
+    zpSigma: null,
     failures: [],
     contentVersion: null,
     pubState: 'pending',
@@ -476,6 +498,21 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     renderAggregate: (rows) => {
       const m = median(rows.map((r) => r.snr));
       return m === null ? dash() : num(`x̃ ${m.toFixed(1)}`);
+    },
+  },
+  transparency: {
+    id: 'transparency',
+    label: 'Transparency',
+    width: 106,
+    numeric: true,
+    value: (v) => v.transparencyLoss,
+    cell: (v) => (v.transparencyLoss === null
+      ? <span className="text-content-ghost" title={v.transparencyReason ?? undefined}>—</span>
+      : num(formatTransparency(v.transparencyLoss))),
+    aggregate: (rows) => median(rows.map((r) => r.transparencyLoss)),
+    renderAggregate: (rows) => {
+      const m = median(rows.map((r) => r.transparencyLoss));
+      return m === null ? dash() : num(`x̃ ${formatTransparency(m)}`);
     },
   },
   size: {
@@ -756,7 +793,7 @@ export interface TableConfig {
 export const TABLES: Record<TableId, TableConfig> = {
   ready: {
     id: 'ready',
-    columns: ['name', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size'],
+    columns: ['name', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'transparency', 'size'],
     defaultColumns: ['name', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'size'],
     groupings: ['night', 'filter', 'camera', 'object', 'none'],
     defaultGrouping: ['night', 'filter'],
@@ -765,7 +802,7 @@ export const TABLES: Record<TableId, TableConfig> = {
   },
   review: {
     id: 'review',
-    columns: ['name', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size'],
+    columns: ['name', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'transparency', 'size'],
     defaultColumns: ['name', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'size'],
     groupings: ['night', 'filter', 'camera', 'object', 'none'],
     defaultGrouping: ['night', 'filter'],
@@ -774,7 +811,7 @@ export const TABLES: Record<TableId, TableConfig> = {
   },
   held: {
     id: 'held',
-    columns: ['name', 'reason', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size'],
+    columns: ['name', 'reason', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'transparency', 'size'],
     defaultColumns: ['name', 'reason', 'night', 'filter', 'exp', 'fwhm', 'ecc', 'stars'],
     groupings: ['reason', 'night', 'filter', 'camera', 'object', 'none'],
     defaultGrouping: ['reason', 'night'],
@@ -798,7 +835,7 @@ export const TABLES: Record<TableId, TableConfig> = {
   },
   library: {
     id: 'library',
-    columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'holders', 'device', 'size'],
+    columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'transparency', 'holders', 'device', 'size'],
     defaultColumns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'holders', 'device', 'size'],
     groupings: ['publisher', 'filter', 'camera', 'night', 'none'],
     defaultGrouping: ['publisher', 'filter'],
@@ -811,8 +848,8 @@ export const TABLES: Record<TableId, TableConfig> = {
   },
   moderation: {
     id: 'moderation',
-    columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size', 'submitted'],
-    defaultColumns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr'],
+    columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'transparency', 'size', 'submitted'],
+    defaultColumns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'transparency'],
     groupings: ['publisher', 'night', 'filter', 'camera', 'none'],
     defaultGrouping: ['publisher', 'night'],
     stateFacet: null,

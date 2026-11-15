@@ -26,7 +26,7 @@ const fileOf = (id: number) => `${id < 20 ? 'L' : id < 30 ? 'R' : 'B'}_${String(
 
 /** B's lights come first, so the plan's order (not the set's) is what orders the groups. */
 const SET_LIGHTS: LightFrameRef[] = [...B_IDS, ...L_IDS, ...R_IDS].map((frameId) => ({
-  frameId, filename: fileOf(frameId), night: null, exptimeSec: 300, focalLenMm: null,
+  frameId, filename: fileOf(frameId), night: null, exptimeSec: 300, focalLenMm: null, transparency: { lossMag: null, reason: null },
 }));
 
 const QUAD_FAIL = 'registration failed: 0 quad matches';
@@ -554,5 +554,47 @@ describe('FramesTable for a project', () => {
   it('says so when a project has no frames', () => {
     renderTable({ projectFrames: [] });
     expect(screen.getByText('No frames in this project.')).toBeInTheDocument();
+  });
+});
+
+// ── The Transparency column ─────────────────────────────────────────────────────────────────────────────────────
+
+describe('FramesTable Transparency column', () => {
+  const REASON = 'no clear-sky reference yet, 12 of 30 frames';
+
+  it('a frame-set row renders its transparency', () => {
+    const lights = SET_LIGHTS.map((f) => (
+      f.frameId === 7 ? { ...f, transparency: { lossMag: 0.77, reason: null } }
+        : f.frameId === 8 ? { ...f, transparency: { lossMag: 0.001, reason: null } }
+          : f
+    ));
+    renderTable({ ...SET, lightFrames: lights });
+    expect(screen.getByRole('columnheader', { name: 'Transparency' })).toBeInTheDocument();
+    expect(within(rowOf('L_0007.fits')).getByText('\u22120.77 mag')).toBeInTheDocument();
+    expect(within(rowOf('L_0008.fits')).getByText('0.00 mag')).toBeInTheDocument();
+  });
+
+  it('a project row renders its published transparency', () => {
+    renderTable({ projectFrames: PLAN_FRAMES.map((f, i) => ({ ...f, transparencyLoss: i === 0 ? 0.31 : null })) });
+    expect(within(rowOf('a.fits')).getByText('\u22120.31 mag')).toBeInTheDocument();
+    expect(within(rowOf('d.fits')).queryByText(/mag$/)).toBeNull();
+  });
+
+  it('a row without a value shows a dash with its reason', () => {
+    const lights = SET_LIGHTS.map((f) => (f.frameId === 7 ? { ...f, transparency: { lossMag: null, reason: REASON } } : f));
+    renderTable({ ...SET, lightFrames: lights });
+    const cell = within(rowOf('L_0007.fits')).getByTitle(REASON);
+    expect(cell).toHaveTextContent('—');
+  });
+
+  it('sorts by the loss, rows without a value last', () => {
+    const loss: Record<number, number> = { 7: 0.5, 8: 0.1 };
+    renderTable({ ...SET, lightFrames: SET_LIGHTS.map((f) => ({ ...f, transparency: { lossMag: loss[f.frameId] ?? null, reason: null } })) });
+    fireEvent.click(within(toolbar()).getByRole('button', { name: 'None' }));
+    const header = within(screen.getByRole('columnheader', { name: 'Transparency' }));
+    fireEvent.click(header.getByRole('button'));
+    expect(fileColumn().slice(0, 3)).toEqual(['L_0008', 'L_0007', 'B_0031']);
+    fireEvent.click(header.getByRole('button'));
+    expect(fileColumn().slice(0, 3)).toEqual(['L_0007', 'L_0008', 'B_0031']);
   });
 });

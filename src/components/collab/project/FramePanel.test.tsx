@@ -112,6 +112,11 @@ function baseFrame(overrides: Partial<FrameVM> = {}): FrameVM {
     ecc: 0.4,
     stars: 500,
     snr: 12,
+    transparencyLoss: null,
+    transparencyReason: null,
+    zeroPoint: null,
+    zpStars: null,
+    zpSigma: null,
     failures: [],
     contentVersion: null,
     pubState: null,
@@ -458,10 +463,35 @@ describe('FramePanel', () => {
     expect(screen.getByText('v2 · v1 superseded')).toBeInTheDocument();
   });
 
-  it('Metrics: SNR to one decimal, no Zero point row', () => {
+  it('Metrics: SNR to one decimal', () => {
     renderPanel(baseFrame({ snr: 23.054622650146484 }));
     expect(screen.getByText('23.1')).toBeInTheDocument();
-    expect(screen.queryByText('Zero point')).toBeNull();
+  });
+
+  it('shows transparency and zero point among the metrics', () => {
+    renderPanel(baseFrame({ transparencyLoss: 0.77, zeroPoint: 21.342, zpStars: 87, zpSigma: 0.041 }));
+    expect(screen.getByText('Transparency').tagName).toBe('DT');
+    expect(screen.getByText('\u22120.77 mag')).toBeInTheDocument();
+    expect(screen.getByText('Zero point').tagName).toBe('DT');
+    expect(screen.getByText('21.34 · 87 stars · ±0.04')).toBeInTheDocument();
+  });
+
+  it('a metric without a transparency value shows a dash and its reason', () => {
+    renderPanel(baseFrame({ transparencyReason: 'published without a transparency value' }));
+    expect(screen.getByText('published without a transparency value')).toBeInTheDocument();
+    expect(screen.getByText('Transparency').nextElementSibling?.textContent).toContain('—');
+  });
+
+  it('a rule without a value shows its reason and no verdict mark', () => {
+    const reason = 'no clear-sky reference yet, 12 of 30 frames';
+    const own = baseOwn({
+      rules: [{ metricKey: 'transparency_loss', label: 'Transparency loss', value: null, needs: '≤ 0.20 mag', pass: null, reason }],
+    });
+    renderPanel(baseFrame({ own }));
+    expect(screen.getByText(reason)).toBeInTheDocument();
+    // Only the three precondition rows carry a mark; the rule row has neither ✓ nor ✕.
+    expect(screen.getAllByText('✓')).toHaveLength(3);
+    expect(screen.queryAllByText('✕')).toHaveLength(0);
   });
 
   it('Gate is a 4-column grid with the thresholds version and precondition rows', () => {
@@ -521,6 +551,7 @@ describe('FramePanel', () => {
   it('a moderation frame shows only the status chip in the title row', () => {
     renderPanel(baseFrame({ own: null, lib: null, device: null, pubState: 'pending' }));
     expect(screen.getByText('pending')).toBeInTheDocument();
-    expect(screen.queryByText('—')).toBeNull();
+    // The title row carries the chip alone: no device cell beside it.
+    expect(screen.getByText('pending').parentElement).not.toHaveTextContent('—');
   });
 });

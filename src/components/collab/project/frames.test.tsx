@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { ModerationFrameView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
+import { sortRows } from './table/model';
 import { COLUMNS, copies, fromLibrary, fromModeration, fromOwn, GROUPS, HELD_KIND_ORDER, REASON_LABEL, TABLES } from './frames';
 
 function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
@@ -273,4 +274,53 @@ it('a review row has no states and a withheld held row carries the withheld kind
 it('the Held back Reason grouping ranks its groups in the facet order (withheld, Black Hole after the blockers)', () => {
   expect(['blackHole', 'withheld', 'threshold', 'analyze'].sort(GROUPS.reason.order))
     .toEqual(['analyze', 'threshold', 'withheld', 'blackHole']);
+});
+
+function ownT(lossMag: number | null, reason: string | null, name: string): OwnFrameRow {
+  return own({ fileName: name, transparency: { zeroPoint: 21.3, zpStars: 80, zpSigma: 0.04, lossMag, reason } });
+}
+
+it('the transparency column renders the loss', () => {
+  const vm = fromOwn(ownT(0.77, null, 'a.fits'));
+  render(<>{COLUMNS.transparency.cell(vm)}</>);
+  expect(screen.getByText('\u22120.77 mag')).toBeInTheDocument();
+  expect(COLUMNS.transparency.label).toBe('Transparency');
+  expect(COLUMNS.transparency.numeric).toBe(true);
+  expect(COLUMNS.transparency.value(vm)).toBe(0.77);
+  const libVm = fromLibrary(lib({ transparencyLoss: 0.12 }), new Map());
+  expect(libVm.transparencyLoss).toBe(0.12);
+  const mod = fromModeration(
+    { frameUuid: 'u9', fileName: 'a.fits', publisher: 'Olga', publisherAccountId: 'acc-o', filter: 'Ha', exptimeSec: 300, fwhmArcsec: 2.1, createdAt: '2026-09-30T08:00:00Z' },
+    new Map([['u9', lib({ frameUuid: 'u9', transparencyLoss: 0.31 })]]),
+  );
+  expect(mod.transparencyLoss).toBe(0.31);
+});
+
+it('an empty transparency cell carries its reason as a title', () => {
+  const vm = fromOwn(ownT(null, 'published without a transparency value', 'a.fits'));
+  render(<>{COLUMNS.transparency.cell(vm)}</>);
+  const dash = screen.getByText('—');
+  expect(dash).toHaveAttribute('title', 'published without a transparency value');
+});
+
+it('sorting by transparency keeps frames without a value last in both directions', () => {
+  const rows = [
+    fromOwn(ownT(null, 'no value', 'n.fits')),
+    fromOwn(ownT(0.5, null, 'b.fits')),
+    fromOwn(ownT(0, null, 'a.fits')),
+  ];
+  const name = (r: { fileName: string }) => r.fileName;
+  expect(sortRows(rows, COLUMNS.transparency, 1, name).map((r) => r.fileName)).toEqual(['a.fits', 'b.fits', 'n.fits']);
+  expect(sortRows(rows, COLUMNS.transparency, -1, name).map((r) => r.fileName)).toEqual(['b.fits', 'a.fits', 'n.fits']);
+});
+
+it('the column sits after SNR in every table that lists SNR', () => {
+  for (const t of Object.values(TABLES)) {
+    for (const list of [t.columns, t.defaultColumns]) {
+      const i = list.indexOf('snr');
+      if (i < 0) continue;
+      expect(list[i + 1]).toBe('transparency');
+    }
+    if (t.columns.includes('snr')) expect(t.columns).toContain('transparency');
+  }
 });

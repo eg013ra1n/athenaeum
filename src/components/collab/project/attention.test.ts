@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { deriveAttention, offlineFor } from './attention';
 
 const NOW = Date.parse('2026-09-29T10:00:00Z');
-const held = (kind: string | string[], night = '2026-09-26', filter = 'Ha') => ({ segment: 'held', failures: (Array.isArray(kind) ? kind : [kind]).map((k) => ({ kind: k, text: k })), night, filter, filterMapped: true }) as never;
-const pub = (p: Partial<Record<string, unknown>>) => ({ segment: 'published', failures: [], holdersTotal: 1, localState: 'own_held', byteSize: 1e9, pubState: 'published', accepted: null, ...p }) as never;
+const NO_TRANSPARENCY = { zeroPoint: null, zpStars: null, zpSigma: null, lossMag: null, reason: 'not measured yet' };
+const held = (kind: string | string[], night = '2026-09-26', filter = 'Ha') => ({ segment: 'held', failures: (Array.isArray(kind) ? kind : [kind]).map((k) => ({ kind: k, text: k })), night, filter, filterMapped: true, transparency: NO_TRANSPARENCY }) as never;
+const pub = (p: Partial<Record<string, unknown>>) => ({ segment: 'published', failures: [], holdersTotal: 1, localState: 'own_held', byteSize: 1e9, pubState: 'published', accepted: null, transparency: NO_TRANSPARENCY, ...p }) as never;
 
 describe('deriveAttention', () => {
   it('one row per held-back cause in blocker order, with the mockup copy', () => {

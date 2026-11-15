@@ -41,7 +41,7 @@ const byKey = (rows: FrameRow[], key: string) => {
 };
 
 const light = (frameId: number, filename: string, over: Partial<LightFrameRef> = {}): LightFrameRef => ({
-  frameId, filename, night: null, exptimeSec: null, focalLenMm: null, ...over,
+  frameId, filename, night: null, exptimeSec: null, focalLenMm: null, transparency: { lossMag: null, reason: null }, ...over,
 });
 
 describe('buildProjectFrameRows', () => {
@@ -358,5 +358,23 @@ describe('sortRows', () => {
     const before = rows.map((r) => r.key);
     sortRows(rows, 'filename', 'desc');
     expect(rows.map((r) => r.key)).toEqual(before);
+  });
+});
+
+describe('transparency on a row', () => {
+  it('a frame-set row takes the light row’s loss and reason', () => {
+    const rows = buildFrameRows(
+      [
+        light(1, 'a.fit', { transparency: { lossMag: 0.4, reason: null } }),
+        light(2, 'b.fit', { transparency: { lossMag: null, reason: 'not measured yet' } }),
+      ],
+      null, null, [], ctxOf(),
+    );
+    expect(rows.map((r) => [r.transparencyLoss, r.transparencyReason])).toEqual([[0.4, null], [null, 'not measured yet']]);
+  });
+
+  it('a project row takes the published loss and has no reason', () => {
+    const rows = buildProjectFrameRows([pf({ frameUuid: 'u1', transparencyLoss: 0.2 }), pf({ frameUuid: 'u2' })], null, null, new Set(), null, ctxOf());
+    expect(rows.map((r) => [r.transparencyLoss, r.transparencyReason])).toEqual([[0.2, null], [null, null]]);
   });
 });

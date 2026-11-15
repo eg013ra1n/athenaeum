@@ -64,7 +64,7 @@ const PROJECT: StackSubject = { kind: 'project', projectId: 'p1', title: 'Projec
 
 const row = (key: string, over: Partial<FrameRow> = {}): FrameRow => ({
   key, frameId: Number(key) || null, filename: `${key}.fit`, publisher: null, groupKey: 'L-mono', night: null,
-  exptimeSec: 300, focalLenMm: null, weight: null, fwhmPx: null, eccentricity: null, stars: null, regRmsPx: null, lnScale: null,
+  exptimeSec: 300, focalLenMm: null, transparencyLoss: null, transparencyReason: null, weight: null, fwhmPx: null, eccentricity: null, stars: null, regRmsPx: null, lnScale: null,
   regInliers: null, regModel: null,
   outcome: { kind: 'included', label: 'Included', tone: 'success', reason: null },
   outOfNextRun: false, editable: true, unavailable: null, pinnable: true, pinned: false, pinNote: null,
