@@ -24,12 +24,13 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
 use rusqlite::Connection;
-use serde::Serialize;
 
 use crate::analysis::zero_point::{is_colour_frame, ZP_VERSION};
 use crate::db::MAX_BIND_PARAMS;
 use crate::plate_solve::layers::{catalog_identity, CatalogOpenError};
 use crate::star_measure::MEASURE_VERSION;
+
+pub use crate::models::Transparency;
 
 /// The share of a rig's zero points that sits at or below its clear-sky reference (nearest rank).
 pub const REFERENCE_PERCENTILE: f64 = 0.90;
@@ -85,18 +86,6 @@ impl LossReason {
             }
         }
     }
-}
-
-/// What the tables show for one frame. The stored zero-point numbers are carried whenever the frame has a current one,
-/// even when the loss is absent for lack of a reference. `reason` is `Some(sentence)` exactly when `loss_mag` is `None`.
-#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
-pub struct Transparency {
-    pub zero_point: Option<f64>,
-    pub zp_stars: Option<i64>,
-    pub zp_sigma: Option<f64>,
-    pub loss_mag: Option<f64>,
-    pub reason: Option<String>,
 }
 
 impl Transparency {

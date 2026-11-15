@@ -47,6 +47,7 @@ function baseOwn(overrides: Partial<OwnFrameRow> = {}): OwnFrameRow {
     calibratedBytes: null,
     preparedAt: null,
     withheld: false,
+    transparency: { zeroPoint: null, zpStars: null, zpSigma: null, lossMag: null, reason: 'not measured yet' },
     ...overrides,
   };
 }
@@ -85,6 +86,7 @@ function baseLib(overrides: Partial<ProjectFrameView> = {}): ProjectFrameView {
     receivedAt: null,
     receivedFromDevice: null,
     receivedFromMember: null,
+    transparencyLoss: null,
     ...overrides,
   };
 }
@@ -175,8 +177,8 @@ describe('FramePanel', () => {
     const own = baseOwn({
       failures: [{ kind: 'solve', text: 'unknown pixel scale' }],
       rules: [
-        { metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false },
-        { metricKey: 'stars', label: 'Stars', value: '500', needs: '≥ 200', pass: true },
+        { metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false, reason: null },
+        { metricKey: 'stars', label: 'Stars', value: '500', needs: '≥ 200', pass: true, reason: null },
       ],
     });
     renderPanel(baseFrame({ own, failures: own.failures }));
@@ -196,7 +198,7 @@ describe('FramePanel', () => {
 
   it('(b) shows a dash and no verdict for a rule that was not evaluated', () => {
     const own = baseOwn({
-      rules: [{ metricKey: 'ecc', label: 'Eccentricity', value: null, needs: '≤ 0.55', pass: null }],
+      rules: [{ metricKey: 'ecc', label: 'Eccentricity', value: null, needs: '≤ 0.55', pass: null, reason: null }],
     });
     renderPanel(baseFrame({ own }));
 
@@ -464,7 +466,7 @@ describe('FramePanel', () => {
 
   it('Gate is a 4-column grid with the thresholds version and precondition rows', () => {
     renderPanel(
-      baseFrame({ own: own({ failures: [{ kind: 'solve', text: 'No WCS' }], rules: [{ metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false }] }) }),
+      baseFrame({ own: own({ failures: [{ kind: 'solve', text: 'No WCS' }], rules: [{ metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false, reason: null }] }) }),
       { thresholdsVersion: 3 },
     );
     expect(screen.getByRole('heading', { name: /Gate thresholds v3/ })).toBeInTheDocument();

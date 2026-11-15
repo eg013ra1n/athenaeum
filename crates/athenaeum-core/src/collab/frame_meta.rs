@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::collab::gate::header_pixel_scale_arcsec;
+use crate::models::Transparency;
 use crate::db::analysis::get_frame_analyses_by_ids;
 use crate::fits_writer::keywords::Bayer;
 use crate::plate_solve::storage::{get_plate_solve, PlateSolveRecord};
@@ -82,6 +83,18 @@ fn load_frame_row(conn: &Connection, frame_id: i64) -> Result<FrameRow> {
 /// `anyhow::Error` at its own boundary — hence the plain `anyhow::Result`
 /// here rather than `ApiError`.
 pub fn build_frame_meta(conn: &Connection, frame_id: i64) -> Result<FrameMeta> {
+    build_frame_meta_with(conn, frame_id, None)
+}
+
+/// [`build_frame_meta`] with the frame's transparency handed in. The loss is a read over the lights of the frame's
+/// cameras (`analysis::transparency::transparency_for_frames`), so it is never computed here, per frame: a batch caller
+/// reads it once for every frame it announces and passes each frame's entry. `None`, or an entry with no loss, writes no
+/// `transparencyLoss` key.
+pub fn build_frame_meta_with(
+    conn: &Connection,
+    frame_id: i64,
+    transparency: Option<&Transparency>,
+) -> Result<FrameMeta> {
     let frow = load_frame_row(conn, frame_id)?;
     let analysis = get_frame_analyses_by_ids(conn, &[frame_id])?
         .into_iter()
@@ -137,6 +150,11 @@ pub fn build_frame_meta(conn: &Connection, frame_id: i64) -> Result<FrameMeta> {
         if let Some(v) = a.measure_version {
             meta.insert("measureVersion".into(), json!(v));
         }
+    }
+    // Append-only: present only when the frame has a loss at announce time, in magnitudes, three decimals.
+    // Frozen with the rest of the meta: a later version never re-announces it (spec C5).
+    if let Some(loss) = transparency.and_then(|t| t.loss_mag).filter(|l| l.is_finite()) {
+        meta.insert("transparencyLoss".into(), json!((loss * 1000.0).round() / 1000.0));
     }
     if let Some(s) = &solve {
         let mut wcs = Map::new();
@@ -195,6 +213,9 @@ pub struct ProjectFrameMeta {
     /// The publisher's Analysis weight of the frame (`meta.snrWeight`); the grid proposal turns with the
     /// best-weighted frame when no reference is pinned.
     pub snr_weight: Option<f64>,
+    /// The frame's transparency loss in magnitudes against its equipment's clear sky at announce time
+    /// (`meta.transparencyLoss`); `None` for a frame announced before it was measured or without a loss.
+    pub transparency_loss: Option<f64>,
 }
 
 /// `meta.wcs` as [`build_frame_meta`] writes it: TAN (no CTYPE), `crpix`
@@ -245,6 +266,7 @@ struct MetaWire {
     instrume: Option<String>,
     wcs: Option<ManifestWcs>,
     snr_weight: Option<f64>,
+    transparency_loss: Option<f64>,
 }
 
 /// Parse one manifest row (plan 6b-2 C4). A missing exposure or a malformed
@@ -266,6 +288,7 @@ pub fn parse_project_frame_meta(manifest_json: &str) -> Result<ProjectFrameMeta>
         instrume: meta.instrume,
         wcs: meta.wcs,
         snr_weight: meta.snr_weight,
+        transparency_loss: meta.transparency_loss,
     })
 }
 
@@ -535,6 +558,56 @@ mod tests {
         assert!(m.meta.get("measureVersion").is_none());
     }
 
+    fn loss(mag: f64) -> Transparency {
+        Transparency { zero_point: Some(21.5), zp_stars: Some(80), zp_sigma: Some(0.03), loss_mag: Some(mag), reason: None }
+    }
+
+    #[test]
+    fn frame_meta_carries_the_transparency_loss() {
+        let conn = seed_db();
+        let frame_id = seed_frame(&conn, Some("L"), None);
+        seed_analysis(&conn, frame_id);
+        let m = build_frame_meta_with(&conn, frame_id, Some(&loss(0.771234))).unwrap();
+        assert_eq!(m.meta.get("transparencyLoss"), Some(&serde_json::json!(0.771)), "mag, three decimals");
+        // Every key the old call writes is still there, with the same value.
+        let old = build_frame_meta(&conn, frame_id).unwrap();
+        for (k, v) in old.meta.as_object().unwrap() {
+            assert_eq!(m.meta.get(k), Some(v), "{k} changed");
+        }
+    }
+
+    #[test]
+    fn frame_meta_omits_it_without_a_loss() {
+        let conn = seed_db();
+        let frame_id = seed_frame(&conn, Some("L"), None);
+        seed_analysis(&conn, frame_id);
+        assert!(build_frame_meta(&conn, frame_id).unwrap().meta.get("transparencyLoss").is_none());
+        assert!(build_frame_meta_with(&conn, frame_id, None).unwrap().meta.get("transparencyLoss").is_none());
+        let none = Transparency {
+            zero_point: Some(21.5),
+            zp_stars: Some(80),
+            zp_sigma: Some(0.03),
+            loss_mag: None,
+            reason: Some("no clear-sky reference yet, 12 of 30 frames".into()),
+        };
+        let m = build_frame_meta_with(&conn, frame_id, Some(&none)).unwrap();
+        assert!(m.meta.get("transparencyLoss").is_none(), "never a null: the key is omitted");
+    }
+
+    #[test]
+    fn the_manifest_parser_reads_the_transparency_loss() {
+        let with = r#"{"exptimeSec":120.0,"meta":{"transparencyLoss":0.771}}"#;
+        assert_eq!(parse_project_frame_meta(with).unwrap().transparency_loss, Some(0.771));
+        let without = r#"{"exptimeSec":120.0,"meta":{"instrume":"ASI2600MM"}}"#;
+        assert_eq!(parse_project_frame_meta(without).unwrap().transparency_loss, None);
+        // The round trip: what build writes, parse reads.
+        let conn = seed_db();
+        let frame_id = seed_frame(&conn, Some("L"), None);
+        let m = build_frame_meta_with(&conn, frame_id, Some(&loss(0.2))).unwrap();
+        let row = serde_json::json!({"exptimeSec": m.exptime_sec, "meta": m.meta});
+        assert_eq!(parse_project_frame_meta(&row.to_string()).unwrap().transparency_loss, Some(0.2));
+    }
+
     #[test]
     fn no_solve_means_no_wcs_key() {
         let conn = seed_db();
@@ -553,7 +626,9 @@ mod tests {
         seed_analysis(&conn, frame_id);
         seed_solve(&conn, frame_id, Some(5));
 
-        let m = build_frame_meta(&conn, frame_id).unwrap();
+        // The worst case carries the newest key too (the wave-6.5 loss is a short number).
+        let m = build_frame_meta_with(&conn, frame_id, Some(&loss(0.771234))).unwrap();
+        assert!(m.meta.get("transparencyLoss").is_some(), "premise: the loss is in the meta");
         let bytes = serde_json::to_vec(&m.meta).unwrap();
         assert!(
             bytes.len() <= 8192,

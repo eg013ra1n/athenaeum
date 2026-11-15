@@ -2017,6 +2017,11 @@ telescope: string | null,
  */
 medianSnr: number | null, 
 /**
+ * Parsed from `meta.transparencyLoss`: the frame's loss in magnitudes against its publisher's clear sky, frozen
+ * at announce. `None` for a frame announced before it was measured, or announced without a loss.
+ */
+transparencyLoss: number | null, 
+/**
  * The UTC date of `dateObs − 12 h` ([`night_of_date_obs`]) — there is no
  * catalog `imaging_nights` row for another member's frame, so this is
  * the best a cached manifest row can do.
@@ -2338,10 +2343,18 @@ value: string | null,
  */
 needs: string, 
 /**
- * `None` = not evaluated (missing input — the precondition failure
- * already blocks the frame).
+ * `None` = not evaluated. For the metrics whose missing input is also a
+ * layer-1 failure (analysis, pixel scale) the precondition failure
+ * already blocks the frame; for `transparency_loss` it means "not
+ * judged, not blocked": the rule has no value and `reason` says why.
  */
-pass: boolean | null, };
+pass: boolean | null, 
+/**
+ * Why the rule has no value, when the metric can lack one without
+ * blocking the frame (`transparency_loss`); `None` for every other
+ * metric and whenever there is a value.
+ */
+reason: string | null, };
 
 export type ThresholdRuleView = { metricKey: string, op: string, 
 /**
@@ -2451,7 +2464,13 @@ path: string | null,
  * `Some(false)` = excluded by the coordinator. `None` for a frame this
  * account has never published.
  */
-accepted: boolean | null, };
+accepted: boolean | null, 
+/**
+ * The frame's zero point and its transparency loss against the equipment's clear sky (wave 6.5). The numbers
+ * (`zeroPoint`, `zpStars`, `zpSigma`) are always the live stored ones; the loss of a frame this account already
+ * published is the one frozen in its manifest, never today's.
+ */
+transparency: Transparency, };
 
 export type Channel = "stable" | "beta";
 

@@ -42,7 +42,8 @@ export function ownFrameRow(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     contributorState: 'published', contributorReason: null, failures: [], contentVersion: null,
     pubState: null, acceptedReason: null, holdersOnline: null, holdersTotal: null, localState: null,
     publishedAt: null, lastError: null, rules: [], path: '/r/a.fits', accepted: null,
-    calibratedPath: null, calibratedBytes: null, preparedAt: null, withheld: false, ...o,
+    calibratedPath: null, calibratedBytes: null, preparedAt: null, withheld: false,
+    transparency: { zeroPoint: null, zpStars: null, zpSigma: null, lossMag: null, reason: 'not measured yet' }, ...o,
   };
 }
 
@@ -55,6 +56,6 @@ export function projectFrameView(o: Partial<ProjectFrameView> = {}): ProjectFram
     newVersionWaiting: false, byteSize: 1024, contentVersion: 1, lastError: null, fwhmArcsec: null,
     eccentricity: null, starsDetected: null, camera: null, telescope: null, night: null, medianSnr: null,
     contributorState: null, contributorReason: null, receivedAt: null, receivedFromDevice: null,
-    receivedFromMember: null, ...o,
+    receivedFromMember: null, transparencyLoss: null, ...o,
   };
 }

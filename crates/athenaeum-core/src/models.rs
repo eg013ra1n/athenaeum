@@ -1445,6 +1445,32 @@ impl Default for LightCalParams {
     }
 }
 
+// ── Transparency read model (collab v3 wave 6.5) ───────────────────────────
+// Lives here, ungated, because the gate (`collab::gate`) builds in every feature set; the reading itself is
+// `analysis::transparency` (solver-gated), which re-exports this type.
+
+/// What the tables show for one frame. The stored zero-point numbers are carried whenever the frame has a current one,
+/// even when the loss is absent for lack of a reference. `reason` is `Some(sentence)` exactly when `loss_mag` is `None`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct Transparency {
+    pub zero_point: Option<f64>,
+    pub zp_stars: Option<i64>,
+    pub zp_sigma: Option<f64>,
+    pub loss_mag: Option<f64>,
+    pub reason: Option<String>,
+}
+
+/// The sentence of a frame nobody has asked a transparency of (or whose read failed): not judged, not blocked.
+pub const NOT_MEASURED_REASON: &str = "not measured yet";
+
+impl Transparency {
+    /// A frame with no transparency read at all.
+    pub fn unmeasured() -> Self {
+        Transparency { zero_point: None, zp_stars: None, zp_sigma: None, loss_mag: None, reason: Some(NOT_MEASURED_REASON.to_string()) }
+    }
+}
+
 #[cfg(test)]
 mod frame_verdict_tests {
     use super::*;

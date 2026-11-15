@@ -1247,6 +1247,19 @@ fn publish_split(
         // path, and a basename collision within this publisher is held back,
         // never renamed on disk. A prepared frame lands where its calibrate
         // wrote it (spec §4.3) — its name was picked then.
+        // The new frames' transparency, read ONCE for the whole batch (never per frame): each frame's meta gets its own
+        // entry. The gate that opened this run has already brought the zero points up to date.
+        let new_transparency = {
+            let new_ids: Vec<i64> = targeted
+                .iter()
+                .filter(|(_, kind, ..)| matches!(kind, PublishKind::New))
+                .map(|(cand, ..)| cand.frame_id)
+                .collect();
+            let catalog = ctx
+                .app_data_dir()
+                .and_then(|dir| crate::analysis::transparency::installed_catalog_identity(&dir));
+            batch_frame_transparency(&conn, project_id, catalog.as_deref(), &new_ids)
+        };
         for (cand, kind, osc, target, external) in targeted {
             let fid = cand.frame_id;
             if let (PublishKind::New, Some(p)) = (&kind, from_prepared.get(&fid)) {
@@ -1279,7 +1292,7 @@ fn publish_split(
                         name_taken.push(fid);
                         continue;
                     }
-                    let meta = match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                    let meta = match new_frame_meta_or_hold_back(&conn, project_id, fid, new_transparency.get(&fid)) {
                         Ok(m) => m,
                         Err(reason) => {
                             held_back.push(held(fid, &cand.filename, reason));
@@ -1375,7 +1388,7 @@ fn publish_split(
                         continue;
                     }
                     taken_names.insert(file_name);
-                    match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                    match new_frame_meta_or_hold_back(&conn, project_id, fid, new_transparency.get(&fid)) {
                         Ok(m) => Some(m),
                         Err(reason) => {
                             held_back.push(held(fid, &cand.filename, reason));
@@ -1416,7 +1429,7 @@ fn publish_split(
             // meta — a version never re-announces it; the hub keeps the
             // prior meta.
             let meta = if matches!(kind, PublishKind::New) {
-                match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                match new_frame_meta_or_hold_back(&conn, project_id, fid, new_transparency.get(&fid)) {
                     Ok(m) => Some(m),
                     Err(reason) => {
                         held_back.push(held(fid, &cand.filename, reason));

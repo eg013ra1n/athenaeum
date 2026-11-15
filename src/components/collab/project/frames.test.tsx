@@ -39,6 +39,7 @@ function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     calibratedBytes: null,
     preparedAt: null,
     withheld: false,
+    transparency: { zeroPoint: null, zpStars: null, zpSigma: null, lossMag: null, reason: 'not measured yet' },
     ...o,
   };
 }
@@ -77,6 +78,7 @@ function lib(o: Partial<ProjectFrameView> = {}): ProjectFrameView {
     receivedAt: null,
     receivedFromDevice: null,
     receivedFromMember: null,
+    transparencyLoss: null,
     ...o,
   };
 }
