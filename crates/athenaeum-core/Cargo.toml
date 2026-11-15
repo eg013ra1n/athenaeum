@@ -235,6 +235,10 @@ required-features = ["render"]
 name = "drizzle_probe"
 required-features = ["render", "solver"]
 
+[[example]]
+name = "zp_probe"
+required-features = ["render", "solver"]
+
 [dev-dependencies]
 # Self dev-dependency: turns on this crate's own `test-support` feature for its integration tests and examples (they have no `cfg(test)` on the lib).
 athenaeum-core = { path = ".", features = ["test-support"] }
