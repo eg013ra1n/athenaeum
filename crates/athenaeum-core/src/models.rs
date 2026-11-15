@@ -341,11 +341,21 @@ pub struct MissingMetadataRow {
     pub has_duplicate: bool,
 }
 
+/// DTO: one file of a session in the frame-set detail: the file, its frame, and the frame's transparency (wave 6.5,
+/// display only). `get_imaging_nights_with_sessions` fills `transparency` with [`Transparency::unmeasured`]; the
+/// frame-set detail command replaces it for the set's lights. A structural superset of [`FileWithFrame`].
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+pub struct SessionFrameRow {
+    pub file: File,
+    pub frame: Option<Frame>,
+    pub transparency: Transparency,
+}
+
 /// DTO: Session with its frames
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct SessionWithFrames {
     pub session: Session,
-    pub frames: Vec<FileWithFrame>,
+    pub frames: Vec<SessionFrameRow>,
 }
 
 /// DTO: Imaging night with its sessions
@@ -1451,7 +1461,7 @@ impl Default for LightCalParams {
 
 /// What the tables show for one frame. The stored zero-point numbers are carried whenever the frame has a current one,
 /// even when the loss is absent for lack of a reference. `reason` is `Some(sentence)` exactly when `loss_mag` is `None`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct Transparency {
     pub zero_point: Option<f64>,

@@ -1210,9 +1210,80 @@ pub fn get_frame_set_detail(
         });
     }
 
-    let nights = db::get_imaging_nights_with_sessions(&conn, frames_set_id)
+    let mut nights = db::get_imaging_nights_with_sessions(&conn, frames_set_id)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let catalog = ctx
+        .app_data_dir()
+        .and_then(|dir| crate::analysis::transparency::installed_catalog_identity(&dir));
+    fill_light_transparency(&conn, frames_set_id, catalog.as_deref(), &mut nights);
     Ok(crate::models::FrameSetDetail { frames_set, nights })
+}
+
+/// What a light carries when the transparency read failed (display only, never an error of the detail command).
+const TRANSPARENCY_UNREADABLE: &str = "transparency could not be read";
+
+/// The row value of a light whose transparency read failed: no numbers, the reason says so.
+fn unreadable_transparency() -> crate::models::Transparency {
+    crate::models::Transparency {
+        zero_point: None,
+        zp_stars: None,
+        zp_sigma: None,
+        loss_mag: None,
+        reason: Some(TRANSPARENCY_UNREADABLE.to_string()),
+    }
+}
+
+/// The transparency of every light (non-master `Light`) of the set's `nights`, from ONE `transparency_for_frames`
+/// call (never one per frame). `catalog` is the installed star catalogue's identity, `None` when none is installed.
+/// A read that fails is a `warn` and gives every light [`unreadable_transparency`]: the frame-set detail never fails
+/// over a display field. This is a read; it triggers no zero-point computation. Rows other than lights keep the
+/// `unmeasured` value the nights read gave them.
+fn fill_light_transparency(
+    conn: &Connection,
+    frames_set_id: i64,
+    catalog: Option<&str>,
+    nights: &mut [crate::models::ImagingNightWithSessions],
+) {
+    let is_light = |row: &crate::models::SessionFrameRow| {
+        row.frame.as_ref().is_some_and(|f| {
+            f.imagetyp == Some(crate::models::ImageType::Light) && !f.is_master && f.id.is_some()
+        })
+    };
+    let ids: Vec<i64> = nights
+        .iter()
+        .flat_map(|n| n.sessions.iter())
+        .flat_map(|s| s.frames.iter())
+        .filter(|r| is_light(r))
+        .filter_map(|r| r.frame.as_ref().and_then(|f| f.id))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let read = crate::analysis::transparency::transparency_for_frames(conn, catalog, &ids);
+    let mut map = match read {
+        Ok(map) => Some(map),
+        Err(e) => {
+            tracing::warn!(
+                frames_set_id,
+                lights = ids.len(),
+                error = %format!("{e:#}"),
+                "frame set detail: transparency read failed"
+            );
+            None
+        }
+    };
+    for row in nights
+        .iter_mut()
+        .flat_map(|n| n.sessions.iter_mut())
+        .flat_map(|s| s.frames.iter_mut())
+        .filter(|r| is_light(r))
+    {
+        let Some(id) = row.frame.as_ref().and_then(|f| f.id) else { continue };
+        row.transparency = match map.as_mut() {
+            Some(m) => m.remove(&id).unwrap_or_else(crate::models::Transparency::unmeasured),
+            None => unreadable_transparency(),
+        };
+    }
 }
 
 /// Delete a frame set (cascade removes its nights, sessions and members).
@@ -2011,5 +2082,195 @@ mod tests {
         assert_eq!(get_excluded_frames_count(&ctx).unwrap(), 2);
         assert_eq!(remove_files_from_excluded(&ctx, &[10]).unwrap(), 1);
         assert_eq!(get_excluded_frames_count(&ctx).unwrap(), 1);
+    }
+
+    // ── Transparency of the lights in the detail (wave 6.5, display only) ──────
+
+    /// Installs a stand-in star catalogue under the context's app-data folder (the identity reads the tier file's
+    /// name, size and time only) and returns its identity, the one a stored zero point must carry to count.
+    fn install_fake_catalogue(tmp: &tempfile::TempDir) -> String {
+        let dir = tmp.path().join("catalogs").join("smac_gaia");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stars.smac"), b"x").unwrap();
+        crate::analysis::transparency::installed_catalog_identity(tmp.path()).expect("the fake catalogue reads")
+    }
+
+    fn seed_analysis(conn: &Connection, id: i64, zero_point: f64, catalog: &str) {
+        let analysis = crate::models::FrameAnalysis {
+            id: None,
+            frame_id: id,
+            file_id: id,
+            stars_detected: 200,
+            median_fwhm: 4.0,
+            median_eccentricity: 0.1,
+            median_snr: 100.0,
+            median_hfr: 2.0,
+            frame_snr: 30.0,
+            snr_weight: 1.0,
+            psf_signal: 100.0,
+            background: 100.0,
+            noise: 5.0,
+            detection_threshold: 5.0,
+            width: 4000,
+            height: 3000,
+            source_channels: 1,
+            trail_r_squared: 0.0,
+            possibly_trailed: false,
+            median_beta: None,
+            quality_score: None,
+            config_hash: Some("t".into()),
+            analyzed_at: "2026-03-01T23:00:00Z".into(),
+            measure_version: Some(crate::star_measure::MEASURE_VERSION),
+            stars_refused: None,
+            frame_verdict: None,
+            zero_point: Some(zero_point),
+            zp_stars: Some(80),
+            zp_sigma: Some(0.03),
+            zp_version: Some(crate::analysis::zero_point::ZP_VERSION),
+            zp_catalog: Some(catalog.to_string()),
+        };
+        crate::plate_solve::storage::insert_plate_solve(
+            conn,
+            &crate::plate_solve::storage::PlateSolveRecord {
+                id: None,
+                frame_id: id,
+                crpix1: 2000.0,
+                crpix2: 1500.0,
+                crval1: 10.0,
+                crval2: 41.0,
+                cd1_1: -2.5e-4,
+                cd1_2: 0.0,
+                cd2_1: 0.0,
+                cd2_2: 2.5e-4,
+                sip_order: None,
+                sip_a_coeffs: None,
+                sip_b_coeffs: None,
+                sip_ap_coeffs: None,
+                sip_bp_coeffs: None,
+                matched_stars: 300,
+                total_detected: 400,
+                rms_residual_px: 0.3,
+                rms_residual_arcsec: 0.3,
+                pixel_scale_arcsec: 1.0,
+                field_rotation_deg: 0.0,
+                solve_time_ms: 10,
+                catalog_used: "test".into(),
+                algorithm_used: "test".into(),
+                solved_at: "2026-03-01T23:00:00Z".into(),
+                expected_catalog_stars_in_fov: None,
+                inlier_ratio: None,
+            },
+        )
+        .unwrap();
+        crate::db::analysis::upsert_frame_analysis(conn, &analysis).unwrap();
+    }
+
+    /// Frame set 1 over two nights with 30 analysed lights whose zero points run 20.00 .. 20.29 (the nearest-rank
+    /// reference of the rig is 20.26, so the 20.00 frame lost 0.26 mag), one light with no analysis and one dark.
+    /// Returns the ids `(thirty lights, the unanalysed light, the dark)`.
+    fn seed_set_with_a_reference(conn: &Connection, catalog: &str) -> (Vec<i64>, i64, i64) {
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M 31')", []).unwrap();
+        let mut sessions = Vec::new();
+        for night in 1..=2 {
+            conn.execute(
+                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) VALUES (1, ?1, ?1)",
+                [format!("2026-03-0{night}T20:00:00Z")],
+            )
+            .unwrap();
+            let night_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'CamA')", [night_id]).unwrap();
+            sessions.push(conn.last_insert_rowid());
+        }
+        let mut next = 1i64;
+        let mut add = |imagetyp: &str, night: usize| -> i64 {
+            let id = next;
+            next += 1;
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2026-03-01T00:00:00Z', 'FITS')",
+                params![id, format!("/t/{id}.fits"), format!("{id}.fits")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master, instrume, telescop, focallen, gain, xbinning,
+                                     filter, date_obs)
+                 VALUES (?1, ?1, ?2, 0, 'CamA', 'Scope', 540.0, 56.0, 1, 'L', ?3)",
+                params![id, imagetyp, format!("2026-03-0{}T21:{:02}:00Z", night + 1, id % 60)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                [sessions[night], id],
+            )
+            .unwrap();
+            id
+        };
+        let mut lights = Vec::new();
+        for i in 0..30usize {
+            let id = add("Light", i % 2);
+            seed_analysis(conn, id, 20.0 + 0.01 * i as f64, catalog);
+            lights.push(id);
+        }
+        let unanalysed = add("Light", 0);
+        let dark = add("Dark", 0);
+        (lights, unanalysed, dark)
+    }
+
+    fn rows_by_frame_id(detail: &crate::models::FrameSetDetail) -> std::collections::HashMap<i64, crate::models::SessionFrameRow> {
+        detail
+            .nights
+            .iter()
+            .flat_map(|n| n.sessions.iter())
+            .flat_map(|s| s.frames.iter().cloned())
+            .map(|r| (r.frame.as_ref().and_then(|f| f.id).expect("a frame id"), r))
+            .collect()
+    }
+
+    #[test]
+    fn frame_set_detail_carries_each_lights_transparency() {
+        let (tmp, ctx) = test_ctx();
+        let catalog = install_fake_catalogue(&tmp);
+        let (lights, unanalysed, dark) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_set_with_a_reference(&conn, &catalog)
+        };
+        let detail = get_frame_set_detail(&ctx, 1).unwrap();
+        let rows = rows_by_frame_id(&detail);
+        // The hazy light (zero point 20.00) lost the difference to the reference 20.26.
+        let hazy = &rows[&lights[0]].transparency;
+        assert!((hazy.loss_mag.expect("a loss") - 0.26).abs() < 1e-9, "{hazy:?}");
+        assert_eq!(hazy.reason, None);
+        assert_eq!(hazy.zero_point, Some(20.0));
+        // A light at the reference lost nothing.
+        assert!(rows[&lights[26]].transparency.loss_mag.expect("a loss").abs() < 1e-9);
+        // A light with no analysis says why.
+        let t = &rows[&unanalysed].transparency;
+        assert_eq!((t.loss_mag, t.reason.as_deref()), (None, Some("not analysed yet")));
+        // A dark is no light: it keeps the unmeasured value, and the read did not ask for it.
+        assert_eq!(rows[&dark].transparency, crate::models::Transparency::unmeasured());
+        // The wire name.
+        let wire = serde_json::to_value(&rows[&lights[0]]).unwrap();
+        assert!(wire["transparency"]["lossMag"].is_number(), "{wire}");
+    }
+
+    #[test]
+    fn frame_set_detail_survives_a_transparency_failure() {
+        let (tmp, ctx) = test_ctx();
+        let catalog = install_fake_catalogue(&tmp);
+        let lights = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let seeded = seed_set_with_a_reference(&conn, &catalog);
+            // The read needs the analysis table: without it the transparency read fails.
+            conn.execute("DROP TABLE frame_analysis", []).unwrap();
+            seeded.0
+        };
+        let detail = get_frame_set_detail(&ctx, 1).expect("the detail never fails over a display field");
+        let rows = rows_by_frame_id(&detail);
+        assert_eq!(rows.len(), 32, "every file is still listed");
+        for id in &lights {
+            let t = &rows[id].transparency;
+            assert_eq!(t.loss_mag, None);
+            assert_eq!(t.reason.as_deref(), Some("transparency could not be read"));
+        }
     }
 }

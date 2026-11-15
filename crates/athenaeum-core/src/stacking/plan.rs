@@ -347,6 +347,9 @@ pub struct PlanProjectFrame {
     pub on_disk: bool,
     // Why the frame is not stacked here; `None` when it is.
     pub reason: Option<String>,
+    // The transparency loss (mag) its manifest published (wave 6.5); `None` when the manifest has none. Display
+    // only: it enters no hash, group key or weight.
+    pub transparency_loss: Option<f64>,
 }
 
 /// What a stacking run would do for a frame set right now: its groups, the
@@ -3148,6 +3151,7 @@ fn project_inputs(
             // The record's flag (landed on this device per the catalog), not a disk check: a landed file
             // gone since reads `true` here and names itself in `reason`.
             on_disk: f.not_stackable.is_none(),
+            transparency_loss: f.meta.as_ref().and_then(|m| m.transparency_loss),
             reason: f.not_stackable.clone().or_else(|| {
                 f.handle
                     .and_then(|h| probe.unsupported_why.get(&h))
@@ -9991,6 +9995,95 @@ mod tests {
         }
         assert!(plan.masters_to_build.is_empty());
         assert_eq!(plan.readiness.total, 0);
+    }
+
+    /// Wave 6.5: a project frame's manifest `meta.transparencyLoss` is stamped into the stored manifest of the
+    /// frames named in `losses`, the way the exchange would have left it.
+    fn publish_losses(conn: &rusqlite::Connection, losses: &[(&str, f64)]) {
+        for (uuid, loss) in losses {
+            let changed = conn
+                .execute(
+                    "UPDATE project_frames_local
+                     SET manifest_json = json_set(manifest_json, '$.meta.transparencyLoss', ?1)
+                     WHERE project_id = 'p1' AND frame_uuid = ?2",
+                    rusqlite::params![loss, uuid],
+                )
+                .unwrap();
+            assert_eq!(changed, 1, "no manifest row for {uuid}");
+        }
+    }
+
+    /// Wave 6.5: the plan's Frames row carries the loss its manifest published, `None` when the manifest has none.
+    #[test]
+    fn a_project_plan_frame_carries_the_published_loss() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        publish_losses(&f.conn, &[("r1", 0.31), ("g3", 0.12)]);
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            Some(with_folders(&working, &output)),
+        )
+        .unwrap();
+        let loss = |uuid: &str| {
+            plan.project_frames
+                .iter()
+                .find(|r| r.frame_uuid == uuid)
+                .unwrap_or_else(|| panic!("no plan row for {uuid}"))
+                .transparency_loss
+        };
+        assert_eq!(loss("r1"), Some(0.31));
+        // A frame not stackable here still shows what its manifest said.
+        assert_eq!(loss("g3"), Some(0.12));
+        assert_eq!(loss("r2"), None);
+        assert_eq!(loss("o1"), None);
+        let wire = serde_json::to_value(&plan.project_frames[0]).unwrap();
+        assert!(wire.get("transparencyLoss").is_some(), "camelCase on the wire: {wire}");
+    }
+
+    /// Wave 6.5: the loss is display only. The plan of a seeded project is built with no frame carrying the key and
+    /// again with every frame carrying one; compared: `config_hash`, `stale_stages`, every group in full (key,
+    /// member handles, counts, the cached counts the stage hashes decide), the blockers and the reference.
+    #[test]
+    fn the_plan_hashes_do_not_see_the_transparency() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let build = || {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                Some(with_folders(&working, &output)),
+            )
+            .unwrap()
+        };
+        let without = build();
+        assert!(without.project_frames.iter().all(|r| r.transparency_loss.is_none()));
+        publish_losses(
+            &f.conn,
+            &[("r1", 0.9), ("r2", 0.0), ("r3", 0.31), ("g1", 0.5), ("g2", 0.7), ("g3", 1.4), ("o1", 0.2), ("x1", 0.1)],
+        );
+        let with = build();
+        assert!(with.project_frames.iter().any(|r| r.transparency_loss == Some(0.9)));
+        assert_eq!(with.config_hash, without.config_hash);
+        assert_eq!(with.stale_stages, without.stale_stages);
+        assert_eq!(
+            serde_json::to_value(&with.groups).unwrap(),
+            serde_json::to_value(&without.groups).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&with.blockers).unwrap(),
+            serde_json::to_value(&without.blockers).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&with.reference).unwrap(),
+            serde_json::to_value(&without.reference).unwrap()
+        );
+        assert_eq!(with.excluded_frame_ids, without.excluded_frame_ids);
+        assert_eq!(with.included_count, without.included_count);
     }
 
     /// Spec §6.3: a confirmed grid lifts the blocker; frames it leaves

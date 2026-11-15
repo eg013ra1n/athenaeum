@@ -175,7 +175,9 @@ export type ImagingNight = { id: number | null, frames_set_id: number, start_tim
 
 export type Session = { id: number | null, imaging_night_id: number, instrume: string, frame_count: number, total_exp_time: number | null, created_at: string | null, uuid: string | null, updated_at: string | null, };
 
-export type SessionWithFrames = { session: Session, frames: Array<FileWithFrame>, };
+export type SessionFrameRow = { file: File, frame: Frame | null, transparency: Transparency, };
+
+export type SessionWithFrames = { session: Session, frames: Array<SessionFrameRow>, };
 
 export type ImagingNightWithSessions = { imaging_night: ImagingNight, sessions: Array<SessionWithFrames>, };
 
