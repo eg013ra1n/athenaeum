@@ -702,11 +702,12 @@ mod tests {
                     ],
                 )
                 .unwrap();
-            if s.analysed {
-                crate::db::analysis::upsert_frame_analysis(&self.conn, &analysis(id, s)).unwrap();
-            }
+            // The solve first: storing a solve clears the frame's zero point, and the analysis row carries it.
             if s.solved {
                 insert_plate_solve(&self.conn, &solve(id)).unwrap();
+            }
+            if s.analysed {
+                crate::db::analysis::upsert_frame_analysis(&self.conn, &analysis(id, s)).unwrap();
             }
             if let Some(set) = s.set {
                 let session = self.session(set, s.night);
@@ -1007,6 +1008,28 @@ mod tests {
         let old = w.seed(&Spec { zp_version: Some(ZP_VERSION + 1), ..Spec::default() });
         let got = ask(&w, Some("A"), &[old]);
         assert_eq!(got[&old].zero_point, None);
+    }
+
+    #[test]
+    fn a_stale_analysis_does_not_feed_a_reference() {
+        let mut w = World::new();
+        // 29 current frames are one short of a reference; ten frames of an older star measurement, each with a bright
+        // stored zero point, would complete it (and raise it) if they counted.
+        let ids = w.series(&Spec::default(), 2, &ramp(29));
+        let stale = Spec { measure_version: Some(MEASURE_VERSION - 1), ..Spec::default() };
+        let stale_ids = w.series(&stale, 2, &[25.0; 10]);
+        let got = ask(&w, Some("A"), &ids);
+        assert_eq!(got[&ids[0]].loss_mag, None);
+        assert_eq!(got[&ids[0]].reason.as_deref(), Some("no clear-sky reference yet, 29 of 30 frames"));
+        // The stale frames neither show their own zero point nor a loss.
+        let own = ask(&w, Some("A"), &stale_ids);
+        for id in &stale_ids {
+            assert_eq!((own[id].zero_point, own[id].loss_mag), (None, None));
+        }
+        // One more current frame completes the reference, and it is the current frames' ninetieth percentile.
+        let more = w.seed(&Spec { zp: Some(20.29), ..Spec::default() });
+        let got = ask(&w, Some("A"), &[ids[0], more]);
+        assert!((loss(&got[&ids[0]]) - 0.26).abs() < 1e-9, "the stale 25.0 values did not raise the reference");
     }
 
     #[test]

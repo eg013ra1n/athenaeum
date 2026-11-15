@@ -690,7 +690,7 @@ fn solve_and_persist(
     // A new solve moves the WCS, so the zero point of every frame just solved is recomputed whatever its `zp_version`
     // says. Only when the solves are really stored; the trigger never fails the batch.
     if error.is_none() {
-        crate::api::analysis::run_zero_point_trigger(ctx, &persisted, false);
+        crate::api::analysis::zero_points_after_solve(ctx, &persisted);
     }
 
     BatchEnd {

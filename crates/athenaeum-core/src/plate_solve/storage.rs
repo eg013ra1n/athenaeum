@@ -165,6 +165,10 @@ pub fn insert_plate_solve(conn: &Connection, record: &PlateSolveRecord) -> Resul
     .context("Failed to insert plate solve record")?;
 
     let id = conn.last_insert_rowid();
+    // A zero point never outlives its solve: the new WCS moves the stars it was matched on. The solve trigger refills
+    // it. On the caller's connection, so it joins the caller's transaction.
+    crate::db::analysis::clear_zero_point(conn, record.frame_id)
+        .context("Failed to clear the zero point of the re-solved frame")?;
     Ok(id)
 }
 
@@ -223,10 +227,12 @@ pub fn get_plate_solve(conn: &Connection, frame_id: i64) -> Result<Option<PlateS
     }
 }
 
-/// Delete plate solve result for a frame.
+/// Delete plate solve result for a frame. The frame's zero point goes with it (see [`insert_plate_solve`]).
 pub fn delete_plate_solve(conn: &Connection, frame_id: i64) -> Result<()> {
     conn.execute("DELETE FROM plate_solves WHERE frame_id = ?1", [frame_id])
         .context("Failed to delete plate solve record")?;
+    crate::db::analysis::clear_zero_point(conn, frame_id)
+        .context("Failed to clear the zero point of the frame whose solve was deleted")?;
     Ok(())
 }
 

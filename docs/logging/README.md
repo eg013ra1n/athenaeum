@@ -59,7 +59,8 @@ inactive.
 
 Operation kinds and their id fields: `scan` (`root_id`), `archive_op`
 (`operation_id`), `file_op` (`operation_id`), `solve` (`frame_id`), `export`
-(`frame_set_id`), `registration` (`frame_set_id`).
+(`frame_set_id`), `registration` (`frame_set_id`), `zero_point_backfill`
+(`catalog`, the installed star catalogue's identity).
 
 ## Querying with log-mcp
 

@@ -49,18 +49,23 @@ pub const ANALYZE_THREAD_CAP: usize = 16;
 #[cfg(feature = "solver")]
 const ZP_CHUNK: usize = crate::analysis::zero_point::BACKFILL_CHUNK;
 
-/// The trigger's body: refresh `frame_ids` (`only_stale`: those whose zero point is not current; otherwise all of them,
-/// the way a new solve needs) and never fail. A failure is logged at `warn` — each frame's own refresh failure by
-/// `zero_point` with the frame id, a failure of the pass as a whole here — and swallowed: the analysis or solve the
-/// trigger follows has already succeeded and must still return `Ok`.
+/// Which frames a trigger refreshes: the two modes are fixed by the named entry points below, never a bare flag.
 #[cfg(feature = "solver")]
-pub(crate) fn zero_point_trigger_with<F>(
-    conn: &rusqlite::Connection,
-    catalog: &str,
-    frame_ids: &[i64],
-    only_stale: bool,
-    cone: F,
-) where
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggerMode {
+    /// Only the frames whose zero point is not current (after an analysis save: the new row carries none).
+    NotCurrent,
+    /// Every frame, current or not (after a solve is stored: the WCS may have moved).
+    All,
+}
+
+/// The trigger's body: refresh `frame_ids` per `mode` and never fail, never panic. An error is logged at `warn` (each
+/// frame's own refresh failure by `zero_point` with the frame id, a failure of the pass as a whole here) and so is a
+/// panic out of the catalogue read or the measurement, caught here: the analysis or solve the trigger follows has
+/// already succeeded and must still return normally.
+#[cfg(feature = "solver")]
+fn zero_point_trigger_with<F>(conn: &rusqlite::Connection, catalog: &str, frame_ids: &[i64], mode: TriggerMode, cone: F)
+where
     F: FnMut(
         &solvemyastro::WcsSolution,
         usize,
@@ -70,21 +75,63 @@ pub(crate) fn zero_point_trigger_with<F>(
     ) -> anyhow::Result<Vec<solvemyastro::CatalogStar>>,
 {
     use crate::analysis::zero_point::{ensure_zero_points_with, recompute_zero_points_with};
-    let done = if only_stale {
-        ensure_zero_points_with(conn, catalog, frame_ids, cone)
-    } else {
-        recompute_zero_points_with(conn, catalog, frame_ids, cone)
-    };
-    if let Err(e) = done {
-        tracing::warn!(frames = frame_ids.len(), error = %format!("{e:#}"), "zero point trigger failed");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
+        TriggerMode::NotCurrent => ensure_zero_points_with(conn, catalog, frame_ids, cone),
+        TriggerMode::All => recompute_zero_points_with(conn, catalog, frame_ids, cone),
+    }));
+    match outcome {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(frames = frame_ids.len(), error = %format!("{e:#}"), "zero point trigger failed");
+        }
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|m| (*m).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic with no message".to_owned());
+            tracing::warn!(frames = frame_ids.len(), error = %what, "zero point trigger panicked");
+        }
     }
 }
 
-/// Refresh the zero points of `frame_ids` against the installed star catalogue: after an analysis save
-/// (`only_stale = true`: the new row carries none) and after a solve is stored (`only_stale = false`: the WCS may have
-/// moved). Without an installed catalogue it does nothing (`zero_point_catalog` says so once, at `debug`). Never fails.
+/// After an analysis is saved: refresh the zero point of the frames among `frame_ids` that do not have a current one,
+/// on `conn` against `catalog`. The testable body of [`zero_points_after_analysis`]; never fails, never panics.
 #[cfg(feature = "solver")]
-pub(crate) fn run_zero_point_trigger(ctx: &ServiceContext, frame_ids: &[i64], only_stale: bool) {
+pub(crate) fn zero_points_after_analysis_with<F>(conn: &rusqlite::Connection, catalog: &str, frame_ids: &[i64], cone: F)
+where
+    F: FnMut(
+        &solvemyastro::WcsSolution,
+        usize,
+        usize,
+        f64,
+        f64,
+    ) -> anyhow::Result<Vec<solvemyastro::CatalogStar>>,
+{
+    zero_point_trigger_with(conn, catalog, frame_ids, TriggerMode::NotCurrent, cone);
+}
+
+/// After a solve is stored: recompute the zero point of every one of `frame_ids`, whatever its `zp_version` says (the
+/// WCS may have moved). The testable body of [`zero_points_after_solve`]; never fails, never panics.
+#[cfg(feature = "solver")]
+pub(crate) fn zero_points_after_solve_with<F>(conn: &rusqlite::Connection, catalog: &str, frame_ids: &[i64], cone: F)
+where
+    F: FnMut(
+        &solvemyastro::WcsSolution,
+        usize,
+        usize,
+        f64,
+        f64,
+    ) -> anyhow::Result<Vec<solvemyastro::CatalogStar>>,
+{
+    zero_point_trigger_with(conn, catalog, frame_ids, TriggerMode::All, cone);
+}
+
+/// Refresh the zero points of `frame_ids` against the installed star catalogue, in chunks of one database checkout.
+/// Without an installed catalogue it does nothing (`zero_point_catalog` says so once, at `debug`). A pool that cannot
+/// hand out a connection is a `warn`, not a panic. Never fails.
+#[cfg(feature = "solver")]
+fn run_zero_point_trigger(ctx: &ServiceContext, frame_ids: &[i64], mode: TriggerMode) {
     if frame_ids.is_empty() {
         return;
     }
@@ -95,21 +142,41 @@ pub(crate) fn run_zero_point_trigger(ctx: &ServiceContext, frame_ids: &[i64], on
         return;
     };
     for chunk in frame_ids.chunks(ZP_CHUNK) {
-        let conn = database.conn();
+        let conn = match database.try_conn() {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(frames = chunk.len(), error = %e, "zero point trigger skipped: no database connection");
+                return;
+            }
+        };
         zero_point_trigger_with(
             &conn,
             &catalog.identity,
             chunk,
-            only_stale,
+            mode,
             crate::analysis::zero_point::catalog_cone(&catalog.layers),
         );
     }
 }
 
+/// The trigger after an analysis save: only the frames whose zero point is not current (the new row carries none).
+/// Never fails, never panics.
+#[cfg(feature = "solver")]
+pub(crate) fn zero_points_after_analysis(ctx: &ServiceContext, frame_ids: &[i64]) {
+    run_zero_point_trigger(ctx, frame_ids, TriggerMode::NotCurrent);
+}
+
+/// The trigger after a solve is stored: every one of `frame_ids`, current or not. Never fails, never panics.
+#[cfg(feature = "solver")]
+pub(crate) fn zero_points_after_solve(ctx: &ServiceContext, frame_ids: &[i64]) {
+    run_zero_point_trigger(ctx, frame_ids, TriggerMode::All);
+}
+
 /// Measure the zero point of every frame that has a current analysis and a solve and no current zero point, in chunks of
 /// 200, and return how many it wrote. Existing catalogues come to hold zero points through this: a frame analysed before
 /// the feature existed, or against another catalogue, would otherwise show an empty column until re-analysed, and no
-/// read path may compute them. Logs one summary `info` line; with no catalogue installed it returns 0 at `debug`.
+/// read path may compute them. A long-running operation: it runs in a `zero_point_backfill` span (id field `catalog`, the
+/// installed catalogue's identity) and logs one summary `info` line; with no catalogue installed it returns 0 at `debug`.
 #[cfg(feature = "solver")]
 pub fn backfill_zero_points(ctx: &ServiceContext) -> Result<usize, ApiError> {
     use crate::analysis::zero_point::{catalog_cone, ensure_zero_points_with, stale_zero_point_frames};
@@ -122,6 +189,8 @@ pub fn backfill_zero_points(ctx: &ServiceContext) -> Result<usize, ApiError> {
         tracing::debug!("zero point backfill skipped: no star catalogue installed");
         return Ok(0);
     };
+    let span = tracing::info_span!("zero_point_backfill", catalog = %catalog.identity);
+    let _guard = span.enter();
     let (mut after, mut seen, mut stored) = (0_i64, 0_usize, 0_usize);
     loop {
         let conn = database.conn();
@@ -135,8 +204,8 @@ pub fn backfill_zero_points(ctx: &ServiceContext) -> Result<usize, ApiError> {
     }
     tracing::info!(
         frames = seen,
-        measured = stored,
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        zp_measured = stored,
+        duration_ms = started.elapsed().as_millis() as u64,
         "zero point backfill done"
     );
     Ok(stored)
@@ -540,7 +609,7 @@ pub fn analyze_frame_set(
     #[cfg(feature = "solver")]
     {
         let ids: Vec<i64> = analyses.iter().map(|a| a.frame_id).collect();
-        run_zero_point_trigger(ctx, &ids, true);
+        zero_points_after_analysis(ctx, &ids);
     }
 
     // Release the compute-queue slot before emitting the completion event
@@ -715,7 +784,7 @@ pub async fn get_frame_star_metrics(
     // The zero point of the frame just analysed; it never fails the call. The response carries what was stored.
     #[cfg(feature = "solver")]
     {
-        tokio::task::block_in_place(|| run_zero_point_trigger(ctx, &[frame_id], true));
+        tokio::task::block_in_place(|| zero_points_after_analysis(ctx, &[frame_id]));
         match db(ctx).and_then(|d| {
             db_analysis::get_frame_analysis(&d.conn(), frame_id).map_err(|e| ApiError::Internal(e.to_string()))
         }) {

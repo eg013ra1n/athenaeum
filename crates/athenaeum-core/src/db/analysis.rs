@@ -52,30 +52,51 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
 
 /// Store the outcome of a zero-point judgement on a frame's analysis row: the value and its figures (all NULL for a
 /// refusal or a colour camera), `zp_version = ZP_VERSION` and the catalogue identity it was judged against, so the
-/// frame is not retried until either changes. An UPDATE, never an upsert: a frame without an analysis row is an error.
+/// frame is not retried until either changes.
+///
+/// Compare-and-set: the write lands only on the analysis row `analysis_id` (the one the judgement read) and, when
+/// `solve_id` is `Some`, only while the frame's `plate_solves` row is still `solve_id`. A re-analysis (`INSERT OR
+/// REPLACE` gives the row a new id) or a new or deleted solve in the meantime makes the judgement stale, and nothing is
+/// written. Returns whether a row was written; `false` is not an error, the frame is simply judged again by whatever
+/// superseded this judgement.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub fn set_zero_point(
     conn: &Connection,
     frame_id: i64,
+    analysis_id: i64,
+    solve_id: Option<i64>,
     value: Option<&crate::analysis::zero_point::ZeroPoint>,
     catalog: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let n = conn.execute(
         "UPDATE frame_analysis
-         SET zero_point = ?2, zp_stars = ?3, zp_sigma = ?4, zp_version = ?5, zp_catalog = ?6
-         WHERE frame_id = ?1",
+         SET zero_point = ?3, zp_stars = ?4, zp_sigma = ?5, zp_version = ?6, zp_catalog = ?7
+         WHERE id = ?1 AND frame_id = ?2
+           AND (?8 IS NULL OR EXISTS (SELECT 1 FROM plate_solves WHERE frame_id = ?2 AND id = ?8))",
         params![
+            analysis_id,
             frame_id,
             value.map(|v| v.zero_point),
             value.map(|v| i64::from(v.stars)),
             value.map(|v| v.sigma),
             crate::analysis::zero_point::ZP_VERSION,
             catalog,
+            solve_id,
         ],
     )?;
-    if n == 0 {
-        return Err(rusqlite::Error::StatementChangedRows(0));
-    }
+    Ok(n > 0)
+}
+
+/// Set all five `zp_*` columns of a frame's analysis row to NULL: a zero point never outlives the solve it was
+/// measured against. Plain SQL on the caller's connection, so it joins whatever transaction the caller holds; a frame
+/// without an analysis row is a no-op.
+pub fn clear_zero_point(conn: &Connection, frame_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE frame_analysis
+         SET zero_point = NULL, zp_stars = NULL, zp_sigma = NULL, zp_version = NULL, zp_catalog = NULL
+         WHERE frame_id = ?1",
+        [frame_id],
+    )?;
     Ok(())
 }
 
@@ -703,15 +724,37 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let (file_id, frame_id) = insert_frame(&conn, "/x/a.fits");
-        upsert_frame_analysis(&conn, &analysis(frame_id, file_id)).unwrap();
+        let analysis_id = upsert_frame_analysis(&conn, &analysis(frame_id, file_id)).unwrap();
         let z = ZeroPoint { zero_point: 21.3, stars: 87, sigma: 0.04 };
-        set_zero_point(&conn, frame_id, Some(&z), "A").unwrap();
+        assert!(set_zero_point(&conn, frame_id, analysis_id, None, Some(&z), "A").unwrap());
         let a = get_frame_analysis(&conn, frame_id).unwrap().unwrap();
         assert_eq!(zp_row(&a), (Some(21.3), Some(87), Some(0.04), Some(ZP_VERSION), Some("A".to_string())));
-        set_zero_point(&conn, frame_id, None, "B").unwrap();
+        assert!(set_zero_point(&conn, frame_id, analysis_id, None, None, "B").unwrap());
         let a = get_frame_analysis(&conn, frame_id).unwrap().unwrap();
         assert_eq!(zp_row(&a), (None, None, None, Some(ZP_VERSION), Some("B".to_string())));
-        // A frame with no analysis row is an error, never a silent no-op.
-        assert!(set_zero_point(&conn, frame_id + 1, None, "B").is_err());
+        // Another analysis id is a superseded judgement: nothing is written, and it is not an error.
+        assert!(!set_zero_point(&conn, frame_id, analysis_id + 100, None, Some(&z), "C").unwrap());
+        let a = get_frame_analysis(&conn, frame_id).unwrap().unwrap();
+        assert_eq!(zp_row(&a), (None, None, None, Some(ZP_VERSION), Some("B".to_string())));
+        // A solve id that is no longer the frame's solve is the same.
+        assert!(!set_zero_point(&conn, frame_id, analysis_id, Some(5), Some(&z), "C").unwrap());
+    }
+
+    #[test]
+    fn clear_zero_point_nulls_all_five_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (file_id, frame_id) = insert_frame(&conn, "/x/a.fits");
+        let mut a = analysis(frame_id, file_id);
+        a.zero_point = Some(21.3);
+        a.zp_stars = Some(87);
+        a.zp_sigma = Some(0.04);
+        a.zp_version = Some(1);
+        a.zp_catalog = Some("A".into());
+        upsert_frame_analysis(&conn, &a).unwrap();
+        clear_zero_point(&conn, frame_id).unwrap();
+        assert_eq!(zp_row(&get_frame_analysis(&conn, frame_id).unwrap().unwrap()), (None, None, None, None, None));
+        // No analysis row is a no-op.
+        clear_zero_point(&conn, frame_id + 1).unwrap();
     }
 }
