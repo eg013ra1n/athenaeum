@@ -18,8 +18,10 @@
 //! `--filter -` selects the frames without a filter (an OSC camera).
 //! `--<field>` is any `ZpParams` field in snake_case; the default is
 //! `ZpParams::default()`. A light whose file is missing, that lives in a zip
-//! or that has no stored solve is counted and named on stderr, never skipped
-//! silently.
+//! or that has no stored solve is named on stderr and written as a row with
+//! `refusal` = `missing_file`, `in_zip` or `no_solve` and no measurement; the
+//! verdict counts those rows apart and leaves them out of the coverage
+//! denominator.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -219,6 +221,9 @@ fn opt_i64(s: &str) -> Option<i64> {
 // The measure row
 // ---------------------------------------------------------------------------
 
+/// Refusal codes of a candidate light the probe did not measure at all.
+const UNMEASURED: [&str; 3] = ["no_solve", "in_zip", "missing_file"];
+
 const MEASURE_HEADER: &str = "frame_id\tfile_name\tobject\tfilter\tnight\tdate_obs\texptime\tstars_detected\tmedian_fwhm\tmatched\tkept\tzero_point\tsigma\tstd_error\tmedian_match_px\trefusal";
 
 #[derive(Debug, Clone, Default)]
@@ -288,6 +293,11 @@ impl MeasureRow {
     /// `date_obs` as seconds since the epoch.
     fn t_s(&self) -> Option<f64> {
         parse_time(&self.date_obs).map(|t| t.timestamp_millis() as f64 / 1000.0)
+    }
+
+    /// A row of a light the probe did not measure (no solve, in a zip, file missing).
+    fn is_unmeasured(&self) -> bool {
+        UNMEASURED.contains(&self.refusal.as_str())
     }
 
     fn set_key(&self) -> (String, String) {
@@ -405,17 +415,35 @@ fn stability(pairs: &[Pair]) -> Option<f64> {
     median(&mut d)
 }
 
-/// Least-squares slope (through the origin: the differences are symmetric) of
-/// `Δzero_point` on `ΔFWHM` over the pairs with `|ΔFWHM| >= 0.2 px`, and their
-/// count; `None` under 20 such pairs.
-fn seeing_slope(pairs: &[Pair]) -> Option<(f64, usize)> {
+/// The seeing slope of a pooled set of pairs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Seeing {
+    /// The judged slope: least squares of `Δzero_point` on `ΔFWHM` with an
+    /// intercept, `Σ(dx − x̄)(dy − ȳ) / Σ(dx − x̄)²` (mag/px).
+    slope: f64,
+    /// The same fit through the origin, printed for information, never judged.
+    through_origin: f64,
+    /// Pairs with `|ΔFWHM| >= 0.2 px` the fit used.
+    pairs: usize,
+}
+
+/// The seeing slope over the pairs with `|ΔFWHM| >= 0.2 px`; `None` under 20
+/// such pairs or when their ΔFWHM do not vary. Both differences are later
+/// minus earlier, so a pair's sign is kept, but a drift in zero point alone
+/// (a mean Δzero_point other than zero) is why the judged fit has an intercept.
+fn seeing_slope(pairs: &[Pair]) -> Option<Seeing> {
     let used: Vec<&Pair> = pairs.iter().filter(|p| p.dfwhm.abs() >= SEEING_MIN_DFWHM_PX).collect();
     if used.len() < SEEING_MIN_PAIRS {
         return None;
     }
-    let sxx: f64 = used.iter().map(|p| p.dfwhm * p.dfwhm).sum();
-    let sxy: f64 = used.iter().map(|p| p.dfwhm * p.dzp).sum();
-    (sxx > 0.0).then(|| (sxy / sxx, used.len()))
+    let n = used.len() as f64;
+    let mx = used.iter().map(|p| p.dfwhm).sum::<f64>() / n;
+    let my = used.iter().map(|p| p.dzp).sum::<f64>() / n;
+    let sxx: f64 = used.iter().map(|p| (p.dfwhm - mx).powi(2)).sum();
+    let sxy: f64 = used.iter().map(|p| (p.dfwhm - mx) * (p.dzp - my)).sum();
+    let sxx0: f64 = used.iter().map(|p| p.dfwhm * p.dfwhm).sum();
+    let sxy0: f64 = used.iter().map(|p| p.dfwhm * p.dzp).sum();
+    (sxx > 1e-12).then(|| Seeing { slope: sxy / sxx, through_origin: sxy0 / sxx0, pairs: used.len() })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -526,12 +554,35 @@ fn tag(o: Outcome) -> &'static str {
     }
 }
 
+/// The class line: FAIL wins over UNJUDGED, which wins over PASS.
+fn class_line(class: &str, bars: &[(&str, Outcome)]) -> String {
+    let names = |want: Outcome| {
+        bars.iter().filter(|(_, o)| *o == want).map(|(n, _)| *n).collect::<Vec<_>>().join(",")
+    };
+    if bars.iter().any(|(_, o)| *o == Outcome::Fail) {
+        format!("ZP PROBE {class}: FAIL({})", names(Outcome::Fail))
+    } else if bars.iter().any(|(_, o)| *o == Outcome::Unjudged) {
+        format!("ZP PROBE {class}: UNJUDGED({})", names(Outcome::Unjudged))
+    } else {
+        format!("ZP PROBE {class}: PASS")
+    }
+}
+
 /// The verdict text (at most 30 lines; the last is the class line).
 fn verdict_lines(
     class: &str,
-    rows: &[MeasureRow],
+    all_rows: &[MeasureRow],
     common: Option<&[CommonRow]>,
 ) -> Vec<String> {
+    // Lights the probe did not measure stay out of every bar; their counts ride
+    // on the coverage line.
+    let rows: Vec<MeasureRow> = all_rows.iter().filter(|r| !r.is_unmeasured()).cloned().collect();
+    let rows = rows.as_slice();
+    let unmeasured: Vec<usize> = UNMEASURED
+        .iter()
+        .map(|code| all_rows.iter().filter(|r| r.refusal == *code).count())
+        .collect();
+
     let mut sets: BTreeMap<(String, String), Vec<&MeasureRow>> = BTreeMap::new();
     for r in rows {
         sets.entry(r.set_key()).or_default().push(r);
@@ -543,9 +594,15 @@ fn verdict_lines(
     let cov = coverage(rows);
     let o = judge_max(cov.map(|c| COVERAGE_MIN - c), 0.0);
     lines.push(format!(
-        "coverage: {} (limit >= {COVERAGE_MIN:.2}) {}",
+        "coverage: {} (limit >= {COVERAGE_MIN:.2}) {}; not in the denominator: {} {}, {} {}, {} {}",
         show(cov, 3),
-        tag(o)
+        tag(o),
+        unmeasured[0],
+        UNMEASURED[0],
+        unmeasured[1],
+        UNMEASURED[1],
+        unmeasured[2],
+        UNMEASURED[2],
     ));
     bars.push(("coverage", o));
 
@@ -559,8 +616,10 @@ fn verdict_lines(
     ));
     bars.push(("geometry", o));
 
-    // stability and seeing on every set's clear night
+    // Stability on every set's clear night; a set it cannot judge says so.
+    // The seeing bar pools the pairs of every set that has a clear night.
     let mut set_lines = Vec::new();
+    let mut not_judged = Vec::new();
     let mut all_pairs: Vec<Pair> = Vec::new();
     let mut set_stabilities: Vec<f64> = Vec::new();
     let mut set_zps: Vec<Vec<f64>> = Vec::new();
@@ -568,14 +627,23 @@ fn verdict_lines(
         let valid: Vec<f64> = members.iter().filter_map(|r| r.zero_point).collect();
         let night = clear_night(members);
         let (night_text, stab) = match &night {
-            None => ("none (no night with 20 frames)".to_string(), None),
+            None => {
+                not_judged.push(format!(
+                    "stability {object}/{filter}: not judged (no night with {CLEAR_NIGHT_MIN_FRAMES} frames)"
+                ));
+                (format!("none (no night with {CLEAR_NIGHT_MIN_FRAMES} frames)"), None)
+            }
             Some(n) => {
                 let in_night: Vec<&MeasureRow> =
                     members.iter().copied().filter(|r| &r.night == n).collect();
                 let pairs = consecutive_pairs(&in_night);
+                all_pairs.extend(pairs.iter().copied());
                 let s = (pairs.len() >= STABILITY_MIN_PAIRS).then(|| stability(&pairs)).flatten();
-                if s.is_some() {
-                    all_pairs.extend(pairs.iter().copied());
+                if s.is_none() {
+                    not_judged.push(format!(
+                        "stability {object}/{filter}: not judged (clear night {n} has {} consecutive pairs, fewer than {STABILITY_MIN_PAIRS})",
+                        pairs.len()
+                    ));
                 }
                 (format!("{n} ({} frames, {} pairs)", in_night.len(), pairs.len()), s)
             }
@@ -596,19 +664,23 @@ fn verdict_lines(
     });
     let o = judge_max(worst_stab, STABILITY_MAX_MAG);
     lines.push(format!(
-        "stability: {} mag worst of {} judged sets (limit <= {STABILITY_MAX_MAG:.2}) {}",
+        "stability: {} mag worst (limit <= {STABILITY_MAX_MAG:.2}) {}, judged {} of {} sets",
         show(worst_stab, 4),
+        tag(o),
         set_stabilities.len(),
-        tag(o)
+        sets.len()
     ));
     bars.push(("stability", o));
 
-    let slope = seeing_slope(&all_pairs);
-    let o = judge_max(slope.map(|(s, _)| s.abs()), SEEING_MAX_SLOPE);
-    lines.push(match slope {
-        Some((s, n)) => format!(
-            "seeing: slope {s:.4} mag/px over {n} pairs (limit |slope| <= {SEEING_MAX_SLOPE:.2}) {}",
-            tag(o)
+    let seeing = seeing_slope(&all_pairs);
+    let o = judge_max(seeing.map(|s| s.slope.abs()), SEEING_MAX_SLOPE);
+    lines.push(match seeing {
+        Some(s) => format!(
+            "seeing: slope {:.4} mag/px over {} pairs (limit |slope| <= {SEEING_MAX_SLOPE:.2}) {}; through-origin slope {:.4} (information)",
+            s.slope,
+            s.pairs,
+            tag(o),
+            s.through_origin
         ),
         None => format!(
             "seeing: fewer than {SEEING_MIN_PAIRS} pairs with |dFWHM| >= {SEEING_MIN_DFWHM_PX} px, {}",
@@ -643,20 +715,19 @@ fn verdict_lines(
         }
     });
 
-    // The final line takes one line and the set lines fill what is left.
+    // The class line takes one line and the set lines fill what is left; the
+    // sets no bar could judge come first, and a cut says how many it dropped.
+    let mut set_lines: Vec<String> = not_judged.into_iter().chain(set_lines).collect();
     let room = VERDICT_MAX_LINES.saturating_sub(lines.len() + 1);
-    lines.extend(set_lines.into_iter().take(room));
-
-    let names = |want: Outcome| {
-        bars.iter().filter(|(_, o)| *o == want).map(|(n, _)| *n).collect::<Vec<_>>().join(",")
-    };
-    lines.push(if bars.iter().any(|(_, o)| *o == Outcome::Fail) {
-        format!("ZP PROBE {class}: FAIL({})", names(Outcome::Fail))
-    } else if bars.iter().any(|(_, o)| *o == Outcome::Unjudged) {
-        format!("ZP PROBE {class}: UNJUDGED({})", names(Outcome::Unjudged))
-    } else {
-        format!("ZP PROBE {class}: PASS")
-    });
+    if set_lines.len() > room {
+        let keep = room.saturating_sub(1);
+        let cut = set_lines.len() - keep;
+        set_lines.truncate(keep);
+        set_lines.push(format!("… {cut} more set lines not shown"));
+        set_lines.truncate(room);
+    }
+    lines.extend(set_lines);
+    lines.push(class_line(class, &bars));
     lines
 }
 
@@ -750,11 +821,9 @@ fn open_rig(conn: &Connection, app_data: &str, params: ZpParams) -> Result<Rig> 
     Ok(Rig { layers, config, config_hash, pool, params })
 }
 
-/// One frame, end to end: the stored solve, an in-memory analysis of its file,
-/// the catalogue cone and the measurement. A failure is the row's `refusal`,
-/// logged on stderr; it never stops the run.
-fn measure_candidate(conn: &Connection, rig: &Rig, c: &Candidate) -> (MeasureRow, Option<ZpMeasurement>) {
-    let mut row = MeasureRow {
+/// The row of a candidate with no measurement yet.
+fn base_row(c: &Candidate) -> MeasureRow {
+    MeasureRow {
         frame_id: Some(c.frame_id),
         file_name: Path::new(&c.path)
             .file_name()
@@ -766,7 +835,20 @@ fn measure_candidate(conn: &Connection, rig: &Rig, c: &Candidate) -> (MeasureRow
         date_obs: c.date_obs.clone(),
         exptime: c.exptime,
         ..MeasureRow::default()
-    };
+    }
+}
+
+/// The row of a light that was not measured: `code` (one of `UNMEASURED`) in
+/// `refusal`, every measurement column empty.
+fn unmeasured_row(c: &Candidate, code: &str) -> MeasureRow {
+    MeasureRow { refusal: code.to_string(), ..base_row(c) }
+}
+
+/// One frame, end to end: the stored solve, an in-memory analysis of its file,
+/// the catalogue cone and the measurement. A failure is the row's `refusal`,
+/// logged on stderr; it never stops the run.
+fn measure_candidate(conn: &Connection, rig: &Rig, c: &Candidate) -> (MeasureRow, Option<ZpMeasurement>) {
+    let mut row = base_row(c);
     let fail = |row: &mut MeasureRow, code: &str, detail: &dyn std::fmt::Display| {
         eprintln!("zp_probe: frame {} refused {code}: {detail}", c.frame_id);
         row.refusal = code.to_string();
@@ -891,16 +973,19 @@ fn cmd_measure(mut args: Args) -> Result<()> {
         if c.in_zip {
             in_zip += 1;
             eprintln!("zp_probe: frame {} lives in a zip, not measured: {}", c.frame_id, c.path);
+            writeln!(w, "{}", unmeasured_row(c, "in_zip").to_tsv())?;
             continue;
         }
         if !Path::new(&c.path).is_file() {
             missing += 1;
             eprintln!("zp_probe: frame {} file missing, not measured: {}", c.frame_id, c.path);
+            writeln!(w, "{}", unmeasured_row(c, "missing_file").to_tsv())?;
             continue;
         }
         if !c.has_solve {
             no_solve += 1;
             eprintln!("zp_probe: frame {} has no stored solve, not measured: {}", c.frame_id, c.path);
+            writeln!(w, "{}", unmeasured_row(c, "no_solve").to_tsv())?;
             continue;
         }
         let (row, _) = measure_candidate(&conn, &rig, c);
@@ -1224,12 +1309,19 @@ mod tests {
 
     #[test]
     fn a_slope_needs_twenty_pairs() {
-        // Every pair carries dFWHM 0.5 px and dzp 0.01: slope 0.02 mag/px.
-        let mk = |n: usize| vec![Pair { dzp: 0.01, dfwhm: 0.5 }; n];
+        // dzp = 0.02·dFWHM + 0.005: slope 0.02 mag/px whatever the intercept.
+        let steps = [0.3, -0.4, 0.5, -0.6];
+        let mk = |n: usize| {
+            (0..n)
+                .map(|i| Pair { dfwhm: steps[i % 4], dzp: 0.02 * steps[i % 4] + 0.005 })
+                .collect::<Vec<_>>()
+        };
         assert_eq!(seeing_slope(&mk(19)), None);
-        let (slope, n) = seeing_slope(&mk(20)).unwrap();
-        assert_eq!(n, 20);
-        assert!((slope - 0.02).abs() < 1e-12, "{slope}");
+        let s = seeing_slope(&mk(20)).unwrap();
+        assert_eq!(s.pairs, 20);
+        assert!((s.slope - 0.02).abs() < 1e-12, "{}", s.slope);
+        // The fit through the origin is pulled by the intercept: it is not the judged one.
+        assert!((s.through_origin - 0.02).abs() > 1e-4, "{}", s.through_origin);
         // Pairs under 0.2 px do not count toward the 20.
         let mut mixed = mk(19);
         mixed.extend(vec![Pair { dzp: 0.5, dfwhm: 0.1 }; 30]);
@@ -1254,25 +1346,97 @@ mod tests {
     }
 
     #[test]
+    fn the_ninetieth_percentile_is_not_the_maximum() {
+        let set = |n: usize| (0..n).map(|i| 21.0 + i as f64 * 1e-4).collect::<Vec<f64>>();
+        // One set carries a single frame 0.5 mag above the rest.
+        let mut outlier = set(29);
+        outlier.push(21.5);
+        match cross_target(&[set(30), set(30), outlier]) {
+            CrossTarget::Judged { spread, sets } => {
+                assert_eq!(sets, 3);
+                assert!(spread < 1e-6, "the outlier moved the spread to {spread}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_slope_keeps_its_sign_through_the_pairing() {
+        // FWHM falls (steps -0.3 and -0.5 alternately) while the zero point
+        // rises by 0.02 mag per px of FWHM lost: dzp / dFWHM = -0.02.
+        let rows: Vec<MeasureRow> = (0..25)
+            .map(|i| {
+                let fwhm = 12.0 - 0.4 * i as f64 + 0.1 * (i % 2) as f64;
+                row("n", T0 + i * 180, Some(21.0 + 0.02 * (12.0 - fwhm)), fwhm, 100)
+            })
+            .collect();
+        let pairs = consecutive_pairs(&refs(&rows));
+        assert_eq!(pairs.len(), 24);
+        let s = seeing_slope(&pairs).unwrap();
+        assert_eq!(s.pairs, 24);
+        assert!(s.slope < 0.0, "{}", s.slope);
+        assert!((s.slope + 0.02).abs() < 1e-9, "{}", s.slope);
+    }
+
+    #[test]
+    fn a_failed_bar_wins_over_an_unjudged_one() {
+        let bars = [
+            ("coverage", Outcome::Pass),
+            ("geometry", Outcome::Fail),
+            ("stability", Outcome::Unjudged),
+        ];
+        assert_eq!(class_line("broadband", &bars), "ZP PROBE broadband: FAIL(geometry)");
+        assert_eq!(
+            class_line("osc", &bars[2..]),
+            "ZP PROBE osc: UNJUDGED(stability)"
+        );
+        assert_eq!(class_line("osc", &bars[..1]), "ZP PROBE osc: PASS");
+    }
+
+    #[test]
     fn the_verdict_ends_in_one_class_line_within_thirty_lines() {
-        // Two nights of 30 frames, steady zero point: stability and coverage pass.
+        // Two nights of 30 frames, steady zero point: every bar passes.
         let mut rows = Vec::new();
         for night in 0..2 {
             for i in 0..30 {
                 let t = T0 + night * 86_400 + i * 180;
-                rows.push(row(
+                let mut r = row(
                     &format!("n{night}"),
                     t,
                     Some(21.3 + 0.001 * (i % 3) as f64),
                     3.0 + 0.3 * (i % 2) as f64,
                     800 + 10 * night,
-                ));
+                );
+                r.median_match_px = Some(0.4);
+                rows.push(r);
             }
         }
+        // A light the probe could not measure stays out of the coverage denominator.
+        let mut gone = row("n0", T0 + 5, None, 3.0, 800);
+        gone.refusal = "missing_file".into();
+        rows.push(gone);
         let lines = verdict_lines("broadband", &rows, None);
         assert!(lines.len() <= VERDICT_MAX_LINES);
-        let last = lines.last().unwrap();
-        assert!(last.starts_with("ZP PROBE broadband: "), "{last}");
-        assert!(last.contains("UNJUDGED(") || last.ends_with("PASS") || last.contains("FAIL("), "{last}");
+        assert_eq!(lines.last().unwrap(), "ZP PROBE broadband: PASS");
+        assert!(lines[1].contains("coverage: 1.000"), "{}", lines[1]);
+        assert!(lines[1].contains("1 missing_file"), "{}", lines[1]);
+
+        // Forty sets of three frames: none can be judged, every one says so, and
+        // the cut of the set lines is announced.
+        let many: Vec<MeasureRow> = (0..40)
+            .flat_map(|k| {
+                (0..3).map(move |i| {
+                    let mut r = row("n", T0 + i * 180, Some(21.3), 3.0, 100);
+                    r.object = format!("S{k:02}");
+                    r
+                })
+            })
+            .collect();
+        let lines = verdict_lines("broadband", &many, None);
+        assert_eq!(lines.len(), VERDICT_MAX_LINES);
+        assert_eq!(lines.last().unwrap(), "ZP PROBE broadband: UNJUDGED(geometry,stability,seeing)");
+        assert!(lines[lines.len() - 2].starts_with("… "), "{}", lines[lines.len() - 2]);
+        assert!(lines[lines.len() - 2].ends_with(" more set lines not shown"));
+        assert!(lines.iter().any(|l| l.starts_with("stability S00/L: not judged (no night with 20 frames")));
     }
 }
