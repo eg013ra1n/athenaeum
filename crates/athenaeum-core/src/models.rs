@@ -1099,6 +1099,22 @@ pub struct FrameAnalysis {
     /// An unknown text (a row from a newer build) reads `None` with a `warn!`, so the rest of the row survives.
     #[serde(default, deserialize_with = "lenient_frame_verdict")]
     pub frame_verdict: Option<FrameVerdict>,
+    /// The frame's photometric zero point against Gaia G (mag), `analysis::zero_point`; `None` = not measured, refused
+    /// or a legacy row. Written by the trigger after an analysis or a solve, never by the analyzer.
+    #[serde(default)]
+    pub zero_point: Option<f64>,
+    /// Stars that survived the clipping of the zero point.
+    #[serde(default)]
+    pub zp_stars: Option<i64>,
+    /// Robust scatter of those stars (mag).
+    #[serde(default)]
+    pub zp_sigma: Option<f64>,
+    /// `zero_point::ZP_VERSION` that judged the frame (a refusal stores it too); `None` = never judged.
+    #[serde(default)]
+    pub zp_version: Option<u32>,
+    /// Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
+    #[serde(default)]
+    pub zp_catalog: Option<String>,
 }
 
 /// Deserialize `Option<FrameVerdict>` leniently: null / absent → `None`; an unknown variant → `None` + `warn!`.

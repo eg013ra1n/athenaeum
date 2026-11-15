@@ -2000,6 +2000,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             measure_version INTEGER,
             stars_refused INTEGER,
             frame_verdict TEXT,
+            zero_point REAL,
+            zp_stars INTEGER,
+            zp_sigma REAL,
+            zp_version INTEGER,
+            zp_catalog TEXT,
             FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
             UNIQUE(frame_id)
@@ -2089,6 +2094,12 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("measure_version", "INTEGER"),
         ("stars_refused", "INTEGER"),
         ("frame_verdict", "TEXT"),
+        // Collab v3 wave 6.5: the zero point against Gaia G, its version and the catalogue it was measured against.
+        ("zero_point", "REAL"),
+        ("zp_stars", "INTEGER"),
+        ("zp_sigma", "REAL"),
+        ("zp_version", "INTEGER"),
+        ("zp_catalog", "TEXT"),
     ] {
         let has: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name = ?1",

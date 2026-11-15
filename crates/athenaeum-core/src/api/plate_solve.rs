@@ -617,6 +617,8 @@ fn solve_and_persist(
     let mut solved = 0usize;
     let mut failed = 0usize;
     let mut error = None;
+    // Frames whose solve was written: their zero points are recomputed once the transaction is done.
+    let mut persisted: Vec<i64> = Vec::new();
     {
         let conn = database.conn();
         // Drop-safe: an early return or panic rolls back instead of leaking
@@ -641,7 +643,10 @@ fn solve_and_persist(
                         dso.as_deref(),
                         ps_config.as_ref(),
                     ) {
-                        Ok(StoreOutcome::Persisted) => solved += 1,
+                        Ok(StoreOutcome::Persisted) => {
+                            solved += 1;
+                            persisted.push(*frame_id);
+                        }
                         Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
                             // The Phase-2 "solved" event already reached the UI;
                             // emit a correction so the frame flips to failed with
@@ -680,6 +685,12 @@ fn solve_and_persist(
                 error = Some(ApiError::Internal(e.to_string()));
             }
         }
+    }
+
+    // A new solve moves the WCS, so the zero point of every frame just solved is recomputed whatever its `zp_version`
+    // says. Only when the solves are really stored; the trigger never fails the batch.
+    if error.is_none() {
+        crate::api::analysis::run_zero_point_trigger(ctx, &persisted, false);
     }
 
     BatchEnd {

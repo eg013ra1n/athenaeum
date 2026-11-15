@@ -119,6 +119,13 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
+    /// The app-data directory: the folder the catalog database lives in, where the star catalogue
+    /// (`catalogs/smac_gaia`) is installed. The same resolution as both hosts' `resolve_layer_caches`.
+    /// `None` before the database is opened, or for a database path with no parent.
+    pub fn app_data_dir(&self) -> Option<std::path::PathBuf> {
+        self.db.get()?.path().parent().map(std::path::Path::to_path_buf)
+    }
+
     /// Test-support constructor: a minimal, fully real `ServiceContext` backed by
     /// a fresh SQLite catalog at `db_path` (schema initialised by
     /// [`Database::new`]), every active-operation map empty, single-threaded

@@ -1,21 +1,36 @@
 //! A frame's photometric zero point from its fitted stars and the installed
 //! star catalogue (Gaia G), the number a transparency loss is later taken from.
 //!
-//! No database and no logging. `measure_zero_point` reads no file: the caller
-//! passes the frame's stored star rows, its WCS, a catalogue cone and its
-//! exposure, and it projects the catalogue through the WCS, matches stars one
-//! to one, and returns the sigma-clipped median of
+//! The first half is pure: `measure_zero_point` reads no file and no database.
+//! The caller passes the frame's stored star rows, its WCS, a catalogue cone and
+//! its exposure, and it projects the catalogue through the WCS, matches stars
+//! one to one, and returns the sigma-clipped median of
 //! `G + 2.5·log10(flux / exptime)` or a typed refusal (spec §5.1).
-//! `catalog_for_frame` is the one reader: it queries the catalogue layers
-//! (memory-mapped files). Pixel positions on both sides are 0-based in file
-//! row order.
+//! `catalog_for_frame` is the one catalogue reader (memory-mapped files). Pixel
+//! positions on both sides are 0-based in file row order.
+//!
+//! The second half (`refresh_zero_point_with` and what is built on it) keeps the
+//! number current in the catalogue: it reads a frame's analysis, stars and solve,
+//! measures, and stores the outcome beside the analysis (`frame_analysis.zp_*`).
+//! A zero point is current when it was judged at `ZP_VERSION` against the
+//! installed catalogue's identity; a refusal and a colour camera are stored too,
+//! so a hopeless frame is not retried on every launch.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use solvemyastro::{CatalogStar, LayeredCones, StarCache, WcsSolution};
 
-use crate::models::StarMetric;
+use crate::db::analysis as db_analysis;
+use crate::models::{Frame, StarMetric};
+use crate::plate_solve::hints::observation_epoch;
+use crate::plate_solve::layers::{catalog_identity, open_catalog_layers, CatalogOpenError};
+use crate::plate_solve::storage::get_plate_solve;
+use crate::stacking::groups::{color_mode_of, ColorMode};
+use crate::star_measure::MEASURE_VERSION;
 
 /// Version of the measurement; a stored zero point is current only at this value.
 pub const ZP_VERSION: u32 = 1;
@@ -376,6 +391,360 @@ pub fn catalog_for_frame(
     cones.cone(layers.len(), ra, dec, radius_deg, f32::INFINITY, epoch)
 }
 
+// ---------------------------------------------------------------------------
+// Storage and currency
+// ---------------------------------------------------------------------------
+
+/// Frames per chunk of an `ensure_zero_points` lookup and of the startup backfill.
+pub const BACKFILL_CHUNK: usize = 200;
+
+/// Why a frame was not judged now. `ColourCamera` is stored like a refusal (owner ruling Z5: colour cameras wait for an
+/// aperture sum); every other reason stores nothing, so the frame is picked up when the missing piece arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReady {
+    /// The frame has no analysis row.
+    NoAnalysis,
+    /// The analysis was measured by an older star-measurement version; its star fluxes are not comparable.
+    StaleAnalysis,
+    /// The frame has no plate solve.
+    NoSolve,
+    /// The stored solve cannot be turned into a sky-to-pixel transform (an unreadable SIP table, or a forward SIP
+    /// with no reverse one).
+    UnreadableSolve,
+    /// No star catalogue is installed.
+    NoCatalogue,
+    /// The catalogue knows the frame as OSC or CFA.
+    ColourCamera,
+}
+
+impl NotReady {
+    /// Stable code for the logs.
+    pub fn code(self) -> &'static str {
+        match self {
+            NotReady::NoAnalysis => "no_analysis",
+            NotReady::StaleAnalysis => "stale_analysis",
+            NotReady::NoSolve => "no_solve",
+            NotReady::UnreadableSolve => "unreadable_solve",
+            NotReady::NoCatalogue => "no_catalogue",
+            NotReady::ColourCamera => "colour_camera",
+        }
+    }
+}
+
+/// What a refresh did with a frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZpStatus {
+    /// A zero point was measured and stored.
+    Measured(ZeroPoint),
+    /// The measurement refused; the refusal was stored (NULL value, current version and catalogue).
+    Refused(ZpRefusal),
+    /// Not judged (see [`NotReady`]); `ColourCamera` was stored, the rest stored nothing.
+    NotReady(NotReady),
+}
+
+impl ZpStatus {
+    /// Whether the refresh wrote a row (a value, a refusal or a colour-camera mark).
+    pub fn stored(&self) -> bool {
+        matches!(
+            self,
+            ZpStatus::Measured(_) | ZpStatus::Refused(_) | ZpStatus::NotReady(NotReady::ColourCamera)
+        )
+    }
+}
+
+/// The installed star catalogue as a zero point needs it: the opened tiers and their identity.
+pub struct ZpCatalog {
+    pub layers: Vec<Arc<StarCache>>,
+    /// `plate_solve::layers::catalog_identity`: what `frame_analysis.zp_catalog` is compared with.
+    pub identity: String,
+}
+
+/// Open the installed catalogue under `app_data_dir`. `None` when none is installed (logged at `debug`: a fresh install
+/// or a Docker build has none, and that is not an error) or when it cannot be opened (`warn`).
+pub fn zero_point_catalog(app_data_dir: &Path) -> Option<ZpCatalog> {
+    let identity = match catalog_identity(app_data_dir) {
+        Ok(i) => i,
+        Err(CatalogOpenError::NotInstalled { .. }) => {
+            tracing::debug!("zero point skipped: no star catalogue installed");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "zero point skipped: star catalogue unreadable");
+            return None;
+        }
+    };
+    match open_catalog_layers(app_data_dir) {
+        Ok(layers) => Some(ZpCatalog { layers, identity }),
+        Err(CatalogOpenError::NotInstalled { .. }) => {
+            tracing::debug!("zero point skipped: no star catalogue installed");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "zero point skipped: star catalogue unreadable");
+            None
+        }
+    }
+}
+
+/// The frame's own header facts the measurement needs.
+struct FrameFacts {
+    exptime: Option<f64>,
+    date_obs: Option<chrono::DateTime<chrono::Utc>>,
+    bayerpat: Option<String>,
+}
+
+fn load_facts(conn: &Connection, frame_id: i64) -> Result<Option<FrameFacts>> {
+    conn.query_row(
+        "SELECT exptime, date_obs, bayerpat FROM frames WHERE id = ?1",
+        [frame_id],
+        |row| {
+            let date_obs: Option<String> = row.get(1)?;
+            Ok(FrameFacts {
+                exptime: row.get(0)?,
+                date_obs: date_obs.as_deref().and_then(parse_date_obs),
+                bayerpat: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .with_context(|| format!("reading the header facts of frame {frame_id}"))
+}
+
+/// `frames.date_obs` is stored as RFC 3339; a header-style text without a zone is read as UTC.
+fn parse_date_obs(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = text.trim();
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(t.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f").ok().map(|n| n.and_utc())
+}
+
+/// Store a judgement and log it with the dictionary fields.
+fn store_outcome(
+    conn: &Connection,
+    frame_id: i64,
+    catalog: &str,
+    value: Option<&ZeroPoint>,
+    matched: Option<u32>,
+    reason: Option<&str>,
+) -> Result<()> {
+    db_analysis::set_zero_point(conn, frame_id, value, catalog)
+        .with_context(|| format!("storing the zero point of frame {frame_id}"))?;
+    match value {
+        Some(z) => tracing::info!(
+            frame_id,
+            zero_point = z.zero_point,
+            zp_stars = z.stars,
+            zp_sigma = z.sigma,
+            zp_matched = matched,
+            "zero point measured"
+        ),
+        None => tracing::info!(frame_id, zp_matched = matched, zp_reason = reason, "zero point refused"),
+    }
+    Ok(())
+}
+
+/// Judge one frame and store the outcome. Reads the analysis (it must carry the current `MEASURE_VERSION`), its star
+/// rows, the solve and the header's `EXPTIME`; asks `cone` for the catalogue stars (`wcs`, width, height, central
+/// fraction, observation epoch); measures; stores through `set_zero_point` with `catalog` (the installed catalogue's
+/// identity). Always recomputes: the currency check belongs to the callers that have many frames to skip.
+/// An `Err` is a database or catalogue failure; a frame that merely cannot be judged is `ZpStatus::NotReady`.
+pub fn refresh_zero_point_with<F>(conn: &Connection, frame_id: i64, catalog: &str, cone: F) -> Result<ZpStatus>
+where
+    F: FnOnce(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    let Some(analysis) = db_analysis::get_frame_analysis(conn, frame_id)
+        .with_context(|| format!("reading the analysis of frame {frame_id}"))?
+    else {
+        return Ok(ZpStatus::NotReady(NotReady::NoAnalysis));
+    };
+    if analysis.measure_version != Some(MEASURE_VERSION) {
+        return Ok(ZpStatus::NotReady(NotReady::StaleAnalysis));
+    }
+    let Some(facts) = load_facts(conn, frame_id)? else {
+        return Ok(ZpStatus::NotReady(NotReady::NoAnalysis));
+    };
+
+    // Z5: a colour camera is not measured yet. Stored like a refusal, so it is not retried.
+    if color_mode_of(&facts.bayerpat) == ColorMode::Osc {
+        store_outcome(conn, frame_id, catalog, None, None, Some(NotReady::ColourCamera.code()))?;
+        return Ok(ZpStatus::NotReady(NotReady::ColourCamera));
+    }
+
+    let Some(record) = get_plate_solve(conn, frame_id)
+        .with_context(|| format!("reading the solve of frame {frame_id}"))?
+    else {
+        return Ok(ZpStatus::NotReady(NotReady::NoSolve));
+    };
+    let Some(wcs) = record.to_solution() else {
+        // `to_solution` has already said why, at `warn`.
+        return Ok(ZpStatus::NotReady(NotReady::UnreadableSolve));
+    };
+    if wcs.sip_forward.is_some() && wcs.sip_reverse.is_none() {
+        tracing::warn!(frame_id, "solve has a forward SIP and no reverse one; the zero point is not measured");
+        return Ok(ZpStatus::NotReady(NotReady::UnreadableSolve));
+    }
+
+    let params = ZpParams::default();
+
+    // A frame with no usable exposure is refused before the catalogue is read.
+    let exposure_ok = facts.exptime.is_some_and(|t| t.is_finite() && t > 0.0);
+    let (width, height) = (analysis.width.max(0) as usize, analysis.height.max(0) as usize);
+    let (m, refusal_only) = if exposure_ok {
+        let stars = match analysis.id {
+            Some(id) => db_analysis::get_star_metrics(conn, id)
+                .with_context(|| format!("reading the stars of frame {frame_id}"))?,
+            None => Vec::new(),
+        };
+        let epoch = observation_epoch(&Frame { date_obs: facts.date_obs, ..Frame::default() });
+        let cat = cone(&wcs, width, height, params.central_fraction, epoch)
+            .with_context(|| format!("reading the catalogue around frame {frame_id}"))?;
+        let m = measure_zero_point(
+            &ZpInput {
+                stars: &stars,
+                wcs: &wcs,
+                catalog: &cat,
+                exptime_s: facts.exptime,
+                width,
+                height,
+                median_fwhm_px: analysis.median_fwhm,
+            },
+            &params,
+        );
+        (m, false)
+    } else {
+        (refused(ZpRefusal::NoExposure), true)
+    };
+    let matched = (!refusal_only).then_some(m.matched);
+
+    match m.result {
+        Ok(z) => {
+            store_outcome(conn, frame_id, catalog, Some(&z), matched, None)?;
+            Ok(ZpStatus::Measured(z))
+        }
+        Err(r) => {
+            store_outcome(conn, frame_id, catalog, None, matched, Some(r.code()))?;
+            Ok(ZpStatus::Refused(r))
+        }
+    }
+}
+
+/// The production catalogue reader for [`refresh_zero_point_with`]'s `cone`.
+pub(crate) fn catalog_cone<'a>(
+    layers: &'a [Arc<StarCache>],
+) -> impl Fn(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>> + 'a {
+    move |wcs, width, height, central_fraction, epoch| {
+        let refs: Vec<&StarCache> = layers.iter().map(Arc::as_ref).collect();
+        catalog_for_frame(&refs, wcs, width, height, central_fraction, epoch)
+    }
+}
+
+/// [`refresh_zero_point_with`] against the catalogue installed under `app_data_dir`: both the layers and the identity are
+/// resolved from it. No catalogue installed is `NotReady(NoCatalogue)` and stores nothing.
+pub fn refresh_zero_point(conn: &Connection, app_data_dir: &Path, frame_id: i64) -> Result<ZpStatus> {
+    let Some(cat) = zero_point_catalog(app_data_dir) else {
+        return Ok(ZpStatus::NotReady(NotReady::NoCatalogue));
+    };
+    refresh_zero_point_with(conn, frame_id, &cat.identity, catalog_cone(&cat.layers))
+}
+
+/// Whether the frame has a current-`MEASURE_VERSION` analysis and a solve and its zero point is not current: judged at
+/// another `ZP_VERSION` or against another catalogue.
+fn needs_refresh(conn: &Connection, frame_id: i64, catalog: &str) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM frame_analysis fa
+             JOIN plate_solves ps ON ps.frame_id = fa.frame_id
+             WHERE fa.frame_id = ?1 AND fa.measure_version = ?2
+               AND (fa.zp_version IS NOT ?3 OR fa.zp_catalog IS NOT ?4)",
+            params![frame_id, MEASURE_VERSION, ZP_VERSION, catalog],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("checking the zero point of frame {frame_id}"))?;
+    Ok(n > 0)
+}
+
+/// Refresh each of `frame_ids` (`only_stale`: only those that are not current). A frame whose refresh fails is logged at
+/// `warn` with its id and left as it was; the rest go on. Returns how many frames wrote a row.
+fn refresh_many_with<F>(
+    conn: &Connection,
+    catalog: &str,
+    frame_ids: &[i64],
+    only_stale: bool,
+    mut cone: F,
+) -> Result<usize>
+where
+    F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    let mut stored = 0;
+    for &frame_id in frame_ids {
+        if only_stale {
+            match needs_refresh(conn, frame_id, catalog) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(frame_id, error = %format!("{e:#}"), "zero point check failed");
+                    continue;
+                }
+            }
+        }
+        match refresh_zero_point_with(conn, frame_id, catalog, &mut cone) {
+            Ok(status) => stored += usize::from(status.stored()),
+            Err(e) => tracing::warn!(frame_id, error = %format!("{e:#}"), "zero point refresh failed"),
+        }
+    }
+    Ok(stored)
+}
+
+/// Refresh the frames among `frame_ids` whose zero point is not current (a current-`MEASURE_VERSION` analysis, a solve,
+/// and `zp_version` / `zp_catalog` other than the current ones). Returns how many it measured, refused or marked as a
+/// colour camera. `cone` as in [`refresh_zero_point_with`].
+pub fn ensure_zero_points_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], cone: F) -> Result<usize>
+where
+    F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    refresh_many_with(conn, catalog, frame_ids, true, cone)
+}
+
+/// [`ensure_zero_points_with`] over an opened catalogue.
+pub fn ensure_zero_points(conn: &Connection, catalog: &ZpCatalog, frame_ids: &[i64]) -> Result<usize> {
+    ensure_zero_points_with(conn, &catalog.identity, frame_ids, catalog_cone(&catalog.layers))
+}
+
+/// Recompute the zero point of every one of `frame_ids`, current or not: the trigger after a solve, whose WCS may have
+/// moved. Returns how many wrote a row.
+pub fn recompute_zero_points_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], cone: F) -> Result<usize>
+where
+    F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    refresh_many_with(conn, catalog, frame_ids, false, cone)
+}
+
+/// [`recompute_zero_points_with`] over an opened catalogue.
+pub fn recompute_zero_points(conn: &Connection, catalog: &ZpCatalog, frame_ids: &[i64]) -> Result<usize> {
+    recompute_zero_points_with(conn, &catalog.identity, frame_ids, catalog_cone(&catalog.layers))
+}
+
+/// Up to `limit` frame ids above `after` whose zero point is not current, in id order: the backfill's cursor. Keyed on
+/// the id, so a frame whose refresh keeps failing is skipped, not retried in a loop.
+pub fn stale_zero_point_frames(conn: &Connection, catalog: &str, after: i64, limit: usize) -> Result<Vec<i64>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT fa.frame_id FROM frame_analysis fa
+             JOIN plate_solves ps ON ps.frame_id = fa.frame_id
+             WHERE fa.frame_id > ?1 AND fa.measure_version = ?2
+               AND (fa.zp_version IS NOT ?3 OR fa.zp_catalog IS NOT ?4)
+             ORDER BY fa.frame_id LIMIT ?5",
+        )
+        .context("preparing the stale zero point query")?;
+    let ids = stmt
+        .query_map(params![after, MEASURE_VERSION, ZP_VERSION, catalog, limit as i64], |r| r.get(0))
+        .context("listing the frames with a stale zero point")?
+        .collect::<rusqlite::Result<Vec<i64>>>()
+        .context("reading the frames with a stale zero point")?;
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +1089,337 @@ mod tests {
             Err(ZpRefusal::TooFewStars { matched: 0, kept: 0 }) => {}
             other => panic!("expected TooFewStars with no matches, got {other:?}"),
         }
+    }
+
+    // ---- storage and currency -------------------------------------------------------------------------------------
+
+    use crate::models::FrameAnalysis;
+    use crate::plate_solve::storage::{insert_plate_solve, PlateSolveRecord};
+
+    fn catalog_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn
+    }
+
+    /// What a seeded frame is made of; the defaults are a measurable mono light.
+    struct Seed {
+        exptime: Option<f64>,
+        bayerpat: Option<&'static str>,
+        measure_version: Option<u32>,
+    }
+
+    impl Default for Seed {
+        fn default() -> Self {
+            Seed { exptime: Some(EXPTIME), bayerpat: None, measure_version: Some(MEASURE_VERSION) }
+        }
+    }
+
+    fn fresh_analysis(id: i64, measure_version: Option<u32>) -> FrameAnalysis {
+        FrameAnalysis {
+            id: None,
+            frame_id: id,
+            file_id: id,
+            stars_detected: 200,
+            median_fwhm: 4.0,
+            median_eccentricity: 0.1,
+            median_snr: 100.0,
+            median_hfr: 2.0,
+            frame_snr: 30.0,
+            snr_weight: 1.0,
+            psf_signal: 100.0,
+            background: 100.0,
+            noise: 5.0,
+            detection_threshold: 5.0,
+            width: W as i64,
+            height: H as i64,
+            source_channels: 1,
+            trail_r_squared: 0.0,
+            possibly_trailed: false,
+            median_beta: None,
+            quality_score: None,
+            config_hash: Some("t".into()),
+            analyzed_at: "2026-03-01T23:00:00Z".into(),
+            measure_version,
+            stars_refused: None,
+            frame_verdict: None,
+            zero_point: None,
+            zp_stars: None,
+            zp_sigma: None,
+            zp_version: None,
+            zp_catalog: None,
+        }
+    }
+
+    /// Store `wcs` as the frame's solve. `forward_only_sip` adds a forward SIP pair and no reverse one.
+    fn seed_solve(conn: &Connection, id: i64, wcs: &WcsSolution, forward_only_sip: bool) {
+        let table = |c: f64| serde_json::to_string(&vec![vec![c; 3]; 3]).unwrap();
+        insert_plate_solve(
+            conn,
+            &PlateSolveRecord {
+                id: None,
+                frame_id: id,
+                crpix1: wcs.crpix.0,
+                crpix2: wcs.crpix.1,
+                crval1: wcs.crval.0,
+                crval2: wcs.crval.1,
+                cd1_1: wcs.cd[0][0],
+                cd1_2: wcs.cd[0][1],
+                cd2_1: wcs.cd[1][0],
+                cd2_2: wcs.cd[1][1],
+                sip_order: forward_only_sip.then_some(2),
+                sip_a_coeffs: forward_only_sip.then(|| table(1e-9)),
+                sip_b_coeffs: forward_only_sip.then(|| table(2e-9)),
+                sip_ap_coeffs: None,
+                sip_bp_coeffs: None,
+                matched_stars: 300,
+                total_detected: 400,
+                rms_residual_px: 0.3,
+                rms_residual_arcsec: 0.3,
+                pixel_scale_arcsec: 1.0,
+                field_rotation_deg: 0.0,
+                solve_time_ms: 10,
+                catalog_used: "test".into(),
+                algorithm_used: "test".into(),
+                solved_at: "2026-03-01T23:00:00Z".into(),
+                expected_catalog_stars_in_fov: None,
+                inlier_ratio: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// A light with an analysis, its 200 stars and (when `solve`) a solve; frame id = file id = `id`.
+    fn seed_frame(conn: &Connection, id: i64, f: &Field, seed: &Seed, solve: bool) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, created_at)
+             VALUES (?1, ?2, ?3, 0, '2026-03-01', 'FITS', '2026-03-01')",
+            params![id, format!("/x/{id}.fits"), format!("{id}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, exptime, date_obs, bayerpat)
+             VALUES (?1, ?1, 'Light', ?2, '2026-03-01T22:00:00+00:00', ?3)",
+            params![id, seed.exptime, seed.bayerpat],
+        )
+        .unwrap();
+        let analysis_id = db_analysis::upsert_frame_analysis(conn, &fresh_analysis(id, seed.measure_version)).unwrap();
+        let stars: Vec<StarMetric> =
+            f.stars.iter().map(|s| StarMetric { frame_analysis_id: analysis_id, ..s.clone() }).collect();
+        db_analysis::upsert_star_metrics(conn, analysis_id, &stars).unwrap();
+        if solve {
+            seed_solve(conn, id, &f.wcs, false);
+        }
+    }
+
+    /// The catalogue of `f` as a `cone` closure; counts its calls.
+    fn cone_of<'a>(
+        f: &'a Field,
+        calls: &'a std::cell::Cell<usize>,
+    ) -> impl FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>> + 'a {
+        move |_, _, _, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(f.catalog.clone())
+        }
+    }
+
+    fn zp_columns(conn: &Connection, id: i64) -> (Option<f64>, Option<i64>, Option<u32>, Option<String>) {
+        let a = db_analysis::get_frame_analysis(conn, id).unwrap().unwrap();
+        (a.zero_point, a.zp_stars, a.zp_version, a.zp_catalog)
+    }
+
+    #[test]
+    fn refresh_measures_and_stores() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 21);
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        let calls = std::cell::Cell::new(0);
+        let status = refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        let ZpStatus::Measured(z) = status else { panic!("expected Measured, got {status:?}") };
+        assert!((z.zero_point - TRUE_ZP).abs() < 1e-9, "zp {}", z.zero_point);
+        let (value, stars, version, catalog) = zp_columns(&conn, 1);
+        assert!((value.unwrap() - TRUE_ZP).abs() < 1e-9);
+        assert_eq!((stars, version, catalog.as_deref()), (Some(i64::from(z.stars)), Some(ZP_VERSION), Some("A")));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_stale_analysis_is_not_measured() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 22);
+        let seed = Seed { measure_version: Some(MEASURE_VERSION - 1), ..Seed::default() };
+        seed_frame(&conn, 1, &f, &seed, true);
+        let calls = std::cell::Cell::new(0);
+        let status = refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        assert_eq!(status, ZpStatus::NotReady(NotReady::StaleAnalysis));
+        assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn a_frame_without_a_solve_or_an_analysis_is_not_ready() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 23);
+        seed_frame(&conn, 1, &f, &Seed::default(), false);
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap(),
+            ZpStatus::NotReady(NotReady::NoSolve)
+        );
+        assert_eq!(
+            refresh_zero_point_with(&conn, 99, "A", cone_of(&f, &calls)).unwrap(),
+            ZpStatus::NotReady(NotReady::NoAnalysis)
+        );
+        assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
+    }
+
+    #[test]
+    fn a_missing_exposure_stores_a_refusal() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 24);
+        seed_frame(&conn, 1, &f, &Seed { exptime: None, ..Seed::default() }, true);
+        // The catalogue is never read for a frame with no exposure: a closure that fails would show it.
+        let status = refresh_zero_point_with(&conn, 1, "A", |_, _, _, _, _| bail!("must not be called")).unwrap();
+        assert_eq!(status, ZpStatus::Refused(ZpRefusal::NoExposure));
+        assert_eq!(zp_columns(&conn, 1), (None, None, Some(ZP_VERSION), Some("A".to_string())));
+    }
+
+    #[test]
+    fn a_colour_camera_frame_is_not_measured() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 25);
+        seed_frame(&conn, 1, &f, &Seed { bayerpat: Some("RGGB"), ..Seed::default() }, true);
+        let calls = std::cell::Cell::new(0);
+        let status = refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        assert_eq!(status, ZpStatus::NotReady(NotReady::ColourCamera));
+        assert!(status.stored());
+        assert_eq!(zp_columns(&conn, 1), (None, None, Some(ZP_VERSION), Some("A".to_string())));
+        assert_eq!(calls.get(), 0, "no catalogue read for a colour camera");
+        // Stored like a refusal: the next pass does not retry it.
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_forward_only_sip_is_not_measured() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 26);
+        seed_frame(&conn, 1, &f, &Seed::default(), false);
+        seed_solve(&conn, 1, &f.wcs, true);
+        let calls = std::cell::Cell::new(0);
+        let status = refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        assert_eq!(status, ZpStatus::NotReady(NotReady::UnreadableSolve));
+        assert!(!status.stored());
+        assert_eq!(zp_columns(&conn, 1), (None, None, None, None), "nothing is written");
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn a_new_analysis_clears_the_zero_point_until_the_trigger_runs() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 27);
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        let calls = std::cell::Cell::new(0);
+        refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        assert!(zp_columns(&conn, 1).0.is_some());
+        // The analyzer's row carries no zero point: the REPLACE drops the old one with the old stars.
+        db_analysis::upsert_frame_analysis(&conn, &fresh_analysis(1, Some(MEASURE_VERSION))).unwrap();
+        assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
+        // ...and `ensure` picks the frame up again once its stars are back.
+        let analysis_id = db_analysis::get_frame_analysis(&conn, 1).unwrap().unwrap().id.unwrap();
+        let stars: Vec<StarMetric> =
+            f.stars.iter().map(|s| StarMetric { frame_analysis_id: analysis_id, ..s.clone() }).collect();
+        db_analysis::upsert_star_metrics(&conn, analysis_id, &stars).unwrap();
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)).unwrap(), 1);
+        assert!(zp_columns(&conn, 1).0.is_some());
+    }
+
+    #[test]
+    fn a_new_solve_recomputes_the_zero_point() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 28);
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        let calls = std::cell::Cell::new(0);
+        refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        let before = zp_columns(&conn, 1);
+        assert!(before.0.is_some());
+        // A better solve, 50 px away: the stored value must not survive. The solve trigger recomputes whatever
+        // `zp_version` says, so the frame is still "current" by version and catalogue.
+        let mut shifted = f.wcs.clone();
+        shifted.crpix.0 += 50.0;
+        seed_solve(&conn, 1, &shifted, false);
+        assert!(!needs_refresh(&conn, 1, "A").unwrap(), "by version and catalogue the old value looks current");
+        crate::api::analysis::zero_point_trigger_with(&conn, "A", &[1], false, cone_of(&f, &calls));
+        let after = zp_columns(&conn, 1);
+        assert_ne!(after, before, "the old zero point survived a new solve");
+        assert_eq!((after.2, after.3.as_deref()), (Some(ZP_VERSION), Some("A")));
+    }
+
+    #[test]
+    fn ensure_skips_frames_that_are_current() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 29);
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        seed_frame(&conn, 2, &f, &Seed::default(), true);
+        let calls = std::cell::Cell::new(0);
+        refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        calls.set(0);
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1, 2], cone_of(&f, &calls)).unwrap(), 1);
+        assert_eq!(calls.get(), 1, "only the stale frame read the catalogue");
+        assert!(zp_columns(&conn, 2).0.is_some());
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1, 2], cone_of(&f, &calls)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_zero_point_from_another_catalogue_is_recomputed() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 30);
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        let calls = std::cell::Cell::new(0);
+        refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)).unwrap(), 0, "skipped under A");
+        assert_eq!(ensure_zero_points_with(&conn, "B", &[1], cone_of(&f, &calls)).unwrap(), 1, "refreshed under B");
+        assert_eq!(zp_columns(&conn, 1).3.as_deref(), Some("B"));
+        assert_eq!(ensure_zero_points_with(&conn, "B", &[1], cone_of(&f, &calls)).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_backfill_cursor_walks_the_stale_frames_in_chunks() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 31);
+        for id in 1..=5 {
+            seed_frame(&conn, id, &f, &Seed::default(), true);
+        }
+        let calls = std::cell::Cell::new(0);
+        refresh_zero_point_with(&conn, 3, "A", cone_of(&f, &calls)).unwrap();
+        let first = stale_zero_point_frames(&conn, "A", 0, 2).unwrap();
+        assert_eq!(first, vec![1, 2]);
+        let second = stale_zero_point_frames(&conn, "A", 2, 2).unwrap();
+        assert_eq!(second, vec![4, 5], "the current frame 3 is not listed");
+        assert!(stale_zero_point_frames(&conn, "A", 5, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_trigger_error_does_not_fail_the_analysis() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 32);
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        // The catalogue read fails; the trigger returns (it cannot fail its host), the analysis row is intact and
+        // its zero point columns stay NULL.
+        crate::api::analysis::zero_point_trigger_with(&conn, "A", &[1], true, |_, _, _, _, _| bail!("catalogue unreadable"));
+        let a = db_analysis::get_frame_analysis(&conn, 1).unwrap().expect("the analysis row exists");
+        assert_eq!(a.stars_detected, 200);
+        assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
+    }
+
+    #[test]
+    fn no_installed_catalogue_is_not_ready_and_stores_nothing() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 33);
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        let empty_app_data = tempfile::tempdir().unwrap();
+        assert!(zero_point_catalog(empty_app_data.path()).is_none());
+        let status = refresh_zero_point(&conn, empty_app_data.path(), 1).unwrap();
+        assert_eq!(status, ZpStatus::NotReady(NotReady::NoCatalogue));
+        assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
     }
 }

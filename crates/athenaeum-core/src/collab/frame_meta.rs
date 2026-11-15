@@ -417,6 +417,11 @@ mod tests {
                 measure_version,
                 stars_refused: None,
                 frame_verdict: None,
+                zero_point: None,
+                zp_stars: None,
+                zp_sigma: None,
+                zp_version: None,
+                zp_catalog: None,
             },
         )
         .unwrap();

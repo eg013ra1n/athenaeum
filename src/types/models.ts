@@ -559,7 +559,28 @@ stars_refused: number | null,
  * Why the frame has no measured star (PC-13); `None` = a measured frame, or a legacy row.
  * An unknown text (a row from a newer build) reads `None` with a `warn!`, so the rest of the row survives.
  */
-frame_verdict: FrameVerdict | null, };
+frame_verdict: FrameVerdict | null, 
+/**
+ * The frame's photometric zero point against Gaia G (mag), `analysis::zero_point`; `None` = not measured, refused
+ * or a legacy row. Written by the trigger after an analysis or a solve, never by the analyzer.
+ */
+zero_point: number | null, 
+/**
+ * Stars that survived the clipping of the zero point.
+ */
+zp_stars: number | null, 
+/**
+ * Robust scatter of those stars (mag).
+ */
+zp_sigma: number | null, 
+/**
+ * `zero_point::ZP_VERSION` that judged the frame (a refusal stores it too); `None` = never judged.
+ */
+zp_version: number | null, 
+/**
+ * Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
+ */
+zp_catalog: string | null, };
 
 export type FrameVerdict = "trailed" | "defocused" | "no_stars";
 

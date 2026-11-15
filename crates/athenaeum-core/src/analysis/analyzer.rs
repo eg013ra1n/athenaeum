@@ -129,6 +129,11 @@ pub fn map_measurement(
         measure_version: Some(MEASURE_VERSION),
         stars_refused: Some(s.stars_refused as i64),
         frame_verdict: s.verdict.map(FrameVerdict::from),
+        zero_point: None,
+        zp_stars: None,
+        zp_sigma: None,
+        zp_version: None,
+        zp_catalog: None,
     };
     (analysis, stars)
 }

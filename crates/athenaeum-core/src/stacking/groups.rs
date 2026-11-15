@@ -410,7 +410,7 @@ pub(crate) fn median_f64(values: &mut [f64]) -> f64 {
     }
 }
 
-fn color_mode_of(bayerpat: &Option<String>) -> ColorMode {
+pub(crate) fn color_mode_of(bayerpat: &Option<String>) -> ColorMode {
     match bayerpat.as_deref().map(str::trim) {
         Some(s) if !s.is_empty() => ColorMode::Osc,
         _ => ColorMode::Mono,

@@ -10,8 +10,10 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
             background, noise, detection_threshold, width, height,
             source_channels, trail_r_squared, possibly_trailed,
             median_beta, quality_score, config_hash, analyzed_at,
-            measure_version, stars_refused, frame_verdict
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+            measure_version, stars_refused, frame_verdict,
+            zero_point, zp_stars, zp_sigma, zp_version, zp_catalog
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                  ?26, ?27, ?28, ?29, ?30)",
         params![
             a.frame_id,
             a.file_id,
@@ -38,9 +40,43 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
             a.measure_version,
             a.stars_refused,
             a.frame_verdict.map(FrameVerdict::as_str),
+            a.zero_point,
+            a.zp_stars,
+            a.zp_sigma,
+            a.zp_version,
+            a.zp_catalog,
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Store the outcome of a zero-point judgement on a frame's analysis row: the value and its figures (all NULL for a
+/// refusal or a colour camera), `zp_version = ZP_VERSION` and the catalogue identity it was judged against, so the
+/// frame is not retried until either changes. An UPDATE, never an upsert: a frame without an analysis row is an error.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub fn set_zero_point(
+    conn: &Connection,
+    frame_id: i64,
+    value: Option<&crate::analysis::zero_point::ZeroPoint>,
+    catalog: &str,
+) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE frame_analysis
+         SET zero_point = ?2, zp_stars = ?3, zp_sigma = ?4, zp_version = ?5, zp_catalog = ?6
+         WHERE frame_id = ?1",
+        params![
+            frame_id,
+            value.map(|v| v.zero_point),
+            value.map(|v| i64::from(v.stars)),
+            value.map(|v| v.sigma),
+            crate::analysis::zero_point::ZP_VERSION,
+            catalog,
+        ],
+    )?;
+    if n == 0 {
+        return Err(rusqlite::Error::StatementChangedRows(0));
+    }
+    Ok(())
 }
 
 /// Get analysis for a single frame.
@@ -51,7 +87,8 @@ pub fn get_frame_analysis(conn: &Connection, frame_id: i64) -> Result<Option<Fra
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
                 median_beta, quality_score, config_hash, analyzed_at,
-                measure_version, stars_refused, frame_verdict
+                measure_version, stars_refused, frame_verdict,
+                zero_point, zp_stars, zp_sigma, zp_version, zp_catalog
          FROM frame_analysis WHERE frame_id = ?1",
     )?;
 
@@ -79,7 +116,8 @@ pub fn get_frame_analyses_by_ids(
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
                 median_beta, quality_score, config_hash, analyzed_at,
-                measure_version, stars_refused, frame_verdict
+                measure_version, stars_refused, frame_verdict,
+                zero_point, zp_stars, zp_sigma, zp_version, zp_catalog
          FROM frame_analysis WHERE frame_id IN ({})",
         placeholders.join(", ")
     );
@@ -109,7 +147,8 @@ pub fn get_frame_analyses_for_frame_set(
                 fa.background, fa.noise, fa.detection_threshold, fa.width, fa.height,
                 fa.source_channels, fa.trail_r_squared, fa.possibly_trailed,
                 fa.median_beta, fa.quality_score, fa.config_hash, fa.analyzed_at,
-                fa.measure_version, fa.stars_refused, fa.frame_verdict
+                fa.measure_version, fa.stars_refused, fa.frame_verdict,
+                fa.zero_point, fa.zp_stars, fa.zp_sigma, fa.zp_version, fa.zp_catalog
          FROM frame_analysis fa
          INNER JOIN session_members sm ON sm.frame_id = fa.frame_id
          INNER JOIN sessions s ON s.id = sm.session_id
@@ -279,6 +318,11 @@ fn row_to_analysis(row: &rusqlite::Row) -> Result<FrameAnalysis> {
         measure_version: row.get(23)?,
         stars_refused: row.get(24)?,
         frame_verdict: verdict_of(row.get::<_, Option<String>>(25)?),
+        zero_point: row.get(26)?,
+        zp_stars: row.get(27)?,
+        zp_sigma: row.get(28)?,
+        zp_version: row.get(29)?,
+        zp_catalog: row.get(30)?,
     })
 }
 
@@ -339,6 +383,11 @@ mod tests {
             measure_version: None,
             stars_refused: None,
             frame_verdict: None,
+            zero_point: None,
+            zp_stars: None,
+            zp_sigma: None,
+            zp_version: None,
+            zp_catalog: None,
         }
     }
 
@@ -572,5 +621,97 @@ mod tests {
         a.frame_verdict = Some(FrameVerdict::Trailed);
         let j = serde_json::to_value(&a).unwrap();
         assert_eq!(serde_json::from_value::<FrameAnalysis>(j).unwrap().frame_verdict, Some(FrameVerdict::Trailed));
+    }
+
+    const ZP_COLUMNS: [&str; 5] = ["zero_point", "zp_stars", "zp_sigma", "zp_version", "zp_catalog"];
+
+    fn zp_row(a: &FrameAnalysis) -> (Option<f64>, Option<i64>, Option<f64>, Option<u32>, Option<String>) {
+        (a.zero_point, a.zp_stars, a.zp_sigma, a.zp_version, a.zp_catalog.clone())
+    }
+
+    #[test]
+    fn migration_adds_the_zero_point_columns_and_keeps_rows() {
+        let conn = old_catalog();
+        init_db(&conn).unwrap();
+        for column in ZP_COLUMNS {
+            let has: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name = ?1",
+                    [column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has, 1, "column {column}");
+        }
+        let a = get_frame_analysis(&conn, 7).unwrap().expect("the row survives");
+        assert_eq!(zp_row(&a), (None, None, None, None, None));
+        assert_eq!((a.stars_detected, a.median_fwhm), (42, 3.1));
+        // A second init is a no-op.
+        init_db(&conn).unwrap();
+        assert_eq!(counts(&conn), (1, 2));
+    }
+
+    #[test]
+    fn frame_analysis_round_trips_the_zero_point() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (file_id, frame_id) = insert_frame(&conn, "/x/a.fits");
+        let mut a = analysis(frame_id, file_id);
+        a.zero_point = Some(21.3);
+        a.zp_stars = Some(87);
+        a.zp_sigma = Some(0.04);
+        a.zp_version = Some(1);
+        a.zp_catalog = Some("tier_500:1:2".into());
+        upsert_frame_analysis(&conn, &a).unwrap();
+        let want = (Some(21.3), Some(87), Some(0.04), Some(1), Some("tier_500:1:2".to_string()));
+        assert_eq!(zp_row(&get_frame_analysis(&conn, frame_id).unwrap().unwrap()), want);
+        assert_eq!(zp_row(&get_frame_analyses_by_ids(&conn, &[frame_id]).unwrap()[0]), want);
+        // The frame-set getter joins through sessions and nights; seed that chain for the one frame.
+        conn.execute_batch(
+            "INSERT INTO frames_set (id, name) VALUES (1, 'set');
+             INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+                 VALUES (1, 1, '2026-01-01T00:00:00Z', '2026-01-01T06:00:00Z');
+             INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (1, 1, 'cam');",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (1, ?1)", [frame_id]).unwrap();
+        let by_set = get_frame_analyses_for_frame_set(&conn, 1).unwrap();
+        assert_eq!(zp_row(&by_set[0]), want);
+    }
+
+    #[test]
+    fn an_old_frame_analysis_json_decodes_without_a_zero_point() {
+        let mut v = serde_json::to_value(analysis(1, 1)).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in ZP_COLUMNS {
+            assert!(o.remove(k).is_some(), "the wire carries {k} under its snake_case name");
+        }
+        let old: FrameAnalysis = serde_json::from_value(v).unwrap();
+        assert_eq!(zp_row(&old), (None, None, None, None, None));
+        // The five keys round-trip.
+        let mut a = analysis(1, 1);
+        a.zero_point = Some(21.3);
+        a.zp_catalog = Some("c".into());
+        let back: FrameAnalysis = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+        assert_eq!((back.zero_point, back.zp_catalog.as_deref()), (Some(21.3), Some("c")));
+    }
+
+    #[cfg(all(feature = "render", feature = "solver"))]
+    #[test]
+    fn set_zero_point_writes_the_value_or_nulls_and_the_version_and_catalogue() {
+        use crate::analysis::zero_point::{ZeroPoint, ZP_VERSION};
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (file_id, frame_id) = insert_frame(&conn, "/x/a.fits");
+        upsert_frame_analysis(&conn, &analysis(frame_id, file_id)).unwrap();
+        let z = ZeroPoint { zero_point: 21.3, stars: 87, sigma: 0.04 };
+        set_zero_point(&conn, frame_id, Some(&z), "A").unwrap();
+        let a = get_frame_analysis(&conn, frame_id).unwrap().unwrap();
+        assert_eq!(zp_row(&a), (Some(21.3), Some(87), Some(0.04), Some(ZP_VERSION), Some("A".to_string())));
+        set_zero_point(&conn, frame_id, None, "B").unwrap();
+        let a = get_frame_analysis(&conn, frame_id).unwrap().unwrap();
+        assert_eq!(zp_row(&a), (None, None, None, Some(ZP_VERSION), Some("B".to_string())));
+        // A frame with no analysis row is an error, never a silent no-op.
+        assert!(set_zero_point(&conn, frame_id + 1, None, "B").is_err());
     }
 }

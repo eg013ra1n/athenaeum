@@ -845,6 +845,11 @@ mod tests {
                 measure_version: Some(crate::star_measure::MEASURE_VERSION),
                 stars_refused: None,
                 frame_verdict: verdict,
+                zero_point: None,
+                zp_stars: None,
+                zp_sigma: None,
+                zp_version: None,
+                zp_catalog: None,
             };
             crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
         };
@@ -920,6 +925,11 @@ mod tests {
                 measure_version: *version,
                 stars_refused: None,
                 frame_verdict: *verdict,
+                zero_point: None,
+                zp_stars: None,
+                zp_sigma: None,
+                zp_version: None,
+                zp_catalog: None,
             };
             crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
         }
