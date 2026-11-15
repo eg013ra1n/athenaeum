@@ -185,6 +185,34 @@ Agent: opus (a judgment run). The controller prepares the job directory first.
 
 ---
 
+## Phase A outcome (2026-11-15) — read before any Phase B task
+
+GO for mono (owner ruling Z5: mono first, then OSC; spec §9). Tasks 1–3 are done (af37cca8, 22114df3, 0409e515,
+3ad45f2f, 8aac9419 and the constants commit); the ledger holds every number. What Phase B must take from it — where a
+task below says otherwise, this section wins:
+
+- **Constants** are `ZpParams::default()` as committed; no task changes them.
+- **`RIG_WIDE_FALLBACK = true`** (cross-target spread 0.025 mag on the one class that could be judged).
+- **OSC is not measured (Z5).** Task 4: `NotReady` gains `ColourCamera` for a frame the catalogue knows as OSC or CFA
+  (the same colour derivation the stacking plan's group key uses); it is stored like a refusal (NULL value, current
+  version and catalogue) so it is not retried. Task 5: `LossReason::ColourCamera`, sentence
+  `not measured for colour cameras yet`. The gate does not block such a frame (the no-value path).
+- **The catalogue is part of a zero point's currency.** Task 4: a fifth column `zp_catalog TEXT` and field
+  `zp_catalog: Option<String>`, written from `plate_solve::layers::catalog_identity`; `set_zero_point` takes it;
+  "current" everywhere (lazy trigger, backfill) means `zp_version == ZP_VERSION AND zp_catalog == the installed
+  identity`. Task 5: a reference reads only frames whose `zp_catalog` is the installed identity; a frame measured
+  against another tier set has the `NotMeasured` reason until it is recomputed.
+- **Refusal wording.** Task 5: `NoZeroPoint`'s sentence is
+  `too few catalogue stars for a reliable zero point — a deeper star catalogue tier may help`.
+- **A solve with a forward SIP and no reverse** (`sip_reverse` absent while `sip_forward` is present) is not measured:
+  `NotReady::UnreadableSolve`, logged. `sky_to_pixel` has no inverse for it. Every solve the current solver stores has
+  both.
+- **No hazy frame exists in the probe sets.** Task 10's real-data gate check uses frame 94501 (IC 5146 L, 2024-10-04,
+  airmass 2.47, loss 0.24 mag against its night) with the rule `transparency_loss lte 0.2`: refused; a frame within
+  0.05 mag of the reference: passed. A cloudy night is recorded as owed in open-items.
+- **Probe lesson** (owner, 2026-11-15): 616 frames were 2–3× more than the bars needed; the weak point was variety.
+  Later probes: one or two nights per set, more rigs and fields.
+
 ## Phase B — build (after GO)
 
 ### Task 4: Storage and triggers

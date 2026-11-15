@@ -1,6 +1,6 @@
 # Collab v3 sub-wave 6.5 — transparency from the photometric zero point (design)
 
-Date: 2026-11-15. Status: draft for owner approval (builder check folded in, scope narrowed by Z4).
+Date: 2026-11-15. Status: approved by the owner 2026-11-15; amended the same day by the real-data probe (§9, ruling Z5).
 Parents: `2026-09-23-collab-v3-per-frame-model-design.md` (R9, §6.3, §6.4, §7) and
 `2026-10-02-collab-v3-wave6-project-stacking-export-design.md` (W1, §8).
 Announced for v0.7.2 as "frame and group weights from star photometry, measured against Gaia"; this
@@ -45,7 +45,8 @@ Controller calls (mine; the owner may overrule any):
   the announced behaviour — so altitude counts as loss, in the table and at the gate. The default
   threshold (0.5 mag) is wider than the extinction down to about airmass 2.5.
 - **C3 — All filters and OSC are in scope**, each judged by its own bars (§6). A class of frames that
-  misses them ships without a zero point: no loss value, no verdict.
+  misses them ships without a zero point: no loss value, no verdict. *Outcome: mono passes, OSC does
+  not and is not measured in this wave (Z5, §9).*
 - **C4 — An analysis made by an older `MEASURE_VERSION` gets no zero point** until the frame is
   re-analysed; its flux meant something else.
 - **C5 — A published frame shows the loss frozen at publication** (frames are never withdrawn, and a
@@ -108,7 +109,8 @@ proper motion to the frame's epoch). Both sides are 0-based in file row order (`
   per-star offset to G is wide, yet the median of many stars is still sharp. An invalid frame has `NULL`
   and a logged reason with the counts.
 - Starting constants, fixed by the probe of §6 before any consumer is built: match radius 2 px, central
-  region 0.6 of the half-diagonal, minimum 15 stars, standard error ≤ 0.05 mag, clip 2.5 σ.
+  region 0.6 of the half-diagonal, minimum 15 stars, standard error ≤ 0.05 mag, clip 2.5 σ. *The probe's
+  final values are in §9.*
 
 Storage — `frame_analysis`, additive nullable columns: `zero_point` (mag, in the analysis' flux units
 per second), `zp_stars`, `zp_sigma`, `zp_version` (a `ZP_VERSION` constant).
@@ -221,3 +223,50 @@ neighbours; a frame of a rig without a reference is not blocked and its row says
 - Whether personal sync carries `frame_analysis` rows; if it does, the new columns travel as appended
   optional fields.
 - Column width, number format and tooltips within `docs/frontend/conventions.md`.
+
+## 9. Probe outcome and amendments (2026-11-15)
+
+The probe of §6 ran on 616 real frames (two rigs, four Milky Way fields, 13 nights) on two catalogue
+sets. Numbers and files: the wave's ledger, `.superpowers/sdd/2026-11-15-collab-v3-wave6-5/progress.md`.
+
+| Class | Outcome with tiers 500 + 2000, final constants |
+| ---- | ---- |
+| Broadband mono (L, 3 targets) | every judged bar passes: stability 0.024, seeing −0.019 mag/px, cross-target 0.025 |
+| Narrowband mono (H, 2 targets) | stability 0.024 passes; the seeing bar is unjudged (too few pairs); with airmass fitted the slope is +0.013 mag/px |
+| OSC | does not pass: the zero point follows the seeing by +0.17…+0.21 mag/px one night and −0.14 another (the stored flux of an OSC star carries no aperture correction) |
+
+Owner ruling:
+
+- **Z5 — Mono first, then OSC.** This wave is built for mono cameras. An OSC frame gets no zero point,
+  its cell says "not measured for colour cameras yet", and the gate does not block it. The OSC remedy
+  (an aperture sum from Analysis, a rustafits change under R-OSP-19, then a re-probe) follows as a task
+  of its own. With the chosen option the owner also accepted: narrowband on the indirect seeing
+  evidence, and a shallow catalogue answered by a refusal that asks for the deeper tier — the "base tier
+  alone" coverage bar of §6 does not hold for broadband and is dropped.
+
+Amendments from what the probe showed:
+
+- **Final constants**: match radius 2 px, central region 0.9 of the half-diagonal, minimum 15 stars,
+  standard error ≤ 0.02 mag, clip 4 σ, the brightest 15 % of the usable stars dropped, star SNR ≥ 10,
+  a catalogue neighbour within 3 FWHM counts as a blend only when it is within 4 mag.
+- **Why the precision limit is tight.** The brightest catalogue stars of a Milky Way field are red
+  (giants, reddened): G reaches 1050 nm, a luminance filter stops near 700 nm, so they read 0.3–2 mag
+  fainter than their G says. With only the base tier installed they are the only matches, and a frame's
+  zero point comes out 0.2–0.3 mag low. It is not saturation (no flag, raw peaks at 10–45 % of full
+  scale). A bright/faint comparison and a star-count floor do not separate such frames; the 0.02 mag
+  limit refuses all of them and keeps 97–100 % of the frames measured on the deeper tier. §5.1's
+  "stars near saturation are out" is therefore the bright-end drop, nothing more.
+- **The catalogue is part of a zero point's identity.** `frame_analysis` gains `zp_catalog` (the
+  installed tiers' identity at measurement time). A frame measured against another tier set is
+  recomputed, and a reference reads only frames measured against the installed one: a deeper tier
+  changes the star population and with it the level.
+- **Extinction in numbers.** 0.11–0.18 mag per airmass in these data. A frame at airmass 2.5–2.7 reads
+  a loss of 0.20–0.25 mag under a clear sky; below about 19° of altitude it crosses 0.5 mag. This is C2
+  as ruled, stated here so a threshold is chosen knowingly.
+- **Frame-to-frame noise** is about 0.03 mag: the 500-star analysis sample shares only a few matched
+  stars between consecutive frames. The sky itself moves 0.013–0.017 mag. `zp_sigma / √zp_stars`
+  understates the real error by about 2×.
+- **Not judged:** no frame in the probe was shot through haze or cloud (the largest dip is 0.09 mag);
+  the cross-target bar for narrowband; a camera under 16 bit; a field at high galactic latitude; a long
+  focal length. The acceptance of §6 uses a low-altitude frame (a real 0.24 mag loss) in place of a hazy
+  one; a cloudy night is owed.
