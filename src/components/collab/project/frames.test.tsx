@@ -314,6 +314,17 @@ it('sorting by transparency keeps frames without a value last in both directions
   expect(sortRows(rows, COLUMNS.transparency, -1, name).map((r) => r.fileName)).toEqual(['b.fits', 'a.fits', 'n.fits']);
 });
 
+it('the transparency column aggregates a group by the median of the frames that have a value', () => {
+  const rows = [
+    fromOwn(ownT(0.1, null, 'a.fits')),
+    fromOwn(ownT(0.31, null, 'b.fits')),
+    fromOwn(ownT(0.6, null, 'c.fits')),
+    fromOwn(ownT(null, 'no value', 'd.fits')),
+  ];
+  render(<span data-testid="agg">{COLUMNS.transparency.renderAggregate!(rows)}</span>);
+  expect(screen.getByTestId('agg')).toHaveTextContent('x̃ \u22120.31 mag');
+});
+
 it('the column sits after SNR in every table that lists SNR', () => {
   for (const t of Object.values(TABLES)) {
     for (const list of [t.columns, t.defaultColumns]) {

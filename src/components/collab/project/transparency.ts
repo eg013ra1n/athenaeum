@@ -5,6 +5,8 @@
  * block read from here, so the text is the same everywhere.
  */
 
+import { pluralize } from '../format';
+
 const MINUS = '−';
 
 /** `−0.77 mag`; `0.00 mag` for a loss under half a hundredth; `—` for no value. */
@@ -20,7 +22,7 @@ export function formatZeroPoint(
 ): string {
   if (!t || t.zeroPoint === null || !Number.isFinite(t.zeroPoint)) return '—';
   const parts = [t.zeroPoint.toFixed(2)];
-  if (t.zpStars !== null) parts.push(`${t.zpStars} stars`);
+  if (t.zpStars !== null) parts.push(`${t.zpStars} ${pluralize(t.zpStars, 'star')}`);
   if (t.zpSigma !== null) parts.push(`±${t.zpSigma.toFixed(2)}`);
   return parts.join(' · ');
 }

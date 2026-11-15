@@ -201,7 +201,7 @@ export default function FramePanel({
         ['Transparency', frame.transparencyLoss !== null
           ? formatTransparency(frame.transparencyLoss)
           : <><span title={frame.transparencyReason ?? undefined}>—</span>{frame.transparencyReason && <span className="ml-1.5 text-content-faint">{frame.transparencyReason}</span>}</>],
-        ['Zero point', formatZeroPoint(frame)],
+        ...(frame.own ? [['Zero point', formatZeroPoint(frame)] as [ReactNode, ReactNode]] : []),
       ]} />
 
       {frame.own && (<>

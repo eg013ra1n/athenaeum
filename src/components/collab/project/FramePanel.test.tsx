@@ -469,7 +469,7 @@ describe('FramePanel', () => {
   });
 
   it('shows transparency and zero point among the metrics', () => {
-    renderPanel(baseFrame({ transparencyLoss: 0.77, zeroPoint: 21.342, zpStars: 87, zpSigma: 0.041 }));
+    renderPanel(baseFrame({ own: baseOwn(), transparencyLoss: 0.77, zeroPoint: 21.342, zpStars: 87, zpSigma: 0.041 }));
     expect(screen.getByText('Transparency').tagName).toBe('DT');
     expect(screen.getByText('\u22120.77 mag')).toBeInTheDocument();
     expect(screen.getByText('Zero point').tagName).toBe('DT');
@@ -553,5 +553,19 @@ describe('FramePanel', () => {
     expect(screen.getByText('pending')).toBeInTheDocument();
     // The title row carries the chip alone: no device cell beside it.
     expect(screen.getByText('pending').parentElement).not.toHaveTextContent('—');
+    // The whole panel shows exactly one dash: the Transparency metric (no loss, no reason). The
+    // Zero point row is own-only, and the title row carries no device cell.
+    expect(screen.getAllByText('—')).toHaveLength(1);
+  });
+
+  it('a moderation frame has no zero point row', () => {
+    renderPanel(baseFrame({ own: null, lib: null, device: null, pubState: 'pending' }));
+    expect(screen.getByText('Transparency')).toBeInTheDocument();
+    expect(screen.queryByText('Zero point')).toBeNull();
+  });
+
+  it('an own frame without a zero point shows a dash in its zero point row', () => {
+    renderPanel(baseFrame({ own: baseOwn(), zeroPoint: null, zpStars: null, zpSigma: null }));
+    expect(screen.getByText('Zero point').nextElementSibling?.textContent).toBe('—');
   });
 });
