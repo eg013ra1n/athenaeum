@@ -118,6 +118,8 @@ impl ZpRefusal {
 /// One matched star, for the probe and the logs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ZpStar {
+    /// Index of the analysis star in `ZpInput::stars`.
+    pub star_index: usize,
     pub g_mag: f32,
     pub zp: f64,
     /// Distance from the frame centre as a fraction of the half-diagonal.
@@ -287,6 +289,7 @@ pub fn measure_zero_point(input: &ZpInput, params: &ZpParams) -> ZpMeasurement {
             let s = &input.stars[si];
             let g = cat[ci].2;
             ZpStar {
+                star_index: si,
                 g_mag: g,
                 zp: f64::from(g) + 2.5 * (s.flux / exptime).log10(),
                 radius_fraction: dist_c(s.x, s.y) / half_diag,
@@ -613,6 +616,11 @@ mod tests {
             m.per_star.iter().filter(|s| (s.g_mag - 12.5).abs() < 1e-3).collect();
         assert_eq!(at_12_5.len(), 1, "one catalogue star served {} analysis stars", at_12_5.len());
         assert!((at_12_5[0].match_px - 0.5).abs() < 1e-9, "match_px {}", at_12_5[0].match_px);
+        assert_eq!(
+            at_12_5[0].star_index,
+            f.stars.len() - 2,
+            "the surviving entry is the 0.5 px star, the second to last pushed"
+        );
     }
 
     #[test]

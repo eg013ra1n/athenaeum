@@ -10,10 +10,15 @@
 //! ```text
 //! zp_probe measure --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> \
 //!                  --object <s> --out <tsv> [--limit <n>] [--<ZpParams field> <v>]...
-//! zp_probe stars   --db <athenaeum.db> --app-data <dir> --frame <id> --out <tsv> [--<field> <v>]...
+//! zp_probe stars   --db <athenaeum.db> --app-data <dir> --frame <id> --out <tsv> [--all-out <tsv>] [--<field> <v>]...
 //! zp_probe common  --db <athenaeum.db> --run <id> --out <tsv>
 //! zp_probe verdict --class <broadband|narrowband|osc> [--common <tsv>] <measure.tsv>...
 //! ```
+//!
+//! `stars` writes one row per matched star with the flags and numbers the star
+//! fit itself carried (`saturated`, `extended`, `flags`, `peak`, `background`,
+//! `snr`, `fwhm`, `flux`); `--all-out` adds one row per analysis star inside the
+//! central region, matched or not.
 //!
 //! `--filter -` selects the frames without a filter (an OSC camera).
 //! `--<field>` is any `ZpParams` field in snake_case; the default is
@@ -30,7 +35,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use athenaeum_core::analysis::analyzer::analyze_frame;
+use athenaeum_core::analysis::analyzer::{
+    analyze_frame, map_measurement, measure_raw_frame,
+};
 use athenaeum_core::analysis::config::{load_config, AnalysisConfig};
 use athenaeum_core::analysis::zero_point::{
     catalog_for_frame, measure_zero_point, ZpInput, ZpMeasurement, ZpParams, ZpRefusal,
@@ -39,6 +46,8 @@ use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::hints::observation_epoch;
 use athenaeum_core::plate_solve::storage::get_plate_solve;
 use athenaeum_core::plate_solve::open_catalog_layers;
+use athenaeum_core::star_measure::raw::read_raw_frame;
+use athenaeum_core::star_measure::StarFit;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use solvemyastro::StarCache;
@@ -844,10 +853,25 @@ fn unmeasured_row(c: &Candidate, code: &str) -> MeasureRow {
     MeasureRow { refusal: code.to_string(), ..base_row(c) }
 }
 
+/// The star fits of a frame's measurement, kept for the `stars` dump: they are
+/// in the order of the analysis stars `ZpStar::star_index` indexes.
+struct FrameFits {
+    fits: Vec<StarFit>,
+    width: usize,
+    height: usize,
+}
+
 /// One frame, end to end: the stored solve, an in-memory analysis of its file,
 /// the catalogue cone and the measurement. A failure is the row's `refusal`,
-/// logged on stderr; it never stops the run.
-fn measure_candidate(conn: &Connection, rig: &Rig, c: &Candidate) -> (MeasureRow, Option<ZpMeasurement>) {
+/// logged on stderr; it never stops the run. With `keep_fits` the analysis goes
+/// through `measure_raw_frame` and `map_measurement` (what `analyze_frame` does)
+/// so the plane measurement's fits stay in hand.
+fn measure_candidate(
+    conn: &Connection,
+    rig: &Rig,
+    c: &Candidate,
+    keep_fits: bool,
+) -> (MeasureRow, Option<ZpMeasurement>, Option<FrameFits>) {
     let mut row = base_row(c);
     let fail = |row: &mut MeasureRow, code: &str, detail: &dyn std::fmt::Display| {
         eprintln!("zp_probe: frame {} refused {code}: {detail}", c.frame_id);
@@ -859,26 +883,36 @@ fn measure_candidate(conn: &Connection, rig: &Rig, c: &Candidate) -> (MeasureRow
             Some(w) => w,
             None => {
                 fail(&mut row, "bad_wcs", &"the stored SIP tables are unusable");
-                return (row, None);
+                return (row, None, None);
             }
         },
         Ok(None) => {
             fail(&mut row, "no_solve", &"no stored solve");
-            return (row, None);
+            return (row, None, None);
         }
         Err(e) => {
             fail(&mut row, "bad_wcs", &e);
-            return (row, None);
+            return (row, None, None);
         }
     };
-    let (analysis, stars, _flip) =
-        match analyze_frame(&c.path, &rig.config, Some(&rig.pool), &rig.config_hash) {
-            Ok(t) => t,
-            Err(e) => {
-                fail(&mut row, "analysis_failed", &e);
-                return (row, None);
-            }
-        };
+    let analysed = if keep_fits {
+        read_raw_frame(Path::new(&c.path)).map(|mut frame| {
+            frame.drop_unmeasured_planes();
+            let mut pm = measure_raw_frame(&frame, &rig.config, Some(&rig.pool));
+            let (analysis, stars) = map_measurement(&pm, &frame, &rig.config, &rig.config_hash);
+            (analysis, stars, Some(std::mem::take(&mut pm.stars)))
+        })
+    } else {
+        analyze_frame(&c.path, &rig.config, Some(&rig.pool), &rig.config_hash)
+            .map(|(analysis, stars, _flip)| (analysis, stars, None))
+    };
+    let (analysis, stars, fits) = match analysed {
+        Ok(t) => t,
+        Err(e) => {
+            fail(&mut row, "analysis_failed", &e);
+            return (row, None, None);
+        }
+    };
     row.stars_detected = Some(analysis.stars_detected);
     row.median_fwhm = Some(analysis.median_fwhm);
     let (width, height) = (analysis.width.max(0) as usize, analysis.height.max(0) as usize);
@@ -890,7 +924,7 @@ fn measure_candidate(conn: &Connection, rig: &Rig, c: &Candidate) -> (MeasureRow
         Ok(cat) => cat,
         Err(e) => {
             fail(&mut row, "no_cone", &e);
-            return (row, None);
+            return (row, None, None);
         }
     };
     let m = measure_zero_point(
@@ -926,7 +960,8 @@ fn measure_candidate(conn: &Connection, rig: &Rig, c: &Candidate) -> (MeasureRow
             }
         }
     }
-    (row, Some(m))
+    let kept = fits.map(|fits| FrameFits { fits, width, height });
+    (row, Some(m), kept)
 }
 
 // ---------------------------------------------------------------------------
@@ -988,7 +1023,7 @@ fn cmd_measure(mut args: Args) -> Result<()> {
             writeln!(w, "{}", unmeasured_row(c, "no_solve").to_tsv())?;
             continue;
         }
-        let (row, _) = measure_candidate(&conn, &rig, c);
+        let (row, _, _) = measure_candidate(&conn, &rig, c, false);
         if row.zero_point.is_none() {
             refused += 1;
         }
@@ -1008,11 +1043,22 @@ fn cmd_measure(mut args: Args) -> Result<()> {
     Ok(())
 }
 
+/// The fit's flag columns: `saturated`, `extended`, `flags`.
+fn flag_fields(f: &StarFit) -> String {
+    format!(
+        "{}\t{}\t{}",
+        u8::from(f.flags.saturated()),
+        u8::from(f.flags.extended()),
+        f.flags.names().join("+")
+    )
+}
+
 fn cmd_stars(mut args: Args) -> Result<()> {
     let db = args.require("db")?;
     let app_data = args.require("app-data")?;
     let frame: i64 = args.take_parsed("frame")?.ok_or_else(|| anyhow!("missing --frame"))?;
     let out = args.require("out")?;
+    let all_out = args.take("all-out");
     let params = args.zp_params()?;
     args.finish()?;
 
@@ -1022,25 +1068,72 @@ fn cmd_stars(mut args: Args) -> Result<()> {
     if c.in_zip || !Path::new(&c.path).is_file() {
         bail!("frame {frame}: file {} is in a zip or missing", c.path);
     }
-    let (row, m) = measure_candidate(&conn, &rig, &c);
+    let (row, m, kept) = measure_candidate(&conn, &rig, &c, true);
     let mut w = create_out(&out)?;
-    writeln!(w, "frame_id\tg_mag\tzp\tradius_fraction\tmatch_px\tkept")?;
-    if let Some(m) = &m {
+    writeln!(
+        w,
+        "frame_id\tg_mag\tzp\tradius_fraction\tmatch_px\tkept\tsaturated\textended\tflags\tpeak\tbackground\tsnr\tfwhm\tflux"
+    )?;
+    let mut matched_idx: HashSet<usize> = HashSet::new();
+    let mut matched_saturated = 0usize;
+    if let (Some(m), Some(k)) = (&m, &kept) {
         for s in &m.per_star {
+            let f = k
+                .fits
+                .get(s.star_index)
+                .ok_or_else(|| anyhow!("star_index {} outside the {} fits", s.star_index, k.fits.len()))?;
+            matched_idx.insert(s.star_index);
+            matched_saturated += usize::from(f.flags.saturated());
             writeln!(
                 w,
-                "{frame}\t{:.3}\t{:.5}\t{:.4}\t{:.4}\t{}",
+                "{frame}\t{:.3}\t{:.5}\t{:.4}\t{:.4}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.4}\t{:.3}",
                 s.g_mag,
                 s.zp,
                 s.radius_fraction,
                 s.match_px,
-                u8::from(s.kept)
+                u8::from(s.kept),
+                flag_fields(f),
+                f.amplitude,
+                f.background,
+                f.snr,
+                f.fwhm(),
+                f.signal
             )?;
         }
     }
     w.flush()?;
+
+    if let Some(path) = &all_out {
+        let mut aw = create_out(path)?;
+        writeln!(
+            aw,
+            "star_index\tx\ty\tsaturated\textended\tflags\tpeak\tsnr\tfwhm\tflux\tmatched"
+        )?;
+        if let Some(k) = &kept {
+            let centre = ((k.width as f64 - 1.0) / 2.0, (k.height as f64 - 1.0) / 2.0);
+            let region = rig.params.central_fraction * 0.5 * (k.width as f64).hypot(k.height as f64);
+            for (i, f) in k.fits.iter().enumerate() {
+                if (f.x - centre.0).hypot(f.y - centre.1) > region {
+                    continue;
+                }
+                writeln!(
+                    aw,
+                    "{i}\t{:.3}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}",
+                    f.x,
+                    f.y,
+                    flag_fields(f),
+                    f.amplitude,
+                    f.snr,
+                    f.fwhm(),
+                    f.signal,
+                    u8::from(matched_idx.contains(&i))
+                )?;
+            }
+        }
+        aw.flush()?;
+    }
     eprintln!(
-        "zp_probe: frame {frame}: zero_point {} refusal {:?} matched {:?} kept {:?}; wrote {out}",
+        "zp_probe: frame {frame}: zero_point {} refusal {:?} matched {:?} kept {:?} matched_saturated {matched_saturated}; wrote {out}",
         num(row.zero_point, 4),
         row.refusal,
         row.matched,
