@@ -1220,7 +1220,7 @@ pub fn get_frame_set_detail(
 }
 
 /// What a light carries when the transparency read failed (display only, never an error of the detail command).
-const TRANSPARENCY_UNREADABLE: &str = "transparency could not be read";
+pub(crate) const TRANSPARENCY_UNREADABLE: &str = "transparency could not be read";
 
 /// The row value of a light whose transparency read failed: no numbers, the reason says so.
 fn unreadable_transparency() -> crate::models::Transparency {

@@ -179,7 +179,7 @@ pub(crate) fn zero_points_after_solve(ctx: &ServiceContext, frame_ids: &[i64]) {
 /// installed catalogue's identity) and logs one summary `info` line; with no catalogue installed it returns 0 at `debug`.
 #[cfg(feature = "solver")]
 pub fn backfill_zero_points(ctx: &ServiceContext) -> Result<usize, ApiError> {
-    use crate::analysis::zero_point::{catalog_cone, ensure_zero_points_with, stale_zero_point_frames};
+    use crate::analysis::zero_point::{catalog_cone, refresh_listed_with, stale_zero_point_frames, ZpPassStats};
     let started = std::time::Instant::now();
     let database = db(ctx)?;
     let Some(dir) = ctx.app_data_dir() else {
@@ -191,7 +191,8 @@ pub fn backfill_zero_points(ctx: &ServiceContext) -> Result<usize, ApiError> {
     };
     let span = tracing::info_span!("zero_point_backfill", catalog = %catalog.identity);
     let _guard = span.enter();
-    let (mut after, mut seen, mut stored) = (0_i64, 0_usize, 0_usize);
+    let (mut after, mut seen) = (0_i64, 0_usize);
+    let mut pass = ZpPassStats::default();
     loop {
         let conn = database.conn();
         let ids = stale_zero_point_frames(&conn, &catalog.identity, after, ZP_CHUNK)
@@ -199,32 +200,122 @@ pub fn backfill_zero_points(ctx: &ServiceContext) -> Result<usize, ApiError> {
         let Some(&last) = ids.last() else { break };
         after = last;
         seen += ids.len();
-        stored += ensure_zero_points_with(&conn, &catalog.identity, &ids, catalog_cone(&catalog.layers))
-            .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        // The cursor is keyed on the id and the ids come from the stale selection itself: each frame is read once per
+        // pass, with no currency check of its own.
+        pass.add(refresh_listed_with(&conn, &catalog.identity, &ids, catalog_cone(&catalog.layers)));
     }
     tracing::info!(
         frames = seen,
-        zp_measured = stored,
+        zp_measured = pass.stored,
         duration_ms = started.elapsed().as_millis() as u64,
         "zero point backfill done"
     );
-    Ok(stored)
+    pass.warn_if_unmeasurable("backfill");
+    Ok(pass.stored)
 }
 
-/// Run [`backfill_zero_points`] once per process on its own thread, off the UI path. A second call (the desktop's
-/// database init can run twice under StrictMode) does nothing. An error is logged at `warn`, never raised.
+/// What a request for a backfill should do, as [`BackfillGuard::request`] decides it.
+#[cfg(feature = "solver")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillRequest {
+    /// Start a backfill now.
+    Start,
+    /// One is running: it will run again for the newest catalogue when it ends.
+    Later,
+    /// A backfill already ran (or is running) for this catalogue identity: nothing to do.
+    Skip,
+}
+
+/// Which catalogue identities a backfill has started for, and whether one is running: one backfill at a time, none
+/// started twice for the same identity (the desktop's database init can run twice under StrictMode), and a second
+/// identity (a tier installed since) allowed. Pure, so the decision is testable without a thread.
+#[cfg(feature = "solver")]
+#[derive(Default)]
+struct BackfillGuard {
+    running: bool,
+    started: Vec<String>,
+    again: bool,
+}
+
+#[cfg(feature = "solver")]
+impl BackfillGuard {
+    const fn new() -> Self {
+        BackfillGuard { running: false, started: Vec::new(), again: false }
+    }
+
+    /// A backfill for the catalogue `identity` is wanted.
+    fn request(&mut self, identity: &str) -> BackfillRequest {
+        if self.started.iter().any(|i| i == identity) {
+            return BackfillRequest::Skip;
+        }
+        if self.running {
+            self.again = true;
+            return BackfillRequest::Later;
+        }
+        self.running = true;
+        self.started.push(identity.to_owned());
+        BackfillRequest::Start
+    }
+
+    /// The running backfill is done. `current` is the catalogue identity now installed: when a request came in meanwhile
+    /// and that identity has not been backfilled, the guard stays busy and this returns true (run again).
+    fn finish(&mut self, current: Option<&str>) -> bool {
+        let again = std::mem::take(&mut self.again);
+        match current {
+            Some(identity) if again && !self.started.iter().any(|i| i == identity) => {
+                self.started.push(identity.to_owned());
+                true
+            }
+            _ => {
+                self.running = false;
+                false
+            }
+        }
+    }
+}
+
+/// The identity of the installed star catalogue, `None` when there is none.
+#[cfg(feature = "solver")]
+fn installed_identity(ctx: &ServiceContext) -> Option<String> {
+    let dir = ctx.app_data_dir()?;
+    crate::analysis::transparency::installed_catalog_identity(&dir)
+}
+
+/// Run [`backfill_zero_points`] on its own thread, off the UI path: at startup, and again when a star-catalogue tier
+/// install finishes (a new catalogue identity makes every stored zero point stale). One backfill runs at a time and none
+/// starts twice for the same catalogue identity, so a second call for the same catalogue (the desktop's database init
+/// can run twice under StrictMode) does nothing. With no catalogue installed it does nothing. An error is logged at
+/// `warn`, never raised.
 #[cfg(feature = "solver")]
 pub fn spawn_zero_point_backfill(ctx: Arc<ServiceContext>) {
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::SeqCst) {
+    static GUARD: std::sync::Mutex<BackfillGuard> = std::sync::Mutex::new(BackfillGuard::new());
+    let lock = || GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(identity) = installed_identity(&ctx) else {
+        tracing::debug!("zero point backfill not started: no star catalogue installed");
         return;
+    };
+    match lock().request(&identity) {
+        BackfillRequest::Start => {}
+        BackfillRequest::Later => {
+            tracing::debug!(catalog = %identity, "zero point backfill queued behind the running one");
+            return;
+        }
+        BackfillRequest::Skip => return,
     }
-    let spawned = std::thread::Builder::new().name("zero-point-backfill".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("zero-point-backfill".into()).spawn(move || loop {
         if let Err(e) = backfill_zero_points(&ctx) {
             tracing::warn!(error = %e, "zero point backfill failed");
         }
+        let current = installed_identity(&ctx);
+        if !lock().finish(current.as_deref()) {
+            break;
+        }
     });
     if let Err(e) = spawned {
+        // Nothing runs: let the same identity be asked for again.
+        let mut guard = lock();
+        guard.running = false;
+        guard.started.retain(|i| i != &identity);
         tracing::warn!(error = %e, "zero point backfill thread did not start");
     }
 }
@@ -1178,5 +1269,38 @@ mod tests {
                 (None, None, None, None, None)
             );
         }
+    }
+
+    /// A tier installed since the first backfill is a new catalogue identity: it may start another backfill.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn a_new_catalogue_identity_allows_another_backfill() {
+        let mut guard = BackfillGuard::new();
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
+        assert!(!guard.finish(Some("tiers-a")), "nothing was asked meanwhile");
+        assert_eq!(guard.request("tiers-b"), BackfillRequest::Start, "a second identity after an install is allowed");
+
+        // One at a time: a request while one runs waits, and the running thread runs again for the newest identity.
+        assert_eq!(guard.request("tiers-c"), BackfillRequest::Later);
+        assert!(guard.finish(Some("tiers-c")), "the queued identity is backfilled next");
+        assert!(guard.running, "still busy: the second run owns the guard");
+        assert!(!guard.finish(Some("tiers-c")));
+        assert!(!guard.running);
+    }
+
+    /// StrictMode's double init (and an install of the tier already there) asks for the same identity twice.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn the_same_identity_does_not_start_twice() {
+        let mut guard = BackfillGuard::new();
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Skip, "while it runs");
+        assert!(!guard.finish(Some("tiers-a")));
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Skip, "and after it is done");
+        // A queued request for an identity that was backfilled meanwhile ends the run.
+        assert_eq!(guard.request("tiers-b"), BackfillRequest::Start);
+        assert_eq!(guard.request("tiers-c"), BackfillRequest::Later);
+        assert!(!guard.finish(Some("tiers-b")), "the current identity is the one just done");
+        assert!(!guard.running);
     }
 }

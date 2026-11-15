@@ -498,12 +498,6 @@ fn frame_gate_inputs(
         return Ok(Vec::new());
     }
     let ids: Vec<i64> = frames.iter().map(|(id, _)| *id).collect();
-    let mut transparency = gate_transparency(
-        conn,
-        project_id,
-        &ids,
-        crate::analysis::transparency::transparency_for_frames(conn, catalog, &ids),
-    );
     let placeholders = vec!["?"; ids.len()].join(",");
 
     // plate_solves: frame_id → (pixel_scale_arcsec, crval1, crval2)
@@ -557,6 +551,20 @@ fn frame_gate_inputs(
             rows_by_id.insert(id, fr);
         }
     }
+
+    // The transparency of every frame: one batch read, the frozen value of a frame this project published laid over it
+    // (found by the frame's id, or by its uuid while the own row is not yet bound to it).
+    let uuids: HashMap<i64, String> = rows_by_id
+        .iter()
+        .filter_map(|(id, f)| f.uuid.as_deref().map(|u| (*id, u.trim().to_string())))
+        .collect();
+    let mut transparency = gate_transparency(
+        conn,
+        project_id,
+        &ids,
+        &uuids,
+        crate::analysis::transparency::transparency_for_frames(conn, catalog, &ids),
+    );
 
     // analyses: frame_id → FrameAnalysis (frames without a row simply absent)
     let mut analyses: HashMap<i64, FrameAnalysis> = HashMap::new();
@@ -683,16 +691,24 @@ fn frame_gate_inputs(
     Ok(out)
 }
 
+/// The sentence of an own, published frame whose manifest holds no loss: the frame was published before transparency was
+/// measured, or by this build before its rig had a clear-sky reference.
+const PUBLISHED_WITHOUT_LOSS: &str = "published without a transparency value";
+
 /// What the gate and the My frames table know about each frame's transparency: `live` (the one batch read, or its
 /// error) with the frozen value of every frame this project already published laid over it (spec C5). A published
 /// frame is judged on the loss in its stored manifest (`meta.transparencyLoss`), never on today's reference; one whose
-/// manifest has no such key has no value and says `published before transparency was measured`. Its zero-point numbers
-/// stay the live stored ones. Never fails: a read error, an unreadable own-row set or an unparsable manifest is logged
-/// at `warn` and leaves the affected frames without a loss.
+/// manifest has no such key has no value and says [`PUBLISHED_WITHOUT_LOSS`]. Its zero-point numbers stay the live
+/// stored ones. The own row is found by the frame's id (`source_frame_id`), or, while the manifest sync got there before
+/// the publish run bound it (`source_frame_id` NULL), by the frame's uuid (`uuids`: frame id to trimmed uuid).
+/// Never fails: a read error or an unparsable manifest is logged at `warn` and leaves the affected frames without a
+/// loss; when the own rows cannot be read at all, every frame has no loss and says `transparency could not be read`
+/// (the live loss is never shown in place of a frozen one that cannot be looked up).
 fn gate_transparency(
     conn: &Connection,
     project_id: &str,
     ids: &[i64],
+    uuids: &HashMap<i64, String>,
     live: anyhow::Result<HashMap<i64, Transparency>>,
 ) -> HashMap<i64, Transparency> {
     let mut out = match live {
@@ -702,15 +718,28 @@ fn gate_transparency(
             HashMap::new()
         }
     };
-    let own = match crate::db::collab_frames::own_by_source_frame(conn, project_id) {
+    let own = crate::db::collab_frames::own_by_source_frame(conn, project_id)
+        .and_then(|bound| crate::db::collab_frames::own_unbound_by_uuid(conn, project_id).map(|unbound| (bound, unbound)));
+    let (bound, unbound) = match own {
         Ok(own) => own,
         Err(e) => {
-            tracing::warn!(project_id, error = %format!("{e:#}"), "gate transparency: own rows unreadable; published frames show the live loss");
+            tracing::warn!(project_id, frames = ids.len(), error = %format!("{e:#}"), "gate transparency: own rows unreadable; frames have no loss value");
+            for id in ids {
+                let entry = out.entry(*id).or_insert_with(Transparency::unmeasured);
+                entry.loss_mag = None;
+                entry.reason = Some(crate::api::frame_sets::TRANSPARENCY_UNREADABLE.to_string());
+            }
             return out;
         }
     };
-    let wanted: HashSet<i64> = ids.iter().copied().collect();
-    for (frame_id, row) in own.iter().filter(|(id, _)| wanted.contains(id)) {
+    for frame_id in ids {
+        let row = bound.get(frame_id).or_else(|| {
+            uuids
+                .get(frame_id)
+                .filter(|u| !u.is_empty())
+                .and_then(|u| unbound.get(u))
+        });
+        let Some(row) = row else { continue };
         let frozen = match crate::collab::frame_meta::parse_project_frame_meta(&row.manifest_json) {
             Ok(meta) => meta.transparency_loss,
             Err(e) => {
@@ -722,7 +751,7 @@ fn gate_transparency(
         entry.loss_mag = frozen;
         entry.reason = match frozen {
             Some(_) => None,
-            None => Some("published before transparency was measured".to_string()),
+            None => Some(PUBLISHED_WITHOUT_LOSS.to_string()),
         };
     }
     out
@@ -737,20 +766,78 @@ fn gate_app_data_dir(conn: &Connection) -> Option<std::path::PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Trigger (c) of the zero point (wave 6.5): before the gate reads transparency, measure the frames among `ids` whose
-/// zero point is not current. Returns the installed catalogue's identity, `None` when no catalogue is installed (the gate
-/// then proceeds without losses; `debug`, said by the catalogue open). Never fails: an error is a `warn`.
-fn ensure_gate_zero_points(conn: &Connection, project_id: &str, ids: &[i64]) -> Option<String> {
+/// The most frames one gate call measures inline. The rest keep `not measured yet` until the startup backfill (or a new
+/// analysis or solve) reaches them: a gate is an interactive call, not a batch job.
+const GATE_INLINE_ZERO_POINTS: usize = 200;
+
+/// Whether the project's current rules judge transparency: only then does the gate measure anything inline.
+fn rules_judge_transparency(rules: &[ThresholdRuleView]) -> bool {
+    rules.iter().any(|r| r.metric_key == "transparency_loss")
+}
+
+/// Trigger (c) of the zero point (wave 6.5), bounded: when the project's rules contain `transparency_loss`, measure the
+/// frames among `ids` whose zero point is not current against `catalog` (the installed catalogue's identity), at most
+/// [`GATE_INLINE_ZERO_POINTS`] of them, `open_cone` being asked for the catalogue reader only when there is something to
+/// measure. The stale frames are ONE chunked selection over `ids`, never a check per frame. A frame that cannot be
+/// measured is a `debug` line of its own; the pass says one `warn` with the count. Returns how many frames wrote a row.
+/// Never fails.
+fn measure_gate_stale_with<F, G>(
+    conn: &Connection,
+    project_id: &str,
+    catalog: &str,
+    ids: &[i64],
+    rules: &[ThresholdRuleView],
+    open_cone: G,
+) -> usize
+where
+    G: FnOnce() -> Option<F>,
+    F: FnMut(
+        &solvemyastro::WcsSolution,
+        usize,
+        usize,
+        f64,
+        f64,
+    ) -> anyhow::Result<Vec<solvemyastro::CatalogStar>>,
+{
+    if ids.is_empty() || !rules_judge_transparency(rules) {
+        return 0;
+    }
+    let mut stale = match crate::analysis::zero_point::stale_among_frames(conn, catalog, ids) {
+        Ok(stale) => stale,
+        Err(e) => {
+            tracing::warn!(project_id, frames = ids.len(), error = %format!("{e:#}"), "gate: stale zero point selection failed");
+            return 0;
+        }
+    };
+    if stale.is_empty() {
+        return 0;
+    }
+    let frames = stale.len();
+    stale.truncate(GATE_INLINE_ZERO_POINTS);
+    let Some(cone) = open_cone() else { return 0 };
+    let stats = crate::analysis::zero_point::refresh_listed_with(conn, catalog, &stale, cone);
+    tracing::debug!(project_id, frames, zp_measured = stats.stored, "gate zero points measured");
+    stats.warn_if_unmeasurable("gate");
+    stats.stored
+}
+
+/// Before the gate reads transparency: the installed catalogue's identity (`None` when none is installed: the gate then
+/// proceeds without losses; `debug`, said by the catalogue open) and, when `rules` judge transparency, the bounded
+/// inline measurement of [`measure_gate_stale_with`]. Never fails.
+fn ensure_gate_zero_points(
+    conn: &Connection,
+    project_id: &str,
+    ids: &[i64],
+    rules: &[ThresholdRuleView],
+) -> Option<String> {
     let dir = gate_app_data_dir(conn)?;
     let identity = crate::analysis::transparency::installed_catalog_identity(&dir)?;
-    if ids.is_empty() {
-        return Some(identity);
-    }
-    if let Some(catalog) = crate::analysis::zero_point::zero_point_catalog(&dir) {
-        if let Err(e) = crate::analysis::zero_point::ensure_zero_points(conn, &catalog, ids) {
-            tracing::warn!(project_id, frames = ids.len(), error = %format!("{e:#}"), "gate: zero point trigger failed");
-        }
-    }
+    measure_gate_stale_with(conn, project_id, &identity, ids, rules, || {
+        let catalog = crate::analysis::zero_point::zero_point_catalog(&dir)?;
+        Some(move |wcs: &solvemyastro::WcsSolution, w: usize, h: usize, central: f64, epoch: f64| {
+            crate::analysis::zero_point::catalog_cone(&catalog.layers)(wcs, w, h, central, epoch)
+        })
+    });
     Some(identity)
 }
 
@@ -1105,7 +1192,7 @@ fn project_gate(
         .collect();
 
     let frame_ids: Vec<i64> = frames.iter().map(|(id, _)| *id).collect();
-    let catalog = ensure_gate_zero_points(conn, project_id, &frame_ids);
+    let catalog = ensure_gate_zero_points(conn, project_id, &frame_ids, &rules);
     let inputs = frame_gate_inputs(
         conn,
         project_id,
@@ -6994,7 +7081,7 @@ pub(crate) mod tests {
         let ids = [frames[0], frames[1]];
         let live: HashMap<i64, Transparency> =
             ids.iter().map(|id| (*id, live_transparency(0.90))).collect();
-        let mut got = gate_transparency(&conn, "p-1", &ids, Ok(live));
+        let mut got = gate_transparency(&conn, "p-1", &ids, &HashMap::new(), Ok(live));
 
         // The unpublished frame keeps its live loss; the published one takes the manifest's, with the live numbers.
         assert_eq!(got[&frames[1]].loss_mag, Some(0.90));
@@ -7021,10 +7108,10 @@ pub(crate) mod tests {
         let (_set, frames) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 1);
         seed_own_row(&conn, "p-1", "u-old", frames[0], "published", None, true);
         let live = HashMap::from([(frames[0], live_transparency(0.90))]);
-        let got = gate_transparency(&conn, "p-1", &frames, Ok(live));
+        let got = gate_transparency(&conn, "p-1", &frames, &HashMap::new(), Ok(live));
         let t = &got[&frames[0]];
         assert_eq!(t.loss_mag, None, "the live 0.90 is not used for a published frame");
-        assert_eq!(t.reason.as_deref(), Some("published before transparency was measured"));
+        assert_eq!(t.reason.as_deref(), Some("published without a transparency value"));
         assert_eq!(t.zero_point, Some(21.5), "the live zero point still shows");
 
         let rules: Vec<ThresholdRuleView> =
@@ -7032,7 +7119,7 @@ pub(crate) mod tests {
         let target = ProjectTarget { ra_deg: 210.8, dec_deg: 54.35, radius_deg: 1.5 };
         let row = evaluate_frame(&gate_input_with(Some(t.clone())), &target, &rules);
         assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
-        assert_eq!(row.rules[0].reason.as_deref(), Some("published before transparency was measured"));
+        assert_eq!(row.rules[0].reason.as_deref(), Some("published without a transparency value"));
         // The rule adds no failure: the only one is this bare input's own missing analysis.
         assert_eq!(row.failures, vec!["no analysis".to_string()]);
     }
@@ -7060,34 +7147,26 @@ pub(crate) mod tests {
         assert_eq!((of(frames[0]).loss_mag, of(frames[0]).reason), (Some(0.2), None));
         assert_eq!(
             (of(frames[1]).loss_mag, of(frames[1]).reason.as_deref()),
-            (None, Some("published before transparency was measured"))
+            (None, Some("published without a transparency value"))
         );
         // An unpublished frame with no zero point: no loss, and a sentence saying why.
         assert_eq!(of(frames[2]).loss_mag, None);
         assert!(of(frames[2]).reason.is_some());
     }
 
-    /// A failed transparency read (or an unreadable catalogue) never fails the gate: the frames have no loss and every
-    /// verdict is what it would be without the rule.
+    /// No catalogue installed: the gate has no loss for anyone, the rule is listed without a value and blocks nothing
+    /// beyond what the other preconditions already say.
     #[test]
-    fn a_transparency_error_does_not_fail_the_gate() {
+    fn no_catalogue_does_not_fail_the_gate() {
         let (_tmp, ctx) = test_ctx();
         let (set_id, frames) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             cached_project(&conn);
             sign_in_as(&conn, "me@example.org");
             lte_rule_project(&conn, 0.5);
-            let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 2);
-            (set_id, ids)
+            seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 2)
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
-        let conn = crate::api::db(&ctx).unwrap().conn();
-        let ids = frames.clone();
-        let got = gate_transparency(&conn, "p-1", &ids, Err(anyhow::anyhow!("no such table: frame_analysis")));
-        assert!(got.is_empty(), "no entry: no loss value");
-
-        // And the gate over the same project, end to end: no catalogue installed, the rule is listed without a value
-        // and blocks nothing beyond what the other preconditions already say.
         let with_rule = evaluate_project_gate(&ctx, "p-1").unwrap();
         for id in &frames {
             let row = row_of(&with_rule, *id);
@@ -7096,6 +7175,7 @@ pub(crate) mod tests {
             assert!(row.rules[0].reason.is_some());
             assert!(!row.failures.iter().any(|f| f.contains("Transparency")), "{:?}", row.failures);
         }
+        let conn = crate::api::db(&ctx).unwrap().conn();
         conn.execute("UPDATE collab_projects SET thresholds_rules_json = '[]' WHERE project_id = 'p-1'", []).unwrap();
         drop(conn);
         let without_rule = evaluate_project_gate(&ctx, "p-1").unwrap();
@@ -7103,6 +7183,205 @@ pub(crate) mod tests {
             let (a, b) = (row_of(&with_rule, *id), row_of(&without_rule, *id));
             assert_eq!((a.publishable, a.failures), (b.publishable, b.failures));
         }
+    }
+
+    /// A transparency read that really fails (the frames table loses a column the read selects and the gate's own reads
+    /// do not) never fails the gate: the frames have no loss and every verdict is what it would be without the rule.
+    #[test]
+    fn a_transparency_error_does_not_fail_the_gate() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            lte_rule_project(&conn, 0.5);
+            seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 2)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let ids = frames.clone();
+        // The read itself: an `Err`, not an empty answer.
+        conn.execute("ALTER TABLE frames DROP COLUMN telescop", []).unwrap();
+        let read = crate::analysis::transparency::transparency_for_frames(&conn, Some("any"), &ids);
+        assert!(read.is_err(), "the read selects frames.telescop: {read:?}");
+        let got = gate_transparency(&conn, "p-1", &ids, &HashMap::new(), read);
+        assert!(got.is_empty(), "no entry: no loss value");
+        drop(conn);
+
+        // And the gate over the same project, end to end: the rule is listed without a value.
+        let with_rule = evaluate_project_gate(&ctx, "p-1").unwrap();
+        for id in &frames {
+            let row = row_of(&with_rule, *id);
+            assert_eq!(row.rules.len(), 1);
+            assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
+            assert!(row.rules[0].reason.is_some());
+            assert!(!row.failures.iter().any(|f| f.contains("Transparency")), "{:?}", row.failures);
+        }
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        conn.execute("UPDATE collab_projects SET thresholds_rules_json = '[]' WHERE project_id = 'p-1'", []).unwrap();
+        drop(conn);
+        let without_rule = evaluate_project_gate(&ctx, "p-1").unwrap();
+        for id in &frames {
+            let (a, b) = (row_of(&with_rule, *id), row_of(&without_rule, *id));
+            assert_eq!((a.publishable, a.failures), (b.publishable, b.failures));
+        }
+    }
+
+    /// Own rows that cannot be read: the frames have no loss and say so; the live loss is never shown in place of a
+    /// frozen one that cannot be looked up.
+    #[test]
+    fn unreadable_own_rows_fail_safe() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let (_set, frames) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 2);
+        conn.execute("DROP TABLE project_frames_local", []).unwrap();
+        let live: HashMap<i64, Transparency> = frames.iter().map(|id| (*id, live_transparency(0.90))).collect();
+        let got = gate_transparency(&conn, "p-1", &frames, &HashMap::new(), Ok(live));
+        for id in &frames {
+            let t = &got[id];
+            assert_eq!(t.loss_mag, None, "not the live 0.90");
+            assert_eq!(t.reason.as_deref(), Some("transparency could not be read"));
+            assert_eq!(t.zero_point, Some(21.5), "the live zero point still shows");
+        }
+        let rules: Vec<ThresholdRuleView> =
+            serde_json::from_str(r#"[{"metricKey":"transparency_loss","op":"lte","value":0.5}]"#).unwrap();
+        let target = ProjectTarget { ra_deg: 210.8, dec_deg: 54.35, radius_deg: 1.5 };
+        let row = evaluate_frame(&gate_input_with(Some(got[&frames[0]].clone())), &target, &rules);
+        assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
+        assert_eq!(row.failures, vec!["no analysis".to_string()], "judged by nothing, blocked by nothing");
+    }
+
+    /// The manifest sync can record an own row before the publish run binds it to its local frame
+    /// (`source_frame_id` NULL): the frame is found by its uuid and judged on the loss the hub froze.
+    #[test]
+    fn an_unbound_own_row_is_still_judged_on_its_published_loss() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let (_set, frames) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 2);
+        let uuid = "uuid-seed-M101-0";
+        seed_own_row_with_meta(
+            &conn, "p-1", uuid, frames[0], "published", None, true,
+            serde_json::json!({"transparencyLoss": 0.40}),
+        );
+        conn.execute("UPDATE project_frames_local SET source_frame_id = NULL WHERE frame_uuid = ?1", [uuid]).unwrap();
+        let uuids: HashMap<i64, String> = HashMap::from([(frames[0], uuid.to_string()), (frames[1], "uuid-seed-M101-1".into())]);
+        let live: HashMap<i64, Transparency> = frames.iter().map(|id| (*id, live_transparency(0.60))).collect();
+        let mut got = gate_transparency(&conn, "p-1", &frames, &uuids, Ok(live));
+        assert_eq!(got[&frames[1]].loss_mag, Some(0.60), "an unpublished frame keeps its live loss");
+        let published = got.remove(&frames[0]).unwrap();
+        assert_eq!((published.loss_mag, published.reason.clone()), (Some(0.40), None));
+
+        let rules: Vec<ThresholdRuleView> =
+            serde_json::from_str(r#"[{"metricKey":"transparency_loss","op":"lte","value":0.5}]"#).unwrap();
+        let target = ProjectTarget { ra_deg: 210.8, dec_deg: 54.35, radius_deg: 1.5 };
+        let row = evaluate_frame(&gate_input_with(Some(published)), &target, &rules);
+        assert_eq!(row.rules[0].value.as_deref(), Some("0.40 mag"));
+        assert_eq!(row.rules[0].pass, Some(true), "0.60 live would have failed; 0.40 published passes");
+        assert!(!row.failures.iter().any(|f| f.contains("Transparency")), "{:?}", row.failures);
+    }
+
+    /// Stale frames for the inline-measure tests: `n` lights with a current analysis (no stars) and a solve.
+    fn seed_stale_zero_points(conn: &rusqlite::Connection, n: usize) -> Vec<i64> {
+        let (_set, frames) = seed_set(conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, n);
+        conn.execute(
+            "UPDATE frame_analysis SET measure_version = ?1, stars_detected = 0",
+            [crate::star_measure::MEASURE_VERSION],
+        )
+        .unwrap();
+        for id in &frames {
+            seed_plate_solve(conn, *id, 1.0, 210.8, 54.35);
+        }
+        frames
+    }
+
+    fn zp_rows_for(conn: &rusqlite::Connection, catalog: &str) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM frame_analysis WHERE zp_catalog = ?1", [catalog], |r| r.get(0)).unwrap()
+    }
+
+    /// Without `transparency_loss` among the project's rules the gate measures nothing inline (the backfill fills the
+    /// column) and does not even open the catalogue.
+    #[test]
+    fn a_project_without_the_rule_measures_nothing_in_the_gate() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let frames = seed_stale_zero_points(&conn, 5);
+        let opened = std::cell::Cell::new(false);
+        let calls = std::cell::Cell::new(0_usize);
+        let no_rules: Vec<ThresholdRuleView> = Vec::new();
+        let other: Vec<ThresholdRuleView> =
+            serde_json::from_str(r#"[{"metricKey":"fwhm_arcsec","op":"lte","value":3.0}]"#).unwrap();
+        for rules in [&no_rules, &other] {
+            let n = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, rules, || {
+                opened.set(true);
+                Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| {
+                    calls.set(calls.get() + 1);
+                    Ok(Vec::new())
+                })
+            });
+            assert_eq!(n, 0);
+        }
+        assert!(!opened.get(), "the catalogue is not opened");
+        assert_eq!((calls.get(), zp_rows_for(&conn, "TEST")), (0, 0));
+
+        // The same frames with the rule are measured.
+        let with_rule: Vec<ThresholdRuleView> =
+            serde_json::from_str(r#"[{"metricKey":"transparency_loss","op":"lte","value":0.5}]"#).unwrap();
+        let n = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, &with_rule, || {
+            Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| {
+                calls.set(calls.get() + 1);
+                Ok(Vec::new())
+            })
+        });
+        assert_eq!((n, calls.get(), zp_rows_for(&conn, "TEST")), (5, 5, 5));
+    }
+
+    /// 250 stale frames and the rule: 200 are measured, 50 keep `not measured yet`, and the gate returns Ok.
+    #[test]
+    fn the_gate_measures_at_most_its_inline_limit() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            lte_rule_project(&conn, 0.5);
+            let frames = seed_stale_zero_points(&conn, 250);
+            let set_id: i64 = conn.query_row("SELECT id FROM frames_set LIMIT 1", [], |r| r.get(0)).unwrap();
+            (set_id, frames)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let rules: Vec<ThresholdRuleView> =
+            serde_json::from_str(r#"[{"metricKey":"transparency_loss","op":"lte","value":0.5}]"#).unwrap();
+        let calls = std::cell::Cell::new(0_usize);
+        let measured = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, &rules, || {
+            Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| {
+                calls.set(calls.get() + 1);
+                Ok(Vec::new())
+            })
+        });
+        assert_eq!((measured, calls.get(), zp_rows_for(&conn, "TEST")), (200, 200, 200));
+
+        // The 50 beyond the limit (the highest ids: the selection is in id order) are still `not measured yet`.
+        let read = crate::analysis::transparency::transparency_for_frames(&conn, Some("TEST"), &frames).unwrap();
+        let unmeasured: Vec<&i64> = frames
+            .iter()
+            .filter(|id| read[id].reason.as_deref() == Some("zero point not measured yet — the star catalogue may not be installed"))
+            .collect();
+        assert_eq!(unmeasured.len(), 50);
+        assert!(unmeasured.iter().all(|id| frames[200..].contains(id)));
+        // The next gate call picks up the next 200 (here: the 50 left).
+        let again = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, &rules, || {
+            Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| Ok(Vec::new()))
+        });
+        assert_eq!(again, 50);
+        drop(conn);
+
+        // The gate itself returns Ok over all 250 (no catalogue is installed in this context, so it measures nothing).
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(report.total, 250);
     }
 
     /// The announce path takes the loss from a map read ONCE for the batch: `build_frame_meta_with` and
@@ -10047,6 +10326,101 @@ pub(crate) mod tests {
                     .all(|(m, _, _)| m != "PUT"),
                 "no holder report for implicit claims"
             );
+            drop(fx.tmp);
+        }
+
+        /// Wave 6.5: a real publish pass announces the loss. A seeded rig reference (30 frames over two sky nights), one
+        /// new frame with a current zero point and one without: the announced meta and the recorded own row's manifest
+        /// carry `transparencyLoss` for the first and no such key for the second.
+        #[tokio::test]
+        async fn a_publish_pass_announces_the_transparency_loss() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            // An installed catalogue is only its tier file for the identity (the pass stats it, never opens it).
+            let root = fx.tmp.path().join("catalogs").join("smac_gaia");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("stars.smac"), b"x").unwrap();
+            let identity = crate::analysis::transparency::installed_catalog_identity(fx.tmp.path())
+                .expect("the dummy tier is an installed catalogue");
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                let v = crate::star_measure::MEASURE_VERSION;
+                // The two new frames: solved, analysed at the current version; only the first has a zero point.
+                for (i, id) in fx.frame_ids.iter().enumerate() {
+                    seed_plate_solve(&conn, *id, 0.78, 10.68, 41.27);
+                    conn.execute("UPDATE frame_analysis SET measure_version = ?1 WHERE frame_id = ?2", rusqlite::params![v, id]).unwrap();
+                    if i == 0 {
+                        conn.execute(
+                            "UPDATE frame_analysis SET zero_point = 21.0, zp_stars = 60, zp_sigma = 0.03, zp_version = ?1, zp_catalog = ?2 \
+                             WHERE frame_id = ?3",
+                            rusqlite::params![crate::analysis::zero_point::ZP_VERSION, identity, id],
+                        )
+                        .unwrap();
+                    }
+                }
+                // The rig's reference: 30 frames of the same rig, 15 on each of two sky nights, zero point 21.5.
+                conn.execute("INSERT INTO frames_set (name) VALUES ('Reference')", []).unwrap();
+                let set = conn.last_insert_rowid();
+                for night in 0..2 {
+                    conn.execute(
+                        "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) VALUES (?1, ?2, ?2)",
+                        rusqlite::params![set, format!("2026-06-1{night}T22:00:00Z")],
+                    )
+                    .unwrap();
+                    let night_id = conn.last_insert_rowid();
+                    conn.execute("INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')", [night_id]).unwrap();
+                    let session = conn.last_insert_rowid();
+                    for k in 0..15 {
+                        let n = night * 15 + k;
+                        conn.execute(
+                            "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, ?2, 10, '2026-06-10', 'FITS')",
+                            rusqlite::params![format!("/ref/R_{n}.fits"), format!("R_{n}.fits")],
+                        )
+                        .unwrap();
+                        let file_id = conn.last_insert_rowid();
+                        conn.execute(
+                            "INSERT INTO frames (file_id, imagetyp, instrume, focallen, filter) VALUES (?1, 'Light', 'ASI2600MM', 1000.0, 'L')",
+                            [file_id],
+                        )
+                        .unwrap();
+                        let frame_id = conn.last_insert_rowid();
+                        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)", [session, frame_id]).unwrap();
+                        conn.execute(
+                            "INSERT INTO frame_analysis \
+                             (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity, median_snr, \
+                              median_hfr, frame_snr, snr_weight, psf_signal, background, noise, \
+                              detection_threshold, width, height, source_channels, trail_r_squared, possibly_trailed, \
+                              measure_version, zero_point, zp_version, zp_catalog) \
+                             VALUES (?1, ?2, 400, 2.0, 0.4, 10.0, 2.0, 10.0, 1.0, 100.0, 10.0, 1.0, 5.0, \
+                                     512, 512, 1, 0.0, 0, ?3, 21.5, ?4, ?5)",
+                            rusqlite::params![frame_id, file_id, v, crate::analysis::zero_point::ZP_VERSION, identity],
+                        )
+                        .unwrap();
+                        seed_plate_solve(&conn, frame_id, 0.78, 10.68, 41.27);
+                    }
+                }
+            }
+
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!((res.announced, res.updated, res.unchanged), (2, 0, 0), "{res:?}");
+            assert!(res.held_back.is_empty(), "{:?}", res.held_back);
+
+            let bodies = announce_bodies(&fx.server).await;
+            assert_eq!(bodies.len(), 1, "one batch");
+            let frames = bodies[0]["frames"].as_array().unwrap();
+            let meta_of = |uuid: &str| {
+                frames.iter().find(|f| f["frameUuid"] == uuid).unwrap_or_else(|| panic!("{uuid} announced: {frames:?}"))["meta"].clone()
+            };
+            assert_eq!(meta_of(&fx.uuids[0])["transparencyLoss"].as_f64(), Some(0.5), "21.5 reference - 21.0 zero point");
+            assert!(meta_of(&fx.uuids[1]).get("transparencyLoss").is_none(), "no zero point: no key");
+
+            // The own row recorded after the announce carries the same manifest.
+            let manifest = |uuid: &str| -> serde_json::Value {
+                serde_json::from_str(&own_row(&fx, uuid).expect("own row recorded").manifest_json).unwrap()
+            };
+            assert_eq!(manifest(&fx.uuids[0])["meta"]["transparencyLoss"].as_f64(), Some(0.5));
+            assert!(manifest(&fx.uuids[1])["meta"].get("transparencyLoss").is_none());
             drop(fx.tmp);
         }
 

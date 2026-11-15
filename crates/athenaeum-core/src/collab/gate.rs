@@ -177,8 +177,12 @@ pub struct FrameGateRow {
 /// Evaluate one frame against the project target and threshold rules (spec §4).
 ///
 /// Layer 1 (preconditions) is always evaluated and every failure is recorded.
-/// Layer 2 (rules) runs only for metrics whose inputs exist; a missing input
-/// means the layer-1 failure already blocks, so the rule is silently skipped.
+/// Layer 2 (rules) is listed for every metric the function understands. For
+/// the metrics whose input is also a layer-1 precondition (analysis, pixel
+/// scale) a missing input is already blocked there and the rule shows no
+/// value. For `transparency_loss` a missing loss is NOT a layer-1 failure:
+/// the rule is listed with no value, `pass: None` and the transparency's own
+/// `reason`, and the frame is neither judged nor blocked by it.
 pub fn evaluate_frame(
     input: &GateFrameInput,
     target: &ProjectTarget,

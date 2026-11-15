@@ -53,8 +53,11 @@ struct CatalogDownloadProgress {
 /// root path. Runs the download on a blocking thread and emits
 /// `catalog-download-progress` through `emitter`. The cancel flag is local to
 /// the call and registered nowhere, so the download cannot be cancelled.
+///
+/// A finished install is a new catalogue identity, so every stored zero point is stale: the zero-point backfill is
+/// started again (it does nothing when one already ran for this identity, or none is installed).
 pub async fn download_catalog_layers(
-    ctx: &ServiceContext,
+    ctx: &Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
     target_density: u32,
 ) -> Result<String, ApiError> {
@@ -112,9 +115,12 @@ pub async fn download_catalog_layers(
     .await
     .map_err(|e| ApiError::Internal(format!("download task panicked: {e}")))?;
 
-    result
+    let root = result
         .map(|p| p.display().to_string())
-        .map_err(|e| ApiError::Internal(e.to_string()))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    #[cfg(feature = "solver")]
+    crate::api::analysis::spawn_zero_point_backfill(Arc::clone(ctx));
+    Ok(root)
 }
 
 /// Download and install the named quad-index packs into the app-data directory

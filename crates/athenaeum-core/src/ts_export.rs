@@ -149,7 +149,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::ExcludedFrameRow,
             crate::models::FrameAnalysis,
             crate::models::FrameVerdict,
-            crate::analysis::transparency::Transparency,
+            crate::models::Transparency,
             crate::models::CalibrationMetadataEdits,
             crate::models::StarMetric,
             crate::models::StarMetricsResponse,

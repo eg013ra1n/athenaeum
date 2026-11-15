@@ -616,12 +616,16 @@ where
     let Some(solve_id) = record.id else {
         return Ok(ZpStatus::NotReady(NotReady::NoSolve));
     };
-    let Some(wcs) = record.to_solution() else {
-        // `to_solution` has already said why, at `warn`.
-        return Ok(ZpStatus::NotReady(NotReady::UnreadableSolve));
+    // A frame whose solve cannot be read is said once per pass by the caller (a count at `warn`), not once per frame.
+    let wcs = match record.try_solution() {
+        Ok(wcs) => wcs,
+        Err(why) => {
+            tracing::debug!(frame_id, reason = %why, "zero point not measured: the solve cannot be read");
+            return Ok(ZpStatus::NotReady(NotReady::UnreadableSolve));
+        }
     };
     if wcs.sip_forward.is_some() && wcs.sip_reverse.is_none() {
-        tracing::warn!(frame_id, "solve has a forward SIP and no reverse one; the zero point is not measured");
+        tracing::debug!(frame_id, "zero point not measured: the solve has a forward SIP and no reverse one");
         return Ok(ZpStatus::NotReady(NotReady::UnreadableSolve));
     }
 
@@ -706,36 +710,100 @@ fn needs_refresh(conn: &Connection, frame_id: i64, catalog: &str) -> Result<bool
     Ok(n > 0)
 }
 
-/// Refresh each of `frame_ids` (`only_stale`: only those that are not current). A frame whose refresh fails is logged at
-/// `warn` with its id and left as it was; the rest go on. Returns how many frames wrote a row.
-fn refresh_many_with<F>(
-    conn: &Connection,
-    catalog: &str,
-    frame_ids: &[i64],
-    only_stale: bool,
-    mut cone: F,
-) -> Result<usize>
+/// What one pass over many frames did, for the single line it says at the end (never a line per frame).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZpPassStats {
+    /// Frames that wrote a row (a value, a refusal or a colour-camera mark).
+    pub stored: usize,
+    /// Frames whose solve cannot be read: nothing stored, `debug` per frame.
+    pub unreadable: usize,
+    /// Frames whose check or refresh failed (a database or catalogue error): left as they were, `debug` per frame.
+    pub failed: usize,
+    /// The first failure's text, for the pass's one `warn`.
+    pub first_error: Option<String>,
+}
+
+impl ZpPassStats {
+    /// Fold the stats of another chunk into this pass.
+    pub fn add(&mut self, other: ZpPassStats) {
+        self.stored += other.stored;
+        self.unreadable += other.unreadable;
+        self.failed += other.failed;
+        if self.first_error.is_none() {
+            self.first_error = other.first_error;
+        }
+    }
+
+    /// The pass's one `warn`: the count of frames that could not be measured, when there are any. `pass` names the
+    /// caller (`backfill`, `gate`, `trigger`).
+    pub fn warn_if_unmeasurable(&self, pass: &'static str) {
+        let skipped = self.unreadable + self.failed;
+        if skipped > 0 {
+            tracing::warn!(
+                pass,
+                frames = skipped,
+                zp_unreadable = self.unreadable,
+                zp_failed = self.failed,
+                error = self.first_error.as_deref(),
+                "zero point: frames could not be measured and were skipped"
+            );
+        }
+    }
+}
+
+/// Refresh each of `frame_ids` (`only_stale`: only those that are not current). A frame whose refresh fails is counted,
+/// logged at `debug` with its id and left as it was; the rest go on. Each frame is read once. Says nothing at `warn`:
+/// the caller prints [`ZpPassStats::warn_if_unmeasurable`] once for its whole pass.
+fn refresh_many_stats<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], only_stale: bool, mut cone: F) -> ZpPassStats
 where
     F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
 {
-    let mut stored = 0;
+    let mut stats = ZpPassStats::default();
+    let failed = |stats: &mut ZpPassStats, frame_id: i64, e: anyhow::Error, what: &'static str| {
+        let text = format!("{e:#}");
+        tracing::debug!(frame_id, error = %text, "{}", what);
+        stats.failed += 1;
+        stats.first_error.get_or_insert(text);
+    };
     for &frame_id in frame_ids {
         if only_stale {
             match needs_refresh(conn, frame_id, catalog) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
-                    tracing::warn!(frame_id, error = %format!("{e:#}"), "zero point check failed");
+                    failed(&mut stats, frame_id, e, "zero point check failed");
                     continue;
                 }
             }
         }
         match refresh_zero_point_with(conn, frame_id, catalog, &mut cone) {
-            Ok(status) => stored += usize::from(status.stored()),
-            Err(e) => tracing::warn!(frame_id, error = %format!("{e:#}"), "zero point refresh failed"),
+            Ok(status) => {
+                stats.stored += usize::from(status.stored());
+                stats.unreadable += usize::from(status == ZpStatus::NotReady(NotReady::UnreadableSolve));
+            }
+            Err(e) => failed(&mut stats, frame_id, e, "zero point refresh failed"),
         }
     }
-    Ok(stored)
+    stats
+}
+
+/// [`refresh_many_stats`] as one pass of its own: says its one `warn` (`trigger`) and returns how many frames wrote a row.
+fn refresh_many_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], only_stale: bool, cone: F) -> Result<usize>
+where
+    F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    let stats = refresh_many_stats(conn, catalog, frame_ids, only_stale, cone);
+    stats.warn_if_unmeasurable("trigger");
+    Ok(stats.stored)
+}
+
+/// Refresh every one of `frame_ids` (the caller has already selected the stale ones), no currency check per frame; the
+/// caller owns the pass's one `warn` ([`ZpPassStats::warn_if_unmeasurable`]).
+pub fn refresh_listed_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], cone: F) -> ZpPassStats
+where
+    F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    refresh_many_stats(conn, catalog, frame_ids, false, cone)
 }
 
 /// Refresh the frames among `frame_ids` whose zero point is not current (a current-`MEASURE_VERSION` analysis, a solve,
@@ -785,6 +853,42 @@ pub fn stale_zero_point_frames(conn: &Connection, catalog: &str, after: i64, lim
         .collect::<rusqlite::Result<Vec<i64>>>()
         .context("reading the frames with a stale zero point")?;
     Ok(ids)
+}
+
+/// The frames among `frame_ids` whose zero point is not current (a current-`MEASURE_VERSION` analysis and a solve, and
+/// `zp_version` / `zp_catalog` other than the current ones), in id order: [`stale_zero_point_frames`] for a known set.
+/// One statement per chunk of [`BACKFILL_CHUNK`] ids, never one per frame.
+pub fn stale_among_frames(conn: &Connection, catalog: &str, frame_ids: &[i64]) -> Result<Vec<i64>> {
+    stale_among_frames_counted(conn, catalog, frame_ids).map(|(ids, _)| ids)
+}
+
+/// [`stale_among_frames`] and the number of statements it prepared (what its test reads: one per chunk).
+fn stale_among_frames_counted(conn: &Connection, catalog: &str, frame_ids: &[i64]) -> Result<(Vec<i64>, usize)> {
+    let mut out = Vec::new();
+    let mut statements = 0;
+    for chunk in frame_ids.chunks(BACKFILL_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT fa.frame_id FROM frame_analysis fa
+             JOIN plate_solves ps ON ps.frame_id = fa.frame_id
+             WHERE fa.measure_version = ? AND (fa.zp_version IS NOT ? OR fa.zp_catalog IS NOT ?)
+               AND fa.frame_id IN ({marks})
+             ORDER BY fa.frame_id"
+        );
+        statements += 1;
+        let mut stmt = conn.prepare(&sql).context("preparing the stale zero point selection")?;
+        let mut bound: Vec<rusqlite::types::Value> =
+            vec![i64::from(MEASURE_VERSION).into(), i64::from(ZP_VERSION).into(), catalog.to_owned().into()];
+        bound.extend(chunk.iter().map(|id| rusqlite::types::Value::from(*id)));
+        let ids = stmt
+            .query_map(rusqlite::params_from_iter(bound.iter()), |r| r.get::<_, i64>(0))
+            .context("selecting the frames with a stale zero point")?
+            .collect::<rusqlite::Result<Vec<i64>>>()
+            .context("reading the frames with a stale zero point")?;
+        out.extend(ids);
+    }
+    out.sort_unstable();
+    Ok((out, statements))
 }
 
 #[cfg(test)]
@@ -1614,5 +1718,30 @@ mod tests {
         let status = refresh_zero_point(&conn, empty_app_data.path(), 1).unwrap();
         assert_eq!(status, ZpStatus::NotReady(NotReady::NoCatalogue));
         assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
+    }
+
+    /// The gate selects its stale frames with the module's statement count in hand: one statement per chunk of
+    /// `BACKFILL_CHUNK` ids, not one per frame (structural: the count is read off the selection itself).
+    #[test]
+    fn the_gates_stale_selection_is_one_query_per_chunk() {
+        let conn = catalog_db();
+        let f = Field { stars: Vec::new(), catalog: Vec::new(), wcs: wcs() };
+        let total = 2 * BACKFILL_CHUNK + 50;
+        let mut ids = Vec::new();
+        for id in 1..=total as i64 {
+            seed_frame(&conn, id, &f, &Seed::default(), true);
+            ids.push(id);
+        }
+        // Frame 3 is current for "A"; frame 4 has no solve and is never selected.
+        conn.execute("UPDATE frame_analysis SET zp_version = ?1, zp_catalog = 'A' WHERE frame_id = 3", [ZP_VERSION]).unwrap();
+        conn.execute("DELETE FROM plate_solves WHERE frame_id = 4", []).unwrap();
+        let (stale, statements) = stale_among_frames_counted(&conn, "A", &ids).unwrap();
+        assert_eq!(statements, 3, "{total} ids are three chunks");
+        assert_eq!(stale.len(), total - 2);
+        assert!(!stale.contains(&3) && !stale.contains(&4));
+        assert!(stale.windows(2).all(|w| w[0] < w[1]), "id order");
+        // Another catalogue makes frame 3 stale too; nothing asked is one empty read.
+        assert!(stale_among_frames(&conn, "B", &ids).unwrap().contains(&3));
+        assert_eq!(stale_among_frames_counted(&conn, "A", &[]).unwrap(), (Vec::new(), 0));
     }
 }
