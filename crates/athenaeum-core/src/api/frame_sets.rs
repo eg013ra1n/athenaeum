@@ -2270,7 +2270,98 @@ mod tests {
         for id in &lights {
             let t = &rows[id].transparency;
             assert_eq!(t.loss_mag, None);
+            // This sentence is produced only by the Err branch of the read (`unreadable_transparency`); a per-frame
+            // reason is another sentence, so the assertion proves the read really errored for every light.
             assert_eq!(t.reason.as_deref(), Some("transparency could not be read"));
         }
+    }
+
+    /// The read path measures nothing: a light with a current analysis, star rows and a solve but no stored zero point
+    /// shows a reason and no numbers, and its five zero point columns are still NULL afterwards.
+    #[test]
+    fn frame_set_detail_does_not_measure_anything() {
+        let (tmp, ctx) = test_ctx();
+        let catalog = install_fake_catalogue(&tmp);
+        let (lights, _, _) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_set_with_a_reference(&conn, &catalog)
+        };
+        let target = lights[5];
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE frame_analysis SET zero_point = NULL, zp_stars = NULL, zp_sigma = NULL, zp_version = NULL,
+                                           zp_catalog = NULL WHERE frame_id = ?1",
+                [target],
+            )
+            .unwrap();
+            let analysis_id: i64 =
+                conn.query_row("SELECT id FROM frame_analysis WHERE frame_id = ?1", [target], |r| r.get(0)).unwrap();
+            conn.execute(
+                "INSERT INTO star_metrics (frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y, eccentricity, theta,
+                                           fit_method, fit_residual)
+                 VALUES (?1, 10, 10, 1000, 5000, 4, 4, 4, 0.1, 0, 'gaussian', 0.01)",
+                [analysis_id],
+            )
+            .unwrap();
+        }
+        let detail = get_frame_set_detail(&ctx, 1).unwrap();
+        let t = &rows_by_frame_id(&detail)[&target].transparency;
+        assert_eq!((t.zero_point, t.zp_stars, t.zp_sigma, t.loss_mag), (None, None, None, None), "{t:?}");
+        assert_eq!(
+            t.reason.as_deref(),
+            Some("zero point not measured yet — the star catalogue may not be installed")
+        );
+        let columns: (Option<f64>, Option<i64>, Option<f64>, Option<i64>, Option<String>) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            conn.query_row(
+                "SELECT zero_point, zp_stars, zp_sigma, zp_version, zp_catalog FROM frame_analysis WHERE frame_id = ?1",
+                [target],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(columns, (None, None, None, None, None), "the read path computed nothing");
+    }
+
+    /// A master `Light` row keeps the placeholder: it is not a light of the read (it was not among the ids asked), so
+    /// it has no loss even though its rig has a reference and it has an analysis of its own.
+    #[test]
+    fn a_master_light_keeps_the_placeholder() {
+        let (tmp, ctx) = test_ctx();
+        let catalog = install_fake_catalogue(&tmp);
+        let master = 100i64;
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let (lights, _, _) = seed_set_with_a_reference(&conn, &catalog);
+            let session: i64 = conn
+                .query_row("SELECT session_id FROM session_members WHERE frame_id = ?1", [lights[0]], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, '/t/master.fits', 'master.fits', 0, '2026-03-01T00:00:00Z', 'FITS')",
+                [master],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master, instrume, telescop, focallen, gain, xbinning,
+                                     filter, date_obs)
+                 VALUES (?1, ?1, 'Light', 1, 'CamA', 'Scope', 540.0, 56.0, 1, 'L', '2026-03-02T21:59:00Z')",
+                [master],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)", [session, master]).unwrap();
+            // Far below the reference (20.26): were it asked about, it would show a loss of 1.26 mag.
+            seed_analysis(&conn, master, 19.0, &catalog);
+        }
+        let detail = get_frame_set_detail(&ctx, 1).unwrap();
+        let rows = rows_by_frame_id(&detail);
+        let row = rows.get(&master).expect("the master is listed in the detail");
+        assert!(row.frame.as_ref().is_some_and(|f| f.is_master));
+        assert_eq!(row.transparency, crate::models::Transparency::unmeasured());
+        assert_eq!(row.transparency.loss_mag, None);
+        // The reference exists: an ordinary light of the same rig has its loss.
+        let hazy = rows.values().find(|r| r.frame.as_ref().is_some_and(|f| f.id == Some(1))).unwrap();
+        assert!(hazy.transparency.loss_mag.is_some(), "{:?}", hazy.transparency);
     }
 }

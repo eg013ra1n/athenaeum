@@ -52,6 +52,9 @@ pub enum LossReason {
     NotSolved,
     /// The frame is OSC or CFA (or an externally debayered colour file): colour cameras are not measured yet (Z5).
     ColourCamera,
+    /// The analysis arrived through personal sync: it counts stars and carries none of their rows, so a zero point
+    /// can never be measured from it here (a frame whose zero point is current is not judged by this).
+    NoStarMetrics,
     /// The stored zero point is not current (another `ZP_VERSION` or catalogue), or no catalogue is installed.
     NotMeasured,
     /// The zero point is current and says "refused".
@@ -70,6 +73,9 @@ impl LossReason {
             LossReason::StaleAnalysis => "analysed by an older version — analyse the frame again".to_string(),
             LossReason::NotSolved => "not plate-solved".to_string(),
             LossReason::ColourCamera => "not measured for colour cameras yet".to_string(),
+            LossReason::NoStarMetrics => {
+                "analysed on another computer — analyse the frame here to measure transparency".to_string()
+            }
             LossReason::NotMeasured => {
                 "zero point not measured yet — the star catalogue may not be installed".to_string()
             }
@@ -134,6 +140,8 @@ struct AnalysisFacts {
     zp_sigma: Option<f64>,
     zp_version: Option<u32>,
     zp_catalog: Option<String>,
+    /// The analysis counts stars and has no `star_metrics` row (one that arrived through personal sync).
+    no_star_rows: bool,
 }
 
 /// One asked frame: its header facts, its analysis (if any) and whether it has a solve.
@@ -196,7 +204,9 @@ fn load_frame_rows(conn: &Connection, stmts: &Stmts, ids: &[i64]) -> Result<Hash
             "SELECT f.id, f.instrume, f.telescop, f.focallen, f.gain, f.xbinning, f.filter, f.bayerpat,
                     fa.id, fa.measure_version, fa.source_channels, fa.zero_point, fa.zp_stars, fa.zp_sigma,
                     fa.zp_version, fa.zp_catalog,
-                    EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = f.id)
+                    EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = f.id),
+                    (fa.stars_detected > 0
+                     AND NOT EXISTS (SELECT 1 FROM star_metrics sm WHERE sm.frame_analysis_id = fa.id))
              FROM frames f
              LEFT JOIN frame_analysis fa ON fa.frame_id = f.id
              WHERE f.id IN ({marks})"
@@ -214,6 +224,7 @@ fn load_frame_rows(conn: &Connection, stmts: &Stmts, ids: &[i64]) -> Result<Hash
                         zp_sigma: r.get(13)?,
                         zp_version: r.get(14)?,
                         zp_catalog: r.get(15)?,
+                        no_star_rows: r.get::<_, Option<bool>>(17)?.unwrap_or(false),
                     })
                 } else {
                     None
@@ -458,7 +469,7 @@ enum Stage {
     NeedsReference { zero_point: f64, zp_stars: Option<i64>, zp_sigma: Option<f64>, rig: RigKey },
 }
 
-/// Reasons 1 to 7 of [`LossReason`], in order; a frame that clears them all waits for a reference.
+/// Reasons 1 to 8 of [`LossReason`], in order; a frame that clears them all waits for a reference.
 fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
     let done = |reason: LossReason| Stage::Done(Transparency::without_numbers(reason));
     let Some(row) = row else {
@@ -479,6 +490,9 @@ fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
     let current = analysis.zp_version == Some(ZP_VERSION)
         && catalog.is_some_and(|c| analysis.zp_catalog.as_deref() == Some(c));
     if !current {
+        if analysis.no_star_rows {
+            return done(LossReason::NoStarMetrics);
+        }
         return done(LossReason::NotMeasured);
     }
     let Some(zero_point) = analysis.zero_point.filter(|z| z.is_finite()) else {
@@ -628,6 +642,8 @@ mod tests {
         filename: Option<String>,
         /// A header fingerprint, which makes the file one of the duplicate-detection identities.
         fingerprint: Option<String>,
+        /// The analysis has a star row (`false`: it arrived through personal sync, which brings the summary only).
+        star_rows: bool,
     }
 
     impl Default for Spec {
@@ -654,6 +670,7 @@ mod tests {
                 path: None,
                 filename: None,
                 fingerprint: None,
+                star_rows: true,
             }
         }
     }
@@ -727,7 +744,17 @@ mod tests {
                 insert_plate_solve(&self.conn, &solve(id)).unwrap();
             }
             if s.analysed {
-                crate::db::analysis::upsert_frame_analysis(&self.conn, &analysis(id, s)).unwrap();
+                let analysis_id = crate::db::analysis::upsert_frame_analysis(&self.conn, &analysis(id, s)).unwrap();
+                if s.star_rows {
+                    self.conn
+                        .execute(
+                            "INSERT INTO star_metrics (frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y,
+                                                       eccentricity, theta, fit_method, fit_residual)
+                             VALUES (?1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 'gaussian', 0)",
+                            [analysis_id],
+                        )
+                        .unwrap();
+                }
             }
             if let Some(set) = s.set {
                 let session = self.session(set, s.night);
@@ -1102,6 +1129,32 @@ mod tests {
     }
 
     #[test]
+    fn a_synced_analysis_says_to_analyse_here() {
+        let mut w = World::new();
+        let own = w.series(&Spec::default(), 2, &ramp(30));
+        // Stars counted, no star rows, no zero point: the catalogue is not the reason, and the sentence says what is.
+        let synced = w.seed(&Spec { star_rows: false, zp: None, zp_version: None, zp_catalog: None, ..Spec::default() });
+        // The same shape but with a zero point already current is judged by that value, not by the missing rows.
+        let measured = w.seed(&Spec { star_rows: false, zp: Some(20.2), ..Spec::default() });
+        // No stars counted at all is not a synced analysis: it keeps the ordinary reasons.
+        let empty = w.seed(&Spec { star_rows: false, zp: None, zp_version: None, zp_catalog: None, ..Spec::default() });
+        w.conn.execute("UPDATE frame_analysis SET stars_detected = 0 WHERE frame_id = ?1", [empty]).unwrap();
+        let got = ask(&w, Some("A"), &[synced, measured, empty, own[0]]);
+        let t = &got[&synced];
+        assert_eq!(
+            t.reason.as_deref(),
+            Some("analysed on another computer — analyse the frame here to measure transparency")
+        );
+        assert_eq!((t.zero_point, t.loss_mag), (None, None));
+        assert!(got[&measured].loss_mag.is_some(), "{:?}", got[&measured]);
+        assert_eq!(
+            got[&empty].reason.as_deref(),
+            Some("zero point not measured yet — the star catalogue may not be installed")
+        );
+        assert!(got[&own[0]].loss_mag.is_some());
+    }
+
+    #[test]
     fn a_zero_point_from_another_catalogue_neither_counts_nor_shows() {
         let mut w = World::new();
         let ids = w.series(&Spec::default(), 2, &ramp(40));
@@ -1221,6 +1274,10 @@ mod tests {
             (Spec { solved: false, ..base.clone() }, "not plate-solved"),
             (Spec { bayerpat: Some("RGGB"), ..base.clone() }, "not measured for colour cameras yet"),
             (
+                Spec { star_rows: false, zp: None, zp_version: None, zp_catalog: None, ..base.clone() },
+                "analysed on another computer — analyse the frame here to measure transparency",
+            ),
+            (
                 Spec { zp: None, zp_version: None, zp_catalog: None, ..base.clone() },
                 "zero point not measured yet — the star catalogue may not be installed",
             ),
@@ -1233,6 +1290,14 @@ mod tests {
                 "camera or focal length unknown — nothing to compare with",
             ),
             // Precedence: the earlier row wins when a frame matches two.
+            (
+                Spec { star_rows: false, bayerpat: Some("RGGB"), zp: None, zp_version: None, ..base.clone() },
+                "not measured for colour cameras yet",
+            ),
+            (
+                Spec { star_rows: false, zp: None, zp_version: None, instrume: None, ..base.clone() },
+                "analysed on another computer — analyse the frame here to measure transparency",
+            ),
             (
                 Spec { measure_version: Some(MEASURE_VERSION - 1), solved: false, ..base.clone() },
                 "analysed by an older version — analyse the frame again",

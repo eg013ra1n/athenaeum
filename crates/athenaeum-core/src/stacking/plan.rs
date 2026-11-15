@@ -10043,9 +10043,13 @@ mod tests {
         assert!(wire.get("transparencyLoss").is_some(), "camelCase on the wire: {wire}");
     }
 
-    /// Wave 6.5: the loss is display only. The plan of a seeded project is built with no frame carrying the key and
-    /// again with every frame carrying one; compared: `config_hash`, `stale_stages`, every group in full (key,
-    /// member handles, counts, the cached counts the stage hashes decide), the blockers and the reference.
+    /// Wave 6.5: the loss is display only. What this test guards is the PLAN side: the plan of a seeded project is
+    /// built with no frame carrying the manifest key and again with every frame carrying one, and compared:
+    /// `config_hash`, `stale_stages` (the staleness verdict), every group in full (key, member handles, counts, the
+    /// cached counts the stage hashes decide), the blockers, the reference choice and the exclusions. The run-side
+    /// stage and artifact hashes are guarded by construction, not by this test: no code under `stacking/` reads
+    /// `transparency_loss` except the plan row's display fill (`grep -rn transparency_loss crates/athenaeum-core/src/stacking`
+    /// finds the `PlanProjectFrame` field, that one fill in `build_plan`, a `None` in a `solve.rs` fixture and tests).
     #[test]
     fn the_plan_hashes_do_not_see_the_transparency() {
         let f = test_fixtures::frame_set("unused");

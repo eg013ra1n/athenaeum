@@ -835,18 +835,25 @@ pub fn recompute_zero_points(conn: &Connection, catalog: &ZpCatalog, frame_ids: 
     recompute_zero_points_with(conn, &catalog.identity, frame_ids, catalog_cone(&catalog.layers))
 }
 
-/// Up to `limit` frame ids above `after` whose zero point is not current, in id order: the backfill's cursor. Keyed on
+/// The stale selections' extra condition (alias `fa` is `frame_analysis`): the frame CAN be measured here. An analysis that
+/// arrived through personal sync has `stars_detected > 0` and no `star_metrics` rows; it stores nothing
+/// ([`NotReady::NoStarMetrics`]), so it would stay "stale" forever and be re-read by every backfill and gate pass.
+const CAN_BE_MEASURED: &str = "(fa.stars_detected = 0
+               OR EXISTS (SELECT 1 FROM star_metrics sm WHERE sm.frame_analysis_id = fa.id))";
+
+/// Up to `limit` frame ids above `after` whose zero point is not current and that can be measured ([`CAN_BE_MEASURED`]),
+/// in id order: the backfill's cursor. Keyed on
 /// the id, so a frame whose refresh keeps failing is skipped, not retried in a loop.
 pub fn stale_zero_point_frames(conn: &Connection, catalog: &str, after: i64, limit: usize) -> Result<Vec<i64>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT fa.frame_id FROM frame_analysis fa
-             JOIN plate_solves ps ON ps.frame_id = fa.frame_id
-             WHERE fa.frame_id > ?1 AND fa.measure_version = ?2
-               AND (fa.zp_version IS NOT ?3 OR fa.zp_catalog IS NOT ?4)
-             ORDER BY fa.frame_id LIMIT ?5",
-        )
-        .context("preparing the stale zero point query")?;
+    let sql = format!(
+        "SELECT fa.frame_id FROM frame_analysis fa
+         JOIN plate_solves ps ON ps.frame_id = fa.frame_id
+         WHERE fa.frame_id > ?1 AND fa.measure_version = ?2
+           AND (fa.zp_version IS NOT ?3 OR fa.zp_catalog IS NOT ?4)
+           AND {CAN_BE_MEASURED}
+         ORDER BY fa.frame_id LIMIT ?5"
+    );
+    let mut stmt = conn.prepare(&sql).context("preparing the stale zero point query")?;
     let ids = stmt
         .query_map(params![after, MEASURE_VERSION, ZP_VERSION, catalog, limit as i64], |r| r.get(0))
         .context("listing the frames with a stale zero point")?
@@ -855,8 +862,8 @@ pub fn stale_zero_point_frames(conn: &Connection, catalog: &str, after: i64, lim
     Ok(ids)
 }
 
-/// The frames among `frame_ids` whose zero point is not current (a current-`MEASURE_VERSION` analysis and a solve, and
-/// `zp_version` / `zp_catalog` other than the current ones), in id order: [`stale_zero_point_frames`] for a known set.
+/// The frames among `frame_ids` whose zero point is not current and that can be measured ([`CAN_BE_MEASURED`]) (a
+/// current-`MEASURE_VERSION` analysis and a solve, and `zp_version` / `zp_catalog` other than the current ones), in id order: [`stale_zero_point_frames`] for a known set.
 /// One statement per chunk of [`BACKFILL_CHUNK`] ids, never one per frame.
 pub fn stale_among_frames(conn: &Connection, catalog: &str, frame_ids: &[i64]) -> Result<Vec<i64>> {
     stale_among_frames_counted(conn, catalog, frame_ids).map(|(ids, _)| ids)
@@ -872,6 +879,7 @@ fn stale_among_frames_counted(conn: &Connection, catalog: &str, frame_ids: &[i64
             "SELECT fa.frame_id FROM frame_analysis fa
              JOIN plate_solves ps ON ps.frame_id = fa.frame_id
              WHERE fa.measure_version = ? AND (fa.zp_version IS NOT ? OR fa.zp_catalog IS NOT ?)
+               AND {CAN_BE_MEASURED}
                AND fa.frame_id IN ({marks})
              ORDER BY fa.frame_id"
         );
@@ -1732,6 +1740,8 @@ mod tests {
             seed_frame(&conn, id, &f, &Seed::default(), true);
             ids.push(id);
         }
+        // The frames carry no star rows, so they count as measurable only when they claim no stars either.
+        conn.execute("UPDATE frame_analysis SET stars_detected = 0", []).unwrap();
         // Frame 3 is current for "A"; frame 4 has no solve and is never selected.
         conn.execute("UPDATE frame_analysis SET zp_version = ?1, zp_catalog = 'A' WHERE frame_id = 3", [ZP_VERSION]).unwrap();
         conn.execute("DELETE FROM plate_solves WHERE frame_id = 4", []).unwrap();
@@ -1743,5 +1753,29 @@ mod tests {
         // Another catalogue makes frame 3 stale too; nothing asked is one empty read.
         assert!(stale_among_frames(&conn, "B", &ids).unwrap().contains(&3));
         assert_eq!(stale_among_frames_counted(&conn, "A", &[]).unwrap(), (Vec::new(), 0));
+    }
+
+    /// An analysis that arrived through personal sync (stars counted, no star rows) can never be measured here: it is
+    /// no stale frame, for the backfill's cursor and for the gate's selection alike.
+    #[test]
+    fn a_synced_analysis_without_star_rows_is_never_stale() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 61);
+        let bare = Field { stars: Vec::new(), catalog: Vec::new(), wcs: wcs() };
+        // Frames 1..=300 are synced analyses (stars_detected 200, no star rows); 301..=310 are real stale frames.
+        for id in 1..=300 {
+            seed_frame(&conn, id, &bare, &Seed::default(), true);
+        }
+        for id in 301..=310 {
+            seed_frame(&conn, id, &f, &Seed::default(), true);
+        }
+        let real: Vec<i64> = (301..=310).collect();
+        assert_eq!(stale_zero_point_frames(&conn, "A", 0, 500).unwrap(), real, "the backfill's cursor");
+        assert_eq!(stale_zero_point_frames(&conn, "A", 0, 5).unwrap(), (301..=305).collect::<Vec<i64>>(), "a limit is not crowded out");
+        let all: Vec<i64> = (1..=310).collect();
+        assert_eq!(stale_among_frames(&conn, "A", &all).unwrap(), real, "the gate's selection");
+        // A frame that counts no stars is still selected: its refresh stores the "too few stars" refusal.
+        conn.execute("UPDATE frame_analysis SET stars_detected = 0 WHERE frame_id = 1", []).unwrap();
+        assert_eq!(stale_among_frames(&conn, "A", &[1]).unwrap(), vec![1]);
     }
 }
