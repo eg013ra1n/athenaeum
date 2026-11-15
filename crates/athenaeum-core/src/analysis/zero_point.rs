@@ -486,6 +486,14 @@ pub fn zero_point_catalog(app_data_dir: &Path) -> Option<ZpCatalog> {
     }
 }
 
+/// Whether a frame is a colour frame, which the zero point does not measure yet (owner ruling Z5): the catalogue knows
+/// it as OSC or CFA (`BAYERPAT` set, the derivation the stacking group key uses), or its analysis found more than one
+/// plane (`frame_analysis.source_channels > 1`: an externally debayered file carries no `BAYERPAT` and three planes).
+/// The one test both the measurement and the transparency read use.
+pub(crate) fn is_colour_frame(bayerpat: Option<&str>, source_channels: Option<i64>) -> bool {
+    color_mode_of(&bayerpat.map(str::to_owned)) == ColorMode::Osc || source_channels.is_some_and(|c| c > 1)
+}
+
 /// The frame's own header facts the measurement needs.
 struct FrameFacts {
     exptime: Option<f64>,
@@ -566,7 +574,7 @@ where
     };
 
     // Z5: a colour camera is not measured yet. Stored like a refusal, so it is not retried.
-    if color_mode_of(&facts.bayerpat) == ColorMode::Osc {
+    if is_colour_frame(facts.bayerpat.as_deref(), Some(analysis.source_channels)) {
         store_outcome(conn, frame_id, catalog, None, None, Some(NotReady::ColourCamera.code()))?;
         return Ok(ZpStatus::NotReady(NotReady::ColourCamera));
     }
@@ -1297,6 +1305,25 @@ mod tests {
         assert_eq!(calls.get(), 0, "no catalogue read for a colour camera");
         // Stored like a refusal: the next pass does not retry it.
         assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_debayered_colour_frame_is_not_measured() {
+        let conn = catalog_db();
+        let f = field(200, TRUE_ZP, 0.0, 40);
+        // No BAYERPAT in the header, but the analysis found three planes: an externally debayered file.
+        seed_frame(&conn, 1, &f, &Seed::default(), true);
+        conn.execute("UPDATE frame_analysis SET source_channels = 3 WHERE frame_id = 1", []).unwrap();
+        assert!(is_colour_frame(None, Some(3)));
+        assert!(is_colour_frame(Some("RGGB"), Some(1)));
+        assert!(!is_colour_frame(None, Some(1)));
+        assert!(!is_colour_frame(Some("  "), None));
+        let calls = std::cell::Cell::new(0);
+        let status = refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
+        assert_eq!(status, ZpStatus::NotReady(NotReady::ColourCamera));
+        assert!(status.stored());
+        assert_eq!(zp_columns(&conn, 1), (None, None, Some(ZP_VERSION), Some("A".to_string())));
+        assert_eq!(calls.get(), 0, "no catalogue read for a colour camera");
     }
 
     #[test]

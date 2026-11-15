@@ -584,6 +584,8 @@ zp_catalog: string | null, };
 
 export type FrameVerdict = "trailed" | "defocused" | "no_stars";
 
+export type Transparency = { zeroPoint: number | null, zpStars: number | null, zpSigma: number | null, lossMag: number | null, reason: string | null, };
+
 export type CalibrationMetadataEdits = { ccd_temp?: number | null, gain?: number | null, offset?: number | null, binning?: string | null, exptime?: number | null, };
 
 export type StarMetric = { id: number | null, frame_analysis_id: number, x: number, y: number, peak: number, flux: number, fwhm: number, fwhm_x: number, fwhm_y: number, eccentricity: number, 
