@@ -38,11 +38,16 @@ pub struct ZpParams {
     pub central_fraction: f64,
     /// Fewest surviving stars of a valid frame.
     pub min_stars: usize,
-    /// Largest standard error of the median (mag) of a valid frame.
+    /// Largest standard error of the median (mag) of a valid frame. It is tight
+    /// on purpose: with few stars the median follows the bright population and
+    /// is biased by 0.2-0.3 mag; 0.02 refuses those frames (probe, 2026-11-15).
     pub max_std_error_mag: f64,
     /// Sigma-clip threshold in robust sigmas.
     pub clip_sigma: f64,
-    /// The brightest fraction of the analysis stars is dropped (saturation guard).
+    /// The brightest fraction of the analysis stars is dropped. The brightest
+    /// catalogue stars of a field are a different population (red giants read
+    /// fainter through a broadband filter than their G says) and may be
+    /// saturated.
     pub bright_drop_fraction: f64,
     /// Analysis stars below this fit SNR are not used.
     pub min_snr: f64,
@@ -58,12 +63,12 @@ impl Default for ZpParams {
     fn default() -> Self {
         Self {
             match_radius_px: 2.0,
-            central_fraction: 0.6,
+            central_fraction: 0.9,
             min_stars: 15,
-            max_std_error_mag: 0.05,
-            clip_sigma: 2.5,
-            bright_drop_fraction: 0.10,
-            min_snr: 20.0,
+            max_std_error_mag: 0.02,
+            clip_sigma: 4.0,
+            bright_drop_fraction: 0.15,
+            min_snr: 10.0,
             blend_radius_fwhm: 3.0,
             blend_dmag: 4.0,
         }
@@ -231,7 +236,7 @@ pub fn measure_zero_point(input: &ZpInput, params: &ZpParams) -> ZpMeasurement {
     let grid = Grid::new(&cat, params.match_radius_px.max(blend_r).max(1.0));
 
     // 3. Analysis stars: central region, positive finite flux, enough SNR;
-    //    the brightest fraction goes (the saturation guard).
+    //    the brightest fraction goes (a different population, maybe saturated).
     let mut usable: Vec<usize> = input
         .stars
         .iter()
@@ -499,8 +504,8 @@ mod tests {
             s.flux *= 0.5;
         }
         let m = measure(&f);
-        // 200 stars, the brightest 10 % (20) dropped: the halved ones go with them.
-        assert_eq!(m.matched, 180);
+        // 200 stars, the brightest 15 % (30) dropped: the halved ones go with them.
+        assert_eq!(m.matched, 170);
         let zp = m.result.expect("valid");
         assert!((zp.zero_point - TRUE_ZP).abs() < 0.01, "zp {}", zp.zero_point);
     }
@@ -569,7 +574,7 @@ mod tests {
     fn a_star_below_the_snr_floor_is_not_used() {
         let mut f = field(60, TRUE_ZP, 0.0, 14);
         for (k, (snr, g)) in
-            [(Some(5.0), 11.111_f32), (None, 11.222_f32), (Some(100.0), 11.333_f32)]
+            [(Some(9.0), 11.111_f32), (None, 11.222_f32), (Some(100.0), 11.333_f32)]
                 .into_iter()
                 .enumerate()
         {
@@ -581,7 +586,7 @@ mod tests {
         }
         let m = measure(&f);
         assert!(m.result.is_ok());
-        assert!(!used_at(&m, 11.111), "a star at SNR 5 was used");
+        assert!(!used_at(&m, 11.111), "a star at SNR 9 was used");
         assert!(!used_at(&m, 11.222), "a star without SNR was used");
         assert!(used_at(&m, 11.333), "the good star beside them was not used");
     }
@@ -589,8 +594,12 @@ mod tests {
     #[test]
     fn stars_outside_the_central_region_are_not_used() {
         let mut f = field(100, TRUE_ZP, 0.0, 4);
+        let half_diag = 0.5 * (W as f64).hypot(H as f64);
         for k in 0..5 {
-            let (x, y) = (3800.0 + k as f64 * 40.0, 150.0);
+            // Corner stars, 0.94 of the half-diagonal from the centre: beyond 0.9.
+            let (x, y) = (3900.0 + k as f64 * 20.0, 100.0);
+            let r = (x - 1999.5).hypot(y - 1499.5) / half_diag;
+            assert!(r > 0.9, "the fixture star is inside the region: {r}");
             f.stars.push(star(x, y, flux_for(11.5, TRUE_ZP)));
             f.catalog.push(cat_at(&f.wcs, x, y, 11.5));
         }
@@ -598,7 +607,7 @@ mod tests {
         assert!(m.result.is_ok());
         assert!(!m.per_star.is_empty());
         assert!(
-            m.per_star.iter().all(|s| s.radius_fraction <= 0.6),
+            m.per_star.iter().all(|s| s.radius_fraction <= 0.9),
             "a star beyond the central region was used"
         );
         assert!(!m.per_star.iter().any(|s| (s.g_mag - 11.5).abs() < 1e-3));
@@ -625,7 +634,8 @@ mod tests {
 
     #[test]
     fn fewer_than_the_minimum_refuses_with_counts() {
-        let f = field(9, TRUE_ZP, 0.0, 6);
+        // 10 stars, the brightest one dropped (15 % of 10 floors to 1): 9 matched.
+        let f = field(10, TRUE_ZP, 0.0, 6);
         let m = measure(&f);
         assert_eq!(m.matched, 9);
         match m.result {
@@ -642,7 +652,7 @@ mod tests {
         let m = measure(&f);
         match m.result {
             Err(ZpRefusal::TooScattered { std_error, kept }) => {
-                assert!(std_error > 0.05, "std_error {std_error}");
+                assert!(std_error > 0.02, "std_error {std_error}");
                 assert!(kept >= 15, "kept {kept}");
             }
             other => panic!("expected TooScattered, got {other:?}"),
@@ -651,10 +661,26 @@ mod tests {
 
     #[test]
     fn a_wide_scatter_of_many_stars_is_valid() {
-        let f = field(400, TRUE_ZP, 0.30, 8);
+        // 800 stars (680 after the bright drop): the standard error of 0.30 mag
+        // scatter is about 0.012, clearly under the 0.02 limit.
+        let f = field(800, TRUE_ZP, 0.30, 8);
         let zp = measure(&f).result.expect("many stars average the scatter out");
         assert!((zp.zero_point - TRUE_ZP).abs() < 0.05, "zp {}", zp.zero_point);
         assert!(zp.sigma > 0.1, "sigma {}", zp.sigma);
+    }
+
+    #[test]
+    fn the_defaults_are_the_probes() {
+        let d = ZpParams::default();
+        assert_eq!(d.match_radius_px, 2.0);
+        assert_eq!(d.central_fraction, 0.9);
+        assert_eq!(d.min_stars, 15);
+        assert_eq!(d.max_std_error_mag, 0.02);
+        assert_eq!(d.clip_sigma, 4.0);
+        assert_eq!(d.bright_drop_fraction, 0.15);
+        assert_eq!(d.min_snr, 10.0);
+        assert_eq!(d.blend_radius_fwhm, 3.0);
+        assert_eq!(d.blend_dmag, 4.0);
     }
 
     #[test]
