@@ -4,12 +4,13 @@
 //! Compared across frames of one rig (camera, telescope, focal length, gain, binning, filter) the best ones mark the
 //! rig's clear sky, and a frame's loss is how far its zero point sits below that mark, in magnitudes. The reference is
 //! computed on read, never stored: the nearest-rank 90th percentile of the rig's own lights, from at least 30 frames
-//! over at least 2 imaging nights, in the frame's own frame set when that has one and otherwise (`RIG_WIDE_FALLBACK`)
+//! over at least 2 sky nights (one evening is one night however many targets were shot on it), in the frame's own frame set when that has one and otherwise (`RIG_WIDE_FALLBACK`)
 //! across the whole rig.
 //!
-//! Only the owner's own lights feed a reference. A frame received through a collaboration project never does (the
+//! Only lights the catalogue uses feed a reference: none in the Black Hole, and a duplicate copy once. A frame received through a collaboration project never does (the
 //! scanner never creates a `frames` row for one, so none is normally there; the read still excludes a row whose file is
-//! a replica's landed path or lies under the Collaboration folder), and masters and non-light frames never do.
+//! a replica's landed path or lies under the Collaboration folder), and masters and non-light frames never do. A frame
+//! in the Black Hole still gets its own loss when asked about; it only never feeds a reference.
 //!
 //! A zero point counts, for its own loss and as a member of a reference, only when it was judged at `ZP_VERSION`
 //! against the installed catalogue's identity. A frame that cannot get a loss says why, in one sentence a user can act
@@ -82,20 +83,6 @@ impl LossReason {
                     format!("no clear-sky reference yet, {have_nights} of {REFERENCE_MIN_NIGHTS} nights")
                 }
             }
-        }
-    }
-
-    /// Stable code for the debug line.
-    fn code(&self) -> &'static str {
-        match self {
-            LossReason::NotAnalysed => "not_analysed",
-            LossReason::StaleAnalysis => "stale_analysis",
-            LossReason::NotSolved => "not_solved",
-            LossReason::ColourCamera => "colour_camera",
-            LossReason::NotMeasured => "not_measured",
-            LossReason::NoZeroPoint => "no_zero_point",
-            LossReason::NoRig => "no_rig",
-            LossReason::NoReference { .. } => "no_reference",
         }
     }
 }
@@ -296,18 +283,25 @@ fn load_frame_sets(conn: &Connection, stmts: &Stmts, ids: &[i64]) -> Result<Hash
 // References
 // ---------------------------------------------------------------------------
 
-/// The zero points one reference is taken from: frames by id (a frame in two sets counts once) and the imaging nights
-/// they were taken on.
+/// The catalogue's calendar key of a night row (`n` = `imaging_nights`): the date of the evening, the same expression
+/// the Shoot Calendar groups by (`api::calendar`). Night rows belong to a frame set, so one evening on two targets is
+/// two rows and one key: the sky does not care which target the telescope pointed at.
+const SKY_NIGHT_SQL: &str = "DATE(n.start_time, '-12 hours')";
+
+/// The zero points one reference is taken from: frames by id (a frame in two sets counts once) and the sky nights
+/// (`SKY_NIGHT_SQL` keys) they were taken on.
 #[derive(Default)]
 struct Pool {
     zero_points: HashMap<i64, f64>,
-    nights: HashSet<i64>,
+    nights: HashSet<String>,
 }
 
 impl Pool {
-    fn add(&mut self, frame_id: i64, night_id: i64, zero_point: f64) {
+    fn add(&mut self, frame_id: i64, night: Option<&str>, zero_point: f64) {
         self.zero_points.insert(frame_id, zero_point);
-        self.nights.insert(night_id);
+        if let Some(night) = night {
+            self.nights.insert(night.to_owned());
+        }
     }
 
     /// The reference, or the counts that fell short of it.
@@ -326,7 +320,8 @@ impl Pool {
 /// Nearest-rank percentile of an ascending list: the value at 1-based rank `ceil(p · n)`.
 fn nearest_rank(sorted: &[f64], p: f64) -> f64 {
     let n = sorted.len();
-    // The tolerance keeps 0.9 · 30 = 27.000000000000004 from rounding up to rank 28.
+    // 0.9 · n is exact in f64 for every n in play (0.9 · 30 is 27.0), so the ceiling is the true rank. The tolerance is
+    // only a guard against a product that lands a hair above a whole number.
     let rank = ((p * n as f64 - 1e-9).ceil() as usize).clamp(1, n);
     sorted[rank - 1]
 }
@@ -349,10 +344,30 @@ fn collaboration_roots(conn: &Connection, stmts: &Stmts) -> Result<Vec<String>> 
     Ok(roots)
 }
 
-/// Every counting zero point of the owner's own lights shot with one of `instrumes`, grouped by rig: one statement per
-/// chunk of camera names. A zero point counts when it was judged at `ZP_VERSION` against `catalog`, the analysis is
-/// current, the frame is solved, not a colour frame, in a frame set (a night is needed), a light and not a master, and
-/// not received (a replica's landed file, or any file under the Collaboration folder).
+/// The raw `instrume` spellings in the catalogue whose trimmed text is one of `instrumes` (already trimmed). The rig key
+/// trims in Rust, so SQL must match the same spellings without a `TRIM()` that would defeat the camera index: this one
+/// index-only scan of the distinct values gives the exact strings to bind.
+fn raw_instrume_spellings(conn: &Connection, stmts: &Stmts, instrumes: &[String]) -> Result<Vec<String>> {
+    let wanted: HashSet<&str> = instrumes.iter().map(String::as_str).collect();
+    let mut stmt = stmts.prepare(conn, "SELECT DISTINCT instrume FROM frames WHERE instrume IS NOT NULL")?;
+    let spellings = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .context("reading the camera names of a transparency read")?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .context("reading the camera names of a transparency read")?;
+    let mut raw: Vec<String> = spellings.into_iter().filter(|s| wanted.contains(s.trim())).collect();
+    raw.sort();
+    Ok(raw)
+}
+
+/// Every counting zero point of the catalogue's own lights shot with one of `instrumes`, grouped by rig: one statement
+/// per chunk of camera spellings. A zero point counts when it was judged at `ZP_VERSION` against `catalog`, the analysis
+/// is current, the frame is solved, not a colour frame, in a frame set (a night is needed), a light and not a master,
+/// outside the Black Hole, the used copy of its file in its set (a duplicate feeds once), and not received (a replica's
+/// landed file, or any file under the Collaboration folder).
+///
+/// One call costs the lights of the asked cameras (`f.instrume IN (…)` walks the camera index), not of the catalogue.
+/// A caller asks once per table, never per row.
 fn load_pools(
     conn: &Connection,
     stmts: &Stmts,
@@ -361,12 +376,13 @@ fn load_pools(
 ) -> Result<HashMap<RigKey, RigPools>> {
     let roots = collaboration_roots(conn, stmts)?;
     let (root_pred, root_values) = crate::db::scan_root_prefix_predicate("fi.path", &roots);
+    let raw_names = raw_instrume_spellings(conn, stmts, instrumes)?;
     let mut pools: HashMap<RigKey, RigPools> = HashMap::new();
-    for chunk in instrumes.chunks(MAX_BIND_PARAMS - 16) {
+    for chunk in raw_names.chunks(MAX_BIND_PARAMS - 16) {
         let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT f.id, TRIM(f.instrume), f.telescop, f.focallen, f.gain, f.xbinning, f.filter, f.bayerpat,
-                    fa.source_channels, fa.zero_point, n.frames_set_id, n.id
+            "SELECT f.id, f.instrume, f.telescop, f.focallen, f.gain, f.xbinning, f.filter, f.bayerpat,
+                    fa.source_channels, fa.zero_point, n.frames_set_id, {night}
              FROM frames f
              JOIN frame_analysis fa ON fa.frame_id = f.id
              JOIN files fi ON fi.id = f.file_id
@@ -378,10 +394,15 @@ fn load_pools(
                AND fa.measure_version = ?
                AND EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = f.id)
                AND f.focallen >= 0.5
+               AND {not_blackholed}
+               AND {used_copy}
                AND NOT EXISTS (SELECT 1 FROM project_frames_local pfl
                                WHERE pfl.origin = 'replica' AND pfl.landed_path = fi.path)
                AND NOT ({root_pred})
-               AND TRIM(f.instrume) IN ({marks})"
+               AND f.instrume IN ({marks})",
+            night = SKY_NIGHT_SQL,
+            not_blackholed = crate::db::FRAME_NOT_IN_BLACK_HOLE_SQL,
+            used_copy = crate::db::frame_is_used_copy_sql("n.frames_set_id"),
         );
         let mut values: Vec<Value> = vec![
             Value::Integer(i64::from(ZP_VERSION)),
@@ -410,10 +431,11 @@ fn load_pools(
             else {
                 continue;
             };
-            let (set_id, night_id): (i64, i64) = (r.get(10)?, r.get(11)?);
+            let set_id: i64 = r.get(10)?;
+            let night: Option<String> = r.get(11)?;
             let rig_pools = pools.entry(rig).or_default();
-            rig_pools.all.add(frame_id, night_id, zero_point);
-            rig_pools.by_set.entry(set_id).or_default().add(frame_id, night_id, zero_point);
+            rig_pools.all.add(frame_id, night.as_deref(), zero_point);
+            rig_pools.by_set.entry(set_id).or_default().add(frame_id, night.as_deref(), zero_point);
         }
     }
     Ok(pools)
@@ -443,13 +465,13 @@ fn resolve_reference(pools: &HashMap<RigKey, RigPools>, rig: &RigKey, set: Optio
 
 /// A frame judged up to the reference.
 enum Stage {
-    Done(Transparency, LossReason),
+    Done(Transparency),
     NeedsReference { zero_point: f64, zp_stars: Option<i64>, zp_sigma: Option<f64>, rig: RigKey },
 }
 
 /// Reasons 1 to 7 of [`LossReason`], in order; a frame that clears them all waits for a reference.
 fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
-    let done = |reason: LossReason| Stage::Done(Transparency::without_numbers(reason), reason);
+    let done = |reason: LossReason| Stage::Done(Transparency::without_numbers(reason));
     let Some(row) = row else {
         return done(LossReason::NotAnalysed);
     };
@@ -474,16 +496,13 @@ fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
         return done(LossReason::NoZeroPoint);
     };
     let numbers = |reason: LossReason| {
-        Stage::Done(
-            Transparency {
-                zero_point: Some(zero_point),
-                zp_stars: analysis.zp_stars,
-                zp_sigma: analysis.zp_sigma,
-                loss_mag: None,
-                reason: Some(reason.sentence()),
-            },
-            reason,
-        )
+        Stage::Done(Transparency {
+            zero_point: Some(zero_point),
+            zp_stars: analysis.zp_stars,
+            zp_sigma: analysis.zp_sigma,
+            loss_mag: None,
+            reason: Some(reason.sentence()),
+        })
     };
     let Some(rig) = rig_key(
         row.instrume.as_deref(),
@@ -537,13 +556,10 @@ fn read(
 
     let mut memo: HashMap<(RigKey, Option<i64>), std::result::Result<f64, (u32, u32)>> = HashMap::new();
     let mut out = HashMap::with_capacity(stages.len());
-    let (mut with_loss, mut by_reason) = (0usize, HashMap::<&'static str, usize>::new());
+    let mut with_loss = 0usize;
     for (id, stage) in stages {
         let transparency = match stage {
-            Stage::Done(t, reason) => {
-                *by_reason.entry(reason.code()).or_default() += 1;
-                t
-            }
+            Stage::Done(t) => t,
             Stage::NeedsReference { zero_point, zp_stars, zp_sigma, rig } => {
                 let set = sets.get(&id).copied();
                 let reference =
@@ -561,7 +577,6 @@ fn read(
                     }
                     Err((have_frames, have_nights)) => {
                         let reason = LossReason::NoReference { have_frames, have_nights };
-                        *by_reason.entry(reason.code()).or_default() += 1;
                         Transparency {
                             zero_point: Some(zero_point),
                             zp_stars,
@@ -575,16 +590,15 @@ fn read(
         };
         out.insert(id, transparency);
     }
-    let mut summary: Vec<String> = by_reason.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
-    summary.sort();
-    tracing::debug!(frames = out.len(), measured = with_loss, outcome = %summary.join(" "), "transparency read");
+    tracing::debug!(frames = out.len(), measured = with_loss, "transparency read");
     Ok(out)
 }
 
 /// The transparency of each of `frame_ids`: its zero point against the clear-sky reference of its rig. `catalog` is the
 /// installed star catalogue's identity ([`installed_catalog_identity`]); `None` means none is installed, and no zero
 /// point counts. Every asked id is in the result (an unknown id reads as `NotAnalysed`). One handful of statements for
-/// the whole set: chunked by the SQLite variable limit, never one per frame.
+/// the whole set: chunked by the SQLite variable limit, never one per frame. The reference read costs the lights of the
+/// asked cameras, so a caller asks once per table with every id it shows, never once per row.
 pub fn transparency_for_frames(
     conn: &Connection,
     catalog: Option<&str>,
@@ -606,6 +620,7 @@ mod tests {
         telescop: Option<&'static str>,
         focallen: Option<f64>,
         gain: Option<f64>,
+        xbinning: Option<i64>,
         filter: Option<&'static str>,
         bayerpat: Option<&'static str>,
         imagetyp: &'static str,
@@ -620,6 +635,10 @@ mod tests {
         zp_version: Option<u32>,
         zp_catalog: Option<&'static str>,
         path: Option<String>,
+        /// A file name other than `<id>.fits` (two copies of one file share it).
+        filename: Option<String>,
+        /// A header fingerprint, which makes the file one of the duplicate-detection identities.
+        fingerprint: Option<String>,
     }
 
     impl Default for Spec {
@@ -629,6 +648,7 @@ mod tests {
                 telescop: Some("Scope"),
                 focallen: Some(540.0),
                 gain: Some(56.0),
+                xbinning: Some(1),
                 filter: Some("L"),
                 bayerpat: None,
                 imagetyp: "Light",
@@ -643,6 +663,8 @@ mod tests {
                 zp_version: Some(ZP_VERSION),
                 zp_catalog: Some("A"),
                 path: None,
+                filename: None,
+                fingerprint: None,
             }
         }
     }
@@ -689,16 +711,25 @@ mod tests {
                 .execute(
                     "INSERT INTO files (id, path, filename, size, modified_at, format)
                      VALUES (?1, ?2, ?3, 0, '2026-03-01', 'FITS')",
-                    rusqlite::params![id, path, format!("{id}.fits")],
+                    rusqlite::params![id, path, s.filename.clone().unwrap_or_else(|| format!("{id}.fits"))],
                 )
                 .unwrap();
+            if let Some(fp) = &s.fingerprint {
+                self.conn
+                    .execute(
+                        "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'H', ?2)",
+                        rusqlite::params![id, fp],
+                    )
+                    .unwrap();
+            }
             self.conn
                 .execute(
                     "INSERT INTO frames (id, file_id, imagetyp, is_master, instrume, telescop, focallen, gain,
                                          xbinning, filter, bayerpat)
-                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)",
+                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
-                        id, s.imagetyp, s.is_master, s.instrume, s.telescop, s.focallen, s.gain, s.filter, s.bayerpat
+                        id, s.imagetyp, s.is_master, s.instrume, s.telescop, s.focallen, s.gain, s.xbinning,
+                        s.filter, s.bayerpat
                     ],
                 )
                 .unwrap();
@@ -718,13 +749,13 @@ mod tests {
             id
         }
 
-        /// One frame per value, alternating over `nights` nights from night 1.
+        /// One frame per value, alternating over `nights` nights from the base's night.
         fn series(&mut self, base: &Spec, nights: i64, values: &[f64]) -> Vec<i64> {
             values
                 .iter()
                 .enumerate()
                 .map(|(i, &zp)| {
-                    self.seed(&Spec { zp: Some(zp), night: 1 + (i as i64) % nights, ..base.clone() })
+                    self.seed(&Spec { zp: Some(zp), night: base.night + (i as i64) % nights, ..base.clone() })
                 })
                 .collect()
         }
@@ -887,14 +918,108 @@ mod tests {
         let own = w.series(&Spec::default(), 2, &ramp(30));
         let f_len = w.series(&Spec { focallen: Some(1000.0), ..Spec::default() }, 2, &vec![25.0; 10]);
         let filt = w.series(&Spec { filter: Some("Ha"), ..Spec::default() }, 2, &vec![25.0; 10]);
-        let got = ask(&w, Some("A"), &[own[0], f_len[0], filt[0]]);
-        assert!((loss(&got[&own[0]]) - 0.26).abs() < 1e-9);
+        let bin = w.series(&Spec { xbinning: Some(2), ..Spec::default() }, 2, &vec![25.0; 10]);
+        let got = ask(&w, Some("A"), &[own[0], f_len[0], filt[0], bin[0]]);
+        assert!((loss(&got[&own[0]]) - 0.26).abs() < 1e-9, "none of the other rigs moved the reference");
         assert!(got[&f_len[0]].loss_mag.is_none());
         assert!(got[&filt[0]].loss_mag.is_none());
+        assert_eq!(got[&bin[0]].reason.as_deref(), Some("no clear-sky reference yet, 10 of 30 frames"));
         // A focal length that rounds to the same whole mm is the same rig.
         let same = w.series(&Spec { focallen: Some(540.3), ..Spec::default() }, 2, &vec![20.0; 5]);
         let got = ask(&w, Some("A"), &[same[0]]);
         assert!(got[&same[0]].loss_mag.is_some(), "540.3 mm is 540 mm: the same rig as the thirty");
+    }
+
+    #[test]
+    fn a_missing_telescope_gain_or_filter_is_its_own_rig() {
+        let mut w = World::new();
+        let own = w.series(&Spec::default(), 2, &ramp(30));
+        let no_scope = w.series(&Spec { telescop: None, ..Spec::default() }, 2, &vec![25.0; 10]);
+        let no_gain = w.series(&Spec { gain: None, ..Spec::default() }, 2, &vec![25.0; 10]);
+        let no_filter = w.series(&Spec { filter: None, ..Spec::default() }, 2, &vec![25.0; 10]);
+        let got = ask(&w, Some("A"), &[own[0], no_scope[0], no_gain[0], no_filter[0]]);
+        assert!((loss(&got[&own[0]]) - 0.26).abs() < 1e-9, "no frame with a missing field moved the reference");
+        for id in [no_scope[0], no_gain[0], no_filter[0]] {
+            assert_eq!(got[&id].loss_mag, None);
+            assert_eq!(got[&id].reason.as_deref(), Some("no clear-sky reference yet, 10 of 30 frames"));
+        }
+        // The three missing-field series do not join each other either: each has its 10, not 30.
+    }
+
+    #[test]
+    fn a_camera_name_with_a_trailing_tab_is_the_same_rig() {
+        let mut w = World::new();
+        // Fifteen frames spelled "CamA" and fifteen "CamA\t": one rig of thirty over two nights, the Rust-side trim.
+        let plain = w.series(&Spec::default(), 2, &ramp(15));
+        let tabbed = w.series(&Spec { instrume: Some("CamA\t"), ..Spec::default() }, 2, &ramp(15));
+        let got = ask(&w, Some("A"), &[plain[0], tabbed[0]]);
+        assert!(got[&plain[0]].loss_mag.is_some(), "{:?}", got[&plain[0]].reason);
+        assert!(got[&tabbed[0]].loss_mag.is_some(), "{:?}", got[&tabbed[0]].reason);
+        assert_eq!(got[&plain[0]].loss_mag, got[&tabbed[0]].loss_mag, "one rig, one reference");
+    }
+
+    #[test]
+    fn one_evening_on_two_targets_is_one_night() {
+        let mut w = World::new();
+        // Set 1 and set 2 each have a night row that starts the same evening: two rows, one night of sky.
+        let one = w.series(&Spec::default(), 1, &ramp(20));
+        w.series(&Spec { set: Some(2), ..Spec::default() }, 1, &ramp(15));
+        let got = ask(&w, Some("A"), &[one[0]]);
+        assert_eq!(got[&one[0]].loss_mag, None);
+        assert_eq!(got[&one[0]].reason.as_deref(), Some("no clear-sky reference yet, 1 of 2 nights"));
+        // The next evening, on either target, completes the two nights.
+        w.seed(&Spec { night: 2, ..Spec::default() });
+        let got = ask(&w, Some("A"), &[one[0]]);
+        assert!(got[&one[0]].loss_mag.is_some(), "{:?}", got[&one[0]].reason);
+    }
+
+    #[test]
+    fn black_hole_frames_do_not_feed_a_reference() {
+        let mut w = World::new();
+        let kept = w.series(&Spec::default(), 1, &ramp(25));
+        let rejected = w.series(&Spec { night: 2, ..Spec::default() }, 1, &vec![25.0; 10]);
+        for id in &rejected {
+            w.conn
+                .execute(
+                    "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+                     VALUES (?1, 'test', '2026-03-05T00:00:00Z', '/x')",
+                    [id],
+                )
+                .unwrap();
+        }
+        // Without the ten rejected frames: one night, 25 of 30 frames.
+        let got = ask(&w, Some("A"), &[kept[0], rejected[0]]);
+        assert_eq!(got[&kept[0]].reason.as_deref(), Some("no clear-sky reference yet, 25 of 30 frames"));
+        // A rejected frame asked about still shows its own zero point.
+        assert_eq!(got[&rejected[0]].zero_point, Some(25.0));
+        // Five more kept frames on night 2 complete a reference, and the rejected frame gets its own loss from it
+        // (it is brighter than the reference, so the loss is 0, not absent).
+        w.series(&Spec { night: 2, ..Spec::default() }, 1, &ramp(5));
+        let got = ask(&w, Some("A"), &[kept[0], rejected[0]]);
+        assert_eq!(got[&rejected[0]].loss_mag, Some(0.0));
+        assert!(got[&kept[0]].loss_mag.is_some());
+    }
+
+    #[test]
+    fn a_duplicate_copy_feeds_a_reference_once() {
+        let mut w = World::new();
+        // Fifteen frames, each present as two files with one fingerprint, size and name, over two nights: 15 frames
+        // are not 30, so there is no reference. Counted twice they would complete one.
+        let mut ids = Vec::new();
+        for i in 0..15 {
+            for copy in ["a", "b"] {
+                ids.push(w.seed(&Spec {
+                    zp: Some(20.0 + 0.01 * i as f64),
+                    night: 1 + i % 2,
+                    path: Some(format!("/{copy}/dup{i}.fits")),
+                    filename: Some(format!("dup{i}.fits")),
+                    fingerprint: Some(format!("fp{i}")),
+                    ..Spec::default()
+                }));
+            }
+        }
+        let got = ask(&w, Some("A"), &ids[..1]);
+        assert_eq!(got[&ids[0]].reason.as_deref(), Some("no clear-sky reference yet, 15 of 30 frames"));
     }
 
     #[test]
@@ -1054,11 +1179,14 @@ mod tests {
         let mut set1 = vec![20.0; 26];
         set1.extend([20.5; 4]);
         let one = w.series(&Spec::default(), 2, &set1);
-        // Set 2, another target of the same rig: 40 frames at 21.00. The rig as a whole sits at 21.00.
-        let two = w.series(&Spec { set: Some(2), ..Spec::default() }, 2, &vec![21.0; 40]);
+        // Set 2, another target of the same rig: 33 frames at 21.00 and 7 at 22.00, so its own rank-36 value is 22.00,
+        // while the rig's 70 frames reach their rank-63 value at set 2's 33rd frame: 21.00. The two references differ.
+        let mut set2 = vec![21.0; 33];
+        set2.extend([22.0; 7]);
+        let two = w.series(&Spec { set: Some(2), ..Spec::default() }, 2, &set2);
         let got = ask(&w, Some("A"), &[one[0], two[0]]);
         assert!((loss(&got[&one[0]]) - 0.5).abs() < 1e-9, "measured from the set's 20.50, not the rig's 21.00");
-        assert!((loss(&got[&two[0]]) - 0.0).abs() < 1e-9, "21.00 against the set's own 21.00");
+        assert!((loss(&got[&two[0]]) - 1.0).abs() < 1e-9, "21.00 against the set's own 22.00, not the rig's 21.00");
     }
 
     #[test]
@@ -1069,7 +1197,7 @@ mod tests {
         let got = ask(&w, Some("A"), &[short[0]]);
         let t = &got[&short[0]];
         if RIG_WIDE_FALLBACK {
-            // 45 frames over four nights, rank 41: 21.00.
+            // 45 frames over two sky nights (both sets shot on the same two evenings), rank 41: 21.00.
             assert!((loss(t) - 1.0).abs() < 1e-9);
         } else {
             assert_eq!(t.loss_mag, None);
@@ -1159,19 +1287,22 @@ mod tests {
         w.conn.execute_batch("BEGIN").unwrap();
         let ids = w.series(&Spec::default(), 4, &(0..5000).map(|i| 20.0 + 0.0001 * i as f64).collect::<Vec<_>>());
         w.conn.execute_batch("COMMIT").unwrap();
-        // The module counts the statements it prepares (rusqlite's trace hooks are not enabled in this crate), so this
-        // asserts the loader's own bookkeeping: every statement goes through `Stmts::prepare`.
+        // This counts the statements the module itself prepares through `Stmts::prepare` (rusqlite's trace hooks are not
+        // enabled in this crate), so it proves the count does not grow per frame for the queries that go through
+        // `Stmts`. It cannot catch a query added outside `Stmts` (a bare `conn.prepare` or `conn.query_row`): a new
+        // statement must be routed through `Stmts`, and review has to hold that line.
         let stmts = Stmts(Cell::new(0));
         let got = read(&w.conn, &stmts, Some("A"), &ids).unwrap();
         assert_eq!(got.len(), 5000);
         assert!(got.values().all(|t| t.loss_mag.is_some()), "every frame got a loss");
         let used = stmts.0.get();
-        // 6 chunks of 900 for the frames, 6 for their sets, 1 for the collaboration folder, 1 for the zero points.
-        assert!(used <= 16, "{used} statements for 5000 frames");
+        // 6 chunks of 900 for the frames, 6 for their sets, 1 for the collaboration folder, 1 for the camera names,
+        // 1 for the zero points.
+        assert!(used <= 15, "{used} statements for 5000 frames");
         // The cost is a function of the chunk count, not of the frame count.
         let few = Stmts(Cell::new(0));
         read(&w.conn, &few, Some("A"), &ids[..50]).unwrap();
-        assert_eq!(few.0.get(), 4, "frames, sets, folder, zero points");
+        assert_eq!(few.0.get(), 5, "frames, sets, folder, camera names, zero points");
     }
 
     #[test]
