@@ -1237,10 +1237,20 @@ by construction; G1 → G2 is the build order; the expected table matches the ve
 - **G7** (the list isolates from the frame's own detections) — spec §5.1: the tiers drop RUWE ≥ 1.4 (G6), so bright
   neighbours of 7.6–10.9 % of the list's weight were missing from the cone; the image carries them. Rule, constants
   (`detected_neighbours`, `own_seed_radius_px` 1.5, `detected_neighbour_min_peak_sigma` 10, `seed_calibration_min_pairs`
-  20; each a probe flag) and the row's `detected_neighbours_removed` / `seed_calibration_pairs` are in the spec; the code is
-  `zero_point.rs::seed_isolation`. **G8**: a mosaic's seeds reach the first
+  20; each a probe flag) and the row's `detected_neighbours_removed` / `seed_calibration_pairs` are in the spec; the code was
+  `zero_point.rs::seed_isolation` (G9 moved it: `seed_rule_in`). **G8**: a mosaic's seeds reach the first
   callback (rustafits lends the native seeds, frame pixels, peaks on the `noise.sigma` scale), and the `G_b − 2` halo rule
   is mirrored on the seeds (`bright_dmag`, `bright_radius_fwhm`, no peak floor).
+  **G9** (the seed rule after the map, on members only, to a fixed depth) — g2's two defects (spec §5.1: on a bad solve the
+  rule read a star's own seed 1–3 px off as a neighbour and removed the stars that show the solve, the gate passed it, LBN
+  582 kept share 0.58–0.61 → 0.77–0.84, `poor_solve` 6 → 1, B1 min 0.58 / 0.74, B3 rms 0.0164; the 10 σ floor followed the
+  seeing, removals 3× within a night, Duo 09-13 B3 slope −0.042): the list is the catalogue's alone again (identity proof
+  against g1t0 with `--detected_neighbours false`), the first callback copies the seeds, and `zero_point.rs::seed_rule_in`
+  runs in the placement step on the stars at their mapped positions; a seed counts down to `G_b + seed_neighbour_depth_mag`
+  (2.0, a probe flag); `forced_zero_point` leaves a removed star out of the members; `seed_peak_floor_rejected` is a row
+  column. Tests: `a_bad_solve_keeps_its_gate_verdict_with_the_seed_rule_on_and_off`, `the_seed_rule_runs_at_the_mapped_positions`,
+  `a_seed_fainter_than_the_depth_never_removes_and_the_peak_floor_counts_what_it_spares`,
+  `a_member_the_seed_rule_removed_is_in_no_sum`.
 - **M2** (6r is not an independent referee) — B3 prints three slopes, a stack miss 6r does not echo is no pass and goes
   to the owner: spec §6 (paragraph, M2 beside RR2, RR3); G3 step 7 and its test; G4's class-line paragraph and STOP list.
 - **M3** (the ±0.1 re-measure moved the edges) — `anchor_shift_mag` before the window rule, re-measures at ±0.1 and ±0.5:

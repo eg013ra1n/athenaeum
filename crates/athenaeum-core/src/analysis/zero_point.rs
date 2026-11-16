@@ -472,13 +472,19 @@ pub struct ForcedListParams {
     pub bright_dmag: f64,
     pub bright_radius_fwhm: f64,
     /// The frame's own detections isolate too (the catalogue lacks what the image carries: sources dropped for a
-    /// high RUWE, stars below the tiers' depth, galaxies): a detected seed other than the star's own, within
-    /// `isolation_radius_fwhm * FWHM_ref` of it, with `G_seed <= G + isolation_dmag` and a peak of at least
-    /// `detected_neighbour_min_peak_sigma` plane sigmas, drops the star. `G_seed` is the seed's flux read through a
+    /// high RUWE, stars below the tiers' depth, galaxies). The rule runs AFTER the frame's map, on the list stars at their
+    /// MAPPED positions, and takes stars out of the MEMBERS only (the list, the map stars and the gate are the catalogue
+    /// rules' alone): a detected seed other than the star's own, within `isolation_radius_fwhm * FWHM_ref` of it, with
+    /// `G_seed <= G + isolation_dmag`, `G_seed <= G_b + seed_neighbour_depth_mag` and a peak of at least
+    /// `detected_neighbour_min_peak_sigma` plane sigmas, removes the star. `G_seed` is the seed's flux read through a
     /// per-frame calibration to the catalogue G. The catalogue halo rule's mirror: a seed with
-    /// `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref` drops the star too (no peak floor: a seed that
+    /// `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref` removes the star too (no peak floor: a seed that
     /// bright is a halo source whatever its peak). Skipped when the plane handed no seeds.
     pub detected_neighbours: bool,
+    /// A seed counts as a neighbour only down to `G_b + seed_neighbour_depth_mag`: the depth the map window reaches, so
+    /// a star's membership follows the field and not the night's seeing (a seed fainter than that is detected on some
+    /// frames and not on others).
+    pub seed_neighbour_depth_mag: f64,
     /// A star's own seed is the nearest one within `max(own_seed_radius_px, FWHM_ref)` of its projection.
     pub own_seed_radius_px: f64,
     /// A neighbouring seed counts from this peak (background-subtracted, in plane sigmas).
@@ -559,6 +565,7 @@ impl Default for ForcedListParams {
             bright_dmag: 2.0,
             bright_radius_fwhm: 10.0,
             detected_neighbours: true,
+            seed_neighbour_depth_mag: 2.0,
             own_seed_radius_px: 1.5,
             detected_neighbour_min_peak_sigma: 10.0,
             seed_calibration_min_pairs: 20,
@@ -604,6 +611,7 @@ impl ForcedListParams {
         }
         for (name, v) in [
             ("own_seed_radius_px", self.own_seed_radius_px),
+            ("seed_neighbour_depth_mag", self.seed_neighbour_depth_mag),
             ("detected_neighbour_min_peak_sigma", self.detected_neighbour_min_peak_sigma),
         ] {
             if v.is_nan() {
@@ -741,8 +749,9 @@ pub fn anchor_zero_point(
     }
 }
 
-/// Everything the list builder reads. It takes no FWHM: the list follows the rig and the frame's light, never the
-/// night's seeing.
+/// Everything the list builder reads. It takes no FWHM and no detection of the frame: the list follows the catalogue, the
+/// rig and the frame's light, never the night's seeing (the frame's own seeds act later, on the members:
+/// [`seed_rule_in`]).
 #[derive(Debug, Clone, Copy)]
 pub struct ForcedListInput<'a> {
     /// The catalogue cone of the frame (`catalog_for_frame`), proper motion applied.
@@ -755,11 +764,6 @@ pub struct ForcedListInput<'a> {
     /// The fit's working-unit full scale (`Domain::RawAdu::full_scale`, `ADU_SCALE` for a calibrated plane).
     pub full_scale: f64,
     pub exptime_s: f64,
-    /// The seeds the plane's matched filter found (`PlaneMeasurement::detected`; empty when the plane handed seeds,
-    /// as a mosaic does), in the pixels of `wcs`. The list isolates from them too ([`ForcedListParams::detected_neighbours`]).
-    pub detected: &'a [Seed],
-    /// The plane's pixel noise (working units), the scale of a seed's peak.
-    pub noise_sigma: f64,
 }
 
 /// One star of the list.
@@ -790,11 +794,18 @@ pub struct ForcedList {
     /// The frame's size (px): the map's coordinates are about its centre.
     pub width: usize,
     pub height: usize,
-    /// List candidates removed by the frame's own detections alone (the catalogue rule had kept them).
+    /// Per list star: removed from the members by the seed rule ([`seed_rule_in`]); empty until the rule ran (the list
+    /// itself is the catalogue rules' alone, and the map stars and the gate never see this).
+    pub seed_removed: Vec<bool>,
+    /// List stars the frame's own detections removed from the members (the count of `seed_removed`).
     pub detected_neighbours_removed: u32,
     /// (star, own seed) pairs the seed flux calibration was taken over (0 when the rule did not run: no seeds, switched
-    /// off, or the calibration had fewer than `seed_calibration_min_pairs`, in which case this is the pairs found).
+    /// off, the map refused, or the calibration had fewer than `seed_calibration_min_pairs`, in which case this is the
+    /// pairs found).
     pub seed_calibration_pairs: u32,
+    /// Seeds the peak floor alone kept from removing a star: depth-eligible (`G_seed <= G_b + seed_neighbour_depth_mag`),
+    /// within the isolation radius of a list star, no brighter than it plus `isolation_dmag`, with a peak under the floor.
+    pub seed_peak_floor_rejected: u32,
     /// The map stars: indices into `stars` (`G <= G_b + map_window_mag`, the first `map_max_stars` in key order).
     pub map: Vec<usize>,
     /// What the first fit pass is asked: the map stars' positions in `map` order and the centre tolerance.
@@ -816,7 +827,7 @@ const KEY_SPACE: f64 = 18_446_744_073_709_551_616.0;
 
 /// Build the list (spec §5.1): the catalogue stars inside the region and the edge margin, isolated by the catalogue
 /// alone, in the window `[G_b, faint]`, thinned by hash above the guard, and the map stars among them. Reads no pixel
-/// and no seeing.
+/// and no seeing, and none of the frame's detections.
 pub fn forced_list(input: &ForcedListInput, params: &ForcedListParams) -> Result<ForcedList, ForcedRefusal> {
     forced_list_in(input, params, None)
 }
@@ -906,15 +917,9 @@ pub fn forced_list_in(
             .collect()
     });
 
-    // The frame's own detections isolate too, then the probe's decimation thins what is left (the same share of the
-    // catalogue stays in every frame: the thinning is on the key, before the faint edge's count).
-    let seed_rule = seed_isolation(input, params, &cat, &isolated, g_b, fwhm_ref, near_r, far_r, pool);
-    let isolated: Vec<(f64, usize, u64)> = isolated
-        .into_iter()
-        .enumerate()
-        .filter(|(n, (_, _, key))| !seed_rule.removed.get(*n).copied().unwrap_or(false) && key % decimate == 0)
-        .map(|(_, e)| e)
-        .collect();
+    // The probe's decimation thins the candidates (the same share of the catalogue stays in every frame: the thinning is
+    // on the key, before the faint edge's count).
+    let isolated: Vec<(f64, usize, u64)> = isolated.into_iter().filter(|(_, _, key)| key % decimate == 0).collect();
 
     // The faint edge: G_b + 3, deepened by catalogue count up to G_b + 4.5 while the window is thin.
     let shallow_edge = g_b + params.window_faint_width_mag;
@@ -965,68 +970,101 @@ pub fn forced_list_in(
         scale_arcsec: scale,
         width: input.width,
         height: input.height,
-        detected_neighbours_removed: seed_rule.removed_count,
-        seed_calibration_pairs: seed_rule.pairs,
+        seed_removed: Vec::new(),
+        detected_neighbours_removed: 0,
+        seed_calibration_pairs: 0,
+        seed_peak_floor_rejected: 0,
         map,
         request,
     })
 }
 
-/// What the frame's own detections did to the candidates ([`seed_isolation`]).
-struct SeedRule {
-    /// Per candidate (the order of the catalogue-isolated list): removed by this rule.
-    removed: Vec<bool>,
-    removed_count: u32,
+/// What the frame's own detections did to the list ([`seed_rule_in`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeedRule {
+    /// Per list star: removed from the members by this rule; empty when the rule did not run.
+    pub removed: Vec<bool>,
+    pub removed_count: u32,
     /// (star, own seed) pairs of the flux calibration.
-    pairs: u32,
+    pub pairs: u32,
+    /// Seeds the peak floor alone kept from removing a star (see [`ForcedList::seed_peak_floor_rejected`]).
+    pub peak_floor_rejected: u32,
 }
 
 impl SeedRule {
     fn none(pairs: u32) -> Self {
-        SeedRule { removed: Vec::new(), removed_count: 0, pairs }
+        SeedRule { pairs, ..SeedRule::default() }
     }
 }
 
-/// The list's isolation from the frame's own detections (spec §5.1). The catalogue misses what the image has (sources
-/// dropped at ingest for RUWE >= 1.4, stars under the tiers' depth, galaxies); a candidate is dropped when a detected seed
-/// that is not its own lies within `isolation_radius_fwhm * FWHM_ref` of it with `G_seed <= G + isolation_dmag` and a peak
-/// of at least `detected_neighbour_min_peak_sigma` plane sigmas: the catalogue rule's own question, asked of the image.
-/// The halo rule is mirrored too: a seed with `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref` drops
-/// the candidate, whatever its peak.
+impl ForcedList {
+    /// Record what the seed rule did. The list's stars, its window and its map stars do not change: the rule acts on the
+    /// members ([`forced_zero_point`] leaves a removed star out of every sum).
+    pub fn apply_seed_rule(&mut self, rule: SeedRule) {
+        self.seed_removed = rule.removed;
+        self.detected_neighbours_removed = rule.removed_count;
+        self.seed_calibration_pairs = rule.pairs;
+        self.seed_peak_floor_rejected = rule.peak_floor_rejected;
+    }
+}
+
+/// The members' isolation from the frame's own detections (spec §5.1). The catalogue misses what the image has (sources
+/// dropped at ingest for RUWE >= 1.4, stars under the tiers' depth, galaxies); a list star is removed from the members when
+/// a detected seed that is not its own lies within `isolation_radius_fwhm * FWHM_ref` of it with `G_seed <= G +
+/// isolation_dmag`, `G_seed <= G_b + seed_neighbour_depth_mag` and a peak of at least `detected_neighbour_min_peak_sigma`
+/// plane sigmas: the catalogue rule's own question, asked of the image, to the depth the map window reaches (a seed
+/// fainter than that is found on some frames and not on others, and a membership that follows it follows the seeing).
+/// The halo rule is mirrored too: a seed with `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref` removes
+/// the star, whatever its peak.
 ///
-/// A seed's magnitude is read through the frame's calibration `k`, the median of `flux * 10^(0.4 G)` over the candidates
-/// of the shallow window with exactly one seed within `max(own_seed_radius_px, FWHM_ref)` of their projection, that seed
-/// being nearer to no other such candidate: `G_seed = -2.5 log10(flux / k)`. Fewer pairs than
-/// `seed_calibration_min_pairs`, no seeds, or the rule switched off: nothing is removed (never a refusal).
-#[allow(clippy::too_many_arguments)]
-fn seed_isolation(
-    input: &ForcedListInput,
+/// It runs on the list stars at their MAPPED positions (`positions`, in list order: where the frame's map put each star),
+/// so a frame whose solve is off by a few pixels still finds a star's own seed beside it. A star's own seed is the nearest
+/// one within `max(own_seed_radius_px, FWHM_ref)` of that position. A seed's magnitude is read through the frame's
+/// calibration `k`, the median of `flux * 10^(0.4 G)` over the stars of the shallow window (`G <= G_b +
+/// window_faint_width_mag`) with exactly one seed within that radius, that seed being nearer to no other such star:
+/// `G_seed = -2.5 log10(flux / k)`. Fewer pairs than `seed_calibration_min_pairs`, no seeds, or the rule switched off:
+/// nothing is removed (never a refusal). The answer for a star is independent of the others, so the pool changes
+/// nothing.
+pub fn seed_rule_in(
+    list: &ForcedList,
+    positions: &[(f64, f64)],
+    seeds: &[Seed],
+    noise_sigma: f64,
     params: &ForcedListParams,
-    cat: &[(f64, f64, f32)],
-    isolated: &[(f64, usize, u64)],
-    g_b: f64,
-    fwhm_ref: f64,
-    near_r: f64,
-    far_r: f64,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> SeedRule {
     use rayon::prelude::*;
     if !params.detected_neighbours {
         return SeedRule::none(0);
     }
-    if input.detected.is_empty() {
+    if positions.len() != list.stars.len() {
+        tracing::warn!(
+            positions = positions.len(),
+            stars = list.stars.len(),
+            "forced list: the mapped positions and the list differ in length; the seed rule is skipped"
+        );
+        return SeedRule::none(0);
+    }
+    if seeds.is_empty() {
         tracing::debug!("forced list: the plane handed no seeds; no isolation from the frame's own detections");
         return SeedRule::none(0);
     }
+    let fwhm_ref = list.fwhm_ref_px;
+    let (g_b, near_r, far_r) = (
+        list.window_bright,
+        params.isolation_radius_fwhm * fwhm_ref,
+        params.bright_radius_fwhm * fwhm_ref,
+    );
     let own_r = params.own_seed_radius_px.max(fwhm_ref);
-    let floor = params.detected_neighbour_min_peak_sigma * input.noise_sigma;
-    if !(own_r.is_finite() && near_r.is_finite() && far_r.is_finite() && floor.is_finite() && own_r > 0.0) {
-        tracing::warn!(own_r, near_r, far_r, floor, "forced list: the seed rule's constants are unusable; the rule is skipped");
+    let floor = params.detected_neighbour_min_peak_sigma * noise_sigma;
+    let depth_edge = g_b + params.seed_neighbour_depth_mag;
+    if !(own_r.is_finite() && near_r.is_finite() && far_r.is_finite() && floor.is_finite() && own_r > 0.0 && depth_edge.is_finite())
+    {
+        tracing::warn!(own_r, near_r, far_r, floor, depth_edge, "forced list: the seed rule's constants are unusable; the rule is skipped");
         return SeedRule::none(0);
     }
     // Seeds with a usable position and flux, as grid points.
-    let seeds: Vec<&Seed> = input
-        .detected
+    let seeds: Vec<&Seed> = seeds
         .iter()
         .filter(|s| s.x.is_finite() && s.y.is_finite() && s.flux.is_finite() && s.flux > 0.0 && s.peak.is_finite())
         .collect();
@@ -1038,10 +1076,15 @@ fn seed_isolation(
     let seed_pts: Vec<(f64, f64, f32)> = seeds.iter().map(|s| (s.x, s.y, 0.0)).collect();
     let seed_grid = Grid::new(&seed_pts, cell);
 
-    // The calibration set: the candidates of the shallow window, the list's common case.
+    // The calibration set: the stars of the shallow window, the list's common case, at their mapped positions.
     let shallow = g_b + params.window_faint_width_mag;
-    let cal: Vec<usize> = (0..isolated.len()).filter(|&n| isolated[n].0 <= shallow).collect();
-    let cal_pts: Vec<(f64, f64, f32)> = cal.iter().map(|&n| cat[isolated[n].1]).collect();
+    let cal_pts: Vec<(f64, f64, f32)> = list
+        .stars
+        .iter()
+        .zip(positions)
+        .filter(|(s, p)| f64::from(s.g_mag) <= shallow && p.0.is_finite() && p.1.is_finite())
+        .map(|(s, p)| (p.0, p.1, s.g_mag))
+        .collect();
     let cal_grid = Grid::new(&cal_pts, cell);
     let calibrate = || -> Vec<f64> {
         cal_pts
@@ -1059,7 +1102,7 @@ fn seed_isolation(
                     }
                 }
                 let (j, d) = own?;
-                // The seed must be nearer to no other candidate.
+                // The seed must be nearer to no other star.
                 let stolen = cal_grid.near(seed_pts[j].0, seed_pts[j].1).any(|c2| {
                     c2 != c && (cal_pts[c2].0 - seed_pts[j].0).hypot(cal_pts[c2].1 - seed_pts[j].1) <= d
                 });
@@ -1088,36 +1131,47 @@ fn seed_isolation(
         return SeedRule::none(pairs);
     }
 
-    // The test, on every candidate of the deepest window.
+    // The test, on every list star.
+    let floor_hit: Vec<std::sync::atomic::AtomicBool> =
+        (0..seeds.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+    let test = || seed_flags(list, positions, &seeds, &seed_pts, &seed_grid, &floor_hit, k, [own_r, near_r, far_r], floor, depth_edge, params);
     let removed: Vec<bool> = match pool {
-        Some(p) => p.install(|| seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, g_b, [own_r, near_r, far_r], floor, params)),
-        None => seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, g_b, [own_r, near_r, far_r], floor, params),
+        Some(p) => p.install(test),
+        None => test(),
     };
     let removed_count = removed.iter().filter(|r| **r).count() as u32;
-    SeedRule { removed, removed_count, pairs }
+    let peak_floor_rejected =
+        floor_hit.iter().filter(|f| f.load(std::sync::atomic::Ordering::Relaxed)).count() as u32;
+    SeedRule { removed, removed_count, pairs, peak_floor_rejected }
 }
 
-/// The per-candidate test of [`seed_isolation`], on the rayon pool the caller is on.
+/// The per-star test of [`seed_rule_in`], on the rayon pool the caller is on. `floor_hit[j]` is set when seed `j` passed
+/// every test but the peak floor for some star.
 #[allow(clippy::too_many_arguments)]
 fn seed_flags(
-    isolated: &[(f64, usize, u64)],
-    cat: &[(f64, f64, f32)],
+    list: &ForcedList,
+    positions: &[(f64, f64)],
     seeds: &[&Seed],
     seed_pts: &[(f64, f64, f32)],
     seed_grid: &Grid,
+    floor_hit: &[std::sync::atomic::AtomicBool],
     k: f64,
-    g_b: f64,
     [own_r, near_r, far_r]: [f64; 3],
     floor: f64,
+    depth_edge: f64,
     params: &ForcedListParams,
 ) -> Vec<bool> {
     use rayon::prelude::*;
-    let halo_g = g_b - params.bright_dmag;
-    isolated
+    let halo_g = list.window_bright - params.bright_dmag;
+    list.stars
         .par_iter()
-        .map(|&(g, i, _)| {
-            let (x, y, _) = cat[i];
-            // The star's own seed: the nearest within `own_r`.
+        .zip(positions.par_iter())
+        .map(|(star, &(x, y))| {
+            if !(x.is_finite() && y.is_finite()) {
+                return false;
+            }
+            let g = f64::from(star.g_mag);
+            // The star's own seed: the nearest within `own_r` of its mapped position.
             let mut own: Option<(usize, f64)> = None;
             for j in seed_grid.near(x, y) {
                 let d = (seed_pts[j].0 - x).hypot(seed_pts[j].1 - y);
@@ -1126,20 +1180,28 @@ fn seed_flags(
                 }
             }
             let own = own.map(|(j, _)| j);
-            seed_grid.near(x, y).any(|j| {
+            let mut removed = false;
+            for j in seed_grid.near(x, y) {
                 if Some(j) == own {
-                    return false;
+                    continue;
                 }
                 let s = seeds[j];
                 let d = (s.x - x).hypot(s.y - y);
                 if d > near_r.max(far_r) {
-                    return false;
+                    continue;
                 }
                 let g_seed = -2.5 * (s.flux / k).log10();
-                // The isolation rule (a peak floor), and the catalogue halo rule's mirror (a seed that bright needs none).
-                (d <= near_r && s.peak >= floor && g_seed <= g + params.isolation_dmag)
-                    || (d <= far_r && g_seed <= halo_g)
-            })
+                // The catalogue halo rule's mirror (a seed that bright needs no peak), and the isolation rule, to the map
+                // window's depth, with a peak floor as a guard.
+                let halo = d <= far_r && g_seed <= halo_g;
+                let neighbour = d <= near_r && g_seed <= g + params.isolation_dmag && g_seed <= depth_edge;
+                if halo || (neighbour && s.peak >= floor) {
+                    removed = true;
+                } else if neighbour {
+                    floor_hit[j].store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            removed
         })
         .collect()
 }
@@ -1532,7 +1594,8 @@ pub struct ForcedOutcome {
     pub result: Result<ForcedZeroPoint, ForcedRefusal>,
     /// The list before fitting (after the guard).
     pub list_stars: u32,
-    /// Members: in the window, on the frame and under the clip floor, whatever their weight, before the screen.
+    /// Members: in the window, on the frame, under the clip floor and not removed by the seed rule, whatever their weight,
+    /// before the screen.
     pub members: u32,
     /// Members above `m + clip_sigma * sigma`: their weight was tapered (or, at zero, they were dropped).
     pub tapered: u32,
@@ -1551,7 +1614,8 @@ pub struct ForcedOutcome {
 }
 
 /// The statistic (spec §5.3) over the apertures of `measured` (one per list star, at the positions `placement` moved).
-/// Members: in the window, on the frame, under the clip floor; the sky pedestal is read off them and taken out of every
+/// Members: in the window, on the frame, under the clip floor, and not removed by the seed rule
+/// ([`ForcedList::seed_removed`]); the sky pedestal is read off them and taken out of every
 /// sum; a screen at `clip_sigma` drops the members far below the field's median (a negative flux inside its noise
 /// stays) and tapers the weight of one far above it (`screen_taper_sigma`); the zero point is the weighted ratio of sums; valid with at least
 /// `min_stars` members of non-zero weight and a scatter within `max_sigma_mag`.
@@ -1606,6 +1670,11 @@ pub fn forced_zero_point(
         .collect();
     let mut members: Vec<usize> = Vec::new();
     for (i, (star, ap)) in list.stars.iter().zip(&measured.apertures).enumerate() {
+        // The seed rule's removals are no members: no weight, not in the sums, the pedestal, `zp_stars` or B1's set. Their
+        // apertures were measured all the same (the placement does not know the rule).
+        if list.seed_removed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let g = f64::from(star.g_mag);
         let under_clip = measured.clip_level.map_or(true, |c| ap.peak < c);
         if g >= list.window_bright && g <= list.window_faint && ap.on_frame && ap.sum.is_finite() && under_clip {
@@ -3214,8 +3283,6 @@ mod forced_tests {
             anchor: ANCHOR,
             full_scale: FULL,
             exptime_s: EXPTIME,
-            detected: &[],
-            noise_sigma: 1.0,
         }
     }
 
@@ -3375,7 +3442,7 @@ mod forced_tests {
         assert!(target_survives(0.0, 9.9, Some(gb - 1.9)));
     }
 
-    // ---- isolation from the frame's own detections ------------------------------------------------------------------
+    // ---- isolation from the frame's own detections (the members' rule, after the map) -------------------------------
 
     const K0: f64 = 4.0e9;
 
@@ -3385,13 +3452,10 @@ mod forced_tests {
     }
 
     /// A 1000 x 1000 frame holding a lattice of 36 px of catalogue stars, all at `G_b + 1`, each with its own seed 0.3 px
-    /// off its position (`own_seeds` of them), plus an optional bright image-only star at `(bx, by)` (in no catalogue)
-    /// with its seed. Returns the catalogue, the seeds, the frame's solve and the lattice's positions.
+    /// off its position, plus nothing else. Returns the catalogue, the seeds, the frame's solve, the lattice's positions
+    /// and the stars' magnitude.
     #[allow(clippy::type_complexity)]
-    fn seeded_field(
-        side: usize,
-        extra: Option<(f64, f64, f64, f64)>,
-    ) -> (Vec<CatalogStar>, Vec<Seed>, WcsSolution, Vec<(f64, f64)>, f64) {
+    fn seeded_field(side: usize) -> (Vec<CatalogStar>, Vec<Seed>, WcsSolution, Vec<(f64, f64)>, f64) {
         let wcs = wcs_at(1000, 1000, 1.0, (0.0, 0.0), 0.0);
         let g = g_b(&wcs) + 1.0;
         let (mut cat, mut seeds, mut pos) = (Vec::new(), Vec::new(), Vec::new());
@@ -3403,166 +3467,239 @@ mod forced_tests {
                 pos.push((x, y));
             }
         }
-        if let Some((x, y, g_seed, peak)) = extra {
-            seeds.push(seed_of(x, y, g_seed, peak));
-        }
         (cat, seeds, wcs, pos, g)
     }
 
-    fn seeded_list(cat: &[CatalogStar], wcs: &WcsSolution, seeds: &[Seed], p: &ForcedListParams) -> ForcedList {
-        let i = ForcedListInput { detected: seeds, noise_sigma: 1.0, ..input(cat, wcs, 1000, 1000) };
-        forced_list(&i, p).unwrap()
+    /// The catalogue's list of a seeded field: the seeds take no part in it.
+    fn seeded_list(cat: &[CatalogStar], wcs: &WcsSolution, p: &ForcedListParams) -> ForcedList {
+        forced_list(&input(cat, wcs, 1000, 1000), p).unwrap()
     }
 
-    fn at_pos(l: &ForcedList, x: f64, y: f64) -> bool {
-        l.stars.iter().any(|s| (s.x - x).abs() < 0.01 && (s.y - y).abs() < 0.01)
+    /// The seed rule on a list at the positions the catalogue projected it to (a map that moves nothing), plane sigma 1.
+    fn ruled(l: &ForcedList, seeds: &[Seed], p: &ForcedListParams) -> SeedRule {
+        let at_projection: Vec<(f64, f64)> = l.stars.iter().map(|s| (s.x, s.y)).collect();
+        seed_rule_in(l, &at_projection, seeds, 1.0, p, None)
+    }
+
+    /// Whether the rule removed the list star at `(x, y)` (the catalogue's projection).
+    fn removed_at(l: &ForcedList, r: &SeedRule, x: f64, y: f64) -> bool {
+        let i = l.stars.iter().position(|s| (s.x - x).abs() < 0.01 && (s.y - y).abs() < 0.01).expect("a listed star");
+        r.removed[i]
     }
 
     #[test]
-    fn a_bright_star_absent_from_the_cone_removes_the_list_stars_around_it_and_no_others() {
-        let (cat, mut seeds, wcs, pos, g) = seeded_field(8, None);
-        let base = seeded_list(&cat, &wcs, &[], &params());
-        assert_eq!(base.stars.len(), 64);
-        assert_eq!((base.detected_neighbours_removed, base.seed_calibration_pairs), (0, 0));
+    fn a_bright_star_absent_from_the_cone_removes_its_neighbours_from_the_members_and_no_others() {
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(8);
+        let list = seeded_list(&cat, &wcs, &params());
+        assert_eq!(list.stars.len(), 64);
+        let base = ruled(&list, &seeds, &params());
+        assert_eq!((base.removed_count, base.pairs, base.peak_floor_rejected), (0, 64, 0));
         // A G_b - 3 star between two lattice stars, 18 px from each (the radius is 8 * 2.5 = 20 px), 36 px from the rest.
         let (bx, by) = (pos[0].0 + 18.0, pos[0].1);
         seeds.push(seed_of(bx, by, g - 4.0, 1000.0));
-        let l = seeded_list(&cat, &wcs, &seeds, &params());
+        let r = ruled(&list, &seeds, &params());
         let near: Vec<(f64, f64)> = pos.iter().copied().filter(|p| (p.0 - bx).hypot(p.1 - by) <= 20.0).collect();
         assert_eq!(near.len(), 2, "the premise: two stars in the radius");
-        assert_eq!(l.detected_neighbours_removed, 2);
-        assert_eq!(l.seed_calibration_pairs, 64, "every lattice star has exactly one seed in its radius");
-        assert_eq!(l.stars.len(), 62);
+        assert_eq!((r.removed_count, r.pairs), (2, 64), "every lattice star has exactly one seed in its radius");
         for &(x, y) in &pos {
-            assert_eq!(at_pos(&l, x, y), !near.contains(&(x, y)), "star at ({x}, {y})");
+            assert_eq!(removed_at(&list, &r, x, y), near.contains(&(x, y)), "star at ({x}, {y})");
         }
-        // Switched off, the list is the catalogue rule's.
-        let off = seeded_list(&cat, &wcs, &seeds, &ForcedListParams { detected_neighbours: false, ..params() });
-        assert_eq!((off.stars.len(), off.detected_neighbours_removed, off.seed_calibration_pairs), (64, 0, 0));
+        // The list is the catalogue's whatever the seeds say: a rule applied to it changes the members' bookkeeping only.
+        let mut applied = list.clone();
+        applied.apply_seed_rule(r.clone());
+        assert_eq!((applied.stars.len(), applied.map.len()), (64, list.map.len()));
+        assert_eq!((applied.stars.clone(), applied.request.clone(), applied.window_faint), (list.stars.clone(), list.request.clone(), list.window_faint));
+        assert_eq!((applied.detected_neighbours_removed, applied.seed_calibration_pairs), (2, 64));
+        assert_eq!(applied.seed_removed.iter().filter(|r| **r).count(), 2);
+        // Switched off, nothing is removed and nothing is said.
+        let off = ruled(&list, &seeds, &ForcedListParams { detected_neighbours: false, ..params() });
+        assert_eq!(off, SeedRule::default());
     }
 
     #[test]
     fn a_stars_own_seed_never_removes_it() {
-        let (cat, seeds, wcs, _, _) = seeded_field(8, None);
-        let l = seeded_list(&cat, &wcs, &seeds, &params());
-        assert_eq!((l.stars.len(), l.detected_neighbours_removed, l.seed_calibration_pairs), (64, 0, 64));
+        let (cat, seeds, wcs, _, _) = seeded_field(8);
+        let list = seeded_list(&cat, &wcs, &params());
+        let r = ruled(&list, &seeds, &params());
+        assert_eq!((r.removed_count, r.pairs), (0, 64));
         // Its own seed 1.4 px off (a proper-motion error, inside the 2.5 px radius) is still its own.
         let shifted: Vec<Seed> = seeds.iter().map(|s| Seed { x: s.x + 1.1, y: s.y + 0.9, ..*s }).collect();
-        let l = seeded_list(&cat, &wcs, &shifted, &params());
-        assert_eq!((l.stars.len(), l.detected_neighbours_removed), (64, 0));
+        let r = ruled(&list, &shifted, &params());
+        assert_eq!(r.removed_count, 0);
     }
 
     #[test]
-    fn a_neighbour_the_peak_floor_or_the_magnitude_rule_spares_does_not_remove() {
-        let (cat, seeds, wcs, pos, g) = seeded_field(8, None);
+    fn a_seed_fainter_than_the_depth_never_removes_and_the_peak_floor_counts_what_it_spares() {
+        let (cat, seeds, wcs, pos, g) = seeded_field(8);
+        let list = seeded_list(&cat, &wcs, &params());
+        let gb = g - 1.0;
         let (bx, by) = (pos[0].0 + 18.0, pos[0].1);
-        let with = |g_seed: f64, peak: f64| {
+        let with = |g_seed: f64, peak: f64, p: &ForcedListParams| {
             let mut s = seeds.clone();
             s.push(seed_of(bx, by, g_seed, peak));
-            seeded_list(&cat, &wcs, &s, &params()).detected_neighbours_removed
+            let r = ruled(&list, &s, p);
+            (r.removed_count, r.peak_floor_rejected)
         };
-        // The floor is 10 sigma (sigma 1): 9.9 keeps, 10 removes.
-        assert_eq!(with(g - 1.0, 9.9), 0);
-        assert_eq!(with(g - 1.0, 10.0), 2);
-        // dG: a neighbour 3.9 mag fainter than the star removes it, 4.1 mag fainter keeps it.
-        assert_eq!(with(g + 3.9, 50.0), 2);
-        assert_eq!(with(g + 4.1, 50.0), 0);
+        // The depth: G_b + 2 (the default). A seed at G_b + 1.9 (peak well above the floor) removes its two neighbours, one
+        // at G_b + 2.1 never does, however bright its peak.
+        assert_eq!(with(gb + 1.9, 1000.0, &params()), (2, 0));
+        assert_eq!(with(gb + 2.1, 1000.0, &params()), (0, 0));
+        assert_eq!(with(gb + 3.9, 1.0e6, &params()), (0, 0));
+        // The floor is 10 sigma (sigma 1): 9.9 spares, 10 removes; the seed it spares is counted (once, however many stars
+        // it was near), a seed past the depth is not (it is no neighbour at all).
+        assert_eq!(with(g - 1.0, 9.9, &params()), (0, 1));
+        assert_eq!(with(g - 1.0, 10.0, &params()), (2, 0));
+        assert_eq!(with(gb + 2.1, 9.9, &params()), (0, 0));
+        // dG: with the depth taken out of the way, a neighbour 3.9 mag fainter than the star removes it, 4.1 mag fainter
+        // keeps it (the isolation rule's own limit, which the depth now sits inside).
+        let deep = ForcedListParams { seed_neighbour_depth_mag: 8.0, ..params() };
+        assert_eq!(with(g + 3.9, 50.0, &deep), (2, 0));
+        assert_eq!(with(g + 4.1, 50.0, &deep), (0, 0));
         // Distance: a seed 27 px from the nearest lattice stars (20.5 px along, 18 px across) is outside 8 FWHM_ref (it is
-        // G_b - 1.5, no halo source either: a brighter one would reach the 10 FWHM_ref of the halo rule, 23.7 px from a star).
+        // G_b - 0.5, no halo source either).
         let mut far = seeds.clone();
-        far.push(seed_of(pos[0].0 + 20.5, pos[0].1 + 18.0, g - 2.5, 1000.0));
+        far.push(seed_of(pos[0].0 + 20.5, pos[0].1 + 18.0, gb - 0.5, 1000.0));
         assert!(pos.iter().all(|p| (p.0 - (pos[0].0 + 20.5)).hypot(p.1 - (pos[0].1 + 18.0)) > 20.0), "the premise");
-        assert_eq!(seeded_list(&cat, &wcs, &far, &params()).detected_neighbours_removed, 0);
+        assert_eq!(ruled(&list, &far, &params()).removed_count, 0);
         // And the same seed 19.5 px from a star removes it.
         let mut near = seeds.clone();
-        near.push(seed_of(pos[0].0 + 19.5, pos[0].1, g - 2.5, 1000.0));
-        assert!(seeded_list(&cat, &wcs, &near, &params()).detected_neighbours_removed >= 1);
+        near.push(seed_of(pos[0].0 + 19.5, pos[0].1, gb - 0.5, 1000.0));
+        assert!(ruled(&list, &near, &params()).removed_count >= 1);
         // A lower peak floor lets the faint peak through: the constant is the rule's.
-        let mut s = seeds.clone();
-        s.push(seed_of(bx, by, g - 1.0, 9.9));
         let lax = ForcedListParams { detected_neighbour_min_peak_sigma: 5.0, ..params() };
-        assert_eq!(seeded_list(&cat, &wcs, &s, &lax).detected_neighbours_removed, 2);
+        assert_eq!(with(g - 1.0, 9.9, &lax), (2, 0));
     }
 
     /// The catalogue halo rule's mirror: a seed with `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref`
     /// (25 px here) removes a list star the isolation rule (20 px) does not reach, whatever its peak.
     #[test]
-    fn a_bright_seed_in_the_halo_radius_removes_the_star_as_the_catalogue_halo_rule_does() {
-        let (cat, seeds, wcs, pos, g) = seeded_field(8, None);
+    fn a_bright_seed_in_the_halo_radius_removes_the_member_as_the_catalogue_halo_rule_does() {
+        let (cat, seeds, wcs, pos, g) = seeded_field(8);
+        let list = seeded_list(&cat, &wcs, &params());
         let gb = g - 1.0;
         // A seed left of the lattice's corner star (the rest are 36 px further): only that star is near it.
         let (x0, y0) = pos[0];
-        let with = |dx: f64, g_seed: f64, peak: f64| {
+        let with = |dx: f64, g_seed: f64, peak: f64, p: &ForcedListParams| {
             let mut s = seeds.clone();
             s.push(seed_of(x0 - dx, y0, g_seed, peak));
-            let l = seeded_list(&cat, &wcs, &s, &params());
-            (l.detected_neighbours_removed, at_pos(&l, x0, y0))
+            let r = ruled(&list, &s, p);
+            (r.removed_count, removed_at(&list, &r, x0, y0))
         };
-        // The edges, as `target_survives` asks the catalogue: 24.75 px (9.9 F) drops it, 25.25 px (10.1 F) keeps it.
-        assert_eq!(with(24.75, gb - 2.1, 1000.0), (1, false));
-        assert_eq!(with(25.25, gb - 2.1, 1000.0), (0, true));
+        // The edges, as `target_survives` asks the catalogue: 24.75 px (9.9 F) removes it, 25.25 px (10.1 F) keeps it.
+        assert_eq!(with(24.75, gb - 2.1, 1000.0, &params()), (1, true));
+        assert_eq!(with(25.25, gb - 2.1, 1000.0, &params()), (0, false));
         // 1.9 mag brighter than G_b is no halo source, and 24.75 px is outside the 20 px of the isolation rule.
-        assert_eq!(with(24.75, gb - 1.9, 1000.0), (0, true));
-        // The same seed at 19 px is the isolation rule's (dG <= 4, a peak above the floor).
-        assert_eq!(with(19.0, gb - 1.9, 1000.0), (1, false));
-        // No peak floor on the halo rule: a 1 sigma peak that bright still drops the star.
-        assert_eq!(with(24.75, gb - 2.1, 1.0), (1, false));
+        assert_eq!(with(24.75, gb - 1.9, 1000.0, &params()), (0, false));
+        // The same seed at 19 px is the isolation rule's (dG <= 4, inside the depth, a peak above the floor).
+        assert_eq!(with(19.0, gb - 1.9, 1000.0, &params()), (1, true));
+        // No peak floor on the halo rule: a 1 sigma peak that bright still removes the star.
+        assert_eq!(with(24.75, gb - 2.1, 1.0, &params()), (1, true));
         // Switched off, nothing is removed; the halo constants are the catalogue rule's own.
+        let off = ForcedListParams { detected_neighbours: false, ..params() };
         let mut s = seeds.clone();
         s.push(seed_of(x0 - 24.75, y0, gb - 2.1, 1000.0));
-        let off = seeded_list(&cat, &wcs, &s, &ForcedListParams { detected_neighbours: false, ..params() });
-        assert_eq!((off.detected_neighbours_removed, at_pos(&off, x0, y0)), (0, true));
+        assert_eq!(ruled(&list, &s, &off), SeedRule::default());
         let wide = ForcedListParams { bright_radius_fwhm: 11.0, ..params() };
-        let mut s = seeds.clone();
-        s.push(seed_of(x0 - 26.0, y0, gb - 2.1, 1000.0));
-        let l = seeded_list(&cat, &wcs, &s, &wide);
-        assert_eq!((l.detected_neighbours_removed, at_pos(&l, x0, y0)), (1, false));
+        assert_eq!(with(26.0, gb - 2.1, 1000.0, &wide), (1, true));
     }
 
     #[test]
-    fn under_twenty_pairs_the_rule_is_skipped_and_the_list_is_the_catalogues() {
-        // Four lattice stars (16 < 20 is wrong: 2 x 2 = 4 stars, 4 pairs) with a bright seed beside one of them.
-        let (cat, mut seeds, wcs, pos, g) = seeded_field(4, None);
+    fn under_twenty_pairs_the_rule_is_skipped_and_the_members_are_the_catalogues() {
+        // Four lattice stars: 4 x 4 = 16 stars, 16 pairs, with a bright seed beside one of them.
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(4);
         seeds.push(seed_of(pos[0].0 + 18.0, pos[0].1, g - 4.0, 1000.0));
-        let base = seeded_list(&cat, &wcs, &[], &params());
-        let l = seeded_list(&cat, &wcs, &seeds, &params());
-        assert_eq!(l.stars, base.stars, "the rule did not run");
-        assert_eq!((l.detected_neighbours_removed, l.seed_calibration_pairs), (0, 16));
+        let list = seeded_list(&cat, &wcs, &params());
+        let r = ruled(&list, &seeds, &params());
+        assert_eq!((r.removed.len(), r.removed_count, r.pairs), (0, 0, 16), "the rule did not run: no flags, the pairs found");
         // The pairs are the number found, and the floor of 20 is the params' constant.
         let few = ForcedListParams { seed_calibration_min_pairs: 16, ..params() };
-        let l = seeded_list(&cat, &wcs, &seeds, &few);
-        assert_eq!((l.detected_neighbours_removed, l.seed_calibration_pairs), (2, 16));
+        let r = ruled(&list, &seeds, &few);
+        assert_eq!((r.removed_count, r.pairs), (2, 16));
     }
 
     #[test]
     fn a_plane_with_no_seeds_skips_the_rule() {
-        let (cat, _, wcs, _, _) = seeded_field(8, None);
-        let l = seeded_list(&cat, &wcs, &[], &params());
-        assert_eq!((l.stars.len(), l.detected_neighbours_removed, l.seed_calibration_pairs), (64, 0, 0));
+        let (cat, _, wcs, _, _) = seeded_field(8);
+        let list = seeded_list(&cat, &wcs, &params());
+        assert_eq!(ruled(&list, &[], &params()), SeedRule::default());
     }
 
     #[test]
     fn a_seed_that_two_stars_share_is_no_calibration_pair() {
-        // Two catalogue stars 3 px apart (the catalogue rule would drop them, so they are made faint-isolated by dG): a
-        // seed between them is within the radius of both and nearer to neither alone: it calibrates nothing.
-        let (cat, mut seeds, wcs, pos, g) = seeded_field(8, None);
+        // Two catalogue stars 3 px apart (the catalogue rule would drop them, so one is made faint-isolated by dG): a seed
+        // between them is within the radius of both and nearer to neither alone: it calibrates nothing.
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(8);
         let mut cat = cat;
         cat.push(at(&wcs, pos[63].0 + 3.0, pos[63].1, (g + 4.5) as f32));
         seeds.push(seed_of(pos[63].0 + 1.5, pos[63].1, g, 100.0));
-        let l = seeded_list(&cat, &wcs, &seeds, &params());
-        assert!(l.seed_calibration_pairs <= 63, "{}", l.seed_calibration_pairs);
+        let list = seeded_list(&cat, &wcs, &params());
+        let r = ruled(&list, &seeds, &params());
+        assert!(r.pairs <= 63, "{}", r.pairs);
+    }
+
+    #[test]
+    fn the_seed_rule_runs_at_the_mapped_positions() {
+        // The frame's map moved every star 3 px (a solve that is off): the seeds sit at the moved positions. Asked at the
+        // projections no star has its own seed in the radius (3.3 px > 2.5 px: no pair, the rule skips); asked at the
+        // mapped positions every star has its own seed and the bright star's neighbours are the ones it removes.
+        let (cat, seeds, wcs, pos, g) = seeded_field(8);
+        let list = seeded_list(&cat, &wcs, &params());
+        let moved = |dx: f64| -> Vec<Seed> { seeds.iter().map(|s| Seed { x: s.x + dx, ..*s }).collect() };
+        let mut shifted = moved(3.0);
+        let (bx, by) = (pos[0].0 + 3.0 + 18.0, pos[0].1);
+        shifted.push(seed_of(bx, by, g - 4.0, 1000.0));
+        let skipped = ruled(&list, &shifted, &params());
+        assert_eq!((skipped.removed.len(), skipped.pairs), (0, 0), "at the projections the rule has nothing to calibrate on");
+        let mapped: Vec<(f64, f64)> = list.stars.iter().map(|s| (s.x + 3.0, s.y)).collect();
+        let r = seed_rule_in(&list, &mapped, &shifted, 1.0, &params(), None);
+        assert_eq!((r.removed_count, r.pairs), (2, 64));
+        let near = |x: f64, y: f64| (x + 3.0 - bx).hypot(y - by) <= 20.0;
+        for (s, flag) in list.stars.iter().zip(&r.removed) {
+            assert_eq!(*flag, near(s.x, s.y), "star at ({}, {})", s.x, s.y);
+        }
+        // A bad solve does not turn a star's own seed into a neighbour: shifted seeds, mapped positions, no bright star.
+        let r = seed_rule_in(&list, &mapped, &moved(3.0), 1.0, &params(), None);
+        assert_eq!(r.removed_count, 0);
     }
 
     #[test]
     fn the_seed_rule_does_not_depend_on_the_pool() {
-        let (cat, mut seeds, wcs, pos, g) = seeded_field(8, None);
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(8);
         seeds.push(seed_of(pos[10].0 + 18.0, pos[10].1, g - 4.0, 1000.0));
-        let i = ForcedListInput { detected: &seeds, noise_sigma: 1.0, ..input(&cat, &wcs, 1000, 1000) };
-        let alone = forced_list(&i, &params()).unwrap();
+        seeds.push(seed_of(pos[40].0 + 18.0, pos[40].1, g - 1.0, 5.0));
+        let list = seeded_list(&cat, &wcs, &params());
+        let at_projection: Vec<(f64, f64)> = list.stars.iter().map(|s| (s.x, s.y)).collect();
+        let alone = seed_rule_in(&list, &at_projection, &seeds, 1.0, &params(), None);
         let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap());
-        let pooled = forced_list_in(&i, &params(), Some(&pool)).unwrap();
+        let pooled = seed_rule_in(&list, &at_projection, &seeds, 1.0, &params(), Some(&pool));
         assert_eq!(alone, pooled);
-        assert!(alone.detected_neighbours_removed > 0);
+        assert!(alone.removed_count > 0 && alone.peak_floor_rejected == 1, "{alone:?}");
+    }
+
+    /// A star the rule removed is no member: no weight, not in the sums, the pedestal or `zp_stars`; the others are as if
+    /// it were not there.
+    #[test]
+    fn a_member_the_seed_rule_removed_is_in_no_sum() {
+        let mut list = hand_list(&even(600, 14.0, 17.0));
+        let m = measured_for(&list, &|_, _| 21.8, 0.05, 0.0, 7);
+        let all = statistic(&list, &m);
+        assert_eq!((all.members, all.pedestal_points), (600, 600));
+        // The rule removed 50 stars in the middle of the window.
+        let mut removed = vec![false; 600];
+        removed[250..300].iter_mut().for_each(|r| *r = true);
+        list.apply_seed_rule(SeedRule { removed, removed_count: 50, pairs: 500, peak_floor_rejected: 0 });
+        let o = statistic(&list, &m);
+        assert_eq!((o.members, o.pedestal_points, o.list_stars), (550, 550, 600));
+        for (i, p) in o.per_star.iter().enumerate() {
+            let gone = (250..300).contains(&i);
+            assert_eq!((p.member, p.screened_in, p.weight == 0.0), (!gone, !gone && p.screened_in, gone || p.weight == 0.0), "star {i}");
+            if gone {
+                assert!(p.zp.is_nan(), "star {i}: a removed star has no zero point of its own");
+            }
+        }
+        assert!(o.result.expect("550 members") .stars <= 550);
+        // The map stars and the placement are the list's: the rule did not touch them.
+        assert_eq!(list.map.len(), hand_list(&even(600, 14.0, 17.0)).map.len());
     }
 
     #[test]
@@ -3860,8 +3997,10 @@ mod forced_tests {
             scale_arcsec: 1.0,
             width: 4000,
             height: 3000,
+            seed_removed: Vec::new(),
             detected_neighbours_removed: 0,
             seed_calibration_pairs: 0,
+            seed_peak_floor_rejected: 0,
             map,
         }
     }

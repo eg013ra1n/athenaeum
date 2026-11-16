@@ -190,14 +190,14 @@ mod forced {
     use super::super::config::AnalysisConfig;
     use super::super::zero_point::{
         anchor_zero_point, forced_list_in, forced_zero_point, map_gate, pixel_scale_arcsec, placement, position_map,
-        Anchor, ForcedList, ForcedListInput, ForcedListParams, ForcedOutcome, ForcedRefusal, ForcedZeroPoint, MapGate,
+        seed_rule_in, Anchor, ForcedList, ForcedListInput, ForcedListParams, ForcedOutcome, ForcedRefusal, ForcedZeroPoint, MapGate,
         QuadMap,
     };
     use super::{frame_options, star_metrics, RawFrame, RawPlanes};
     use crate::star_measure::analysis_mode::{
         self, FrameOptions, FrameSummary, ListFit, ListMeasurement, ListPlacement, ListRefusal,
     };
-    use crate::star_measure::{Domain, PlaneMeasurement, ADU_SCALE};
+    use crate::star_measure::{Domain, PlaneMeasurement, Seed, ADU_SCALE};
 
     /// What a solved frame hands the zero point: its sky-to-pixel transform, `EXPTIME` and observation epoch (decimal year).
     #[derive(Debug, Clone, Copy)]
@@ -333,8 +333,6 @@ mod forced {
                 anchor: anchor.zero_point,
                 full_scale: full_scale_working(&frame.domain),
                 exptime_s: exptime,
-                detected: &pm.detected,
-                noise_sigma: pm.noise.sigma,
             },
             params,
             pool,
@@ -372,6 +370,10 @@ mod forced {
         let built: RefCell<Option<(Anchor, ForcedList)>> = RefCell::new(None);
         let placed: RefCell<Option<(QuadMap, ListPlacement)>> = RefCell::new(None);
         let frame_fwhm = std::cell::Cell::new(f64::NAN);
+        // The seed rule's input, copied in the first callback (on a mosaic the seeds are lent for that call only) and read
+        // by the second, after the map: the seeds' position, flux and peak, and the plane's noise.
+        let seeds: RefCell<Vec<Seed>> = RefCell::new(Vec::new());
+        let noise_sigma = std::cell::Cell::new(f64::NAN);
         let (pm, measured) = analysis_mode::measure_raw_frame_and_list(
             frame,
             &opts,
@@ -380,6 +382,10 @@ mod forced {
                 match catch_unwind(AssertUnwindSafe(|| prepare_forced_list(frame, pm, &opts, zp, params, pool, cone))) {
                     Ok(Ok((anchor, list, fwhm))) => {
                         frame_fwhm.set(fwhm);
+                        if params.detected_neighbours {
+                            *seeds.borrow_mut() = pm.detected.clone();
+                            noise_sigma.set(pm.noise.sigma);
+                        }
                         // No map star: nothing to fit (the refusal is the list's size, below).
                         let request = (!list.map.is_empty()).then(|| list.request.clone());
                         *built.borrow_mut() = Some((anchor, list));
@@ -402,10 +408,21 @@ mod forced {
                     if PLACEMENT_PANICS.with(|c| c.get()) {
                         panic!("the placement panicked (test)");
                     }
-                    let built = built.borrow();
-                    let (_, list) = built.as_ref().ok_or(ForcedRefusal::Internal)?;
+                    let mut built = built.borrow_mut();
+                    let (_, list) = built.as_mut().ok_or(ForcedRefusal::Internal)?;
                     let map = position_map(list, fits, params)?;
                     let placement = placement(list, &map, frame_fwhm.get(), params);
+                    // After the map: the seed rule asks its question at the stars' MAPPED positions and removes members
+                    // only (the map stars and the gate are the catalogue list's, whatever the seeds say).
+                    let rule = seed_rule_in(
+                        list,
+                        &placement.aperture_positions,
+                        &seeds.borrow(),
+                        noise_sigma.get(),
+                        params,
+                        pool,
+                    );
+                    list.apply_seed_rule(rule);
                     Ok::<_, ForcedRefusal>((map, placement))
                 }));
                 match outcome {
@@ -1164,9 +1181,10 @@ mod tests {
             assert!(z.stars >= 50, "survivors {}", z.stars);
         }
 
-        /// G8: on a mosaic the frame's own detections reach the list (rustafits hands the first callback the matched
-        /// filter's seeds in the frame's pixels): a bright star the catalogue lacks removes the list stars around it, and
-        /// only them; with the rule off the same frame lists them.
+        /// G8 / G9: on a mosaic the frame's own detections reach the seed rule (rustafits hands the first callback the
+        /// matched filter's seeds in the frame's pixels, the rule copies them and asks after the map): a bright star the
+        /// catalogue lacks removes the members around it, and only them; the list stays the catalogue's. With the rule off
+        /// the same frame has them as members.
         #[test]
         fn on_a_mosaic_a_bright_star_absent_from_the_cone_removes_its_neighbours() {
             let (w, h) = (2000, 1500);
@@ -1183,7 +1201,7 @@ mod tests {
             // The premise: the plain frame lists stars, and no seed rule has anything to say with the rule off.
             let (_, base) = run_on(&mosaic_of_stars(&stars, w, h, 61), &off);
             let base_list = base.list.as_ref().expect("list");
-            assert!(base_list.stars.len() >= 50 && base_list.detected_neighbours_removed == 0);
+            assert!(base_list.stars.len() >= 50 && base_list.detected_neighbours_removed == 0 && base_list.seed_removed.is_empty());
             // A list star well inside the frame, and a bright star in no catalogue 14 px from it.
             let target = base_list
                 .stars
@@ -1198,22 +1216,80 @@ mod tests {
             let list = run.list.as_ref().expect("list");
             assert!(
                 pm.detected.is_empty() && list.seed_calibration_pairs >= 20,
-                "{} pairs: the seeds reached the list",
+                "{} pairs: the seeds reached the rule",
                 list.seed_calibration_pairs
             );
             assert!(list.detected_neighbours_removed >= 1, "removed {}", list.detected_neighbours_removed);
-            let listed = |l: &ForcedList| l.stars.iter().any(|s| (s.x - tx).abs() < 0.01 && (s.y - ty).abs() < 0.01);
-            assert!(!listed(list), "the star beside the uncatalogued bright one is not listed");
-            // Rule off, the same frame lists it: the removal is the seed rule's.
+            let at = |l: &ForcedList| {
+                l.stars.iter().position(|s| (s.x - tx).abs() < 0.01 && (s.y - ty).abs() < 0.01).expect("the star is listed")
+            };
+            // The list is the catalogue's (the frame beside the bright star lists the same stars with the rule off); the
+            // star is a list star that is no member.
             let (_, run_off) = run_on(&frame, &off);
             let list_off = run_off.list.as_ref().expect("list");
-            assert!(listed(list_off) && list_off.detected_neighbours_removed == 0 && list_off.seed_calibration_pairs == 0);
+            assert_eq!(list.stars, list_off.stars, "the list does not depend on the seeds");
+            assert_eq!((list.map.clone(), list.window_bright), (list_off.map.clone(), list_off.window_bright));
+            let (i, i_off) = (at(list), at(list_off));
+            assert!(list.seed_removed[i], "the star beside the uncatalogued bright one is removed from the members");
+            assert!(list_off.seed_removed.is_empty() && list_off.detected_neighbours_removed == 0 && list_off.seed_calibration_pairs == 0);
+            let (o, o_off) = (run.outcome.as_ref().expect("outcome"), run_off.outcome.as_ref().expect("outcome"));
+            assert!(!o.per_star[i].member && o_off.per_star[i_off].member, "the removal is the seed rule's");
             // Few stars go: the rule is local, not a wipe of the list.
             assert!(
-                list.detected_neighbours_removed <= 10 && list.stars.len() + 10 >= list_off.stars.len(),
-                "removed {} of {}",
+                list.detected_neighbours_removed <= 10 && o.members + 10 >= o_off.members,
+                "removed {}; members {} of {}",
                 list.detected_neighbours_removed,
-                list_off.stars.len()
+                o.members,
+                o_off.members
+            );
+        }
+
+        /// G9: the rule runs after the map and takes members only, so a frame that shows a bad solve keeps its gate verdict
+        /// with the rule on and off (placed before the map, the rule read a star 1 to 3 px off its own seed as its own
+        /// neighbour and removed the stars that show the bad solve: LBN 582's kept share went from 0.58-0.61 to 0.77-0.84).
+        /// A third of the field is drawn 3 px off the catalogue.
+        #[test]
+        fn a_bad_solve_keeps_its_gate_verdict_with_the_seed_rule_on_and_off() {
+            let (w, h) = (2000, 1500);
+            let stars = grid_stars(900, w, h, 3.5, 71);
+            let wcs = wcs_1as(w, h);
+            let cat = catalogue_of(&stars, &wcs);
+            // The right third of the field is drawn 3 px to the right of where the catalogue puts it.
+            let drawn: Vec<MoffatStar> = stars
+                .iter()
+                .map(|s| MoffatStar { x: if s.x > w as f64 * 2.0 / 3.0 { s.x + 3.0 } else { s.x }, ..*s })
+                .collect();
+            let mut p = moffat_field(w, h, &drawn, 4.0, 1000.0);
+            add_noise(&mut p, 5.0, 72);
+            let frame = RawFrame { planes: RawPlanes::Mono(p), w, h, domain: RAW, flip_vertical: false, channels: 1 };
+            let on = ForcedListParams::default();
+            let off = ForcedListParams { detected_neighbours: false, ..on };
+            let run_with = |p: &ForcedListParams| {
+                let (_, run) =
+                    measure_with_zero_point(&frame, &cfg(), None, Some(&inputs(&wcs)), p, |_, _, _, _, _| Ok(cat.clone()));
+                run.expect("a solved frame is judged")
+            };
+            let (a, b) = (run_with(&on), run_with(&off));
+            // The list, the map and the gate are the catalogue's: identical with the rule on and off.
+            assert_eq!(a.list.as_ref().map(|l| &l.stars), b.list.as_ref().map(|l| &l.stars));
+            assert_eq!(a.map, b.map);
+            assert_eq!(a.gate, b.gate);
+            assert_eq!(a.result.err(), b.result.err(), "the verdict on a bad solve, its kept share included, is the same");
+            assert!(
+                a.list.as_ref().is_some_and(|l| l.detected_neighbours_removed > 0),
+                "premise: the rule ran (the map stood) and removed members, so the gate was judged after it"
+            );
+            // The premise: the solve is bad enough to show in the gate's share.
+            let share = |r: &ForcedRun| match (&r.gate, &r.result) {
+                (Some(g), _) => g.kept_share,
+                (None, Err(ForcedRefusal::PoorSolve { kept_share })) => *kept_share,
+                _ => f64::NAN,
+            };
+            assert!(
+                share(&a) < 0.95 || a.map.is_none(),
+                "premise: the bad solve shows (kept share {}, result {:?})",
+                share(&a),
+                a.result
             );
         }
 

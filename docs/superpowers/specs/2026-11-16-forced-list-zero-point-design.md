@@ -162,23 +162,40 @@ budget's fits from the same measurement. Positions are 0-based in file row order
   (`gaia_bulk.rs`, `GAIA_RUWE_MAX`), a position-quality cut that is wrong for a neighbour test, and they end at each
   cell's tier depth (G 14.4–17.4 here); 7.6–10.9 % of a frame's list weight sat beside such a star (G 10–13, RUWE
   1.5–21 on the nine checked), lifting a field's level by +0.018 (vdB 152) … +0.045 (Duo LDN 1272), a level and no
-  seeing slope. So a list star is also dropped when a **detected seed** that is not its own lies within
-  `8·FWHM_ref` with `G_seed ≤ G + 4` and a peak of at least 10 σ_sky (`detected_neighbour_min_peak_sigma`, the plane's
-  noise): the catalogue rule's constants, asked of the image. A star's own seed is the nearest one within
-  `max(1.5 px, FWHM_ref)` of its projection (`own_seed_radius_px`). A seed's magnitude is its flux read through the
-  frame's own calibration `k`, the median of `flux·10^(0.4·G)` over the shallow-window candidates (the catalogue rule's
-  survivors with `G ≤ G_b + 3`) that have exactly one seed within the own-seed radius, that seed being nearer to no other
-  such candidate: `G_seed = −2.5·log10(flux / k)`. Fewer than 20 such pairs (`seed_calibration_min_pairs`) skip the rule
-  for the frame with a `warn!`, never a refusal; the row's `seed_calibration_pairs` says how many there were and
-  `detected_neighbours_removed` how many candidates this rule removed that the catalogue rule had kept. The rule runs
-  before the faint edge's count and the cap, so the window deepens on the stars that are left. It needs the plane's
-  matched-filter seeds (`PlaneMeasurement::detected`): a mosaic hands them to its fit as given seeds, so rustafits lends
-  the native ones to the first callback (G8; the returned measurement is unchanged): in the frame's own pixels, each peak
-  the green-sum peak halved (about 0.8 of the star's brightest green site above the sky, on the scale of `noise.sigma`),
-  each flux the green sites' own sum (the calibration `k` absorbs the scale). The `G_b − 2` halo rule is mirrored too (G8):
-  a seed with `G_seed ≤ G_b − 2` within `10·FWHM_ref` drops the star (the catalogue rule's `bright_dmag` and
-  `bright_radius_fwhm`), whatever its peak. A plane that handed no seeds skips the rule with a `debug!`.
-  A judged round (g2) compares the list with and without it (`--detected_neighbours false`).
+  seeing slope. So a list star is also removed from the **members** when a **detected seed** that is not its own lies
+  within `8·FWHM_ref` with `G_seed ≤ G + 4`, `G_seed ≤ G_b + 2` (`seed_neighbour_depth_mag`) and a peak of at least 10 σ_sky
+  (`detected_neighbour_min_peak_sigma`, the plane's noise): the catalogue rule's constants, asked of the image. The
+  `G_b − 2` halo rule is mirrored too (G8): a seed with `G_seed ≤ G_b − 2` within `10·FWHM_ref` removes the star (the
+  catalogue rule's `bright_dmag` and `bright_radius_fwhm`), whatever its peak.
+  **Where it runs (G9, from g2).** G7 and G8 ran the rule inside the list build, on the raw projections, before the
+  map, and g2 (`out/g2`) showed two defects: (1) on a bad solve a star 1–3 px off its own seed read that seed as a
+  neighbour and was removed, so the stars that show the bad solve went and the gate passed it (ATR LBN 582's kept
+  share 0.58–0.61 → 0.77–0.84, `poor_solve` 6 → 1; those frames read −0.08…−0.13 and missed B1 and B3); (2) the 10 σ
+  peak floor follows the seeing (removals varied 3× inside one night: vdB 152 250–837, ATR LDN 1272 749–2156, r with
+  FWHM −0.6…−0.94), so on Duo 09-13 the zero point followed the FWHM at −0.014 mag/px (B3 slope −0.042). So the list,
+  its faint-edge count, the map stars, the map and the gate are built by the catalogue rules alone, exactly as before
+  G7, and the seed rule runs **after the map** (the placement step) on the list stars at their **mapped** positions and
+  takes stars out of the **members** only: a removed star gets no weight (not in the sums, the pedestal, `zp_stars` or
+  B1's shared set); the map stars and the gate never see the rule. Its apertures are still measured (the placement
+  does not know the rule; the cost is nil and a row of the aperture dump stays complete). The depth `G_b + 2` is the
+  map window's: a seed that deep is detected on every frame, so a star's membership follows the field, not the seeing;
+  a deeper seed never counts. The peak floor stays as a guard and its binding count is reported (the row's
+  `seed_peak_floor_rejected`: seeds depth-eligible, in the isolation radius of a list star, no fainter than that star
+  plus 4, with a peak under the floor).
+  A star's own seed is the nearest one within `max(1.5 px, FWHM_ref)` of its mapped position (`own_seed_radius_px`). A
+  seed's magnitude is its flux read through the frame's own calibration `k`, the median of `flux·10^(0.4·G)` over the
+  shallow-window list stars (`G ≤ G_b + 3`, at their mapped positions) that have exactly one seed within the own-seed
+  radius, that seed being nearer to no other such star: `G_seed = −2.5·log10(flux / k)`. Fewer than 20 such pairs
+  (`seed_calibration_min_pairs`) skip the rule for the frame with a `warn!`, never a refusal; the row's
+  `seed_calibration_pairs` says how many there were and `detected_neighbours_removed` how many list stars this rule
+  removed from the members. The rule needs the plane's matched-filter seeds (`PlaneMeasurement::detected`), which the
+  first callback copies (x, y, flux, peak; the plane's noise) into the composition's shared cell: a mosaic hands them
+  to its fit as given seeds, so rustafits lends the native ones to the first callback (G8; the returned measurement is
+  unchanged): in the frame's own pixels, each peak the green-sum peak halved (about 0.8 of the star's brightest green
+  site above the sky, on the scale of `noise.sigma`), each flux the green sites' own sum (the calibration `k` absorbs
+  the scale). A plane that handed no seeds, or a frame the map refused, has no rule (a `debug!` for the first).
+  A judged round compares the members with and without it (`--detected_neighbours false`, which gives g1's rows byte
+  for byte: the identity proof of G9).
 - **No cap.** The hash cap churned a sum (cap 1 000: B2 0.0163 on 09-13; no cap 0.0077; ramped edges 0.0047). A guard of
   12 000 stars stays, by the same hash of the catalogue record (G, position at 1″): above it a star stays when its key
   falls under `12 000 / n`. No rig here reaches it; unjudged.
@@ -213,8 +230,9 @@ pool against the r0 list's 35 ms (an estimate: Phase A times it, §6).
 
 ### 5.3 Statistic and validity
 
-Members: the list stars in the window whose annulus is on the frame and whose highest pixel is under the plane's clip
-floor (any peak when the plane shows no clipped evidence).
+Members: the list stars in the window whose annulus is on the frame, whose highest pixel is under the plane's clip
+floor (any peak when the plane shows no clipped evidence) and that the seed rule (§5.1, G9) did not remove: a removed
+star has no weight, is in no sum, in neither the pedestal's line nor `zp_stars`, nor B1's shared set.
 
 - **Pedestal** ε: over the members (every weight), `D = S(6·FWHM_ref) − S(4·FWHM_ref)` against `S(3·FWHM_ref)`, a
   straight line with four rounds (`pedestal_clip_rounds`) dropping the residuals beyond 3 σ about zero, σ = 1.4826 × the
