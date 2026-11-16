@@ -25,18 +25,21 @@ refuses every star, because half the pixels of its 5 F disc are red or blue site
   `star_metrics.flux` keeps its meaning for every frame, `MEASURE_VERSION` stays 8, no number Analysis stores today
   moves, mono and stacking are untouched, and only OSC frames are re-analysed. Option A (`flux` corrected on OSC, a
   `MEASURE_VERSION` bump, the whole catalogue re-analysed and the stacking caches recomputed) is declined.
-- **O2 — the green-site growth (controller).** On a mosaic a star's growth flux at 5 F is the sum of `(v − B_i)` over
-  the green sites whose centres lie within 5 F, divided by 0.5, the green sites' exact share of a Bayer lattice (not the disc's own count ratio,
-  which moves with its rim: ±1.3 % per phase at FWHM 2 px, Task 1). `B_i` is already the green sky (`ring_sky` reads green sites only, `photometry.rs:854-859`); a G1 / G2 gain or
-  pedestal difference cancels to first order in growth / model, because the fit's one amplitude averages the two
-  sites as the growth does. The green sites form a quincunx lattice; for one star the sum over it, times two, departs
-  from the full sum by `4·exp(−π²σ²)·cos πx₀·cos πy₀` (σ the PSF's Gaussian width in native px, `(x₀, y₀)` the centre's
-  sub-pixel phase): 0.3 % at FWHM 2 px, 7 % at 1.5, about 20 % at 1.3 point-sampled (less with pixel integration). The
-  term has zero mean over phases, so the median over up to 64 stars at random phases is unbiased; per-star noise grows
-  at small FWHM. Aperture photometry on the green channel of a raw colour frame is the established practice of
-  colour-camera photometry (the AAVSO DSLR observing manual). Cost if wrong: Phase A (§6) misses a bar and the build
-  stops before anything is stored.
-- **O3 — measured, never applied (controller).** The green-site `c` is reported on its own; no fit's `signal`
+- **O2 — the green-site growth, phase-matched (controller; owner «делай по своему методу, подтверждаю», 2026-11-16).**
+  On a mosaic a candidate star's ratio is `S_d · (S_ma / S_mg) / model_flux_in_fwtm`: `S_d` the sum of `(v − B_i)` over
+  the green sites within 5 F, `S_mg` the star's own fitted model summed over the same green sites, `S_ma` the model over
+  every pixel within 5 F (evaluated as the fit evaluates it). The model's own green share `S_mg / S_ma` takes the place
+  of a constant 0.5. Why: the green sites form a quincunx lattice, and one star's green-site sum departs from half its
+  full sum by up to `4·exp(−π²σ²)·cos πx₀·cos πy₀` (σ the PSF's Gaussian width in native px, `(x₀, y₀)` its sub-pixel
+  phase): ±10 % per star at FWHM 1.25 px, ±3 % at 1.5, ±0.5 % at 1.8, ~0 from 2.5. The model knows the star's phase, so
+  the error is in numerator and denominator alike and cancels; what is left is the real wings' excess over the model,
+  which is what `c` is for. This is how survey pipelines treat undersampled stars (a pixel-response-matched model with
+  a per-image aperture correction; `research-web.md` beside the ledger). `B_i` is the green sky (`ring_sky` reads green
+  sites only); a G1 / G2 gain or pedestal difference cancels to first order. History: version 1 divided by 0.5 (Task 1;
+  the disc's own count ratio was rejected first, it moves with the rim); on the sharpest night (FWHM 1.25–1.8) its
+  frame `c` was noisy (median se/c 0.0126, |Δ ln c| 0.0146, stability 0.035 → 0.043 mag), version 2 (Task 1b) reads
+  se/c 0.0050, |Δ ln c| 0.0056, stability 0.034. Synthetic truth of signal·c: 0.994–0.996 at FWHM 1.3–3 (v1: 0.982 at
+  1.3). Both references measure the raw mosaic on its green sites only or not at all (`research-local-sources.md`).
   changes, so every field the Analysis tab, Blink, the plate-solve gate and the overlay read is bit-identical before
   and after (`signal`, HFR's half-flux target, SNR read before `c`, `FrameSummary`). `aperture_correction`,
   `aperture_stars`, `aperture_se`, `aperture_ratios` and the population's `aperture_se` stay as today on a mosaic
@@ -85,7 +88,8 @@ portal (the metric is the same `transparency_loss`); a background re-analysis; t
 ### 5.1 rustafits (`star_measure`, a rustafits PR and a submodule bump, R-OSP-19)
 
 - `photometry::growth_curve` gains a masked form: a masked pixel within 5 F is counted in `N_all` and skipped, a
-  present pixel that is not finite still refuses the star, the sum is divided by the lattice density 0.5, and a disc whose
+  present pixel that is not finite still refuses the star, the sum is scaled by the star's own model's green share
+  (O2), and a disc whose
   present share is outside `[0.45, 0.55]` refuses the star. Footprint, `12F` disc and `B_i` rules unchanged; the
   unmasked form is today's, bit for bit.
 - `photometry::aperture_correction` passes the choice through; every candidate screen is unchanged.
@@ -93,7 +97,7 @@ portal (the metric is the same `transparency_loss`); a background re-analysis; t
   `green::measure_green_sites` only. `PlaneMeasurement` gains `reported_aperture_correction: Option<f64>`,
   `reported_aperture_stars: usize`, `reported_aperture_se: Option<f64>` (`None` / 0 on every other path) — the only
   public change. The per-plane log lines for this path say "reported, not applied".
-- `star_measure::CFA_APERTURE_VERSION = 1` beside `MEASURE_VERSION` (8, unchanged): the version of the reported
+- `star_measure::CFA_APERTURE_VERSION = 2` (1 = the density-0.5 form, never stored) beside `MEASURE_VERSION` (8, unchanged): the version of the reported
   mosaic `c`, bumped when only it changes.
 - `CHANGELOG.md` entry; released as 1.9.0. rustafits commits carry no trailer (its own rule).
 
