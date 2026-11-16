@@ -26,8 +26,8 @@ refuses every star, because half the pixels of its 5 F disc are red or blue site
   moves, mono and stacking are untouched, and only OSC frames are re-analysed. Option A (`flux` corrected on OSC, a
   `MEASURE_VERSION` bump, the whole catalogue re-analysed and the stacking caches recomputed) is declined.
 - **O2 — the green-site growth (controller).** On a mosaic a star's growth flux at 5 F is the sum of `(v − B_i)` over
-  the green sites whose centres lie within 5 F, times `N_all / N_green` (the pixel centres of the disc over its green
-  ones). `B_i` is already the green sky (`ring_sky` reads green sites only, `photometry.rs:854-859`); a G1 / G2 gain or
+  the green sites whose centres lie within 5 F, divided by 0.5, the green sites' exact share of a Bayer lattice (not the disc's own count ratio,
+  which moves with its rim: ±1.3 % per phase at FWHM 2 px, Task 1). `B_i` is already the green sky (`ring_sky` reads green sites only, `photometry.rs:854-859`); a G1 / G2 gain or
   pedestal difference cancels to first order in growth / model, because the fit's one amplitude averages the two
   sites as the growth does. The green sites form a quincunx lattice; for one star the sum over it, times two, departs
   from the full sum by `4·exp(−π²σ²)·cos πx₀·cos πy₀` (σ the PSF's Gaussian width in native px, `(x₀, y₀)` the centre's
@@ -85,7 +85,7 @@ portal (the metric is the same `transparency_loss`); a background re-analysis; t
 ### 5.1 rustafits (`star_measure`, a rustafits PR and a submodule bump, R-OSP-19)
 
 - `photometry::growth_curve` gains a masked form: a masked pixel within 5 F is counted in `N_all` and skipped, a
-  present pixel that is not finite still refuses the star, the sum is scaled by `N_all / N_present`, and a disc whose
+  present pixel that is not finite still refuses the star, the sum is divided by the lattice density 0.5, and a disc whose
   present share is outside `[0.45, 0.55]` refuses the star. Footprint, `12F` disc and `B_i` rules unchanged; the
   unmasked form is today's, bit for bit.
 - `photometry::aperture_correction` passes the choice through; every candidate screen is unchanged.
