@@ -246,16 +246,26 @@ Owner ruling:
 
 Amendments from what the probe showed:
 
-- **Final constants**: match radius 2 px, central region 0.9 of the half-diagonal, minimum 15 stars,
-  standard error ≤ 0.02 mag, clip 4 σ, the brightest 15 % of the usable stars dropped, star SNR ≥ 10,
-  a catalogue neighbour within 3 FWHM counts as a blend only when it is within 4 mag.
-- **Why the precision limit is tight.** The brightest catalogue stars of a Milky Way field are red
-  (giants, reddened): G reaches 1050 nm, a luminance filter stops near 700 nm, so they read 0.3–2 mag
-  fainter than their G says. With only the base tier installed they are the only matches, and a frame's
-  zero point comes out 0.2–0.3 mag low. It is not saturation (no flag, raw peaks at 10–45 % of full
-  scale). A bright/faint comparison and a star-count floor do not separate such frames; the 0.02 mag
-  limit refuses all of them and keeps 97–100 % of the frames measured on the deeper tier. §5.1's
-  "stars near saturation are out" is therefore the bright-end drop, nothing more.
+- **Final constants**: match radius 2 px, central region 0.9 of the half-diagonal, minimum 50 stars,
+  standard error ≤ 0.035 mag, clip 4 σ, the brightest 15 % of the usable stars dropped, star SNR ≥ 10,
+  a catalogue neighbour within 3 FWHM counts as a blend only when it is within 4 mag. The first
+  probe fixed 15 stars and 0.02 mag; the acceptance run on real data corrected both (next bullet).
+- **What the validity rule guards.** A zero point is current only for the installed catalogue's
+  identity (next bullet), and a transparency loss is a difference between frames of one rig measured
+  against one catalogue, so a bias of the star population cancels in it. What the rule guards is
+  noise, not bias: under 50 matched stars the frame-to-frame scatter was 0.10–0.12 mag. The shallow
+  catalogue is where that happens. The brightest catalogue stars of a Milky Way field are red (giants,
+  reddened): G reaches 1050 nm, a luminance filter stops near 700 nm, so they read 0.3–2 mag fainter
+  than their G says. With only the base tier installed they are the only matches, so a frame keeps few
+  stars (at most 49 on the 295 shallow-catalogue L frames) and its zero point comes out 0.2–0.3 mag
+  low. It is not saturation (no flag, raw peaks at 10–45 % of full scale). §5.1's "stars near
+  saturation are out" is therefore the bright-end drop, nothing more. The first limit, 0.02 mag, was
+  set to refuse those frames, and it refused the wrong ones too: through a blue filter the per-star
+  offset to G scatters widely, so with ~265 kept stars the standard error is 0.022–0.030, yet those
+  frames are stable to 0.04 mag frame to frame; 49 of 50 blue frames were refused. Standard error
+  ≤ 0.035 mag and at least 50 kept stars keep every frame measured on the deeper catalogue and still
+  refuse the shallow ones. Result with tiers 500 + 2000, valid frames over frames measured: L, H, R, G
+  and B each 100 %; the shallow-catalogue L frames 0 of 295.
 - **The catalogue is part of a zero point's identity.** `frame_analysis` gains `zp_catalog` (the
   installed tiers' identity at measurement time). A frame measured against another tier set is
   recomputed, and a reference reads only frames measured against the installed one: a deeper tier
@@ -266,7 +276,8 @@ Amendments from what the probe showed:
 - **Frame-to-frame noise** is about 0.03 mag: the 500-star analysis sample shares only a few matched
   stars between consecutive frames. The sky itself moves 0.013–0.017 mag. `zp_sigma / √zp_stars`
   understates the real error by about 2×.
-- **Not judged:** no frame in the probe was shot through haze or cloud (the largest dip is 0.09 mag);
+- **Not judged:** the green and blue filters were judged on stability only (0.024–0.041 mag), not on the
+  other bars; no frame in the probe was shot through haze or cloud (the largest dip is 0.09 mag);
   the cross-target bar for narrowband; a camera under 16 bit; a field at high galactic latitude; a long
   focal length. The acceptance of §6 uses a low-altitude frame (a real 0.24 mag loss) in place of a hazy
   one; a cloudy night is owed.

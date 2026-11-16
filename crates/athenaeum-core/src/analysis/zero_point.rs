@@ -51,11 +51,15 @@ pub struct ZpParams {
     pub match_radius_px: f64,
     /// Stars inside this fraction of the half-diagonal are used.
     pub central_fraction: f64,
-    /// Fewest surviving stars of a valid frame.
+    /// Fewest surviving stars of a valid frame. Under 50 matched stars the
+    /// frame-to-frame scatter of the zero point was 0.10-0.12 mag: this limit
+    /// guards the noise of the median, and the frames it refuses are the ones
+    /// measured on a shallow catalogue, where only the brightest stars match.
     pub min_stars: usize,
-    /// Largest standard error of the median (mag) of a valid frame. It is tight
-    /// on purpose: with few stars the median follows the bright population and
-    /// is biased by 0.2-0.3 mag; 0.02 refuses those frames (probe, 2026-11-15).
+    /// Largest standard error of the median (mag) of a valid frame. Through a
+    /// blue filter the per-star offset to G scatters widely, so a stable frame
+    /// still has an error of 0.022-0.030 with ~265 stars; 0.035 keeps those and
+    /// refuses a median that is too noisy to compare (acceptance run, 2026-11-15).
     pub max_std_error_mag: f64,
     /// Sigma-clip threshold in robust sigmas.
     pub clip_sigma: f64,
@@ -79,8 +83,8 @@ impl Default for ZpParams {
         Self {
             match_radius_px: 2.0,
             central_fraction: 0.9,
-            min_stars: 15,
-            max_std_error_mag: 0.02,
+            min_stars: 50,
+            max_std_error_mag: 0.035,
             clip_sigma: 4.0,
             bright_drop_fraction: 0.15,
             min_snr: 10.0,
@@ -1016,7 +1020,7 @@ mod tests {
         let zp = m.result.expect("a clean field is valid");
         assert!((zp.zero_point - TRUE_ZP).abs() < 1e-9, "zp {}", zp.zero_point);
         assert!(zp.sigma < 1e-9, "sigma {}", zp.sigma);
-        assert!(zp.stars >= 15, "stars {}", zp.stars);
+        assert!(zp.stars >= 50, "stars {}", zp.stars);
     }
 
     #[test]
@@ -1157,7 +1161,8 @@ mod tests {
 
     #[test]
     fn fewer_than_the_minimum_refuses_with_counts() {
-        // 10 stars, the brightest one dropped (15 % of 10 floors to 1): 9 matched.
+        // 10 stars, the brightest one dropped (15 % of 10 floors to 1): 9 matched,
+        // far under the 50 a valid frame needs.
         let f = field(10, TRUE_ZP, 0.0, 6);
         let m = measure(&f);
         assert_eq!(m.matched, 9);
@@ -1170,13 +1175,34 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_scatter_of_few_stars_refuses() {
-        let f = field(20, TRUE_ZP, 1.0, 7);
+    fn forty_nine_stars_refuse_and_fifty_measure() {
+        // No scatter, so every matched star is kept. Brightest 15 % dropped:
+        // 57 stars drop 8 (8.55 floors to 8) and leave 49; 58 drop 8 (8.7) and
+        // leave 50.
+        let m = measure(&field(57, TRUE_ZP, 0.0, 15));
+        assert_eq!(m.matched, 49);
+        match m.result {
+            Err(ZpRefusal::TooFewStars { matched, kept }) => assert_eq!((matched, kept), (49, 49)),
+            other => panic!("expected TooFewStars at 49 stars, got {other:?}"),
+        }
+        let m = measure(&field(58, TRUE_ZP, 0.0, 16));
+        assert_eq!(m.matched, 50);
+        let zp = m.result.expect("50 kept stars are enough");
+        assert_eq!(zp.stars, 50);
+        assert!((zp.zero_point - TRUE_ZP).abs() < 1e-9, "zp {}", zp.zero_point);
+    }
+
+    #[test]
+    fn a_wide_scatter_of_many_enough_stars_refuses() {
+        // 100 stars, 85 after the bright drop: at least 50 are kept, so the
+        // refusal is the scatter (standard error ~1.0 / sqrt(85) = 0.11), not
+        // the star count.
+        let f = field(100, TRUE_ZP, 1.0, 7);
         let m = measure(&f);
         match m.result {
             Err(ZpRefusal::TooScattered { std_error, kept }) => {
-                assert!(std_error > 0.02, "std_error {std_error}");
-                assert!(kept >= 15, "kept {kept}");
+                assert!(std_error > 0.035, "std_error {std_error}");
+                assert!(kept >= 50, "kept {kept}");
             }
             other => panic!("expected TooScattered, got {other:?}"),
         }
@@ -1185,7 +1211,7 @@ mod tests {
     #[test]
     fn a_wide_scatter_of_many_stars_is_valid() {
         // 800 stars (680 after the bright drop): the standard error of 0.30 mag
-        // scatter is about 0.012, clearly under the 0.02 limit.
+        // scatter is about 0.012, clearly under the 0.035 limit.
         let f = field(800, TRUE_ZP, 0.30, 8);
         let zp = measure(&f).result.expect("many stars average the scatter out");
         assert!((zp.zero_point - TRUE_ZP).abs() < 0.05, "zp {}", zp.zero_point);
@@ -1197,8 +1223,8 @@ mod tests {
         let d = ZpParams::default();
         assert_eq!(d.match_radius_px, 2.0);
         assert_eq!(d.central_fraction, 0.9);
-        assert_eq!(d.min_stars, 15);
-        assert_eq!(d.max_std_error_mag, 0.02);
+        assert_eq!(d.min_stars, 50);
+        assert_eq!(d.max_std_error_mag, 0.035);
         assert_eq!(d.clip_sigma, 4.0);
         assert_eq!(d.bright_drop_fraction, 0.15);
         assert_eq!(d.min_snr, 10.0);
