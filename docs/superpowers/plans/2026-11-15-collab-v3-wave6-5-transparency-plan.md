@@ -317,7 +317,7 @@ Agent: rust-engineer, sonnet.
   - `evaluate_frame`: metric `transparency_loss` reads `transparency.loss_mag`; label `Transparency loss`, unit `mag`, value printed with two decimals; with no value the rule's row has `value: None, pass: None, reason: Some(sentence)` and the frame's `publishable` and `failures` are untouched.
   - Manifest key `transparencyLoss` (number, mag), written by `build_frame_meta` when a loss exists; `MetaWire` and `ProjectFrameMeta` gain `transparency_loss: Option<f64>`.
   - `OwnFrameRow` gains `pub transparency: Transparency`; `ProjectFrameView` gains `pub transparency_loss: Option<f64>`.
-  - Frozen value (C5): for a frame already published, the gate input and `OwnFrameRow.transparency.loss_mag` take the manifest's `transparencyLoss`; a published frame whose manifest has none shows no value with the reason `published before transparency was measured`.
+  - Frozen value (C5): for a frame already published, the gate input and `OwnFrameRow.transparency.loss_mag` take the manifest's `transparencyLoss`; a published frame whose manifest has none shows no value with the reason `published without a transparency value`.
   - `project_gate` calls `ensure_zero_points` for its frames before it builds inputs (trigger c); no catalogue → it proceeds without.
 
 - [ ] **Step 1: Write the failing tests:**

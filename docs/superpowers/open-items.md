@@ -394,6 +394,18 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab v3 sub-wave 6.5 — transparency (2026-11-16)
+
+Branch `collab-v3-wave6-5` (spec `docs/superpowers/specs/2026-11-15-collab-v3-wave6-5-zero-point-design.md`, plan `docs/superpowers/plans/2026-11-15-collab-v3-wave6-5-transparency-plan.md`, rulings Z1–Z5). Reference: `docs/catalog/README.md` (Zero point and transparency) and `docs/transfers/README.md` (the transparency gate metric and manifest key). Code-complete; the probe ran on 616 real frames (two rigs, four Milky Way fields, 13 nights). Owed:
+
+- **Owed: the hub.** Branch `transparency-loss-metric` in `athenaeum-hub` is not merged, not pushed, not deployed. Deploy to the test hub first, then production, on the owner's word, and not before the app release that carries the metric. Then the portal's threshold editor with the new metric checked in a browser: add a `Transparency loss` rule (only `≤` offered), save, see it under the thresholds. Delete this line when it passes.
+- **Owed: a real-window look.** The Transparency column in the project frame tables, the frame panel (zero point, star count, scatter) and the stacking Frames block, in the Tauri window on the owner's catalog: the minus sign, the `—` cell and its tooltip, the sort. Checked only in the UI harness. Delete this line when it passes.
+- **Owed: a cloudy or hazy night.** No frame in the probe lost more than 0.09 mag to anything but altitude, so the gate has not been seen refusing a hazy frame; the acceptance used a low-altitude frame (a real 0.24 mag loss). Run a night with cloud or haze through a project with a `transparency_loss` rule and see the dips refused and the clear neighbours passed. Delete this line when it passes.
+- **Owed: OSC.** Not measured (Z5): the stored flux of an OSC star carries no aperture correction and the zero point follows the seeing. The remedy is an aperture sum from Analysis in rustafits (R-OSP-19), then a re-probe on the OSC set. A task of its own.
+- **Owed: the release-notes line.** `RELEASE_NOTES.md`, "Coming in 0.7.2", still promises "frame and group weights from star photometry". Proposed replacement, to apply only on the owner's yes: "**See how clear the sky was for every frame.** Athenaeum will compare the brightness of each frame's stars with their Gaia catalog magnitudes and show how much light the frame lost to haze, cloud or a low target. In a collaboration project the coordinator can set one limit that is fair to every telescope. Colour cameras follow in a later update."
+- **Not judged by the probe.** Narrowband across targets (the cross-target bar), a camera under 16 bit, a field at high galactic latitude, a long focal length.
+- **Do NOT re-flag**: the `equivalent` zero-point rung and the `Exposure` weight are not built (ruling Z4: deferred, not owed). Altitude counts as loss (C2): a frame low in the sky really collected less light, and a frame below about 19° reads over 0.5 mag on a clear sky. The Library and Moderation tables show no reason for an empty Transparency cell: the manifest carries the loss only.
+
 ### Review follow-ups, evening of 2026-11-12 — rows 10, 11, 13, 27, 28, the colour-token warning, the dark guard
 
 Ledger: `.superpowers/sdd/2026-11-10-review-followups/progress.md` (close-out of the evening). Code-complete, each row re-gated, one opus review of the product commits with its fixes taken. Nothing below was run in the launched app. Owed by a human, on real data:
@@ -1099,8 +1111,9 @@ in Admin and the members & roles editor.
 - **Owed**: on the test hub, `POST /projects/{id}/thresholds` with `{"metricKey":"fwhm"}` answers
   400 `unknown metric "fwhm"`.
 - **Do NOT re-flag**: `zero_point` is deliberately absent from all three registry copies
-  (hub `collab_rules.rs`, portal `metrics.ts`, app `collab/gate.rs::METRIC_REGISTRY`) until
-  wave 3 (spec §6.3).
+  (hub `collab_rules.rs`, portal `metrics.ts`, app `collab/gate.rs::METRIC_REGISTRY`). It stays
+  absent by owner ruling Z3 (2026-11-15, sub-wave 6.5: the gate compares loss, not the absolute
+  value); the gate metric is `transparency_loss`.
 
 ### Stacking perf Tier C (2026-09-20)
 

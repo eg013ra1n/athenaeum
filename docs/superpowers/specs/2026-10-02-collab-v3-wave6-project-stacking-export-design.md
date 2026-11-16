@@ -43,6 +43,8 @@ Numbered so plans and reviews can cite them.
   becomes sub-wave 6.5. Wave 6 ships the exposure modes `seconds`, `stops`,
   `equivalent` (ladder `t/N²` → seconds only) and `none` (§8). ZP later plugs
   in as the top rung of `equivalent` without changing any group key format.
+  *Sub-wave 6.5 shipped the transparency number instead; the zero point as a rung of `equivalent` is deferred, not
+  built: `2026-11-15-collab-v3-wave6-5-zero-point-design.md`, ruling Z4.*
 - **W2 — The coordinator remaps filters in the app** — Moderation tab,
   section *Filters* — through the hub's existing per-frame
   `PATCH /projects/{id}/frames/{uuid}` (`filterCanonical`, capability
@@ -905,7 +907,7 @@ and cached (a second run does not solve it again).
 ## 17. Out of scope and open
 
 - **Out of scope:**
-  - ZP and the `t_eq` weight term (sub-wave 6.5, W1).
+  - ZP and the `t_eq` weight term (W1; deferred, not built, by ruling Z4 of the sub-wave 6.5 spec, `2026-11-15-collab-v3-wave6-5-zero-point-design.md`).
   - The bin/scale admission study (W7).
   - The portal's grid editor and per-frame list (wave 7).
   - OSC channel split / super luminance (R21).
