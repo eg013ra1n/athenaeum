@@ -35,16 +35,16 @@
 //! `--osc-c` the verdict is the sub-wave 6.5 one, line for line.
 //!
 //! `forced` (forced-list zero point, Task 3) runs the shipping composition `analysis::analyzer::measure_with_zero_point`
-//! on frames read in memory and writes `<x>.tsv` (one row per light: the anchor, the window, the list, `c`, the zero
-//! point or its refusal, today's zero point on the same measurement, the 6F reference, the identity check, the wall time
+//! on frames read in memory and writes `<x>.tsv` (one row per light: the anchor, the window, the list, the zero
+//! point or its refusal, today's zero point on the same measurement, the identity check, the wall time
 //! and memory of the list) and `<x>.stars.tsv` (one row per list star). `--identity-every <n>` (default 10) measures every
 //! n-th frame a second time without a list and compares the two (B9). `verdict --forced [--common <tsv>] <x>.tsv...`
 //! judges the bars B1-B9 of the forced-list spec (section 6, with the plan's review rulings): every night of at least 30
 //! measured frames, pairs under 15 minutes apart, one line per bar and a last line GO or STOP. A bar judged on no night
 //! of its class is a STOP. The pier side of a frame is read from the solve's field rotation against the night's first
 //! frame (more than 90 degrees mod 360 is the other side). `--<field> <v>` on `forced` is any `ForcedListParams` field in
-//! snake_case (`--cap 800`, `--window_bright_margin_mag 1.0`, ...) so a tuning round needs no rebuild; `min_stars`,
-//! `clip_sigma` and `max_std_error_mag` are also `ZpParams` fields and a value given for one of them sets both (today's
+//! snake_case (`--cap 800`, `--window_bright_margin_mag 1.0`, `--pedestal_radii_ref 3,4,6`, ...) so a tuning round needs
+//! no rebuild; `min_stars` and `clip_sigma` are also `ZpParams` fields and a value given for one of them sets both (today's
 //! zero point is judged by the same rule as the forced one). The parameters actually used, and the flags that moved
 //! them, are echoed on stderr and written to `<x>.flags.txt` beside the TSV (the TSV's first line stays its header).
 //!
@@ -74,15 +74,15 @@ use athenaeum_core::analysis::analyzer::{
 };
 use athenaeum_core::analysis::config::{load_config, AnalysisConfig};
 use athenaeum_core::analysis::zero_point::{
-    catalog_for_frame, forced_zero_point, measure_zero_point, ForcedList, ForcedListParams,
-    ForcedRefusal, ForcedStar, ZpInput, ZpMeasurement, ZpParams, ZpRefusal,
+    catalog_for_frame, measure_zero_point, ForcedListParams, ForcedRefusal, ForcedStar,
+    ForcedStarZp, ZpInput, ZpMeasurement, ZpParams, ZpRefusal,
 };
 use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::hints::observation_epoch;
 use athenaeum_core::plate_solve::open_catalog_layers;
 use athenaeum_core::plate_solve::storage::get_plate_solve;
 use athenaeum_core::star_measure::analysis_mode::{
-    measure_raw_frame_and_list, FrameOptions, FrameSummary, ListFit, ListMeasurement,
+    FrameOptions, FrameSummary, ListAperture, ListFit,
 };
 use athenaeum_core::star_measure::raw::{read_raw_frame, RawPlanes};
 use athenaeum_core::star_measure::{PlaneMeasurement, StarFit};
@@ -233,54 +233,66 @@ impl Args {
     /// [`Args::zp_params`], which takes it, so one value sets both.
     fn forced_list_params(&mut self) -> Result<ForcedListParams> {
         let d = ForcedListParams::default();
+        let pedestal_radii_ref = match self.take("pedestal_radii_ref") {
+            None => d.pedestal_radii_ref,
+            Some(v) => {
+                let parts: Vec<f64> = v
+                    .split(',')
+                    .map(|x| x.trim().parse::<f64>())
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|_| anyhow!("--pedestal_radii_ref: cannot read {v:?} (three numbers a,b,c)"))?;
+                let [a, b, c] = parts[..] else {
+                    bail!("--pedestal_radii_ref: needs three numbers a,b,c, got {v:?}");
+                };
+                [a, b, c]
+            }
+        };
         Ok(ForcedListParams {
             fwhm_floor_px: self.take_parsed("fwhm_floor_px")?.unwrap_or(d.fwhm_floor_px),
             fwhm_ref_arcsec: self.take_parsed("fwhm_ref_arcsec")?.unwrap_or(d.fwhm_ref_arcsec),
-            anchor_min_matches: self
-                .take_parsed("anchor_min_matches")?
-                .unwrap_or(d.anchor_min_matches),
-            window_peak_fraction: self
-                .take_parsed("window_peak_fraction")?
-                .unwrap_or(d.window_peak_fraction),
+            anchor_min_matches: self.take_parsed("anchor_min_matches")?.unwrap_or(d.anchor_min_matches),
+            window_peak_fraction: self.take_parsed("window_peak_fraction")?.unwrap_or(d.window_peak_fraction),
             window_bright_margin_mag: self
                 .take_parsed("window_bright_margin_mag")?
                 .unwrap_or(d.window_bright_margin_mag),
-            window_faint_width_mag: self
-                .take_parsed("window_faint_width_mag")?
-                .unwrap_or(d.window_faint_width_mag),
-            window_faint_max_mag: self
-                .take_parsed("window_faint_max_mag")?
-                .unwrap_or(d.window_faint_max_mag),
+            window_faint_width_mag: self.take_parsed("window_faint_width_mag")?.unwrap_or(d.window_faint_width_mag),
+            window_faint_max_mag: self.take_parsed("window_faint_max_mag")?.unwrap_or(d.window_faint_max_mag),
             min_isolated: self.take_parsed("min_isolated")?.unwrap_or(d.min_isolated),
-            region_fraction: self
-                .take_parsed("region_fraction")?
-                .unwrap_or(d.region_fraction),
-            edge_margin_fwhm: self
-                .take_parsed("edge_margin_fwhm")?
-                .unwrap_or(d.edge_margin_fwhm),
-            isolation_dmag: self
-                .take_parsed("isolation_dmag")?
-                .unwrap_or(d.isolation_dmag),
-            isolation_radius_fwhm: self
-                .take_parsed("isolation_radius_fwhm")?
-                .unwrap_or(d.isolation_radius_fwhm),
+            window_ramp_mag: self.take_parsed("window_ramp_mag")?.unwrap_or(d.window_ramp_mag),
+            region_fraction: self.take_parsed("region_fraction")?.unwrap_or(d.region_fraction),
+            edge_margin_fwhm: self.take_parsed("edge_margin_fwhm")?.unwrap_or(d.edge_margin_fwhm),
+            isolation_dmag: self.take_parsed("isolation_dmag")?.unwrap_or(d.isolation_dmag),
+            isolation_radius_fwhm: self.take_parsed("isolation_radius_fwhm")?.unwrap_or(d.isolation_radius_fwhm),
             bright_dmag: self.take_parsed("bright_dmag")?.unwrap_or(d.bright_dmag),
-            bright_radius_fwhm: self
-                .take_parsed("bright_radius_fwhm")?
-                .unwrap_or(d.bright_radius_fwhm),
+            bright_radius_fwhm: self.take_parsed("bright_radius_fwhm")?.unwrap_or(d.bright_radius_fwhm),
             cap: self.take_parsed("cap")?.unwrap_or(d.cap),
-            centre_tolerance_px: self
-                .take_parsed("centre_tolerance_px")?
-                .unwrap_or(d.centre_tolerance_px),
-            centre_tolerance_fwhm: self
-                .take_parsed("centre_tolerance_fwhm")?
-                .unwrap_or(d.centre_tolerance_fwhm),
-            c_stars: self.take_parsed("c_stars")?.unwrap_or(d.c_stars),
+            map_window_mag: self.take_parsed("map_window_mag")?.unwrap_or(d.map_window_mag),
+            map_max_stars: self.take_parsed("map_max_stars")?.unwrap_or(d.map_max_stars),
+            map_min_snr: self.take_parsed("map_min_snr")?.unwrap_or(d.map_min_snr),
+            map_radius_fwhm: self.take_parsed("map_radius_fwhm")?.unwrap_or(d.map_radius_fwhm),
+            map_clip_rounds: self.take_parsed("map_clip_rounds")?.unwrap_or(d.map_clip_rounds),
+            map_clip_sigma: self.take_parsed("map_clip_sigma")?.unwrap_or(d.map_clip_sigma),
+            map_clip_floor_px: self.take_parsed("map_clip_floor_px")?.unwrap_or(d.map_clip_floor_px),
+            map_min_members: self.take_parsed("map_min_members")?.unwrap_or(d.map_min_members),
+            map_min_kept_share: self.take_parsed("map_min_kept_share")?.unwrap_or(d.map_min_kept_share),
+            centre_tolerance_px: self.take_parsed("centre_tolerance_px")?.unwrap_or(d.centre_tolerance_px),
+            centre_tolerance_fwhm: self.take_parsed("centre_tolerance_fwhm")?.unwrap_or(d.centre_tolerance_fwhm),
+            aperture_radius_ref: self.take_parsed("aperture_radius_ref")?.unwrap_or(d.aperture_radius_ref),
+            aperture_radius_fwhm: self.take_parsed("aperture_radius_fwhm")?.unwrap_or(d.aperture_radius_fwhm),
+            pedestal_radii_ref,
+            pedestal_clip_sigma: self.take_parsed("pedestal_clip_sigma")?.unwrap_or(d.pedestal_clip_sigma),
+            pedestal_clip_rounds: self.take_parsed("pedestal_clip_rounds")?.unwrap_or(d.pedestal_clip_rounds),
+            pedestal_min_points: self.take_parsed("pedestal_min_points")?.unwrap_or(d.pedestal_min_points),
+            annulus_area_px: self.take_parsed("annulus_area_px")?.unwrap_or(d.annulus_area_px),
+            annulus_start_fwhm: self.take_parsed("annulus_start_fwhm")?.unwrap_or(d.annulus_start_fwhm),
+            annulus_gap_px: self.take_parsed("annulus_gap_px")?.unwrap_or(d.annulus_gap_px),
+            peak_radius_ref: self.take_parsed("peak_radius_ref")?.unwrap_or(d.peak_radius_ref),
             clip_sigma: self.peek_parsed("clip_sigma")?.unwrap_or(d.clip_sigma),
             min_stars: self.peek_parsed("min_stars")?.unwrap_or(d.min_stars),
-            max_std_error_mag: self
-                .peek_parsed("max_std_error_mag")?
-                .unwrap_or(d.max_std_error_mag),
+            max_sigma_mag: self.take_parsed("max_sigma_mag")?.unwrap_or(d.max_sigma_mag),
+            slope_min_ramp_members: self.take_parsed("slope_min_ramp_members")?.unwrap_or(d.slope_min_ramp_members),
+            decimate: self.take_parsed("decimate")?.unwrap_or(d.decimate),
+            anchor_shift_mag: self.take_parsed("anchor_shift_mag")?.unwrap_or(d.anchor_shift_mag),
         })
     }
 
@@ -2847,12 +2859,6 @@ const FORCED_HEADER: &str = "frame_id\tfile_name\tobject\tfilter\tnight\tdate_ob
 const FORCED_STARS_HEADER: &str =
     "frame_id\tkey\tg\tx_proj\ty_proj\tx_fit\ty_fit\tmodel_flux\tflux\tsnr\tflags\taccepted\tkept\tzp_i\tclipped";
 
-/// The 6F reference is measured on at most this many of a frame's kept list stars (key order, the same in every frame).
-const BIG6_MAX_STARS: usize = 400;
-/// Index of the 6 F aperture in [`BIGAP_RADII_FWHM`].
-const BIG6_RADIUS_INDEX: usize = 4;
-/// A frame's 6F zero point needs this many stars.
-const BIG6_MIN_STARS: usize = 20;
 /// Every n-th frame is measured a second time without a list and compared (B9), unless `--identity-every` says else.
 const IDENTITY_EVERY_DEFAULT: usize = 10;
 
@@ -2862,8 +2868,8 @@ const IDENTITY_EVERY_DEFAULT: usize = 10;
 /// refused. `accepted` / `kept` count the list's fits that were accepted / kept by the fitter (before the 4 sigma clip);
 /// `zp_stars` the survivors of the clip. `c*` are the list's aperture correction, `c_budget` the budget's reported one
 /// (mosaic only). `ring_missing` counts accepted list fits within 12 F of an edge, F the ring width the list was read at
-/// (their ring is truncated). `zero_point_6f` is the clipped median of the plain 6 F aperture zero points of the first
-/// [`BIG6_MAX_STARS`] kept list stars (green sites, each CFA phase less its own annulus sky): the second reference of B3.
+/// (their ring is truncated). `zero_point_6f` is written empty (the 6F referee went with the F5 emulation in G2;
+/// G3 re-measures it).
 #[derive(Debug, Clone, Default)]
 struct ForcedRow {
     frame_id: Option<i64>,
@@ -3159,354 +3165,22 @@ fn identity_mismatch(
     None
 }
 
-// ---- the 6F reference ----
-
-/// The clipped median of `values`: a median, the values beyond `sigma` robust sigmas dropped, repeated until none is
-/// (at most ten rounds); `None` under `min` values.
-fn clip_median(values: &[f64], sigma: f64, min: usize) -> Option<f64> {
-    if values.len() < min {
-        return None;
-    }
-    let mut alive = values.to_vec();
-    for _ in 0..10 {
-        let m = median(&mut alive.clone())?;
-        let mut dev: Vec<f64> = alive.iter().map(|v| (v - m).abs()).collect();
-        let robust = (median(&mut dev)? * 1.4826).max(0.005);
-        let next: Vec<f64> = alive
-            .iter()
-            .copied()
-            .filter(|v| (v - m).abs() <= sigma * robust)
-            .collect();
-        if next.len() == alive.len() || next.len() < min {
-            break;
-        }
-        alive = next;
-    }
-    median(&mut alive)
-}
-
-/// The plain 6 F aperture zero point of a frame on its list: per kept list star (key order, at most
-/// [`BIG6_MAX_STARS`]), the sum within 6 F of the fitted centre over the green sites (every site of a mono plane), each
-/// CFA phase less the median of its own annulus (`bigap_star`), `G + 2.5 log10(flux / t)`; the clipped median. No
-/// aperture correction, no model: an independent photometry on the same stars.
-fn six_f_zero_point(
-    planes: &RawPlanes,
-    (w, h): (usize, usize),
-    stars: &[ForcedStar],
-    fits: &[ListFit],
-    fwhm: f64,
-    exptime_s: f64,
-) -> Option<f64> {
-    let (plane, pattern): (&[f32], astroimage::BayerPattern) = match planes {
-        RawPlanes::Mono(p) => (p, astroimage::BayerPattern::None),
-        RawPlanes::Cfa { mosaic, pattern } => (mosaic, *pattern),
-        RawPlanes::Rgb(_) => return None,
-    };
-    if !(fwhm.is_finite() && fwhm > 0.0 && exptime_s > 0.0) {
-        return None;
-    }
-    let mut zps = Vec::new();
-    for (star, fit) in stars
-        .iter()
-        .zip(fits)
-        .filter(|(_, f)| f.kept)
-        .take(BIG6_MAX_STARS)
-    {
-        let Some(b) = bigap_star(plane, pattern, (w, h), (fit.x, fit.y), fwhm) else {
-            continue;
-        };
-        let mut flux = 0.0;
-        let mut usable = true;
-        for p in 0..4 {
-            if cfa_colour(pattern, p & 1, p >> 1) != 1 {
-                continue;
-            }
-            if !b.med[p].is_finite() {
-                usable = false;
-                break;
-            }
-            flux += b.sum[BIG6_RADIUS_INDEX][p] - b.cnt[BIG6_RADIUS_INDEX][p] as f64 * b.med[p];
-        }
-        if usable && flux > 0.0 {
-            zps.push(f64::from(star.g_mag) + 2.5 * (flux / exptime_s).log10());
-        }
-    }
-    clip_median(&zps, 4.0, BIG6_MIN_STARS)
-}
-
-
-// ---- F5 emulation modes: the list re-seeded through a map of its own fits, and plain aperture sums per list star ----
-
-/// The emulation switches of `forced` (design round F5; none of them is the shipping composition).
-#[derive(Debug, Clone, Copy, Default)]
-struct Emulation {
-    /// Re-seed the list this many times: a quadratic map of fitted - projected centres over the accepted fits, the
-    /// positions moved by it, the list fitted again. The row and the stars TSV then carry the last pass.
-    reseed: usize,
-    /// Write `<x>.ap.tsv`: per accepted list star, aperture sums at radii tied to the frame's FWHM and to `FWHM_ref`.
-    dump_ap: bool,
-}
-
-/// Aperture radii of the dump in units of the frame's median FWHM, then in units of `FWHM_ref`.
-const AP_RADII_FWHM: [f64; 5] = [1.5, 2.0, 2.5, 3.0, 4.0];
-const AP_RADII_REF: [f64; 5] = [1.5, 2.0, 3.0, 4.0, 6.0];
-/// The dump's sky annulus: its area (px), and its gap outside max(4 F, 6 FWHM_ref).
-const AP_ANNULUS_AREA_PX: f64 = 2000.0;
-const AP_ANNULUS_GAP_PX: f64 = 2.0;
-/// A fit within this many `FWHM_ref` of its position is a member of the re-seeding map (the list is isolated to 4).
-const MAP_RADIUS_FWHM: f64 = 2.0;
-const MAP_MIN_MEMBERS: usize = 30;
-
-const AP_HEADER: &str = "frame_id\tkey\tg\tx0\ty0\txs\tys\txf\tyf\tmodel_flux\tsnr\tsat\taccepted\tkept\tnn4\tnn6\tsky\tsky_sd\tpeak\tf15\tf20\tf25\tf30\tf40\tr15\tr20\tr30\tr40\tr60\tcf30\tcr30";
-const G_HEADER: &str = "frame_id\treseeds\tmap_members\toff_before\tres_after\tmap_corner_max\taccepted_p1\tkept_p1\tzp_p1\tcentre_p1\trefused";
-
-/// A quadratic map `(dx, dy)(x, y)` in coordinates normalised to the frame.
-struct QuadMap {
-    cx: f64,
-    cy: f64,
-    half: f64,
-    ax: Vec<f64>,
-    ay: Vec<f64>,
-    members: usize,
-    /// Median |fitted - projected| of the members, and median |residual| after the map.
-    off_before: f64,
-    res_after: f64,
-}
-
-impl QuadMap {
-    fn basis(&self, x: f64, y: f64) -> Vec<f64> {
-        let (u, v) = ((x - self.cx) / self.half, (y - self.cy) / self.half);
-        vec![1.0, u, v, u * u, u * v, v * v]
-    }
-    fn eval(&self, x: f64, y: f64) -> (f64, f64) {
-        let b = self.basis(x, y);
-        (
-            b.iter().zip(&self.ax).map(|(p, q)| p * q).sum(),
-            b.iter().zip(&self.ay).map(|(p, q)| p * q).sum(),
-        )
-    }
-}
-
-/// The map of a list's fits: over the accepted, unsaturated fits within `radius` px of their positions (SNR >= 10 where
-/// one is known), a full quadratic in x and y for each axis, three rounds of clipping at 3 robust sigmas.
-fn quad_map(list: &ForcedList, m: &ListMeasurement, (w, h): (usize, usize), radius: f64) -> Option<QuadMap> {
-    let mut map = QuadMap {
-        cx: (w as f64 - 1.0) / 2.0,
-        cy: (h as f64 - 1.0) / 2.0,
-        half: 0.5 * (w as f64).hypot(h as f64),
-        ax: vec![0.0; 6],
-        ay: vec![0.0; 6],
-        members: 0,
-        off_before: f64::NAN,
-        res_after: f64::NAN,
-    };
-    let mut pts: Vec<(f64, f64, f64, f64)> = list
-        .stars
-        .iter()
-        .zip(&m.fits)
-        .filter(|(_, f)| {
-            f.accepted
-                && !f.flags.saturated()
-                && f.centre_offset_px.is_finite()
-                && f.centre_offset_px <= radius
-                && !(f.snr.is_finite() && f.snr < 10.0)
-        })
-        .map(|(s, f)| (s.x, s.y, f.x - s.x, f.y - s.y))
-        .collect();
-    if pts.len() < MAP_MIN_MEMBERS {
-        return None;
-    }
-    let mut before: Vec<f64> = pts.iter().map(|p| p.2.hypot(p.3)).collect();
-    map.off_before = median(&mut before)?;
-    for round in 0..4 {
-        let rows: Vec<Vec<f64>> = pts.iter().map(|p| map.basis(p.0, p.1)).collect();
-        let dx: Vec<f64> = pts.iter().map(|p| p.2).collect();
-        let dy: Vec<f64> = pts.iter().map(|p| p.3).collect();
-        map.ax = least_squares(&rows, &dx)?.0;
-        map.ay = least_squares(&rows, &dy)?.0;
-        let res: Vec<f64> = pts
-            .iter()
-            .map(|p| {
-                let (ex, ey) = map.eval(p.0, p.1);
-                (p.2 - ex).hypot(p.3 - ey)
-            })
-            .collect();
-        let med = median(&mut res.clone())?;
-        map.res_after = med;
-        map.members = pts.len();
-        if round == 3 {
-            break;
-        }
-        let limit = (3.0 * 1.4826 * med).max(0.15);
-        let kept: Vec<(f64, f64, f64, f64)> = pts
-            .iter()
-            .zip(&res)
-            .filter(|(_, r)| **r <= limit)
-            .map(|(p, _)| *p)
-            .collect();
-        if kept.len() == pts.len() || kept.len() < MAP_MIN_MEMBERS {
-            break;
-        }
-        pts = kept;
-    }
-    Some(map)
-}
-
-/// The share of pixel (px, py) inside the circle of radius `r` about (x, y): 1 or 0 away from the edge, a 4 x 4
-/// sub-sample on it.
-fn disc_share(px: f64, py: f64, x: f64, y: f64, r: f64) -> f64 {
-    let d = (px - x).hypot(py - y);
-    if d <= r - 0.75 {
-        return 1.0;
-    }
-    if d >= r + 0.75 {
-        return 0.0;
-    }
-    let mut inside = 0;
-    for i in 0..4 {
-        for j in 0..4 {
-            let sx = px - 0.375 + 0.25 * i as f64;
-            let sy = py - 0.375 + 0.25 * j as f64;
-            if (sx - x).hypot(sy - y) <= r {
-                inside += 1;
-            }
-        }
-    }
-    f64::from(inside) / 16.0
-}
-
-/// Plain aperture sums of one star: per radius the sky-subtracted sum over the plane's own sites (a mosaic's green
-/// sites, each phase less its own annulus median), scaled by the disc's area over the area of the sites read, so a
-/// mosaic and a mono plane report the same quantity. Also the sky and the annulus scatter. `None` off the frame.
-fn ap_fluxes(
-    plane: &[f32],
-    pattern: astroimage::BayerPattern,
-    (w, h): (usize, usize),
-    (x, y): (f64, f64),
-    radii: &[f64],
-    r_in: f64,
-) -> Option<(Vec<f64>, f64, f64)> {
-    let r_out = (r_in * r_in + AP_ANNULUS_AREA_PX / std::f64::consts::PI).sqrt();
-    let (x0, x1) = ((x - r_out).floor(), (x + r_out).ceil());
-    let (y0, y1) = ((y - r_out).floor(), (y + r_out).ceil());
-    if !(x.is_finite() && y.is_finite()) || x0 < 0.0 || y0 < 0.0 || x1 > (w - 1) as f64 || y1 > (h - 1) as f64 {
-        return None;
-    }
-    let mono = matches!(pattern, astroimage::BayerPattern::None);
-    let phase_of = |px: usize, py: usize| if mono { 0 } else { (py & 1) * 2 + (px & 1) };
-    let green = |px: usize, py: usize| mono || cfa_colour(pattern, px, py) == 1;
-    let mut sky: [Vec<f64>; 4] = Default::default();
-    let r_max = radii.iter().cloned().fold(0.0, f64::max);
-    let mut inner: Vec<(f64, f64, usize, f64, bool)> = Vec::new();
-    for py in y0 as usize..=y1 as usize {
-        for px in x0 as usize..=x1 as usize {
-            let d = (px as f64 - x).hypot(py as f64 - y);
-            let v = f64::from(plane[py * w + px]);
-            if !v.is_finite() {
-                continue;
-            }
-            if d >= r_in && d <= r_out {
-                if green(px, py) {
-                    sky[phase_of(px, py)].push(v);
-                }
-            } else if d <= r_max + 0.75 {
-                inner.push((px as f64, py as f64, phase_of(px, py), v, green(px, py)));
-            }
-        }
-    }
-    let mut med = [f64::NAN; 4];
-    let mut dev: Vec<f64> = Vec::new();
-    for (p, s) in sky.iter_mut().enumerate() {
-        if s.is_empty() {
-            continue;
-        }
-        med[p] = grouped_median(s);
-        dev.extend(s.iter().map(|v| (v - med[p]).abs()));
-    }
-    let sd = median(&mut dev)? * 1.4826;
-    let used: Vec<f64> = med.iter().copied().filter(|m| m.is_finite()).collect();
-    if used.is_empty() {
-        return None;
-    }
-    let sky_level = used.iter().sum::<f64>() / used.len() as f64;
-    let mut out = Vec::with_capacity(radii.len());
-    for &r in radii {
-        let (mut sum, mut wg, mut wa) = (0.0, 0.0, 0.0);
-        for &(px, py, phase, v, is_green) in &inner {
-            let share = disc_share(px, py, x, y, r);
-            if share == 0.0 {
-                continue;
-            }
-            wa += share;
-            if is_green && med[phase].is_finite() {
-                sum += share * (v - med[phase]);
-                wg += share;
-            }
-        }
-        out.push(if wg > 0.0 { sum * wa / wg } else { f64::NAN });
-    }
-    Some((out, sky_level, sd))
-}
-
-/// Per list position, the distance (px) to the nearest catalogue star no more than 4 and 6 mag fainter than it (the
-/// star itself left out); 99 when none lies within 40 px.
-fn neighbour_distances(cat: &[(f64, f64, f32)], stars: &[(f64, f64, f32)]) -> Vec<(f64, f64)> {
-    let mut sorted: Vec<(f64, f64, f32)> = cat.to_vec();
-    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-    stars
-        .iter()
-        .map(|&(x, y, g)| {
-            let lo = sorted.partition_point(|c| c.0 < x - 40.0);
-            let (mut n4, mut n6) = (99.0f64, 99.0f64);
-            for c in &sorted[lo..] {
-                if c.0 > x + 40.0 {
-                    break;
-                }
-                let d = (c.0 - x).hypot(c.1 - y);
-                if d < 0.3 && (c.2 - g).abs() < 0.005 {
-                    continue;
-                }
-                if c.2 <= g + 4.0 {
-                    n4 = n4.min(d);
-                }
-                if c.2 <= g + 6.0 {
-                    n6 = n6.min(d);
-                }
-            }
-            (n4, n6)
-        })
-        .collect()
-}
-
-/// One list star's row of the stars TSV.
-fn forced_star_line(
-    frame_id: i64,
-    s: &ForcedStar,
-    f: Option<&ListFit>,
-    zp: Option<(f64, bool)>,
-) -> String {
-    let n = |v: Option<f64>, p: usize| num(v, p);
-    let (x_fit, y_fit, model, flux, snr, flags, accepted, kept) = match f {
-        Some(f) => (
-            n(Some(f.x), 3),
-            n(Some(f.y), 3),
-            n(Some(f.model_flux), 3),
-            n(Some(f.flux), 3),
-            n(Some(f.snr), 2),
-            f.flags.names().join("+"),
-            u8::from(f.accepted),
-            u8::from(f.kept),
+/// One list star's row of the stars TSV. The fit columns are empty (no list star is fitted any more: G3 rewrites the
+/// file); `accepted` is a member of the statistic, `kept` a member of non-zero weight the screen kept, `zp_i` the star's
+/// zero point and `clipped` 1 when the screen dropped it.
+fn forced_star_line(frame_id: i64, s: &ForcedStar, p: Option<&ForcedStarZp>) -> String {
+    let (accepted, kept, zp, clipped) = match p {
+        Some(p) => (
+            u8::from(p.member),
+            u8::from(p.member && p.screened_in && p.weight > 0.0),
+            num(Some(p.zp).filter(|v| v.is_finite()), 5),
+            if p.member { u8::from(!p.screened_in).to_string() } else { String::new() },
         ),
         None => Default::default(),
     };
     format!(
-        "{frame_id}\t{:016x}\t{:.3}\t{:.3}\t{:.3}\t{x_fit}\t{y_fit}\t{model}\t{flux}\t{snr}\t{flags}\t{accepted}\t{kept}\t{}\t{}",
-        s.key,
-        s.g_mag,
-        s.x,
-        s.y,
-        zp.map(|z| format!("{:.5}", z.0)).unwrap_or_default(),
-        zp.map(|z| u8::from(!z.1).to_string()).unwrap_or_default(),
+        "{frame_id}\t{:016x}\t{:.3}\t{:.3}\t{:.3}\t\t\t\t\t\t\t{accepted}\t{kept}\t{zp}\t{clipped}",
+        s.key, s.g_mag, s.x, s.y,
     )
 }
 
@@ -3523,8 +3197,7 @@ fn forced_frame(
     fp: &ForcedListParams,
     c: &Candidate,
     identity: bool,
-    emul: Emulation,
-) -> (ForcedRow, Vec<String>, Option<String>, Vec<String>) {
+) -> (ForcedRow, Vec<String>) {
     let mut row = forced_base_row(c);
     let fail = |row: &mut ForcedRow, code: &str, detail: &dyn std::fmt::Display| {
         eprintln!("zp_probe: frame {} refused {code}: {detail}", c.frame_id);
@@ -3534,23 +3207,23 @@ fn forced_frame(
         Ok(Some(r)) => r,
         Ok(None) => {
             fail(&mut row, "no_solve", &"no stored solve");
-            return (row, Vec::new(), None, Vec::new());
+            return (row, Vec::new());
         }
         Err(e) => {
             fail(&mut row, "bad_wcs", &e);
-            return (row, Vec::new(), None, Vec::new());
+            return (row, Vec::new());
         }
     };
     row.rotation_deg = Some(rec.field_rotation_deg).filter(|r| r.is_finite());
     let Some(wcs) = rec.to_solution() else {
         fail(&mut row, "bad_wcs", &"the stored SIP tables are unusable");
-        return (row, Vec::new(), None, Vec::new());
+        return (row, Vec::new());
     };
     let mut frame = match read_raw_frame(Path::new(&c.path)) {
         Ok(f) => f,
         Err(e) => {
             fail(&mut row, "analysis_failed", &e);
-            return (row, Vec::new(), None, Vec::new());
+            return (row, Vec::new());
         }
     };
     frame.drop_unmeasured_planes();
@@ -3583,79 +3256,10 @@ fn forced_frame(
         |w, wd, ht, region, ep| catalog_for_frame(&layers, w, wd, ht, region, ep),
     );
     row.call_ms = Some(millis(started));
-    let Some(mut run) = run else {
+    let Some(run) = run else {
         fail(&mut row, "analysis_failed", &"no zero-point run came back");
-        return (row, Vec::new(), None, Vec::new());
+        return (row, Vec::new());
     };
-    // F5 emulation: the list re-seeded through a quadratic map of its own fits.
-    let projected: Vec<(f64, f64)> = run
-        .list
-        .as_ref()
-        .map(|l| l.stars.iter().map(|s| (s.x, s.y)).collect())
-        .unwrap_or_default();
-    let mut g_cells: Vec<String> = vec![String::new(); 10];
-    if let Some(m) = &run.measured {
-        g_cells[5] = m.fits.iter().filter(|f| f.accepted).count().to_string();
-        g_cells[6] = m.fits.iter().filter(|f| f.kept).count().to_string();
-        g_cells[7] = num(run.result.as_ref().ok().map(|z| z.zero_point), 5);
-        let mut offs: Vec<f64> = m
-            .fits
-            .iter()
-            .filter(|f| f.accepted && f.centre_offset_px.is_finite())
-            .map(|f| f.centre_offset_px)
-            .collect();
-        g_cells[8] = num(median(&mut offs), 4);
-    }
-    let mut reseeds = 0usize;
-    for _ in 0..emul.reseed {
-        let (Some(l), Some(m), Some(t)) = (&run.list, &run.measured, c.exptime) else {
-            break;
-        };
-        let Some(map) = quad_map(l, m, (width, height), MAP_RADIUS_FWHM * l.fwhm_ref_px) else {
-            break;
-        };
-        if reseeds > 0 {
-            g_cells[2].push('/');
-            g_cells[3].push('/');
-        }
-        g_cells[2].push_str(&num(Some(map.off_before), 4));
-        g_cells[3].push_str(&num(Some(map.res_after), 4));
-        if reseeds == 0 {
-            g_cells[1] = map.members.to_string();
-            let (w1, h1) = (width as f64 - 1.0, height as f64 - 1.0);
-            let corner = [(0.0, 0.0), (w1, 0.0), (0.0, h1), (w1, h1)]
-                .iter()
-                .map(|&(x, y)| {
-                    let (dx, dy) = map.eval(x, y);
-                    dx.hypot(dy)
-                })
-                .fold(0.0, f64::max);
-            g_cells[4] = num(Some(corner), 3);
-        }
-        let mut l2 = l.clone();
-        for s in &mut l2.stars {
-            let (dx, dy) = map.eval(s.x, s.y);
-            s.x += dx;
-            s.y += dy;
-        }
-        l2.request.positions = l2.stars.iter().map(|s| (s.x, s.y)).collect();
-        let req = l2.request.clone();
-        let (_, lm2) = measure_raw_frame_and_list(&frame, &frame_options(&rig.config), Some(&rig.pool), |_| Some(req));
-        let Some(lm2) = lm2 else {
-            break;
-        };
-        let outcome = forced_zero_point(&l2, &lm2, t, fp);
-        run.result = outcome.result;
-        run.list = Some(l2);
-        run.measured = Some(lm2);
-        run.outcome = Some(outcome);
-        reseeds += 1;
-    }
-    g_cells[0] = reseeds.to_string();
-    if let Some(m) = &run.measured {
-        g_cells[9] = format!("{:?}", m.refused).replace(['\t', '\n'], " ");
-    }
-    let g_line = format!("{}\t{}", c.frame_id, g_cells.join("\t"));
     let (analysis, stars) = map_measurement(&pm, &frame, &rig.config, &rig.config_hash);
     row.stars_detected = Some(analysis.stars_detected);
     row.median_fwhm = Some(analysis.median_fwhm).filter(|f| *f > 0.0);
@@ -3688,18 +3292,9 @@ fn forced_frame(
         row.list_stars = Some(l.stars.len() as i64);
     }
     if let Some(m) = &run.measured {
+        // The map stars' first fits (the only fits a frame has now).
         row.accepted = Some(m.fits.iter().filter(|f| f.accepted).count() as i64);
         row.kept = Some(m.fits.iter().filter(|f| f.kept).count() as i64);
-        row.c = m.aperture_correction;
-        row.c_stars = Some(m.aperture_stars as i64);
-        row.c_se = m.aperture_se;
-        let mut offsets: Vec<f64> = m
-            .fits
-            .iter()
-            .filter(|f| f.accepted && f.centre_offset_px.is_finite())
-            .map(|f| f.centre_offset_px)
-            .collect();
-        row.centre_median_px = median(&mut offsets);
         if let Some(ring) = m.ring_fwhm.filter(|r| r.is_finite()) {
             let edge = 12.0 * ring;
             let (w1, h1) = (width as f64 - 1.0, height as f64 - 1.0);
@@ -3712,10 +3307,12 @@ fn forced_frame(
             );
         }
     }
+    row.centre_median_px = run.gate.as_ref().map(|g| g.centre_median_px).filter(|v| v.is_finite());
     if let (Some(l), Some(m)) = (&run.list, &run.measured) {
         let bytes = l.stars.len() * std::mem::size_of::<ForcedStar>()
-            + m.fits.len() * std::mem::size_of::<ListFit>()
-            + l.request.positions.len() * std::mem::size_of::<(f64, f64)>();
+            + (m.fits.len() + m.refits.len()) * std::mem::size_of::<ListFit>()
+            + m.apertures.len() * std::mem::size_of::<ListAperture>()
+            + l.request.fit_positions.len() * std::mem::size_of::<(f64, f64)>();
         row.list_kb = Some(bytes as f64 / 1024.0);
     }
     match &run.result {
@@ -3730,14 +3327,9 @@ fn forced_frame(
             match r {
                 ForcedRefusal::NoAnchor { kept } => row.anchor_stars = Some(i64::from(*kept)),
                 ForcedRefusal::TooFewStars { kept, .. } => row.zp_stars = Some(i64::from(*kept)),
-                ForcedRefusal::TooScattered {
-                    std_error,
-                    kept,
-                    sigma,
-                } => {
+                ForcedRefusal::TooScattered { kept, sigma } => {
                     row.zp_stars = Some(i64::from(*kept));
-                    row.std_error = Some(*std_error);
-                    row.sigma = Some(*sigma);
+                    row.sigma = Some(*sigma).filter(|v| v.is_finite());
                 }
                 _ => {}
             }
@@ -3781,119 +3373,11 @@ fn forced_frame(
         }
     }
 
-    if let (Some(l), Some(m), Some(fwhm), Some(t)) =
-        (&run.list, &run.measured, row.median_fwhm, c.exptime)
-    {
-        row.zero_point_6f =
-            six_f_zero_point(&frame.planes, (width, height), &l.stars, &m.fits, fwhm, t);
-    }
-
     let mut lines = Vec::new();
-    if let (Some(l), Some(m)) = (&run.list, &run.measured) {
-        let per: HashMap<usize, (f64, bool)> = run
-            .outcome
-            .as_ref()
-            .map(|o| {
-                o.per_star
-                    .iter()
-                    .map(|p| (p.index, (p.zp, p.clipped_in)))
-                    .collect()
-            })
-            .unwrap_or_default();
+    if let Some(l) = &run.list {
+        let per = run.outcome.as_ref().map(|o| &o.per_star[..]).unwrap_or(&[]);
         for (i, s) in l.stars.iter().enumerate() {
-            lines.push(forced_star_line(
-                c.frame_id,
-                s,
-                m.fits.get(i),
-                per.get(&i).copied(),
-            ));
-        }
-    }
-
-    // F5 emulation: plain aperture sums per accepted list star.
-    let mut ap_lines = Vec::new();
-    if let (true, Some(l), Some(m), Some(fwhm)) = (emul.dump_ap, &run.list, &run.measured, row.median_fwhm) {
-        let plane_pattern: Option<(&[f32], astroimage::BayerPattern)> = match &frame.planes {
-            RawPlanes::Mono(p) => Some((p, astroimage::BayerPattern::None)),
-            RawPlanes::Cfa { mosaic, pattern } => Some((mosaic, *pattern)),
-            RawPlanes::Rgb(_) => None,
-        };
-        let cat_px: Vec<(f64, f64, f32)> = catalog_for_frame(&layers, &wcs, width, height, 1.0, epoch)
-            .map(|cat| {
-                cat.iter()
-                    .filter(|s| s.mag.is_finite())
-                    .map(|s| {
-                        let (x, y) = wcs.sky_to_pixel(s.ra, s.dec);
-                        (x, y, s.mag)
-                    })
-                    .filter(|p| p.0.is_finite() && p.1.is_finite())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let at: Vec<(f64, f64, f32)> = l
-            .stars
-            .iter()
-            .zip(&projected)
-            .map(|(s, p)| (p.0, p.1, s.g_mag))
-            .collect();
-        let nn = neighbour_distances(&cat_px, &at);
-        let radii: Vec<f64> = AP_RADII_FWHM
-            .iter()
-            .map(|k| k * fwhm)
-            .chain(AP_RADII_REF.iter().map(|k| k * l.fwhm_ref_px))
-            .collect();
-        let r_in = (4.0 * fwhm).max(6.0 * l.fwhm_ref_px) + AP_ANNULUS_GAP_PX;
-        if let Some((plane, pattern)) = plane_pattern {
-            for (i, (s, f)) in l.stars.iter().zip(&m.fits).enumerate() {
-                // At the seeded (list) position, fit or no fit: the forced aperture.
-                let Some((fl, sky, sd)) = ap_fluxes(plane, pattern, (width, height), (s.x, s.y), &radii, r_in) else {
-                    continue;
-                };
-                // The highest pixel within 1.5 FWHM_ref of the position (the clip screen of a star with no fit).
-                let pr = 1.5 * l.fwhm_ref_px;
-                let mut peak = f64::NEG_INFINITY;
-                for py in (s.y - pr).floor().max(0.0) as usize..=((s.y + pr).ceil() as usize).min(height - 1) {
-                    for px in (s.x - pr).floor().max(0.0) as usize..=((s.x + pr).ceil() as usize).min(width - 1) {
-                        peak = peak.max(f64::from(plane[py * width + px]));
-                    }
-                }
-                // At the fitted centre, the 3 F and 3 FWHM_ref sums only (centring's effect).
-                let at_fit = if f.accepted {
-                    ap_fluxes(plane, pattern, (width, height), (f.x, f.y), &[radii[3], radii[7]], r_in).map(|r| r.0)
-                } else {
-                    None
-                };
-                let mut line = format!(
-                    "{}\t{:016x}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{:.0}",
-                    c.frame_id,
-                    s.key,
-                    s.g_mag,
-                    projected[i].0,
-                    projected[i].1,
-                    s.x,
-                    s.y,
-                    num(Some(f.x).filter(|v| v.is_finite()), 2),
-                    num(Some(f.y).filter(|v| v.is_finite()), 2),
-                    if f.model_flux.is_finite() { format!("{:.5e}", f.model_flux) } else { String::new() },
-                    num(Some(f.snr).filter(|v| v.is_finite()), 1),
-                    u8::from(f.flags.saturated()),
-                    u8::from(f.accepted),
-                    u8::from(f.kept),
-                    nn[i].0,
-                    nn[i].1,
-                    sky,
-                    sd,
-                    peak
-                );
-                for v in fl {
-                    line.push_str(&format!("\t{v:.5e}"));
-                }
-                match at_fit {
-                    Some(v) => line.push_str(&format!("\t{:.5e}\t{:.5e}", v[0], v[1])),
-                    None => line.push_str("\t\t"),
-                }
-                ap_lines.push(line);
-            }
+            lines.push(forced_star_line(c.frame_id, s, per.get(i)));
         }
     }
 
@@ -3905,7 +3389,7 @@ fn forced_frame(
             .map_or_else(|| "ok".to_string(), |f| format!("mismatch:{f}"));
     }
     row.rss_mb = peak_rss_mb();
-    (row, lines, Some(g_line), ap_lines)
+    (row, lines)
 }
 
 /// `<x>.stars.tsv` for `<x>.tsv`.
@@ -3962,10 +3446,6 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     let identity_every: usize = args
         .take_parsed("identity-every")?
         .unwrap_or(IDENTITY_EVERY_DEFAULT);
-    let emul = Emulation {
-        reseed: args.take_parsed("reseed")?.unwrap_or(0),
-        dump_ap: args.take_parsed::<u8>("dump-ap")?.unwrap_or(0) != 0,
-    };
     let (fp, params, given) = take_forced_params(&mut args)?;
 
     let conn = open_read_only(&db)?;
@@ -3983,17 +3463,6 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     writeln!(w, "{FORCED_HEADER}")?;
     let mut ws = create_out(&stars_path(&out))?;
     writeln!(ws, "{FORCED_STARS_HEADER}")?;
-    let base = out.strip_suffix(".tsv").unwrap_or(&out).to_string();
-    let mut wg = create_out(&format!("{base}.g.tsv"))?;
-    writeln!(wg, "{G_HEADER}")?;
-    let mut wa = if emul.dump_ap {
-        let mut f = create_out(&format!("{base}.ap.tsv"))?;
-        writeln!(f, "{AP_HEADER}")?;
-        Some(f)
-    } else {
-        None
-    };
-    eprintln!("zp_probe forced: emulation {emul:?}");
     let (mut measured, mut refused, mut examined) = (0usize, 0usize, 0usize);
     let mut first_rotation: HashMap<String, f64> = HashMap::new();
     for c in &candidates {
@@ -4021,17 +3490,7 @@ fn cmd_forced(mut args: Args) -> Result<()> {
             continue;
         }
         let identity = identity_every > 0 && measured % identity_every == 0;
-        let (mut row, star_lines, g_line, ap_lines) = forced_frame(&conn, &rig, &fp, c, identity, emul);
-        if let Some(g) = g_line {
-            writeln!(wg, "{g}")?;
-            wg.flush()?;
-        }
-        if let Some(f) = wa.as_mut() {
-            for l in &ap_lines {
-                writeln!(f, "{l}")?;
-            }
-            f.flush()?;
-        }
+        let (mut row, star_lines) = forced_frame(&conn, &rig, &fp, c, identity);
         if let Some(rot) = row.rotation_deg {
             let first = *first_rotation.entry(c.night.clone()).or_insert(rot);
             row.pier = Some(pier_side(first, rot));
@@ -4323,6 +3782,14 @@ fn ols(xs: &[f64], ys: &[f64]) -> Option<(f64, f64, usize)> {
         .map(|(x, y)| (y - my - slope * (x - mx)).powi(2))
         .sum();
     Some((slope, (rss / (nf - 2.0) / sxx).sqrt(), n))
+}
+
+/// RMS of `values` about their median (only the test below reads it since the one-pier-side B3 centres each side itself;
+/// the helper went missing in 7d26e764 and left that test unbuilt).
+#[cfg(test)]
+fn rms_about_median(values: &[f64]) -> Option<f64> {
+    let m = median(&mut values.to_vec())?;
+    Some((values.iter().map(|v| (v - m).powi(2)).sum::<f64>() / values.len() as f64).sqrt())
 }
 
 /// `y = k x + a + s side` over the points `(x, y, side)`: `(k, a, s)`; `None` for a singular design.
@@ -5226,7 +4693,7 @@ mod tests {
             "800",
             "--window_bright_margin_mag",
             "1.25",
-            "--c_stars",
+            "--map_max_stars",
             "128",
             "--min_stars",
             "40",
@@ -5234,12 +4701,12 @@ mod tests {
             "0.8",
         ])
         .unwrap();
-        assert_eq!((fp.cap, fp.c_stars, fp.window_bright_margin_mag), (800, 128, 1.25));
+        assert_eq!((fp.cap, fp.map_max_stars, fp.window_bright_margin_mag), (800, 128, 1.25));
         // Everything not named keeps its default.
         assert_eq!(
             ForcedListParams {
                 cap: d.cap,
-                c_stars: d.c_stars,
+                map_max_stars: d.map_max_stars,
                 window_bright_margin_mag: d.window_bright_margin_mag,
                 min_stars: d.min_stars,
                 ..fp
@@ -5264,7 +4731,7 @@ mod tests {
         // A field added to `ForcedListParams` without a flag fails to compile in `forced_list_params`; this checks each
         // flag is wired to its own field (a value no default has reaches only that field).
         let d = ForcedListParams::default();
-        let flags: [(&str, fn(&ForcedListParams) -> f64); 21] = [
+        let flags: &[(&str, fn(&ForcedListParams) -> f64)] = &[
             ("fwhm_floor_px", |p| p.fwhm_floor_px),
             ("fwhm_ref_arcsec", |p| p.fwhm_ref_arcsec),
             ("anchor_min_matches", |p| p.anchor_min_matches as f64),
@@ -5273,6 +4740,7 @@ mod tests {
             ("window_faint_width_mag", |p| p.window_faint_width_mag),
             ("window_faint_max_mag", |p| p.window_faint_max_mag),
             ("min_isolated", |p| p.min_isolated as f64),
+            ("window_ramp_mag", |p| p.window_ramp_mag),
             ("region_fraction", |p| p.region_fraction),
             ("edge_margin_fwhm", |p| p.edge_margin_fwhm),
             ("isolation_dmag", |p| p.isolation_dmag),
@@ -5280,19 +4748,47 @@ mod tests {
             ("bright_dmag", |p| p.bright_dmag),
             ("bright_radius_fwhm", |p| p.bright_radius_fwhm),
             ("cap", |p| p.cap as f64),
+            ("map_window_mag", |p| p.map_window_mag),
+            ("map_max_stars", |p| p.map_max_stars as f64),
+            ("map_min_snr", |p| p.map_min_snr),
+            ("map_radius_fwhm", |p| p.map_radius_fwhm),
+            ("map_clip_rounds", |p| p.map_clip_rounds as f64),
+            ("map_clip_sigma", |p| p.map_clip_sigma),
+            ("map_clip_floor_px", |p| p.map_clip_floor_px),
+            ("map_min_members", |p| p.map_min_members as f64),
+            ("map_min_kept_share", |p| p.map_min_kept_share),
             ("centre_tolerance_px", |p| p.centre_tolerance_px),
             ("centre_tolerance_fwhm", |p| p.centre_tolerance_fwhm),
-            ("c_stars", |p| p.c_stars as f64),
+            ("aperture_radius_ref", |p| p.aperture_radius_ref),
+            ("aperture_radius_fwhm", |p| p.aperture_radius_fwhm),
+            ("pedestal_clip_sigma", |p| p.pedestal_clip_sigma),
+            ("pedestal_clip_rounds", |p| p.pedestal_clip_rounds as f64),
+            ("pedestal_min_points", |p| p.pedestal_min_points as f64),
+            ("annulus_area_px", |p| p.annulus_area_px),
+            ("annulus_start_fwhm", |p| p.annulus_start_fwhm),
+            ("annulus_gap_px", |p| p.annulus_gap_px),
+            ("peak_radius_ref", |p| p.peak_radius_ref),
             ("clip_sigma", |p| p.clip_sigma),
             ("min_stars", |p| p.min_stars as f64),
-            ("max_std_error_mag", |p| p.max_std_error_mag),
+            ("max_sigma_mag", |p| p.max_sigma_mag),
+            ("slope_min_ramp_members", |p| p.slope_min_ramp_members as f64),
+            ("decimate", |p| p.decimate as f64),
+            ("anchor_shift_mag", |p| p.anchor_shift_mag),
         ];
-        for (name, read) in flags {
+        for &(name, read) in flags {
             let (fp, _, _) = parsed(&[&format!("--{name}"), "7"]).unwrap();
             assert_eq!(read(&fp), 7.0, "--{name}");
             assert_ne!(read(&d), 7.0, "--{name}: pick a probe value that is not the default");
             assert_ne!(fp, d, "--{name} changed nothing");
         }
+    }
+
+    #[test]
+    fn the_pedestal_radii_flag_reads_three_numbers() {
+        let (fp, _, _) = parsed(&["--pedestal_radii_ref", "2.5, 3.5,5"]).unwrap();
+        assert_eq!(fp.pedestal_radii_ref, [2.5, 3.5, 5.0]);
+        assert!(parsed(&["--pedestal_radii_ref", "3,4"]).is_err());
+        assert!(parsed(&["--pedestal_radii_ref", "3,4,x"]).is_err());
     }
 
     #[test]

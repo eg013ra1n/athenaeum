@@ -180,6 +180,7 @@ pub fn analyze_frame(
 #[cfg(feature = "solver")]
 mod forced {
     use std::any::Any;
+    use std::cell::RefCell;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::Arc;
 
@@ -188,11 +189,14 @@ mod forced {
 
     use super::super::config::AnalysisConfig;
     use super::super::zero_point::{
-        anchor_zero_point, forced_list, forced_zero_point, pixel_scale_arcsec, Anchor, ForcedList, ForcedListInput,
-        ForcedListParams, ForcedOutcome, ForcedRefusal, ForcedZeroPoint,
+        anchor_zero_point, forced_list, forced_zero_point, map_gate, pixel_scale_arcsec, placement, position_map,
+        Anchor, ForcedList, ForcedListInput, ForcedListParams, ForcedOutcome, ForcedRefusal, ForcedZeroPoint, MapGate,
+        QuadMap,
     };
     use super::{frame_options, star_metrics, RawFrame, RawPlanes};
-    use crate::star_measure::analysis_mode::{self, FrameOptions, FrameSummary, ListMeasurement, ListRefusal};
+    use crate::star_measure::analysis_mode::{
+        self, FrameOptions, FrameSummary, ListFit, ListMeasurement, ListPlacement, ListRefusal,
+    };
     use crate::star_measure::{Domain, PlaneMeasurement, ADU_SCALE};
 
     /// What a solved frame hands the zero point: its sky-to-pixel transform, `EXPTIME` and observation epoch (decimal year).
@@ -215,14 +219,35 @@ mod forced {
         pub list: Option<ForcedList>,
         /// What the fitter measured at the list's positions.
         pub measured: Option<ListMeasurement>,
+        /// The frame's map of its own fits, when the map stars' fits gave one.
+        pub map: Option<QuadMap>,
+        /// What the second fit said of the map, when it was asked.
+        pub gate: Option<MapGate>,
+        /// Where the refits and the apertures were placed, when the map gave a placement.
+        pub placement: Option<ListPlacement>,
         /// The statistic with its per-star rows, when the list was measured.
         pub outcome: Option<ForcedOutcome>,
     }
 
     impl ForcedRun {
         fn refused(r: ForcedRefusal) -> Self {
-            ForcedRun { result: Err(r), anchor: None, list: None, measured: None, outcome: None }
+            ForcedRun {
+                result: Err(r),
+                anchor: None,
+                list: None,
+                measured: None,
+                map: None,
+                gate: None,
+                placement: None,
+                outcome: None,
+            }
         }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// A test's switch: the placement callback panics on this thread (the catch is otherwise out of reach).
+        pub(super) static PLACEMENT_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The fit's working-unit full scale, as the saturation test reads it (`saturation_plane`'s `norm`).
@@ -252,13 +277,14 @@ mod forced {
         zp: &ZpInputs,
         params: &ForcedListParams,
         cone: F,
-    ) -> Result<(Anchor, ForcedList), ForcedRefusal>
+    ) -> Result<(Anchor, ForcedList, f64), ForcedRefusal>
     where
         F: FnOnce(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
     {
         // A plane with no stars in its statistic gives nothing a re-read would change (trailed and defocused planes never
         // reach the callback).
-        if FrameSummary::from_measurement(pm, opts).verdict.is_some() {
+        let summary = FrameSummary::from_measurement(pm, opts);
+        if summary.verdict.is_some() {
             return Err(ForcedRefusal::FrameVerdict);
         }
         let exptime = match zp.exptime_s {
@@ -307,12 +333,14 @@ mod forced {
             },
             params,
         )?;
-        Ok((anchor, list))
+        // `F`, the Analysis median FWHM: the aperture and its sky annulus grow with it.
+        Ok((anchor, list, summary.median_fwhm))
     }
 
     /// Measure a raw frame exactly as [`super::measure_raw_frame`] does and, when the frame is solved (`inputs`), its
     /// forced-list zero point: the Analysis measurement, then the anchor from its own fits, the list from the catalogue,
-    /// the list fitted on the same plane (rustafits' list entry) and the statistic. Pure of any database or file; the
+    /// the map stars fitted on the same plane (rustafits' list entry), the frame's map of their offsets, a plain
+    /// aperture at every list star's moved position and the statistic over those sums. Pure of any database or file; the
     /// probe and the analyzer call this one function, so what the probe judges is what ships. `cone` reads the catalogue
     /// stars (`wcs`, width, height, region fraction, epoch) and is called at most once; a trailed or defocused plane and
     /// a three-plane file never call it. The Analysis numbers are bit-identical with and without `inputs`. Nothing in the
@@ -333,28 +361,65 @@ mod forced {
         let Some(zp) = inputs else {
             return (analysis_mode::measure_raw_frame(frame, &opts, pool), None);
         };
-        let mut refused: Option<ForcedRefusal> = None;
-        let mut built: Option<(Anchor, ForcedList)> = None;
-        let mut requested = 0usize;
-        let (pm, measured) = analysis_mode::measure_raw_frame_and_list(frame, &opts, pool, |pm| {
-            match catch_unwind(AssertUnwindSafe(|| prepare_forced_list(frame, pm, &opts, zp, params, cone))) {
-                Ok(Ok((anchor, list))) => {
-                    requested = list.stars.len();
-                    let request = (!list.stars.is_empty()).then(|| list.request.clone());
-                    built = Some((anchor, list));
-                    request
+        // Both callbacks run inside one call and share what they find, so the state sits in cells.
+        let refused: RefCell<Option<ForcedRefusal>> = RefCell::new(None);
+        let built: RefCell<Option<(Anchor, ForcedList)>> = RefCell::new(None);
+        let placed: RefCell<Option<(QuadMap, ListPlacement)>> = RefCell::new(None);
+        let frame_fwhm = std::cell::Cell::new(f64::NAN);
+        let (pm, measured) = analysis_mode::measure_raw_frame_and_list(
+            frame,
+            &opts,
+            pool,
+            |pm| {
+                match catch_unwind(AssertUnwindSafe(|| prepare_forced_list(frame, pm, &opts, zp, params, cone))) {
+                    Ok(Ok((anchor, list, fwhm))) => {
+                        frame_fwhm.set(fwhm);
+                        // No map star: nothing to fit (the refusal is the list's size, below).
+                        let request = (!list.map.is_empty()).then(|| list.request.clone());
+                        *built.borrow_mut() = Some((anchor, list));
+                        request
+                    }
+                    Ok(Err(r)) => {
+                        *refused.borrow_mut() = Some(r);
+                        None
+                    }
+                    Err(payload) => {
+                        tracing::error!(error = %panic_text(&*payload), "forced list: the composition panicked");
+                        *refused.borrow_mut() = Some(ForcedRefusal::Internal);
+                        None
+                    }
                 }
-                Ok(Err(r)) => {
-                    refused = Some(r);
-                    None
+            },
+            |fits: &[ListFit]| {
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if PLACEMENT_PANICS.with(|c| c.get()) {
+                        panic!("the placement panicked (test)");
+                    }
+                    let built = built.borrow();
+                    let (_, list) = built.as_ref().ok_or(ForcedRefusal::Internal)?;
+                    let map = position_map(list, fits, params)?;
+                    let placement = placement(list, &map, frame_fwhm.get(), params);
+                    Ok::<_, ForcedRefusal>((map, placement))
+                }));
+                match outcome {
+                    Ok(Ok((map, p))) => {
+                        *placed.borrow_mut() = Some((map, p.clone()));
+                        Some(p)
+                    }
+                    Ok(Err(r)) => {
+                        *refused.borrow_mut() = Some(r);
+                        None
+                    }
+                    Err(payload) => {
+                        tracing::error!(error = %panic_text(&*payload), "forced list: the placement panicked");
+                        *refused.borrow_mut() = Some(ForcedRefusal::Internal);
+                        None
+                    }
                 }
-                Err(payload) => {
-                    tracing::error!(error = %panic_text(&*payload), "forced list: the composition panicked");
-                    refused = Some(ForcedRefusal::Internal);
-                    None
-                }
-            }
-        });
+            },
+        );
+        let (refused, built, placed) = (refused.into_inner(), built.into_inner(), placed.into_inner());
 
         let colour = matches!(frame.planes, RawPlanes::Rgb(_));
         let run = match measured {
@@ -372,16 +437,41 @@ mod forced {
                 }
                 None => match built {
                     Some((anchor, list)) => {
-                        // `exptime_s` was valid to get here.
-                        let t = zp.exptime_s.unwrap_or(f64::NAN);
-                        let outcome = forced_zero_point(&list, &lm, t, params);
-                        ForcedRun {
-                            result: outcome.result,
+                        let mut run = ForcedRun {
+                            result: Err(ForcedRefusal::Internal),
                             anchor: Some(anchor),
                             list: Some(list),
-                            measured: Some(lm),
-                            outcome: Some(outcome),
+                            measured: None,
+                            map: None,
+                            gate: None,
+                            placement: None,
+                            outcome: None,
+                        };
+                        let list_ref = run.list.as_ref().expect("just set");
+                        match (refused, placed) {
+                            // The map's own refusal (too few members, or a refusal of the second callback).
+                            (Some(r), _) => run.result = Err(r),
+                            (None, Some((map, placement))) => {
+                                match map_gate(list_ref, &lm.refits, &placement, params) {
+                                    Ok(gate) => {
+                                        // `exptime_s` was valid to get here.
+                                        let t = zp.exptime_s.unwrap_or(f64::NAN);
+                                        let outcome = forced_zero_point(list_ref, &lm, &placement, t, params);
+                                        run.result = outcome.result;
+                                        run.gate = Some(gate);
+                                        run.outcome = Some(outcome);
+                                    }
+                                    Err(r) => run.result = Err(r),
+                                }
+                                run.map = Some(map);
+                                run.placement = Some(placement);
+                            }
+                            (None, None) => {
+                                tracing::warn!("forced list was measured with no map and no refusal");
+                            }
                         }
+                        run.measured = Some(lm);
+                        run
                     }
                     None => {
                         tracing::warn!("forced list measured without a list built");
@@ -398,22 +488,42 @@ mod forced {
                     r
                 } else if pm.trailed || pm.defocused {
                     ForcedRefusal::FrameVerdict
-                } else if requested == 0 {
-                    // The list is empty: nothing in the window, or the catalogue holds nothing there.
-                    ForcedRefusal::TooFewStars { list: 0, kept: 0 }
+                } else if built.as_ref().is_some_and(|(_, l)| l.map.is_empty()) {
+                    // No map star: nothing in the window, or the catalogue holds nothing there. The refusal carries the
+                    // list's size, so a shallow catalogue is told from a measurement that failed.
+                    let n = built.as_ref().map_or(0, |(_, l)| l.stars.len() as u32);
+                    ForcedRefusal::TooFewStars { list: n, kept: 0 }
                 } else {
-                    // A non-empty, valid request the fitter returned nothing for: its tolerance or `c` cap or the plane's
-                    // mask geometry broke an invariant. A bug, not a verdict: not stored, a fixed build measures again.
-                    tracing::warn!(list = requested, "forced list was not measured: the request or the plane's mask was refused");
+                    // A non-empty, valid request the fitter returned nothing for: its tolerance or the plane's mask
+                    // geometry broke an invariant. A bug, not a verdict: not stored, a fixed build measures again.
+                    let n = built.as_ref().map_or(0, |(_, l)| l.map.len());
+                    tracing::warn!(list = n, "forced list was not measured: the request or the plane's mask was refused");
                     ForcedRefusal::Internal
                 };
                 let (anchor, list) = match built {
                     Some((a, l)) => (Some(a), Some(l)),
                     None => (None, None),
                 };
-                ForcedRun { result: Err(reason), anchor, list, measured: None, outcome: None }
+                let mut run = ForcedRun::refused(reason);
+                run.anchor = anchor;
+                run.list = list;
+                run
             }
         };
+        if run.list.is_some() {
+            let refusal = run.result.err().map(|r| r.code());
+            tracing::debug!(
+                list = run.list.as_ref().map_or(0, |l| l.stars.len()),
+                members = run.outcome.as_ref().map_or(0, |o| o.members as usize),
+                map_members = run.map.as_ref().map_or(0, |m| m.members),
+                map_kept_share = run.gate.as_ref().map_or(f64::NAN, |g| g.kept_share),
+                map_residual_px = run.map.as_ref().map_or(f64::NAN, |m| m.residual_px),
+                pedestal = run.outcome.as_ref().and_then(|o| o.pedestal).unwrap_or(f64::NAN),
+                window_slope = run.outcome.as_ref().and_then(|o| o.window_slope).unwrap_or(f64::NAN),
+                zp_reason = refusal,
+                "forced list measured"
+            );
+        }
         (pm, Some(run))
     }
 }
@@ -839,6 +949,7 @@ mod tests {
     mod forced {
         use super::*;
         use crate::analysis::zero_point::{anchor_zero_point, ForcedListParams, ForcedRefusal};
+        use crate::analysis::analyzer::forced::PLACEMENT_PANICS;
         use solvemyastro::{CatalogStar, WcsSolution};
 
         const ZP_TRUE: f64 = 24.0;
@@ -966,7 +1077,13 @@ mod tests {
                 list.window_bright
             );
             let o = run.outcome.expect("outcome");
-            assert!(o.aperture_correction.is_some_and(|c| c > 1.0 && c < 1.5), "c {:?}", o.aperture_correction);
+            let (map, gate) = (run.map.expect("the map"), run.gate.expect("the gate"));
+            assert!(map.members >= 30 && map.residual_px < 0.2, "map {} members, residual {}", map.members, map.residual_px);
+            assert!(gate.kept_share >= 0.9, "kept share {}", gate.kept_share);
+            assert!(o.members >= 50 && o.pedestal.is_some(), "{} members, pedestal {:?}", o.members, o.pedestal);
+            let lm = run.measured.expect("measured");
+            assert_eq!(lm.apertures.len(), list.stars.len());
+            assert_eq!(lm.fits.len(), list.map.len());
             assert!(pm.stars.len() >= 400);
         }
 
@@ -1008,15 +1125,14 @@ mod tests {
                 (bare.zero_point - ZP_TRUE).abs()
             );
 
-            // The list: measured on the green plane (the fitter's masked list c), enough kept fits, the zero point.
+            // The list: measured on the green sites, apertures for every list star, the map's second fit kept.
             let list = run.list.as_ref().expect("list");
             let lm = run.measured.as_ref().expect("the list was measured");
-            assert!(lm.refusal.is_none() && lm.fits.len() == list.stars.len() && list.stars.len() >= 50);
-            assert!(lm.fits.iter().filter(|f| f.kept).count() >= 50, "kept fits");
-            let list_c = lm.aperture_correction.expect("the list's own c on the green sites");
-            assert!(list_c.is_finite() && list_c > 1.0 && list_c < 1.6, "list c {list_c}");
+            assert!(lm.refusal.is_none() && lm.apertures.len() == list.stars.len() && list.stars.len() >= 50);
+            assert!(lm.apertures.iter().filter(|a| a.on_frame).count() >= 50, "apertures on the frame");
+            assert!(run.gate.is_some_and(|g| g.kept_share >= 0.9), "{:?}", run.gate);
             let z = run.result.unwrap_or_else(|r| panic!("refused: {r:?}; anchor {:?}", run.anchor));
-            assert!((z.zero_point - ZP_TRUE).abs() < 0.01, "zero point {} (truth {ZP_TRUE})", z.zero_point);
+            assert!((z.zero_point - ZP_TRUE).abs() < 0.02, "zero point {} (truth {ZP_TRUE})", z.zero_point);
             assert!(z.stars >= 50, "survivors {}", z.stars);
         }
 
@@ -1167,6 +1283,40 @@ mod tests {
                 assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::CatalogueUnreadable, "catalogue_unreadable", false));
                 assert!(run.list.is_none() && run.measured.is_none() && run.anchor.is_none());
             }
+        }
+        /// R4 / M5: a list whose window holds no map star carries the list's size in `too_few_stars`, not 0.
+        #[test]
+        fn an_empty_map_request_carries_the_list_size() {
+            let (frame, cat, wcs) = solved_mono(300, 1400, 1000, 51);
+            // Map stars are the list stars with G <= G_b + map_window_mag: a map window of -10 mag leaves none.
+            let params = ForcedListParams { map_window_mag: -10.0, ..ForcedListParams::default() };
+            let (_, run) =
+                measure_with_zero_point(&frame, &cfg(), None, Some(&inputs(&wcs)), &params, |_, _, _, _, _| Ok(cat.clone()));
+            let run = run.expect("a solved frame is judged");
+            let list = run.list.as_ref().expect("the list was built");
+            assert!(list.stars.len() >= 50 && list.map.is_empty());
+            assert_eq!(run.result, Err(ForcedRefusal::TooFewStars { list: list.stars.len() as u32, kept: 0 }));
+            assert!(run.measured.is_none());
+        }
+
+        /// A panic of the placement callback keeps the Analysis measurement and stores nothing.
+        #[test]
+        fn a_panicking_placement_keeps_the_measurement() {
+            let (frame, cat, wcs) = solved_mono(300, 1400, 1000, 71);
+            let plain = measure_raw_frame(&frame, &cfg(), None);
+            PLACEMENT_PANICS.with(|c| c.set(true));
+            let (pm, run) = measure_with_zero_point(
+                &frame,
+                &cfg(),
+                None,
+                Some(&inputs(&wcs)),
+                &ForcedListParams::default(),
+                |_, _, _, _, _| Ok(cat.clone()),
+            );
+            PLACEMENT_PANICS.with(|c| c.set(false));
+            same_analysis("placement panic", &pm, &plain);
+            let r = run.expect("a solved frame is judged").result.unwrap_err();
+            assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::Internal, "internal", false));
         }
     }
 }
