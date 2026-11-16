@@ -187,12 +187,16 @@ nights; 6.5 put it at 0.013–0.017 on its mono nights (no common set). A missed
 | B1 kept list stars a frame shares with its successor | every pair ≥ 80 % | the 3c mechanism is gone (today 5–7.5 %); not that the ZP is right |
 | B2 stability, median \|ΔZP\| | ≤ 0.015 on the common-set nights; elsewhere ≤ 0.020 and not above today's (vdB 0.021–0.024, 6.5 L / H 0.024) | frame-to-frame noise; not a slow drift or a constant bias |
 | B3 ZP − 2.5·log10(t_flux / t), common set | rms ≤ 0.015; FWHM slope within ±0.04 mag/px | agreement with an independent calibrated photometry; not seeing independence below the ~0.04–0.06 mag/px spread of the references' own unconverged apertures (3c) |
-| B4 ZP = a + kX (+ s·[after flip], reported), per night | \|k − k_stack\| ≤ 0.05 where ΔX ≥ 0.4: ATR L, and 10-18 one pier side at a time (F7) | the ZP follows real light loss in size; not haze or cloud |
+| B4 ZP = a + kX (+ s·[after flip], reported), per night | \|k − k_stack\| ≤ 0.02 where ΔX ≥ 0.4: ATR L, and 10-18 after the flip (F7; before it ΔX is 0.07) | the ZP follows real light loss in size; not haze or cloud |
 | B5 no common set: one k per rig, an intercept per night, a flip term where one exists | \|FWHM slope\| ≤ 0.03 mag/px where its error ≤ 0.015 | no seeing term on the vdB and 6.5 nights; not below the error |
 | B6 coverage: valid ZPs of the solved, analysed frames | ≥ 90 % per night; 6.5's sets at 6.5's 100 % | the rule works on real frames; not accuracy |
 | B7 median \|fitted − projected\| centre | ≤ 0.25·FWHM_ref | the WCS and the seeding agree; not the flux |
-| B8 mono not worse: seeing slope with airmass (≤ 0.03), L cross-target agreement (≤ 0.10; 6.5 0.025) | each within 6.5's bar and not above its value | no regression on the shipped classes |
+| B8 mono not worse: seeing slope with airmass | ≤ 0.03 and ≤ \|today\| + 2σ; L and Duo cross-target spreads reported as decision rows (not a STOP) | no regression on the shipped classes |
 | B9 the Analysis measurement with and without a list | every `StarFit`, `FrameSummary`, `PlaneMeasurement` field bit-identical | no Analysis number moves (rustafits test + probe) |
+
+A bar judged on no night of its class is a STOP (no silent pass); B1 counts pairs where both frames are valid; B3's
+slope is also fitted against the probe's plain 6F aperture on the same list, a miss called only when both agree; B6
+exempts frames with a plane verdict (plan, Review rulings).
 
 Reported, not judged: both `c`s; list size and refusals per frame; haze (none in the corpus, largest dip 0.09 mag; a
 cloudy night is owed); under 16 bit, long focal length, high latitude (no data; the faint-edge extension is unjudged).

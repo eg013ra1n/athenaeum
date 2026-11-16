@@ -608,3 +608,37 @@ committed; REGISTRY row closed). Push: 6.5 and this together, on the owner's wor
 13. B4's pier side is derived from the solve's field rotation; the solve pass takes the compute queue (not in the spec).
 14. FL5 (spec:31–32) says 6.5's Z1–Z5 stand, while F0 measures mosaics, which Z5 had deferred: read as Z5's OSC
     deferral being superseded.
+
+## Review rulings (opus review of spec + plan, `review-forced-spec-plan-opus.md`, 2026-11-16) — they override the tasks above
+
+Controller rulings; numbers in the ledger. Each task's implementer reads this section first.
+
+- **R1 (#1, Task 1)** — no change: `fit::Correction`'s `Default` is hand-written (`max_c_stars` = `CORRECTION_STARS`,
+  fit.rs:2063); the F1 review confirms it.
+- **R2 (#2, Task 1 fix round)** — a list star's own detection is the nearest one within
+  max(`max_centre_offset_px`, 1.0·F_field), not within `max_centre_offset_px`. Test: a mosaic star whose own detection
+  sits 1.3 px off is kept (no `Blend`) and qualifies for `c`.
+- **R3 (#3, Task 1 fix round)** — the list's near-clip class uses the plane's clip floor (`pm.clip_floor`), not one
+  re-derived from the list seeds.
+- **R4 (#4)** — (a) the list's short-`c` warn is quiet (`warn_short_c`, debug); (b) `c` is over the kept fits only
+  (pre-filter; documented); (c) no list is measured on a 3-plane file (O4: such a file keeps `ColourCamera`).
+- **R5 (#5, Tasks 5a / 5b)** — every outcome that will not change on a re-read is stored at version 3 with its own
+  refusal: a plane with a verdict (trailed, defocused, no stars) → `frame_verdict`; a WCS with no cone →
+  `unreadable_solve`. A caught panic stores nothing and retries. Test: a trailed solved frame is selected by Analyze
+  once, then not again.
+- **R6 (#14)** — `zp_window_bright` is replaced by `zp_refusal TEXT` (the refusal code; NULL on a valid ZP), so loss
+  reasons read the code and the plan's Reading 4 derivation goes. The probe reports the list's wall time and memory per
+  frame.
+- **R7 (#13)** — the pass after a solve batch is Analyze's own worker over the newly solved ids (one writer of `zp_*`),
+  skipping frames already current, taking the compute queue per chunk; 6b shows "N to update" beside Analyze instead of
+  counting outdated rows as not analysed.
+- **R8 (#7)** — the rig-wide reference fallback stays OFF for mosaics until judged; the probe reports a cross-target
+  row for the Duo (LDN 1272 against vdB 152) as a decision row for the owner.
+- **Bars (spec §6, amended in the same commit):** B4 tolerance 0.05 → **0.02**, judged on ATR L and 10-18 after the flip
+  (before the flip ΔX is 0.07); B8 → |slope| ≤ 0.03 and ≤ |today| + 2σ, the cross-target spread a decision row, not a
+  STOP; **a bar judged on no night of its class is a STOP** (no silent pass); B1 counted over pairs where both frames are
+  valid; B3's FWHM slope is also fitted against `bigap` 6F on the same list and a miss is called only when both agree
+  (09-13 named a known risk: +0.036 ± 0.009 in 3c); B6 exempts frames with a plane verdict.
+- **Tests (#12)** — pier side from the rotation difference mod 360 (a +179 / −179 case); the list builder's type takes
+  no FWHM, so "the list does not follow the seeing" holds by type. **Lines (#15)** — implementers re-verify every
+  line number they edit.
