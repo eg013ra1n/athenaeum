@@ -1,9 +1,12 @@
 # Forced-list zero point — mono and OSC (design)
 
-Date: 2026-11-16. Status: draft for the owner. Follows `2026-11-15-collab-v3-wave6-5-zero-point-design.md` (§5.1, §6,
-§9; merged to local `main`, not pushed) and `2026-11-16-osc-zero-point-design.md` (O1–O7; its Phase A stopped).
-Evidence: ledger `.superpowers/sdd/2026-11-16-osc-zp/` (`task-3c-report-r0.md`, `research-web.md`); data and the
-emulation of §4 in `~/.athenaeum-acc/2026-11-16-osc-zp/out/{3c,r1,4d}/` (`4d/emul4d.py`, `4d/emul4d-r3.txt`).
+Date: 2026-11-16. Status: draft for the owner; amended the same day by the model re-audit (F5) after the first Phase A
+stopped (§4.5). Follows `2026-11-15-collab-v3-wave6-5-zero-point-design.md` (§5.1, §6, §9; merged to local `main`, not
+pushed) and `2026-11-16-osc-zero-point-design.md` (O1–O7; its Phase A stopped).
+Evidence: ledger `.superpowers/sdd/2026-11-16-osc-zp/` (`task-3c-report-r0.md`, `research-web.md`, `task-F4-report-r0.md`,
+`task-F5-report-r0.md`, the controller's rulings RR1–RR4 in `progress.md`); data and the emulations in
+`~/.athenaeum-acc/2026-11-16-osc-zp/out/` (`3c/`, `r1/`, `4d/emul4d.py`, `4d/emul4d-r3.txt`; the first Phase A `f0/`, its
+judge `f4/`; the re-audit's run `g0/`, scripts and evidence `f5/`, the chosen candidate `e-max4020+p/verdict-forced.txt`).
 
 ## 1. Intent
 
@@ -12,31 +15,44 @@ The budget fits 500 of 5 500–10 400 detections, chosen per frame: consecutive 
 and 5.0 % (2025-10-18) of their matched stars, a star's offset to G scatters 0.1–0.95 mag, so the median jitters by
 0.03 and drifts with the subset (on 09-13 its median G follows the seeing, +1.5 mag/px). On a fixed sample the same
 fluxes follow the stacking photometry to 0.012–0.013 mag rms and its extinction to 0.001 mag/airmass (3c). The ZP moves
-to **a list of catalogue stars chosen before any pixel is read, measured at their catalogue positions**, the same stars
-in every frame of a pointing. 6.5's mono ZP reads the same budget (2–8 shared stars of ~180), so mono moves too.
+to **a list of catalogue stars chosen before any pixel is read, measured at their catalogue positions** (mapped onto the
+frame by the list's own bright stars, FL6, as plain aperture sums, FL2), the same stars in every frame of a pointing.
+6.5's mono ZP reads the same budget (2–8 shared stars of ~180), so mono moves too.
 
 ## 2. Rulings
 
 - **F0 (owner, 2026-11-16: «да, давай оба переводить»).** Mono and OSC move to the forced list now; 6.5's push waits.
   Controller calls follow (the owner may overrule any).
 - **FL1 — the window is set per frame by a rig-independent rule anchored on the frame's own preliminary ZP** (§5.1);
-  not per rig from data, not ensemble photometry (§4.2).
-- **FL2 — a list star is measured by the one PSF path**: Analysis' Moffat fit seeded at its WCS position, centre free,
-  the frame's β and field width, times an aperture correction `c` measured over the list's own bright members (§5.2).
+  not per rig from data, not ensemble photometry (§4.2). *Amended (F5):* the window stays anchored on the preliminary
+  ZP; what it costs (κ, §4.2) is taken out on read by a stored slope (FL8), not by the window.
+- **FL2 (replaced in F5) — a list star's flux is a plain aperture sum at its mapped catalogue position.** No fit of the
+  star, no aperture correction. The sum is `star_measure`'s, beside the growth sum `c`'s numerator uses (the same module,
+  pixel walk, mask and present-pixel rule; on a mosaic scaled by area, since a star that is not fitted has no model to
+  phase-match), so there is still one star path. Fits are made only on the map stars (FL6). Was: Analysis' Moffat fit
+  seeded at the WCS position × an aperture correction `c` over the list's own bright members (§4.5).
 - **FL3 — it runs inside Analysis' read** of a solved frame and in a background pass after a solve batch; nothing
   reads pixels at launch, on a tier install or at the gate (§5.4).
-- **FL4 — no per-star table**; `ZP_VERSION` 2 → 3, three columns added (§5.5).
+- **FL4 — no per-star table**; `ZP_VERSION` 2 → 3, four columns added (§5.5). *Amended (F5):* the columns are §5.5's.
 - **FL5 — the OSC spec:** O1 holds in substance (no Analysis number moves, `MEASURE_VERSION` stays 8); O2's
-  phase-matched masked growth measures the list's `c` on a mosaic; O4's `is_mosaic` and O7 stay; O5, O6, the
-  `cfa_aperture_*` columns and `AnalysisBeforeColour` are superseded by the ZP's own currency. 6.5's Z1–Z5 and C1–C8
-  stand, except C3's outcome: mosaics are measured again, judged by §6.
+  phase-matched masked growth gives the reported `c` the mosaic anchor reads (the list itself has no `c`, FL2); O4's
+  `is_mosaic` and O7 stay; O5, O6, the `cfa_aperture_*` columns and `AnalysisBeforeColour` are superseded by the ZP's own
+  currency. 6.5's Z1–Z5 and C1–C8 stand, except C3's outcome: mosaics are measured again, judged by §6.
+- **FL6 — positions come from a map of the list's own fits** (§5.2); a frame whose stars do not sit where the solve
+  puts them is refused as `poor_solve`.
+- **FL7 — the zero point is a weighted ratio of sums over the list**, not a median of per-star magnitudes; the list has no
+  cap; its window edges are ramps; the sky under an aperture is the annulus median plus a pedestal measured on the frame
+  (§5.3).
+- **FL8 — κ is removed on read**: each frame stores its window's bright edge and its zero point's slope against a window
+  shift; a reader reduces a frame set to one window before it compares frames (§5.6).
 
 ## 3. Goals, non-goals, anti-goals
 
 - Goals: a stored per-frame ZP from a frame-independent list, mono and OSC mosaics; §6's bars met in the probe before
   anything is stored; the loss, the gate and the Transparency column read it unchanged.
-- Non-goals: a colour term or synthetic catalogue magnitudes; a seeing-regularised `c` (a cross-frame value); ensemble
-  photometry; debayered or 3-plane colour files (keep `ColourCamera`); a Settings entry; hub and portal (same metric).
+- Non-goals: a colour term or synthetic catalogue magnitudes; an aperture correction of any kind (`c`, per band, or from
+  a PSF model); a pixel-integrated PSF fit of the list; ensemble photometry; debayered or 3-plane colour files (keep
+  `ColourCamera`); a Settings entry; hub and portal (same metric).
 - Anti-goals: an Analysis number moves (stars, `FrameSummary`, `c`, β, the overlay, the plate-solve gate); a second
   star path beside `star_measure`; a launch pass reading every catalogued light; a stack changes by one bit.
 
@@ -60,15 +76,18 @@ only, no fit refusals; saturation does not bind for G ≥ 12.6 (70 % of full sca
 | anchored on the frame's own saturation G (seeing and sky) | 3 036 / 2 149 | 92.2 / 83.8 % | 0.0014 / 0.0056 | 0.0039 / 0.0065 |
 
 The chosen rule's 90.3 % is the 10-18 meridian flip, where the anchor follows the real +0.17 mag step. A window on the
-frame's saturation carries a seeing slope from churn alone, −0.029 / +0.034 mag/px: the 3c mechanism again.
+frame's saturation carries a seeing slope from churn alone, −0.029 / +0.034 mag/px: the 3c mechanism again. (F5 dropped
+the cap, §5.1: on real frames it churned a sum.)
 
 ### 4.2 The brightness window
 
 - **(a) Per frame, anchored on the preliminary ZP (chosen).** A stored per-frame value no other frame changes, so
   `transparency.rs`' reference-on-read stays. Cost: under a loss L the window follows the frame's light L mag brighter,
   and the offset depends on G (10-18: G 12.5–13 reads 18.42 against 19.13 at 13–13.5, red giants). Emulated ZP shift
-  −0.008 / +0.005 mag at L = 0.5, +0.012 / +0.040 at L = 1: the loss reads up to 4 % small.
-- **(b) Per rig, fixed from data.** Removes that ≤ 4 % but needs a stored window per rig and exposure, frozen by the
+  −0.008 / +0.005 mag at L = 0.5, +0.012 / +0.040 at L = 1: the loss reads up to 4 % small. Phase A measured more: a
+  real change L reads (1 + κ)·L with κ −0.18 in LDN 1272 (reddened background stars), −0.12 ATR LDN 1272, −0.08 LBN 582
+  (F4). FL8 takes it out on read (§5.6): |κ| ≤ 0.022 in every field after it.
+- **(b) Per rig, fixed from data.** Removes that cost but needs a stored window per rig and exposure, frozen by the
   first frame measured (order-dependent; two machines differ under sync) or chosen on read (a moving window turns
   stored ZPs stale, and re-measuring costs a file read). Rejected.
 - **(c) Ensemble, each star against its own reference.** Churn stops mattering (3c same stars: 0.0090 / 0.0140), but
@@ -79,20 +98,39 @@ frame's saturation carries a seeing slope from churn alone, −0.029 / +0.034 ma
 
 | At the catalogue position | Evidence | Verdict |
 | ---- | ---- | ---- |
-| Moffat fit seeded there, centre free, × `c` | 3c same stars: rms against the stack 0.012 / 0.013, FWHM slope +0.036 / −0.013 mag/px | **chosen** |
+| Moffat fit seeded there, centre free, × `c` | 3c same stars: rms against the stack 0.012 / 0.013, FWHM slope +0.036 / −0.013 mag/px | chosen in r0 (Tasks F1–F3); failed Phase A (§4.5) |
 | Fixed-position, fixed-shape amplitude fit | a position error δ costs `exp(−δ²/4σ²)` of the flux: 1.3 % at 09-13's 0.12 px median match (σ 0.53 px), 3.5 % at 0.2 px; the WCS changes at a flip; new rustafits code | rejected |
 | Aperture of k·FWHM × `c_k` | a second photometry path; on the mosaic ±10 % lattice phase error per star at FWHM 1.25 px | rejected |
-| Plain large aperture (6 F, per-phase annulus sky) | rms 0.009 / 0.020, slope +0.015 / +0.061; a detected neighbour within 8–20 px brightens a 6 F sum by 0.28–0.47 mag against the model (10-18) | rejected; the probe's referee |
+| Plain large aperture (6 F, per-phase annulus sky) | rms 0.009 / 0.020, slope +0.015 / +0.061; a detected neighbour within 8–20 px brightens a 6 F sum by 0.28–0.47 mag against the model (10-18) | rejected; the r0 probe's referee |
+| **Plain aperture at the mapped position, radius `max(4·FWHM_ref, 2·F)`, per-phase annulus sky plus a frame pedestal, a weighted ratio of sums** | F5 emulation on run g0 (nine sets), judged by the probe's verdict: B2 0.0019–0.0097, B3 rms 0.0073–0.0114, B7 0.064–0.149 px; misses B4 on LBN 582 10-18 by 0.0014 and B5 on IC 5146 H 10-04 with the rig's k | **chosen (FL2, FL7)** |
 
-`c` over the budget's ≤ 64 qualifiers takes the seeing slope away (+0.065 → −0.013 mag/px against the stack, 10-18) but
-adds jitter (ours − stack stability 0.0086 → 0.0123; `c` alone 0.0061 / 0.0121). Over the list's own isolated bright
-members, up to 256, its noise should about halve (an estimate; the probe reports both).
+Measured in F5 (run g0, nine sets): the Moffat flux × `c` fails where `c` is short (FWHM ≫ FWHM_ref) or the fit refuses
+(undersampled mosaic); an aperture of k·F reads +0.06…+0.13 mag/px on the QHY nights; a radius fixed by the rig with a
+frame pedestal passes. The lattice phase error of a green-site sum is a per-star scatter, unbiased over the list. Also
+rejected by measurement: a fixed 6 px radius (LBN 582 09-13 −0.039 mag/px); the median of per-star magnitudes (on a fixed
+window the same aperture fluxes give B3 rms 0.016–0.019 as a median, 0.008–0.011 as a ratio of sums, 09-13); the annulus
+median alone as the sky (it leaves a pedestal under the aperture: −4.4 % of the pixel noise per px on LBN 582, −1.8 % on
+the Duo, +10…+14 % in IC 5146, which made k depend on brightness). `c` per band and a pixel-integrated fit were not needed
+and not built.
 
 ### 4.4 Where it runs
 
 Inside Analysis' read (chosen: plane in memory, the budget gives the anchor, one path). The solver reads its file inside
 `solvemyastro` and hands back no pixels, so a solve batch's frames are measured afterwards by the Analysis entry. A
 launch pass would read every solved light (1 352 OSC lights alone in the release catalogue, many on network shares).
+
+### 4.5 Phase A of the Moffat × `c` list, and the re-audit
+
+The list as first built (Moffat fit at the SIP position × a `c` over ≤ 256 of the list's kept fits; rustafits 45236db,
+30fd4e7; core 1bd79263, c7cf5c9c; probe 3134eb8a) was judged on the nine sets (`out/f0/`, 933 frames) and stopped:
+STOP(missed B1, B3, B5, B7, B8), no constant buying a class pass in four tuning rounds (`out/f1–f3/`). Causes, on the frames
+(`task-F4-report-r0.md`, `out/f4/`): B1 (ATR 10-17 min 0.616) and B7 (QHY L 0.55–0.59 px) are bad stored solves and a smooth
+WCS scale term the list's positions inherit (a quadratic re-map leaves 0.06–0.09 px); B3 on undersampled Duo 09-13 (rms
+0.0163), B3 on LBN 582 10-18 (0.0233) and B5/B8 on QHY L (−0.032…−0.047 mag/px) are one `c` per frame against a seeing term
+that depends on brightness (FWHM < 1.4 px on green sites) or is short where FWHM ≫ FWHM_ref; B3 on Duo 10-18 is the anchored
+window's κ at the flip (−0.18, against §4.2's ≤ 4 %); QHY H is off-axis stars on unflatted frames plus B5's shared k. The
+third fix round in the subsystem became a re-audit of the model (F5, `task-F5-report-r0.md`, `out/g0/`, `out/f5/`): positions,
+the flux estimator and κ, measured by emulation on the job's data; FL2, FL6–FL8 and §5 are its outcome.
 
 ## 5. Design
 
@@ -107,39 +145,82 @@ budget's fits from the same measurement. Positions are 0-based in file row order
 - **Anchor**: the preliminary ZP, 6.5's `measure_zero_point` over the budget fits (on a mosaic their flux × the
   reported `c`, so mono and OSC sit alike), validity relaxed to ≥ 10 matches; fewer → refusal `no_anchor`.
 - **Window**: the bright edge `G_b` is 1.5 mag fainter than a star whose peak would reach 70 % of full scale at
-  `FWHM_ref` (Moffat β 4) at the anchor; the faint edge `G_b + 3`, deepened by catalogue count up to `G_b + 4.5` while
-  the region holds fewer than 200 isolated stars. Here `G_b` ≈ 12.5–12.7, 1.0–2.2 mag below the real 70 % level.
-- **Region**: inside 0.9 of the half-diagonal (6.5) and at least `13·FWHM_ref` from every edge (the ring sky fits).
-- **Isolation, by the catalogue only**: no neighbour with ΔG ≤ 4 within `4·FWHM_ref` (15″ here), no star brighter than
-  `G_b − 2` within `10·FWHM_ref` (halo, bleed, spikes). Contamination goes with distance over PSF width; `FWHM_ref` is
-  arcsec on a well-sampled rig, pixels at the sampling floor, and never moves with seeing, so isolation never churns
-  (6.5's 3 × the frame's FWHM did). ΔG 4 is 2.5 % of the light; at `4·FWHM_ref` a β-4 Moffat puts < 0.1 % of it in the
-  fit region. Proxy share with a neighbour (ΔG ≤ 5) within 10″ / 20″: 0.6–2.8 % / 3.9–5.7 % (a lower bound).
-- **Cap** 1 000: above it a star stays when a hash of its catalogue record (G, position at 1″) falls under `1000 / n`,
-  so the same stars are kept in every frame and the G distribution holds (list noise 0.0053 against 0.0078 at 500).
+  `FWHM_ref` (Moffat β 4) at the anchor; the faint edge `G_f` is `G_b + 3`, deepened by catalogue count up to `G_b + 4.5`
+  while the region holds fewer than 200 isolated stars. Here `G_b` ≈ 12.5–12.7, 1.0–2.2 mag below the real 70 % level.
+- **Window weights**: a star's weight is `w(G) = clamp(min((G − G_b)/ρ, (G_f − G)/ρ), 0, 1)`, ρ = 0.5 mag. A star
+  entering at an edge enters with weight 0, so a ZP changes continuously as the window moves.
+- **Region**: inside 0.9 of the half-diagonal (6.5) and at least `13·FWHM_ref` from every edge (the map fits' ring sky
+  fits; a list star whose aperture annulus leaves the frame is no member, §5.3).
+- **Isolation, by the catalogue only**: no neighbour with ΔG ≤ 4 within `8·FWHM_ref` (was 4: the aperture and its
+  pedestal radii reach `6·FWHM_ref`), no star brighter than `G_b − 2` within `10·FWHM_ref` (halo, bleed, spikes).
+  Contamination goes with distance over PSF width; `FWHM_ref` is arcsec on a well-sampled rig, pixels at the sampling
+  floor, and never moves with seeing, so isolation never churns (6.5's 3 × the frame's FWHM did). ΔG 4 is 2.5 % of the
+  light.
+- **No cap.** The hash cap churned a sum (cap 1 000: B2 0.0163 on 09-13; no cap 0.0077; ramped edges 0.0047). A guard of
+  12 000 stars stays, by the same hash of the catalogue record (G, position at 1″): above it a star stays when its key
+  falls under `12 000 / n`. No rig here reaches it; unjudged.
+- **Map stars**: the list stars with `G ≤ G_b + 2`, at most 400, lowest keys first.
 
 ### 5.2 The measurement (rustafits PR and submodule bump, R-OSP-19)
 
-One entry beside `analysis_mode::measure_raw_frame` reads the frame once, measures it exactly as today, lets the caller
-build the list from that measurement, then fits the list on the same plane:
+One entry beside `analysis_mode::measure_raw_frame` reads the frame once and measures it exactly as today; two callbacks
+of the caller then drive the list on the same plane. rustafits measures; the caller (core, pure) decides:
 
-- seeds at the list positions, by `fit_stars_at`'s path with the plane's β and field width (on a mosaic the native
-  mosaic under the green-site mask); the detected seeds keep their `3F` discs out of every ring sky, so an unlisted
-  neighbour cannot lift `B_i`; a mosaic's sky is green sites only, G1 and G2 in equal shares in ring and fit, so a
-  pedestal difference cancels (per-phase sky served the probe's all-site sums);
-- a fit is kept when accepted, not saturated or near the clip, and centred within `max(1 px, 0.5·FWHM_ref)` of its
-  projected position; no SNR cut (a frame-dependent cut churns the faint end with the sky);
-- `c` over the kept fits passing Analysis' own `c` screen, at most 256 (`growth_curve` on mono, O2's phase-matched
-  masked growth on a mosaic; fewer than 5 → `None`); each kept flux = model flux in its FWTM × `c`;
-- returned apart: per seed its fitted position, flux, SNR, flags; `c`, its stars, its error. Cost: ≤ 1 000 fits and 256
-  growth curves beside the budget's 500 fits. The Analysis measurement is bit-identical with and without a list (test).
+1. the first callback builds the list from the measurement (§5.1) and asks for the **map stars**; rustafits fits them
+   seeded at their projections (the list path: the plane's β and field width, the saturation verdict with the plane's
+   clip floor, the detected neighbours kept out of the ring sky, no aperture correction);
+2. the second callback gets those fits; core builds the **map**: over the fits accepted, unsaturated, with SNR ≥ 10 and
+   within `2·FWHM_ref` of their seeds, `fitted − projected` per axis as a full quadratic of the frame position, three
+   rounds of 3 σ clipping (1.4826·MAD of the residuals, floor 0.15 px); fewer than 30 members → `poor_solve` (on a sparse
+   list see §5.3). Every list position is moved by it;
+3. rustafits fits the map stars once more at the moved seeds. **Gate** (core): fewer than 75 % of them kept (accepted,
+   unsaturated, within `max(1 px, 0.5·FWHM_ref)` of the moved seed) → `poor_solve` (the eight bad frames of the corpus
+   0.31–0.64, every other frame ≥ 0.86). One re-seed: a second changes nothing (F5);
+4. rustafits sums **every list star** at its moved position, no fit: radius `R = max(4·FWHM_ref, 2·F)`, `F` the frame's
+   Analysis median FWHM (8 px here; wider only above F = 4 px); a pixel on the edge counts by its 4 × 4 sub-sampled share;
+   on a mosaic the green sites only, each green phase less its own sky, the sum scaled by the disc's area over its green
+   area. Sky per star: the grouped median (of integer data) of an annulus of 2 000 px starting at
+   `max(4·F, 6·FWHM_ref) + 2 px`, per phase. Returned per star: the sums at `R`, `3·`, `4·` and `6·FWHM_ref`, the sky, the
+   annulus scatter, the highest pixel within `1.5·FWHM_ref`, and whether the annulus stayed on the frame; with them the
+   plane's clip floor in the same units.
+
+The Analysis measurement stays bit-identical with and without a list (B9, the rustafits test). Cost: no fit of the list,
+≤ 400 map stars fitted twice, one aperture and annulus per list star (2 000–9 000 here); estimated 20–70 ms a frame on the
+pool against the r0 list's 35 ms (an estimate: Phase A times it, §6).
 
 ### 5.3 Statistic and validity
 
-`zp_i = G_i + 2.5·log10(flux_i / t)` per kept star; the ZP is the 4 σ-clipped median, `zp_sigma` its 1.4826·MAD,
-`zp_stars` the survivors (6.5's code). Valid with ≥ 50 survivors and `zp_sigma / √zp_stars` ≤ 0.035 (6.5's constants;
-the probe may move constants, never a bar). Stored refusals: `no_exposure`, `no_anchor`, `no_aperture_correction`,
-`too_few_stars` (with the list size: a shallow catalogue or sparse field is told from failed fits), `too_scattered`.
+Members: the list stars in the window whose annulus is on the frame and whose highest pixel is under the plane's clip
+floor (any peak when the plane shows no clipped evidence).
+
+- **Pedestal** ε: over the members (every weight), `D = S(6·FWHM_ref) − S(4·FWHM_ref)` against `S(3·FWHM_ref)`, a
+  straight line with four rounds of 3 σ (MAD) clipping; ε = intercept / (π·(6² − 4²)·FWHM_ref²). Each flux is
+  `f = S(R) − ε·π·R²`.
+- **Screen**: `zp_i = G + 2.5·log10(f / t)` over the positive fluxes gives a 4 σ-clipped median `m` and `σ` (today's
+  code). A member is dropped when `f` is above `t·10^(0.4·(m + 4σ − G))`, or `f + 4·n` is below
+  `t·10^(0.4·(m − 4σ − G))`, with `n = sky scatter·√(π·R²)`. A negative flux inside its noise stays.
+- **Zero point**: `2.5·log10( Σ w·f / (t·Σ w·10^(−0.4·G)) )` over the members left.
+- **Window slope**: `s = 1.0857·[ (Σ_faint ramp f − Σ_bright ramp f)/(ρ·Σ w·f) − (the same with 10^(−0.4·G)) ]`, the
+  ramps the members with `w < 1` at each edge: the ZP's change per magnitude the window moves fainter.
+- Valid with ≥ 50 members of non-zero weight and `σ ≤ 1.0` mag; `zp_stars` counts those members, `zp_sigma` is `σ`.
+  Refusals: `no_exposure`, `no_anchor`, `poor_solve`, `too_few_stars` (with the list size: a shallow catalogue or sparse
+  field is told from a measurement that failed), `too_scattered`; stored besides (plan, Review rulings) `colour_camera`,
+  `unreadable_solve`, `frame_verdict`. `no_aperture_correction` goes.
+
+**On a sparse list** (under ~500 stars; no corpus set is one, so this is unjudged, and Phase A's decimated round reports
+it, §6):
+
+- **the map**: when the list holds fewer than 40 map stars (30 / 0.75), a map of fewer than 30 members is
+  `too_few_stars`, not `poor_solve` (a sparse field, not a bad solve); from 40 map stars on, §5.2's rule.
+- **the pedestal** is fitted over every member whatever its weight and is never replaced: its error on the ZP is about
+  0.03 / √n mag at n members (an estimate at the corpus' sky noise: 0.004 at 50), inside B2, so it needs no fallback
+  above the validity floor. A fit left with fewer than 20 points after its clipping, or with no spread in
+  `S(3·FWHM_ref)`, refuses the frame `too_scattered`: there is never a ZP with ε = 0, which would carry the annulus bias of
+  §4.3.
+- **the window slope** needs at least 10 members on each ramp; with fewer the frame stores no slope (`zp_window_slope`
+  NULL) and its ZP stays valid. On read it is reduced with its frame set's median slope (§5.6); a set in which no frame
+  has a slope reads its ZPs unreduced (`s̄` = 0).
+- **the faint edge** deepens to `G_b + 4.5` as before (unjudged).
 
 ### 5.4 Where it runs (no new command: Tauri and Axum call the same core)
 
@@ -156,62 +237,95 @@ the probe may move constants, never a bar). Stored refusals: `no_exposure`, `no_
 
 ### 5.5 Storage and currency
 
-- `ZP_VERSION` = 3. `frame_analysis` keeps `zero_point` (the list's flux units per second), `zp_stars`, `zp_sigma`,
-  `zp_version`, `zp_catalog`, and gains `zp_list_stars INTEGER` (the list before fitting), `zp_aperture_correction
-  REAL` (the `c` applied), `zp_window_bright REAL` (`G_b`): `CREATE TABLE`, the `ALTER TABLE` loop, `FrameAnalysis`,
-  `ts_export.rs`, `src/types/models.ts`; personal sync carries them as appended optional fields.
+- `ZP_VERSION` = 3. `frame_analysis` keeps `zero_point` (the aperture sums' working units per second), `zp_stars`
+  (members), `zp_sigma`, `zp_version` (3), `zp_catalog`, and gains `zp_refusal TEXT` (the refusal code, NULL on a valid
+  ZP; plan ruling R6), `zp_list_stars INTEGER` (the list before it is measured), **`zp_window_bright REAL`** (`G_b`) and
+  **`zp_window_slope REAL`** (`s`; NULL when §5.3 gives none). `zp_aperture_correction` is not added. `CREATE TABLE`, the
+  `ALTER TABLE` loop, `FrameAnalysis`, `ts_export.rs`, `src/types/models.ts`; personal sync carries them as appended
+  optional fields (the analysis summary rides the package manifest as opaque JSON; no wire golden pin changes, plan
+  Task 5a).
 - Current = `zp_version` 3 and `zp_catalog` the installed identity; an analysis upsert or a new solve clears `zp_*` (a
   new WCS moves the list) and §5.4 fills them again. No per-star table: it would spare a file read only when the
   statistic alone changes, double `star_metrics`' rows, and not travel by personal sync.
 
 ### 5.6 Loss, gate, UI
 
+- **Reduction on read** (FL8): for the frames of one rig and frame set holding a current ZP, `P` = median
+  `zp_window_bright`, `s̄` = median `zp_window_slope` (over the frames that have one; 0 when none); a frame reads
+  `ZP − s̄·(G_b − P)`. A single frame reads its ZP. The rig-wide fallback reduces each frame set within itself first.
+  Stored values are never rewritten: the cell shows the stored ZP, the loss is taken from the reduced ones. Checked
+  against a ZP measured in a fixed window: rms 0.0008–0.0014 mag (max 0.004); κ after it ≤ 0.022 in every field (was
+  −0.18); the 10-18 flip step then reads 0.138 / 0.159 against the stack's 0.139 / 0.167.
 - `transparency.rs` keeps its arithmetic (rig, frame set, 90th percentile, 30 frames, 2 nights, fallback), reads only
-  version-3 ZPs; mosaics join the references (`is_mosaic`); other colour files keep `ColourCamera`.
+  version-3 ZPs, reduced as above; mosaics join the references (`is_mosaic`); other colour files keep `ColourCamera`.
 - `NotMeasured` says "transparency not measured yet — run Analyze on its frame set"; `NoStarMetrics` goes (no stored
-  star rows are read); a refusal says why in one sentence (too few isolated stars to measure the halos; too few
-  catalogue stars, install the deeper tier, when the list was small). Gate: O7 stays; a frame without a current ZP gets
-  no verdict and is not blocked. New fields and codes go into the logging dictionary.
+  star rows are read); a refusal says why in one sentence: `poor_solve` reads "the stars are not where the plate solve
+  puts them — solve this frame again"; too few catalogue stars, install the deeper tier, when the list was small. Gate: O7
+  stays; a frame without a current ZP gets no verdict and is not blocked. New fields and codes go into the logging
+  dictionary.
 
 ## 6. Truth check — bars fixed now, judged in the probe before anything is stored
 
 `zp_probe forced` runs §5.1–5.3's shipping functions on frames read in memory and writes TSVs and a verdict, no
 database. Tiers 500 + 2000, all solved in the dev catalogue. OSC: LDN 1272 2025-09-13 (55) and 10-18 (105), common sets
-of stacking runs 10 and 9; vdB 152 2025-08-22 (100), 08-23 (116), 10-24 (45). Mono: ATR2600M L, LDN 1272 2025-10-18
-(82, run 9's common set); 6.5's QHY268M L (IC 5146, LDN 1042, LDN 1031) and H (IC 5146, LDN 1042). Nights of ≥ 30
-frames are judged, pairs ≤ 15 min apart. The sky moves 0.0032 / 0.0041 / 0.0036 frame to frame on the common-set
-nights; 6.5 put it at 0.013–0.017 on its mono nights (no common set). A missed bar stops the build; numbers to owner.
+of stacking runs 10 and 9; vdB 152 2025-08-22 (100), 08-23 (116), 10-24 (45). Mono: ATR2600M L on LBN 582 2025-09-13 and
+2025-10-18 (139 lights; 10-18 holds stacking run 9's mono common set, 82 frames) and on LDN 1272 (65 lights with an empty
+`FILTER`, night key 2025-10-17, no common set); 6.5's QHY268M L (IC 5146, LDN 1042, LDN 1031) and H (IC 5146, LDN 1042).
+Nights of ≥ 30 frames are judged, pairs ≤ 15 min apart. The sky moves 0.0032 / 0.0041 / 0.0036 frame to frame on the
+common-set nights; 6.5 put it at 0.013–0.017 on its mono nights (no common set). A missed bar stops the build; numbers to
+owner.
 
 | Check | Bar | Establishes / cannot establish |
 | ---- | ---- | ---- |
-| B1 kept list stars a frame shares with its successor | every pair ≥ 80 % | the 3c mechanism is gone (today 5–7.5 %); not that the ZP is right |
+| B1 members of non-zero weight a frame shares with its successor | every pair ≥ 80 % | the 3c mechanism is gone (today 5–7.5 %); not that the ZP is right |
 | B2 stability, median \|ΔZP\| | ≤ 0.015 on the common-set nights; elsewhere ≤ 0.020 and not above today's (vdB 0.021–0.024, 6.5 L / H 0.024) | frame-to-frame noise; not a slow drift or a constant bias |
 | B3 ZP − 2.5·log10(t_flux / t), common set | rms ≤ 0.015; FWHM slope within ±0.04 mag/px | agreement with an independent calibrated photometry; not seeing independence below the ~0.04–0.06 mag/px spread of the references' own unconverged apertures (3c) |
-| B4 ZP = a + kX (+ s·[after flip], reported), per night | \|k − k_stack\| ≤ 0.02 where ΔX ≥ 0.4: ATR L, and 10-18 after the flip (F7; before it ΔX is 0.07) | the ZP follows real light loss in size; not haze or cloud |
-| B5 no common set: one k per rig, an intercept per night, a flip term where one exists | \|FWHM slope\| ≤ 0.03 mag/px where its error ≤ 0.015 | no seeing term on the vdB and 6.5 nights; not below the error |
+| B4 ZP = a + kX (+ s·[after flip], reported), per night | \|k − k_stack\| ≤ 0.02 where ΔX ≥ 0.4, one pier side at a time (F7): the ATR2600M L common set (LBN 582 10-18) and the Duo's 10-18 after the flip (before it ΔX is 0.07) | the ZP follows real light loss in size; not haze or cloud |
+| B5 no common set: one night at a time, `zp = a + k·X + s·F` (+ a side step on a two-sided night) | \|s\| ≤ 0.03 mag/px where its error ≤ 0.015 | no seeing term on the vdB and 6.5 nights; not below the error |
 | B6 coverage: valid ZPs of the solved, analysed frames | ≥ 90 % per night; 6.5's sets at 6.5's 100 % | the rule works on real frames; not accuracy |
-| B7 median \|fitted − projected\| centre | ≤ 0.25·FWHM_ref | the WCS and the seeding agree; not the flux |
-| B8 mono not worse: seeing slope with airmass | ≤ 0.03 and ≤ \|today\| + 2σ; L and Duo cross-target spreads reported as decision rows (not a STOP) | no regression on the shipped classes |
+| B7 the map stars' median \|fitted − seed\| after the re-seed | ≤ 0.25·FWHM_ref | the solve, its map and the seeding agree; not the flux |
+| B8 mono not worse: seeing slope with airmass, per night as B5 | ≤ 0.03 and ≤ \|today\| + 2σ; L and Duo cross-target spreads reported as decision rows (not a STOP) | no regression on the shipped classes |
 | B9 the Analysis measurement with and without a list | every `StarFit`, `FrameSummary`, `PlaneMeasurement` field bit-identical | no Analysis number moves (rustafits test + probe) |
 
-A bar judged on no night of its class is a STOP (no silent pass); B1 counts pairs where both frames are valid; B3's
-slope is also fitted against the probe's plain 6F aperture on the same list, a miss called only when both agree; B6
-exempts frames with a plane verdict (plan, Review rulings).
+A bar judged on no night of its class is a STOP (no silent pass); B1 counts pairs where both frames are valid; B2–B5 and
+B8 are judged on the reduced ZP (§5.6), per rig and object (the probe's frame set); B3 is judged one pier side at a time
+on a two-sided night (F7), and its slope is also fitted against the same ratio of sums at `6·FWHM_ref` with its pedestal on
+the same members, a miss called only when both agree; B6 exempts frames with a plane verdict (plan, Review rulings).
 
-Reported, not judged: both `c`s; list size and refusals per frame; haze (none in the corpus, largest dip 0.09 mag; a
-cloudy night is owed); under 16 bit, long focal length, high latitude (no data; the faint-edge extension is unjudged).
+Referees (the controller's rulings after F5, `progress.md`; no threshold moved):
+
+- **RR1** — B5 and B8 fit one night at a time, `zp = a + k·X + s·F` jointly; `s` is judged with its error from the joint
+  fit, unjudged above 0.015 as written. Extinction is a night's property (IC 5146 H 10-04: k −0.074 against the rig's
+  −0.114; with the night's own k the slope is −0.0004 ± 0.0032, with the rig's +0.060 ± 0.010). If wrong, a real seeing term
+  hides in k on a night where FWHM tracks airmass: then its error grows, the night is unjudged, and a class judged on no
+  night is a STOP.
+- **RR2** — B4 gets no allowance for the stack's own error (that would move a threshold). A miss inside Δk's own standard
+  error goes to the owner as a stated limit, with its numbers.
+- **RR3** — B3's cross-check stays as written, on a repaired referee: the same sum at `6·FWHM_ref` (the r0 6F referee's
+  aperture outgrew the list's isolation).
+- **RR4** — Phase A again takes an identity pass (B9) and a decimated-list round (every 10th list star by its key: the
+  sparse field no corpus set has; reported, not judged); the list's cost above 70 ms a frame is a STOP; every run goes
+  through the job's memory guard.
+
+Reported, not judged: the budget's reported `c` (the mosaic anchor); list size, map figures, pedestal, window slope (and,
+on every tenth frame, a ±0.1 mag re-measure beside it) and refusals per frame; the decimated round; the cost. Unjudged
+(no data in the corpus): a window move beyond 0.14 mag within a set, the largest the corpus holds (haze; its largest dip
+is 0.09 mag; a cloudy night is owed), where the linear reduction is unverified; a list under ~500 stars (§5.3); under 16
+bit, long focal length, high latitude; the faint-edge extension.
 Acceptance on a catalogue copy (headless web): a solved set analysed stores version-3 ZPs; a set solved after analysis
-fills in by the solve pass; an offline file says "run Analyze"; an existing stack is bit-identical and recomputes no
-cached stage; a low-altitude frame reads its loss; a rig without a reference is not blocked and says why.
+fills in by the solve pass; an offline file says "run Analyze"; a frame refused `poor_solve` says to solve it again; an
+existing stack is bit-identical and recomputes no cached stage; a low-altitude frame reads its loss; a rig without a
+reference is not blocked and says why.
 
 ## 7. Order of work
 
 1. rustafits: §5.2's entry and identity test (PR, `CHANGELOG.md`, no trailer; submodule bump). 2. Core, pure: anchor,
-list, statistic, synthetic tests (a dithered field keeps ≥ 95 % of its list; a loss moves the window by the loss; a
-capped list keeps the same stars). 3. `zp_probe forced` and its verdict. 4. Phase A: GO or STOP. 5. Storage, currency,
-triggers, removals. 6. Loss reasons, gate, the tab's count, the cell. 7. Acceptance. 8. Docs (`docs/catalog/README.md`,
-`CLAUDE.md`'s Transparency line, `docs/logging/`, `open-items.md`, pointers in the 6.5 and OSC specs), final review,
-merge into local `main`; 6.5 and this push together on the owner's word.
+list, statistic, synthetic tests. 3. `zp_probe forced` and its verdict. 4. Phase A: STOP (§4.5). 4a. The model re-audit
+(F5): this amendment. 4b. The plan's G1–G4: the rustafits list entry v2, core pure (map, gate, pedestal, statistic,
+slope, the reduction), the probe and runner, Phase A again: GO or STOP. 5. Storage, currency, triggers, removals. 6. Loss
+reasons and the reduction, gate, the tab's count, the cell. 7. Acceptance. 8. Docs (`docs/catalog/README.md`, `CLAUDE.md`'s
+Transparency line, `docs/logging/`, `open-items.md`, pointers in the 6.5 and OSC specs), final review, merge into local
+`main`; 6.5 and this push together on the owner's word.
 
 ## 8. Owner answers (2026-11-16) and what is still open
 
@@ -220,7 +334,7 @@ merge into local `main`; 6.5 and this push together on the owner's word.
   says its analysis differs from the current one ("run Analyze"), and Analyze re-measures it. Publication does not
   measure: a frame without a current ZP is published with no transparency verdict and is not blocked (as today).
 - **F7 — the 10-18 meridian-flip step** («Без понятия, возьми другие кадры»): its cause is unknown, so it is not a
-  judge of the method. B4 is judged on the ATR2600M L night and on 10-18 one pier side at a time where a side has
+  judge of the method. B4 is judged on the ATR2600M L common set and on 10-18 one pier side at a time where a side has
   ΔX ≥ 0.4; the flip step `s` is reported, not judged.
 - **F8 — dual-band data for the OSC spec's §8 guard** («Squid и некоторые veil снимались с узкой полосой»): the
   ASI2600MC Pro Squid set and part of the Veil sets were shot through a dual-band filter, the rest of that rig without.
