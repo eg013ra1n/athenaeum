@@ -508,14 +508,15 @@ impl Default for ForcedListParams {
     }
 }
 
-/// Why a frame has no forced-list zero point. Every code but `catalogue_unreadable` is stored (an outcome a re-read of
-/// the same file and solve would repeat); `catalogue_unreadable` is a failure of this run and stores nothing.
+/// Why a frame has no forced-list zero point. Every code but `catalogue_unreadable` and `internal` is stored (an outcome
+/// a re-read of the same file and solve would repeat); those two are failures of this run and store nothing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ForcedRefusal {
     /// `EXPTIME` missing, not finite, or not positive.
     NoExposure,
-    /// The anchor (6.5's matcher over the budget fits) found fewer than the needed matches.
-    NoAnchor { matched: u32 },
+    /// The anchor (6.5's matcher over the budget fits) left fewer than the needed survivors of its clipping: `kept` is
+    /// the survivors, what the rule counts (0 when the matcher found none).
+    NoAnchor { kept: u32 },
     /// Fewer than 5 of the list's kept fits qualified for the aperture correction.
     NoApertureCorrection { qualifiers: u32 },
     /// Fewer survivors than the minimum, with the list's size before fitting.
@@ -528,8 +529,13 @@ pub enum ForcedRefusal {
     UnreadableSolve,
     /// The plane has a verdict (trailed, defocused, no stars) that a re-read would repeat; the analysis row carries it.
     FrameVerdict,
-    /// The catalogue could not be read this time; nothing is stored, a later run tries again.
+    /// The catalogue could not be read this time (an error or a panic of the cone); nothing is stored, a later run tries
+    /// again.
     CatalogueUnreadable,
+    /// An invariant between this code and the fitter broke (the request was refused although it was built, the fits do
+    /// not match the list, the composition panicked): a bug, not a verdict on the frame. Logged, nothing is stored, so a
+    /// build that fixes it measures the frame again.
+    Internal,
 }
 
 impl ForcedRefusal {
@@ -545,12 +551,13 @@ impl ForcedRefusal {
             ForcedRefusal::UnreadableSolve => "unreadable_solve",
             ForcedRefusal::FrameVerdict => "frame_verdict",
             ForcedRefusal::CatalogueUnreadable => "catalogue_unreadable",
+            ForcedRefusal::Internal => "internal",
         }
     }
 
     /// Whether the outcome is written to the catalogue (false: a failure of this run, retried later).
     pub fn is_stored(&self) -> bool {
-        !matches!(self, ForcedRefusal::CatalogueUnreadable)
+        !matches!(self, ForcedRefusal::CatalogueUnreadable | ForcedRefusal::Internal)
     }
 }
 
@@ -588,7 +595,8 @@ pub struct Anchor {
 
 /// The anchor: 6.5's `measure_zero_point` over the budget's fits (their fluxes times `reported_c` on a mosaic, times 1
 /// when the mosaic reported none or the plane is mono), valid from `anchor_min_matches` survivors with no standard-error
-/// limit. Fewer survivors: `NoAnchor`; no exposure: `NoExposure`.
+/// limit. Fewer survivors: `NoAnchor { kept }` (the survivors after the clip, what the rule counts); no exposure:
+/// `NoExposure`.
 #[allow(clippy::too_many_arguments)]
 pub fn anchor_zero_point(
     stars: &[StarMetric],
@@ -619,8 +627,8 @@ pub fn anchor_zero_point(
     match m.result {
         Ok(z) => Ok(Anchor { zero_point: z.zero_point, stars: z.stars, matched: m.matched }),
         Err(ZpRefusal::NoExposure) => Err(ForcedRefusal::NoExposure),
-        Err(ZpRefusal::TooFewStars { matched, .. } | ZpRefusal::TooScattered { kept: matched, .. }) => {
-            Err(ForcedRefusal::NoAnchor { matched })
+        Err(ZpRefusal::TooFewStars { kept, .. } | ZpRefusal::TooScattered { kept, .. }) => {
+            Err(ForcedRefusal::NoAnchor { kept })
         }
     }
 }
@@ -693,7 +701,7 @@ pub fn forced_list(input: &ForcedListInput, params: &ForcedListParams) -> Result
     let fwhm_ref = fwhm_ref_px(scale, params);
     let g_b = window(input.anchor, fwhm_ref, input.full_scale, input.exptime_s, params);
     if !(g_b.is_finite() && fwhm_ref.is_finite()) {
-        return Err(ForcedRefusal::NoAnchor { matched: 0 });
+        return Err(ForcedRefusal::NoAnchor { kept: 0 });
     }
 
     // The cone in pixels (non-finite skipped, as `measure_zero_point` does), with each star's sky record.
@@ -858,12 +866,13 @@ pub fn forced_zero_point(
         );
     }
     if measured.fits.len() != list.stars.len() {
-        tracing::error!(
+        // An invariant of the fitter's answer, not a frame's verdict: nothing is stored (a fixed build measures again).
+        tracing::warn!(
             list = list.stars.len(),
             fits = measured.fits.len(),
             "forced list and its fits differ in length"
         );
-        return base(Err(ForcedRefusal::TooFewStars { list: list_stars, kept: 0 }), 0, Vec::new());
+        return base(Err(ForcedRefusal::Internal), 0, Vec::new());
     }
     let mut used: Vec<(usize, f64)> = Vec::new();
     for (i, (star, fit)) in list.stars.iter().zip(&measured.fits).enumerate() {
@@ -2433,7 +2442,7 @@ mod forced_tests {
         // A change of the hash or of the record's bytes changes every stored list: bump on purpose only.
         assert_eq!(cap_key(15.123, 150.5, 20.25), PINNED_KEY);
         // Rounding: a position within 0.4 arcsec of the same record gives the same key.
-        assert_eq!(cap_key(15.123, 150.5 + 0.0001 / 3600.0, 20.25), PINNED_KEY);
+        assert_eq!(cap_key(15.123, 150.5 + 0.4 / 3600.0, 20.25), PINNED_KEY);
     }
     const PINNED_KEY: u64 = 7_866_977_722_513_562_110;
 
@@ -2572,21 +2581,21 @@ mod forced_tests {
             let cat = grid_catalogue(&wcs, &gs);
             forced_list(&input(&cat, &wcs, w, h), &params()).unwrap()
         };
-        // (a) 100 stars spread over G_b..G_b + 6: fewer than 200, the edge goes to 4.5 and no deeper.
-        let sparse: Vec<f64> = (0..120).map(|i| gb + 6.0 * i as f64 / 119.0).collect();
+        // (a) 120 stars spread over G_b..G_b + 6: fewer than 200, the edge goes to 4.5 and no deeper.
+        let sparse: Vec<f64> = (0..120).map(|i| gb + 0.001 + 5.99 * i as f64 / 119.0).collect();
         let l = edge(sparse);
         assert!((l.window_faint - (gb + 4.5)).abs() < 1e-9, "{}", l.window_faint);
         assert!(l.stars.iter().all(|s| f64::from(s.g_mag) <= gb + 4.5 + 1e-6));
         assert!(l.stars.iter().any(|s| f64::from(s.g_mag) > gb + 3.5), "the deepening admitted fainter stars");
         // (b) 250 stars within G_b + 3 and some beyond: the edge stays at 3.
         let dense: Vec<f64> =
-            (0..250).map(|i| gb + 2.99 * i as f64 / 249.0).chain((0..50).map(|i| gb + 3.1 + 0.02 * i as f64)).collect();
+            (0..250).map(|i| gb + 0.001 + 2.98 * i as f64 / 249.0).chain((0..50).map(|i| gb + 3.1 + 0.02 * i as f64)).collect();
         let l = edge(dense);
         assert!((l.window_faint - (gb + 3.0)).abs() < 1e-9, "{}", l.window_faint);
         assert_eq!(l.stars.len(), 250);
         // (c) 150 within G_b + 3 and 200 more up to G_b + 4.4: the edge is the 200th brightest's G.
         let mid: Vec<f64> =
-            (0..150).map(|i| gb + 2.99 * i as f64 / 149.0).chain((0..200).map(|i| gb + 3.01 + 1.39 * i as f64 / 199.0)).collect();
+            (0..150).map(|i| gb + 0.001 + 2.98 * i as f64 / 149.0).chain((0..200).map(|i| gb + 3.01 + 1.39 * i as f64 / 199.0)).collect();
         let l = edge(mid);
         let g200 = gb + 3.01 + 1.39 * 49.0 / 199.0;
         assert!((l.window_faint - g200).abs() < 1e-5, "{} vs {g200}", l.window_faint);
@@ -2614,13 +2623,48 @@ mod forced_tests {
             let r = anchor_zero_point(&stars, None, &wcs, &cat, Some(EXPTIME), 1000, 1000, 3.0, &params());
             match (ok, r) {
                 (true, Ok(a)) => assert!((a.zero_point - ANCHOR).abs() < 1e-9 && a.matched == 10, "{a:?}"),
-                (false, Err(ForcedRefusal::NoAnchor { matched: 9 })) => {}
+                (false, Err(ForcedRefusal::NoAnchor { kept: 9 })) => {}
                 (_, other) => panic!("{n} stars: {other:?}"),
             }
         }
         let (wcs, stars, cat) = rich_field(60, ANCHOR, 1.0);
         let r = anchor_zero_point(&stars, None, &wcs, &cat, None, 1000, 1000, 3.0, &params());
         assert_eq!(r, Err(ForcedRefusal::NoExposure));
+    }
+
+    #[test]
+    fn no_anchor_reports_the_survivors_of_the_clip_not_the_matches() {
+        // 12 stars: the brightest is dropped, 11 are matched; five of them read three magnitudes faint, so the 4 sigma
+        // clip leaves six: the rule (at least ten survivors) refuses, and the refusal says six, not eleven.
+        let (wcs, mut stars, cat) = rich_field(12, ANCHOR, 1.0);
+        for s in &mut stars[6..11] {
+            s.flux *= 10f64.powf(-1.2);
+        }
+        let m = measure_zero_point(
+            &ZpInput {
+                stars: &stars,
+                wcs: &wcs,
+                catalog: &cat,
+                exptime_s: Some(EXPTIME),
+                width: 1000,
+                height: 1000,
+                median_fwhm_px: 3.0,
+            },
+            &ZpParams { min_stars: 1, max_std_error_mag: f64::INFINITY, ..ZpParams::default() },
+        );
+        assert_eq!(m.matched, 11, "premise: eleven matches");
+        let r = anchor_zero_point(&stars, None, &wcs, &cat, Some(EXPTIME), 1000, 1000, 3.0, &params());
+        assert_eq!(r, Err(ForcedRefusal::NoAnchor { kept: 6 }));
+    }
+
+    #[test]
+    fn a_fits_length_mismatch_is_internal_and_not_stored() {
+        let (list, mut m) = fitted(300, 21.8, 0.05, 300, Some(1.2));
+        m.fits.pop();
+        let o = forced_zero_point(&list, &m, EXPTIME, &params());
+        assert_eq!(o.result, Err(ForcedRefusal::Internal));
+        assert!(!ForcedRefusal::Internal.is_stored());
+        assert_ne!(o.result.unwrap_err().code(), "too_few_stars");
     }
 
     #[test]
@@ -2716,7 +2760,7 @@ mod forced_tests {
     fn the_refusal_codes_are_stable_and_one_is_not_stored() {
         let all = [
             (ForcedRefusal::NoExposure, "no_exposure"),
-            (ForcedRefusal::NoAnchor { matched: 3 }, "no_anchor"),
+            (ForcedRefusal::NoAnchor { kept: 3 }, "no_anchor"),
             (ForcedRefusal::NoApertureCorrection { qualifiers: 1 }, "no_aperture_correction"),
             (ForcedRefusal::TooFewStars { list: 1, kept: 1 }, "too_few_stars"),
             (ForcedRefusal::TooScattered { std_error: 1.0, kept: 1, sigma: 1.0 }, "too_scattered"),
@@ -2724,10 +2768,11 @@ mod forced_tests {
             (ForcedRefusal::UnreadableSolve, "unreadable_solve"),
             (ForcedRefusal::FrameVerdict, "frame_verdict"),
             (ForcedRefusal::CatalogueUnreadable, "catalogue_unreadable"),
+            (ForcedRefusal::Internal, "internal"),
         ];
         for (r, code) in all {
             assert_eq!(r.code(), code);
-            assert_eq!(r.is_stored(), code != "catalogue_unreadable", "{code}");
+            assert_eq!(r.is_stored(), !["catalogue_unreadable", "internal"].contains(&code), "{code}");
         }
     }
 

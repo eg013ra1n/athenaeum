@@ -16,7 +16,8 @@
 //! zp_probe bigap   --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> --object <s> \
 //!                  [--night <label>] [--every <n>] --out <frames.tsv> --stars-out <stars.tsv>
 //! zp_probe forced  --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> --object <s> \
-//!                  --out <x.tsv> [--limit <n>] [--identity-every <n>] [--<ZpParams field> <v>]...
+//!                  --out <x.tsv> [--limit <n>] [--identity-every <n>] [--<ForcedListParams field> <v>]... \
+//!                  [--<ZpParams field> <v>]...
 //! zp_probe verdict --forced [--common <tsv>] <x.tsv>...
 //! ```
 //!
@@ -41,7 +42,11 @@
 //! judges the bars B1-B9 of the forced-list spec (section 6, with the plan's review rulings): every night of at least 30
 //! measured frames, pairs under 15 minutes apart, one line per bar and a last line GO or STOP. A bar judged on no night
 //! of its class is a STOP. The pier side of a frame is read from the solve's field rotation against the night's first
-//! frame (more than 90 degrees mod 360 is the other side).
+//! frame (more than 90 degrees mod 360 is the other side). `--<field> <v>` on `forced` is any `ForcedListParams` field in
+//! snake_case (`--cap 800`, `--window_bright_margin_mag 1.0`, ...) so a tuning round needs no rebuild; `min_stars`,
+//! `clip_sigma` and `max_std_error_mag` are also `ZpParams` fields and a value given for one of them sets both (today's
+//! zero point is judged by the same rule as the forced one). The parameters actually used, and the flags that moved
+//! them, are echoed on stderr and written to `<x>.flags.txt` beside the TSV (the TSV's first line stays its header).
 //!
 //! `stars` writes one row per matched star with the flags and numbers the star
 //! fit itself carried (`saturated`, `extended`, `flags`, `peak`, `background`,
@@ -207,6 +212,73 @@ impl Args {
                 .take_parsed("blend_radius_fwhm")?
                 .unwrap_or(d.blend_radius_fwhm),
             blend_dmag: self.take_parsed("blend_dmag")?.unwrap_or(d.blend_dmag),
+        })
+    }
+
+    /// Like [`Args::take_parsed`], but the flag stays for the next reader (a name `ForcedListParams` and `ZpParams` share).
+    fn peek_parsed<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>> {
+        match self.flags.get(name) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<T>()
+                .map(Some)
+                .map_err(|_| anyhow!("--{name}: cannot read {v:?}")),
+        }
+    }
+
+    /// The `ForcedListParams` of the command line, each field defaulting to `ForcedListParams::default()`. A name
+    /// `ZpParams` has too (`min_stars`, `clip_sigma`, `max_std_error_mag`) is read without being taken: call this BEFORE
+    /// [`Args::zp_params`], which takes it, so one value sets both.
+    fn forced_list_params(&mut self) -> Result<ForcedListParams> {
+        let d = ForcedListParams::default();
+        Ok(ForcedListParams {
+            fwhm_floor_px: self.take_parsed("fwhm_floor_px")?.unwrap_or(d.fwhm_floor_px),
+            fwhm_ref_arcsec: self.take_parsed("fwhm_ref_arcsec")?.unwrap_or(d.fwhm_ref_arcsec),
+            anchor_min_matches: self
+                .take_parsed("anchor_min_matches")?
+                .unwrap_or(d.anchor_min_matches),
+            window_peak_fraction: self
+                .take_parsed("window_peak_fraction")?
+                .unwrap_or(d.window_peak_fraction),
+            window_bright_margin_mag: self
+                .take_parsed("window_bright_margin_mag")?
+                .unwrap_or(d.window_bright_margin_mag),
+            window_faint_width_mag: self
+                .take_parsed("window_faint_width_mag")?
+                .unwrap_or(d.window_faint_width_mag),
+            window_faint_max_mag: self
+                .take_parsed("window_faint_max_mag")?
+                .unwrap_or(d.window_faint_max_mag),
+            min_isolated: self.take_parsed("min_isolated")?.unwrap_or(d.min_isolated),
+            region_fraction: self
+                .take_parsed("region_fraction")?
+                .unwrap_or(d.region_fraction),
+            edge_margin_fwhm: self
+                .take_parsed("edge_margin_fwhm")?
+                .unwrap_or(d.edge_margin_fwhm),
+            isolation_dmag: self
+                .take_parsed("isolation_dmag")?
+                .unwrap_or(d.isolation_dmag),
+            isolation_radius_fwhm: self
+                .take_parsed("isolation_radius_fwhm")?
+                .unwrap_or(d.isolation_radius_fwhm),
+            bright_dmag: self.take_parsed("bright_dmag")?.unwrap_or(d.bright_dmag),
+            bright_radius_fwhm: self
+                .take_parsed("bright_radius_fwhm")?
+                .unwrap_or(d.bright_radius_fwhm),
+            cap: self.take_parsed("cap")?.unwrap_or(d.cap),
+            centre_tolerance_px: self
+                .take_parsed("centre_tolerance_px")?
+                .unwrap_or(d.centre_tolerance_px),
+            centre_tolerance_fwhm: self
+                .take_parsed("centre_tolerance_fwhm")?
+                .unwrap_or(d.centre_tolerance_fwhm),
+            c_stars: self.take_parsed("c_stars")?.unwrap_or(d.c_stars),
+            clip_sigma: self.peek_parsed("clip_sigma")?.unwrap_or(d.clip_sigma),
+            min_stars: self.peek_parsed("min_stars")?.unwrap_or(d.min_stars),
+            max_std_error_mag: self
+                .peek_parsed("max_std_error_mag")?
+                .unwrap_or(d.max_std_error_mag),
         })
     }
 
@@ -3340,7 +3412,7 @@ fn forced_frame(
         Err(r) => {
             row.refusal = r.code().to_string();
             match r {
-                ForcedRefusal::NoAnchor { matched } => row.anchor_stars = Some(i64::from(*matched)),
+                ForcedRefusal::NoAnchor { kept } => row.anchor_stars = Some(i64::from(*kept)),
                 ForcedRefusal::TooFewStars { kept, .. } => row.zp_stars = Some(i64::from(*kept)),
                 ForcedRefusal::TooScattered {
                     std_error,
@@ -3438,6 +3510,44 @@ fn stars_path(out: &str) -> String {
     format!("{}.stars.tsv", out.strip_suffix(".tsv").unwrap_or(out))
 }
 
+/// The text of `<x>.flags.txt`: the command line's flags (sorted) and every parameter the run used, in full, so a tuning
+/// round can be read back without its shell history.
+fn forced_flags_text(given: &[(String, String)], fp: &ForcedListParams, zp: &ZpParams) -> String {
+    let mut text = String::from("# zp_probe forced: the parameters of this run\n");
+    if given.is_empty() {
+        text.push_str("flags: none (every parameter at its default)\n");
+    } else {
+        for (name, value) in given {
+            text.push_str(&format!("flag --{name} {value}\n"));
+        }
+    }
+    text.push_str(&format!("ForcedListParams {fp:?}\n"));
+    text.push_str(&format!("ZpParams {zp:?}\n"));
+    text
+}
+
+/// `<x>.flags.txt` for `<x>.tsv`.
+fn flags_path(out: &str) -> String {
+    format!("{}.flags.txt", out.strip_suffix(".tsv").unwrap_or(out))
+}
+
+/// What is left of `forced`'s command line once its structural flags are taken: the `ForcedListParams`, the `ZpParams`
+/// and the parameter flags as given (sorted by name). A flag that is neither is an error.
+fn take_forced_params(
+    args: &mut Args,
+) -> Result<(ForcedListParams, ZpParams, Vec<(String, String)>)> {
+    let mut given: Vec<(String, String)> = args
+        .flags
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    given.sort();
+    let fp = args.forced_list_params()?;
+    let zp = args.zp_params()?;
+    args.finish()?;
+    Ok((fp, zp, given))
+}
+
 fn cmd_forced(mut args: Args) -> Result<()> {
     let db = args.require("db")?;
     let app_data = args.require("app-data")?;
@@ -3449,17 +3559,19 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     let identity_every: usize = args
         .take_parsed("identity-every")?
         .unwrap_or(IDENTITY_EVERY_DEFAULT);
-    let params = args.zp_params()?;
-    args.finish()?;
+    let (fp, params, given) = take_forced_params(&mut args)?;
 
     let conn = open_read_only(&db)?;
     let rig = open_rig(&conn, &app_data, params)?;
-    let fp = ForcedListParams::default();
     let candidates = load_candidates(&conn, &instrume, &object, &filter)?;
     eprintln!(
         "zp_probe forced: {} lights of {instrume} / {object} / {filter} in the catalogue; list params {fp:?}",
         candidates.len()
     );
+    let flags_text = forced_flags_text(&given, &fp, &params);
+    eprint!("{flags_text}");
+    std::fs::write(flags_path(&out), &flags_text)
+        .with_context(|| format!("writing {}", flags_path(&out)))?;
     let mut w = create_out(&out)?;
     writeln!(w, "{FORCED_HEADER}")?;
     let mut ws = create_out(&stars_path(&out))?;
@@ -4645,6 +4757,98 @@ mod tests {
     use super::*;
 
     const T0: i64 = 1_760_000_000;
+
+    fn parsed(argv: &[&str]) -> Result<(ForcedListParams, ZpParams, Vec<(String, String)>)> {
+        let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        take_forced_params(&mut Args::parse(&argv)?)
+    }
+
+    #[test]
+    fn a_forced_flag_reaches_the_list_params() {
+        let d = ForcedListParams::default();
+        let (fp, zp, given) = parsed(&[
+            "--cap",
+            "800",
+            "--window_bright_margin_mag",
+            "1.25",
+            "--c_stars",
+            "128",
+            "--min_stars",
+            "40",
+            "--central_fraction",
+            "0.8",
+        ])
+        .unwrap();
+        assert_eq!((fp.cap, fp.c_stars, fp.window_bright_margin_mag), (800, 128, 1.25));
+        // Everything not named keeps its default.
+        assert_eq!(
+            ForcedListParams {
+                cap: d.cap,
+                c_stars: d.c_stars,
+                window_bright_margin_mag: d.window_bright_margin_mag,
+                min_stars: d.min_stars,
+                ..fp
+            },
+            d
+        );
+        // A name both parameter sets have sets both; a ZpParams-only name reaches ZpParams only.
+        assert_eq!((fp.min_stars, zp.min_stars), (40, 40));
+        assert_eq!(zp.central_fraction, 0.8);
+        assert_eq!(fp.clip_sigma, d.clip_sigma);
+        // The echo carries the flags as given and the parameters used.
+        let text = forced_flags_text(&given, &fp, &zp);
+        assert!(text.contains("flag --cap 800") && text.contains("cap: 800"), "{text}");
+        assert!(text.contains("flag --min_stars 40") && text.contains("min_stars: 40"), "{text}");
+        let (fp0, zp0, none) = parsed(&[]).unwrap();
+        assert_eq!((fp0, zp0.min_stars), (d, ZpParams::default().min_stars));
+        assert!(forced_flags_text(&none, &fp0, &zp0).contains("flags: none"));
+    }
+
+    #[test]
+    fn every_forced_list_field_has_a_flag() {
+        // A field added to `ForcedListParams` without a flag fails to compile in `forced_list_params`; this checks each
+        // flag is wired to its own field (a value no default has reaches only that field).
+        let d = ForcedListParams::default();
+        let flags: [(&str, fn(&ForcedListParams) -> f64); 21] = [
+            ("fwhm_floor_px", |p| p.fwhm_floor_px),
+            ("fwhm_ref_arcsec", |p| p.fwhm_ref_arcsec),
+            ("anchor_min_matches", |p| p.anchor_min_matches as f64),
+            ("window_peak_fraction", |p| p.window_peak_fraction),
+            ("window_bright_margin_mag", |p| p.window_bright_margin_mag),
+            ("window_faint_width_mag", |p| p.window_faint_width_mag),
+            ("window_faint_max_mag", |p| p.window_faint_max_mag),
+            ("min_isolated", |p| p.min_isolated as f64),
+            ("region_fraction", |p| p.region_fraction),
+            ("edge_margin_fwhm", |p| p.edge_margin_fwhm),
+            ("isolation_dmag", |p| p.isolation_dmag),
+            ("isolation_radius_fwhm", |p| p.isolation_radius_fwhm),
+            ("bright_dmag", |p| p.bright_dmag),
+            ("bright_radius_fwhm", |p| p.bright_radius_fwhm),
+            ("cap", |p| p.cap as f64),
+            ("centre_tolerance_px", |p| p.centre_tolerance_px),
+            ("centre_tolerance_fwhm", |p| p.centre_tolerance_fwhm),
+            ("c_stars", |p| p.c_stars as f64),
+            ("clip_sigma", |p| p.clip_sigma),
+            ("min_stars", |p| p.min_stars as f64),
+            ("max_std_error_mag", |p| p.max_std_error_mag),
+        ];
+        for (name, read) in flags {
+            let (fp, _, _) = parsed(&[&format!("--{name}"), "7"]).unwrap();
+            assert_eq!(read(&fp), 7.0, "--{name}");
+            assert_ne!(read(&d), 7.0, "--{name}: pick a probe value that is not the default");
+            assert_ne!(fp, d, "--{name} changed nothing");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_unreadable_forced_flag_is_an_error() {
+        let e = parsed(&["--capp", "800"]).unwrap_err().to_string();
+        assert!(e.contains("unknown flag --capp"), "{e}");
+        let e = parsed(&["--cap", "many"]).unwrap_err().to_string();
+        assert!(e.contains("--cap") && e.contains("cannot read"), "{e}");
+        // A typo beside a good flag is still refused (nothing runs with a default in its place).
+        assert!(parsed(&["--cap", "800", "--window_bright_margin", "1"]).is_err());
+    }
 
     fn iso(t_s: i64) -> String {
         DateTime::from_timestamp(t_s, 0).unwrap().to_rfc3339()
