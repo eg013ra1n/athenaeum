@@ -74,14 +74,16 @@ use athenaeum_core::analysis::analyzer::{
 };
 use athenaeum_core::analysis::config::{load_config, AnalysisConfig};
 use athenaeum_core::analysis::zero_point::{
-    catalog_for_frame, measure_zero_point, ForcedListParams, ForcedRefusal, ForcedStar, ZpInput,
-    ZpMeasurement, ZpParams, ZpRefusal,
+    catalog_for_frame, forced_zero_point, measure_zero_point, ForcedList, ForcedListParams,
+    ForcedRefusal, ForcedStar, ZpInput, ZpMeasurement, ZpParams, ZpRefusal,
 };
 use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::hints::observation_epoch;
 use athenaeum_core::plate_solve::open_catalog_layers;
 use athenaeum_core::plate_solve::storage::get_plate_solve;
-use athenaeum_core::star_measure::analysis_mode::{FrameOptions, FrameSummary, ListFit};
+use athenaeum_core::star_measure::analysis_mode::{
+    measure_raw_frame_and_list, FrameOptions, FrameSummary, ListFit, ListMeasurement,
+};
 use athenaeum_core::star_measure::raw::{read_raw_frame, RawPlanes};
 use athenaeum_core::star_measure::{PlaneMeasurement, StarFit};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
@@ -3232,6 +3234,250 @@ fn six_f_zero_point(
     clip_median(&zps, 4.0, BIG6_MIN_STARS)
 }
 
+
+// ---- F5 emulation modes: the list re-seeded through a map of its own fits, and plain aperture sums per list star ----
+
+/// The emulation switches of `forced` (design round F5; none of them is the shipping composition).
+#[derive(Debug, Clone, Copy, Default)]
+struct Emulation {
+    /// Re-seed the list this many times: a quadratic map of fitted - projected centres over the accepted fits, the
+    /// positions moved by it, the list fitted again. The row and the stars TSV then carry the last pass.
+    reseed: usize,
+    /// Write `<x>.ap.tsv`: per accepted list star, aperture sums at radii tied to the frame's FWHM and to `FWHM_ref`.
+    dump_ap: bool,
+}
+
+/// Aperture radii of the dump in units of the frame's median FWHM, then in units of `FWHM_ref`.
+const AP_RADII_FWHM: [f64; 5] = [1.5, 2.0, 2.5, 3.0, 4.0];
+const AP_RADII_REF: [f64; 5] = [1.5, 2.0, 3.0, 4.0, 6.0];
+/// The dump's sky annulus: its area (px), and its gap outside max(4 F, 6 FWHM_ref).
+const AP_ANNULUS_AREA_PX: f64 = 2000.0;
+const AP_ANNULUS_GAP_PX: f64 = 2.0;
+/// A fit within this many `FWHM_ref` of its position is a member of the re-seeding map (the list is isolated to 4).
+const MAP_RADIUS_FWHM: f64 = 2.0;
+const MAP_MIN_MEMBERS: usize = 30;
+
+const AP_HEADER: &str = "frame_id\tkey\tg\tx0\ty0\txs\tys\txf\tyf\tmodel_flux\tsnr\tsat\taccepted\tkept\tnn4\tnn6\tsky\tsky_sd\tpeak\tf15\tf20\tf25\tf30\tf40\tr15\tr20\tr30\tr40\tr60\tcf30\tcr30";
+const G_HEADER: &str = "frame_id\treseeds\tmap_members\toff_before\tres_after\tmap_corner_max\taccepted_p1\tkept_p1\tzp_p1\tcentre_p1\trefused";
+
+/// A quadratic map `(dx, dy)(x, y)` in coordinates normalised to the frame.
+struct QuadMap {
+    cx: f64,
+    cy: f64,
+    half: f64,
+    ax: Vec<f64>,
+    ay: Vec<f64>,
+    members: usize,
+    /// Median |fitted - projected| of the members, and median |residual| after the map.
+    off_before: f64,
+    res_after: f64,
+}
+
+impl QuadMap {
+    fn basis(&self, x: f64, y: f64) -> Vec<f64> {
+        let (u, v) = ((x - self.cx) / self.half, (y - self.cy) / self.half);
+        vec![1.0, u, v, u * u, u * v, v * v]
+    }
+    fn eval(&self, x: f64, y: f64) -> (f64, f64) {
+        let b = self.basis(x, y);
+        (
+            b.iter().zip(&self.ax).map(|(p, q)| p * q).sum(),
+            b.iter().zip(&self.ay).map(|(p, q)| p * q).sum(),
+        )
+    }
+}
+
+/// The map of a list's fits: over the accepted, unsaturated fits within `radius` px of their positions (SNR >= 10 where
+/// one is known), a full quadratic in x and y for each axis, three rounds of clipping at 3 robust sigmas.
+fn quad_map(list: &ForcedList, m: &ListMeasurement, (w, h): (usize, usize), radius: f64) -> Option<QuadMap> {
+    let mut map = QuadMap {
+        cx: (w as f64 - 1.0) / 2.0,
+        cy: (h as f64 - 1.0) / 2.0,
+        half: 0.5 * (w as f64).hypot(h as f64),
+        ax: vec![0.0; 6],
+        ay: vec![0.0; 6],
+        members: 0,
+        off_before: f64::NAN,
+        res_after: f64::NAN,
+    };
+    let mut pts: Vec<(f64, f64, f64, f64)> = list
+        .stars
+        .iter()
+        .zip(&m.fits)
+        .filter(|(_, f)| {
+            f.accepted
+                && !f.flags.saturated()
+                && f.centre_offset_px.is_finite()
+                && f.centre_offset_px <= radius
+                && !(f.snr.is_finite() && f.snr < 10.0)
+        })
+        .map(|(s, f)| (s.x, s.y, f.x - s.x, f.y - s.y))
+        .collect();
+    if pts.len() < MAP_MIN_MEMBERS {
+        return None;
+    }
+    let mut before: Vec<f64> = pts.iter().map(|p| p.2.hypot(p.3)).collect();
+    map.off_before = median(&mut before)?;
+    for round in 0..4 {
+        let rows: Vec<Vec<f64>> = pts.iter().map(|p| map.basis(p.0, p.1)).collect();
+        let dx: Vec<f64> = pts.iter().map(|p| p.2).collect();
+        let dy: Vec<f64> = pts.iter().map(|p| p.3).collect();
+        map.ax = least_squares(&rows, &dx)?.0;
+        map.ay = least_squares(&rows, &dy)?.0;
+        let res: Vec<f64> = pts
+            .iter()
+            .map(|p| {
+                let (ex, ey) = map.eval(p.0, p.1);
+                (p.2 - ex).hypot(p.3 - ey)
+            })
+            .collect();
+        let med = median(&mut res.clone())?;
+        map.res_after = med;
+        map.members = pts.len();
+        if round == 3 {
+            break;
+        }
+        let limit = (3.0 * 1.4826 * med).max(0.15);
+        let kept: Vec<(f64, f64, f64, f64)> = pts
+            .iter()
+            .zip(&res)
+            .filter(|(_, r)| **r <= limit)
+            .map(|(p, _)| *p)
+            .collect();
+        if kept.len() == pts.len() || kept.len() < MAP_MIN_MEMBERS {
+            break;
+        }
+        pts = kept;
+    }
+    Some(map)
+}
+
+/// The share of pixel (px, py) inside the circle of radius `r` about (x, y): 1 or 0 away from the edge, a 4 x 4
+/// sub-sample on it.
+fn disc_share(px: f64, py: f64, x: f64, y: f64, r: f64) -> f64 {
+    let d = (px - x).hypot(py - y);
+    if d <= r - 0.75 {
+        return 1.0;
+    }
+    if d >= r + 0.75 {
+        return 0.0;
+    }
+    let mut inside = 0;
+    for i in 0..4 {
+        for j in 0..4 {
+            let sx = px - 0.375 + 0.25 * i as f64;
+            let sy = py - 0.375 + 0.25 * j as f64;
+            if (sx - x).hypot(sy - y) <= r {
+                inside += 1;
+            }
+        }
+    }
+    f64::from(inside) / 16.0
+}
+
+/// Plain aperture sums of one star: per radius the sky-subtracted sum over the plane's own sites (a mosaic's green
+/// sites, each phase less its own annulus median), scaled by the disc's area over the area of the sites read, so a
+/// mosaic and a mono plane report the same quantity. Also the sky and the annulus scatter. `None` off the frame.
+fn ap_fluxes(
+    plane: &[f32],
+    pattern: astroimage::BayerPattern,
+    (w, h): (usize, usize),
+    (x, y): (f64, f64),
+    radii: &[f64],
+    r_in: f64,
+) -> Option<(Vec<f64>, f64, f64)> {
+    let r_out = (r_in * r_in + AP_ANNULUS_AREA_PX / std::f64::consts::PI).sqrt();
+    let (x0, x1) = ((x - r_out).floor(), (x + r_out).ceil());
+    let (y0, y1) = ((y - r_out).floor(), (y + r_out).ceil());
+    if !(x.is_finite() && y.is_finite()) || x0 < 0.0 || y0 < 0.0 || x1 > (w - 1) as f64 || y1 > (h - 1) as f64 {
+        return None;
+    }
+    let mono = matches!(pattern, astroimage::BayerPattern::None);
+    let phase_of = |px: usize, py: usize| if mono { 0 } else { (py & 1) * 2 + (px & 1) };
+    let green = |px: usize, py: usize| mono || cfa_colour(pattern, px, py) == 1;
+    let mut sky: [Vec<f64>; 4] = Default::default();
+    let r_max = radii.iter().cloned().fold(0.0, f64::max);
+    let mut inner: Vec<(f64, f64, usize, f64, bool)> = Vec::new();
+    for py in y0 as usize..=y1 as usize {
+        for px in x0 as usize..=x1 as usize {
+            let d = (px as f64 - x).hypot(py as f64 - y);
+            let v = f64::from(plane[py * w + px]);
+            if !v.is_finite() {
+                continue;
+            }
+            if d >= r_in && d <= r_out {
+                if green(px, py) {
+                    sky[phase_of(px, py)].push(v);
+                }
+            } else if d <= r_max + 0.75 {
+                inner.push((px as f64, py as f64, phase_of(px, py), v, green(px, py)));
+            }
+        }
+    }
+    let mut med = [f64::NAN; 4];
+    let mut dev: Vec<f64> = Vec::new();
+    for (p, s) in sky.iter_mut().enumerate() {
+        if s.is_empty() {
+            continue;
+        }
+        med[p] = grouped_median(s);
+        dev.extend(s.iter().map(|v| (v - med[p]).abs()));
+    }
+    let sd = median(&mut dev)? * 1.4826;
+    let used: Vec<f64> = med.iter().copied().filter(|m| m.is_finite()).collect();
+    if used.is_empty() {
+        return None;
+    }
+    let sky_level = used.iter().sum::<f64>() / used.len() as f64;
+    let mut out = Vec::with_capacity(radii.len());
+    for &r in radii {
+        let (mut sum, mut wg, mut wa) = (0.0, 0.0, 0.0);
+        for &(px, py, phase, v, is_green) in &inner {
+            let share = disc_share(px, py, x, y, r);
+            if share == 0.0 {
+                continue;
+            }
+            wa += share;
+            if is_green && med[phase].is_finite() {
+                sum += share * (v - med[phase]);
+                wg += share;
+            }
+        }
+        out.push(if wg > 0.0 { sum * wa / wg } else { f64::NAN });
+    }
+    Some((out, sky_level, sd))
+}
+
+/// Per list position, the distance (px) to the nearest catalogue star no more than 4 and 6 mag fainter than it (the
+/// star itself left out); 99 when none lies within 40 px.
+fn neighbour_distances(cat: &[(f64, f64, f32)], stars: &[(f64, f64, f32)]) -> Vec<(f64, f64)> {
+    let mut sorted: Vec<(f64, f64, f32)> = cat.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    stars
+        .iter()
+        .map(|&(x, y, g)| {
+            let lo = sorted.partition_point(|c| c.0 < x - 40.0);
+            let (mut n4, mut n6) = (99.0f64, 99.0f64);
+            for c in &sorted[lo..] {
+                if c.0 > x + 40.0 {
+                    break;
+                }
+                let d = (c.0 - x).hypot(c.1 - y);
+                if d < 0.3 && (c.2 - g).abs() < 0.005 {
+                    continue;
+                }
+                if c.2 <= g + 4.0 {
+                    n4 = n4.min(d);
+                }
+                if c.2 <= g + 6.0 {
+                    n6 = n6.min(d);
+                }
+            }
+            (n4, n6)
+        })
+        .collect()
+}
+
 /// One list star's row of the stars TSV.
 fn forced_star_line(
     frame_id: i64,
@@ -3277,7 +3523,8 @@ fn forced_frame(
     fp: &ForcedListParams,
     c: &Candidate,
     identity: bool,
-) -> (ForcedRow, Vec<String>) {
+    emul: Emulation,
+) -> (ForcedRow, Vec<String>, Option<String>, Vec<String>) {
     let mut row = forced_base_row(c);
     let fail = |row: &mut ForcedRow, code: &str, detail: &dyn std::fmt::Display| {
         eprintln!("zp_probe: frame {} refused {code}: {detail}", c.frame_id);
@@ -3287,23 +3534,23 @@ fn forced_frame(
         Ok(Some(r)) => r,
         Ok(None) => {
             fail(&mut row, "no_solve", &"no stored solve");
-            return (row, Vec::new());
+            return (row, Vec::new(), None, Vec::new());
         }
         Err(e) => {
             fail(&mut row, "bad_wcs", &e);
-            return (row, Vec::new());
+            return (row, Vec::new(), None, Vec::new());
         }
     };
     row.rotation_deg = Some(rec.field_rotation_deg).filter(|r| r.is_finite());
     let Some(wcs) = rec.to_solution() else {
         fail(&mut row, "bad_wcs", &"the stored SIP tables are unusable");
-        return (row, Vec::new());
+        return (row, Vec::new(), None, Vec::new());
     };
     let mut frame = match read_raw_frame(Path::new(&c.path)) {
         Ok(f) => f,
         Err(e) => {
             fail(&mut row, "analysis_failed", &e);
-            return (row, Vec::new());
+            return (row, Vec::new(), None, Vec::new());
         }
     };
     frame.drop_unmeasured_planes();
@@ -3336,10 +3583,79 @@ fn forced_frame(
         |w, wd, ht, region, ep| catalog_for_frame(&layers, w, wd, ht, region, ep),
     );
     row.call_ms = Some(millis(started));
-    let Some(run) = run else {
+    let Some(mut run) = run else {
         fail(&mut row, "analysis_failed", &"no zero-point run came back");
-        return (row, Vec::new());
+        return (row, Vec::new(), None, Vec::new());
     };
+    // F5 emulation: the list re-seeded through a quadratic map of its own fits.
+    let projected: Vec<(f64, f64)> = run
+        .list
+        .as_ref()
+        .map(|l| l.stars.iter().map(|s| (s.x, s.y)).collect())
+        .unwrap_or_default();
+    let mut g_cells: Vec<String> = vec![String::new(); 10];
+    if let Some(m) = &run.measured {
+        g_cells[5] = m.fits.iter().filter(|f| f.accepted).count().to_string();
+        g_cells[6] = m.fits.iter().filter(|f| f.kept).count().to_string();
+        g_cells[7] = num(run.result.as_ref().ok().map(|z| z.zero_point), 5);
+        let mut offs: Vec<f64> = m
+            .fits
+            .iter()
+            .filter(|f| f.accepted && f.centre_offset_px.is_finite())
+            .map(|f| f.centre_offset_px)
+            .collect();
+        g_cells[8] = num(median(&mut offs), 4);
+    }
+    let mut reseeds = 0usize;
+    for _ in 0..emul.reseed {
+        let (Some(l), Some(m), Some(t)) = (&run.list, &run.measured, c.exptime) else {
+            break;
+        };
+        let Some(map) = quad_map(l, m, (width, height), MAP_RADIUS_FWHM * l.fwhm_ref_px) else {
+            break;
+        };
+        if reseeds > 0 {
+            g_cells[2].push('/');
+            g_cells[3].push('/');
+        }
+        g_cells[2].push_str(&num(Some(map.off_before), 4));
+        g_cells[3].push_str(&num(Some(map.res_after), 4));
+        if reseeds == 0 {
+            g_cells[1] = map.members.to_string();
+            let (w1, h1) = (width as f64 - 1.0, height as f64 - 1.0);
+            let corner = [(0.0, 0.0), (w1, 0.0), (0.0, h1), (w1, h1)]
+                .iter()
+                .map(|&(x, y)| {
+                    let (dx, dy) = map.eval(x, y);
+                    dx.hypot(dy)
+                })
+                .fold(0.0, f64::max);
+            g_cells[4] = num(Some(corner), 3);
+        }
+        let mut l2 = l.clone();
+        for s in &mut l2.stars {
+            let (dx, dy) = map.eval(s.x, s.y);
+            s.x += dx;
+            s.y += dy;
+        }
+        l2.request.positions = l2.stars.iter().map(|s| (s.x, s.y)).collect();
+        let req = l2.request.clone();
+        let (_, lm2) = measure_raw_frame_and_list(&frame, &frame_options(&rig.config), Some(&rig.pool), |_| Some(req));
+        let Some(lm2) = lm2 else {
+            break;
+        };
+        let outcome = forced_zero_point(&l2, &lm2, t, fp);
+        run.result = outcome.result;
+        run.list = Some(l2);
+        run.measured = Some(lm2);
+        run.outcome = Some(outcome);
+        reseeds += 1;
+    }
+    g_cells[0] = reseeds.to_string();
+    if let Some(m) = &run.measured {
+        g_cells[9] = format!("{:?}", m.refused).replace(['\t', '\n'], " ");
+    }
+    let g_line = format!("{}\t{}", c.frame_id, g_cells.join("\t"));
     let (analysis, stars) = map_measurement(&pm, &frame, &rig.config, &rig.config_hash);
     row.stars_detected = Some(analysis.stars_detected);
     row.median_fwhm = Some(analysis.median_fwhm).filter(|f| *f > 0.0);
@@ -3494,6 +3810,93 @@ fn forced_frame(
         }
     }
 
+    // F5 emulation: plain aperture sums per accepted list star.
+    let mut ap_lines = Vec::new();
+    if let (true, Some(l), Some(m), Some(fwhm)) = (emul.dump_ap, &run.list, &run.measured, row.median_fwhm) {
+        let plane_pattern: Option<(&[f32], astroimage::BayerPattern)> = match &frame.planes {
+            RawPlanes::Mono(p) => Some((p, astroimage::BayerPattern::None)),
+            RawPlanes::Cfa { mosaic, pattern } => Some((mosaic, *pattern)),
+            RawPlanes::Rgb(_) => None,
+        };
+        let cat_px: Vec<(f64, f64, f32)> = catalog_for_frame(&layers, &wcs, width, height, 1.0, epoch)
+            .map(|cat| {
+                cat.iter()
+                    .filter(|s| s.mag.is_finite())
+                    .map(|s| {
+                        let (x, y) = wcs.sky_to_pixel(s.ra, s.dec);
+                        (x, y, s.mag)
+                    })
+                    .filter(|p| p.0.is_finite() && p.1.is_finite())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let at: Vec<(f64, f64, f32)> = l
+            .stars
+            .iter()
+            .zip(&projected)
+            .map(|(s, p)| (p.0, p.1, s.g_mag))
+            .collect();
+        let nn = neighbour_distances(&cat_px, &at);
+        let radii: Vec<f64> = AP_RADII_FWHM
+            .iter()
+            .map(|k| k * fwhm)
+            .chain(AP_RADII_REF.iter().map(|k| k * l.fwhm_ref_px))
+            .collect();
+        let r_in = (4.0 * fwhm).max(6.0 * l.fwhm_ref_px) + AP_ANNULUS_GAP_PX;
+        if let Some((plane, pattern)) = plane_pattern {
+            for (i, (s, f)) in l.stars.iter().zip(&m.fits).enumerate() {
+                // At the seeded (list) position, fit or no fit: the forced aperture.
+                let Some((fl, sky, sd)) = ap_fluxes(plane, pattern, (width, height), (s.x, s.y), &radii, r_in) else {
+                    continue;
+                };
+                // The highest pixel within 1.5 FWHM_ref of the position (the clip screen of a star with no fit).
+                let pr = 1.5 * l.fwhm_ref_px;
+                let mut peak = f64::NEG_INFINITY;
+                for py in (s.y - pr).floor().max(0.0) as usize..=((s.y + pr).ceil() as usize).min(height - 1) {
+                    for px in (s.x - pr).floor().max(0.0) as usize..=((s.x + pr).ceil() as usize).min(width - 1) {
+                        peak = peak.max(f64::from(plane[py * width + px]));
+                    }
+                }
+                // At the fitted centre, the 3 F and 3 FWHM_ref sums only (centring's effect).
+                let at_fit = if f.accepted {
+                    ap_fluxes(plane, pattern, (width, height), (f.x, f.y), &[radii[3], radii[7]], r_in).map(|r| r.0)
+                } else {
+                    None
+                };
+                let mut line = format!(
+                    "{}\t{:016x}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{:.0}",
+                    c.frame_id,
+                    s.key,
+                    s.g_mag,
+                    projected[i].0,
+                    projected[i].1,
+                    s.x,
+                    s.y,
+                    num(Some(f.x).filter(|v| v.is_finite()), 2),
+                    num(Some(f.y).filter(|v| v.is_finite()), 2),
+                    if f.model_flux.is_finite() { format!("{:.5e}", f.model_flux) } else { String::new() },
+                    num(Some(f.snr).filter(|v| v.is_finite()), 1),
+                    u8::from(f.flags.saturated()),
+                    u8::from(f.accepted),
+                    u8::from(f.kept),
+                    nn[i].0,
+                    nn[i].1,
+                    sky,
+                    sd,
+                    peak
+                );
+                for v in fl {
+                    line.push_str(&format!("\t{v:.5e}"));
+                }
+                match at_fit {
+                    Some(v) => line.push_str(&format!("\t{:.5e}\t{:.5e}", v[0], v[1])),
+                    None => line.push_str("\t\t"),
+                }
+                ap_lines.push(line);
+            }
+        }
+    }
+
     if identity {
         let started = Instant::now();
         let plain = measure_raw_frame(&frame, &rig.config, Some(&rig.pool));
@@ -3502,7 +3905,7 @@ fn forced_frame(
             .map_or_else(|| "ok".to_string(), |f| format!("mismatch:{f}"));
     }
     row.rss_mb = peak_rss_mb();
-    (row, lines)
+    (row, lines, Some(g_line), ap_lines)
 }
 
 /// `<x>.stars.tsv` for `<x>.tsv`.
@@ -3559,6 +3962,10 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     let identity_every: usize = args
         .take_parsed("identity-every")?
         .unwrap_or(IDENTITY_EVERY_DEFAULT);
+    let emul = Emulation {
+        reseed: args.take_parsed("reseed")?.unwrap_or(0),
+        dump_ap: args.take_parsed::<u8>("dump-ap")?.unwrap_or(0) != 0,
+    };
     let (fp, params, given) = take_forced_params(&mut args)?;
 
     let conn = open_read_only(&db)?;
@@ -3576,6 +3983,17 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     writeln!(w, "{FORCED_HEADER}")?;
     let mut ws = create_out(&stars_path(&out))?;
     writeln!(ws, "{FORCED_STARS_HEADER}")?;
+    let base = out.strip_suffix(".tsv").unwrap_or(&out).to_string();
+    let mut wg = create_out(&format!("{base}.g.tsv"))?;
+    writeln!(wg, "{G_HEADER}")?;
+    let mut wa = if emul.dump_ap {
+        let mut f = create_out(&format!("{base}.ap.tsv"))?;
+        writeln!(f, "{AP_HEADER}")?;
+        Some(f)
+    } else {
+        None
+    };
+    eprintln!("zp_probe forced: emulation {emul:?}");
     let (mut measured, mut refused, mut examined) = (0usize, 0usize, 0usize);
     let mut first_rotation: HashMap<String, f64> = HashMap::new();
     for c in &candidates {
@@ -3603,7 +4021,17 @@ fn cmd_forced(mut args: Args) -> Result<()> {
             continue;
         }
         let identity = identity_every > 0 && measured % identity_every == 0;
-        let (mut row, star_lines) = forced_frame(&conn, &rig, &fp, c, identity);
+        let (mut row, star_lines, g_line, ap_lines) = forced_frame(&conn, &rig, &fp, c, identity, emul);
+        if let Some(g) = g_line {
+            writeln!(wg, "{g}")?;
+            wg.flush()?;
+        }
+        if let Some(f) = wa.as_mut() {
+            for l in &ap_lines {
+                writeln!(f, "{l}")?;
+            }
+            f.flush()?;
+        }
         if let Some(rot) = row.rotation_deg {
             let first = *first_rotation.entry(c.night.clone()).or_insert(rot);
             row.pier = Some(pier_side(first, rot));
@@ -3897,12 +4325,6 @@ fn ols(xs: &[f64], ys: &[f64]) -> Option<(f64, f64, usize)> {
     Some((slope, (rss / (nf - 2.0) / sxx).sqrt(), n))
 }
 
-/// RMS of `values` about their median.
-fn rms_about_median(values: &[f64]) -> Option<f64> {
-    let m = median(&mut values.to_vec())?;
-    Some((values.iter().map(|v| (v - m).powi(2)).sum::<f64>() / values.len() as f64).sqrt())
-}
-
 /// `y = k x + a + s side` over the points `(x, y, side)`: `(k, a, s)`; `None` for a singular design.
 fn side_fit(points: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
     let rows: Vec<Vec<f64>> = points.iter().map(|p| vec![p.0, 1.0, p.2]).collect();
@@ -4008,35 +4430,68 @@ struct B3Night {
     ref_6f_vs_stack: Option<f64>,
 }
 
+/// The slope of `y` on `x` with a step between the pier sides when `sided` (`y = s x + a + step side`): slope, its
+/// standard error, points. One-sided: plain least squares.
+fn slope_by_side(xs: &[f64], ys: &[f64], sides: &[f64], sided: bool) -> Option<(f64, f64, usize)> {
+    if !sided {
+        return ols(xs, ys);
+    }
+    let rows: Vec<Vec<f64>> = xs.iter().zip(sides).map(|(x, s)| vec![*x, 1.0, *s]).collect();
+    let (beta, inv_diag, rss) = least_squares(&rows, ys)?;
+    let dof = xs.len().checked_sub(3).filter(|d| *d > 0)? as f64;
+    Some((beta[0], (rss / dof * inv_diag[0]).sqrt(), xs.len()))
+}
+
+/// B3 of a night. On a two-sided night it is judged one pier side at a time (owner ruling F7: the flip step is not a
+/// judge of the method): the rms is about each side's own median and every slope carries a step between the sides.
 fn b3_night(night: &FNight, common: &CommonIndex) -> Option<B3Night> {
+    let sided = night.two_sided();
     let mut d = Vec::new();
     let mut fw = Vec::new();
-    let (mut x6, mut y6, mut r6) = (Vec::new(), Vec::new(), Vec::new());
-    for r in &night.rows {
+    let mut sd = Vec::new();
+    let (mut x6, mut y6, mut r6, mut s6) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (r, side) in night.rows.iter().zip(&night.sides) {
         let (Some(zp), Some(level), Some(f)) = (r.zero_point, common.level(r), r.median_fwhm)
         else {
             continue;
         };
+        let side = side.unwrap_or(0) as f64;
         d.push(zp - level);
         fw.push(f);
+        sd.push(side);
         if let Some(z6) = r.zero_point_6f {
             x6.push(f);
             y6.push(zp - z6);
             r6.push(z6 - level);
+            s6.push(side);
         }
     }
     if d.len() < B3_MIN_POINTS {
         return None;
     }
-    let (slope, se, _) = ols(&fw, &d)?;
+    let (slope, se, _) = slope_by_side(&fw, &d, &sd, sided)?;
+    // The rms about the median of each side (of the night when it has one side).
+    let mut centred = Vec::with_capacity(d.len());
+    for side in [0.0, 1.0] {
+        let mine: Vec<f64> = d.iter().zip(&sd).filter(|(_, s)| !sided || **s == side).map(|(v, _)| *v).collect();
+        if let Some(m) = median(&mut mine.clone()) {
+            centred.extend(mine.iter().map(|v| v - m));
+        }
+        if !sided {
+            break;
+        }
+    }
+    let rms = (centred.iter().map(|v| v * v).sum::<f64>() / centred.len().max(1) as f64).sqrt();
     Some(B3Night {
         points: d.len(),
-        rms: rms_about_median(&d)?,
+        rms,
         slope,
         se,
-        slope_6f: (x6.len() >= B3_MIN_POINTS).then(|| ols(&x6, &y6)).flatten(),
+        slope_6f: (x6.len() >= B3_MIN_POINTS)
+            .then(|| slope_by_side(&x6, &y6, &s6, sided))
+            .flatten(),
         ref_6f_vs_stack: (x6.len() >= B3_MIN_POINTS)
-            .then(|| ols(&x6, &r6).map(|s| s.0))
+            .then(|| slope_by_side(&x6, &r6, &s6, sided).map(|s| s.0))
             .flatten(),
     })
 }
