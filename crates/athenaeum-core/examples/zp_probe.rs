@@ -16,8 +16,8 @@
 //! zp_probe bigap   --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> --object <s> \
 //!                  [--night <label>] [--every <n>] --out <frames.tsv> --stars-out <stars.tsv>
 //! zp_probe forced  --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> --object <s> \
-//!                  --out <x.tsv> [--limit <n>] [--identity-every <n>] [--<ForcedListParams field> <v>]... \
-//!                  [--<ZpParams field> <v>]...
+//!                  --out <x.tsv> [--limit <n>] [--identity-every <n>] [--dump-ap 1] \
+//!                  [--<ForcedListParams field> <v>]... [--<ZpParams field> <v>]...
 //! zp_probe verdict --forced [--common <tsv>] <x.tsv>...
 //! ```
 //!
@@ -34,19 +34,22 @@
 //! of at least 30 measured frames against the bars of the OSC spec section 6 (see `osc_c_verdict_lines`); without
 //! `--osc-c` the verdict is the sub-wave 6.5 one, line for line.
 //!
-//! `forced` (forced-list zero point, Task 3) runs the shipping composition `analysis::analyzer::measure_with_zero_point`
-//! on frames read in memory and writes `<x>.tsv` (one row per light: the anchor, the window, the list, the zero
-//! point or its refusal, today's zero point on the same measurement, the identity check, the wall time
-//! and memory of the list) and `<x>.stars.tsv` (one row per list star). `--identity-every <n>` (default 10) measures every
-//! n-th frame a second time without a list and compares the two (B9). `verdict --forced [--common <tsv>] <x>.tsv...`
-//! judges the bars B1-B9 of the forced-list spec (section 6, with the plan's review rulings): every night of at least 30
-//! measured frames, pairs under 15 minutes apart, one line per bar and a last line GO or STOP. A bar judged on no night
-//! of its class is a STOP. The pier side of a frame is read from the solve's field rotation against the night's first
-//! frame (more than 90 degrees mod 360 is the other side). `--<field> <v>` on `forced` is any `ForcedListParams` field in
-//! snake_case (`--cap 800`, `--window_bright_margin_mag 1.0`, `--pedestal_radii_ref 3,4,6`, ...) so a tuning round needs
-//! no rebuild; `min_stars` and `clip_sigma` are also `ZpParams` fields and a value given for one of them sets both (today's
-//! zero point is judged by the same rule as the forced one). The parameters actually used, and the flags that moved
-//! them, are echoed on stderr and written to `<x>.flags.txt` beside the TSV (the TSV's first line stays its header).
+//! `forced` (forced-list zero point, G3) runs the shipping composition `analysis::analyzer::measure_with_zero_point`
+//! on frames read in memory and writes TSVs only: `<x>.tsv` (one row per light: the anchor, the window, the list, the map,
+//! the pedestal and its clip's kept share, the zero point or its refusal, the 6r referee, today's zero point on the same
+//! measurement, the identity check, the wall time of the list split into fits and apertures), `<x>.stars.tsv` (one compact
+//! row per list star), `<x>.shifts.tsv` (the anchor-shifted re-measures of the identity frames) and, with `--dump-ap 1`,
+//! `<x>.ap.tsv` (every aperture figure). `--identity-every <n>` (default 10) measures every n-th frame a second time
+//! without a list and compares the two (B9), and re-measures it with the anchor shifted by +-0.1, +-0.5, +-0.44, +-1.0 and
+//! +-1.75 mag. `--decimate <n>` keeps every n-th list star by key. `forced` refuses to start on flags whose ratios break
+//! rustafits' annulus rule. `verdict --forced [--common <tsv>] <x.tsv>...` judges the bars B1-B9 of the forced-list spec
+//! (section 6, with the plan's review rulings) on the zero point reduced to the common window of each rig, object and
+//! exposure: every night of at least 30 measured frames, pairs under 15 minutes apart, one line per bar and a last line
+//! GO or STOP. A bar judged on no night of its class is a STOP. The pier side of a frame is read from the solve's field
+//! rotation against the night's first frame (more than 90 degrees mod 360 is the other side). `--<field> <v>` on `forced`
+//! is any `ForcedListParams` field in snake_case (`--cap 800`, `--pedestal_radii_ref 3,4,6`, ...) so a tuning round needs no
+//! rebuild; `min_stars` and `clip_sigma` are also `ZpParams` fields and a value given for one of them sets both. The
+//! parameters actually used, and the flags that moved them, are echoed on stderr and written to `<x>.flags.txt`.
 //!
 //! `stars` writes one row per matched star with the flags and numbers the star
 //! fit itself carried (`saturated`, `extended`, `flags`, `peak`, `background`,
@@ -70,12 +73,12 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use athenaeum_core::analysis::analyzer::{
-    frame_options, map_measurement, measure_raw_frame, measure_with_zero_point, ZpInputs,
+    frame_options, map_measurement, measure_raw_frame, measure_with_zero_point, ForcedRun, ZpInputs,
 };
 use athenaeum_core::analysis::config::{load_config, AnalysisConfig};
 use athenaeum_core::analysis::zero_point::{
-    catalog_for_frame, measure_zero_point, ForcedListParams, ForcedRefusal, ForcedStar,
-    ForcedStarZp, ZpInput, ZpMeasurement, ZpParams, ZpRefusal,
+    catalog_for_frame, common_window, measure_zero_point, CommonWindow, ForcedList, ForcedListParams, ForcedRefusal,
+    ForcedStar, ForcedStarZp, ZpInput, ZpMeasurement, ZpParams, ZpRefusal,
 };
 use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::hints::observation_epoch;
@@ -2847,30 +2850,50 @@ fn cmd_bigap(mut args: Args) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// forced: the shipping forced-list zero point on real frames (forced-list plan, Task 3)
+// forced: the shipping forced-list zero point on real frames (forced-list plan, G3)
 // ---------------------------------------------------------------------------
 //
 // `forced` calls `analysis::analyzer::measure_with_zero_point`, the one function the analyzer ships, on a frame read in
-// memory, and writes two TSVs: one row per light (`<x>.tsv`) and one row per list star (`<x>.stars.tsv`). Today's zero
-// point (6.5's matcher over the budget fits, times the reported `c` on a mosaic) is measured on the same frame for the
-// comparisons of B2 and B8. The catalogue is opened read-only and nothing else is written.
+// memory, and writes TSVs only: one row per light (`<x>.tsv`), one compact row per list star (`<x>.stars.tsv`), on every
+// `--identity-every`-th frame the anchor-shifted re-measures (`<x>.shifts.tsv`) and, with `--dump-ap 1`, every aperture
+// figure of every list star (`<x>.ap.tsv`). Today's zero point (6.5's matcher over the budget fits, times the reported
+// `c` on a mosaic) is measured on the same frame for the comparisons of B2 and B8. The catalogue is opened read-only.
 
-const FORCED_HEADER: &str = "frame_id\tfile_name\tobject\tfilter\tnight\tdate_obs\texptime\trig\tlayout\tairmass\tpier\trotation_deg\tstars_detected\tmedian_fwhm\tscale\tfwhm_ref\tanchor\tanchor_stars\twindow_bright\twindow_faint\tlist_before_cap\tlist_stars\taccepted\tkept\tzp_stars\tc\tc_stars\tc_se\tc_budget\tzero_point\tsigma\tstd_error\trefusal\tcentre_median_px\tring_missing\tzero_point_today\ttoday_refusal\tzero_point_6f\tidentity\tcall_ms\tplain_ms\tlist_kb\trss_mb";
+const FORCED_HEADER: &str = "frame_id\tfile_name\tobject\tfilter\tnight\tdate_obs\texptime\trig\tlayout\tairmass\tpier\trotation_deg\tstars_detected\tmedian_fwhm\tscale\tfwhm_ref\tanchor\tanchor_stars\twindow_bright\twindow_faint\tlist_before_cap\tlist_stars\tmap_stars\tmap_members\tmap_offset_px\tmap_residual_px\tmap_kept_share\taperture_radius_px\tmembers\ttapered\tzp_stars\tpedestal\tpedestal_kept_share\tpedestal_zp_mag\tannulus_off\tc_budget\tzero_point\tsigma\trefusal\tcentre_median_px\twindow_slope\tslope_remeasured\tzero_point_6r\tzero_point_today\ttoday_refusal\tidentity\tcall_ms\tplain_ms\tlist_fit_ms\tlist_refit_ms\tlist_ap_ms\tlist_kb\trss_mb";
 
-const FORCED_STARS_HEADER: &str =
-    "frame_id\tkey\tg\tx_proj\ty_proj\tx_fit\ty_fit\tmodel_flux\tflux\tsnr\tflags\taccepted\tkept\tzp_i\tclipped";
+const FORCED_STARS_HEADER: &str = "frame_id\tkey\tg\tweight\tmember\tscreened_in";
 
-/// Every n-th frame is measured a second time without a list and compared (B9), unless `--identity-every` says else.
+const FORCED_SHIFTS_HEADER: &str =
+    "frame_id\tshift\tzero_point\twindow_bright\twindow_faint\twindow_slope\tmembers\trefusal";
+
+const FORCED_AP_HEADER: &str =
+    "frame_id\tkey\tg\tx\ty\ton_frame\tsum\tsum_a\tsum_b\tsum_c\tsky\tsky_scatter\tpeak\tweight\tmember\tscreened_in";
+
+/// Every n-th frame is measured a second time without a list and compared (B9), unless `--identity-every` says else; the
+/// same frames carry the anchor-shifted re-measures.
 const IDENTITY_EVERY_DEFAULT: usize = 10;
+
+/// The anchor shifts (mag, both signs) of the identity frames' re-measures: +-0.1 and +-0.5 (M3: the window slope against
+/// the re-measured one, kappa after the reduction) and +-0.44, +-1.0 and +-1.75 (H2: an exposure step of 1.5x, 2.5x and
+/// 5x). Probe only.
+const REMEASURE_SHIFTS: [f64; 10] = [0.1, -0.1, 0.5, -0.5, 0.44, -0.44, 1.0, -1.0, 1.75, -1.75];
+
+/// The sets whose list alone costs more than this (ms a frame, median) are named by the verdict and stop Phase A (RR4).
+const LIST_COST_MAX_MS: f64 = 70.0;
 
 /// One light of a `forced` run. A light that was not measured carries one of [`UNMEASURED`] in `refusal`.
 ///
 /// `layout` is `mono`, `cfa` or `rgb`. `anchor_stars` is the anchor's survivors, or the matches it found when the anchor
-/// refused. `accepted` / `kept` are the first fit pass's map stars accepted / kept by the fitter (the per-night line
-/// only: the verdict reads the stars TSV's `kept`, a member of non-zero weight the screen kept); `zp_stars` the members
-/// of non-zero weight the screen kept. `c*` are written empty (the list has no aperture correction any more), `c_budget`
-/// is the budget's reported one (mosaic only). `ring_missing` counts the accepted first-pass fits within 12 F of an edge, F the ring width they were read at. `zero_point_6f` is written empty (the 6F
-/// referee went with the F5 emulation in G2; G3 re-measures it).
+/// refused. `map_stars` is the list's map stars, `map_members` the members of the frame's map after its clip,
+/// `map_offset_px` / `map_residual_px` its offset and residual, `map_kept_share` the share of the map stars the second fit
+/// kept. `aperture_radius_px` is the disc's radius, `members` the members before the screen, `tapered` those above the
+/// screen's upper limit (H1: weight tapered), `zp_stars` the members of non-zero weight the screen kept. `pedestal` is
+/// the sky pedestal (working units per pixel; empty when it was not fitted), `pedestal_kept_share` the share of the
+/// points offered to its line that the clip kept (set also when the pedestal collapsed) and `pedestal_zp_mag` its part of the zero
+/// point (zero point less the same ratio of sums with no pedestal). `annulus_off` counts the list stars whose annulus or
+/// disc left the plane. `c_budget` is the budget's reported `c` (mosaic only; the anchor's). `window_slope` is the
+/// analytic slope of the window, `slope_remeasured` the two-sided difference of the +-0.1 mag anchor shifts (identity
+/// frames only), `zero_point_6r` the ratio of sums at `6 * FWHM_ref` with the same pedestal on the same members (RR3).
 #[derive(Debug, Clone, Default)]
 struct ForcedRow {
     frame_id: Option<i64>,
@@ -2896,26 +2919,37 @@ struct ForcedRow {
     window_faint: Option<f64>,
     list_before_cap: Option<i64>,
     list_stars: Option<i64>,
-    accepted: Option<i64>,
-    kept: Option<i64>,
+    map_stars: Option<i64>,
+    map_members: Option<i64>,
+    map_offset_px: Option<f64>,
+    map_residual_px: Option<f64>,
+    map_kept_share: Option<f64>,
+    aperture_radius_px: Option<f64>,
+    members: Option<i64>,
+    tapered: Option<i64>,
     zp_stars: Option<i64>,
-    c: Option<f64>,
-    c_stars: Option<i64>,
-    c_se: Option<f64>,
+    pedestal: Option<f64>,
+    pedestal_kept_share: Option<f64>,
+    pedestal_zp_mag: Option<f64>,
+    annulus_off: Option<i64>,
     c_budget: Option<f64>,
     zero_point: Option<f64>,
     sigma: Option<f64>,
-    std_error: Option<f64>,
     refusal: String,
     centre_median_px: Option<f64>,
-    ring_missing: Option<i64>,
+    window_slope: Option<f64>,
+    slope_remeasured: Option<f64>,
+    zero_point_6r: Option<f64>,
     zero_point_today: Option<f64>,
     today_refusal: String,
-    zero_point_6f: Option<f64>,
     /// `ok` or `mismatch:<field>` on a frame measured a second time without a list; empty on the others.
     identity: String,
     call_ms: Option<f64>,
     plain_ms: Option<f64>,
+    /// The fitter's wall time of the first fit pass, the second and the aperture sums, ms.
+    list_fit_ms: Option<f64>,
+    list_refit_ms: Option<f64>,
+    list_ap_ms: Option<f64>,
     /// The list's structures (stars, fits), kB.
     list_kb: Option<f64>,
     /// The process' peak resident set after the frame, MB.
@@ -2951,25 +2985,35 @@ impl ForcedRow {
             num(self.window_faint, 3),
             int(self.list_before_cap),
             int(self.list_stars),
-            int(self.accepted),
-            int(self.kept),
+            int(self.map_stars),
+            int(self.map_members),
+            num(self.map_offset_px, 4),
+            num(self.map_residual_px, 4),
+            num(self.map_kept_share, 4),
+            num(self.aperture_radius_px, 3),
+            int(self.members),
+            int(self.tapered),
             int(self.zp_stars),
-            num(self.c, 5),
-            int(self.c_stars),
-            num(self.c_se, 5),
+            num(self.pedestal, 5),
+            num(self.pedestal_kept_share, 4),
+            num(self.pedestal_zp_mag, 5),
+            int(self.annulus_off),
             num(self.c_budget, 5),
             num(self.zero_point, 5),
             num(self.sigma, 5),
-            num(self.std_error, 5),
             clean(&self.refusal),
             num(self.centre_median_px, 4),
-            int(self.ring_missing),
+            num(self.window_slope, 5),
+            num(self.slope_remeasured, 5),
+            num(self.zero_point_6r, 5),
             num(self.zero_point_today, 5),
             clean(&self.today_refusal),
-            num(self.zero_point_6f, 5),
             clean(&self.identity),
             num(self.call_ms, 0),
             num(self.plain_ms, 0),
+            num(self.list_fit_ms, 0),
+            num(self.list_refit_ms, 0),
+            num(self.list_ap_ms, 0),
             num(self.list_kb, 1),
             num(self.rss_mb, 0),
         ]
@@ -3006,25 +3050,35 @@ impl ForcedRow {
             window_faint: x("window_faint"),
             list_before_cap: i("list_before_cap"),
             list_stars: i("list_stars"),
-            accepted: i("accepted"),
-            kept: i("kept"),
+            map_stars: i("map_stars"),
+            map_members: i("map_members"),
+            map_offset_px: x("map_offset_px"),
+            map_residual_px: x("map_residual_px"),
+            map_kept_share: x("map_kept_share"),
+            aperture_radius_px: x("aperture_radius_px"),
+            members: i("members"),
+            tapered: i("tapered"),
             zp_stars: i("zp_stars"),
-            c: x("c"),
-            c_stars: i("c_stars"),
-            c_se: x("c_se"),
+            pedestal: x("pedestal"),
+            pedestal_kept_share: x("pedestal_kept_share"),
+            pedestal_zp_mag: x("pedestal_zp_mag"),
+            annulus_off: i("annulus_off"),
             c_budget: x("c_budget"),
             zero_point: x("zero_point"),
             sigma: x("sigma"),
-            std_error: x("std_error"),
             refusal: s("refusal"),
             centre_median_px: x("centre_median_px"),
-            ring_missing: i("ring_missing"),
+            window_slope: x("window_slope"),
+            slope_remeasured: x("slope_remeasured"),
+            zero_point_6r: x("zero_point_6r"),
             zero_point_today: x("zero_point_today"),
             today_refusal: s("today_refusal"),
-            zero_point_6f: x("zero_point_6f"),
             identity: s("identity"),
             call_ms: x("call_ms"),
             plain_ms: x("plain_ms"),
+            list_fit_ms: x("list_fit_ms"),
+            list_refit_ms: x("list_refit_ms"),
+            list_ap_ms: x("list_ap_ms"),
             list_kb: x("list_kb"),
             rss_mb: x("rss_mb"),
         }
@@ -3166,22 +3220,132 @@ fn identity_mismatch(
     None
 }
 
-/// One list star's row of the stars TSV. The fit columns are empty (no list star is fitted any more: G3 rewrites the
-/// file); `accepted` is a member of the statistic, `kept` a member of non-zero weight the screen kept, `zp_i` the star's
-/// zero point and `clipped` 1 when the screen dropped it.
-fn forced_star_line(frame_id: i64, s: &ForcedStar, p: Option<&ForcedStarZp>) -> String {
-    let (accepted, kept, zp, clipped) = match p {
-        Some(p) => (
-            u8::from(p.member),
-            u8::from(p.member && p.screened_in && p.weight > 0.0),
-            num(Some(p.zp).filter(|v| v.is_finite()), 5),
-            if p.member { u8::from(!p.screened_in).to_string() } else { String::new() },
-        ),
-        None => Default::default(),
-    };
+/// What one light of a `forced` run writes: its row and the rows of the three side files.
+struct FrameOut {
+    row: ForcedRow,
+    /// `<x>.stars.tsv`.
+    stars: Vec<String>,
+    /// `<x>.ap.tsv` (only with `--dump-ap 1`).
+    aps: Vec<String>,
+    /// `<x>.shifts.tsv` (identity frames only).
+    shifts: Vec<String>,
+}
+
+impl FrameOut {
+    fn bare(row: ForcedRow) -> Self {
+        Self { row, stars: Vec::new(), aps: Vec::new(), shifts: Vec::new() }
+    }
+}
+
+/// One list star of a ratio of sums: its catalogue magnitude, the weight it enters the statistic with (0 for a star that
+/// is no member or that the screen dropped) and its aperture sum at the radius the ratio is read at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SumStar {
+    g: f64,
+    weight: f64,
+    sum: f64,
+}
+
+/// The statistic's ratio of sums over `stars`, the pedestal `eps` (flux per pixel) taken out of every sum at
+/// `radius_px`: `2.5 log10( sum w (S - eps pi r^2) / (t sum w 10^(-0.4 G)) )`. With the radius and the pedestal the
+/// statistic used it is the statistic's own zero point; at `6 * FWHM_ref` with the same pedestal and the same members and
+/// weights it is RR3's referee; with `eps = 0` it is the zero point the pedestal did not touch. `None` for no weight or a
+/// sum that is not positive.
+fn ratio_of_sums(stars: &[SumStar], eps: f64, radius_px: f64, exptime_s: f64) -> Option<f64> {
+    let area = std::f64::consts::PI * radius_px * radius_px;
+    let (mut sw_f, mut sw_c) = (0.0, 0.0);
+    for s in stars.iter().filter(|s| s.weight > 0.0 && s.sum.is_finite()) {
+        sw_f += s.weight * (s.sum - eps * area);
+        sw_c += s.weight * 10f64.powf(-0.4 * s.g);
+    }
+    (sw_f > 0.0 && sw_c > 0.0 && exptime_s > 0.0)
+        .then(|| 2.5 * (sw_f / (exptime_s * sw_c)).log10())
+        .filter(|z| z.is_finite())
+}
+
+/// The list's stars as [`SumStar`]s, the sums read by `sum_of` (the disc, or the pedestal radius `RR3` names).
+fn sum_stars(
+    list: &ForcedList,
+    per: &[ForcedStarZp],
+    apertures: &[ListAperture],
+    sum_of: impl Fn(&ListAperture) -> Option<f64>,
+) -> Vec<SumStar> {
+    list.stars
+        .iter()
+        .zip(per)
+        .zip(apertures)
+        .map(|((star, p), ap)| SumStar {
+            g: f64::from(star.g_mag),
+            weight: if p.member && p.screened_in { p.weight } else { 0.0 },
+            sum: sum_of(ap).unwrap_or(f64::NAN),
+        })
+        .collect()
+}
+
+/// One list star's row of the stars TSV: its key, magnitude, the weight it enters the statistic with, whether it is a
+/// member (in the window, on the frame, under the clip floor) and whether the screen left it.
+fn forced_star_line(frame_id: i64, s: &ForcedStar, p: &ForcedStarZp) -> String {
     format!(
-        "{frame_id}\t{:016x}\t{:.3}\t{:.3}\t{:.3}\t\t\t\t\t\t\t{accepted}\t{kept}\t{zp}\t{clipped}",
-        s.key, s.g_mag, s.x, s.y,
+        "{frame_id}\t{:016x}\t{:.3}\t{:.4}\t{}\t{}",
+        s.key,
+        s.g_mag,
+        p.weight,
+        u8::from(p.member),
+        u8::from(p.member && p.screened_in),
+    )
+}
+
+/// One list star's row of the aperture dump (`--dump-ap 1`): every figure of its aperture, at the position the map put it.
+fn forced_ap_line(
+    frame_id: i64,
+    s: &ForcedStar,
+    ap: &ListAperture,
+    at: (f64, f64),
+    p: &ForcedStarZp,
+) -> String {
+    let extra = |i: usize| num(ap.extra_sums.get(i).copied(), 2);
+    format!(
+        "{frame_id}\t{:016x}\t{:.3}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}",
+        s.key,
+        s.g_mag,
+        at.0,
+        at.1,
+        u8::from(ap.on_frame),
+        num(Some(ap.sum), 2),
+        extra(0),
+        extra(1),
+        extra(2),
+        num(Some(ap.sky), 3),
+        num(Some(ap.sky_scatter), 3),
+        num(Some(ap.peak), 1),
+        p.weight,
+        u8::from(p.member),
+        u8::from(p.member && p.screened_in),
+    )
+}
+
+/// One re-measure's row of `<x>.shifts.tsv`: the zero point, the window and the statistic's counts at an anchor shifted
+/// by `shift` mag, or the refusal.
+fn forced_shift_line(frame_id: i64, shift: f64, run: &ForcedRun) -> String {
+    let (zp, refusal) = match &run.result {
+        Ok(z) => (Some(z.zero_point), String::new()),
+        Err(r) => (None, r.code().to_string()),
+    };
+    let (bright, faint) = run
+        .list
+        .as_ref()
+        .map_or((None, None), |l| (Some(l.window_bright), Some(l.window_faint)));
+    let (slope, members) = run
+        .outcome
+        .as_ref()
+        .map_or((None, None), |o| (o.window_slope, Some(i64::from(o.members))));
+    format!(
+        "{frame_id}\t{shift:+.2}\t{}\t{}\t{}\t{}\t{}\t{refusal}",
+        num(zp, 5),
+        num(bright, 4),
+        num(faint, 4),
+        num(slope, 5),
+        int(members),
     )
 }
 
@@ -3190,15 +3354,17 @@ fn millis(t: Instant) -> f64 {
 }
 
 /// One light, end to end: the stored solve, the frame read in memory, the shipping composition, today's zero point on
-/// the same measurement, the 6F reference and, when `identity`, a second plain measurement compared with the first.
-/// Returns the light's row (its failure is the `refusal`, logged on stderr) and its list stars' rows.
+/// the same measurement, RR3's 6r referee and, when `identity`, a second plain measurement compared with the first and
+/// the anchor-shifted re-measures ([`REMEASURE_SHIFTS`], outside `call_ms`). Returns the light's row (its failure is the
+/// `refusal`, logged on stderr) and the rows of the side files.
 fn forced_frame(
     conn: &Connection,
     rig: &Rig,
     fp: &ForcedListParams,
     c: &Candidate,
     identity: bool,
-) -> (ForcedRow, Vec<String>) {
+    dump_ap: bool,
+) -> FrameOut {
     let mut row = forced_base_row(c);
     let fail = |row: &mut ForcedRow, code: &str, detail: &dyn std::fmt::Display| {
         eprintln!("zp_probe: frame {} refused {code}: {detail}", c.frame_id);
@@ -3208,23 +3374,23 @@ fn forced_frame(
         Ok(Some(r)) => r,
         Ok(None) => {
             fail(&mut row, "no_solve", &"no stored solve");
-            return (row, Vec::new());
+            return FrameOut::bare(row);
         }
         Err(e) => {
             fail(&mut row, "bad_wcs", &e);
-            return (row, Vec::new());
+            return FrameOut::bare(row);
         }
     };
     row.rotation_deg = Some(rec.field_rotation_deg).filter(|r| r.is_finite());
     let Some(wcs) = rec.to_solution() else {
         fail(&mut row, "bad_wcs", &"the stored SIP tables are unusable");
-        return (row, Vec::new());
+        return FrameOut::bare(row);
     };
     let mut frame = match read_raw_frame(Path::new(&c.path)) {
         Ok(f) => f,
         Err(e) => {
             fail(&mut row, "analysis_failed", &e);
-            return (row, Vec::new());
+            return FrameOut::bare(row);
         }
     };
     frame.drop_unmeasured_planes();
@@ -3259,7 +3425,7 @@ fn forced_frame(
     row.call_ms = Some(millis(started));
     let Some(run) = run else {
         fail(&mut row, "analysis_failed", &"no zero-point run came back");
-        return (row, Vec::new());
+        return FrameOut::bare(row);
     };
     let (analysis, stars) = map_measurement(&pm, &frame, &rig.config, &rig.config_hash);
     row.stars_detected = Some(analysis.stars_detected);
@@ -3291,24 +3457,28 @@ fn forced_frame(
         row.window_faint = Some(l.window_faint);
         row.list_before_cap = Some(l.list_before_cap as i64);
         row.list_stars = Some(l.stars.len() as i64);
+        row.map_stars = Some(l.map.len() as i64);
     }
-    if let Some(m) = &run.measured {
-        // The map stars' first fits (the only fits a frame has now).
-        row.accepted = Some(m.fits.iter().filter(|f| f.accepted).count() as i64);
-        row.kept = Some(m.fits.iter().filter(|f| f.kept).count() as i64);
-        if let Some(ring) = m.ring_fwhm.filter(|r| r.is_finite()) {
-            let edge = 12.0 * ring;
-            let (w1, h1) = (width as f64 - 1.0, height as f64 - 1.0);
-            row.ring_missing = Some(
-                m.fits
-                    .iter()
-                    .filter(|f| f.accepted)
-                    .filter(|f| f.x < edge || f.y < edge || f.x > w1 - edge || f.y > h1 - edge)
-                    .count() as i64,
-            );
-        }
+    if let Some(m) = &run.map {
+        row.map_members = Some(m.members as i64);
+        row.map_offset_px = Some(m.offset_px).filter(|v| v.is_finite());
+        row.map_residual_px = Some(m.residual_px).filter(|v| v.is_finite());
     }
+    // The second fit's share of the map stars it kept: the gate's, or the one a `poor_solve` refusal carries.
+    row.map_kept_share = match (&run.gate, &run.result) {
+        (Some(g), _) => Some(g.kept_share),
+        (None, Err(ForcedRefusal::PoorSolve { kept_share })) => Some(*kept_share),
+        _ => None,
+    }
+    .filter(|v| v.is_finite());
     row.centre_median_px = run.gate.as_ref().map(|g| g.centre_median_px).filter(|v| v.is_finite());
+    row.aperture_radius_px = run.placement.as_ref().map(|p| p.radius_px);
+    if let Some(m) = &run.measured {
+        row.annulus_off = Some(m.apertures.iter().filter(|a| !a.on_frame).count() as i64);
+        row.list_fit_ms = Some(m.timings.fit_ms as f64);
+        row.list_refit_ms = Some(m.timings.refit_ms as f64);
+        row.list_ap_ms = Some(m.timings.aperture_ms as f64);
+    }
     if let (Some(l), Some(m)) = (&run.list, &run.measured) {
         let bytes = l.stars.len() * std::mem::size_of::<ForcedStar>()
             + (m.fits.len() + m.refits.len()) * std::mem::size_of::<ListFit>()
@@ -3316,12 +3486,19 @@ fn forced_frame(
             + l.request.fit_positions.len() * std::mem::size_of::<(f64, f64)>();
         row.list_kb = Some(bytes as f64 / 1024.0);
     }
+    if let Some(o) = &run.outcome {
+        row.members = Some(i64::from(o.members));
+        row.tapered = Some(i64::from(o.tapered));
+        row.pedestal = o.pedestal.filter(|v| v.is_finite());
+        row.pedestal_kept_share =
+            (o.pedestal_points > 0).then(|| f64::from(o.pedestal_kept) / f64::from(o.pedestal_points));
+        row.window_slope = o.window_slope.filter(|v| v.is_finite());
+    }
     match &run.result {
         Ok(z) => {
             row.zero_point = Some(z.zero_point);
             row.sigma = Some(z.sigma);
             row.zp_stars = Some(i64::from(z.stars));
-            row.std_error = Some(z.sigma / f64::from(z.stars.max(1)).sqrt());
         }
         Err(r) => {
             row.refusal = r.code().to_string();
@@ -3334,6 +3511,36 @@ fn forced_frame(
                 }
                 _ => {}
             }
+        }
+    }
+
+    // RR3's referee and the pedestal's part of the zero point, from the outcome's rows and the apertures: the same ratio
+    // of sums over the same members and weights, read at the third pedestal radius (`6 * FWHM_ref`) and at the disc with no
+    // pedestal at all.
+    if let (Ok(z), Some(l), Some(m), Some(o), Some(p), Some(eps)) = (
+        &run.result,
+        &run.list,
+        &run.measured,
+        &run.outcome,
+        &run.placement,
+        run.outcome.as_ref().and_then(|o| o.pedestal),
+    ) {
+        let t = c.exptime.unwrap_or(f64::NAN);
+        let disc = sum_stars(l, &o.per_star, &m.apertures, |a| Some(a.sum));
+        match ratio_of_sums(&disc, eps, p.radius_px, t) {
+            Some(own) if (own - z.zero_point).abs() <= 1e-6 => {
+                row.pedestal_zp_mag = ratio_of_sums(&disc, 0.0, p.radius_px, t).map(|bare| z.zero_point - bare);
+            }
+            other => eprintln!(
+                "zp_probe: frame {} the probe's ratio of sums {} differs from the statistic's {:.6}",
+                c.frame_id,
+                show(other, 6),
+                z.zero_point
+            ),
+        }
+        if let Some(r6) = p.extra_radii_px.get(2).copied() {
+            let six = sum_stars(l, &o.per_star, &m.apertures, |a| a.extra_sums.get(2).copied());
+            row.zero_point_6r = ratio_of_sums(&six, eps, r6, t);
         }
     }
 
@@ -3374,11 +3581,15 @@ fn forced_frame(
         }
     }
 
-    let mut lines = Vec::new();
-    if let Some(l) = &run.list {
-        let per = run.outcome.as_ref().map(|o| &o.per_star[..]).unwrap_or(&[]);
-        for (i, s) in l.stars.iter().enumerate() {
-            lines.push(forced_star_line(c.frame_id, s, per.get(i)));
+    let mut out = FrameOut::bare(ForcedRow::default());
+    if let (Some(l), Some(o)) = (&run.list, &run.outcome) {
+        for (s, p) in l.stars.iter().zip(&o.per_star) {
+            out.stars.push(forced_star_line(c.frame_id, s, p));
+        }
+        if let (true, Some(m), Some(p)) = (dump_ap, &run.measured, &run.placement) {
+            for (((s, zp), ap), at) in l.stars.iter().zip(&o.per_star).zip(&m.apertures).zip(&p.aperture_positions) {
+                out.aps.push(forced_ap_line(c.frame_id, s, ap, *at, zp));
+            }
         }
     }
 
@@ -3388,14 +3599,45 @@ fn forced_frame(
         row.plain_ms = Some(millis(started));
         row.identity = identity_mismatch(&plain, &pm, &frame_options(&rig.config))
             .map_or_else(|| "ok".to_string(), |f| format!("mismatch:{f}"));
+        // The re-measures: the same composition with the anchor moved (probe only), outside `call_ms`.
+        let mut at: HashMap<i64, Option<f64>> = HashMap::new();
+        for shift in REMEASURE_SHIFTS {
+            let shifted = ForcedListParams { anchor_shift_mag: fp.anchor_shift_mag + shift, ..*fp };
+            let (_, again) = measure_with_zero_point(
+                &frame,
+                &rig.config,
+                Some(&rig.pool),
+                Some(&inputs),
+                &shifted,
+                |w, wd, ht, region, ep| catalog_for_frame(&layers, w, wd, ht, region, ep),
+            );
+            match again {
+                Some(r) => {
+                    at.insert((shift * 100.0).round() as i64, r.result.as_ref().ok().map(|z| z.zero_point));
+                    out.shifts.push(forced_shift_line(c.frame_id, shift, &r));
+                }
+                None => eprintln!("zp_probe: frame {} the re-measure at {shift:+.2} came back empty", c.frame_id),
+            }
+        }
+        // The slope the re-measures give, per mag the window moves fainter: the two-sided difference at +-0.1.
+        row.slope_remeasured = match (at.get(&10).copied().flatten(), at.get(&-10).copied().flatten()) {
+            (Some(up), Some(down)) => Some((up - down) / 0.2),
+            _ => None,
+        };
     }
     row.rss_mb = peak_rss_mb();
-    (row, lines)
+    out.row = row;
+    out
+}
+
+/// `<x>.<kind>.tsv` for `<x>.tsv`.
+fn side_path(out: &str, kind: &str) -> String {
+    format!("{}.{kind}.tsv", out.strip_suffix(".tsv").unwrap_or(out))
 }
 
 /// `<x>.stars.tsv` for `<x>.tsv`.
 fn stars_path(out: &str) -> String {
-    format!("{}.stars.tsv", out.strip_suffix(".tsv").unwrap_or(out))
+    side_path(out, "stars")
 }
 
 /// The text of `<x>.flags.txt`: the command line's flags (sorted) and every parameter the run used, in full, so a tuning
@@ -3447,7 +3689,9 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     let identity_every: usize = args
         .take_parsed("identity-every")?
         .unwrap_or(IDENTITY_EVERY_DEFAULT);
+    let dump_ap = args.take_parsed::<u8>("dump-ap")?.unwrap_or(0) != 0;
     let (fp, params, given) = take_forced_params(&mut args)?;
+    check_annulus_rule(&fp)?;
 
     let conn = open_read_only(&db)?;
     let rig = open_rig(&conn, &app_data, params)?;
@@ -3464,6 +3708,15 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     writeln!(w, "{FORCED_HEADER}")?;
     let mut ws = create_out(&stars_path(&out))?;
     writeln!(ws, "{FORCED_STARS_HEADER}")?;
+    let mut wh = create_out(&side_path(&out, "shifts"))?;
+    writeln!(wh, "{FORCED_SHIFTS_HEADER}")?;
+    let mut wa = if dump_ap {
+        let mut w = create_out(&side_path(&out, "ap"))?;
+        writeln!(w, "{FORCED_AP_HEADER}")?;
+        Some(w)
+    } else {
+        None
+    };
     let (mut measured, mut refused, mut examined) = (0usize, 0usize, 0usize);
     let mut first_rotation: HashMap<String, f64> = HashMap::new();
     for c in &candidates {
@@ -3491,7 +3744,7 @@ fn cmd_forced(mut args: Args) -> Result<()> {
             continue;
         }
         let identity = identity_every > 0 && measured % identity_every == 0;
-        let (mut row, star_lines) = forced_frame(&conn, &rig, &fp, c, identity);
+        let FrameOut { mut row, stars, aps, shifts } = forced_frame(&conn, &rig, &fp, c, identity, dump_ap);
         if let Some(rot) = row.rotation_deg {
             let first = *first_rotation.entry(c.night.clone()).or_insert(rot);
             row.pier = Some(pier_side(first, rot));
@@ -3500,11 +3753,21 @@ fn cmd_forced(mut args: Args) -> Result<()> {
             refused += 1;
         }
         writeln!(w, "{}", row.to_tsv())?;
-        for l in &star_lines {
+        for l in &stars {
             writeln!(ws, "{l}")?;
+        }
+        for l in &shifts {
+            writeln!(wh, "{l}")?;
+        }
+        if let Some(wa) = wa.as_mut() {
+            for l in &aps {
+                writeln!(wa, "{l}")?;
+            }
+            wa.flush()?;
         }
         w.flush()?;
         ws.flush()?;
+        wh.flush()?;
         measured += 1;
         if measured % PROGRESS_EVERY == 0 {
             eprintln!(
@@ -3514,10 +3777,12 @@ fn cmd_forced(mut args: Args) -> Result<()> {
     }
     w.flush()?;
     ws.flush()?;
+    wh.flush()?;
     eprintln!(
-        "zp_probe summary: examined {examined} of {} lights, measured {measured} ({refused} without a zero point); wrote {out} and {}",
+        "zp_probe summary: examined {examined} of {} lights, measured {measured} ({refused} without a zero point); wrote {out}, {} and {}",
         candidates.len(),
-        stars_path(&out)
+        stars_path(&out),
+        side_path(&out, "shifts")
     );
     Ok(())
 }
@@ -3628,12 +3893,14 @@ impl FNight<'_> {
         self.rig.starts_with("QHY268M")
     }
 
-    fn rig_short(&self) -> String {
-        let parts: Vec<&str> = self.rig.split('|').collect();
-        match (parts.first(), parts.last()) {
-            (Some(a), Some(b)) if parts.len() > 1 => format!("{a}/{b}"),
-            _ => self.rig.clone(),
-        }
+}
+
+/// A rig key as `camera/filter`.
+fn rig_short_of(rig: &str) -> String {
+    let parts: Vec<&str> = rig.split('|').collect();
+    match (parts.first(), parts.last()) {
+        (Some(a), Some(b)) if parts.len() > 1 => format!("{a}/{b}"),
+        _ => rig.to_string(),
     }
 }
 
@@ -3673,6 +3940,45 @@ fn forced_nights<'a>(rows: &'a [ForcedRow], common: Option<&CommonIndex>) -> Vec
         .collect()
 }
 
+/// What a reduction group is: a rig, the probe's frame set (the object) and the exposure to 0.1 s. The exposure is in the
+/// key because `G_b` carries `+ 2.5 log10(t)`: two exposures in one pool would put a step of the window into the median
+/// (H2); one exposure per set in the corpus.
+type ReductionKey = (String, String, i64);
+
+fn reduction_key(r: &ForcedRow) -> ReductionKey {
+    (r.rig_key(), r.object.clone(), (r.exptime.unwrap_or(0.0) * 10.0).round() as i64)
+}
+
+/// The rows with `zero_point` and `zero_point_6r` read in the common window of their group (spec section 5.6): `P` the
+/// median `window_bright` and `s` the median `window_slope` (over the frames that have one, 0 when none) of the group's
+/// valid rows, a frame reading `ZP - s (G_b - P)` (core's `common_window`, the one `reduce_to_common_window` is made of;
+/// a single frame reads its own). The 6r referee is reduced by the same group's window, today's zero point has no window
+/// and is read as it is. Returns the rows and each group's window.
+fn reduce_rows(rows: &[ForcedRow]) -> (Vec<ForcedRow>, BTreeMap<ReductionKey, CommonWindow>) {
+    let mut pools: BTreeMap<ReductionKey, Vec<(f64, Option<f64>)>> = BTreeMap::new();
+    for r in rows.iter().filter(|r| !r.is_unmeasured()) {
+        if let (Some(_), Some(gb)) = (r.zero_point, r.window_bright) {
+            pools.entry(reduction_key(r)).or_default().push((gb, r.window_slope));
+        }
+    }
+    let windows: BTreeMap<ReductionKey, CommonWindow> = pools
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), common_window(v)?)))
+        .collect();
+    let reduced = rows
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if let (Some(w), Some(gb)) = (windows.get(&reduction_key(&r)), r.window_bright) {
+                r.zero_point = r.zero_point.map(|z| w.reduce(z, gb));
+                r.zero_point_6r = r.zero_point_6r.map(|z| w.reduce(z, gb));
+            }
+            r
+        })
+        .collect();
+    (reduced, windows)
+}
+
 /// Consecutive pairs of the frames `keep` accepts, in time order, a pair kept when its frames are under 15 minutes apart.
 fn time_pairs<'a>(
     rows: &[&'a ForcedRow],
@@ -3695,7 +4001,9 @@ fn time_pairs<'a>(
 /// The kept keys of the frames, read from `<x>.stars.tsv`: sorted, per frame id.
 type KeptKeys = HashMap<i64, Vec<u64>>;
 
-/// Streams a stars TSV for the keys of the list stars the fitter kept, per frame.
+/// Streams a stars TSV for the keys of the list stars a frame's statistic kept, per frame: a member (`member = 1`) of
+/// non-zero weight (`weight > 0`) that the screen left (`screened_in = 1`), the stars `zp_stars` counts (B1 counts those
+/// and no others: a member the screen dropped is left out).
 fn read_kept_keys(path: &str, into: &mut KeptKeys) -> Result<()> {
     let file = File::open(path).with_context(|| format!("reading {path}"))?;
     let mut lines = BufReader::new(file).lines();
@@ -3711,15 +4019,17 @@ fn read_kept_keys(path: &str, into: &mut KeptKeys) -> Result<()> {
             .position(|h| h == name)
             .ok_or_else(|| anyhow!("{path} has no {name} column"))
     };
-    let (i_frame, i_key, i_kept) = (at("frame_id")?, at("key")?, at("kept")?);
+    let (i_frame, i_key, i_weight, i_member, i_screened) =
+        (at("frame_id")?, at("key")?, at("weight")?, at("member")?, at("screened_in")?);
     for line in lines {
         let line = line?;
         let f: Vec<&str> = line.split('\t').collect();
-        let (Some(id), Some(key), Some(kept)) = (f.get(i_frame), f.get(i_key), f.get(i_kept))
+        let (Some(id), Some(key), Some(weight), Some(member), Some(screened)) =
+            (f.get(i_frame), f.get(i_key), f.get(i_weight), f.get(i_member), f.get(i_screened))
         else {
             continue;
         };
-        if *kept != "1" {
+        if *member != "1" || *screened != "1" || !weight.parse::<f64>().is_ok_and(|w| w > 0.0) {
             continue;
         }
         if let (Ok(id), Ok(key)) = (id.parse::<i64>(), u64::from_str_radix(key, 16)) {
@@ -3762,6 +4072,59 @@ fn kept_shares(night: &FNight, keys: &KeptKeys) -> Vec<f64> {
             (!ka.is_empty()).then(|| sorted_intersection(ka, kb) as f64 / ka.len() as f64)
         })
         .collect()
+}
+
+/// Pearson's correlation of `(x, y)` pairs; `None` under 3 pairs or no spread in either.
+fn correlation(pairs: &[(f64, f64)]) -> Option<f64> {
+    let n = pairs.len();
+    if n < 3 {
+        return None;
+    }
+    let nf = n as f64;
+    let (mx, my) = (pairs.iter().map(|p| p.0).sum::<f64>() / nf, pairs.iter().map(|p| p.1).sum::<f64>() / nf);
+    let sxx: f64 = pairs.iter().map(|p| (p.0 - mx).powi(2)).sum();
+    let syy: f64 = pairs.iter().map(|p| (p.1 - my).powi(2)).sum();
+    let sxy: f64 = pairs.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+    (sxx > 1e-24 && syy > 1e-24).then(|| sxy / (sxx * syy).sqrt())
+}
+
+/// The flag combinations that break rustafits' annulus rule (the annulus must start at least 0.75 px beyond the largest
+/// radius, or the second pass is dropped and every frame reads `internal`), by the flags' names. The frame's FWHM `F` is
+/// not known before a frame, so the rule is read for every `F`: the disc's `F` part under the annulus' (`aperture_radius_fwhm`
+/// not above `annulus_start_fwhm`), the `FWHM_ref` radii under the outer pedestal radius the annulus starts from
+/// (`pedestal_radii_ref` rising to its last, `aperture_radius_ref` not above it), and a gap of at least 0.75 px.
+fn check_annulus_rule(p: &ForcedListParams) -> Result<()> {
+    let mut why = Vec::new();
+    if !(p.annulus_gap_px >= 0.75) {
+        why.push(format!("--annulus_gap_px {} is under 0.75", p.annulus_gap_px));
+    }
+    if !(p.aperture_radius_fwhm <= p.annulus_start_fwhm) {
+        why.push(format!(
+            "--aperture_radius_fwhm {} is above --annulus_start_fwhm {}",
+            p.aperture_radius_fwhm, p.annulus_start_fwhm
+        ));
+    }
+    let outer = p.pedestal_radii_ref[2];
+    if !(p.pedestal_radii_ref[0] <= outer && p.pedestal_radii_ref[1] <= outer) {
+        why.push(format!(
+            "--pedestal_radii_ref {:?} has a radius above its last (the annulus starts from the last)",
+            p.pedestal_radii_ref
+        ));
+    }
+    if !(p.aperture_radius_ref <= outer) {
+        why.push(format!(
+            "--aperture_radius_ref {} is above the last --pedestal_radii_ref {outer}",
+            p.aperture_radius_ref
+        ));
+    }
+    if why.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "the annulus would reach into a disc (it must start 0.75 px beyond the largest radius, or the second fit pass is dropped and every frame reads internal): {}",
+            why.join("; ")
+        )
+    }
 }
 
 /// Least squares `y = a + s x`: the slope, its standard error and the points; `None` under 3 points or one x.
@@ -3891,12 +4254,13 @@ fn b2_night(night: &FNight) -> (String, Outcome) {
 struct B3Night {
     points: usize,
     rms: f64,
+    /// ZP - stack against the frame's FWHM: slope and its error.
     slope: f64,
     se: f64,
-    /// ZP against the plain 6F zero point on the same list: slope, error, points.
-    slope_6f: Option<(f64, f64, usize)>,
-    /// The plain 6F zero point against the stack, for information.
-    ref_6f_vs_stack: Option<f64>,
+    /// ZP - 6r against the FWHM (the referee's own slope, on the same members and weights): slope, error, points.
+    slope_zp_6r: Option<(f64, f64, usize)>,
+    /// 6r - stack against the FWHM, for information.
+    slope_6r_stack: Option<(f64, f64, usize)>,
 }
 
 /// The slope of `y` on `x` with a step between the pier sides when `sided` (`y = s x + a + step side`): slope, its
@@ -3912,7 +4276,8 @@ fn slope_by_side(xs: &[f64], ys: &[f64], sides: &[f64], sided: bool) -> Option<(
 }
 
 /// B3 of a night. On a two-sided night it is judged one pier side at a time (owner ruling F7: the flip step is not a
-/// judge of the method): the rms is about each side's own median and every slope carries a step between the sides.
+/// judge of the method): the rms is about each side's own median and every slope carries a step between the sides. The
+/// rows are the reduced ones (spec section 5.6).
 fn b3_night(night: &FNight, common: &CommonIndex) -> Option<B3Night> {
     let sided = night.two_sided();
     let mut d = Vec::new();
@@ -3928,7 +4293,7 @@ fn b3_night(night: &FNight, common: &CommonIndex) -> Option<B3Night> {
         d.push(zp - level);
         fw.push(f);
         sd.push(side);
-        if let Some(z6) = r.zero_point_6f {
+        if let Some(z6) = r.zero_point_6r {
             x6.push(f);
             y6.push(zp - z6);
             r6.push(z6 - level);
@@ -3951,18 +4316,31 @@ fn b3_night(night: &FNight, common: &CommonIndex) -> Option<B3Night> {
         }
     }
     let rms = (centred.iter().map(|v| v * v).sum::<f64>() / centred.len().max(1) as f64).sqrt();
+    let referee = |ys: &[f64]| (x6.len() >= B3_MIN_POINTS).then(|| slope_by_side(&x6, ys, &s6, sided)).flatten();
     Some(B3Night {
         points: d.len(),
         rms,
         slope,
         se,
-        slope_6f: (x6.len() >= B3_MIN_POINTS)
-            .then(|| slope_by_side(&x6, &y6, &s6, sided))
-            .flatten(),
-        ref_6f_vs_stack: (x6.len() >= B3_MIN_POINTS)
-            .then(|| slope_by_side(&x6, &r6, &s6, sided).map(|s| s.0))
-            .flatten(),
+        slope_zp_6r: referee(&y6),
+        slope_6r_stack: referee(&r6),
     })
+}
+
+/// B3's slope against the stack. Within +-0.04 it passes. Beyond it the bar is missed whether or not 6r echoes it (M2: 6r
+/// shares the list, positions, annulus, pedestal, screen and weights, so it cannot clear a slope the stack shows): the
+/// line says which. Echoed means ZP - 6r is beyond +-0.04 on the same side, 6r agreeing with the stack against ZP; not
+/// echoed means 6r agrees with ZP and the stack stands alone, the owner's as a stated limit with the three slopes.
+fn b3_slope_outcome(b: &B3Night) -> (Outcome, String) {
+    if b.slope.abs() <= B3_SLOPE_MAX {
+        return (Outcome::Pass, String::new());
+    }
+    let note = match &b.slope_zp_6r {
+        Some((s6, _, _)) if s6.abs() > B3_SLOPE_MAX && s6 * b.slope > 0.0 => " (echoed by 6r: a miss)".to_string(),
+        Some(_) => " (not echoed by 6r, no pass: the owner's as a stated limit)".to_string(),
+        None => " (no 6r to say: no pass, the owner's)".to_string(),
+    };
+    (Outcome::Fail, note)
 }
 
 fn b3_entry(night: &FNight, common: &CommonIndex) -> (String, Outcome) {
@@ -3976,33 +4354,19 @@ fn b3_entry(night: &FNight, common: &CommonIndex) -> (String, Outcome) {
         );
     };
     let rms_ok = b.rms <= B3_RMS_MAX;
-    // The slope misses only when the plain 6F reference agrees with the stack's: both see the same seeing term.
-    let (slope_o, note) = if b.slope.abs() <= B3_SLOPE_MAX {
-        (Outcome::Pass, String::new())
-    } else {
-        match b.slope_6f {
-            Some((s6, _, _)) if s6.abs() > B3_SLOPE_MAX && s6 * b.slope > 0.0 => {
-                (Outcome::Fail, String::new())
-            }
-            Some(_) => (
-                Outcome::Pass,
-                " (stack slope not confirmed by 6F: reference-limited)".to_string(),
-            ),
-            None => (Outcome::Unjudged, " (no 6F reference)".to_string()),
-        }
-    };
+    let (slope_o, note) = b3_slope_outcome(&b);
     let o = if !rms_ok { Outcome::Fail } else { slope_o };
+    let sl = |s: &Option<(f64, f64, usize)>| s.map_or_else(|| "n/a".to_string(), |s| format!("{:+.4}", s.0));
     (
         format!(
-            "{}: rms {:.4}, slope {:+.4} +- {:.4} vs stack, {} vs 6F ({} frames; 6F against stack {}){note}",
+            "{}: rms {:.4}, slopes ZP-stack {:+.4} +- {:.4}, ZP-6r {}, 6r-stack {} ({} frames){note}",
             night.label(),
             b.rms,
             b.slope,
             b.se,
-            b.slope_6f
-                .map_or_else(|| "n/a".to_string(), |s| format!("{:+.4} +- {:.4}", s.0, s.1)),
+            sl(&b.slope_zp_6r),
+            sl(&b.slope_6r_stack),
             b.points,
-            show(b.ref_6f_vs_stack, 4),
         ),
         o,
     )
@@ -4050,10 +4414,16 @@ fn b4_entry(night: &FNight, common: &CommonIndex) -> (String, Outcome) {
         match (ols(&xs, &zs), ols(&xs, &ls)) {
             (Some(z), Some(l)) => {
                 let o = judge_max(Some((z.0 - l.0).abs()), B4_K_TOL);
+                // dk's own standard error, for the owner (RR2: no allowance in the bar): the slope of the difference
+                // of the two series on the airmass, whose error holds what the two fits share.
+                let dzp: Vec<f64> = zs.iter().zip(&ls).map(|(a, b)| a - b).collect();
+                let dk_se = ols(&xs, &dzp).map(|d| d.1);
                 parts.push(format!(
-                    "{name}k {:+.4} vs stack {:+.4} (range {dx:.2}, {} frames) {}",
+                    "{name}k {:+.4} vs stack {:+.4} (dk {:+.4} +- {}, range {dx:.2}, {} frames) {}",
                     z.0,
                     l.0,
+                    z.0 - l.0,
+                    show(dk_se, 4),
                     z.2,
                     tag(o)
                 ));
@@ -4170,13 +4540,17 @@ fn forced_verdict_lines(
     keys: Option<&KeptKeys>,
 ) -> Vec<String> {
     let index = common.map(CommonIndex::new);
-    let nights = forced_nights(all_rows, index.as_ref());
+    // B2-B5 and B8 judge the reduced zero point (spec section 5.6, per rig, object and exposure); the decision rows and
+    // today's zero point read the stored ones.
+    let (reduced, windows) = reduce_rows(all_rows);
+    let nights = forced_nights(&reduced, index.as_ref());
     let measured = all_rows.iter().filter(|r| !r.is_unmeasured()).count();
     let unmeasured = all_rows.len() - measured;
     let mut lines = vec![format!(
-        "ZP PROBE forced: {measured} frames measured ({unmeasured} not measured), {} judged nights (>= {OSC_NIGHT_MIN_FRAMES} measured frames, {} common-set)",
+        "ZP PROBE forced: {measured} frames measured ({unmeasured} not measured), {} judged nights (>= {OSC_NIGHT_MIN_FRAMES} measured frames, {} common-set), zero points reduced in {} (rig, object, exposure) groups",
         nights.len(),
-        nights.iter().filter(|n| n.common()).count()
+        nights.iter().filter(|n| n.common()).count(),
+        windows.len()
     )];
     let mut bars: Vec<(&str, Outcome)> = Vec::new();
     let mut push = |lines: &mut Vec<String>, name: &'static str, r: (String, Outcome)| {
@@ -4214,7 +4588,7 @@ fn forced_verdict_lines(
         &mut lines,
         "B1",
         bar_line(
-            "B1 kept list stars shared with the successor (valid pairs)",
+            "B1 members of non-zero weight left by the screen that the successor also has (valid pairs)",
             &format!("(every pair >= {B1_MIN_SHARE:.2})"),
             &entries,
         ),
@@ -4246,7 +4620,7 @@ fn forced_verdict_lines(
         "B3",
         bar_line(
             "B3 ZP - 2.5 log10(t_flux/t), common-set nights",
-            &format!("(rms <= {B3_RMS_MAX:.3}; |slope on FWHM| <= {B3_SLOPE_MAX:.2}, a miss when the 6F reference agrees)"),
+            &format!("(reduced; rms <= {B3_RMS_MAX:.3}; |slope on FWHM| <= {B3_SLOPE_MAX:.2} against the stack, echoed by 6r or not)"),
             &entries,
         ),
     );
@@ -4270,43 +4644,32 @@ fn forced_verdict_lines(
         ),
     );
 
-    // B5: nights without a common set, per rig
+    // B5: nights without a common set, one night at a time (RR1): `zp = a + k X + s F` (+ a step between the sides)
+    // fitted jointly on the night, so a night's own extinction is not read as a seeing term.
     let mut entries: Vec<(String, Outcome)> = Vec::new();
-    let rigs: std::collections::BTreeSet<String> = nights.iter().map(|n| n.rig.clone()).collect();
-    for rig in &rigs {
-        let members: Vec<&FNight> = nights
-            .iter()
-            .filter(|n| &n.rig == rig && !n.common())
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        let (fit, no_airmass, frames) = rig_fit(&members, |r| r.zero_point, |_| true);
-        let short = members[0].rig_short();
+    for n in nights.iter().filter(|n| !n.common()) {
+        let (fit, no_airmass, frames) = rig_fit(&[n], |r| r.zero_point, |_| true);
         match fit {
             None => entries.push((
-                format!("{short}: no fit ({frames} frames, {no_airmass} without an airmass)"),
+                format!("{}: no fit ({frames} frames, {no_airmass} without an airmass)", n.label()),
                 Outcome::Unjudged,
             )),
             Some(f) => {
-                for (i, n) in members.iter().enumerate() {
-                    let nf = f.nights[i];
-                    let o = match nf {
-                        Some(x) if x.slope_se <= SLOPE_SE_MAX => {
-                            judge_max(Some(x.slope.abs()), SLOPE_MAX)
-                        }
-                        _ => Outcome::Unjudged,
-                    };
-                    entries.push((
-                        format!(
-                            "{} [k {:+.3}, {no_airmass} without an airmass]: {}",
-                            n.label(),
-                            f.k,
-                            slope_text(&nf)
-                        ),
-                        o,
-                    ));
-                }
+                let nf = f.nights[0];
+                let o = match nf {
+                    Some(x) if x.slope_se <= SLOPE_SE_MAX => judge_max(Some(x.slope.abs()), SLOPE_MAX),
+                    _ => Outcome::Unjudged,
+                };
+                entries.push((
+                    format!(
+                        "{} [k {:+.3} +- {:.3}, {no_airmass} without an airmass]: {}",
+                        n.label(),
+                        f.k,
+                        f.k_se,
+                        slope_text(&nf)
+                    ),
+                    o,
+                ));
             }
         }
     }
@@ -4314,8 +4677,8 @@ fn forced_verdict_lines(
         &mut lines,
         "B5",
         bar_line(
-            "B5 seeing slope, nights without a common set",
-            &format!("(|s| <= {SLOPE_MAX:.2} where its error <= {SLOPE_SE_MAX:.3})"),
+            "B5 seeing slope, nights without a common set, one night's own fit",
+            &format!("(reduced; |s| <= {SLOPE_MAX:.2} where its error <= {SLOPE_SE_MAX:.3})"),
             &entries,
         ),
     );
@@ -4381,59 +4744,42 @@ fn forced_verdict_lines(
         &mut lines,
         "B7",
         bar_line(
-            "B7 median |refit - moved seed| centre",
+            "B7 map stars, median |refit - moved seed|",
             &format!("(<= {B7_MAX_FWHM_REF:.2} FWHM_ref)"),
             &entries,
         ),
     );
 
-    // B8: mono rigs, the seeing slope of the forced zero point against today's on the same frames
+    // B8: mono nights, the seeing slope of the forced zero point against today's on the same frames, each night fitted
+    // on its own (RR1), the forced zero point reduced and today's as it is.
     let mut entries: Vec<(String, Outcome)> = Vec::new();
-    let mono_rigs: std::collections::BTreeSet<String> = nights
-        .iter()
-        .filter(|n| n.mono())
-        .map(|n| n.rig.clone())
-        .collect();
-    for rig in &mono_rigs {
-        let members: Vec<&FNight> = nights
-            .iter()
-            .filter(|n| &n.rig == rig && n.mono())
-            .collect();
+    for n in nights.iter().filter(|n| n.mono()) {
         let both = |r: &ForcedRow| r.zero_point.is_some() && r.zero_point_today.is_some();
-        let (ours, _, _) = rig_fit(&members, |r| r.zero_point, both);
-        let (today, _, _) = rig_fit(&members, |r| r.zero_point_today, both);
-        for (i, n) in members.iter().enumerate() {
-            let o_fit = ours.as_ref().and_then(|f| f.nights[i]);
-            let t_fit = today.as_ref().and_then(|f| f.nights[i]);
-            let o = match (o_fit, t_fit) {
-                (Some(a), Some(t)) if a.slope_se <= SLOPE_SE_MAX => {
-                    if a.slope.abs() <= SLOPE_MAX
-                        && a.slope.abs() <= t.slope.abs() + B8_SIGMAS * t.slope_se
-                    {
-                        Outcome::Pass
-                    } else {
-                        Outcome::Fail
-                    }
+        let (ours, _, _) = rig_fit(&[n], |r| r.zero_point, both);
+        let (today, _, _) = rig_fit(&[n], |r| r.zero_point_today, both);
+        let o_fit = ours.as_ref().and_then(|f| f.nights[0]);
+        let t_fit = today.as_ref().and_then(|f| f.nights[0]);
+        let o = match (o_fit, t_fit) {
+            (Some(a), Some(t)) if a.slope_se <= SLOPE_SE_MAX => {
+                if a.slope.abs() <= SLOPE_MAX && a.slope.abs() <= t.slope.abs() + B8_SIGMAS * t.slope_se {
+                    Outcome::Pass
+                } else {
+                    Outcome::Fail
                 }
-                _ => Outcome::Unjudged,
-            };
-            entries.push((
-                format!(
-                    "{}: {} against today {}",
-                    n.label(),
-                    slope_text(&o_fit),
-                    slope_text(&t_fit)
-                ),
-                o,
-            ));
-        }
+            }
+            _ => Outcome::Unjudged,
+        };
+        entries.push((
+            format!("{}: {} against today {}", n.label(), slope_text(&o_fit), slope_text(&t_fit)),
+            o,
+        ));
     }
     push(
         &mut lines,
         "B8",
         bar_line(
-            "B8 mono rigs, seeing slope",
-            &format!("(|s| <= {SLOPE_MAX:.2} and <= |today| + {B8_SIGMAS:.0} sigma, error <= {SLOPE_SE_MAX:.3})"),
+            "B8 mono nights, seeing slope, one night's own fit",
+            &format!("(reduced; |s| <= {SLOPE_MAX:.2} and <= |today| + {B8_SIGMAS:.0} sigma, error <= {SLOPE_SE_MAX:.3})"),
             &entries,
         ),
     );
@@ -4473,10 +4819,47 @@ fn forced_verdict_lines(
     );
 
     // Reported only
+    let med = |rows: &[&ForcedRow], f: &dyn Fn(&ForcedRow) -> Option<f64>| {
+        median(&mut rows.iter().filter_map(|r| f(r)).collect::<Vec<_>>())
+    };
+    let min_of = |rows: &[&ForcedRow], f: &dyn Fn(&ForcedRow) -> Option<f64>| {
+        rows.iter().filter_map(|r| f(r)).fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.min(v))))
+    };
     let per_night: Vec<String> = nights
         .iter()
         .map(|n| {
-            let med = |f: &dyn Fn(&ForcedRow) -> Option<f64>| median(&mut n.rows.iter().filter_map(|r| f(r)).collect::<Vec<_>>());
+            format!(
+                "{}: list {}, members {} (tapered {}), map {}/{} kept {}, pedestal {} (clip kept min {} med {}, r with the reduced ZP {})",
+                n.label(),
+                show(med(&n.rows, &|r| r.list_stars.map(|v| v as f64)), 0),
+                show(med(&n.rows, &|r| r.members.map(|v| v as f64)), 0),
+                show(med(&n.rows, &|r| r.tapered.map(|v| v as f64)), 0),
+                show(med(&n.rows, &|r| r.map_members.map(|v| v as f64)), 0),
+                show(med(&n.rows, &|r| r.map_stars.map(|v| v as f64)), 0),
+                show(med(&n.rows, &|r| r.map_kept_share), 3),
+                show(med(&n.rows, &|r| r.pedestal), 4),
+                show(min_of(&n.rows, &|r| r.pedestal_kept_share), 3),
+                show(med(&n.rows, &|r| r.pedestal_kept_share), 3),
+                show(
+                    correlation(
+                        &n.rows.iter().filter_map(|r| Some((r.zero_point?, r.pedestal_kept_share?))).collect::<Vec<_>>()
+                    ),
+                    2
+                ),
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "reported, per night (median over its frames): {}",
+        if per_night.is_empty() {
+            "no judged night".to_string()
+        } else {
+            per_night.join("; ")
+        }
+    ));
+    let per_night: Vec<String> = nights
+        .iter()
+        .map(|n| {
             let mut refusals: BTreeMap<&str, usize> = BTreeMap::new();
             for r in n.rows.iter().filter(|r| !r.refusal.is_empty()) {
                 *refusals.entry(r.refusal.as_str()).or_default() += 1;
@@ -4486,26 +4869,36 @@ fn forced_verdict_lines(
             } else {
                 refusals.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(",")
             };
+            let both: Vec<&ForcedRow> = n
+                .rows
+                .iter()
+                .copied()
+                .filter(|r| r.window_slope.is_some() && r.slope_remeasured.is_some())
+                .collect();
+            let group = n.rows.first().and_then(|r| windows.get(&reduction_key(r)));
+            let valid = n.rows.iter().filter(|r| r.valid()).count();
+            let with_slope = n.rows.iter().filter(|r| r.valid() && r.window_slope.is_some()).count();
             format!(
-                "{}: c list {} / budget {}, list {} (before cap {}), kept {}, ring_missing {}, refusals {refused}",
+                "{}: window slope analytic {} / re-measured {} ({} frames), set slope {}, {with_slope}/{valid} with one, refusals {refused}",
                 n.label(),
-                show(med(&|r| r.c), 4),
-                show(med(&|r| r.c_budget), 4),
-                show(med(&|r| r.list_stars.map(|v| v as f64)), 0),
-                show(med(&|r| r.list_before_cap.map(|v| v as f64)), 0),
-                show(med(&|r| r.kept.map(|v| v as f64)), 0),
-                show(med(&|r| r.ring_missing.map(|v| v as f64)), 0),
+                show(med(&both, &|r| r.window_slope), 4),
+                show(med(&both, &|r| r.slope_remeasured), 4),
+                both.len(),
+                show(group.map(|w| w.slope), 4),
             )
         })
         .collect();
     lines.push(format!(
-        "reported, per night: {}",
+        "reported, per night (window slope, mag per mag): {}",
         if per_night.is_empty() {
             "no judged night".to_string()
         } else {
             per_night.join("; ")
         }
     ));
+
+    // The cost: per frame set the medians of the fitter's three steps and of the list alone (the call less the plain
+    // measurement, on the frames measured both ways); a set above `LIST_COST_MAX_MS` is named (RR4's STOP).
     let mut call: Vec<f64> = all_rows.iter().filter_map(|r| r.call_ms).collect();
     let mut list_ms: Vec<f64> = all_rows
         .iter()
@@ -4524,6 +4917,32 @@ fn forced_verdict_lines(
         show(median(&mut list_ms), 0),
         show(median(&mut kb), 0),
         show(rss, 0)
+    ));
+    let mut sets: BTreeMap<(String, String), Vec<&ForcedRow>> = BTreeMap::new();
+    for r in all_rows.iter().filter(|r| !r.is_unmeasured()) {
+        sets.entry((rig_short_of(&r.rig_key()), r.object.clone())).or_default().push(r);
+    }
+    let mut over = Vec::new();
+    let per_set: Vec<String> = sets
+        .iter()
+        .map(|((rig, object), rows)| {
+            let alone = med(rows, &|r| Some(r.call_ms? - r.plain_ms?));
+            if alone.is_some_and(|a| a > LIST_COST_MAX_MS) {
+                over.push(format!("{rig}/{object}"));
+            }
+            format!(
+                "{rig}/{object} {}/{}/{}/{}",
+                show(med(rows, &|r| r.list_fit_ms), 0),
+                show(med(rows, &|r| r.list_refit_ms), 0),
+                show(med(rows, &|r| r.list_ap_ms), 0),
+                show(alone, 0)
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "list cost per set, median ms fit/refit/apertures/list alone: {}; list alone over {LIST_COST_MAX_MS:.0} ms: {}",
+        if per_set.is_empty() { "no set".to_string() } else { per_set.join("; ") },
+        if over.is_empty() { "none".to_string() } else { over.join(", ") }
     ));
 
     // Decision rows (not bars): the cross-target spread per rig, forced against today on the same frames.
@@ -4784,6 +5203,25 @@ mod tests {
             assert_ne!(read(&d), 7.0, "--{name}: pick a probe value that is not the default");
             assert_ne!(fp, d, "--{name} changed nothing");
         }
+        // The one array field: its own flag reaches it and nothing else.
+        let (fp, _, _) = parsed(&["--pedestal_radii_ref", "7,8,9"]).unwrap();
+        assert_eq!(fp.pedestal_radii_ref, [7.0, 8.0, 9.0]);
+        assert_eq!(ForcedListParams { pedestal_radii_ref: d.pedestal_radii_ref, ..fp }, d);
+        // Every field is named below (a field added without a flag fails here to compile): the flag list and this
+        // destructuring are the two halves of the same check.
+        let ForcedListParams {
+            fwhm_floor_px: _, fwhm_ref_arcsec: _, anchor_min_matches: _, window_peak_fraction: _,
+            window_bright_margin_mag: _, window_faint_width_mag: _, window_faint_max_mag: _, min_isolated: _,
+            window_ramp_mag: _, region_fraction: _, edge_margin_fwhm: _, isolation_dmag: _, isolation_radius_fwhm: _,
+            bright_dmag: _, bright_radius_fwhm: _, cap: _, map_window_mag: _, map_max_stars: _, map_min_snr: _,
+            map_radius_fwhm: _, map_clip_rounds: _, map_clip_sigma: _, map_clip_floor_px: _, map_min_members: _,
+            map_min_kept_share: _, centre_tolerance_px: _, centre_tolerance_fwhm: _, aperture_radius_ref: _,
+            aperture_radius_fwhm: _, pedestal_radii_ref: _, pedestal_clip_sigma: _, pedestal_clip_rounds: _,
+            pedestal_min_points: _, annulus_area_px: _, annulus_start_fwhm: _, annulus_gap_px: _, peak_radius_ref: _,
+            clip_sigma: _, min_stars: _, max_sigma_mag: _, screen_taper_sigma: _, slope_min_ramp_members: _,
+            decimate: _, anchor_shift_mag: _,
+        } = d;
+        assert_eq!(flags.len() + 1, 44, "43 numeric fields have a flag each, the array field has its own");
     }
 
     #[test]
@@ -5388,6 +5826,34 @@ mod tests {
     }
 
     #[test]
+    fn the_stars_tsv_keeps_members_of_non_zero_weight_the_screen_left() {
+        // Per frame: a kept member, a member the screen dropped (weight 0, screened_in 0), a member whose weight is
+        // tapered (kept), a window-edge member of weight 0, and a list star that is no member.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.stars.tsv");
+        let text = format!(
+            "{FORCED_STARS_HEADER}\n\
+             7\t{:016x}\t14.000\t1.0000\t1\t1\n\
+             7\t{:016x}\t14.100\t0.0000\t1\t0\n\
+             7\t{:016x}\t14.200\t0.4000\t1\t1\n\
+             7\t{:016x}\t14.300\t0.0000\t1\t1\n\
+             7\t{:016x}\t09.000\t0.0000\t0\t0\n\
+             8\t{:016x}\t14.000\t1.0000\t1\t1\n",
+            11u64, 22u64, 33u64, 44u64, 55u64, 11u64
+        );
+        std::fs::write(&path, text).unwrap();
+        let mut keys: KeptKeys = HashMap::new();
+        read_kept_keys(path.to_str().unwrap(), &mut keys).unwrap();
+        assert_eq!(keys[&7], vec![11, 33], "{keys:?}");
+        assert_eq!(keys[&8], vec![11]);
+        // A file without the new columns is an error that names it, not a silent empty B1.
+        let old = dir.path().join("old.stars.tsv");
+        std::fs::write(&old, "frame_id\tkey\tkept\n7\t000000000000000b\t1\n").unwrap();
+        let e = read_kept_keys(old.to_str().unwrap(), &mut HashMap::new()).unwrap_err().to_string();
+        assert!(e.contains("no weight column"), "{e}");
+    }
+
+    #[test]
     fn b2_uses_the_common_bar_only_on_a_joined_night() {
         // |dZP| = 0.018 every pair; today's 0.03.
         let rows: Vec<ForcedRow> = (0..40)
@@ -5581,35 +6047,94 @@ mod tests {
             b.slope
         );
         assert_eq!(b3_entry(&night, &idx).1, Outcome::Pass);
-        // A seeing slope of 0.06 on the stack's side misses only when the 6F reference agrees.
+        // A stack slope of 0.06 is a miss with or without a 6r to say anything (the next test reads the notes).
         let mut rows = rows;
         for r in rows.iter_mut() {
             let f = r.median_fwhm.unwrap();
             r.zero_point = r.zero_point.map(|z| z + 0.06 * f);
         }
         let night = forced_nights(&rows, Some(&idx)).remove(0);
-        assert_eq!(
-            b3_entry(&night, &idx).1,
-            Outcome::Unjudged,
-            "no 6F reference is not a pass"
-        );
-        let mut agree = rows.clone();
-        for r in agree.iter_mut() {
-            r.zero_point_6f = r.zero_point.map(|z| z - 0.06 * r.median_fwhm.unwrap());
+        assert_eq!(b3_entry(&night, &idx).1, Outcome::Fail, "no 6r is not a pass");
+    }
+
+    /// Frames of `b4_rows` whose zero point carries a seeing term `s` against the stack, with the 6r referee `z6(zp, f)`.
+    fn b3_rows(s: f64, z6: impl Fn(f64, f64) -> Option<f64>) -> (Vec<ForcedRow>, Vec<CommonRow>) {
+        let (mut rows, common) = b4_rows(|i| 1.2 + 0.01 * i as f64, (-0.17, -0.17), (0.0, 0.0), None);
+        for r in rows.iter_mut() {
+            let f = r.median_fwhm.unwrap();
+            r.zero_point = r.zero_point.map(|z| z + s * f);
+            r.zero_point_6r = z6(r.zero_point.unwrap(), f);
         }
-        let night = forced_nights(&agree, Some(&idx)).remove(0);
-        assert_eq!(b3_entry(&night, &idx).1, Outcome::Fail);
-        let mut disagree = rows;
-        for r in disagree.iter_mut() {
-            r.zero_point_6f = r.zero_point.map(|z| {
-                z - 0.001 * r.median_fwhm.unwrap() - 0.059 * r.median_fwhm.unwrap()
-                    + 0.06 * r.median_fwhm.unwrap()
-            });
-        }
-        let night = forced_nights(&disagree, Some(&idx)).remove(0);
+        (rows, common)
+    }
+
+    #[test]
+    fn b3_a_stack_slope_miss_six_r_does_not_echo_is_no_pass() {
+        // Within the bar: passes with the three slopes printed.
+        let (rows, common) = b3_rows(0.03, |z, _| Some(z));
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
         let (text, o) = b3_entry(&night, &idx);
         assert_eq!(o, Outcome::Pass, "{text}");
-        assert!(text.contains("reference-limited"), "{text}");
+        assert!(text.contains("slopes ZP-stack +0.0300") && text.contains("ZP-6r ") && text.contains("6r-stack "), "{text}");
+        let b = b3_night(&night, &idx).unwrap();
+        assert!((b.slope - 0.03).abs() < 1e-9 && b.slope_zp_6r.unwrap().0.abs() < 1e-9, "{:?}", b.slope_zp_6r);
+        assert!((b.slope_6r_stack.unwrap().0 - 0.03).abs() < 1e-9);
+        // Beyond +-0.04 against the stack, 6r agreeing with the stack against ZP: a miss, echoed.
+        let (rows, common) = b3_rows(0.06, |z, f| Some(z - 0.06 * f));
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        let (text, o) = b3_entry(&night, &idx);
+        assert_eq!(o, Outcome::Fail, "{text}");
+        assert!(text.contains("echoed by 6r: a miss"), "{text}");
+        let b = b3_night(&night, &idx).unwrap();
+        assert!((b.slope_zp_6r.unwrap().0 - 0.06).abs() < 1e-9 && b.slope_6r_stack.unwrap().0.abs() < 1e-9);
+        // Beyond +-0.04 with 6r equal to ZP (the referee shares everything but the outer light): still no pass, and the
+        // line says it is the owner's, with the three slopes.
+        let (rows, common) = b3_rows(0.06, |z, _| Some(z));
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        let (text, o) = b3_entry(&night, &idx);
+        assert_eq!(o, Outcome::Fail, "{text}");
+        assert!(text.contains("not echoed by 6r, no pass: the owner's as a stated limit"), "{text}");
+        assert!(text.contains("slopes ZP-stack +0.0600") && text.contains("ZP-6r ") && text.contains("6r-stack +0.0600"), "{text}");
+        let b = b3_night(&night, &idx).unwrap();
+        assert!(b.slope_zp_6r.unwrap().0.abs() < 1e-9 && (b.slope_6r_stack.unwrap().0 - 0.06).abs() < 1e-9);
+        // No 6r at all: no pass either.
+        let (rows, common) = b3_rows(0.06, |_, _| None);
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        let (text, o) = b3_entry(&night, &idx);
+        assert_eq!(o, Outcome::Fail, "{text}");
+        assert!(text.contains("no 6r to say"), "{text}");
+        // The scatter bar is its own: a clean slope with a noisy night misses on the rms.
+        let (mut rows, common) = b3_rows(0.0, |z, _| Some(z));
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.zero_point = r.zero_point.map(|z| z + if i % 2 == 0 { 0.03 } else { -0.03 });
+        }
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        assert_eq!(b3_entry(&night, &idx).1, Outcome::Fail);
+    }
+
+    #[test]
+    fn b4_prints_the_standard_error_of_dk_and_judges_it_unchanged() {
+        // k -0.17 against the stack's -0.12, noise-free: dk -0.05 exactly, a miss with no allowance, its error printed.
+        let (rows, common) = b4_rows(|i| 1.1 + 0.03 * i as f64, (-0.17, -0.12), (0.0, 0.0), None);
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        let (text, o) = b4_entry(&night, &idx);
+        assert_eq!(o, Outcome::Fail, "{text}");
+        assert!(text.contains("dk -0.0500 +- 0.0000"), "{text}");
+        // A noisy ZP: the error is the regression's and is not zero.
+        let (mut rows, common) = b4_rows(|i| 1.1 + 0.03 * i as f64, (-0.17, -0.17), (0.0, 0.0), None);
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.zero_point = r.zero_point.map(|z| z + 0.01 * wobble(i));
+        }
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        let (text, _) = b4_entry(&night, &idx);
+        assert!(text.contains("+- 0.00") && !text.contains("+- 0.0000,"), "{text}");
     }
 
     #[test]
@@ -5708,9 +6233,16 @@ mod tests {
                 r.zero_point_today = Some(21.0 - 0.2 * x + 0.008 * wobble(3 * i + 1));
                 r.list_stars = Some(900);
                 r.list_before_cap = Some(1400);
-                r.kept = Some(700);
-                r.c = Some(1.08);
-                r.call_ms = Some(2300.0);
+                r.map_stars = Some(120);
+                r.map_members = Some(110);
+                r.map_kept_share = Some(0.93);
+                r.members = Some(700);
+                r.tapered = Some(6);
+                r.pedestal = Some(0.4);
+                r.list_fit_ms = Some(20.0);
+                r.list_refit_ms = Some(18.0);
+                r.list_ap_ms = Some(9.0);
+                r.call_ms = Some(1960.0);
                 if i % 10 == 0 {
                     r.identity = "ok".into();
                     r.plain_ms = Some(1900.0);
@@ -5800,7 +6332,7 @@ mod tests {
     #[test]
     fn an_older_tsv_parses_and_a_forced_row_round_trips() {
         let header: Vec<String> = FORCED_HEADER.split('\t').map(str::to_string).collect();
-        // The first fifteen columns only, as an older file would end.
+        // The first fifteen columns only, as an older file would end: every new column parses empty.
         let fields: Vec<String> = (0..15)
             .map(|i| {
                 if i == 0 {
@@ -5812,9 +6344,18 @@ mod tests {
             .collect();
         let old = ForcedRow::from_fields(&header[..15], &fields);
         assert_eq!(
-            (old.frame_id, old.zero_point, old.identity.as_str()),
-            (Some(7), None, "")
+            (old.frame_id, old.zero_point, old.identity.as_str(), old.tapered, old.zero_point_6r, old.window_slope),
+            (Some(7), None, "", None, None, None)
         );
+        // A row of the r0 / f0 header (it has `c`, `accepted`, `zero_point_6f`, no map columns) still reads its common ones.
+        let f0 = "frame_id\tzero_point\tc\taccepted\tzero_point_6f\tidentity\n9\t21.5\t1.08\t400\t21.4\tok";
+        let (h, d) = f0.split_once('\n').unwrap();
+        let (h, d): (Vec<String>, Vec<String>) = (
+            h.split('\t').map(str::to_string).collect(),
+            d.split('\t').map(str::to_string).collect(),
+        );
+        let r0 = ForcedRow::from_fields(&h, &d);
+        assert_eq!((r0.frame_id, r0.zero_point, r0.identity.as_str(), r0.map_members), (Some(9), Some(21.5), "ok", None));
         let mut full = frow("n", T0, Some(21.0123), 2.4);
         full.pier = Some(1);
         full.rotation_deg = Some(-90.4);
@@ -5822,44 +6363,319 @@ mod tests {
         full.anchor = Some(21.2);
         full.anchor_stars = Some(31);
         full.window_bright = Some(13.4);
+        full.window_faint = Some(16.4);
         full.list_stars = Some(998);
-        full.c = Some(1.0345);
-        full.c_stars = Some(120);
+        full.map_stars = Some(400);
+        full.map_members = Some(371);
+        full.map_offset_px = Some(1.2345);
+        full.map_residual_px = Some(0.0612);
+        full.map_kept_share = Some(0.9125);
+        full.aperture_radius_px = Some(8.0);
+        full.members = Some(812);
+        full.tapered = Some(9);
+        full.zp_stars = Some(790);
+        full.pedestal = Some(0.31234);
+        full.pedestal_kept_share = Some(0.8667);
+        full.pedestal_zp_mag = Some(-0.00412);
+        full.annulus_off = Some(3);
+        full.window_slope = Some(0.0345);
+        full.slope_remeasured = Some(0.0301);
+        full.zero_point_6r = Some(21.0111);
         full.zero_point_today = Some(21.0368);
-        full.zero_point_6f = Some(19.5);
         full.identity = "mismatch:star_x".into();
         full.call_ms = Some(2310.0);
+        full.list_fit_ms = Some(21.0);
+        full.list_refit_ms = Some(19.0);
+        full.list_ap_ms = Some(11.0);
         full.refusal = "too_scattered".into();
         let cells: Vec<String> = full.to_tsv().split('\t').map(str::to_string).collect();
         assert_eq!(cells.len(), header.len(), "one cell per column");
         let back = ForcedRow::from_fields(&header, &cells);
         assert_eq!(
-            (
-                back.pier,
-                back.rotation_deg,
-                back.airmass,
-                back.anchor_stars,
-                back.list_stars
-            ),
+            (back.pier, back.rotation_deg, back.airmass, back.anchor_stars, back.list_stars),
             (Some(1), Some(-90.4), Some(1.2345), Some(31), Some(998))
         );
         assert_eq!(
-            (
-                back.c_stars,
-                back.zero_point_today,
-                back.zero_point_6f,
-                back.call_ms
-            ),
-            (Some(120), Some(21.0368), Some(19.5), Some(2310.0))
+            (back.map_stars, back.map_members, back.map_offset_px, back.map_residual_px, back.map_kept_share),
+            (Some(400), Some(371), Some(1.2345), Some(0.0612), Some(0.9125))
         );
         assert_eq!(
-            (
-                back.identity.as_str(),
-                back.refusal.as_str(),
-                back.zero_point
-            ),
+            (back.aperture_radius_px, back.members, back.tapered, back.zp_stars, back.annulus_off),
+            (Some(8.0), Some(812), Some(9), Some(790), Some(3))
+        );
+        assert_eq!(
+            (back.pedestal, back.pedestal_zp_mag, back.window_slope, back.slope_remeasured, back.zero_point_6r),
+            (Some(0.31234), Some(-0.00412), Some(0.0345), Some(0.0301), Some(21.0111))
+        );
+        assert_eq!(back.pedestal_kept_share, Some(0.8667));
+        assert_eq!(
+            (back.zero_point_today, back.call_ms, back.list_fit_ms, back.list_refit_ms, back.list_ap_ms),
+            (Some(21.0368), Some(2310.0), Some(21.0), Some(19.0), Some(11.0))
+        );
+        assert_eq!(
+            (back.identity.as_str(), back.refusal.as_str(), back.zero_point),
             ("mismatch:star_x", "too_scattered", Some(21.0123))
         );
         assert_eq!(stars_path("a/b/x.tsv"), "a/b/x.stars.tsv");
+        assert_eq!(side_path("a/b/x.tsv", "shifts"), "a/b/x.shifts.tsv");
+    }
+
+    /// 40 frames of one night of one set, every frame 180 s unless `exptime` says else, the zero point from `zp(i)`.
+    fn set_rows(object: &str, exptime: f64, zp: impl Fn(usize) -> f64, bright: impl Fn(usize) -> f64) -> Vec<ForcedRow> {
+        (0..40usize)
+            .map(|i| {
+                let t = T0 + i as i64 * 180 + (exptime as i64) * 100_000;
+                let mut r = frow("n", t, Some(zp(i)), 2.3 + 0.4 * (i as f64 / 5.0).sin());
+                r.object = object.into();
+                r.exptime = Some(exptime);
+                r.window_bright = Some(bright(i));
+                r.airmass = Some(1.2 + 0.01 * i as f64);
+                r.zero_point_today = Some(21.0 + if i % 2 == 0 { 0.0 } else { 0.005 });
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_verdict_reads_the_reduced_zero_point() {
+        // The window alternates 1 mag; the raw zero point follows it at 0.2 mag per mag: 0.2 mag apart frame to frame.
+        let with_slope = |rows: &mut Vec<ForcedRow>| {
+            for r in rows.iter_mut() {
+                r.window_slope = Some(0.2);
+            }
+        };
+        let bright = |i: usize| 13.0 + f64::from(i as u8 % 2);
+        let mut rows = set_rows("T", 180.0, |i| 21.0 + 0.2 * (bright(i) - 13.5), bright);
+        // Unreduced (no slope on any frame: s = 0) the night misses B2 by far ...
+        let lines = forced_verdict_lines(&rows, None, None);
+        let b2 = lines.iter().find(|l| l.starts_with("B2")).unwrap();
+        assert!(b2.contains("FAIL"), "{b2}");
+        // ... and read in the common window it is flat and passes, today's alternation 0.005 not exceeded.
+        with_slope(&mut rows);
+        let lines = forced_verdict_lines(&rows, None, None);
+        let b2 = lines.iter().find(|l| l.starts_with("B2")).unwrap();
+        assert!(b2.contains(" pass:") && b2.contains("0.0000 mag"), "{b2}");
+        assert!(lines[0].contains("reduced in 1 (rig, object, exposure) groups"), "{}", lines[0]);
+        // The reduction itself: every frame reads the zero point it would have at the median window.
+        let (reduced, windows) = reduce_rows(&rows);
+        let w = windows.values().next().unwrap();
+        assert!((w.pivot - 13.5).abs() < 1e-12 && (w.slope - 0.2).abs() < 1e-12);
+        assert!(reduced.iter().all(|r| (r.zero_point.unwrap() - 21.0).abs() < 1e-9));
+        // Today's zero point is read as it is, and a frame without a zero point stays without.
+        assert_eq!(reduced[3].zero_point_today, rows[3].zero_point_today);
+        let mut gap = rows.clone();
+        gap[5].zero_point = None;
+        assert_eq!(reduce_rows(&gap).0[5].zero_point, None);
+        // The reduction is core's: the probe's group window and `reduce_to_common_window` agree.
+        let mut core: Vec<(f64, f64, Option<f64>)> =
+            rows.iter().map(|r| (r.zero_point.unwrap(), r.window_bright.unwrap(), r.window_slope)).collect();
+        athenaeum_core::analysis::zero_point::reduce_to_common_window(&mut core);
+        assert!(core.iter().zip(&reduced).all(|(c, r)| (c.0 - r.zero_point.unwrap()).abs() < 1e-12));
+    }
+
+    #[test]
+    fn the_reduction_groups_by_exposure() {
+        // 20 frames at 300 s with the window at 13.0 and 20 at 60 s with it 1.75 mag fainter (a 5x exposure step moves
+        // the window by 2.5 log10(5)), the same 0.2 mag per mag slope: each exposure is read at its own window, so the
+        // 1.75 mag step is not put into one pool's slope term.
+        let mut rows = set_rows("T", 300.0, |i| 21.0 + 0.2 * 0.01 * i as f64, |i| 13.0 + 0.01 * i as f64);
+        rows.truncate(20);
+        let mut fast = set_rows("T", 60.0, |i| 21.35 + 0.2 * 0.01 * i as f64, |i| 14.75 + 0.01 * i as f64);
+        fast.truncate(20);
+        rows.extend(fast);
+        for r in rows.iter_mut() {
+            r.window_slope = Some(0.2);
+        }
+        let (reduced, windows) = reduce_rows(&rows);
+        assert_eq!(windows.len(), 2, "two exposures, two references: {windows:?}");
+        let pivots: Vec<f64> = windows.values().map(|w| w.pivot).collect();
+        assert!(pivots.iter().any(|p| (p - 13.095).abs() < 1e-9) && pivots.iter().any(|p| (p - 14.845).abs() < 1e-9), "{pivots:?}");
+        // Within each exposure the reduced zero point is constant, and the two references stay 0.35 mag apart: the
+        // 1.75 mag step is the cost of keeping each exposure in its own window (the linear reduction is measured to
+        // +-0.5 mag only), which Phase A's anchor shifts of 0.44, 1.0 and 1.75 mag measure.
+        let level = |exposure: f64| {
+            let z: Vec<f64> = reduced.iter().filter(|r| r.exptime == Some(exposure)).map(|r| r.zero_point.unwrap()).collect();
+            assert!(z.iter().all(|v| (v - z[0]).abs() < 1e-9), "{exposure}: {z:?}");
+            z[0]
+        };
+        assert!((level(60.0) - level(300.0) - 0.35).abs() < 1e-9);
+        // Were both exposures one pool, the slope term would carry the whole step and fold the two together.
+        let mut one_pool = rows.clone();
+        for r in one_pool.iter_mut() {
+            r.exptime = Some(300.0);
+        }
+        let (flat, one) = reduce_rows(&one_pool);
+        assert_eq!(one.len(), 1);
+        let z: Vec<f64> = flat.iter().map(|r| r.zero_point.unwrap()).collect();
+        assert!(z.iter().all(|v| (v - z[0]).abs() < 1e-9), "{z:?}");
+    }
+
+    #[test]
+    fn b5_fits_one_night_at_a_time() {
+        // Two nights of one set: k -0.07 and -0.11, no seeing term on either; on night a the FWHM tracks the airmass.
+        let mut rows = Vec::new();
+        for (night, k, track) in [("a", -0.07, 1.0), ("b", -0.11, 0.0)] {
+            for i in 0..40usize {
+                let x = 1.1 + 0.02 * i as f64;
+                let fwhm = 2.0 + track * (x - 1.1) * 1.5 + 0.25 * (i as f64 * 0.9).sin() + 0.1 * (i as f64 * 0.37).cos();
+                let t = T0 + i as i64 * 180 + if night == "b" { 86_400 } else { 0 };
+                let mut r = frow(night, t, Some(21.0 + k * x), fwhm);
+                r.airmass = Some(x);
+                rows.push(r);
+            }
+        }
+        let nights = forced_nights(&rows, None);
+        assert_eq!(nights.len(), 2);
+        let alone: Vec<_> = nights.iter().map(|n| rig_fit(&[n], |r| r.zero_point, |_| true).0.unwrap()).collect();
+        for (fit, k) in alone.iter().zip([-0.07, -0.11]) {
+            assert!((fit.k - k).abs() < 1e-9, "{}", fit.k);
+            assert!(fit.nights[0].unwrap().slope.abs() < 1e-9, "{:?}", fit.nights[0]);
+        }
+        // One k for both nights would have handed a night a slope it does not have.
+        let joint = rig_fit(&nights.iter().collect::<Vec<_>>(), |r| r.zero_point, |_| true).0.unwrap();
+        let worst = joint.nights.iter().flatten().map(|n| n.slope.abs()).fold(0.0, f64::max);
+        assert!(worst > 0.003, "the rig-wide fit is not the night's own: {worst}");
+        // The verdict judges each night on its own: both pass, with their own k printed.
+        let lines = forced_verdict_lines(&rows, None, None);
+        let b5 = lines.iter().find(|l| l.starts_with("B5")).unwrap();
+        assert!(b5.contains(" pass:") && b5.contains("k -0.070") && b5.contains("k -0.110"), "{b5}");
+        assert!(!b5.contains("FAIL"), "{b5}");
+        // B8 reads the night's own fit too (mono nights; today's has the same terms and the same nights).
+        let mut mono = rows.clone();
+        for r in mono.iter_mut() {
+            r.layout = "mono".into();
+            r.zero_point_today = r.zero_point.map(|z| z + 0.001);
+        }
+        let lines = forced_verdict_lines(&mono, None, None);
+        let b8 = lines.iter().find(|l| l.starts_with("B8")).unwrap();
+        assert!(b8.contains(" pass:"), "{b8}");
+    }
+
+    #[test]
+    fn the_per_night_line_reports_the_pedestal_clip_and_its_correlation_with_the_zero_point() {
+        // The zero point falls as the clip keeps less: r = +1 over the night, min and median of the share printed.
+        let mut rows = set_rows("T", 180.0, |i| 21.0 - 0.001 * i as f64, |_| 13.0);
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.pedestal = Some(0.4);
+            r.pedestal_kept_share = Some(1.0 - 0.005 * i as f64);
+        }
+        let lines = forced_verdict_lines(&rows, None, None);
+        let line = lines.iter().find(|l| l.starts_with("reported, per night (median")).unwrap();
+        assert!(line.contains("clip kept min 0.805 med 0.903, r with the reduced ZP 1.00"), "{line}");
+        // No share on any frame: n/a, not a crash.
+        for r in rows.iter_mut() {
+            r.pedestal_kept_share = None;
+        }
+        let lines = forced_verdict_lines(&rows, None, None);
+        let line = lines.iter().find(|l| l.starts_with("reported, per night (median")).unwrap();
+        assert!(line.contains("clip kept min n/a med n/a, r with the reduced ZP n/a"), "{line}");
+        assert_eq!(correlation(&[(1.0, 2.0), (2.0, 4.0)]), None, "two pairs are no correlation");
+        assert_eq!(correlation(&[(1.0, 2.0), (1.0, 4.0), (1.0, 5.0)]), None, "no spread in x");
+    }
+
+    #[test]
+    fn a_flag_that_breaks_the_annulus_rule_stops_forced_naming_it() {
+        let d = ForcedListParams::default();
+        assert!(check_annulus_rule(&d).is_ok());
+        let bad = |argv: &[&str]| {
+            let (fp, _, _) = parsed(argv).unwrap();
+            check_annulus_rule(&fp).unwrap_err().to_string()
+        };
+        let e = bad(&["--aperture_radius_fwhm", "5"]);
+        assert!(e.contains("--aperture_radius_fwhm 5") && e.contains("--annulus_start_fwhm 4"), "{e}");
+        let e = bad(&["--annulus_gap_px", "0.5"]);
+        assert!(e.contains("--annulus_gap_px 0.5"), "{e}");
+        let e = bad(&["--pedestal_radii_ref", "3,7,6"]);
+        assert!(e.contains("--pedestal_radii_ref"), "{e}");
+        let e = bad(&["--aperture_radius_ref", "7"]);
+        assert!(e.contains("--aperture_radius_ref 7"), "{e}");
+        // Two at once are both named; a flag that stays inside the rule is not refused.
+        let e = bad(&["--annulus_gap_px", "0.1", "--aperture_radius_fwhm", "9"]);
+        assert!(e.contains("--annulus_gap_px") && e.contains("--aperture_radius_fwhm"), "{e}");
+        let (fp, _, _) = parsed(&["--aperture_radius_fwhm", "3", "--annulus_gap_px", "0.75", "--decimate", "10"]).unwrap();
+        assert!(check_annulus_rule(&fp).is_ok());
+    }
+
+    #[test]
+    fn b7_reads_the_map_refits() {
+        let mut rows = set_rows("T", 180.0, |_| 21.0, |_| 13.0);
+        for r in rows.iter_mut() {
+            r.centre_median_px = Some(0.2);
+            r.fwhm_ref = Some(2.0);
+        }
+        let lines = forced_verdict_lines(&rows, None, None);
+        let b7 = lines.iter().find(|l| l.starts_with("B7")).unwrap();
+        assert!(b7.contains(" pass:") && b7.contains("map stars") && b7.contains("0.200 px"), "{b7}");
+        // 0.6 px against a quarter of FWHM_ref 2: a miss; frames without the figure leave the night unjudged.
+        for r in rows.iter_mut() {
+            r.centre_median_px = Some(0.6);
+        }
+        let lines = forced_verdict_lines(&rows, None, None);
+        assert!(lines.iter().find(|l| l.starts_with("B7")).unwrap().contains("FAIL"));
+        for r in rows.iter_mut() {
+            r.centre_median_px = None;
+        }
+        let lines = forced_verdict_lines(&rows, None, None);
+        assert!(lines.iter().find(|l| l.starts_with("B7")).unwrap().contains("unjudged"));
+    }
+
+    #[test]
+    fn the_six_ref_referee_uses_the_pedestal() {
+        // 120 stars of a zero point 21.0 on a sky pedestal: the sum at a radius is the flux plus eps pi r^2.
+        let (t, eps, zp0) = (180.0, 30.0, 21.0);
+        let (r_disc, r6) = (8.0, 12.0);
+        let star = |i: usize, r: f64| {
+            let g = 13.0 + 3.0 * i as f64 / 119.0;
+            SumStar {
+                g,
+                weight: 1.0,
+                sum: t * 10f64.powf(0.4 * (zp0 - g)) + eps * std::f64::consts::PI * r * r,
+            }
+        };
+        let six: Vec<SumStar> = (0..120).map(|i| star(i, r6)).collect();
+        let z = ratio_of_sums(&six, eps, r6, t).unwrap();
+        assert!((z - zp0).abs() < 1e-9, "{z}");
+        // Without the pedestal taken out the referee reads too bright: the 6r annulus sky bias the plan measured.
+        let bare = ratio_of_sums(&six, 0.0, r6, t).unwrap();
+        assert!(bare - zp0 > 0.01, "{bare}");
+        // The disc's ratio and its bare twin differ by the pedestal's part (negative: the pedestal lowers the zero point).
+        let disc: Vec<SumStar> = (0..120).map(|i| star(i, r_disc)).collect();
+        let own = ratio_of_sums(&disc, eps, r_disc, t).unwrap();
+        let part = own - ratio_of_sums(&disc, 0.0, r_disc, t).unwrap();
+        assert!((own - zp0).abs() < 1e-9 && part < -0.001, "{own} {part}");
+        // The same members and weights: a star the screen dropped (weight 0) or a sum that is not finite takes no part.
+        let mut six = six;
+        six[3].weight = 0.0;
+        six[4].sum = f64::NAN;
+        six[5].weight = 0.5;
+        let z = ratio_of_sums(&six, eps, r6, t).unwrap();
+        assert!(z.is_finite() && (z - zp0).abs() < 1e-9, "{z}");
+        // Nothing to sum, or a sum that is not positive: no zero point.
+        assert_eq!(ratio_of_sums(&[], eps, r6, t), None);
+        let dark = [SumStar { g: 14.0, weight: 1.0, sum: -5.0 }];
+        assert_eq!(ratio_of_sums(&dark, 0.0, r6, t), None);
+    }
+
+    #[test]
+    fn a_set_whose_list_costs_over_seventy_ms_is_named() {
+        let cost = |call: f64| {
+            let mut rows = set_rows("LDN 1272", 180.0, |_| 21.0, |_| 13.0);
+            for (i, r) in rows.iter_mut().enumerate() {
+                r.list_fit_ms = Some(30.0);
+                r.list_refit_ms = Some(25.0);
+                r.list_ap_ms = Some(12.0);
+                r.call_ms = Some(call);
+                if i % 10 == 0 {
+                    r.plain_ms = Some(1900.0);
+                }
+            }
+            let lines = forced_verdict_lines(&rows, None, None);
+            lines.iter().find(|l| l.starts_with("list cost per set")).unwrap().clone()
+        };
+        let slow = cost(2000.0);
+        assert!(slow.contains("cam/-/LDN 1272 30/25/12/100"), "{slow}");
+        assert!(slow.ends_with("over 70 ms: cam/-/LDN 1272"), "{slow}");
+        let ok = cost(1960.0);
+        assert!(ok.contains("30/25/12/60") && ok.ends_with("over 70 ms: none"), "{ok}");
     }
 }

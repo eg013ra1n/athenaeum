@@ -1164,6 +1164,25 @@ fn fit_line(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
     (a.is_finite() && b.is_finite()).then_some((a, b))
 }
 
+/// The sky pedestal's fit with the clip's bookkeeping (G2 review M1: the share the clip keeps is the band that comes
+/// before a collapse to `None`, and nothing else shows it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PedestalFit {
+    /// The pedestal, `None` when it could not be fitted.
+    pub eps: Option<f64>,
+    /// Points offered to the line (members whose sums are finite).
+    pub points: u32,
+    /// Points left after the clipping (at a collapse, the survivors of the round that collapsed it).
+    pub kept: u32,
+}
+
+impl PedestalFit {
+    /// The share of the offered points the clip kept (1.0 for a clean set); `None` with no point offered.
+    pub fn kept_share(&self) -> Option<f64> {
+        (self.points > 0).then(|| f64::from(self.kept) / f64::from(self.points))
+    }
+}
+
 /// The sky pedestal `epsilon` (flux per pixel; the sums carry `+ epsilon * pi * r^2`): over `members` (indices of
 /// `apertures`, every weight), `D = S(c) - S(b)` against `S(a)` at the three pedestal radii, a straight line with
 /// `pedestal_clip_rounds` rounds of clipping the residuals over `pedestal_clip_sigma` robust sigmas (1.4826 times the
@@ -1175,11 +1194,18 @@ pub fn sky_pedestal(
     fwhm_ref: f64,
     params: &ForcedListParams,
 ) -> Option<f64> {
+    sky_pedestal_fit(apertures, members, fwhm_ref, params).eps
+}
+
+/// [`sky_pedestal`] with the points offered and the points the clip kept.
+pub fn sky_pedestal_fit(
+    apertures: &[ListAperture],
+    members: &[usize],
+    fwhm_ref: f64,
+    params: &ForcedListParams,
+) -> PedestalFit {
     let (r_b, r_c) = (params.pedestal_radii_ref[1] * fwhm_ref, params.pedestal_radii_ref[2] * fwhm_ref);
     let area = std::f64::consts::PI * (r_c * r_c - r_b * r_b);
-    if !(area.is_finite() && area > 0.0) {
-        return None;
-    }
     let mut pts: Vec<(f64, f64)> = members
         .iter()
         .filter_map(|&i| {
@@ -1189,11 +1215,15 @@ pub fn sky_pedestal(
             (a.is_finite() && d.is_finite()).then_some((a, d))
         })
         .collect();
-    if pts.len() < params.pedestal_min_points {
-        return None;
+    let points = pts.len() as u32;
+    let mut fit = PedestalFit { eps: None, points, kept: points };
+    if !(area.is_finite() && area > 0.0) || pts.len() < params.pedestal_min_points {
+        return fit;
     }
     for _ in 0..params.pedestal_clip_rounds {
-        let (a, b) = fit_line(&pts)?;
+        let Some((a, b)) = fit_line(&pts) else {
+            return fit;
+        };
         let res: Vec<f64> = pts.iter().map(|p| p.1 - (a + b * p.0)).collect();
         let m = median(&mut res.clone());
         let mut dev: Vec<f64> = res.iter().map(|r| (r - m).abs()).collect();
@@ -1206,14 +1236,14 @@ pub fn sky_pedestal(
         if kept.len() == pts.len() {
             break;
         }
+        fit.kept = kept.len() as u32;
         if kept.len() < params.pedestal_min_points {
-            return None;
+            return fit;
         }
         pts = kept;
     }
-    let (intercept, _) = fit_line(&pts)?;
-    let eps = intercept / area;
-    eps.is_finite().then_some(eps)
+    fit.eps = fit_line(&pts).map(|(intercept, _)| intercept / area).filter(|e| e.is_finite());
+    fit
 }
 
 /// One list star's contribution to the statistic.
@@ -1255,6 +1285,10 @@ pub struct ForcedOutcome {
     pub tapered: u32,
     /// The sky pedestal (working units per pixel), when it was fitted.
     pub pedestal: Option<f64>,
+    /// Points offered to the pedestal's line and points its clip kept (0 / 0 before the pedestal was read); also set
+    /// when the pedestal collapsed to `None` (G2 review M1).
+    pub pedestal_points: u32,
+    pub pedestal_kept: u32,
     pub window_bright: f64,
     /// The zero point's change per magnitude the window moves fainter; `None` with fewer than `slope_min_ramp_members`
     /// members on the bright ramp.
@@ -1276,6 +1310,8 @@ pub fn forced_zero_point(
     params: &ForcedListParams,
 ) -> ForcedOutcome {
     let list_stars = list.stars.len() as u32;
+    // The pedestal's clip bookkeeping, set once the pedestal has been read.
+    let ped_counts = std::cell::Cell::new((0u32, 0u32));
     let outcome = |result, members: u32, tapered: u32, pedestal, window_slope, per_star: Vec<ForcedStarZp>| {
         ForcedOutcome {
             result,
@@ -1283,6 +1319,8 @@ pub fn forced_zero_point(
             members,
             tapered,
             pedestal,
+            pedestal_points: ped_counts.get().0,
+            pedestal_kept: ped_counts.get().1,
             window_bright: list.window_bright,
             window_slope,
             per_star,
@@ -1333,7 +1371,9 @@ pub fn forced_zero_point(
 
     // The pedestal, over every member whatever its weight; with none there is no zero point (never one with
     // epsilon = 0, which would carry the annulus' bias).
-    let Some(eps) = sky_pedestal(&measured.apertures, &members, list.fwhm_ref_px, params) else {
+    let ped = sky_pedestal_fit(&measured.apertures, &members, list.fwhm_ref_px, params);
+    ped_counts.set((ped.points, ped.kept));
+    let Some(eps) = ped.eps else {
         let r = ForcedRefusal::TooScattered { kept: n_weighted, sigma: f64::NAN };
         return outcome(Err(r), n_members, 0, None, None, per_star);
     };
@@ -3344,6 +3384,9 @@ mod forced_tests {
         assert!(z.stars >= 580, "{}", z.stars);
         assert_eq!((o.list_stars, o.members, o.per_star.len()), (600, 600, 600));
         assert!(o.pedestal.is_some_and(|e| e.abs() < 0.05), "{:?}", o.pedestal);
+        // The pedestal's clip bookkeeping rides in the outcome: 600 points offered, almost all kept.
+        assert_eq!(o.pedestal_points, 600);
+        assert!(o.pedestal_kept >= 570 && o.pedestal_kept <= 600, "{}", o.pedestal_kept);
         assert_eq!(o.window_bright, 14.0);
     }
 
@@ -3486,6 +3529,36 @@ mod forced_tests {
         // Thirty points are plenty, but the six outliers go and 24 are left: under 25 is no pedestal.
         let strict = ForcedListParams { pedestal_min_points: 25, ..params() };
         assert_eq!(sky_pedestal(&aps, &members, 2.5, &strict), None);
+    }
+
+    #[test]
+    fn the_pedestal_reports_the_share_its_clip_kept() {
+        // A clean set (every point on the line): nothing clipped, a share of exactly 1.
+        let apertures: Vec<ListAperture> = (0..30)
+            .map(|i| {
+                let a = 100.0 + 10.0 * i as f64;
+                ListAperture::test_new(0.0, vec![a, 0.0, 2.0 + 0.01 * a], 1000.0, 4.0, 1000.0)
+            })
+            .collect();
+        let members: Vec<usize> = (0..30).collect();
+        let clean = sky_pedestal_fit(&apertures, &members, 2.5, &params());
+        assert!(clean.eps.is_some());
+        assert_eq!((clean.points, clean.kept, clean.kept_share()), (30, 30, Some(1.0)));
+        // Six one-sided-in-pairs outliers among 24 good points: they are clipped, the share is what is left.
+        let (aps, members) = pedestal_points(24, 6);
+        let fit = sky_pedestal_fit(&aps, &members, 2.5, &params());
+        assert_eq!(fit.points, 30);
+        assert!((24..=26).contains(&fit.kept), "{fit:?}");
+        let share = fit.kept_share().unwrap();
+        assert!((0.8..=0.87).contains(&share), "{share}");
+        assert_eq!(fit.eps, sky_pedestal(&aps, &members, 2.5, &params()), "one fit, two doors");
+        // At a collapse the figure is still there: 24 left of 30 and under the minimum of 25.
+        let strict = ForcedListParams { pedestal_min_points: 25, ..params() };
+        let collapsed = sky_pedestal_fit(&aps, &members, 2.5, &strict);
+        assert_eq!((collapsed.eps, collapsed.points), (None, 30));
+        assert!(collapsed.kept < 25, "{collapsed:?}");
+        // Nothing offered: no share.
+        assert_eq!(sky_pedestal_fit(&[], &[], 2.5, &params()).kept_share(), None);
     }
 
     #[test]
