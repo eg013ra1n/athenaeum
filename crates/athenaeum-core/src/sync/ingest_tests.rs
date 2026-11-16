@@ -3049,7 +3049,7 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
     current["zero_point"] = serde_json::json!(21.3);
     current["zp_stars"] = serde_json::json!(87);
     current["zp_sigma"] = serde_json::json!(0.04);
-    current["zp_version"] = serde_json::json!(1);
+    current["zp_version"] = serde_json::json!(crate::analysis::zero_point::ZP_VERSION);
     current["zp_catalog"] = serde_json::json!("tier_500:1:2");
     // A verdict a newer build wrote (C6 review m8): the verdict reads None, the rest of the row is kept.
     let mut future = current.clone();
@@ -3087,7 +3087,7 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
         if uuid == "an-old" {
             assert_eq!(zp, (None, None, None, None, None), "{uuid}: an older summary has no zero point");
         } else {
-            let want_zp = (Some(21.3), Some(87), Some(0.04), Some(1u32), Some("tier_500:1:2".to_string()));
+            let want_zp = (Some(21.3), Some(87), Some(0.04), Some(crate::analysis::zero_point::ZP_VERSION), Some("tier_500:1:2".to_string()));
             assert_eq!(zp, want_zp, "{uuid}");
         }
     }

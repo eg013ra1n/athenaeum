@@ -32,8 +32,9 @@ use crate::plate_solve::storage::get_plate_solve;
 use crate::stacking::groups::{color_mode_of, ColorMode};
 use crate::star_measure::MEASURE_VERSION;
 
-/// Version of the measurement; a stored zero point is current only at this value.
-pub const ZP_VERSION: u32 = 1;
+/// Version of the measurement; a stored zero point is current only at this value. Version 2: the validity rule changed
+/// (fifty stars and a standard error within 0.035 mag) after version 1 was written to catalogues by development builds.
+pub const ZP_VERSION: u32 = 2;
 
 /// Robust scatter of a Gaussian from the median absolute deviation.
 const MAD_TO_SIGMA: f64 = 1.4826;
@@ -689,15 +690,6 @@ pub(crate) fn catalog_cone<'a>(
     }
 }
 
-/// [`refresh_zero_point_with`] against the catalogue installed under `app_data_dir`: both the layers and the identity are
-/// resolved from it. No catalogue installed is `NotReady(NoCatalogue)` and stores nothing.
-pub fn refresh_zero_point(conn: &Connection, app_data_dir: &Path, frame_id: i64) -> Result<ZpStatus> {
-    let Some(cat) = zero_point_catalog(app_data_dir) else {
-        return Ok(ZpStatus::NotReady(NotReady::NoCatalogue));
-    };
-    refresh_zero_point_with(conn, frame_id, &cat.identity, catalog_cone(&cat.layers))
-}
-
 /// Whether the frame has a current-`MEASURE_VERSION` analysis and a solve and its zero point is not current: judged at
 /// another `ZP_VERSION` or against another catalogue.
 fn needs_refresh(conn: &Connection, frame_id: i64, catalog: &str) -> Result<bool> {
@@ -763,11 +755,12 @@ where
     F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
 {
     let mut stats = ZpPassStats::default();
-    let failed = |stats: &mut ZpPassStats, frame_id: i64, e: anyhow::Error, what: &'static str| {
+    // Counts a frame's failure into the pass and returns its text; each call site says its own `debug` line.
+    let failed = |stats: &mut ZpPassStats, e: anyhow::Error| -> String {
         let text = format!("{e:#}");
-        tracing::debug!(frame_id, error = %text, "{}", what);
         stats.failed += 1;
-        stats.first_error.get_or_insert(text);
+        stats.first_error.get_or_insert_with(|| text.clone());
+        text
     };
     for &frame_id in frame_ids {
         if only_stale {
@@ -775,7 +768,8 @@ where
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
-                    failed(&mut stats, frame_id, e, "zero point check failed");
+                    let text = failed(&mut stats, e);
+                    tracing::debug!(frame_id, error = %text, "zero point check failed");
                     continue;
                 }
             }
@@ -785,20 +779,24 @@ where
                 stats.stored += usize::from(status.stored());
                 stats.unreadable += usize::from(status == ZpStatus::NotReady(NotReady::UnreadableSolve));
             }
-            Err(e) => failed(&mut stats, frame_id, e, "zero point refresh failed"),
+            Err(e) => {
+                let text = failed(&mut stats, e);
+                tracing::debug!(frame_id, error = %text, "zero point refresh failed");
+            }
         }
     }
     stats
 }
 
 /// [`refresh_many_stats`] as one pass of its own: says its one `warn` (`trigger`) and returns how many frames wrote a row.
-fn refresh_many_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], only_stale: bool, cone: F) -> Result<usize>
+/// A frame's failure is counted and logged inside the pass; the pass itself cannot fail.
+fn refresh_many_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], only_stale: bool, cone: F) -> usize
 where
     F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
 {
     let stats = refresh_many_stats(conn, catalog, frame_ids, only_stale, cone);
     stats.warn_if_unmeasurable("trigger");
-    Ok(stats.stored)
+    stats.stored
 }
 
 /// Refresh every one of `frame_ids` (the caller has already selected the stale ones), no currency check per frame; the
@@ -811,32 +809,22 @@ where
 }
 
 /// Refresh the frames among `frame_ids` whose zero point is not current (a current-`MEASURE_VERSION` analysis, a solve,
-/// and `zp_version` / `zp_catalog` other than the current ones). Returns how many it measured, refused or marked as a
-/// colour camera. `cone` as in [`refresh_zero_point_with`].
-pub fn ensure_zero_points_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], cone: F) -> Result<usize>
+/// and `zp_version` / `zp_catalog` other than the current ones): the trigger after an analysis is saved. Returns how many
+/// it measured, refused or marked as a colour camera. `cone` as in [`refresh_zero_point_with`]. Never fails.
+pub fn ensure_zero_points_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], cone: F) -> usize
 where
     F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
 {
     refresh_many_with(conn, catalog, frame_ids, true, cone)
 }
 
-/// [`ensure_zero_points_with`] over an opened catalogue.
-pub fn ensure_zero_points(conn: &Connection, catalog: &ZpCatalog, frame_ids: &[i64]) -> Result<usize> {
-    ensure_zero_points_with(conn, &catalog.identity, frame_ids, catalog_cone(&catalog.layers))
-}
-
 /// Recompute the zero point of every one of `frame_ids`, current or not: the trigger after a solve, whose WCS may have
-/// moved. Returns how many wrote a row.
-pub fn recompute_zero_points_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], cone: F) -> Result<usize>
+/// moved. Returns how many wrote a row. Never fails.
+pub fn recompute_zero_points_with<F>(conn: &Connection, catalog: &str, frame_ids: &[i64], cone: F) -> usize
 where
     F: FnMut(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
 {
     refresh_many_with(conn, catalog, frame_ids, false, cone)
-}
-
-/// [`recompute_zero_points_with`] over an opened catalogue.
-pub fn recompute_zero_points(conn: &Connection, catalog: &ZpCatalog, frame_ids: &[i64]) -> Result<usize> {
-    recompute_zero_points_with(conn, &catalog.identity, frame_ids, catalog_cone(&catalog.layers))
 }
 
 /// The stale selections' extra condition (alias `fa` is `frame_analysis`): the frame CAN be measured here. An analysis that
@@ -1476,7 +1464,7 @@ mod tests {
         assert_eq!(zp_columns(&conn, 1), (None, None, Some(ZP_VERSION), Some("A".to_string())));
         assert_eq!(calls.get(), 0, "no catalogue read for a colour camera");
         // Stored like a refusal: the next pass does not retry it.
-        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)).unwrap(), 0);
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)), 0);
     }
 
     #[test]
@@ -1528,7 +1516,7 @@ mod tests {
         let stars: Vec<StarMetric> =
             f.stars.iter().map(|s| StarMetric { frame_analysis_id: analysis_id, ..s.clone() }).collect();
         db_analysis::upsert_star_metrics(&conn, analysis_id, &stars).unwrap();
-        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)).unwrap(), 1);
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)), 1);
         assert!(zp_columns(&conn, 1).0.is_some());
     }
 
@@ -1678,10 +1666,10 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
         calls.set(0);
-        assert_eq!(ensure_zero_points_with(&conn, "A", &[1, 2], cone_of(&f, &calls)).unwrap(), 1);
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1, 2], cone_of(&f, &calls)), 1);
         assert_eq!(calls.get(), 1, "only the stale frame read the catalogue");
         assert!(zp_columns(&conn, 2).0.is_some());
-        assert_eq!(ensure_zero_points_with(&conn, "A", &[1, 2], cone_of(&f, &calls)).unwrap(), 0);
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1, 2], cone_of(&f, &calls)), 0);
     }
 
     #[test]
@@ -1691,10 +1679,10 @@ mod tests {
         seed_frame(&conn, 1, &f, &Seed::default(), true);
         let calls = std::cell::Cell::new(0);
         refresh_zero_point_with(&conn, 1, "A", cone_of(&f, &calls)).unwrap();
-        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)).unwrap(), 0, "skipped under A");
-        assert_eq!(ensure_zero_points_with(&conn, "B", &[1], cone_of(&f, &calls)).unwrap(), 1, "refreshed under B");
+        assert_eq!(ensure_zero_points_with(&conn, "A", &[1], cone_of(&f, &calls)), 0, "skipped under A");
+        assert_eq!(ensure_zero_points_with(&conn, "B", &[1], cone_of(&f, &calls)), 1, "refreshed under B");
         assert_eq!(zp_columns(&conn, 1).3.as_deref(), Some("B"));
-        assert_eq!(ensure_zero_points_with(&conn, "B", &[1], cone_of(&f, &calls)).unwrap(), 0);
+        assert_eq!(ensure_zero_points_with(&conn, "B", &[1], cone_of(&f, &calls)), 0);
     }
 
     #[test]
@@ -1742,16 +1730,21 @@ mod tests {
         assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
     }
 
+    /// A zero point judged at an older `ZP_VERSION` (version 1 was written by development builds under another validity
+    /// rule) is stale, for the gate's selection and the backfill's cursor alike; one at the current version is not.
     #[test]
-    fn no_installed_catalogue_is_not_ready_and_stores_nothing() {
+    fn a_zero_point_of_an_older_version_is_stale() {
         let conn = catalog_db();
-        let f = field(200, TRUE_ZP, 0.0, 33);
-        seed_frame(&conn, 1, &f, &Seed::default(), true);
-        let empty_app_data = tempfile::tempdir().unwrap();
-        assert!(zero_point_catalog(empty_app_data.path()).is_none());
-        let status = refresh_zero_point(&conn, empty_app_data.path(), 1).unwrap();
-        assert_eq!(status, ZpStatus::NotReady(NotReady::NoCatalogue));
-        assert_eq!(zp_columns(&conn, 1), (None, None, None, None));
+        let f = Field { stars: Vec::new(), catalog: Vec::new(), wcs: wcs() };
+        for id in 1..=2 {
+            seed_frame(&conn, id, &f, &Seed::default(), true);
+        }
+        conn.execute("UPDATE frame_analysis SET stars_detected = 0", []).unwrap();
+        assert_eq!(ZP_VERSION, 2);
+        conn.execute("UPDATE frame_analysis SET zp_version = 1, zp_catalog = 'A' WHERE frame_id = 1", []).unwrap();
+        conn.execute("UPDATE frame_analysis SET zp_version = ?1, zp_catalog = 'A' WHERE frame_id = 2", [ZP_VERSION]).unwrap();
+        assert_eq!(stale_among_frames(&conn, "A", &[1, 2]).unwrap(), vec![1]);
+        assert_eq!(stale_zero_point_frames(&conn, "A", 0, 10).unwrap(), vec![1]);
     }
 
     /// The gate selects its stale frames with the module's statement count in hand: one statement per chunk of

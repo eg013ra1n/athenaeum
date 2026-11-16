@@ -766,9 +766,42 @@ fn gate_app_data_dir(conn: &Connection) -> Option<std::path::PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The most frames one gate call measures inline. The rest keep `not measured yet` until the startup backfill (or a new
-/// analysis or solve) reaches them: a gate is an interactive call, not a batch job.
+/// The most frames an interactive gate call measures inline. The rest keep `not measured yet` until the startup backfill
+/// (or a new analysis or solve) reaches them: an interactive gate is a screen read, not a batch job. A publish run has no
+/// such limit ([`GateMeasure::publish`]): a frame it announces carries a frozen loss.
 const GATE_INLINE_ZERO_POINTS: usize = 200;
+
+/// What one gate call may measure inline: the frames it is about (`only`, `None` = every frame of the project) and how
+/// many of them it measures at most (`limit`, `None` = all). The cap is applied to the selection, never to the project's
+/// frames first.
+#[derive(Clone, Copy)]
+struct GateMeasure<'a> {
+    only: Option<&'a [i64]>,
+    limit: Option<usize>,
+}
+
+impl<'a> GateMeasure<'a> {
+    /// A screen read over the whole project: bounded by [`GATE_INLINE_ZERO_POINTS`].
+    fn interactive() -> Self {
+        Self { only: None, limit: Some(GATE_INLINE_ZERO_POINTS) }
+    }
+
+    /// A publish run: every frame the run is about (`only`, or all) is measured before the gate is read; no limit.
+    fn publish(only: Option<&'a [i64]>) -> Self {
+        Self { only, limit: None }
+    }
+
+    /// The frames of `all` this call may measure: the selection's members (kept in `all`'s order).
+    fn candidates(&self, all: &[i64]) -> Vec<i64> {
+        match self.only {
+            None => all.to_vec(),
+            Some(only) => {
+                let keep: HashSet<i64> = only.iter().copied().collect();
+                all.iter().copied().filter(|id| keep.contains(id)).collect()
+            }
+        }
+    }
+}
 
 /// Whether the project's current rules judge transparency: only then does the gate measure anything inline.
 fn rules_judge_transparency(rules: &[ThresholdRuleView]) -> bool {
@@ -776,16 +809,17 @@ fn rules_judge_transparency(rules: &[ThresholdRuleView]) -> bool {
 }
 
 /// Trigger (c) of the zero point (wave 6.5), bounded: when the project's rules contain `transparency_loss`, measure the
-/// frames among `ids` whose zero point is not current against `catalog` (the installed catalogue's identity), at most
-/// [`GATE_INLINE_ZERO_POINTS`] of them, `open_cone` being asked for the catalogue reader only when there is something to
-/// measure. The stale frames are ONE chunked selection over `ids`, never a check per frame. A frame that cannot be
-/// measured is a `debug` line of its own; the pass says one `warn` with the count. Returns how many frames wrote a row.
-/// Never fails.
+/// frames among `all_ids` that `measure` allows (its selection first, THEN its limit on the stale ones among them) whose
+/// zero point is not current against `catalog` (the installed catalogue's identity), `open_cone` being asked for the
+/// catalogue reader only when there is something to measure. The stale frames are ONE chunked selection over the
+/// candidates, never a check per frame. A frame that cannot be measured is a `debug` line of its own; the pass says one
+/// `warn` with the count. Returns how many frames wrote a row. Never fails.
 fn measure_gate_stale_with<F, G>(
     conn: &Connection,
     project_id: &str,
     catalog: &str,
-    ids: &[i64],
+    all_ids: &[i64],
+    measure: GateMeasure<'_>,
     rules: &[ThresholdRuleView],
     open_cone: G,
 ) -> usize
@@ -799,10 +833,11 @@ where
         f64,
     ) -> anyhow::Result<Vec<solvemyastro::CatalogStar>>,
 {
+    let ids = measure.candidates(all_ids);
     if ids.is_empty() || !rules_judge_transparency(rules) {
         return 0;
     }
-    let mut stale = match crate::analysis::zero_point::stale_among_frames(conn, catalog, ids) {
+    let mut stale = match crate::analysis::zero_point::stale_among_frames(conn, catalog, &ids) {
         Ok(stale) => stale,
         Err(e) => {
             tracing::warn!(project_id, frames = ids.len(), error = %format!("{e:#}"), "gate: stale zero point selection failed");
@@ -813,7 +848,9 @@ where
         return 0;
     }
     let frames = stale.len();
-    stale.truncate(GATE_INLINE_ZERO_POINTS);
+    if let Some(limit) = measure.limit {
+        stale.truncate(limit);
+    }
     let Some(cone) = open_cone() else { return 0 };
     let stats = crate::analysis::zero_point::refresh_listed_with(conn, catalog, &stale, cone);
     tracing::debug!(project_id, frames, zp_measured = stats.stored, "gate zero points measured");
@@ -822,22 +859,30 @@ where
 }
 
 /// Before the gate reads transparency: the installed catalogue's identity (`None` when none is installed: the gate then
-/// proceeds without losses; `debug`, said by the catalogue open) and, when `rules` judge transparency, the bounded
-/// inline measurement of [`measure_gate_stale_with`]. Never fails.
+/// proceeds without losses; `debug`, said by the catalogue open) and, when `rules` judge transparency, the inline
+/// measurement of [`measure_gate_stale_with`] over the frames `measure` allows (its selection of `all_ids`, at most its
+/// limit). The measurement runs under `catch_unwind`: a panic out of the catalogue read or the measurement is one `warn`
+/// and the gate goes on without those losses. Never fails, never panics.
 fn ensure_gate_zero_points(
     conn: &Connection,
     project_id: &str,
-    ids: &[i64],
+    all_ids: &[i64],
+    measure: GateMeasure<'_>,
     rules: &[ThresholdRuleView],
 ) -> Option<String> {
     let dir = gate_app_data_dir(conn)?;
     let identity = crate::analysis::transparency::installed_catalog_identity(&dir)?;
-    measure_gate_stale_with(conn, project_id, &identity, ids, rules, || {
-        let catalog = crate::analysis::zero_point::zero_point_catalog(&dir)?;
-        Some(move |wcs: &solvemyastro::WcsSolution, w: usize, h: usize, central: f64, epoch: f64| {
-            crate::analysis::zero_point::catalog_cone(&catalog.layers)(wcs, w, h, central, epoch)
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        measure_gate_stale_with(conn, project_id, &identity, all_ids, measure, rules, || {
+            let catalog = crate::analysis::zero_point::zero_point_catalog(&dir)?;
+            Some(move |wcs: &solvemyastro::WcsSolution, w: usize, h: usize, central: f64, epoch: f64| {
+                crate::analysis::zero_point::catalog_cone(&catalog.layers)(wcs, w, h, central, epoch)
+            })
         })
-    });
+    }));
+    if let Err(payload) = outcome {
+        tracing::warn!(project_id, frames = all_ids.len(), error = %crate::api::analysis::panic_text(payload.as_ref()), "gate zero point measurement panicked");
+    }
     Some(identity)
 }
 
@@ -1056,7 +1101,7 @@ pub fn evaluate_project_gate(
                 "project {project_id} is not cached — refresh first"
             ))
         })?;
-    let gated = project_gate(&conn, &project)?;
+    let gated = project_gate(&conn, &project, GateMeasure::interactive())?;
     let blocker_rows: Vec<crate::collab::gate::BlockerRow<'_>> = gated
         .iter()
         .map(|(id, row)| crate::collab::gate::BlockerRow {
@@ -1130,9 +1175,14 @@ struct GateIdentity {
 /// so the report the user reads and the set a publish acts on can never
 /// disagree. Each verdict row is paired with the identity fields publish
 /// stamps and announces.
+///
+/// `measure` says what the gate may measure inline before it reads transparency: a screen read bounds it
+/// ([`GateMeasure::interactive`]); a publish run measures every frame it is about ([`GateMeasure::publish`]), so no frame
+/// is announced with a loss that was merely not measured yet. The verdict rows always cover every project frame.
 fn project_gate(
     conn: &Connection,
     project: &CollabProjectRow,
+    measure: GateMeasure<'_>,
 ) -> Result<Vec<(GateIdentity, FrameGateRow)>, ApiError> {
     let project_id = project.project_id.as_str();
     let target = ProjectTarget {
@@ -1192,7 +1242,7 @@ fn project_gate(
         .collect();
 
     let frame_ids: Vec<i64> = frames.iter().map(|(id, _)| *id).collect();
-    let catalog = ensure_gate_zero_points(conn, project_id, &frame_ids, &rules);
+    let catalog = ensure_gate_zero_points(conn, project_id, &frame_ids, measure, &rules);
     let inputs = frame_gate_inputs(
         conn,
         project_id,
@@ -1638,7 +1688,7 @@ pub fn get_frame_set_project_status(
         {
             continue;
         }
-        let gated = project_gate(&conn, &p)?;
+        let gated = project_gate(&conn, &p, GateMeasure::interactive())?;
         let own = crate::db::collab_frames::own_by_source_frame(&conn, &p.project_id)
             .map_err(internal)?;
 
@@ -1723,7 +1773,7 @@ pub(crate) fn own_contributor_states(
     project_id: &str,
     project: &CollabProjectRow,
 ) -> HashMap<String, (String, Option<String>)> {
-    let gated = match project_gate(conn, project) {
+    let gated = match project_gate(conn, project, GateMeasure::interactive()) {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(project_id, error = %e, "gate evaluation failed; own contributor state left blank");
@@ -2106,7 +2156,7 @@ pub fn list_project_own_frames(
                 "project {project_id} is not cached — refresh first"
             ))
         })?;
-    let gated = project_gate(&conn, &project)?;
+    let gated = project_gate(&conn, &project, GateMeasure::interactive())?;
     let ids: Vec<i64> = gated.iter().map(|(_, r)| r.frame_id).collect();
     let facts = frame_facts(&conn, &ids)?;
     let set_ids: HashSet<i64> = gated.iter().filter_map(|(i, _)| i.set_id).collect();
@@ -4815,14 +4865,16 @@ async fn refresh_project_thresholds(
     Ok(row)
 }
 
-/// Re-run the gate for the stale-gate retry: frame id → verdict.
+/// Re-run the gate for the stale-gate retry: frame id → verdict. A publish-family call like the run's own gate: the
+/// run's selection (`only`) is measured without a limit.
 fn regate(
     ctx: &ServiceContext,
     project: &CollabProjectRow,
+    only: Option<&[i64]>,
 ) -> Result<HashMap<i64, FrameGateRow>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(project_gate(&conn, project)
+    Ok(project_gate(&conn, project, GateMeasure::publish(only))
         .map_err(|e| {
             tracing::error!(project_id = %project.project_id, error = %e, "publish: re-running the gate failed");
             e
@@ -7314,7 +7366,7 @@ pub(crate) mod tests {
         let other: Vec<ThresholdRuleView> =
             serde_json::from_str(r#"[{"metricKey":"fwhm_arcsec","op":"lte","value":3.0}]"#).unwrap();
         for rules in [&no_rules, &other] {
-            let n = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, rules, || {
+            let n = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, GateMeasure::interactive(), rules, || {
                 opened.set(true);
                 Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| {
                     calls.set(calls.get() + 1);
@@ -7329,7 +7381,7 @@ pub(crate) mod tests {
         // The same frames with the rule are measured.
         let with_rule: Vec<ThresholdRuleView> =
             serde_json::from_str(r#"[{"metricKey":"transparency_loss","op":"lte","value":0.5}]"#).unwrap();
-        let n = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, &with_rule, || {
+        let n = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, GateMeasure::interactive(), &with_rule, || {
             Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| {
                 calls.set(calls.get() + 1);
                 Ok(Vec::new())
@@ -7338,9 +7390,31 @@ pub(crate) mod tests {
         assert_eq!((n, calls.get(), zp_rows_for(&conn, "TEST")), (5, 5, 5));
     }
 
-    /// 250 stale frames and the rule: 200 are measured, 50 keep `not measured yet`, and the gate returns Ok.
+    /// A catalogue reader that finds no stars, counting its calls.
+    fn counting_cone<'a>(
+        calls: &'a std::cell::Cell<usize>,
+    ) -> Option<impl FnMut(&solvemyastro::WcsSolution, usize, usize, f64, f64) -> anyhow::Result<Vec<solvemyastro::CatalogStar>> + 'a> {
+        Some(move |_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        })
+    }
+
+    const NOT_MEASURED_YET: &str = "zero point not measured yet — the star catalogue may not be installed";
+
+    fn transparency_rules() -> Vec<ThresholdRuleView> {
+        serde_json::from_str(r#"[{"metricKey":"transparency_loss","op":"lte","value":0.5}]"#).unwrap()
+    }
+
+    fn not_measured_yet(conn: &rusqlite::Connection, frames: &[i64]) -> Vec<i64> {
+        let read = crate::analysis::transparency::transparency_for_frames(conn, Some("TEST"), frames).unwrap();
+        frames.iter().copied().filter(|id| read[id].reason.as_deref() == Some(NOT_MEASURED_YET)).collect()
+    }
+
+    /// 250 stale frames and the rule: an interactive gate measures 200, 50 keep `not measured yet`, and the next call
+    /// picks up the rest.
     #[test]
-    fn the_gate_measures_at_most_its_inline_limit() {
+    fn an_interactive_gate_keeps_its_inline_limit() {
         let (_tmp, ctx) = test_ctx();
         let (set_id, frames) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
@@ -7353,28 +7427,20 @@ pub(crate) mod tests {
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
         let conn = crate::api::db(&ctx).unwrap().conn();
-        let rules: Vec<ThresholdRuleView> =
-            serde_json::from_str(r#"[{"metricKey":"transparency_loss","op":"lte","value":0.5}]"#).unwrap();
+        let rules = transparency_rules();
         let calls = std::cell::Cell::new(0_usize);
-        let measured = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, &rules, || {
-            Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| {
-                calls.set(calls.get() + 1);
-                Ok(Vec::new())
-            })
+        let measured = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, GateMeasure::interactive(), &rules, || {
+            counting_cone(&calls)
         });
         assert_eq!((measured, calls.get(), zp_rows_for(&conn, "TEST")), (200, 200, 200));
 
         // The 50 beyond the limit (the highest ids: the selection is in id order) are still `not measured yet`.
-        let read = crate::analysis::transparency::transparency_for_frames(&conn, Some("TEST"), &frames).unwrap();
-        let unmeasured: Vec<&i64> = frames
-            .iter()
-            .filter(|id| read[id].reason.as_deref() == Some("zero point not measured yet — the star catalogue may not be installed"))
-            .collect();
+        let unmeasured = not_measured_yet(&conn, &frames);
         assert_eq!(unmeasured.len(), 50);
         assert!(unmeasured.iter().all(|id| frames[200..].contains(id)));
         // The next gate call picks up the next 200 (here: the 50 left).
-        let again = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, &rules, || {
-            Some(|_: &solvemyastro::WcsSolution, _: usize, _: usize, _: f64, _: f64| Ok(Vec::new()))
+        let again = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, GateMeasure::interactive(), &rules, || {
+            counting_cone(&calls)
         });
         assert_eq!(again, 50);
         drop(conn);
@@ -7382,6 +7448,43 @@ pub(crate) mod tests {
         // The gate itself returns Ok over all 250 (no catalogue is installed in this context, so it measures nothing).
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
         assert_eq!(report.total, 250);
+    }
+
+    /// A publish run's gate has no limit: 250 stale frames selected for the run are ALL measured before the announce, so
+    /// none is announced as `not measured yet` with a loss frozen at nothing.
+    #[test]
+    fn a_publish_run_measures_every_selected_frame() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let frames = seed_stale_zero_points(&conn, 250);
+        let rules = transparency_rules();
+        assert!(GateMeasure::publish(None).limit.is_none(), "a publish run sets no limit");
+        let calls = std::cell::Cell::new(0_usize);
+        let measured = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, GateMeasure::publish(Some(&frames)), &rules, || {
+            counting_cone(&calls)
+        });
+        assert_eq!((measured, calls.get(), zp_rows_for(&conn, "TEST")), (250, 250, 250));
+        assert!(not_measured_yet(&conn, &frames).is_empty(), "no frame is left `not measured yet` for the announce");
+    }
+
+    /// The limit applies to the frames the call is about, never to all project frames first: a selection of 10 stale
+    /// frames whose ids are higher than 300 other stale frames is measured in full.
+    #[test]
+    fn the_inline_limit_applies_to_the_selection() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let frames = seed_stale_zero_points(&conn, 310);
+        let selection: Vec<i64> = frames[300..].to_vec();
+        assert_eq!(selection.len(), 10);
+        let rules = transparency_rules();
+        let calls = std::cell::Cell::new(0_usize);
+        let selected = GateMeasure { only: Some(&selection), limit: Some(GATE_INLINE_ZERO_POINTS) };
+        let measured = measure_gate_stale_with(&conn, "p-1", "TEST", &frames, selected, &rules, || counting_cone(&calls));
+        assert_eq!((measured, calls.get(), zp_rows_for(&conn, "TEST")), (10, 10, 10));
+        assert!(not_measured_yet(&conn, &selection).is_empty(), "the selected frames are measured");
+        assert_eq!(not_measured_yet(&conn, &frames[..300]).len(), 300, "the others are not touched");
     }
 
     /// The announce path takes the loss from a map read ONCE for the batch: `build_frame_meta_with` and

@@ -681,10 +681,10 @@ mod tests {
         a.zero_point = Some(21.3);
         a.zp_stars = Some(87);
         a.zp_sigma = Some(0.04);
-        a.zp_version = Some(1);
+        a.zp_version = Some(crate::analysis::zero_point::ZP_VERSION);
         a.zp_catalog = Some("tier_500:1:2".into());
         upsert_frame_analysis(&conn, &a).unwrap();
-        let want = (Some(21.3), Some(87), Some(0.04), Some(1), Some("tier_500:1:2".to_string()));
+        let want = (Some(21.3), Some(87), Some(0.04), Some(crate::analysis::zero_point::ZP_VERSION), Some("tier_500:1:2".to_string()));
         assert_eq!(zp_row(&get_frame_analysis(&conn, frame_id).unwrap().unwrap()), want);
         assert_eq!(zp_row(&get_frame_analyses_by_ids(&conn, &[frame_id]).unwrap()[0]), want);
         // The frame-set getter joins through sessions and nights; seed that chain for the one frame.
@@ -749,7 +749,7 @@ mod tests {
         a.zero_point = Some(21.3);
         a.zp_stars = Some(87);
         a.zp_sigma = Some(0.04);
-        a.zp_version = Some(1);
+        a.zp_version = Some(crate::analysis::zero_point::ZP_VERSION);
         a.zp_catalog = Some("A".into());
         upsert_frame_analysis(&conn, &a).unwrap();
         clear_zero_point(&conn, frame_id).unwrap();
