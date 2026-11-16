@@ -15,6 +15,9 @@
 //! zp_probe verdict --class <broadband|narrowband|osc> [--common <tsv>] [--osc-c] <measure.tsv>...
 //! zp_probe bigap   --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> --object <s> \
 //!                  [--night <label>] [--every <n>] --out <frames.tsv> --stars-out <stars.tsv>
+//! zp_probe forced  --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> --object <s> \
+//!                  --out <x.tsv> [--limit <n>] [--identity-every <n>] [--<ZpParams field> <v>]...
+//! zp_probe verdict --forced [--common <tsv>] <x.tsv>...
 //! ```
 //!
 //! `bigap` (OSC Task 3c) adds an independent photometry of the raw mosaic: per Gaia-matched star, plain aperture
@@ -29,6 +32,16 @@
 //! TT); a frame without a site has an empty airmass and is counted. `verdict --class osc --osc-c` judges every night
 //! of at least 30 measured frames against the bars of the OSC spec section 6 (see `osc_c_verdict_lines`); without
 //! `--osc-c` the verdict is the sub-wave 6.5 one, line for line.
+//!
+//! `forced` (forced-list zero point, Task 3) runs the shipping composition `analysis::analyzer::measure_with_zero_point`
+//! on frames read in memory and writes `<x>.tsv` (one row per light: the anchor, the window, the list, `c`, the zero
+//! point or its refusal, today's zero point on the same measurement, the 6F reference, the identity check, the wall time
+//! and memory of the list) and `<x>.stars.tsv` (one row per list star). `--identity-every <n>` (default 10) measures every
+//! n-th frame a second time without a list and compares the two (B9). `verdict --forced [--common <tsv>] <x>.tsv...`
+//! judges the bars B1-B9 of the forced-list spec (section 6, with the plan's review rulings): every night of at least 30
+//! measured frames, pairs under 15 minutes apart, one line per bar and a last line GO or STOP. A bar judged on no night
+//! of its class is a STOP. The pier side of a frame is read from the solve's field rotation against the night's first
+//! frame (more than 90 degrees mod 360 is the other side).
 //!
 //! `stars` writes one row per matched star with the flags and numbers the star
 //! fit itself carried (`saturated`, `extended`, `flags`, `peak`, `background`,
@@ -45,22 +58,27 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use athenaeum_core::analysis::analyzer::{map_measurement, measure_raw_frame};
+use athenaeum_core::analysis::analyzer::{
+    frame_options, map_measurement, measure_raw_frame, measure_with_zero_point, ZpInputs,
+};
 use athenaeum_core::analysis::config::{load_config, AnalysisConfig};
 use athenaeum_core::analysis::zero_point::{
-    catalog_for_frame, measure_zero_point, ZpInput, ZpMeasurement, ZpParams, ZpRefusal,
+    catalog_for_frame, measure_zero_point, ForcedListParams, ForcedRefusal, ForcedStar, ZpInput,
+    ZpMeasurement, ZpParams, ZpRefusal,
 };
 use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::hints::observation_epoch;
 use athenaeum_core::plate_solve::open_catalog_layers;
 use athenaeum_core::plate_solve::storage::get_plate_solve;
+use athenaeum_core::star_measure::analysis_mode::{FrameOptions, FrameSummary, ListFit};
 use athenaeum_core::star_measure::raw::{read_raw_frame, RawPlanes};
-use athenaeum_core::star_measure::StarFit;
+use athenaeum_core::star_measure::{PlaneMeasurement, StarFit};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use solvemyastro::StarCache;
@@ -107,7 +125,7 @@ const PROGRESS_EVERY: usize = 20;
 // ---------------------------------------------------------------------------
 
 /// Flags that take no value (stored as "true").
-const SWITCHES: [&str; 1] = ["osc-c"];
+const SWITCHES: [&str; 2] = ["osc-c", "forced"];
 
 struct Args {
     flags: HashMap<String, String>,
@@ -938,6 +956,8 @@ const C_STEADY_MIN_PAIRS: usize = 5;
 struct FitPoint {
     /// Index of the night in the fit.
     night: usize,
+    /// The pier side of the frame (0 or 1); read only on a night the fit marks two-sided.
+    side: f64,
     airmass: f64,
     fwhm: f64,
     zp: f64,
@@ -954,6 +974,8 @@ struct NightFit {
     n: usize,
     fwhm_min: f64,
     fwhm_max: f64,
+    /// The step of the zero point between the two pier sides (side 1 minus side 0), on a two-sided night.
+    side_step: Option<f64>,
 }
 
 /// `zero point = k · airmass + a_night + s_night · FWHM`, ordinary least squares over every night of a rig (the
@@ -1045,6 +1067,16 @@ fn least_squares(rows: &[Vec<f64>], y: &[f64]) -> Option<(Vec<f64>, Vec<f64>, f6
 /// or the fit has no degrees of freedom. Airmass and FWHM are centred on their means inside (conditioning) and the
 /// intercepts are returned in the original coordinates.
 fn shared_extinction_fit(points: &[FitPoint], n_nights: usize) -> Option<SharedFit> {
+    shared_extinction_fit_sided(points, n_nights, &vec![false; n_nights])
+}
+
+/// [`shared_extinction_fit`] with a pier-side column on every night `two_sided` marks (one k, an intercept per night, an
+/// FWHM slope per night, and on a two-sided night a step between its sides, reported as `side_step`).
+fn shared_extinction_fit_sided(
+    points: &[FitPoint],
+    n_nights: usize,
+    two_sided: &[bool],
+) -> Option<SharedFit> {
     let mut counts = vec![0usize; n_nights];
     for p in points {
         counts[p.night] += 1;
@@ -1059,15 +1091,24 @@ fn shared_extinction_fit(points: &[FitPoint], n_nights: usize) -> Option<SharedF
         let n = used.len() as f64;
         let mx = used.iter().map(|p| p.airmass).sum::<f64>() / n;
         let mf = used.iter().map(|p| p.fwhm).sum::<f64>() / n;
-        let width = 1 + 2 * slots.len();
+        // The first column of each night: intercept, FWHM slope, then the side step where there is one.
+        let mut offsets = Vec::with_capacity(slots.len());
+        let mut width = 1;
+        for night in &slots {
+            offsets.push(width);
+            width += 2 + usize::from(two_sided.get(*night).copied().unwrap_or(false));
+        }
         let rows: Vec<Vec<f64>> = used
             .iter()
             .map(|p| {
                 let mut r = vec![0.0; width];
                 r[0] = p.airmass - mx;
                 let j = slots.iter().position(|s| *s == p.night).unwrap_or(0);
-                r[1 + 2 * j] = 1.0;
-                r[2 + 2 * j] = p.fwhm - mf;
+                r[offsets[j]] = 1.0;
+                r[offsets[j] + 1] = p.fwhm - mf;
+                if two_sided.get(p.night).copied().unwrap_or(false) {
+                    r[offsets[j] + 2] = p.side;
+                }
                 r
             })
             .collect();
@@ -1087,14 +1128,19 @@ fn shared_extinction_fit(points: &[FitPoint], n_nights: usize) -> Option<SharedF
                         .filter(|p| p.night == *night)
                         .map(|p| p.fwhm)
                         .collect();
-                    let slope = beta[2 + 2 * j];
+                    let slope = beta[offsets[j] + 1];
                     nights[*night] = Some(NightFit {
-                        intercept: beta[1 + 2 * j] - k * mx - slope * mf,
+                        intercept: beta[offsets[j]] - k * mx - slope * mf,
                         slope,
-                        slope_se: (var * inv_diag[2 + 2 * j]).sqrt(),
+                        slope_se: (var * inv_diag[offsets[j] + 1]).sqrt(),
                         n: mine.len(),
                         fwhm_min: mine.iter().copied().fold(f64::INFINITY, f64::min),
                         fwhm_max: mine.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                        side_step: two_sided
+                            .get(*night)
+                            .copied()
+                            .unwrap_or(false)
+                            .then(|| beta[offsets[j] + 2]),
                     });
                 }
                 return Some(SharedFit {
@@ -1312,12 +1358,14 @@ fn osc_c_verdict_lines(all_rows: &[MeasureRow], common: Option<&[CommonRow]>) ->
                     continue;
                 };
                 points_c.push(FitPoint {
+                    side: 0.0,
                     night: slot,
                     airmass: x,
                     fwhm,
                     zp: zpc,
                 });
                 points_u.push(FitPoint {
+                    side: 0.0,
                     night: slot,
                     airmass: x,
                     fwhm,
@@ -2326,6 +2374,11 @@ fn cmd_common(mut args: Args) -> Result<()> {
 }
 
 fn cmd_verdict(mut args: Args) -> Result<()> {
+    if args.take_switch("forced") {
+        let common_path = args.take("common");
+        args.finish()?;
+        return cmd_verdict_forced(&args, common_path);
+    }
     let class = args.require("class")?;
     if !["broadband", "narrowband", "osc"].contains(&class.as_str()) {
         bail!("--class must be broadband, narrowband or osc");
@@ -2706,12 +2759,1867 @@ fn cmd_bigap(mut args: Args) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// forced: the shipping forced-list zero point on real frames (forced-list plan, Task 3)
+// ---------------------------------------------------------------------------
+//
+// `forced` calls `analysis::analyzer::measure_with_zero_point`, the one function the analyzer ships, on a frame read in
+// memory, and writes two TSVs: one row per light (`<x>.tsv`) and one row per list star (`<x>.stars.tsv`). Today's zero
+// point (6.5's matcher over the budget fits, times the reported `c` on a mosaic) is measured on the same frame for the
+// comparisons of B2 and B8. The catalogue is opened read-only and nothing else is written.
+
+const FORCED_HEADER: &str = "frame_id\tfile_name\tobject\tfilter\tnight\tdate_obs\texptime\trig\tlayout\tairmass\tpier\trotation_deg\tstars_detected\tmedian_fwhm\tscale\tfwhm_ref\tanchor\tanchor_stars\twindow_bright\twindow_faint\tlist_before_cap\tlist_stars\taccepted\tkept\tzp_stars\tc\tc_stars\tc_se\tc_budget\tzero_point\tsigma\tstd_error\trefusal\tcentre_median_px\tring_missing\tzero_point_today\ttoday_refusal\tzero_point_6f\tidentity\tcall_ms\tplain_ms\tlist_kb\trss_mb";
+
+const FORCED_STARS_HEADER: &str =
+    "frame_id\tkey\tg\tx_proj\ty_proj\tx_fit\ty_fit\tmodel_flux\tflux\tsnr\tflags\taccepted\tkept\tzp_i\tclipped";
+
+/// The 6F reference is measured on at most this many of a frame's kept list stars (key order, the same in every frame).
+const BIG6_MAX_STARS: usize = 400;
+/// Index of the 6 F aperture in [`BIGAP_RADII_FWHM`].
+const BIG6_RADIUS_INDEX: usize = 4;
+/// A frame's 6F zero point needs this many stars.
+const BIG6_MIN_STARS: usize = 20;
+/// Every n-th frame is measured a second time without a list and compared (B9), unless `--identity-every` says else.
+const IDENTITY_EVERY_DEFAULT: usize = 10;
+
+/// One light of a `forced` run. A light that was not measured carries one of [`UNMEASURED`] in `refusal`.
+///
+/// `layout` is `mono`, `cfa` or `rgb`. `anchor_stars` is the anchor's survivors, or the matches it found when the anchor
+/// refused. `accepted` / `kept` count the list's fits that were accepted / kept by the fitter (before the 4 sigma clip);
+/// `zp_stars` the survivors of the clip. `c*` are the list's aperture correction, `c_budget` the budget's reported one
+/// (mosaic only). `ring_missing` counts accepted list fits within 12 F of an edge, F the ring width the list was read at
+/// (their ring is truncated). `zero_point_6f` is the clipped median of the plain 6 F aperture zero points of the first
+/// [`BIG6_MAX_STARS`] kept list stars (green sites, each CFA phase less its own annulus sky): the second reference of B3.
+#[derive(Debug, Clone, Default)]
+struct ForcedRow {
+    frame_id: Option<i64>,
+    file_name: String,
+    object: String,
+    filter: String,
+    night: String,
+    date_obs: String,
+    exptime: Option<f64>,
+    rig: String,
+    layout: String,
+    airmass: Option<f64>,
+    /// 0 or 1: the pier side, from the rotation against the night's first frame.
+    pier: Option<i64>,
+    rotation_deg: Option<f64>,
+    stars_detected: Option<i64>,
+    median_fwhm: Option<f64>,
+    scale: Option<f64>,
+    fwhm_ref: Option<f64>,
+    anchor: Option<f64>,
+    anchor_stars: Option<i64>,
+    window_bright: Option<f64>,
+    window_faint: Option<f64>,
+    list_before_cap: Option<i64>,
+    list_stars: Option<i64>,
+    accepted: Option<i64>,
+    kept: Option<i64>,
+    zp_stars: Option<i64>,
+    c: Option<f64>,
+    c_stars: Option<i64>,
+    c_se: Option<f64>,
+    c_budget: Option<f64>,
+    zero_point: Option<f64>,
+    sigma: Option<f64>,
+    std_error: Option<f64>,
+    refusal: String,
+    centre_median_px: Option<f64>,
+    ring_missing: Option<i64>,
+    zero_point_today: Option<f64>,
+    today_refusal: String,
+    zero_point_6f: Option<f64>,
+    /// `ok` or `mismatch:<field>` on a frame measured a second time without a list; empty on the others.
+    identity: String,
+    call_ms: Option<f64>,
+    plain_ms: Option<f64>,
+    /// The list's structures (stars, fits), kB.
+    list_kb: Option<f64>,
+    /// The process' peak resident set after the frame, MB.
+    rss_mb: Option<f64>,
+}
+
+fn int(x: Option<i64>) -> String {
+    x.map(|v| v.to_string()).unwrap_or_default()
+}
+
+impl ForcedRow {
+    fn cells(&self) -> Vec<String> {
+        vec![
+            int(self.frame_id),
+            clean(&self.file_name),
+            clean(&self.object),
+            clean(&self.filter),
+            clean(&self.night),
+            clean(&self.date_obs),
+            num(self.exptime, 3),
+            clean(&self.rig),
+            clean(&self.layout),
+            num(self.airmass, 4),
+            int(self.pier),
+            num(self.rotation_deg, 3),
+            int(self.stars_detected),
+            num(self.median_fwhm, 3),
+            num(self.scale, 4),
+            num(self.fwhm_ref, 3),
+            num(self.anchor, 5),
+            int(self.anchor_stars),
+            num(self.window_bright, 3),
+            num(self.window_faint, 3),
+            int(self.list_before_cap),
+            int(self.list_stars),
+            int(self.accepted),
+            int(self.kept),
+            int(self.zp_stars),
+            num(self.c, 5),
+            int(self.c_stars),
+            num(self.c_se, 5),
+            num(self.c_budget, 5),
+            num(self.zero_point, 5),
+            num(self.sigma, 5),
+            num(self.std_error, 5),
+            clean(&self.refusal),
+            num(self.centre_median_px, 4),
+            int(self.ring_missing),
+            num(self.zero_point_today, 5),
+            clean(&self.today_refusal),
+            num(self.zero_point_6f, 5),
+            clean(&self.identity),
+            num(self.call_ms, 0),
+            num(self.plain_ms, 0),
+            num(self.list_kb, 1),
+            num(self.rss_mb, 0),
+        ]
+    }
+
+    fn to_tsv(&self) -> String {
+        self.cells().join("\t")
+    }
+
+    fn from_fields(h: &[String], f: &[String]) -> Self {
+        let s = |n: &str| col(h, f, n).to_string();
+        let x = |n: &str| opt_f64(col(h, f, n));
+        let i = |n: &str| opt_i64(col(h, f, n));
+        Self {
+            frame_id: i("frame_id"),
+            file_name: s("file_name"),
+            object: s("object"),
+            filter: s("filter"),
+            night: s("night"),
+            date_obs: s("date_obs"),
+            exptime: x("exptime"),
+            rig: s("rig"),
+            layout: s("layout"),
+            airmass: x("airmass"),
+            pier: i("pier"),
+            rotation_deg: x("rotation_deg"),
+            stars_detected: i("stars_detected"),
+            median_fwhm: x("median_fwhm"),
+            scale: x("scale"),
+            fwhm_ref: x("fwhm_ref"),
+            anchor: x("anchor"),
+            anchor_stars: i("anchor_stars"),
+            window_bright: x("window_bright"),
+            window_faint: x("window_faint"),
+            list_before_cap: i("list_before_cap"),
+            list_stars: i("list_stars"),
+            accepted: i("accepted"),
+            kept: i("kept"),
+            zp_stars: i("zp_stars"),
+            c: x("c"),
+            c_stars: i("c_stars"),
+            c_se: x("c_se"),
+            c_budget: x("c_budget"),
+            zero_point: x("zero_point"),
+            sigma: x("sigma"),
+            std_error: x("std_error"),
+            refusal: s("refusal"),
+            centre_median_px: x("centre_median_px"),
+            ring_missing: i("ring_missing"),
+            zero_point_today: x("zero_point_today"),
+            today_refusal: s("today_refusal"),
+            zero_point_6f: x("zero_point_6f"),
+            identity: s("identity"),
+            call_ms: x("call_ms"),
+            plain_ms: x("plain_ms"),
+            list_kb: x("list_kb"),
+            rss_mb: x("rss_mb"),
+        }
+    }
+
+    fn t_s(&self) -> Option<f64> {
+        parse_time(&self.date_obs).map(|t| t.timestamp_millis() as f64 / 1000.0)
+    }
+
+    fn is_unmeasured(&self) -> bool {
+        UNMEASURED.contains(&self.refusal.as_str())
+    }
+
+    fn valid(&self) -> bool {
+        self.zero_point.is_some()
+    }
+
+    /// The rig of the row: the TSV's column, the filter for an older TSV.
+    fn rig_key(&self) -> String {
+        if self.rig.is_empty() {
+            self.filter.clone()
+        } else {
+            self.rig.clone()
+        }
+    }
+}
+
+fn forced_base_row(c: &Candidate) -> ForcedRow {
+    let m = base_row(c);
+    ForcedRow {
+        frame_id: m.frame_id,
+        file_name: m.file_name,
+        object: m.object,
+        filter: m.filter,
+        night: m.night,
+        date_obs: m.date_obs,
+        exptime: m.exptime,
+        rig: m.rig,
+        ..ForcedRow::default()
+    }
+}
+
+// ---- the pier side ----
+
+/// The signed difference of two rotations, degrees, in `[-180, 180)`.
+fn rotation_gap_deg(a: f64, b: f64) -> f64 {
+    (a - b + 540.0).rem_euclid(360.0) - 180.0
+}
+
+/// The pier side of a frame: 0 while its rotation is within 90 degrees (mod 360) of the night's first frame, else 1.
+fn pier_side(first_rotation_deg: f64, rotation_deg: f64) -> i64 {
+    i64::from(rotation_gap_deg(rotation_deg, first_rotation_deg).abs() > 90.0)
+}
+
+// ---- the process' memory ----
+
+/// The process' peak resident set (MB): `ru_maxrss`, bytes on macOS and kilobytes elsewhere. `None` off Unix.
+#[cfg(unix)]
+fn peak_rss_mb() -> Option<f64> {
+    // SAFETY: `getrusage` writes into the zeroed struct we own and reads nothing else.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return None;
+    }
+    let raw = usage.ru_maxrss as f64;
+    Some(if cfg!(target_os = "macos") {
+        raw / 1_048_576.0
+    } else {
+        raw / 1024.0
+    })
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb() -> Option<f64> {
+    None
+}
+
+// ---- identity (B9) ----
+
+/// Every number of a fit by name as bits (NaN equals NaN by its bits), the order of rustafits' own identity test.
+fn star_bits(f: &StarFit) -> Vec<(&'static str, u64)> {
+    vec![
+        ("x", f.x.to_bits()),
+        ("y", f.y.to_bits()),
+        ("background", f.background.to_bits()),
+        ("amplitude", f.amplitude.to_bits()),
+        ("fwhm_x", f.fwhm_x.to_bits()),
+        ("fwhm_y", f.fwhm_y.to_bits()),
+        ("fwtm_x", f.fwtm_x.to_bits()),
+        ("fwtm_y", f.fwtm_y.to_bits()),
+        ("theta", f.theta.to_bits()),
+        ("beta", f.beta.to_bits()),
+        ("residual", f.residual.to_bits()),
+        ("signal", f.signal.to_bits()),
+        ("area", f.area.to_bits()),
+        ("peak5", f.peak5.to_bits()),
+        ("sky_ring", f.sky_ring.to_bits()),
+        ("sky_ring_sigma", f.sky_ring_sigma.to_bits()),
+        ("snr", f.snr.to_bits()),
+        ("ap_sum", f.ap_sum.to_bits()),
+        ("hfr", f.hfr.to_bits()),
+        ("sky_ring_n", u64::from(f.sky_ring_n)),
+        ("flags", u64::from(f.flags.bits())),
+    ]
+}
+
+/// The measurement with its wall-clock fields reset, as text: `{:?}` prints a float as its shortest round trip.
+fn measurement_text(pm: &PlaneMeasurement) -> String {
+    let mut pm = pm.clone();
+    pm.timings = Default::default();
+    pm.sub_steps = Default::default();
+    format!("{pm:?}")
+}
+
+/// What differs between the measurement a plain `measure_raw_frame` made and the one `measure_with_zero_point` made (B9,
+/// rustafits' `the_analysis_measurement_is_identical_with_and_without_a_list`): the first field that does, by name.
+fn identity_mismatch(
+    plain: &PlaneMeasurement,
+    with: &PlaneMeasurement,
+    opts: &FrameOptions,
+) -> Option<String> {
+    if plain.stars.len() != with.stars.len() {
+        return Some("stars_len".to_string());
+    }
+    for (a, b) in plain.stars.iter().zip(&with.stars) {
+        for ((name, x), (_, y)) in star_bits(a).into_iter().zip(star_bits(b)) {
+            if x != y {
+                return Some(format!("star_{name}"));
+            }
+        }
+    }
+    if measurement_text(plain) != measurement_text(with) {
+        return Some("measurement".to_string());
+    }
+    let summary = |pm: &PlaneMeasurement| format!("{:?}", FrameSummary::from_measurement(pm, opts));
+    if summary(plain) != summary(with) {
+        return Some("summary".to_string());
+    }
+    None
+}
+
+// ---- the 6F reference ----
+
+/// The clipped median of `values`: a median, the values beyond `sigma` robust sigmas dropped, repeated until none is
+/// (at most ten rounds); `None` under `min` values.
+fn clip_median(values: &[f64], sigma: f64, min: usize) -> Option<f64> {
+    if values.len() < min {
+        return None;
+    }
+    let mut alive = values.to_vec();
+    for _ in 0..10 {
+        let m = median(&mut alive.clone())?;
+        let mut dev: Vec<f64> = alive.iter().map(|v| (v - m).abs()).collect();
+        let robust = (median(&mut dev)? * 1.4826).max(0.005);
+        let next: Vec<f64> = alive
+            .iter()
+            .copied()
+            .filter(|v| (v - m).abs() <= sigma * robust)
+            .collect();
+        if next.len() == alive.len() || next.len() < min {
+            break;
+        }
+        alive = next;
+    }
+    median(&mut alive)
+}
+
+/// The plain 6 F aperture zero point of a frame on its list: per kept list star (key order, at most
+/// [`BIG6_MAX_STARS`]), the sum within 6 F of the fitted centre over the green sites (every site of a mono plane), each
+/// CFA phase less the median of its own annulus (`bigap_star`), `G + 2.5 log10(flux / t)`; the clipped median. No
+/// aperture correction, no model: an independent photometry on the same stars.
+fn six_f_zero_point(
+    planes: &RawPlanes,
+    (w, h): (usize, usize),
+    stars: &[ForcedStar],
+    fits: &[ListFit],
+    fwhm: f64,
+    exptime_s: f64,
+) -> Option<f64> {
+    let (plane, pattern): (&[f32], astroimage::BayerPattern) = match planes {
+        RawPlanes::Mono(p) => (p, astroimage::BayerPattern::None),
+        RawPlanes::Cfa { mosaic, pattern } => (mosaic, *pattern),
+        RawPlanes::Rgb(_) => return None,
+    };
+    if !(fwhm.is_finite() && fwhm > 0.0 && exptime_s > 0.0) {
+        return None;
+    }
+    let mut zps = Vec::new();
+    for (star, fit) in stars
+        .iter()
+        .zip(fits)
+        .filter(|(_, f)| f.kept)
+        .take(BIG6_MAX_STARS)
+    {
+        let Some(b) = bigap_star(plane, pattern, (w, h), (fit.x, fit.y), fwhm) else {
+            continue;
+        };
+        let mut flux = 0.0;
+        let mut usable = true;
+        for p in 0..4 {
+            if cfa_colour(pattern, p & 1, p >> 1) != 1 {
+                continue;
+            }
+            if !b.med[p].is_finite() {
+                usable = false;
+                break;
+            }
+            flux += b.sum[BIG6_RADIUS_INDEX][p] - b.cnt[BIG6_RADIUS_INDEX][p] as f64 * b.med[p];
+        }
+        if usable && flux > 0.0 {
+            zps.push(f64::from(star.g_mag) + 2.5 * (flux / exptime_s).log10());
+        }
+    }
+    clip_median(&zps, 4.0, BIG6_MIN_STARS)
+}
+
+/// One list star's row of the stars TSV.
+fn forced_star_line(
+    frame_id: i64,
+    s: &ForcedStar,
+    f: Option<&ListFit>,
+    zp: Option<(f64, bool)>,
+) -> String {
+    let n = |v: Option<f64>, p: usize| num(v, p);
+    let (x_fit, y_fit, model, flux, snr, flags, accepted, kept) = match f {
+        Some(f) => (
+            n(Some(f.x), 3),
+            n(Some(f.y), 3),
+            n(Some(f.model_flux), 3),
+            n(Some(f.flux), 3),
+            n(Some(f.snr), 2),
+            f.flags.names().join("+"),
+            u8::from(f.accepted),
+            u8::from(f.kept),
+        ),
+        None => Default::default(),
+    };
+    format!(
+        "{frame_id}\t{:016x}\t{:.3}\t{:.3}\t{:.3}\t{x_fit}\t{y_fit}\t{model}\t{flux}\t{snr}\t{flags}\t{accepted}\t{kept}\t{}\t{}",
+        s.key,
+        s.g_mag,
+        s.x,
+        s.y,
+        zp.map(|z| format!("{:.5}", z.0)).unwrap_or_default(),
+        zp.map(|z| u8::from(!z.1).to_string()).unwrap_or_default(),
+    )
+}
+
+fn millis(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+
+/// One light, end to end: the stored solve, the frame read in memory, the shipping composition, today's zero point on
+/// the same measurement, the 6F reference and, when `identity`, a second plain measurement compared with the first.
+/// Returns the light's row (its failure is the `refusal`, logged on stderr) and its list stars' rows.
+fn forced_frame(
+    conn: &Connection,
+    rig: &Rig,
+    fp: &ForcedListParams,
+    c: &Candidate,
+    identity: bool,
+) -> (ForcedRow, Vec<String>) {
+    let mut row = forced_base_row(c);
+    let fail = |row: &mut ForcedRow, code: &str, detail: &dyn std::fmt::Display| {
+        eprintln!("zp_probe: frame {} refused {code}: {detail}", c.frame_id);
+        row.refusal = code.to_string();
+    };
+    let rec = match get_plate_solve(conn, c.frame_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            fail(&mut row, "no_solve", &"no stored solve");
+            return (row, Vec::new());
+        }
+        Err(e) => {
+            fail(&mut row, "bad_wcs", &e);
+            return (row, Vec::new());
+        }
+    };
+    row.rotation_deg = Some(rec.field_rotation_deg).filter(|r| r.is_finite());
+    let Some(wcs) = rec.to_solution() else {
+        fail(&mut row, "bad_wcs", &"the stored SIP tables are unusable");
+        return (row, Vec::new());
+    };
+    let mut frame = match read_raw_frame(Path::new(&c.path)) {
+        Ok(f) => f,
+        Err(e) => {
+            fail(&mut row, "analysis_failed", &e);
+            return (row, Vec::new());
+        }
+    };
+    frame.drop_unmeasured_planes();
+    row.layout = match &frame.planes {
+        RawPlanes::Mono(_) => "mono",
+        RawPlanes::Cfa { .. } => "cfa",
+        RawPlanes::Rgb(_) => "rgb",
+    }
+    .to_string();
+    let (width, height) = (frame.w, frame.h);
+
+    let meta = Frame {
+        date_obs: parse_time(&c.date_obs),
+        ..Frame::default()
+    };
+    let epoch = observation_epoch(&meta);
+    let layers: Vec<&StarCache> = rig.layers.iter().map(|l| l.as_ref()).collect();
+    let inputs = ZpInputs {
+        wcs: &wcs,
+        exptime_s: c.exptime,
+        epoch,
+    };
+    let started = Instant::now();
+    let (pm, run) = measure_with_zero_point(
+        &frame,
+        &rig.config,
+        Some(&rig.pool),
+        Some(&inputs),
+        fp,
+        |w, wd, ht, region, ep| catalog_for_frame(&layers, w, wd, ht, region, ep),
+    );
+    row.call_ms = Some(millis(started));
+    let Some(run) = run else {
+        fail(&mut row, "analysis_failed", &"no zero-point run came back");
+        return (row, Vec::new());
+    };
+    let (analysis, stars) = map_measurement(&pm, &frame, &rig.config, &rig.config_hash);
+    row.stars_detected = Some(analysis.stars_detected);
+    row.median_fwhm = Some(analysis.median_fwhm).filter(|f| *f > 0.0);
+    let mosaic = row.layout == "cfa";
+    if mosaic {
+        row.c_budget = pm.reported_aperture_correction;
+    }
+
+    // The airmass of the solve centre at the middle of the exposure; no site, no airmass.
+    let (ra, dec) = wcs.pixel_to_sky((width as f64 - 1.0) / 2.0, (height as f64 - 1.0) / 2.0);
+    row.airmass = match (c.sitelat, c.sitelong, parse_time(&c.date_obs)) {
+        (Some(lat), Some(lon), Some(t)) => {
+            let mid = t.timestamp_millis() as f64 / 1000.0
+                + c.exptime.filter(|e| e.is_finite()).unwrap_or(0.0) / 2.0;
+            airmass(ra, dec, mid, lat, lon)
+        }
+        _ => None,
+    };
+
+    if let Some(a) = &run.anchor {
+        row.anchor = Some(a.zero_point);
+        row.anchor_stars = Some(i64::from(a.stars));
+    }
+    if let Some(l) = &run.list {
+        row.scale = Some(l.scale_arcsec);
+        row.fwhm_ref = Some(l.fwhm_ref_px);
+        row.window_bright = Some(l.window_bright);
+        row.window_faint = Some(l.window_faint);
+        row.list_before_cap = Some(l.list_before_cap as i64);
+        row.list_stars = Some(l.stars.len() as i64);
+    }
+    if let Some(m) = &run.measured {
+        row.accepted = Some(m.fits.iter().filter(|f| f.accepted).count() as i64);
+        row.kept = Some(m.fits.iter().filter(|f| f.kept).count() as i64);
+        row.c = m.aperture_correction;
+        row.c_stars = Some(m.aperture_stars as i64);
+        row.c_se = m.aperture_se;
+        let mut offsets: Vec<f64> = m
+            .fits
+            .iter()
+            .filter(|f| f.accepted && f.centre_offset_px.is_finite())
+            .map(|f| f.centre_offset_px)
+            .collect();
+        row.centre_median_px = median(&mut offsets);
+        if let Some(ring) = m.ring_fwhm.filter(|r| r.is_finite()) {
+            let edge = 12.0 * ring;
+            let (w1, h1) = (width as f64 - 1.0, height as f64 - 1.0);
+            row.ring_missing = Some(
+                m.fits
+                    .iter()
+                    .filter(|f| f.accepted)
+                    .filter(|f| f.x < edge || f.y < edge || f.x > w1 - edge || f.y > h1 - edge)
+                    .count() as i64,
+            );
+        }
+    }
+    if let (Some(l), Some(m)) = (&run.list, &run.measured) {
+        let bytes = l.stars.len() * std::mem::size_of::<ForcedStar>()
+            + m.fits.len() * std::mem::size_of::<ListFit>()
+            + l.request.positions.len() * std::mem::size_of::<(f64, f64)>();
+        row.list_kb = Some(bytes as f64 / 1024.0);
+    }
+    match &run.result {
+        Ok(z) => {
+            row.zero_point = Some(z.zero_point);
+            row.sigma = Some(z.sigma);
+            row.zp_stars = Some(i64::from(z.stars));
+            row.std_error = Some(z.sigma / f64::from(z.stars.max(1)).sqrt());
+        }
+        Err(r) => {
+            row.refusal = r.code().to_string();
+            match r {
+                ForcedRefusal::NoAnchor { matched } => row.anchor_stars = Some(i64::from(*matched)),
+                ForcedRefusal::TooFewStars { kept, .. } => row.zp_stars = Some(i64::from(*kept)),
+                ForcedRefusal::TooScattered {
+                    std_error,
+                    kept,
+                    sigma,
+                } => {
+                    row.zp_stars = Some(i64::from(*kept));
+                    row.std_error = Some(*std_error);
+                    row.sigma = Some(*sigma);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Today's zero point on the same measurement (6.5's matcher over the budget fits, times the reported c on a mosaic).
+    match catalog_for_frame(
+        &layers,
+        &wcs,
+        width,
+        height,
+        rig.params.central_fraction,
+        epoch,
+    ) {
+        Ok(cat) => {
+            let today = measure_zero_point(
+                &ZpInput {
+                    stars: &stars,
+                    wcs: &wcs,
+                    catalog: &cat,
+                    exptime_s: c.exptime,
+                    width,
+                    height,
+                    median_fwhm_px: analysis.median_fwhm,
+                },
+                &rig.params,
+            );
+            match today.result {
+                Ok(z) if mosaic => match pm.reported_aperture_correction {
+                    Some(cc) => row.zero_point_today = Some(z.zero_point + 2.5 * cc.log10()),
+                    None => row.today_refusal = "no_c".to_string(),
+                },
+                Ok(z) => row.zero_point_today = Some(z.zero_point),
+                Err(r) => row.today_refusal = r.code().to_string(),
+            }
+        }
+        Err(e) => {
+            eprintln!("zp_probe: frame {} today's cone: {e:#}", c.frame_id);
+            row.today_refusal = "no_cone".to_string();
+        }
+    }
+
+    if let (Some(l), Some(m), Some(fwhm), Some(t)) =
+        (&run.list, &run.measured, row.median_fwhm, c.exptime)
+    {
+        row.zero_point_6f =
+            six_f_zero_point(&frame.planes, (width, height), &l.stars, &m.fits, fwhm, t);
+    }
+
+    let mut lines = Vec::new();
+    if let (Some(l), Some(m)) = (&run.list, &run.measured) {
+        let per: HashMap<usize, (f64, bool)> = run
+            .outcome
+            .as_ref()
+            .map(|o| {
+                o.per_star
+                    .iter()
+                    .map(|p| (p.index, (p.zp, p.clipped_in)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (i, s) in l.stars.iter().enumerate() {
+            lines.push(forced_star_line(
+                c.frame_id,
+                s,
+                m.fits.get(i),
+                per.get(&i).copied(),
+            ));
+        }
+    }
+
+    if identity {
+        let started = Instant::now();
+        let plain = measure_raw_frame(&frame, &rig.config, Some(&rig.pool));
+        row.plain_ms = Some(millis(started));
+        row.identity = identity_mismatch(&plain, &pm, &frame_options(&rig.config))
+            .map_or_else(|| "ok".to_string(), |f| format!("mismatch:{f}"));
+    }
+    row.rss_mb = peak_rss_mb();
+    (row, lines)
+}
+
+/// `<x>.stars.tsv` for `<x>.tsv`.
+fn stars_path(out: &str) -> String {
+    format!("{}.stars.tsv", out.strip_suffix(".tsv").unwrap_or(out))
+}
+
+fn cmd_forced(mut args: Args) -> Result<()> {
+    let db = args.require("db")?;
+    let app_data = args.require("app-data")?;
+    let instrume = args.require("instrume")?;
+    let filter = args.require("filter")?;
+    let object = args.require("object")?;
+    let out = args.require("out")?;
+    let limit: Option<usize> = args.take_parsed("limit")?;
+    let identity_every: usize = args
+        .take_parsed("identity-every")?
+        .unwrap_or(IDENTITY_EVERY_DEFAULT);
+    let params = args.zp_params()?;
+    args.finish()?;
+
+    let conn = open_read_only(&db)?;
+    let rig = open_rig(&conn, &app_data, params)?;
+    let fp = ForcedListParams::default();
+    let candidates = load_candidates(&conn, &instrume, &object, &filter)?;
+    eprintln!(
+        "zp_probe forced: {} lights of {instrume} / {object} / {filter} in the catalogue; list params {fp:?}",
+        candidates.len()
+    );
+    let mut w = create_out(&out)?;
+    writeln!(w, "{FORCED_HEADER}")?;
+    let mut ws = create_out(&stars_path(&out))?;
+    writeln!(ws, "{FORCED_STARS_HEADER}")?;
+    let (mut measured, mut refused, mut examined) = (0usize, 0usize, 0usize);
+    let mut first_rotation: HashMap<String, f64> = HashMap::new();
+    for c in &candidates {
+        if limit.is_some_and(|n| measured >= n) {
+            break;
+        }
+        examined += 1;
+        let skip = if c.in_zip {
+            Some("in_zip")
+        } else if !Path::new(&c.path).is_file() {
+            Some("missing_file")
+        } else if !c.has_solve {
+            Some("no_solve")
+        } else {
+            None
+        };
+        if let Some(code) = skip {
+            eprintln!(
+                "zp_probe: frame {} not measured ({code}): {}",
+                c.frame_id, c.path
+            );
+            let mut row = forced_base_row(c);
+            row.refusal = code.to_string();
+            writeln!(w, "{}", row.to_tsv())?;
+            continue;
+        }
+        let identity = identity_every > 0 && measured % identity_every == 0;
+        let (mut row, star_lines) = forced_frame(&conn, &rig, &fp, c, identity);
+        if let Some(rot) = row.rotation_deg {
+            let first = *first_rotation.entry(c.night.clone()).or_insert(rot);
+            row.pier = Some(pier_side(first, rot));
+        }
+        if row.zero_point.is_none() {
+            refused += 1;
+        }
+        writeln!(w, "{}", row.to_tsv())?;
+        for l in &star_lines {
+            writeln!(ws, "{l}")?;
+        }
+        w.flush()?;
+        ws.flush()?;
+        measured += 1;
+        if measured % PROGRESS_EVERY == 0 {
+            eprintln!(
+                "zp_probe forced: {measured} frames measured ({refused} without a zero point)"
+            );
+        }
+    }
+    w.flush()?;
+    ws.flush()?;
+    eprintln!(
+        "zp_probe summary: examined {examined} of {} lights, measured {measured} ({refused} without a zero point); wrote {out} and {}",
+        candidates.len(),
+        stars_path(&out)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verdict --forced: the bars B1-B9 of the forced-list spec section 6, as amended by the plan's review rulings
+// ---------------------------------------------------------------------------
+
+/// B1: every pair shares at least this share of the first frame's kept keys.
+const B1_MIN_SHARE: f64 = 0.80;
+/// B2: median |dZP| of a night's pairs, on a common-set night / elsewhere (and not above today's).
+const B2_COMMON_MAX: f64 = 0.015;
+const B2_OTHER_MAX: f64 = 0.020;
+/// B3: RMS about the median of `ZP - 2.5 log10(t_flux / t)`, and |slope| of that on FWHM (mag/px).
+const B3_RMS_MAX: f64 = 0.015;
+const B3_SLOPE_MAX: f64 = 0.04;
+/// B3's slope needs this many joined frames.
+const B3_MIN_POINTS: usize = 20;
+/// B4: |k - k_stack| (mag per airmass), judged where the side's airmass range is at least `B4_MIN_DX`.
+const B4_K_TOL: f64 = 0.02;
+const B4_MIN_DX: f64 = 0.4;
+const B4_MIN_POINTS: usize = 10;
+/// B6: valid over measured per night; 6.5's QHY268M sets must be complete.
+const B6_MIN: f64 = 0.90;
+const B6_COMPLETE: f64 = 1.00;
+/// B7: median |fitted - projected| over frames, in units of `FWHM_ref`.
+const B7_MAX_FWHM_REF: f64 = 0.25;
+/// B8: today's slope plus this many of its errors bounds the forced slope.
+const B8_SIGMAS: f64 = 2.0;
+/// A night with this many frames joined to `--common` is a common-set night.
+const COMMON_NIGHT_MIN_JOINED: usize = 30;
+/// 6.5's committed cross-target spread of the QHY268M L sets (mag), printed beside ours.
+const CROSS_COMMITTED_6_5_MAG: f64 = 0.025;
+
+/// The `--common` rows by frame id and by local file name.
+struct CommonIndex<'a> {
+    by_id: HashMap<i64, &'a CommonRow>,
+    by_name: HashMap<&'a str, &'a CommonRow>,
+}
+
+impl<'a> CommonIndex<'a> {
+    fn new(rows: &'a [CommonRow]) -> Self {
+        Self {
+            by_id: rows.iter().filter_map(|c| Some((c.frame_id?, c))).collect(),
+            by_name: rows.iter().map(|c| (name_key(&c.file_name), c)).collect(),
+        }
+    }
+
+    /// The row's common flux (green plane of a colour frame, the plane of a mono one), by frame id else file name.
+    fn tflux(&self, r: &ForcedRow) -> Option<f64> {
+        let c = r
+            .frame_id
+            .and_then(|id| self.by_id.get(&id).copied())
+            .or_else(|| self.by_name.get(r.file_name.as_str()).copied())?;
+        c.green_tflux()
+    }
+
+    /// `2.5 log10(t_flux / t)`, the stack's level of the frame, in the units of the zero point.
+    fn level(&self, r: &ForcedRow) -> Option<f64> {
+        let t = r.exptime.filter(|t| *t > 0.0)?;
+        Some(2.5 * (self.tflux(r)? / t).log10())
+    }
+}
+
+/// A night judged under `--forced`: its rig, object and date, its measured frames in time order and their pier sides.
+struct FNight<'a> {
+    rig: String,
+    object: String,
+    night: String,
+    filter: String,
+    rows: Vec<&'a ForcedRow>,
+    /// The pier side of each row (the night's first frame with a rotation is side 0); `None` without a rotation.
+    sides: Vec<Option<i64>>,
+    /// Frames joined to `--common`.
+    joined: usize,
+}
+
+impl FNight<'_> {
+    fn label(&self) -> String {
+        if self.filter == "-" || self.filter.is_empty() {
+            format!("{}/{}", self.object, self.night)
+        } else {
+            format!("{}/{}/{}", self.object, self.filter, self.night)
+        }
+    }
+
+    fn common(&self) -> bool {
+        self.joined >= COMMON_NIGHT_MIN_JOINED
+    }
+
+    fn two_sided(&self) -> bool {
+        let has = |s| self.sides.contains(&Some(s));
+        has(0) && has(1)
+    }
+
+    fn mono(&self) -> bool {
+        let layouts: Vec<&str> = self
+            .rows
+            .iter()
+            .map(|r| r.layout.as_str())
+            .filter(|l| !l.is_empty())
+            .collect();
+        !layouts.is_empty() && layouts.iter().all(|l| *l == "mono")
+    }
+
+    fn qhy(&self) -> bool {
+        self.rig.starts_with("QHY268M")
+    }
+
+    fn rig_short(&self) -> String {
+        let parts: Vec<&str> = self.rig.split('|').collect();
+        match (parts.first(), parts.last()) {
+            (Some(a), Some(b)) if parts.len() > 1 => format!("{a}/{b}"),
+            _ => self.rig.clone(),
+        }
+    }
+}
+
+/// Every night of at least [`OSC_NIGHT_MIN_FRAMES`] measured frames, by rig, object and night, in time order.
+fn forced_nights<'a>(rows: &'a [ForcedRow], common: Option<&CommonIndex>) -> Vec<FNight<'a>> {
+    let mut by: BTreeMap<(String, String, String), Vec<&ForcedRow>> = BTreeMap::new();
+    for r in rows.iter().filter(|r| !r.is_unmeasured()) {
+        by.entry((r.rig_key(), r.object.clone(), r.night.clone()))
+            .or_default()
+            .push(r);
+    }
+    by.into_iter()
+        .filter(|(_, v)| v.len() >= OSC_NIGHT_MIN_FRAMES)
+        .map(|((rig, object, night), mut rows)| {
+            rows.sort_by(|a, b| {
+                a.t_s()
+                    .unwrap_or(f64::MAX)
+                    .total_cmp(&b.t_s().unwrap_or(f64::MAX))
+            });
+            let first = rows.iter().find_map(|r| r.rotation_deg);
+            let sides = rows
+                .iter()
+                .map(|r| Some(pier_side(first?, r.rotation_deg?)))
+                .collect();
+            let joined = common.map_or(0, |c| rows.iter().filter(|r| c.tflux(r).is_some()).count());
+            let filter = rows.first().map(|r| r.filter.clone()).unwrap_or_default();
+            FNight {
+                rig,
+                object,
+                night,
+                filter,
+                rows,
+                sides,
+                joined,
+            }
+        })
+        .collect()
+}
+
+/// Consecutive pairs of the frames `keep` accepts, in time order, a pair kept when its frames are under 15 minutes apart.
+fn time_pairs<'a>(
+    rows: &[&'a ForcedRow],
+    keep: impl Fn(&ForcedRow) -> bool,
+) -> Vec<(&'a ForcedRow, &'a ForcedRow)> {
+    let mut frames: Vec<(f64, &ForcedRow)> = rows
+        .iter()
+        .copied()
+        .filter(|r| keep(r))
+        .filter_map(|r| Some((r.t_s()?, r)))
+        .collect();
+    frames.sort_by(|a, b| a.0.total_cmp(&b.0));
+    frames
+        .windows(2)
+        .filter(|w| w[1].0 - w[0].0 < PAIR_MAX_GAP_S)
+        .map(|w| (w[0].1, w[1].1))
+        .collect()
+}
+
+/// The kept keys of the frames, read from `<x>.stars.tsv`: sorted, per frame id.
+type KeptKeys = HashMap<i64, Vec<u64>>;
+
+/// Streams a stars TSV for the keys of the list stars the fitter kept, per frame.
+fn read_kept_keys(path: &str, into: &mut KeptKeys) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("reading {path}"))?;
+    let mut lines = BufReader::new(file).lines();
+    let header: Vec<String> = lines
+        .next()
+        .ok_or_else(|| anyhow!("{path} is empty"))??
+        .split('\t')
+        .map(str::to_string)
+        .collect();
+    let at = |name: &str| {
+        header
+            .iter()
+            .position(|h| h == name)
+            .ok_or_else(|| anyhow!("{path} has no {name} column"))
+    };
+    let (i_frame, i_key, i_kept) = (at("frame_id")?, at("key")?, at("kept")?);
+    for line in lines {
+        let line = line?;
+        let f: Vec<&str> = line.split('\t').collect();
+        let (Some(id), Some(key), Some(kept)) = (f.get(i_frame), f.get(i_key), f.get(i_kept))
+        else {
+            continue;
+        };
+        if *kept != "1" {
+            continue;
+        }
+        if let (Ok(id), Ok(key)) = (id.parse::<i64>(), u64::from_str_radix(key, 16)) {
+            into.entry(id).or_default().push(key);
+        }
+    }
+    for v in into.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    Ok(())
+}
+
+/// Size of the intersection of two sorted, de-duplicated slices.
+fn sorted_intersection(a: &[u64], b: &[u64]) -> usize {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    n
+}
+
+/// B1 of a night: for every pair of consecutive frames (under 15 minutes apart) that both hold a zero point, the share of
+/// the first frame's kept keys the second also kept. Only consecutive pairs count (never frame j with j+2, and a frame
+/// without a zero point breaks its pair rather than joining its neighbours).
+fn kept_shares(night: &FNight, keys: &KeptKeys) -> Vec<f64> {
+    time_pairs(&night.rows, |_| true)
+        .iter()
+        .filter(|(a, b)| a.valid() && b.valid())
+        .filter_map(|(a, b)| {
+            let (ka, kb) = (keys.get(&a.frame_id?)?, keys.get(&b.frame_id?)?);
+            (!ka.is_empty()).then(|| sorted_intersection(ka, kb) as f64 / ka.len() as f64)
+        })
+        .collect()
+}
+
+/// Least squares `y = a + s x`: the slope, its standard error and the points; `None` under 3 points or one x.
+fn ols(xs: &[f64], ys: &[f64]) -> Option<(f64, f64, usize)> {
+    let n = xs.len();
+    if n < 3 || ys.len() != n {
+        return None;
+    }
+    let nf = n as f64;
+    let (mx, my) = (xs.iter().sum::<f64>() / nf, ys.iter().sum::<f64>() / nf);
+    let sxx: f64 = xs.iter().map(|x| (x - mx).powi(2)).sum();
+    if sxx <= 1e-12 {
+        return None;
+    }
+    let sxy: f64 = xs.iter().zip(ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+    let slope = sxy / sxx;
+    let rss: f64 = xs
+        .iter()
+        .zip(ys)
+        .map(|(x, y)| (y - my - slope * (x - mx)).powi(2))
+        .sum();
+    Some((slope, (rss / (nf - 2.0) / sxx).sqrt(), n))
+}
+
+/// RMS of `values` about their median.
+fn rms_about_median(values: &[f64]) -> Option<f64> {
+    let m = median(&mut values.to_vec())?;
+    Some((values.iter().map(|v| (v - m).powi(2)).sum::<f64>() / values.len() as f64).sqrt())
+}
+
+/// `y = k x + a + s side` over the points `(x, y, side)`: `(k, a, s)`; `None` for a singular design.
+fn side_fit(points: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
+    let rows: Vec<Vec<f64>> = points.iter().map(|p| vec![p.0, 1.0, p.2]).collect();
+    let y: Vec<f64> = points.iter().map(|p| p.1).collect();
+    let (beta, _, _) = least_squares(&rows, &y)?;
+    Some((beta[0], beta[1], beta[2]))
+}
+
+/// A bar's result over its nights: a miss anywhere wins, else a pass anywhere, else it was judged on no night.
+fn bar_outcome(outs: &[Outcome]) -> Outcome {
+    if outs.contains(&Outcome::Fail) {
+        Outcome::Fail
+    } else if outs.contains(&Outcome::Pass) {
+        Outcome::Pass
+    } else {
+        Outcome::Unjudged
+    }
+}
+
+/// One bar's line: its name and limit, its outcome, a night's entry each.
+fn bar_line(name: &str, limit: &str, entries: &[(String, Outcome)]) -> (String, Outcome) {
+    let outs: Vec<Outcome> = entries.iter().map(|e| e.1).collect();
+    let o = bar_outcome(&outs);
+    let text = if entries.is_empty() {
+        "judged on no night".to_string()
+    } else {
+        entries
+            .iter()
+            .map(|(t, o)| format!("{t} {}", tag(*o)))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let verdict = if entries.is_empty() {
+        "NO NIGHT"
+    } else {
+        tag(o)
+    };
+    (format!("{name} {limit} {verdict}: {text}"), o)
+}
+
+fn dzp_median(
+    pairs: &[(&ForcedRow, &ForcedRow)],
+    value: impl Fn(&ForcedRow) -> Option<f64>,
+) -> Option<f64> {
+    let mut d: Vec<f64> = pairs
+        .iter()
+        .filter_map(|(a, b)| Some((value(b)? - value(a)?).abs()))
+        .collect();
+    median(&mut d)
+}
+
+/// B2 of a night: median |dZP| of consecutive pairs; the common bar on a common-set night, else the other bar and not
+/// above the same statistic of today's zero point on the same pairs.
+fn b2_night(night: &FNight) -> (String, Outcome) {
+    let common = night.common();
+    let pairs = time_pairs(&night.rows, |r| {
+        r.valid() && (common || r.zero_point_today.is_some())
+    });
+    if pairs.len() < STABILITY_MIN_PAIRS {
+        return (
+            format!("{}: {} pairs, too few", night.label(), pairs.len()),
+            Outcome::Unjudged,
+        );
+    }
+    let ours = dzp_median(&pairs, |r| r.zero_point);
+    let today = dzp_median(&pairs, |r| r.zero_point_today);
+    let o = if common {
+        judge_max(ours, B2_COMMON_MAX)
+    } else {
+        match (ours, today) {
+            (Some(o), Some(t)) if o <= B2_OTHER_MAX && o <= t => Outcome::Pass,
+            (Some(_), Some(_)) => Outcome::Fail,
+            _ => Outcome::Unjudged,
+        }
+    };
+    let bar = if common { B2_COMMON_MAX } else { B2_OTHER_MAX };
+    (
+        format!(
+            "{}: {} mag ({} pairs; today {}; limit {bar:.3}{})",
+            night.label(),
+            show(ours, 4),
+            pairs.len(),
+            show(today, 4),
+            if common {
+                ", common set"
+            } else {
+                " and not above today"
+            }
+        ),
+        o,
+    )
+}
+
+/// B3 of a common-set night.
+struct B3Night {
+    points: usize,
+    rms: f64,
+    slope: f64,
+    se: f64,
+    /// ZP against the plain 6F zero point on the same list: slope, error, points.
+    slope_6f: Option<(f64, f64, usize)>,
+    /// The plain 6F zero point against the stack, for information.
+    ref_6f_vs_stack: Option<f64>,
+}
+
+fn b3_night(night: &FNight, common: &CommonIndex) -> Option<B3Night> {
+    let mut d = Vec::new();
+    let mut fw = Vec::new();
+    let (mut x6, mut y6, mut r6) = (Vec::new(), Vec::new(), Vec::new());
+    for r in &night.rows {
+        let (Some(zp), Some(level), Some(f)) = (r.zero_point, common.level(r), r.median_fwhm)
+        else {
+            continue;
+        };
+        d.push(zp - level);
+        fw.push(f);
+        if let Some(z6) = r.zero_point_6f {
+            x6.push(f);
+            y6.push(zp - z6);
+            r6.push(z6 - level);
+        }
+    }
+    if d.len() < B3_MIN_POINTS {
+        return None;
+    }
+    let (slope, se, _) = ols(&fw, &d)?;
+    Some(B3Night {
+        points: d.len(),
+        rms: rms_about_median(&d)?,
+        slope,
+        se,
+        slope_6f: (x6.len() >= B3_MIN_POINTS).then(|| ols(&x6, &y6)).flatten(),
+        ref_6f_vs_stack: (x6.len() >= B3_MIN_POINTS)
+            .then(|| ols(&x6, &r6).map(|s| s.0))
+            .flatten(),
+    })
+}
+
+fn b3_entry(night: &FNight, common: &CommonIndex) -> (String, Outcome) {
+    let Some(b) = b3_night(night, common) else {
+        return (
+            format!(
+                "{}: fewer than {B3_MIN_POINTS} joined frames",
+                night.label()
+            ),
+            Outcome::Unjudged,
+        );
+    };
+    let rms_ok = b.rms <= B3_RMS_MAX;
+    // The slope misses only when the plain 6F reference agrees with the stack's: both see the same seeing term.
+    let (slope_o, note) = if b.slope.abs() <= B3_SLOPE_MAX {
+        (Outcome::Pass, String::new())
+    } else {
+        match b.slope_6f {
+            Some((s6, _, _)) if s6.abs() > B3_SLOPE_MAX && s6 * b.slope > 0.0 => {
+                (Outcome::Fail, String::new())
+            }
+            Some(_) => (
+                Outcome::Pass,
+                " (stack slope not confirmed by 6F: reference-limited)".to_string(),
+            ),
+            None => (Outcome::Unjudged, " (no 6F reference)".to_string()),
+        }
+    };
+    let o = if !rms_ok { Outcome::Fail } else { slope_o };
+    (
+        format!(
+            "{}: rms {:.4}, slope {:+.4} +- {:.4} vs stack, {} vs 6F ({} frames; 6F against stack {}){note}",
+            night.label(),
+            b.rms,
+            b.slope,
+            b.se,
+            b.slope_6f
+                .map_or_else(|| "n/a".to_string(), |s| format!("{:+.4} +- {:.4}", s.0, s.1)),
+            b.points,
+            show(b.ref_6f_vs_stack, 4),
+        ),
+        o,
+    )
+}
+
+/// B4 of a common-set night: ZP = a + kX and the stack's level fitted alike, one pier side at a time on a two-sided night;
+/// the step between the sides is printed and never judged.
+fn b4_entry(night: &FNight, common: &CommonIndex) -> (String, Outcome) {
+    let mut pts: Vec<(f64, f64, f64, i64)> = Vec::new(); // airmass, zp, level, side
+    for (r, side) in night.rows.iter().zip(&night.sides) {
+        if let (Some(x), Some(zp), Some(level)) = (r.airmass, r.zero_point, common.level(r)) {
+            pts.push((x, zp, level, side.unwrap_or(0)));
+        }
+    }
+    let sides: Vec<i64> = if night.two_sided() {
+        vec![0, 1]
+    } else {
+        vec![0]
+    };
+    let mut parts = Vec::new();
+    let mut outs = Vec::new();
+    for side in sides {
+        let mine: Vec<&(f64, f64, f64, i64)> = pts
+            .iter()
+            .filter(|p| !night.two_sided() || p.3 == side)
+            .collect();
+        let name = if night.two_sided() {
+            format!("side {side} ")
+        } else {
+            String::new()
+        };
+        let xs: Vec<f64> = mine.iter().map(|p| p.0).collect();
+        let dx = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            - xs.iter().copied().fold(f64::INFINITY, f64::min);
+        if mine.len() < B4_MIN_POINTS || !(dx >= B4_MIN_DX) {
+            parts.push(format!(
+                "{name}unjudged (airmass range {}, {} frames)",
+                show(Some(dx), 2),
+                mine.len()
+            ));
+            outs.push(Outcome::Unjudged);
+            continue;
+        }
+        let (zs, ls): (Vec<f64>, Vec<f64>) = mine.iter().map(|p| (p.1, p.2)).unzip();
+        match (ols(&xs, &zs), ols(&xs, &ls)) {
+            (Some(z), Some(l)) => {
+                let o = judge_max(Some((z.0 - l.0).abs()), B4_K_TOL);
+                parts.push(format!(
+                    "{name}k {:+.4} vs stack {:+.4} (range {dx:.2}, {} frames) {}",
+                    z.0,
+                    l.0,
+                    z.2,
+                    tag(o)
+                ));
+                outs.push(o);
+            }
+            _ => {
+                parts.push(format!("{name}no fit"));
+                outs.push(Outcome::Unjudged);
+            }
+        }
+    }
+    if night.two_sided() {
+        let with_side = |value: fn(&(f64, f64, f64, i64)) -> f64| {
+            let p: Vec<(f64, f64, f64)> = pts.iter().map(|q| (q.0, value(q), q.3 as f64)).collect();
+            side_fit(&p).map(|f| f.2)
+        };
+        parts.push(format!(
+            "flip step zp {} stack {} (reported, not judged)",
+            show(with_side(|q| q.1), 3),
+            show(with_side(|q| q.2), 3)
+        ));
+    }
+    (
+        format!("{}: {}", night.label(), parts.join(", ")),
+        bar_outcome(&outs),
+    )
+}
+
+/// The shared extinction fit over the nights of one rig, on the frames `value` gives and `also` accepts: one k, an
+/// intercept and an FWHM slope per night, a side step on a night with both sides. The frames in the fit, those without an
+/// airmass counted out.
+fn rig_fit(
+    nights: &[&FNight],
+    value: impl Fn(&ForcedRow) -> Option<f64>,
+    also: impl Fn(&ForcedRow) -> bool,
+) -> (Option<SharedFit>, usize, usize) {
+    let mut points = Vec::new();
+    let mut two_sided = Vec::new();
+    let mut no_airmass = 0;
+    for (slot, n) in nights.iter().enumerate() {
+        let mut sides_used = [0usize; 2];
+        for (r, side) in n.rows.iter().zip(&n.sides) {
+            let (Some(zp), Some(f)) = (value(r), r.median_fwhm) else {
+                continue;
+            };
+            if !also(r) {
+                continue;
+            }
+            let Some(x) = r.airmass else {
+                no_airmass += 1;
+                continue;
+            };
+            let s = side.unwrap_or(0).clamp(0, 1);
+            sides_used[s as usize] += 1;
+            points.push(FitPoint {
+                night: slot,
+                side: s as f64,
+                airmass: x,
+                fwhm: f,
+                zp,
+            });
+        }
+        two_sided.push(sides_used[0] >= 3 && sides_used[1] >= 3);
+    }
+    let frames = points.len();
+    (
+        shared_extinction_fit_sided(&points, nights.len(), &two_sided),
+        no_airmass,
+        frames,
+    )
+}
+
+fn slope_text(f: &Option<NightFit>) -> String {
+    match f {
+        None => "no fit".to_string(),
+        Some(f) => format!(
+            "{:+.4} +- {:.4} (FWHM {:.2}-{:.2}, {} frames{})",
+            f.slope,
+            f.slope_se,
+            f.fwhm_min,
+            f.fwhm_max,
+            f.n,
+            f.side_step
+                .map_or(String::new(), |s| format!(", flip step {s:+.3}"))
+        ),
+    }
+}
+
+/// The 90th-percentile zero point of each object's frames, over the objects with at least [`CROSS_MIN_FRAMES`] valid
+/// frames, per rig: `(spread, sets)`.
+fn cross_spread(sets: &[Vec<f64>]) -> Option<(f64, usize)> {
+    let mut p90: Vec<f64> = sets
+        .iter()
+        .filter(|z| z.len() >= CROSS_MIN_FRAMES)
+        .filter_map(|z| {
+            let mut s = z.clone();
+            s.sort_by(|a, b| a.total_cmp(b));
+            percentile(&s, 0.9)
+        })
+        .collect();
+    if p90.len() < 2 {
+        return None;
+    }
+    p90.sort_by(|a, b| a.total_cmp(b));
+    Some((p90[p90.len() - 1] - p90[0], p90.len()))
+}
+
+/// The verdict of `verdict --forced`: each bar one line (a night's entry each), the reported figures, the decision rows,
+/// the last line the class line, GO or STOP. `keys` are the kept list keys of `<x>.stars.tsv`; without them B1 is judged
+/// on no night.
+fn forced_verdict_lines(
+    all_rows: &[ForcedRow],
+    common: Option<&[CommonRow]>,
+    keys: Option<&KeptKeys>,
+) -> Vec<String> {
+    let index = common.map(CommonIndex::new);
+    let nights = forced_nights(all_rows, index.as_ref());
+    let measured = all_rows.iter().filter(|r| !r.is_unmeasured()).count();
+    let unmeasured = all_rows.len() - measured;
+    let mut lines = vec![format!(
+        "ZP PROBE forced: {measured} frames measured ({unmeasured} not measured), {} judged nights (>= {OSC_NIGHT_MIN_FRAMES} measured frames, {} common-set)",
+        nights.len(),
+        nights.iter().filter(|n| n.common()).count()
+    )];
+    let mut bars: Vec<(&str, Outcome)> = Vec::new();
+    let mut push = |lines: &mut Vec<String>, name: &'static str, r: (String, Outcome)| {
+        lines.push(r.0);
+        bars.push((name, r.1));
+    };
+
+    // B1
+    let entries: Vec<(String, Outcome)> = match keys {
+        None => Vec::new(),
+        Some(k) => nights
+            .iter()
+            .map(|n| {
+                let mut s = kept_shares(n, k);
+                if s.len() < STABILITY_MIN_PAIRS {
+                    return (
+                        format!("{}: {} pairs, too few", n.label(), s.len()),
+                        Outcome::Unjudged,
+                    );
+                }
+                let lo = s.iter().copied().fold(f64::INFINITY, f64::min);
+                let med = median(&mut s).unwrap_or(f64::NAN);
+                (
+                    format!(
+                        "{}: min {lo:.3}, median {med:.3} over {} pairs",
+                        n.label(),
+                        s.len()
+                    ),
+                    judge_max(Some(B1_MIN_SHARE - lo), 0.0),
+                )
+            })
+            .collect(),
+    };
+    push(
+        &mut lines,
+        "B1",
+        bar_line(
+            "B1 kept list stars shared with the successor (valid pairs)",
+            &format!("(every pair >= {B1_MIN_SHARE:.2})"),
+            &entries,
+        ),
+    );
+
+    // B2
+    let entries: Vec<_> = nights.iter().map(b2_night).collect();
+    push(
+        &mut lines,
+        "B2",
+        bar_line(
+            "B2 stability, median |dZP|",
+            "(<= 0.015 common set; else <= 0.020 and not above today)",
+            &entries,
+        ),
+    );
+
+    // B3
+    let entries: Vec<_> = match &index {
+        Some(c) => nights
+            .iter()
+            .filter(|n| n.common())
+            .map(|n| b3_entry(n, c))
+            .collect(),
+        None => Vec::new(),
+    };
+    push(
+        &mut lines,
+        "B3",
+        bar_line(
+            "B3 ZP - 2.5 log10(t_flux/t), common-set nights",
+            &format!("(rms <= {B3_RMS_MAX:.3}; |slope on FWHM| <= {B3_SLOPE_MAX:.2}, a miss when the 6F reference agrees)"),
+            &entries,
+        ),
+    );
+
+    // B4
+    let entries: Vec<_> = match &index {
+        Some(c) => nights
+            .iter()
+            .filter(|n| n.common())
+            .map(|n| b4_entry(n, c))
+            .collect(),
+        None => Vec::new(),
+    };
+    push(
+        &mut lines,
+        "B4",
+        bar_line(
+            "B4 extinction k against the stack's",
+            &format!("(|dk| <= {B4_K_TOL:.2} where the airmass range >= {B4_MIN_DX:.1}, one side at a time)"),
+            &entries,
+        ),
+    );
+
+    // B5: nights without a common set, per rig
+    let mut entries: Vec<(String, Outcome)> = Vec::new();
+    let rigs: std::collections::BTreeSet<String> = nights.iter().map(|n| n.rig.clone()).collect();
+    for rig in &rigs {
+        let members: Vec<&FNight> = nights
+            .iter()
+            .filter(|n| &n.rig == rig && !n.common())
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let (fit, no_airmass, frames) = rig_fit(&members, |r| r.zero_point, |_| true);
+        let short = members[0].rig_short();
+        match fit {
+            None => entries.push((
+                format!("{short}: no fit ({frames} frames, {no_airmass} without an airmass)"),
+                Outcome::Unjudged,
+            )),
+            Some(f) => {
+                for (i, n) in members.iter().enumerate() {
+                    let nf = f.nights[i];
+                    let o = match nf {
+                        Some(x) if x.slope_se <= SLOPE_SE_MAX => {
+                            judge_max(Some(x.slope.abs()), SLOPE_MAX)
+                        }
+                        _ => Outcome::Unjudged,
+                    };
+                    entries.push((
+                        format!(
+                            "{} [k {:+.3}, {no_airmass} without an airmass]: {}",
+                            n.label(),
+                            f.k,
+                            slope_text(&nf)
+                        ),
+                        o,
+                    ));
+                }
+            }
+        }
+    }
+    push(
+        &mut lines,
+        "B5",
+        bar_line(
+            "B5 seeing slope, nights without a common set",
+            &format!("(|s| <= {SLOPE_MAX:.2} where its error <= {SLOPE_SE_MAX:.3})"),
+            &entries,
+        ),
+    );
+
+    // B6
+    let entries: Vec<_> = nights
+        .iter()
+        .map(|n| {
+            let counted: Vec<&&ForcedRow> = n
+                .rows
+                .iter()
+                .filter(|r| r.refusal != "frame_verdict")
+                .collect();
+            let exempt = n.rows.len() - counted.len();
+            let valid = counted.iter().filter(|r| r.valid()).count();
+            let share = (!counted.is_empty()).then(|| valid as f64 / counted.len() as f64);
+            let limit = if n.qhy() { B6_COMPLETE } else { B6_MIN };
+            (
+                format!(
+                    "{}: {} ({valid}/{}; {exempt} with a plane verdict; limit {limit:.2})",
+                    n.label(),
+                    show(share, 3),
+                    counted.len()
+                ),
+                judge_max(share.map(|s| limit - s), 0.0),
+            )
+        })
+        .collect();
+    push(
+        &mut lines,
+        "B6",
+        bar_line(
+            "B6 valid / measured",
+            "(>= 0.90; 6.5's QHY268M sets 1.00; plane verdicts exempt)",
+            &entries,
+        ),
+    );
+
+    // B7
+    let entries: Vec<_> = nights
+        .iter()
+        .map(|n| {
+            let mut c: Vec<f64> = n.rows.iter().filter_map(|r| r.centre_median_px).collect();
+            let mut f: Vec<f64> = n.rows.iter().filter_map(|r| r.fwhm_ref).collect();
+            let (m, fr) = (median(&mut c), median(&mut f));
+            let o = match (m, fr) {
+                (Some(m), Some(fr)) => judge_max(Some(m), B7_MAX_FWHM_REF * fr),
+                _ => Outcome::Unjudged,
+            };
+            (
+                format!(
+                    "{}: {} px (limit {} = {B7_MAX_FWHM_REF:.2} FWHM_ref {})",
+                    n.label(),
+                    show(m, 3),
+                    show(fr.map(|f| f * B7_MAX_FWHM_REF), 3),
+                    show(fr, 2)
+                ),
+                o,
+            )
+        })
+        .collect();
+    push(
+        &mut lines,
+        "B7",
+        bar_line(
+            "B7 median |fitted - projected| centre",
+            &format!("(<= {B7_MAX_FWHM_REF:.2} FWHM_ref)"),
+            &entries,
+        ),
+    );
+
+    // B8: mono rigs, the seeing slope of the forced zero point against today's on the same frames
+    let mut entries: Vec<(String, Outcome)> = Vec::new();
+    let mono_rigs: std::collections::BTreeSet<String> = nights
+        .iter()
+        .filter(|n| n.mono())
+        .map(|n| n.rig.clone())
+        .collect();
+    for rig in &mono_rigs {
+        let members: Vec<&FNight> = nights
+            .iter()
+            .filter(|n| &n.rig == rig && n.mono())
+            .collect();
+        let both = |r: &ForcedRow| r.zero_point.is_some() && r.zero_point_today.is_some();
+        let (ours, _, _) = rig_fit(&members, |r| r.zero_point, both);
+        let (today, _, _) = rig_fit(&members, |r| r.zero_point_today, both);
+        for (i, n) in members.iter().enumerate() {
+            let o_fit = ours.as_ref().and_then(|f| f.nights[i]);
+            let t_fit = today.as_ref().and_then(|f| f.nights[i]);
+            let o = match (o_fit, t_fit) {
+                (Some(a), Some(t)) if a.slope_se <= SLOPE_SE_MAX => {
+                    if a.slope.abs() <= SLOPE_MAX
+                        && a.slope.abs() <= t.slope.abs() + B8_SIGMAS * t.slope_se
+                    {
+                        Outcome::Pass
+                    } else {
+                        Outcome::Fail
+                    }
+                }
+                _ => Outcome::Unjudged,
+            };
+            entries.push((
+                format!(
+                    "{}: {} against today {}",
+                    n.label(),
+                    slope_text(&o_fit),
+                    slope_text(&t_fit)
+                ),
+                o,
+            ));
+        }
+    }
+    push(
+        &mut lines,
+        "B8",
+        bar_line(
+            "B8 mono rigs, seeing slope",
+            &format!("(|s| <= {SLOPE_MAX:.2} and <= |today| + {B8_SIGMAS:.0} sigma, error <= {SLOPE_SE_MAX:.3})"),
+            &entries,
+        ),
+    );
+
+    // B9
+    let compared: Vec<&ForcedRow> = all_rows.iter().filter(|r| !r.identity.is_empty()).collect();
+    let bad: Vec<&str> = compared
+        .iter()
+        .filter(|r| r.identity != "ok")
+        .map(|r| r.identity.as_str())
+        .collect();
+    let entries = if compared.is_empty() {
+        Vec::new()
+    } else {
+        vec![(
+            format!(
+                "{} frames compared, {} differ{}; rustafits' test the_analysis_measurement_is_identical_with_and_without_a_list judges the layouts",
+                compared.len(),
+                bad.len(),
+                if bad.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", bad.join(","))
+                }
+            ),
+            if bad.is_empty() { Outcome::Pass } else { Outcome::Fail },
+        )]
+    };
+    push(
+        &mut lines,
+        "B9",
+        bar_line(
+            "B9 Analysis numbers with and without a list",
+            "(every compared frame ok)",
+            &entries,
+        ),
+    );
+
+    // Reported only
+    let per_night: Vec<String> = nights
+        .iter()
+        .map(|n| {
+            let med = |f: &dyn Fn(&ForcedRow) -> Option<f64>| median(&mut n.rows.iter().filter_map(|r| f(r)).collect::<Vec<_>>());
+            let mut refusals: BTreeMap<&str, usize> = BTreeMap::new();
+            for r in n.rows.iter().filter(|r| !r.refusal.is_empty()) {
+                *refusals.entry(r.refusal.as_str()).or_default() += 1;
+            }
+            let refused = if refusals.is_empty() {
+                "none".to_string()
+            } else {
+                refusals.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(",")
+            };
+            format!(
+                "{}: c list {} / budget {}, list {} (before cap {}), kept {}, ring_missing {}, refusals {refused}",
+                n.label(),
+                show(med(&|r| r.c), 4),
+                show(med(&|r| r.c_budget), 4),
+                show(med(&|r| r.list_stars.map(|v| v as f64)), 0),
+                show(med(&|r| r.list_before_cap.map(|v| v as f64)), 0),
+                show(med(&|r| r.kept.map(|v| v as f64)), 0),
+                show(med(&|r| r.ring_missing.map(|v| v as f64)), 0),
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "reported, per night: {}",
+        if per_night.is_empty() {
+            "no judged night".to_string()
+        } else {
+            per_night.join("; ")
+        }
+    ));
+    let mut call: Vec<f64> = all_rows.iter().filter_map(|r| r.call_ms).collect();
+    let mut list_ms: Vec<f64> = all_rows
+        .iter()
+        .filter_map(|r| Some(r.call_ms? - r.plain_ms?))
+        .collect();
+    let mut plain: Vec<f64> = all_rows.iter().filter_map(|r| r.plain_ms).collect();
+    let mut kb: Vec<f64> = all_rows.iter().filter_map(|r| r.list_kb).collect();
+    let rss = all_rows
+        .iter()
+        .filter_map(|r| r.rss_mb)
+        .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.max(v))));
+    lines.push(format!(
+        "list cost: median call {} ms, plain measurement {} ms, list alone {} ms (frames measured both ways), list structures {} kB per frame, peak RSS {} MB",
+        show(median(&mut call), 0),
+        show(median(&mut plain), 0),
+        show(median(&mut list_ms), 0),
+        show(median(&mut kb), 0),
+        show(rss, 0)
+    ));
+
+    // Decision rows (not bars): the cross-target spread per rig, forced against today on the same frames.
+    // Per rig, per object: the forced and today's zero points of the frames that have both.
+    type PerObject = BTreeMap<String, (Vec<f64>, Vec<f64>)>;
+    let mut by_rig: BTreeMap<String, PerObject> = BTreeMap::new();
+    for r in all_rows.iter().filter(|r| !r.is_unmeasured()) {
+        if let (Some(z), Some(t)) = (r.zero_point, r.zero_point_today) {
+            let e = by_rig
+                .entry(r.rig_key())
+                .or_default()
+                .entry(r.object.clone())
+                .or_default();
+            e.0.push(z);
+            e.1.push(t);
+        }
+    }
+    let mut decisions = Vec::new();
+    for (rig, objects) in &by_rig {
+        let ours: Vec<Vec<f64>> = objects.values().map(|v| v.0.clone()).collect();
+        let today: Vec<Vec<f64>> = objects.values().map(|v| v.1.clone()).collect();
+        if let (Some((o, n)), Some((t, _))) = (cross_spread(&ours), cross_spread(&today)) {
+            let short = rig.split('|').next().unwrap_or(rig).to_string()
+                + "/"
+                + rig.split('|').next_back().unwrap_or("");
+            let committed = if rig.starts_with("QHY268M") && rig.ends_with("|L") {
+                format!(", 6.5 committed {CROSS_COMMITTED_6_5_MAG:.3}")
+            } else {
+                String::new()
+            };
+            decisions.push(format!(
+                "{short} {o:.4} over {n} targets (today {t:.4}{committed})"
+            ));
+        }
+    }
+    lines.push(format!(
+        "decision rows, cross-target spread of the 90th-percentile ZP (not a bar; QHY268M L limit 0.10 and not above today): {}",
+        if decisions.is_empty() { "no rig with two targets of 30 valid frames".to_string() } else { decisions.join("; ") }
+    ));
+    lines.push("no data in the corpus, unjudged: haze (largest dip 0.09 mag), under 16 bit, long focal length, high latitude; the faint-edge extension is unjudged".to_string());
+
+    // The class line: GO only when every bar passed on at least one night and no night missed.
+    let fails: Vec<&str> = bars
+        .iter()
+        .filter(|(_, o)| *o == Outcome::Fail)
+        .map(|(n, _)| *n)
+        .collect();
+    let none: Vec<&str> = bars
+        .iter()
+        .filter(|(_, o)| *o == Outcome::Unjudged)
+        .map(|(n, _)| *n)
+        .collect();
+    lines.push(if fails.is_empty() && none.is_empty() {
+        "ZP PROBE forced: GO".to_string()
+    } else {
+        format!(
+            "ZP PROBE forced: STOP(missed {}; judged on no night {})",
+            if fails.is_empty() {
+                "none".to_string()
+            } else {
+                fails.join(",")
+            },
+            if none.is_empty() {
+                "none".to_string()
+            } else {
+                none.join(",")
+            }
+        )
+    });
+    // At most 30 lines: the reported lines are the ones to give up, the bars and the class line stay.
+    while lines.len() > VERDICT_MAX_LINES {
+        lines.remove(lines.len() - 2);
+    }
+    lines
+}
+
+fn cmd_verdict_forced(args: &Args, common_path: Option<String>) -> Result<()> {
+    let mut rows = Vec::new();
+    let mut keys: KeptKeys = HashMap::new();
+    let mut keys_ok = true;
+    for path in args
+        .positional
+        .iter()
+        .filter(|p| !p.ends_with(".stars.tsv"))
+    {
+        let (header, data) = read_tsv(path)?;
+        rows.extend(data.iter().map(|f| ForcedRow::from_fields(&header, f)));
+        let sp = stars_path(path);
+        if let Err(e) = read_kept_keys(&sp, &mut keys) {
+            eprintln!("zp_probe: no list stars for {path}: {e:#}; B1 is judged on no night");
+            keys_ok = false;
+        }
+    }
+    if rows.is_empty() {
+        bail!("verdict --forced needs at least one forced TSV");
+    }
+    let common = match common_path {
+        Some(p) => Some(read_common(&p)?),
+        None => None,
+    };
+    for line in forced_verdict_lines(&rows, common.as_deref(), keys_ok.then_some(&keys)) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The `--common` TSV (`common` subcommand's output).
+fn read_common(path: &str) -> Result<Vec<CommonRow>> {
+    let (header, data) = read_tsv(path)?;
+    Ok(data
+        .iter()
+        .map(|f| CommonRow {
+            frame_id: opt_i64(col(&header, f, "frame_id")),
+            file_name: col(&header, f, "file_name").to_string(),
+            group_key: col(&header, f, "group_key").to_string(),
+            planes: col(&header, f, "planes").trim().parse().unwrap_or(0),
+            tflux: [
+                opt_f64(col(&header, f, "common_tflux_0")),
+                opt_f64(col(&header, f, "common_tflux_1")),
+                opt_f64(col(&header, f, "common_tflux_2")),
+            ],
+        })
+        .collect())
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = match argv.first().map(String::as_str) {
-        Some(sub @ ("measure" | "stars" | "common" | "verdict" | "bigap")) => {
+        Some(sub @ ("measure" | "stars" | "common" | "verdict" | "bigap" | "forced")) => {
             Args::parse(&argv[1..]).and_then(|a| match sub {
                 "measure" => cmd_measure(a),
+                "forced" => cmd_forced(a),
                 "stars" => cmd_stars(a),
                 "common" => cmd_common(a),
                 "bigap" => cmd_bigap(a),
@@ -2719,7 +4627,7 @@ fn main() {
             })
         }
         _ => Err(anyhow!(
-            "usage: zp_probe <measure|stars|common|verdict|bigap> ... (see the file's header)"
+            "usage: zp_probe <measure|stars|common|verdict|bigap|forced> ... (see the file's header)"
         )),
     };
     if let Err(e) = result {
@@ -2987,6 +4895,7 @@ mod tests {
                 let airmass = 1.1 + 0.9 * ((i * 11 + night * 5) % 40) as f64 / 40.0;
                 let fwhm = 1.6 + 1.3 * ((i * 17 + night * 3) % 40) as f64 / 40.0;
                 points.push(FitPoint {
+                    side: 0.0,
                     night,
                     airmass,
                     fwhm,
@@ -3026,6 +4935,7 @@ mod tests {
             let airmass = 1.0 + ((i * 37) % 200) as f64 / 200.0;
             let fwhm = 2.0 + ((i * 91) % 200) as f64 / 200.0;
             points.push(FitPoint {
+                side: 0.0,
                 night: 0,
                 airmass,
                 fwhm,
@@ -3052,12 +4962,14 @@ mod tests {
         for i in 0..30 {
             let airmass = 1.1 + 0.02 * i as f64;
             points.push(FitPoint {
+                side: 0.0,
                 night: 0,
                 airmass,
                 fwhm: 2.0 + 0.03 * ((i * 7) % 30) as f64,
                 zp: 21.0 - 0.2 * airmass,
             });
             points.push(FitPoint {
+                side: 0.0,
                 night: 1,
                 airmass,
                 fwhm: 2.5,
@@ -3256,5 +5168,540 @@ mod tests {
             (back.zero_point_c, back.rig.as_str()),
             (Some(21.0368), "a|b|414|g100|1x1|-")
         );
+    }
+
+    // ---- the forced verdict ----
+
+    const RIG_A: &str = "cam|scope|414|g100|1x1|-";
+    const RIG_MONO: &str = "QHY268M|scope|400|g56|1x1|L";
+
+    fn frow(night: &str, t_s: i64, zp: Option<f64>, fwhm: f64) -> ForcedRow {
+        ForcedRow {
+            frame_id: Some(t_s),
+            file_name: format!("f{t_s}.fits"),
+            object: "T".into(),
+            filter: "-".into(),
+            night: night.into(),
+            date_obs: iso(t_s),
+            exptime: Some(180.0),
+            rig: RIG_A.into(),
+            layout: "cfa".into(),
+            median_fwhm: Some(fwhm),
+            fwhm_ref: Some(2.0),
+            centre_median_px: Some(0.2),
+            zero_point: zp,
+            ..ForcedRow::default()
+        }
+    }
+
+    /// A night of the given rows as the verdict sees it (no 30-frame floor, no sides).
+    fn night_of(rows: &[ForcedRow], joined: usize) -> FNight<'_> {
+        FNight {
+            rig: RIG_A.into(),
+            object: "T".into(),
+            night: "n".into(),
+            filter: "-".into(),
+            rows: rows.iter().collect(),
+            sides: vec![None; rows.len()],
+            joined,
+        }
+    }
+
+    #[test]
+    fn the_kept_share_counts_consecutive_pairs_only() {
+        let rows: Vec<ForcedRow> = (0..3)
+            .map(|i| frow("n", T0 + i * 180, Some(21.0), 2.0))
+            .collect();
+        let mut keys: KeptKeys = HashMap::new();
+        // A holds 0..100, B 50..150, C 100..200: A and B share half, B and C share half, A and C nothing.
+        for (r, lo) in rows.iter().zip([0u64, 50, 100]) {
+            keys.insert(r.frame_id.unwrap(), (lo..lo + 100).collect());
+        }
+        let shares = kept_shares(&night_of(&rows, 0), &keys);
+        assert_eq!(shares, vec![0.5, 0.5], "{shares:?}");
+        // A frame without a zero point breaks the pair: its neighbours are not paired over it.
+        let mut gap = rows.clone();
+        gap[1].zero_point = None;
+        assert!(kept_shares(&night_of(&gap, 0), &keys).is_empty());
+        // Frames more than 15 minutes apart are not a pair.
+        let mut far = rows.clone();
+        far[1].date_obs = iso(T0 + 180 + 1200);
+        assert_eq!(kept_shares(&night_of(&far, 0), &keys).len(), 1);
+    }
+
+    #[test]
+    fn b2_uses_the_common_bar_only_on_a_joined_night() {
+        // |dZP| = 0.018 every pair; today's 0.03.
+        let rows: Vec<ForcedRow> = (0..40)
+            .map(|i| {
+                let z = 21.0 + if i % 2 == 0 { 0.0 } else { 0.018 };
+                let mut r = frow("n", T0 + i * 180, Some(z), 2.0);
+                r.zero_point_today = Some(21.0 + if i % 2 == 0 { 0.0 } else { 0.03 });
+                r
+            })
+            .collect();
+        let (text, o) = b2_night(&night_of(&rows, 0));
+        assert_eq!(o, Outcome::Pass, "{text}");
+        let (text, o) = b2_night(&night_of(&rows, 40));
+        assert_eq!(o, Outcome::Fail, "{text}");
+        // Elsewhere the forced statistic must also stay at or under today's: 0.018 against today's 0.01 misses.
+        let mut rows = rows;
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.zero_point_today = Some(21.0 + if i % 2 == 0 { 0.0 } else { 0.01 });
+        }
+        assert_eq!(b2_night(&night_of(&rows, 0)).1, Outcome::Fail);
+    }
+
+    #[test]
+    fn the_side_follows_the_rotation() {
+        assert_eq!(pier_side(91.9, 91.9), 0);
+        assert_eq!(pier_side(91.9, -90.4), 1);
+        // A +179 / -179 pair is 2 degrees apart, not 358: the same side.
+        assert_eq!(pier_side(179.0, -179.0), 0);
+        assert_eq!(pier_side(-179.0, 179.0), 0);
+        assert_eq!(pier_side(10.0, 189.0), 1);
+        assert!((rotation_gap_deg(-179.0, 179.0) - 2.0).abs() < 1e-12);
+        // The night's first frame with a rotation is side 0.
+        let mut rows: Vec<ForcedRow> = (0..40)
+            .map(|i| frow("n", T0 + i * 180, Some(21.0), 2.0))
+            .collect();
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.rotation_deg = Some(if i < 20 { 91.9 } else { -90.4 });
+        }
+        let nights = forced_nights(&rows, None);
+        assert_eq!(nights.len(), 1);
+        assert!(nights[0].two_sided());
+        assert_eq!(nights[0].sides[0], Some(0));
+        assert_eq!(nights[0].sides[39], Some(1));
+    }
+
+    /// 40 frames of a night with a common set: ZP and the stack's level follow `k * X + a (+ step after the flip)`.
+    fn b4_rows(
+        x_of: impl Fn(usize) -> f64,
+        k: (f64, f64),
+        step: (f64, f64),
+        flip_at: Option<usize>,
+    ) -> (Vec<ForcedRow>, Vec<CommonRow>) {
+        let mut rows = Vec::new();
+        let mut common = Vec::new();
+        for i in 0..40usize {
+            let side = flip_at.is_some_and(|f| i >= f);
+            let x = x_of(i);
+            let zp = 21.0 + k.0 * x + if side { step.0 } else { 0.0 };
+            let level = 5.0 + k.1 * x + if side { step.1 } else { 0.0 };
+            let mut r = frow(
+                "n",
+                T0 + i as i64 * 180,
+                Some(zp),
+                2.0 + 0.2 * (i as f64 / 3.0).sin(),
+            );
+            r.airmass = Some(x);
+            r.rotation_deg = Some(if side { -90.0 } else { 90.0 });
+            common.push(CommonRow {
+                frame_id: r.frame_id,
+                file_name: r.file_name.clone(),
+                group_key: "g".into(),
+                planes: 1,
+                tflux: [Some(180.0 * 10f64.powf(0.4 * level)), None, None],
+            });
+            rows.push(r);
+        }
+        (rows, common)
+    }
+
+    #[test]
+    fn the_flip_term_is_fitted_and_not_judged() {
+        // Recovered to 1e-9 by the joint fit with a side column.
+        let pts: Vec<(f64, f64, f64)> = (0..40)
+            .map(|i| {
+                let x = 1.1 + 0.03 * i as f64;
+                let side = f64::from(i >= 17);
+                (x, 21.0 - 0.17 * x + 0.15 * side, side)
+            })
+            .collect();
+        let (k, a, s) = side_fit(&pts).unwrap();
+        assert!(
+            (k + 0.17).abs() < 1e-9 && (a - 21.0).abs() < 1e-9 && (s - 0.15).abs() < 1e-9,
+            "{k} {a} {s}"
+        );
+        // The shared fit carries the step too.
+        let fit_points: Vec<FitPoint> = pts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| FitPoint {
+                night: 0,
+                side: p.2,
+                airmass: p.0,
+                fwhm: 2.0 + 0.3 * ((i * 7) % 11) as f64 / 11.0,
+                zp: p.1,
+            })
+            .collect();
+        let fit = shared_extinction_fit_sided(&fit_points, 1, &[true]).unwrap();
+        let n = fit.nights[0].unwrap();
+        assert!((fit.k + 0.17).abs() < 1e-9, "{}", fit.k);
+        assert!(
+            (n.side_step.unwrap() - 0.15).abs() < 1e-9 && n.slope.abs() < 1e-9,
+            "{n:?}"
+        );
+        // The two series step by very different amounts and still pass: the step is printed, never judged.
+        let (rows, common) = b4_rows(
+            |i| 1.1 + 0.03 * i as f64,
+            (-0.17, -0.17),
+            (0.15, 0.9),
+            Some(20),
+        );
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        assert!(night.two_sided());
+        let (text, o) = b4_entry(&night, &idx);
+        assert_eq!(o, Outcome::Pass, "{text}");
+        assert!(
+            text.contains("flip step zp 0.150 stack 0.900 (reported, not judged)"),
+            "{text}"
+        );
+        // A different k does miss.
+        let (rows, common) = b4_rows(
+            |i| 1.1 + 0.03 * i as f64,
+            (-0.17, -0.12),
+            (0.0, 0.0),
+            Some(20),
+        );
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        assert_eq!(b4_entry(&night, &idx).1, Outcome::Fail);
+    }
+
+    #[test]
+    fn b4_is_unjudged_below_four_tenths_of_an_airmass() {
+        // One side, 40 frames: the airmass range is 0.39 or 0.41.
+        for (span, want) in [(0.39, Outcome::Unjudged), (0.41, Outcome::Pass)] {
+            let (rows, common) = b4_rows(
+                |i| 1.2 + span * i as f64 / 39.0,
+                (-0.17, -0.17),
+                (0.0, 0.0),
+                None,
+            );
+            let idx = CommonIndex::new(&common);
+            let night = forced_nights(&rows, Some(&idx)).remove(0);
+            let (text, o) = b4_entry(&night, &idx);
+            assert_eq!(o, want, "{span}: {text}");
+        }
+        // A side with a range under 0.4 is unjudged while the other side is judged: 20 frames each, one side wide.
+        let (rows, common) = b4_rows(
+            |i| {
+                if i < 20 {
+                    1.2 + 0.03 * i as f64
+                } else {
+                    1.2 + 0.005 * i as f64
+                }
+            },
+            (-0.17, -0.17),
+            (0.0, 0.0),
+            Some(20),
+        );
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        let (text, o) = b4_entry(&night, &idx);
+        assert_eq!(o, Outcome::Pass, "{text}");
+        assert!(text.contains("side 1 unjudged"), "{text}");
+    }
+
+    #[test]
+    fn b3_rms_is_about_the_median() {
+        // A single outlier moves the mean, not the median: rms about the median of [1,1,1,1,5] is sqrt(16/5).
+        let v = [1.0, 1.0, 1.0, 1.0, 5.0];
+        assert!((rms_about_median(&v).unwrap() - (16.0f64 / 5.0).sqrt()).abs() < 1e-12);
+        // And through the night: a constant offset (a different constant per run) is no scatter.
+        let (rows, common) = b4_rows(|i| 1.2 + 0.01 * i as f64, (-0.17, -0.17), (0.0, 0.0), None);
+        let idx = CommonIndex::new(&common);
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        let b = b3_night(&night, &idx).unwrap();
+        assert!(
+            b.rms < 1e-9 && b.slope.abs() < 1e-9,
+            "{} {}",
+            b.rms,
+            b.slope
+        );
+        assert_eq!(b3_entry(&night, &idx).1, Outcome::Pass);
+        // A seeing slope of 0.06 on the stack's side misses only when the 6F reference agrees.
+        let mut rows = rows;
+        for r in rows.iter_mut() {
+            let f = r.median_fwhm.unwrap();
+            r.zero_point = r.zero_point.map(|z| z + 0.06 * f);
+        }
+        let night = forced_nights(&rows, Some(&idx)).remove(0);
+        assert_eq!(
+            b3_entry(&night, &idx).1,
+            Outcome::Unjudged,
+            "no 6F reference is not a pass"
+        );
+        let mut agree = rows.clone();
+        for r in agree.iter_mut() {
+            r.zero_point_6f = r.zero_point.map(|z| z - 0.06 * r.median_fwhm.unwrap());
+        }
+        let night = forced_nights(&agree, Some(&idx)).remove(0);
+        assert_eq!(b3_entry(&night, &idx).1, Outcome::Fail);
+        let mut disagree = rows;
+        for r in disagree.iter_mut() {
+            r.zero_point_6f = r.zero_point.map(|z| {
+                z - 0.001 * r.median_fwhm.unwrap() - 0.059 * r.median_fwhm.unwrap()
+                    + 0.06 * r.median_fwhm.unwrap()
+            });
+        }
+        let night = forced_nights(&disagree, Some(&idx)).remove(0);
+        let (text, o) = b3_entry(&night, &idx);
+        assert_eq!(o, Outcome::Pass, "{text}");
+        assert!(text.contains("reference-limited"), "{text}");
+    }
+
+    #[test]
+    fn an_identity_mismatch_names_its_field() {
+        // A frame of eight Gaussian stars on a noisy sky, measured the way the analyzer does.
+        let (w, h) = (320usize, 320usize);
+        let mut plane = vec![1000.0f32; w * h];
+        let mut state = 12345u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (1u64 << 31) as f64
+        };
+        for k in 0..8 {
+            let (cx, cy) = (40.0 + 35.0 * k as f64, 60.0 + 29.0 * ((k * 5) % 8) as f64);
+            for y in 0..h {
+                for x in 0..w {
+                    let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+                    plane[y * w + x] += (4000.0 * (-r2 / (2.0 * 1.6f64.powi(2))).exp()) as f32;
+                }
+            }
+        }
+        for v in plane.iter_mut() {
+            *v += (next() * 8.0 - 4.0) as f32;
+        }
+        let frame = athenaeum_core::star_measure::raw::RawFrame {
+            planes: RawPlanes::Mono(plane),
+            w,
+            h,
+            domain: athenaeum_core::star_measure::Domain::RawAdu {
+                clip: 65535.0,
+                full_scale: 65535.0,
+                gain_e_per_adu: None,
+            },
+            flip_vertical: false,
+            channels: 1,
+        };
+        let config = AnalysisConfig::default();
+        let opts = frame_options(&config);
+        let a = measure_raw_frame(&frame, &config, None);
+        assert!(!a.stars.is_empty(), "the synthetic frame has stars");
+        let b = measure_raw_frame(&frame, &config, None);
+        assert_eq!(identity_mismatch(&a, &b, &opts), None);
+        let mut moved = b.clone();
+        moved.stars[0].x += 1e-9;
+        assert_eq!(
+            identity_mismatch(&a, &moved, &opts).as_deref(),
+            Some("star_x")
+        );
+        let mut ring = b.clone();
+        ring.stars[0].sky_ring_n += 1;
+        assert_eq!(
+            identity_mismatch(&a, &ring, &opts).as_deref(),
+            Some("star_sky_ring_n")
+        );
+        let mut fewer = b.clone();
+        fewer.stars.pop();
+        assert_eq!(
+            identity_mismatch(&a, &fewer, &opts).as_deref(),
+            Some("stars_len")
+        );
+        let mut whole = b;
+        whole.seeds += 1;
+        assert_eq!(
+            identity_mismatch(&a, &whole, &opts).as_deref(),
+            Some("measurement")
+        );
+    }
+
+    /// A clean dataset: a common-set night, an ordinary night and a mono QHY268M night, every bar fed.
+    fn go_dataset() -> (Vec<ForcedRow>, Vec<CommonRow>, KeptKeys) {
+        let mut rows = Vec::new();
+        let mut common = Vec::new();
+        let mut keys: KeptKeys = HashMap::new();
+        for (n, (object, rig, layout)) in [
+            ("T0", RIG_A, "cfa"),
+            ("T1", RIG_A, "cfa"),
+            ("T2", RIG_MONO, "mono"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for i in 0..40usize {
+                let t = T0 + n as i64 * 86_400 + i as i64 * 180;
+                let x = 1.1 + 0.6 * i as f64 / 39.0;
+                let fwhm = 2.3 + 0.5 * (i as f64 / 4.0).sin();
+                let zp = 21.0 - 0.2 * x + 0.003 * wobble(i + 5 * n);
+                let mut r = frow(&format!("n{n}"), t, Some(zp), fwhm);
+                r.frame_id = Some(1000 * n as i64 + i as i64);
+                r.file_name = format!("f{n}_{i}.fits");
+                r.object = object.into();
+                r.rig = rig.into();
+                r.layout = layout.into();
+                r.airmass = Some(x);
+                r.zero_point_today = Some(21.0 - 0.2 * x + 0.008 * wobble(3 * i + 1));
+                r.list_stars = Some(900);
+                r.list_before_cap = Some(1400);
+                r.kept = Some(700);
+                r.c = Some(1.08);
+                r.call_ms = Some(2300.0);
+                if i % 10 == 0 {
+                    r.identity = "ok".into();
+                    r.plain_ms = Some(1900.0);
+                }
+                keys.insert(
+                    r.frame_id.unwrap(),
+                    (2 * i as u64..2 * i as u64 + 100).collect(),
+                );
+                if n == 0 {
+                    common.push(CommonRow {
+                        frame_id: r.frame_id,
+                        file_name: r.file_name.clone(),
+                        group_key: "g".into(),
+                        planes: 3,
+                        tflux: [None, Some(180.0 * 10f64.powf(0.4 * (zp - 21.0))), None],
+                    });
+                }
+                rows.push(r);
+            }
+        }
+        (rows, common, keys)
+    }
+
+    #[test]
+    fn the_forced_verdict_ends_in_one_class_line_within_thirty_lines() {
+        let (rows, common, keys) = go_dataset();
+        let lines = forced_verdict_lines(&rows, Some(&common), Some(&keys));
+        let text = lines.join("\n");
+        assert!(lines.len() <= VERDICT_MAX_LINES, "{text}");
+        assert_eq!(lines.last().unwrap(), "ZP PROBE forced: GO", "{text}");
+        for bar in ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(bar) && l.contains(" pass:")),
+                "{bar} must pass on a night:\n{text}"
+            );
+        }
+        // The class line is the only GO / STOP line.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("ZP PROBE forced: GO")
+                    || l.starts_with("ZP PROBE forced: STOP("))
+                .count(),
+            1
+        );
+
+        // A bar judged on no night is a STOP: no common set gives no B3 / B4 night, no keys no B1 night.
+        let lines = forced_verdict_lines(&rows, None, None);
+        let last = lines.last().unwrap();
+        assert!(last.starts_with("ZP PROBE forced: STOP("), "{last}");
+        assert!(last.contains("judged on no night B1,B3,B4"), "{last}");
+        // No frame compared is a STOP too.
+        let mut none = rows.clone();
+        for r in none.iter_mut() {
+            r.identity.clear();
+        }
+        let lines = forced_verdict_lines(&none, Some(&common), Some(&keys));
+        assert!(
+            lines.last().unwrap().contains("judged on no night B9"),
+            "{lines:?}"
+        );
+        // A miss names its bar: a night whose frames share 70 % of their keys with the successor.
+        let mut thin = keys.clone();
+        for (id, k) in thin.iter_mut() {
+            if *id < 1000 {
+                *k = (30 * (*id as u64)..30 * (*id as u64) + 100).collect();
+            }
+        }
+        let lines = forced_verdict_lines(&rows, Some(&common), Some(&thin));
+        assert!(lines.last().unwrap().contains("missed B1"), "{lines:?}");
+        // Many nights never push the verdict past thirty lines.
+        let mut many = Vec::new();
+        for k in 0..12 {
+            for r in &rows {
+                let mut c = r.clone();
+                c.object = format!("S{k:02}");
+                many.push(c);
+            }
+        }
+        let lines = forced_verdict_lines(&many, None, None);
+        assert!(lines.len() <= VERDICT_MAX_LINES);
+        assert!(lines.last().unwrap().starts_with("ZP PROBE forced: STOP("));
+    }
+
+    #[test]
+    fn an_older_tsv_parses_and_a_forced_row_round_trips() {
+        let header: Vec<String> = FORCED_HEADER.split('\t').map(str::to_string).collect();
+        // The first fifteen columns only, as an older file would end.
+        let fields: Vec<String> = (0..15)
+            .map(|i| {
+                if i == 0 {
+                    "7".to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        let old = ForcedRow::from_fields(&header[..15], &fields);
+        assert_eq!(
+            (old.frame_id, old.zero_point, old.identity.as_str()),
+            (Some(7), None, "")
+        );
+        let mut full = frow("n", T0, Some(21.0123), 2.4);
+        full.pier = Some(1);
+        full.rotation_deg = Some(-90.4);
+        full.airmass = Some(1.2345);
+        full.anchor = Some(21.2);
+        full.anchor_stars = Some(31);
+        full.window_bright = Some(13.4);
+        full.list_stars = Some(998);
+        full.c = Some(1.0345);
+        full.c_stars = Some(120);
+        full.zero_point_today = Some(21.0368);
+        full.zero_point_6f = Some(19.5);
+        full.identity = "mismatch:star_x".into();
+        full.call_ms = Some(2310.0);
+        full.refusal = "too_scattered".into();
+        let cells: Vec<String> = full.to_tsv().split('\t').map(str::to_string).collect();
+        assert_eq!(cells.len(), header.len(), "one cell per column");
+        let back = ForcedRow::from_fields(&header, &cells);
+        assert_eq!(
+            (
+                back.pier,
+                back.rotation_deg,
+                back.airmass,
+                back.anchor_stars,
+                back.list_stars
+            ),
+            (Some(1), Some(-90.4), Some(1.2345), Some(31), Some(998))
+        );
+        assert_eq!(
+            (
+                back.c_stars,
+                back.zero_point_today,
+                back.zero_point_6f,
+                back.call_ms
+            ),
+            (Some(120), Some(21.0368), Some(19.5), Some(2310.0))
+        );
+        assert_eq!(
+            (
+                back.identity.as_str(),
+                back.refusal.as_str(),
+                back.zero_point
+            ),
+            ("mismatch:star_x", "too_scattered", Some(21.0123))
+        );
+        assert_eq!(stars_path("a/b/x.tsv"), "a/b/x.stars.tsv");
     }
 }
