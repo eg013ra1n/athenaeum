@@ -972,7 +972,7 @@ mod tests {
     #[cfg(feature = "solver")]
     mod forced {
         use super::*;
-        use crate::analysis::zero_point::{anchor_zero_point, ForcedListParams, ForcedRefusal};
+        use crate::analysis::zero_point::{anchor_zero_point, ForcedList, ForcedListParams, ForcedRefusal};
         use crate::analysis::analyzer::forced::{PLACEMENT_PANICS, STATISTIC_PANICS};
         use solvemyastro::{CatalogStar, WcsSolution};
 
@@ -1020,7 +1020,12 @@ mod tests {
             let stars = grid_stars(n, w, h, 3.5, seed);
             let wcs = wcs_1as(w, h);
             let cat = catalogue_of(&stars, &wcs);
-            let scene = moffat_field(w, h, &stars, 4.0, 0.0);
+            (mosaic_of_stars(&stars, w, h, seed), cat, wcs)
+        }
+
+        /// An RGGB mosaic of `stars` (see [`solved_mosaic`]), the noise drawn from `seed + 1`.
+        fn mosaic_of_stars(stars: &[MoffatStar], w: usize, h: usize, seed: u64) -> RawFrame {
+            let scene = moffat_field(w, h, stars, 4.0, 0.0);
             let mut m: Vec<f32> = (0..w * h)
                 .map(|i| {
                     let (gain, sky) = match site(BayerPattern::Rggb, i % w, i / w) {
@@ -1032,15 +1037,14 @@ mod tests {
                 })
                 .collect();
             add_noise(&mut m, 5.0, seed + 1);
-            let frame = RawFrame {
+            RawFrame {
                 planes: RawPlanes::Cfa { mosaic: m, pattern: BayerPattern::Rggb },
                 w,
                 h,
                 domain: RAW,
                 flip_vertical: false,
                 channels: 1,
-            };
-            (frame, cat, wcs)
+            }
         }
 
         fn inputs(wcs: &WcsSolution) -> ZpInputs<'_> {
@@ -1158,6 +1162,59 @@ mod tests {
             let z = run.result.unwrap_or_else(|r| panic!("refused: {r:?}; anchor {:?}", run.anchor));
             assert!((z.zero_point - ZP_TRUE).abs() < 0.02, "zero point {} (truth {ZP_TRUE})", z.zero_point);
             assert!(z.stars >= 50, "survivors {}", z.stars);
+        }
+
+        /// G8: on a mosaic the frame's own detections reach the list (rustafits hands the first callback the matched
+        /// filter's seeds in the frame's pixels): a bright star the catalogue lacks removes the list stars around it, and
+        /// only them; with the rule off the same frame lists them.
+        #[test]
+        fn on_a_mosaic_a_bright_star_absent_from_the_cone_removes_its_neighbours() {
+            let (w, h) = (2000, 1500);
+            let stars = grid_stars(500, w, h, 3.5, 61);
+            let wcs = wcs_1as(w, h);
+            let cat = catalogue_of(&stars, &wcs);
+            let params = ForcedListParams::default();
+            let off = ForcedListParams { detected_neighbours: false, ..params };
+            let run_on = |frame: &RawFrame, p: &ForcedListParams| {
+                let (pm, run) =
+                    measure_with_zero_point(frame, &cfg(), None, Some(&inputs(&wcs)), p, |_, _, _, _, _| Ok(cat.clone()));
+                (pm, run.expect("a solved frame is judged"))
+            };
+            // The premise: the plain frame lists stars, and no seed rule has anything to say with the rule off.
+            let (_, base) = run_on(&mosaic_of_stars(&stars, w, h, 61), &off);
+            let base_list = base.list.as_ref().expect("list");
+            assert!(base_list.stars.len() >= 50 && base_list.detected_neighbours_removed == 0);
+            // A list star well inside the frame, and a bright star in no catalogue 14 px from it.
+            let target = base_list
+                .stars
+                .iter()
+                .find(|s| s.x > 200.0 && s.y > 200.0 && s.x < 1800.0 && s.y < 1300.0)
+                .expect("a list star inside the frame");
+            let (tx, ty) = (target.x, target.y);
+            let mut extra = stars.clone();
+            extra.push(star(tx + 14.0, ty, 6000.0, 3.5));
+            let frame = mosaic_of_stars(&extra, w, h, 61);
+            let (pm, run) = run_on(&frame, &params);
+            let list = run.list.as_ref().expect("list");
+            assert!(
+                pm.detected.is_empty() && list.seed_calibration_pairs >= 20,
+                "{} pairs: the seeds reached the list",
+                list.seed_calibration_pairs
+            );
+            assert!(list.detected_neighbours_removed >= 1, "removed {}", list.detected_neighbours_removed);
+            let listed = |l: &ForcedList| l.stars.iter().any(|s| (s.x - tx).abs() < 0.01 && (s.y - ty).abs() < 0.01);
+            assert!(!listed(list), "the star beside the uncatalogued bright one is not listed");
+            // Rule off, the same frame lists it: the removal is the seed rule's.
+            let (_, run_off) = run_on(&frame, &off);
+            let list_off = run_off.list.as_ref().expect("list");
+            assert!(listed(list_off) && list_off.detected_neighbours_removed == 0 && list_off.seed_calibration_pairs == 0);
+            // Few stars go: the rule is local, not a wipe of the list.
+            assert!(
+                list.detected_neighbours_removed <= 10 && list.stars.len() + 10 >= list_off.stars.len(),
+                "removed {} of {}",
+                list.detected_neighbours_removed,
+                list_off.stars.len()
+            );
         }
 
         /// L2: with a solve the list is measured and the statistic is computed, and the Analysis numbers are still the

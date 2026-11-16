@@ -172,10 +172,13 @@ budget's fits from the same measurement. Positions are 0-based in file row order
   for the frame with a `warn!`, never a refusal; the row's `seed_calibration_pairs` says how many there were and
   `detected_neighbours_removed` how many candidates this rule removed that the catalogue rule had kept. The rule runs
   before the faint edge's count and the cap, so the window deepens on the stars that are left. It needs the plane's
-  matched-filter seeds (`PlaneMeasurement::detected`): a plane that handed its seeds in, as a mosaic does (the green-site
-  measurement keeps them inside rustafits), has none and the rule is skipped there with a `debug!`; a rustafits change
-  to hand the native seeds to the first callback turns it on (open; see the G7 report). Not mirrored for the `G_b − 2`
-  halo rule. A judged round (g2) compares the list with and without it (`--detected_neighbours false`).
+  matched-filter seeds (`PlaneMeasurement::detected`): a mosaic hands them to its fit as given seeds, so rustafits lends
+  the native ones to the first callback (G8; the returned measurement is unchanged): in the frame's own pixels, each peak
+  the green-sum peak halved (about 0.8 of the star's brightest green site above the sky, on the scale of `noise.sigma`),
+  each flux the green sites' own sum (the calibration `k` absorbs the scale). The `G_b − 2` halo rule is mirrored too (G8):
+  a seed with `G_seed ≤ G_b − 2` within `10·FWHM_ref` drops the star (the catalogue rule's `bright_dmag` and
+  `bright_radius_fwhm`), whatever its peak. A plane that handed no seeds skips the rule with a `debug!`.
+  A judged round (g2) compares the list with and without it (`--detected_neighbours false`).
 - **No cap.** The hash cap churned a sum (cap 1 000: B2 0.0163 on 09-13; no cap 0.0077; ramped edges 0.0047). A guard of
   12 000 stars stays, by the same hash of the catalogue record (G, position at 1″): above it a star stays when its key
   falls under `12 000 / n`. No rig here reaches it; unjudged.

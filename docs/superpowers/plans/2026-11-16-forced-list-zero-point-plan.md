@@ -1238,8 +1238,9 @@ by construction; G1 → G2 is the build order; the expected table matches the ve
   neighbours of 7.6–10.9 % of the list's weight were missing from the cone; the image carries them. Rule, constants
   (`detected_neighbours`, `own_seed_radius_px` 1.5, `detected_neighbour_min_peak_sigma` 10, `seed_calibration_min_pairs`
   20; each a probe flag) and the row's `detected_neighbours_removed` / `seed_calibration_pairs` are in the spec; the code is
-  `zero_point.rs::seed_isolation`. A mosaic hands its seeds inside rustafits (`PlaneMeasurement::detected` is empty there):
-  the rule is skipped on a mosaic until rustafits hands the native seeds to the first callback (open).
+  `zero_point.rs::seed_isolation`. **G8**: a mosaic's seeds reach the first
+  callback (rustafits lends the native seeds, frame pixels, peaks on the `noise.sigma` scale), and the `G_b − 2` halo rule
+  is mirrored on the seeds (`bright_dmag`, `bright_radius_fwhm`, no peak floor).
 - **M2** (6r is not an independent referee) — B3 prints three slopes, a stack miss 6r does not echo is no pass and goes
   to the owner: spec §6 (paragraph, M2 beside RR2, RR3); G3 step 7 and its test; G4's class-line paragraph and STOP list.
 - **M3** (the ±0.1 re-measure moved the edges) — `anchor_shift_mag` before the window rule, re-measures at ±0.1 and ±0.5:

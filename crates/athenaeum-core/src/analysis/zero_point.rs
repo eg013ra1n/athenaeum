@@ -475,7 +475,9 @@ pub struct ForcedListParams {
     /// high RUWE, stars below the tiers' depth, galaxies): a detected seed other than the star's own, within
     /// `isolation_radius_fwhm * FWHM_ref` of it, with `G_seed <= G + isolation_dmag` and a peak of at least
     /// `detected_neighbour_min_peak_sigma` plane sigmas, drops the star. `G_seed` is the seed's flux read through a
-    /// per-frame calibration to the catalogue G. Skipped when the plane handed no seeds.
+    /// per-frame calibration to the catalogue G. The catalogue halo rule's mirror: a seed with
+    /// `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref` drops the star too (no peak floor: a seed that
+    /// bright is a halo source whatever its peak). Skipped when the plane handed no seeds.
     pub detected_neighbours: bool,
     /// A star's own seed is the nearest one within `max(own_seed_radius_px, FWHM_ref)` of its projection.
     pub own_seed_radius_px: f64,
@@ -906,7 +908,7 @@ pub fn forced_list_in(
 
     // The frame's own detections isolate too, then the probe's decimation thins what is left (the same share of the
     // catalogue stays in every frame: the thinning is on the key, before the faint edge's count).
-    let seed_rule = seed_isolation(input, params, &cat, &isolated, g_b, fwhm_ref, near_r, pool);
+    let seed_rule = seed_isolation(input, params, &cat, &isolated, g_b, fwhm_ref, near_r, far_r, pool);
     let isolated: Vec<(f64, usize, u64)> = isolated
         .into_iter()
         .enumerate()
@@ -989,6 +991,8 @@ impl SeedRule {
 /// dropped at ingest for RUWE >= 1.4, stars under the tiers' depth, galaxies); a candidate is dropped when a detected seed
 /// that is not its own lies within `isolation_radius_fwhm * FWHM_ref` of it with `G_seed <= G + isolation_dmag` and a peak
 /// of at least `detected_neighbour_min_peak_sigma` plane sigmas: the catalogue rule's own question, asked of the image.
+/// The halo rule is mirrored too: a seed with `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref` drops
+/// the candidate, whatever its peak.
 ///
 /// A seed's magnitude is read through the frame's calibration `k`, the median of `flux * 10^(0.4 G)` over the candidates
 /// of the shallow window with exactly one seed within `max(own_seed_radius_px, FWHM_ref)` of their projection, that seed
@@ -1003,6 +1007,7 @@ fn seed_isolation(
     g_b: f64,
     fwhm_ref: f64,
     near_r: f64,
+    far_r: f64,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> SeedRule {
     use rayon::prelude::*;
@@ -1015,8 +1020,8 @@ fn seed_isolation(
     }
     let own_r = params.own_seed_radius_px.max(fwhm_ref);
     let floor = params.detected_neighbour_min_peak_sigma * input.noise_sigma;
-    if !(own_r.is_finite() && near_r.is_finite() && floor.is_finite() && own_r > 0.0) {
-        tracing::warn!(own_r, near_r, floor, "forced list: the seed rule's constants are unusable; the rule is skipped");
+    if !(own_r.is_finite() && near_r.is_finite() && far_r.is_finite() && floor.is_finite() && own_r > 0.0) {
+        tracing::warn!(own_r, near_r, far_r, floor, "forced list: the seed rule's constants are unusable; the rule is skipped");
         return SeedRule::none(0);
     }
     // Seeds with a usable position and flux, as grid points.
@@ -1029,7 +1034,7 @@ fn seed_isolation(
         tracing::debug!("forced list: no seed has a usable flux; no isolation from the frame's own detections");
         return SeedRule::none(0);
     }
-    let cell = own_r.max(near_r).max(1.0);
+    let cell = own_r.max(near_r).max(far_r).max(1.0);
     let seed_pts: Vec<(f64, f64, f32)> = seeds.iter().map(|s| (s.x, s.y, 0.0)).collect();
     let seed_grid = Grid::new(&seed_pts, cell);
 
@@ -1085,8 +1090,8 @@ fn seed_isolation(
 
     // The test, on every candidate of the deepest window.
     let removed: Vec<bool> = match pool {
-        Some(p) => p.install(|| seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, own_r, near_r, floor, params)),
-        None => seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, own_r, near_r, floor, params),
+        Some(p) => p.install(|| seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, g_b, [own_r, near_r, far_r], floor, params)),
+        None => seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, g_b, [own_r, near_r, far_r], floor, params),
     };
     let removed_count = removed.iter().filter(|r| **r).count() as u32;
     SeedRule { removed, removed_count, pairs }
@@ -1101,12 +1106,13 @@ fn seed_flags(
     seed_pts: &[(f64, f64, f32)],
     seed_grid: &Grid,
     k: f64,
-    own_r: f64,
-    near_r: f64,
+    g_b: f64,
+    [own_r, near_r, far_r]: [f64; 3],
     floor: f64,
     params: &ForcedListParams,
 ) -> Vec<bool> {
     use rayon::prelude::*;
+    let halo_g = g_b - params.bright_dmag;
     isolated
         .par_iter()
         .map(|&(g, i, _)| {
@@ -1126,7 +1132,13 @@ fn seed_flags(
                 }
                 let s = seeds[j];
                 let d = (s.x - x).hypot(s.y - y);
-                d <= near_r && s.peak >= floor && -2.5 * (s.flux / k).log10() <= g + params.isolation_dmag
+                if d > near_r.max(far_r) {
+                    return false;
+                }
+                let g_seed = -2.5 * (s.flux / k).log10();
+                // The isolation rule (a peak floor), and the catalogue halo rule's mirror (a seed that bright needs none).
+                (d <= near_r && s.peak >= floor && g_seed <= g + params.isolation_dmag)
+                    || (d <= far_r && g_seed <= halo_g)
             })
         })
         .collect()
@@ -3455,20 +3467,56 @@ mod forced_tests {
         // dG: a neighbour 3.9 mag fainter than the star removes it, 4.1 mag fainter keeps it.
         assert_eq!(with(g + 3.9, 50.0), 2);
         assert_eq!(with(g + 4.1, 50.0), 0);
-        // Distance: a bright seed 27 px from the nearest lattice stars (20.5 px along, 18 px across) is outside 8 FWHM_ref.
+        // Distance: a seed 27 px from the nearest lattice stars (20.5 px along, 18 px across) is outside 8 FWHM_ref (it is
+        // G_b - 1.5, no halo source either: a brighter one would reach the 10 FWHM_ref of the halo rule, 23.7 px from a star).
         let mut far = seeds.clone();
-        far.push(seed_of(pos[0].0 + 20.5, pos[0].1 + 18.0, g - 4.0, 1000.0));
+        far.push(seed_of(pos[0].0 + 20.5, pos[0].1 + 18.0, g - 2.5, 1000.0));
         assert!(pos.iter().all(|p| (p.0 - (pos[0].0 + 20.5)).hypot(p.1 - (pos[0].1 + 18.0)) > 20.0), "the premise");
         assert_eq!(seeded_list(&cat, &wcs, &far, &params()).detected_neighbours_removed, 0);
         // And the same seed 19.5 px from a star removes it.
         let mut near = seeds.clone();
-        near.push(seed_of(pos[0].0 + 19.5, pos[0].1 - 36.0 * 0.0 + 0.0, g - 4.0, 1000.0));
+        near.push(seed_of(pos[0].0 + 19.5, pos[0].1, g - 2.5, 1000.0));
         assert!(seeded_list(&cat, &wcs, &near, &params()).detected_neighbours_removed >= 1);
         // A lower peak floor lets the faint peak through: the constant is the rule's.
         let mut s = seeds.clone();
         s.push(seed_of(bx, by, g - 1.0, 9.9));
         let lax = ForcedListParams { detected_neighbour_min_peak_sigma: 5.0, ..params() };
         assert_eq!(seeded_list(&cat, &wcs, &s, &lax).detected_neighbours_removed, 2);
+    }
+
+    /// The catalogue halo rule's mirror: a seed with `G_seed <= G_b - bright_dmag` within `bright_radius_fwhm * FWHM_ref`
+    /// (25 px here) removes a list star the isolation rule (20 px) does not reach, whatever its peak.
+    #[test]
+    fn a_bright_seed_in_the_halo_radius_removes_the_star_as_the_catalogue_halo_rule_does() {
+        let (cat, seeds, wcs, pos, g) = seeded_field(8, None);
+        let gb = g - 1.0;
+        // A seed left of the lattice's corner star (the rest are 36 px further): only that star is near it.
+        let (x0, y0) = pos[0];
+        let with = |dx: f64, g_seed: f64, peak: f64| {
+            let mut s = seeds.clone();
+            s.push(seed_of(x0 - dx, y0, g_seed, peak));
+            let l = seeded_list(&cat, &wcs, &s, &params());
+            (l.detected_neighbours_removed, at_pos(&l, x0, y0))
+        };
+        // The edges, as `target_survives` asks the catalogue: 24.75 px (9.9 F) drops it, 25.25 px (10.1 F) keeps it.
+        assert_eq!(with(24.75, gb - 2.1, 1000.0), (1, false));
+        assert_eq!(with(25.25, gb - 2.1, 1000.0), (0, true));
+        // 1.9 mag brighter than G_b is no halo source, and 24.75 px is outside the 20 px of the isolation rule.
+        assert_eq!(with(24.75, gb - 1.9, 1000.0), (0, true));
+        // The same seed at 19 px is the isolation rule's (dG <= 4, a peak above the floor).
+        assert_eq!(with(19.0, gb - 1.9, 1000.0), (1, false));
+        // No peak floor on the halo rule: a 1 sigma peak that bright still drops the star.
+        assert_eq!(with(24.75, gb - 2.1, 1.0), (1, false));
+        // Switched off, nothing is removed; the halo constants are the catalogue rule's own.
+        let mut s = seeds.clone();
+        s.push(seed_of(x0 - 24.75, y0, gb - 2.1, 1000.0));
+        let off = seeded_list(&cat, &wcs, &s, &ForcedListParams { detected_neighbours: false, ..params() });
+        assert_eq!((off.detected_neighbours_removed, at_pos(&off, x0, y0)), (0, true));
+        let wide = ForcedListParams { bright_radius_fwhm: 11.0, ..params() };
+        let mut s = seeds.clone();
+        s.push(seed_of(x0 - 26.0, y0, gb - 2.1, 1000.0));
+        let l = seeded_list(&cat, &wcs, &s, &wide);
+        assert_eq!((l.detected_neighbours_removed, at_pos(&l, x0, y0)), (1, false));
     }
 
     #[test]
