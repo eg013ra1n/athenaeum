@@ -13,7 +13,13 @@
 //! zp_probe stars   --db <athenaeum.db> --app-data <dir> --frame <id> --out <tsv> [--all-out <tsv>] [--<field> <v>]...
 //! zp_probe common  --db <athenaeum.db> --run <id> --out <tsv>
 //! zp_probe verdict --class <broadband|narrowband|osc> [--common <tsv>] [--osc-c] <measure.tsv>...
+//! zp_probe bigap   --db <athenaeum.db> --app-data <dir> --instrume <s> --filter <s|-> --object <s> \
+//!                  [--night <label>] [--every <n>] --out <frames.tsv> --stars-out <stars.tsv>
 //! ```
+//!
+//! `bigap` (OSC Task 3c) adds an independent photometry of the raw mosaic: per Gaia-matched star, plain aperture
+//! sums at 1.5 … 8 x the frame's FWHM over all sites and over the green sites, each site less its own CFA phase's sky
+//! (see `cmd_bigap`).
 //!
 //! OSC zero point (Phase A): on a Bayer mosaic `measure` also writes, at the END of the row, the green-site aperture
 //! correction `c` rustafits reports (`PlaneMeasurement::reported_aperture_*`, never applied), its star count and
@@ -2370,18 +2376,350 @@ fn cmd_verdict(mut args: Args) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// bigap: a plain large-aperture photometry of the raw mosaic (OSC Task 3c)
+// ---------------------------------------------------------------------------
+
+/// Aperture radii of `bigap`, in units of the frame's median FWHM.
+const BIGAP_RADII_FWHM: [f64; 6] = [1.5, 2.0, 3.0, 4.0, 6.0, 8.0];
+/// The sky annulus starts this far (px) outside the largest aperture.
+const BIGAP_ANNULUS_GAP_PX: f64 = 3.0;
+/// The sky annulus holds at least this many pixels (a quarter of them per CFA phase).
+const BIGAP_ANNULUS_AREA_PX: f64 = 2400.0;
+/// A neighbour fit brighter than this share of the star's model flux counts against its isolation.
+const BIGAP_NEIGHBOUR_SHARE: f64 = 0.002;
+
+/// Colour of a mosaic site, 0 red, 1 green, 2 blue: the pattern addresses the file's row order, as the mosaic does.
+fn cfa_colour(pattern: astroimage::BayerPattern, x: usize, y: usize) -> usize {
+    use astroimage::BayerPattern as B;
+    let cells: [usize; 4] = match pattern {
+        B::Rggb => [0, 1, 1, 2],
+        B::Bggr => [2, 1, 1, 0],
+        B::Gbrg => [1, 2, 0, 1],
+        B::Grbg => [1, 0, 2, 1],
+        B::None => [1, 1, 1, 1],
+    };
+    cells[(y & 1) * 2 + (x & 1)]
+}
+
+/// The per-star columns of `bigap`, after the fixed ones: per radius k of [`BIGAP_RADII_FWHM`] and CFA phase p
+/// (`(y & 1) * 2 + (x & 1)`), the raw sum `sum_<k>_<p>` and the pixel count `n_<k>_<p>`; the analysis subtracts a sky.
+fn bigap_star_header() -> String {
+    let mut h = String::from(
+        "frame_id\tstar_index\tra\tdec\tg_mag\tkept\tx\ty\tfit_fwhm\tmodel_flux\tzp_model\tpeak\tclip\t\
+         med_p0\tmed_p1\tmed_p2\tmed_p3\tmean_p0\tmean_p1\tmean_p2\tmean_p3\tsky_green_mad\tn_sky\tnear6\tnear8\tnearest_px",
+    );
+    for prefix in ["sum", "n"] {
+        for k in BIGAP_RADII_FWHM {
+            for p in 0..4 {
+                h.push_str(&format!("\t{prefix}_{k}_{p}"));
+            }
+        }
+    }
+    h
+}
+
+/// One star on the raw mosaic: raw sums and pixel counts per radius and CFA phase, and two continuous sky estimates per
+/// phase (the annulus' grouped median and its 3-sigma-clipped mean).
+struct BigapSums {
+    /// Grouped (interpolated) median of the annulus per phase: continuous on integer ADU, where a plain median is not.
+    med: [f64; 4],
+    /// Mean of the annulus per phase, clipped at 3 sigma (MAD) about the median, three rounds.
+    mean: [f64; 4],
+    /// The green phases' pixel scatter about their medians (MAD x 1.4826).
+    sky_green_mad: f64,
+    /// Fewest annulus pixels of any phase.
+    n_sky: usize,
+    /// Raw sum per radius and phase, and the pixel count.
+    sum: [[f64; 4]; 6],
+    cnt: [[usize; 4]; 6],
+    /// Highest raw value within 2 FWHM.
+    peak: f64,
+}
+
+/// The median of integer-valued data as a grouped median, `m - 1/2 + (n/2 - below) / equal` (continuous in the
+/// underlying level); a plain median when the data are not integers. Sorts `v`.
+fn grouped_median(v: &mut [f64]) -> f64 {
+    let Some(m) = median(v) else {
+        return f64::NAN;
+    };
+    if v.iter().any(|x| x.fract() != 0.0) {
+        return m;
+    }
+    let m = m.round();
+    let below = v.iter().filter(|x| **x < m).count() as f64;
+    let equal = v.iter().filter(|x| **x == m).count() as f64;
+    if equal == 0.0 {
+        return m;
+    }
+    m - 0.5 + (v.len() as f64 / 2.0 - below) / equal
+}
+
+/// The mean of `v` clipped at 3 sigma (1.4826 MAD) about the median, three rounds.
+fn clipped_mean(v: &[f64]) -> f64 {
+    let mut keep: Vec<f64> = v.to_vec();
+    for _ in 0..3 {
+        let mut s = keep.clone();
+        let Some(m) = median(&mut s) else {
+            return f64::NAN;
+        };
+        let mut dev: Vec<f64> = keep.iter().map(|x| (x - m).abs()).collect();
+        let sig = median(&mut dev).unwrap_or(0.0) * 1.4826;
+        if !(sig > 0.0) {
+            break;
+        }
+        keep.retain(|x| (x - m).abs() <= 3.0 * sig);
+    }
+    if keep.is_empty() {
+        f64::NAN
+    } else {
+        keep.iter().sum::<f64>() / keep.len() as f64
+    }
+}
+
+/// One matched star on the raw mosaic. `None` when the annulus leaves the frame.
+fn bigap_star(
+    mosaic: &[f32],
+    pattern: astroimage::BayerPattern,
+    (w, h): (usize, usize),
+    (x, y): (f64, f64),
+    fwhm: f64,
+) -> Option<BigapSums> {
+    let r_max = BIGAP_RADII_FWHM[BIGAP_RADII_FWHM.len() - 1] * fwhm;
+    let r_in = r_max + BIGAP_ANNULUS_GAP_PX;
+    let r_out = (r_in * r_in + BIGAP_ANNULUS_AREA_PX / std::f64::consts::PI).sqrt();
+    let (x0, x1) = ((x - r_out).floor(), (x + r_out).ceil());
+    let (y0, y1) = ((y - r_out).floor(), (y + r_out).ceil());
+    if x0 < 0.0 || y0 < 0.0 || x1 > (w - 1) as f64 || y1 > (h - 1) as f64 {
+        return None;
+    }
+    let mut sky: [Vec<f64>; 4] = Default::default();
+    let (mut sum, mut cnt) = ([[0.0f64; 4]; 6], [[0usize; 4]; 6]);
+    let r2: Vec<f64> = BIGAP_RADII_FWHM
+        .iter()
+        .map(|k| (k * fwhm).powi(2))
+        .collect();
+    let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
+    let peak_r2 = (2.0 * fwhm).powi(2);
+    let mut peak = f64::NEG_INFINITY;
+    for py in y0 as usize..=y1 as usize {
+        let dy2 = (py as f64 - y).powi(2);
+        for px in x0 as usize..=x1 as usize {
+            let d2 = (px as f64 - x).powi(2) + dy2;
+            let v = mosaic[py * w + px] as f64;
+            if !v.is_finite() {
+                continue;
+            }
+            let phase = (py & 1) * 2 + (px & 1);
+            if d2 >= r_in2 && d2 <= r_out2 {
+                sky[phase].push(v);
+                continue;
+            }
+            for (k, rk2) in r2.iter().enumerate() {
+                if d2 <= *rk2 {
+                    sum[k][phase] += v;
+                    cnt[k][phase] += 1;
+                }
+            }
+            if d2 <= peak_r2 {
+                peak = peak.max(v);
+            }
+        }
+    }
+    let n_sky = sky.iter().map(Vec::len).min().unwrap_or(0);
+    let (mut med, mut mean) = ([f64::NAN; 4], [f64::NAN; 4]);
+    for (p, s) in sky.iter_mut().enumerate() {
+        mean[p] = clipped_mean(s);
+        med[p] = grouped_median(s);
+    }
+    // The green sky's scatter (MAD of the green phases' pixels about their own medians), for the noise of a sum.
+    let mut dev: Vec<f64> = Vec::new();
+    for (p, s) in sky.iter().enumerate() {
+        if cfa_colour(pattern, p & 1, p >> 1) == 1 {
+            dev.extend(s.iter().map(|v| (v - med[p]).abs()));
+        }
+    }
+    let mad = median(&mut dev).unwrap_or(f64::NAN) * 1.4826;
+    Some(BigapSums {
+        med,
+        mean,
+        sky_green_mad: mad,
+        n_sky,
+        sum,
+        cnt,
+        peak,
+    })
+}
+
+/// `bigap`: per frame of one rig / object / filter (optionally one night, every n-th frame), the row `measure` writes
+/// plus the solve's position angle, the clip level and the CFA colours of the four phases; per Gaia-matched star, the
+/// raw mosaic's sums and pixel counts per CFA phase within 1.5 … 8 x the frame's median FWHM, the annulus sky per phase
+/// outside the largest aperture (grouped median and clipped mean), the peak raw value within 2 F, the neighbour counts
+/// an isolation test reads, and the star's sky position (the cross-frame join). The analysis subtracts the sky of each
+/// site's own phase. The stars are the ones the zero point matched by sky position (`measure_zero_point`'s per-star
+/// list), so a meridian flip cannot mix them up.
+fn cmd_bigap(mut args: Args) -> Result<()> {
+    let db = args.require("db")?;
+    let app_data = args.require("app-data")?;
+    let instrume = args.require("instrume")?;
+    let filter = args.require("filter")?;
+    let object = args.require("object")?;
+    let night = args.take("night");
+    let every: usize = args.take_parsed("every")?.unwrap_or(1).max(1);
+    let out = args.require("out")?;
+    let stars_out = args.require("stars-out")?;
+    let params = args.zp_params()?;
+    args.finish()?;
+
+    let conn = open_read_only(&db)?;
+    let rig = open_rig(&conn, &app_data, params)?;
+    let candidates: Vec<Candidate> = load_candidates(&conn, &instrume, &object, &filter)?
+        .into_iter()
+        .filter(|c| night.as_deref().is_none_or(|n| c.night == n))
+        .filter(|c| !c.in_zip && c.has_solve && Path::new(&c.path).is_file())
+        .enumerate()
+        .filter(|(i, _)| i % every == 0)
+        .map(|(_, c)| c)
+        .collect();
+    eprintln!("zp_probe bigap: {} frames to measure", candidates.len());
+    let mut w = create_out(&out)?;
+    writeln!(w, "{MEASURE_HEADER}\tpa_deg\tclip\tpattern")?;
+    let mut ws = create_out(&stars_out)?;
+    writeln!(ws, "{}", bigap_star_header())?;
+    let mut done = 0usize;
+    for c in &candidates {
+        let (row, m, fits) = measure_candidate(&conn, &rig, c, true);
+        let (Some(m), Some(fits), Some(fwhm)) = (m, fits, row.median_fwhm) else {
+            eprintln!(
+                "zp_probe bigap: frame {} has no measurement, skipped",
+                c.frame_id
+            );
+            continue;
+        };
+        let wcs = match get_plate_solve(&conn, c.frame_id)?.and_then(|r| r.to_solution()) {
+            Some(wcs) => wcs,
+            None => {
+                eprintln!(
+                    "zp_probe bigap: frame {} has no usable solve, skipped",
+                    c.frame_id
+                );
+                continue;
+            }
+        };
+        let frame = match read_raw_frame(Path::new(&c.path)) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("zp_probe bigap: frame {} unreadable: {e:#}", c.frame_id);
+                continue;
+            }
+        };
+        let clip = match frame.domain {
+            athenaeum_core::star_measure::Domain::RawAdu { clip, .. } => clip,
+            _ => f64::NAN,
+        };
+        let RawPlanes::Cfa { mosaic, pattern } = &frame.planes else {
+            eprintln!(
+                "zp_probe bigap: frame {} is not a mosaic, skipped",
+                c.frame_id
+            );
+            continue;
+        };
+        let pa = wcs.cd[1][0].atan2(wcs.cd[0][0]).to_degrees();
+        let colours: String = (0..4)
+            .map(|p| ['R', 'G', 'B'][cfa_colour(*pattern, p & 1, p >> 1)])
+            .collect();
+        writeln!(w, "{}\t{pa:.3}\t{clip:.1}\t{colours}", row.to_tsv())?;
+        let r6 = 6.0 * fwhm + 2.0 * fwhm;
+        let r8 = 8.0 * fwhm + 2.0 * fwhm;
+        for s in &m.per_star {
+            let Some(f) = fits.fits.get(s.star_index) else {
+                bail!(
+                    "star_index {} outside the {} fits",
+                    s.star_index,
+                    fits.fits.len()
+                );
+            };
+            let Some(b) = bigap_star(mosaic, *pattern, (frame.w, frame.h), (f.x, f.y), fwhm) else {
+                continue;
+            };
+            let (mut near6, mut near8, mut nearest) = (0usize, 0usize, f64::INFINITY);
+            for (j, o) in fits.fits.iter().enumerate() {
+                if j == s.star_index || !(o.x.is_finite() && o.y.is_finite()) {
+                    continue;
+                }
+                let d = (o.x - f.x).hypot(o.y - f.y);
+                if d > r8 {
+                    continue;
+                }
+                nearest = nearest.min(d);
+                if o.signal > BIGAP_NEIGHBOUR_SHARE * f.signal {
+                    near8 += 1;
+                    near6 += usize::from(d <= r6);
+                }
+            }
+            let (ra, dec) = wcs.pixel_to_sky(f.x, f.y);
+            let mut cols: Vec<String> = Vec::with_capacity(48);
+            for row_k in &b.sum {
+                cols.extend(row_k.iter().map(|v| format!("{v:.0}")));
+            }
+            for row_k in &b.cnt {
+                cols.extend(row_k.iter().map(|v| v.to_string()));
+            }
+            writeln!(
+                ws,
+                "{}\t{}\t{ra:.6}\t{dec:.6}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.4}\t{:.3}\t{:.5}\t{:.1}\t{clip:.1}\t\
+                 {:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.3}\t{}\t{near6}\t{near8}\t{nearest:.2}\t{}",
+                c.frame_id,
+                s.star_index,
+                s.g_mag,
+                u8::from(s.kept),
+                f.x,
+                f.y,
+                f.fwhm(),
+                f.signal,
+                s.zp,
+                b.peak,
+                b.med[0],
+                b.med[1],
+                b.med[2],
+                b.med[3],
+                b.mean[0],
+                b.mean[1],
+                b.mean[2],
+                b.mean[3],
+                b.sky_green_mad,
+                b.n_sky,
+                cols.join("\t"),
+            )?;
+        }
+        w.flush()?;
+        ws.flush()?;
+        done += 1;
+        if done % PROGRESS_EVERY == 0 {
+            eprintln!("zp_probe bigap: {done} frames measured");
+        }
+    }
+    eprintln!(
+        "zp_probe bigap summary: {done} of {} frames; wrote {out} and {stars_out}",
+        candidates.len()
+    );
+    Ok(())
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = match argv.first().map(String::as_str) {
-        Some(sub @ ("measure" | "stars" | "common" | "verdict")) => Args::parse(&argv[1..])
-            .and_then(|a| match sub {
+        Some(sub @ ("measure" | "stars" | "common" | "verdict" | "bigap")) => {
+            Args::parse(&argv[1..]).and_then(|a| match sub {
                 "measure" => cmd_measure(a),
                 "stars" => cmd_stars(a),
                 "common" => cmd_common(a),
+                "bigap" => cmd_bigap(a),
                 _ => cmd_verdict(a),
-            }),
+            })
+        }
         _ => Err(anyhow!(
-            "usage: zp_probe <measure|stars|common|verdict> ... (see the file's header)"
+            "usage: zp_probe <measure|stars|common|verdict|bigap> ... (see the file's header)"
         )),
     };
     if let Err(e) = result {
