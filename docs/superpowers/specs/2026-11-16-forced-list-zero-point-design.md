@@ -187,7 +187,7 @@ nights; 6.5 put it at 0.013–0.017 on its mono nights (no common set). A missed
 | B1 kept list stars a frame shares with its successor | every pair ≥ 80 % | the 3c mechanism is gone (today 5–7.5 %); not that the ZP is right |
 | B2 stability, median \|ΔZP\| | ≤ 0.015 on the common-set nights; elsewhere ≤ 0.020 and not above today's (vdB 0.021–0.024, 6.5 L / H 0.024) | frame-to-frame noise; not a slow drift or a constant bias |
 | B3 ZP − 2.5·log10(t_flux / t), common set | rms ≤ 0.015; FWHM slope within ±0.04 mag/px | agreement with an independent calibrated photometry; not seeing independence below the ~0.04–0.06 mag/px spread of the references' own unconverged apertures (3c) |
-| B4 ZP = a + kX + s·[after flip], per night | \|k − k_stack\| ≤ 0.05 and \|s − s_stack\| ≤ 0.05 where ΔX ≥ 0.4 (10-18, ATR L) | the ZP follows real light loss in size; not haze or cloud |
+| B4 ZP = a + kX (+ s·[after flip], reported), per night | \|k − k_stack\| ≤ 0.05 where ΔX ≥ 0.4: ATR L, and 10-18 one pier side at a time (F7) | the ZP follows real light loss in size; not haze or cloud |
 | B5 no common set: one k per rig, an intercept per night, a flip term where one exists | \|FWHM slope\| ≤ 0.03 mag/px where its error ≤ 0.015 | no seeing term on the vdB and 6.5 nights; not below the error |
 | B6 coverage: valid ZPs of the solved, analysed frames | ≥ 90 % per night; 6.5's sets at 6.5's 100 % | the rule works on real frames; not accuracy |
 | B7 median \|fitted − projected\| centre | ≤ 0.25·FWHM_ref | the WCS and the seeding agree; not the flux |
@@ -209,12 +209,17 @@ triggers, removals. 6. Loss reasons, gate, the tab's count, the cell. 7. Accepta
 `CLAUDE.md`'s Transparency line, `docs/logging/`, `open-items.md`, pointers in the 6.5 and OSC specs), final review,
 merge into local `main`; 6.5 and this push together on the owner's word.
 
-## 8. Open for the owner
+## 8. Owner answers (2026-11-16) and what is still open
 
-- **Existing frames.** Nothing reads files at launch or after a tier install, so every solved light says "run Analyze"
-  until its set is analysed again (6.5 refilled alone). Wanted instead: an opt-in background pass over present files?
-- **Publication.** A frame without a current ZP is published with no transparency verdict and is not blocked. Should
-  publishing measure it first (its file is read for sending anyway)?
-- **The 10-18 meridian-flip step** (+0.13–0.19 mag of real light, sky −3 %, no halo or trail): the loss will show the
-  pre-flip frames as clearer. Expected on that rig (an obstruction, dew wiped at the flip)?
-- The OSC spec's §8 dual-band question (O7 stays meanwhile) and the release-notes line.
+- **F6 — existing frames: no migration** («Не нужна миграция, достаточно сказать что анализ отличается. В лайве ещё
+  нет проектов больших»). Nothing reads files at launch, after a tier install or at publication: an old frame's cell
+  says its analysis differs from the current one ("run Analyze"), and Analyze re-measures it. Publication does not
+  measure: a frame without a current ZP is published with no transparency verdict and is not blocked (as today).
+- **F7 — the 10-18 meridian-flip step** («Без понятия, возьми другие кадры»): its cause is unknown, so it is not a
+  judge of the method. B4 is judged on the ATR2600M L night and on 10-18 one pier side at a time where a side has
+  ΔX ≥ 0.4; the flip step `s` is reported, not judged.
+- **F8 — dual-band data for the OSC spec's §8 guard** («Squid и некоторые veil снимались с узкой полосой»): the
+  ASI2600MC Pro Squid set and part of the Veil sets were shot through a dual-band filter, the rest of that rig without.
+  The guard is not built in this cycle; O7 keeps the gate off OSC frames with an empty `FILTER`. Those sets (none
+  solved today) are the guard's data when it is built.
+- Still open: the `RELEASE_NOTES.md` line (proposed at the close, applied only on the owner's yes).
