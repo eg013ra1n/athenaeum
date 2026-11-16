@@ -189,7 +189,7 @@ mod forced {
 
     use super::super::config::AnalysisConfig;
     use super::super::zero_point::{
-        anchor_zero_point, forced_list, forced_zero_point, map_gate, pixel_scale_arcsec, placement, position_map,
+        anchor_zero_point, forced_list_in, forced_zero_point, map_gate, pixel_scale_arcsec, placement, position_map,
         Anchor, ForcedList, ForcedListInput, ForcedListParams, ForcedOutcome, ForcedRefusal, ForcedZeroPoint, MapGate,
         QuadMap,
     };
@@ -278,6 +278,7 @@ mod forced {
         opts: &FrameOptions,
         zp: &ZpInputs,
         params: &ForcedListParams,
+        pool: Option<&Arc<rayon::ThreadPool>>,
         cone: F,
     ) -> Result<(Anchor, ForcedList, f64), ForcedRefusal>
     where
@@ -323,7 +324,7 @@ mod forced {
             pm.frame.fwhm_px.unwrap_or(0.0),
             params,
         )?;
-        let list = forced_list(
+        let list = forced_list_in(
             &ForcedListInput {
                 catalog: &catalog,
                 wcs: zp.wcs,
@@ -334,6 +335,7 @@ mod forced {
                 exptime_s: exptime,
             },
             params,
+            pool,
         )?;
         // `F`, the Analysis median FWHM: the aperture and its sky annulus grow with it.
         Ok((anchor, list, summary.median_fwhm))
@@ -373,7 +375,7 @@ mod forced {
             &opts,
             pool,
             |pm| {
-                match catch_unwind(AssertUnwindSafe(|| prepare_forced_list(frame, pm, &opts, zp, params, cone))) {
+                match catch_unwind(AssertUnwindSafe(|| prepare_forced_list(frame, pm, &opts, zp, params, pool, cone))) {
                     Ok(Ok((anchor, list, fwhm))) => {
                         frame_fwhm.set(fwhm);
                         // No map star: nothing to fit (the refusal is the list's size, below).

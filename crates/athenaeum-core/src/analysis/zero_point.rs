@@ -769,6 +769,23 @@ const KEY_SPACE: f64 = 18_446_744_073_709_551_616.0;
 /// alone, in the window `[G_b, faint]`, thinned by hash above the guard, and the map stars among them. Reads no pixel
 /// and no seeing.
 pub fn forced_list(input: &ForcedListInput, params: &ForcedListParams) -> Result<ForcedList, ForcedRefusal> {
+    forced_list_in(input, params, None)
+}
+
+/// [`forced_list`] with the cone's projection and the isolation test (one independent answer per catalogue star) run on
+/// `pool` (the global pool when there is none); the list is the same, star for star and in the same order.
+pub fn forced_list_in(
+    input: &ForcedListInput,
+    params: &ForcedListParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<ForcedList, ForcedRefusal> {
+    use rayon::prelude::*;
+    fn on<R: Send>(pool: Option<&Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R + Send) -> R {
+        match pool {
+            Some(p) => p.install(f),
+            None => f(),
+        }
+    }
     if !(input.exptime_s.is_finite() && input.exptime_s > 0.0) {
         return Err(ForcedRefusal::NoExposure);
     }
@@ -781,18 +798,20 @@ pub fn forced_list(input: &ForcedListInput, params: &ForcedListParams) -> Result
     }
 
     // The cone in pixels (non-finite skipped, as `measure_zero_point` does), with each star's sky record.
-    let mut cat: Vec<(f64, f64, f32)> = Vec::with_capacity(input.catalog.len());
-    let mut sky: Vec<(f64, f64)> = Vec::with_capacity(input.catalog.len());
-    for c in input.catalog {
-        if !c.mag.is_finite() {
-            continue;
-        }
-        let (x, y) = input.wcs.sky_to_pixel(c.ra, c.dec);
-        if x.is_finite() && y.is_finite() {
-            cat.push((x, y, c.mag));
-            sky.push((c.ra, c.dec));
-        }
-    }
+    let projected: Vec<((f64, f64, f32), (f64, f64))> = on(pool, || {
+        input
+            .catalog
+            .par_iter()
+            .filter_map(|c| {
+                if !c.mag.is_finite() {
+                    return None;
+                }
+                let (x, y) = input.wcs.sky_to_pixel(c.ra, c.dec);
+                (x.is_finite() && y.is_finite()).then_some(((x, y, c.mag), (c.ra, c.dec)))
+            })
+            .collect()
+    });
+    let (cat, sky): (Vec<(f64, f64, f32)>, Vec<(f64, f64)>) = projected.into_iter().unzip();
     let near_r = params.isolation_radius_fwhm * fwhm_ref;
     let far_r = params.bright_radius_fwhm * fwhm_ref;
     let grid = Grid::new(&cat, far_r.max(near_r).max(1.0));
@@ -806,36 +825,39 @@ pub fn forced_list(input: &ForcedListInput, params: &ForcedListParams) -> Result
 
     // Isolated candidates of the deepest window. Under a probe's decimation the same share of the catalogue stays in
     // every frame: the thinning is on the key, before the faint edge's count.
-    let mut isolated: Vec<(f64, usize, u64)> = Vec::new();
-    for (i, &(x, y, g)) in cat.iter().enumerate() {
-        let g = f64::from(g);
-        if g < g_b || g > faint_limit {
-            continue;
-        }
-        if (x - centre.0).hypot(y - centre.1) > region
-            || x < margin
-            || y < margin
-            || x > w - 1.0 - margin
-            || y > h - 1.0 - margin
-        {
-            continue;
-        }
-        let crowded = grid.near(x, y).any(|j| {
-            if j == i {
-                return false;
-            }
-            let d = (cat[j].0 - x).hypot(cat[j].1 - y);
-            let gj = f64::from(cat[j].2);
-            (gj <= g + params.isolation_dmag && d <= near_r) || (gj <= g_b - params.bright_dmag && d <= far_r)
-        });
-        if crowded {
-            continue;
-        }
-        let key = cap_key(cat[i].2, sky[i].0, sky[i].1);
-        if key % decimate == 0 {
-            isolated.push((g, i, key));
-        }
-    }
+    let isolated: Vec<(f64, usize, u64)> = on(pool, || {
+        cat.par_iter()
+            .enumerate()
+            .filter_map(|(i, &(x, y, g))| {
+                let g = f64::from(g);
+                if g < g_b || g > faint_limit {
+                    return None;
+                }
+                if (x - centre.0).hypot(y - centre.1) > region
+                    || x < margin
+                    || y < margin
+                    || x > w - 1.0 - margin
+                    || y > h - 1.0 - margin
+                {
+                    return None;
+                }
+                let crowded = grid.near(x, y).any(|j| {
+                    if j == i {
+                        return false;
+                    }
+                    let d = (cat[j].0 - x).hypot(cat[j].1 - y);
+                    let gj = f64::from(cat[j].2);
+                    (gj <= g + params.isolation_dmag && d <= near_r)
+                        || (gj <= g_b - params.bright_dmag && d <= far_r)
+                });
+                if crowded {
+                    return None;
+                }
+                let key = cap_key(cat[i].2, sky[i].0, sky[i].1);
+                (key % decimate == 0).then_some((g, i, key))
+            })
+            .collect()
+    });
 
     // The faint edge: G_b + 3, deepened by catalogue count up to G_b + 4.5 while the window is thin.
     let shallow_edge = g_b + params.window_faint_width_mag;
@@ -3009,6 +3031,23 @@ mod forced_tests {
         assert!(s >= 0.95, "share {s}");
         let s2 = share(&lb, &la);
         assert!(s2 >= 0.95, "reverse share {s2}");
+    }
+
+    /// The projection and the isolation test run per catalogue star, so the list is the same whatever pool (or none) runs
+    /// them: the same stars in the same order, the same window and map.
+    #[test]
+    fn the_list_does_not_depend_on_the_pool_that_builds_it() {
+        let wcs = wcs_at(W, H, 1.0, (0.0, 0.0), 0.0);
+        let gb = g_b(&wcs);
+        let cat = sky_catalogue(6000, &wcs, W, H, gb - 1.0, gb + 6.0, 31);
+        let pool = |n: usize| Arc::new(rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap());
+        let (one, six) = (pool(1), pool(6));
+        let i = input(&cat, &wcs, W, H);
+        let base = forced_list_in(&i, &params(), Some(&one)).unwrap();
+        assert!(base.stars.len() > 300 && !base.map.is_empty(), "a usable list: {}", base.stars.len());
+        assert_eq!(base, forced_list_in(&i, &params(), Some(&six)).unwrap());
+        assert_eq!(base, forced_list_in(&i, &params(), None).unwrap());
+        assert_eq!(base, forced_list(&i, &params()).unwrap());
     }
 
     #[test]
