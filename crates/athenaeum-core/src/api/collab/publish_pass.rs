@@ -814,7 +814,9 @@ fn publish_select(pass: &PublishPass<'_>) -> Result<Selection, ApiError> {
         let db = db(ctx)?;
         let conn = db.conn();
         let project = crate::api::collab_exchange::live_project(&conn, project_id)?;
-        let gated = project_gate(&conn, &project)?;
+        // The run measures every frame it is about before the gate is read, with no limit: a frame it announces carries a
+        // frozen loss, so none may be announced merely because its zero point was not measured yet.
+        let gated = project_gate(&conn, &project, GateMeasure::publish(only))?;
         let binding =
             crate::db::collab::publishing_device(&conn, project_id).map_err(|e| {
                 tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the publishing device failed");
@@ -1247,6 +1249,23 @@ fn publish_split(
         // path, and a basename collision within this publisher is held back,
         // never renamed on disk. A prepared frame lands where its calibrate
         // wrote it (spec §4.3) — its name was picked then.
+        // The new frames' transparency, read ONCE for the whole batch (never per frame): each frame's meta gets its own
+        // entry. When the project's rules judge transparency, the gate that opened this run measured every frame the run
+        // is about (no limit), so a measurable frame arrives here with its zero point current; a frame without a value
+        // is one that cannot be measured (no solve, no analysis, no catalogue, a refusal) and is announced without a
+        // loss. A project whose rules do not judge transparency measures nothing here: its frames carry whatever the
+        // column already holds.
+        let new_transparency = {
+            let new_ids: Vec<i64> = targeted
+                .iter()
+                .filter(|(_, kind, ..)| matches!(kind, PublishKind::New))
+                .map(|(cand, ..)| cand.frame_id)
+                .collect();
+            let catalog = ctx
+                .app_data_dir()
+                .and_then(|dir| crate::analysis::transparency::installed_catalog_identity(&dir));
+            batch_frame_transparency(&conn, project_id, catalog.as_deref(), &new_ids)
+        };
         for (cand, kind, osc, target, external) in targeted {
             let fid = cand.frame_id;
             if let (PublishKind::New, Some(p)) = (&kind, from_prepared.get(&fid)) {
@@ -1279,7 +1298,7 @@ fn publish_split(
                         name_taken.push(fid);
                         continue;
                     }
-                    let meta = match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                    let meta = match new_frame_meta_or_hold_back(&conn, project_id, fid, new_transparency.get(&fid)) {
                         Ok(m) => m,
                         Err(reason) => {
                             held_back.push(held(fid, &cand.filename, reason));
@@ -1375,7 +1394,7 @@ fn publish_split(
                         continue;
                     }
                     taken_names.insert(file_name);
-                    match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                    match new_frame_meta_or_hold_back(&conn, project_id, fid, new_transparency.get(&fid)) {
                         Ok(m) => Some(m),
                         Err(reason) => {
                             held_back.push(held(fid, &cand.filename, reason));
@@ -1416,7 +1435,7 @@ fn publish_split(
             // meta — a version never re-announces it; the hub keeps the
             // prior meta.
             let meta = if matches!(kind, PublishKind::New) {
-                match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                match new_frame_meta_or_hold_back(&conn, project_id, fid, new_transparency.get(&fid)) {
                     Ok(m) => Some(m),
                     Err(reason) => {
                         held_back.push(held(fid, &cand.filename, reason));
@@ -2369,7 +2388,7 @@ async fn publish_announce(
                         match refresh_project_thresholds(ctx, &client, &token, project_id).await {
                             Ok(refreshed) => {
                                 gate_version = refreshed.thresholds_version.unwrap_or(0);
-                                regate(ctx, &refreshed)
+                                regate(ctx, &refreshed, pass.only)
                             }
                             Err(err) => Err(err),
                         };

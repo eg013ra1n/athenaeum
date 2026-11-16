@@ -59,6 +59,7 @@ function libraryFrame(overrides: Partial<ProjectFrameView> = {}): ProjectFrameVi
     receivedAt: null,
     receivedFromDevice: null,
     receivedFromMember: null,
+    transparencyLoss: null,
     ...overrides,
   };
 }

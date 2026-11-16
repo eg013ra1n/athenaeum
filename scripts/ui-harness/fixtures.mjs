@@ -9,6 +9,16 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const MOCKUP = path.join(ROOT, 'docs/superpowers/research/2026-09-29-collab-project-layout-mockup.html');
 
+// A frame's transparency by its number: every sixth has no value (with the backend's reason), the next one a loss under
+// half a hundredth (`0.00 mag`), the rest a loss of 0.07 to 0.71 mag.
+const NO_VALUE_REASON = 'no clear-sky reference yet, 12 of 30 frames';
+function transparencyOf(n) {
+  if (n % 6 === 0) return { zeroPoint: n % 12 === 0 ? 21.34 : null, zpStars: n % 12 === 0 ? 87 : null, zpSigma: n % 12 === 0 ? 0.041 : null, lossMag: null, reason: NO_VALUE_REASON };
+  const zp = { zeroPoint: 21.3 + (n % 5) * 0.07, zpStars: 60 + (n % 11) * 6, zpSigma: 0.03 + (n % 4) * 0.01 };
+  if (n % 6 === 1) return { ...zp, lossMag: 0.003, reason: null };
+  return { ...zp, lossMag: 0.07 + (n % 9) * 0.08, reason: null };
+}
+
 function mockupData() {
   const html = fs.readFileSync(MOCKUP, 'utf8');
   const start = html.indexOf('<script>') + '<script>'.length;
@@ -132,6 +142,7 @@ function stackingHandlers({ projectId, card, nameOf, acc }) {
     exptimeSec: f.exp, colorMode: f.colorMode, focalLenMm: f.centre === null ? null : f.colorMode === 'osc' ? 400 : 530,
     hasWcs: f.centre !== null, onDisk: f.flag !== 'offDevice',
     reason: f.flag === 'offDevice' ? 'not on this device' : f.flag === 'unsupported' ? 'unsupported file: tile-compressed FITS' : null,
+    transparencyLoss: f.i % 4 === 3 ? null : f.i % 4 === 0 ? 0.002 : 0.12 + f.i * 0.05,
   }));
   const group = (filter, cameras, anchor, scale, source) => {
     const [colorMode, exp] = FILTER[filter];
@@ -279,6 +290,7 @@ export function buildFixtures(scenario = 'default') {
     receivedAt: !f.own && f.mine === 'have' ? `${f.publishedAt.replace(' ', 'T')}Z` : null,
     receivedFromDevice: !f.own && f.mine === 'have' ? devId(f.publisher, 0) : null,
     receivedFromMember: !f.own && f.mine === 'have' ? MBY[f.publisher].name : null,
+    transparencyLoss: transparencyOf(f.id).lossMag,
   });
   const rulesOf = (f) => [
     { metricKey: 'fwhm_arcsec', label: 'FWHM', value: `${f.fwhm.toFixed(2)}″`, needs: '≤ 3.00″', pass: f.fwhm <= 3 },
@@ -299,6 +311,7 @@ export function buildFixtures(scenario = 'default') {
     localState: f.pub ? localStateOf(f) : null, publishedAt: f.publishedAt ?? null, lastError: null, rules: rulesOf(f),
     path: `/Volumes/Astro/M31/2026-autumn/${f.night}/LIGHT/${f.name}`, accepted: f.pub ? f.pub !== 'excluded' : null,
     calibratedPath: null, calibratedBytes: null, preparedAt: null, withheld: false,
+    transparency: transparencyOf(f.id),
   });
   const med = (a) => { const s = [...a].sort((x, y) => x - y); const k = s.length >> 1; return s.length ? (s.length % 2 ? s[k] : (s[k - 1] + s[k]) / 2) : null; };
   const memberSummary = MEMBERS.map((m) => {

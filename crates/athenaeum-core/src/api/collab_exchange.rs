@@ -814,6 +814,9 @@ pub struct ProjectFrameView {
     pub telescope: Option<String>,
     /// Parsed from `meta.medianSnr`.
     pub median_snr: Option<f64>,
+    /// Parsed from `meta.transparencyLoss`: the frame's loss in magnitudes against its publisher's clear sky, frozen
+    /// at announce. `None` for a frame announced before it was measured, or announced without a loss.
+    pub transparency_loss: Option<f64>,
     /// The UTC date of `dateObs − 12 h` ([`night_of_date_obs`]) — there is no
     /// catalog `imaging_nights` row for another member's frame, so this is
     /// the best a cached manifest row can do.
@@ -888,6 +891,7 @@ impl ProjectFrameView {
             camera,
             telescope,
             median_snr,
+            transparency_loss,
             night,
         ) = match &wire {
             Some(w) => (
@@ -910,9 +914,12 @@ impl ProjectFrameView {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
                 w.meta.get("medianSnr").and_then(serde_json::Value::as_f64),
+                w.meta
+                    .get("transparencyLoss")
+                    .and_then(serde_json::Value::as_f64),
                 w.date_obs.as_deref().and_then(night_of_date_obs),
             ),
-            None => (0.0, None, None, None, None, None, None, None, None, None),
+            None => (0.0, None, None, None, None, None, None, None, None, None, None),
         };
         let (received_at, received_from_device, received_from_member) = match received {
             Some((at, dev, member)) => (Some(at), Some(dev), member),
@@ -945,6 +952,7 @@ impl ProjectFrameView {
             camera,
             telescope,
             median_snr,
+            transparency_loss,
             night,
             contributor_state: None,
             contributor_reason: None,

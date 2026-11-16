@@ -3045,6 +3045,12 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
     current["measure_version"] = serde_json::json!(5);
     current["stars_refused"] = serde_json::json!(17);
     current["frame_verdict"] = serde_json::json!("defocused");
+    // Wave 6.5: the zero point and what it was measured against ride along under their snake_case names.
+    current["zero_point"] = serde_json::json!(21.3);
+    current["zp_stars"] = serde_json::json!(87);
+    current["zp_sigma"] = serde_json::json!(0.04);
+    current["zp_version"] = serde_json::json!(crate::analysis::zero_point::ZP_VERSION);
+    current["zp_catalog"] = serde_json::json!("tier_500:1:2");
     // A verdict a newer build wrote (C6 review m8): the verdict reads None, the rest of the row is kept.
     let mut future = current.clone();
     future["frame_verdict"] = serde_json::json!("some_future_verdict");
@@ -3077,5 +3083,12 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
             .expect("the analysis rode along");
         assert_eq!((a.stars_detected, a.median_fwhm), (300, 3.0), "{uuid}");
         assert_eq!((a.measure_version, a.stars_refused, a.frame_verdict), want, "{uuid}");
+        let zp = (a.zero_point, a.zp_stars, a.zp_sigma, a.zp_version, a.zp_catalog);
+        if uuid == "an-old" {
+            assert_eq!(zp, (None, None, None, None, None), "{uuid}: an older summary has no zero point");
+        } else {
+            let want_zp = (Some(21.3), Some(87), Some(0.04), Some(crate::analysis::zero_point::ZP_VERSION), Some("tier_500:1:2".to_string()));
+            assert_eq!(zp, want_zp, "{uuid}");
+        }
     }
 }

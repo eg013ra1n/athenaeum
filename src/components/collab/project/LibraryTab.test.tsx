@@ -55,6 +55,7 @@ function frame(overrides: Partial<ProjectFrameView> = {}): ProjectFrameView {
     receivedAt: null,
     receivedFromDevice: null,
     receivedFromMember: null,
+    transparencyLoss: null,
     ...overrides,
   };
 }

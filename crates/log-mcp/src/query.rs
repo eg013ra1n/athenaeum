@@ -25,7 +25,7 @@
 //! Operation spans (for `list_operations`/`get_operation`): `scan`
 //! (`root_id`), `archive_op` (`operation_id`), `file_op` (`operation_id`),
 //! `solve` (`frame_id`), `export` (`frame_set_id`), `registration`
-//! (`frame_set_id`).
+//! (`frame_set_id`), `zero_point_backfill` (`catalog`).
 
 use anyhow::Result;
 use serde::Serialize;
@@ -41,6 +41,7 @@ pub const OPERATION_KINDS: &[(&str, &str)] = &[
     ("solve", "frame_id"),
     ("export", "frame_set_id"),
     ("registration", "frame_set_id"),
+    ("zero_point_backfill", "catalog"),
 ];
 
 pub const DEFAULT_LIMIT: usize = 200;

@@ -39,6 +39,8 @@ function row(
     night: null,
     exptimeSec: null,
     focalLenMm: null,
+    transparencyLoss: null,
+    transparencyReason: null,
     weight: null,
     fwhmPx: null,
     eccentricity: null,

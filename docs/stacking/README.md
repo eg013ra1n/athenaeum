@@ -1703,7 +1703,10 @@ unchanged.
   min 0.01); `stops` and `equivalent` take `Width (stops)` (`stopsWidth`, min 0.1); `none` takes none. The `Exp` column
   shows the plan's `exposureClass` token (`180s`, `st120`, `eq0.24`, `all`, `unknown`). A change patches `grouping` and
   the plan refetches as for any config edit. A frame set's default stays `seconds`; a project's stored config is seeded
-  `stops` 1.0. The measured zero point of `equivalent` is sub-wave 6.5, not built.
+  `stops` 1.0. A measured zero point as the top rung of `equivalent` is deferred by owner ruling Z4 (2026-11-15), not owed:
+  sub-wave 6.5 shipped the transparency number instead (`docs/catalog/README.md`, "Zero point and transparency"), and
+  nothing in the stacking pipeline reads a zero point. The Frames block shows it as a display-only Transparency column
+  (`PlanProjectFrame.transparency_loss` for a project, the frame-set row's `transparency` for a frame set).
   - **No tolerance hint.** The tolerance only regroups frames (frame-level cache spec §5.1, §5.2): calibrated frames,
     measurements and registrations are kept per frame and reused, so changing it re-calibrates nothing and the table
     carries no warning about it. `equivalent` carries its own hint (classes by t / N²; frames without both numbers are
@@ -1743,7 +1746,7 @@ unchanged.
   frame-set rule stands (the Save-time overlap warning only), and the working-root check is unchanged.
 - **Harness.** `HARNESS_SCENARIO=stacking npm run ui:harness`, `/projects/p-m31?tab=stacking` (`scripts/ui-harness/README.md`).
 - **Not in 6c.** The grid and the outlines over the sky-chart survey background (a follow-up, possibly with the portal's
-  grid editor, wave 7), and the `equivalent` zero point (sub-wave 6.5). Owed checks, the owner decisions and the
+  grid editor, wave 7), and the `equivalent` zero point (deferred by owner ruling Z4, 2026-11-15, not owed). Owed checks, the owner decisions and the
   acceptance re-check on current `main`: `docs/superpowers/open-items.md`, "Collab wave 6c".
 
 **The Frames block (2026-11-06)** (spec `docs/superpowers/specs/2026-11-06-stacking-frames-block-design.md`, plan

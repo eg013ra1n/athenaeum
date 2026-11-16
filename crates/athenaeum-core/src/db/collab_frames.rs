@@ -1418,6 +1418,22 @@ pub fn own_by_source_frame(
         .collect())
 }
 
+/// Every own-frame row of a project that is not bound to a local frame (`source_frame_id IS NULL`: the manifest sync
+/// recorded the row before the publish run bound it), keyed by `frame_uuid`.
+pub fn own_unbound_by_uuid(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<HashMap<String, LocalFrameRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM project_frames_local \
+         WHERE project_id = ?1 AND origin = 'own' AND source_frame_id IS NULL"
+    ))?;
+    let rows = stmt
+        .query_map(params![project_id], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().map(|r| (r.frame_uuid.clone(), r)).collect())
+}
+
 /// The parent directory of any already-landed row for a publisher in a
 /// project (P10) that lies under `root`, the current Collaboration folder:
 /// the folder every later frame from that publisher reuses. A landing under

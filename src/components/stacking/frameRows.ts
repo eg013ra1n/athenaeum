@@ -1,3 +1,4 @@
+import type { Transparency } from '../../types/models';
 import type {
   PlanProjectFrame,
   RunSummary,
@@ -24,6 +25,9 @@ export interface LightFrameRef {
   exptimeSec: number | null;
   /** The frame's focal length in mm (`frame.focallen`, the header's FOCALLEN); `null` when unknown. */
   focalLenMm: number | null;
+  /** The light row's transparency (`SessionFrameRow.transparency`): the loss and the reason it has none. The list
+   *  holds lights only, so a non-light's placeholder reason never reaches a row. */
+  transparency: Pick<Transparency, 'lossMag' | 'reason'>;
 }
 
 /** The run-scoped slice the builders need — `groups`/`frames` and the run's
@@ -86,6 +90,13 @@ export interface FrameRow {
   /** The focal length in mm the frame declares: the set frame's FOCALLEN, the
    *  project frame's manifest value. `null` when it declares none. */
   focalLenMm: number | null;
+  /** The frame's loss in magnitudes against its equipment's clear sky (wave
+   *  6.5): the light row's `lossMag` for a frame set, the published value
+   *  (`PlanProjectFrame.transparencyLoss`) for a project. `null` = no value. */
+  transparencyLoss: number | null;
+  /** Why `transparencyLoss` is `null`, as the backend sent it; `null` with a
+   *  value, and always for a project row (the plan carries no reason). */
+  transparencyReason: string | null;
   weight: number | null;
   fwhmPx: number | null;
   eccentricity: number | null;
@@ -139,6 +150,7 @@ export type SortKey =
   | 'night'
   | 'exptimeSec'
   | 'focalLenMm'
+  | 'transparencyLoss'
   | 'weight'
   | 'fwhmPx'
   | 'eccentricity'
@@ -252,6 +264,8 @@ export function buildFrameRows(
       night: lightRef?.night ?? null,
       exptimeSec: lightRef?.exptimeSec ?? null,
       focalLenMm: lightRef?.focalLenMm ?? null,
+      transparencyLoss: lightRef?.transparency.lossMag ?? null,
+      transparencyReason: lightRef?.transparency.reason ?? null,
       ...runMetrics(runRow, s),
       outcome: runRow && detail ? runOutcome(runRow, detail.run) : null,
       outOfNextRun: excludedSet.has(frameId),
@@ -335,6 +349,8 @@ export function buildProjectFrameRows(
       night: null,
       exptimeSec: p.exptimeSec,
       focalLenMm: p.focalLenMm,
+      transparencyLoss: p.transparencyLoss,
+      transparencyReason: null,
       ...runMetrics(runRow, s),
       outcome,
       outOfNextRun: excluded.has(p.frameUuid),
@@ -359,6 +375,8 @@ export function buildProjectFrameRows(
         night: null,
         exptimeSec: null,
         focalLenMm: null,
+        transparencyLoss: null,
+        transparencyReason: null,
         ...runMetrics(runRow, s),
         outcome: detail ? runOutcome(runRow, detail.run) : null,
         outOfNextRun: excluded.has(key),

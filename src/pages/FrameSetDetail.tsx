@@ -402,6 +402,7 @@ export default function FrameSetDetail() {
               night: nightLabel,
               exptimeSec: fw.frame.exptime,
               focalLenMm: fw.frame.focallen,
+              transparency: fw.transparency,
             });
           }
         }

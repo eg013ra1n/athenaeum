@@ -47,6 +47,7 @@ function baseOwn(overrides: Partial<OwnFrameRow> = {}): OwnFrameRow {
     calibratedBytes: null,
     preparedAt: null,
     withheld: false,
+    transparency: { zeroPoint: null, zpStars: null, zpSigma: null, lossMag: null, reason: 'not measured yet' },
     ...overrides,
   };
 }
@@ -85,6 +86,7 @@ function baseLib(overrides: Partial<ProjectFrameView> = {}): ProjectFrameView {
     receivedAt: null,
     receivedFromDevice: null,
     receivedFromMember: null,
+    transparencyLoss: null,
     ...overrides,
   };
 }
@@ -110,6 +112,11 @@ function baseFrame(overrides: Partial<FrameVM> = {}): FrameVM {
     ecc: 0.4,
     stars: 500,
     snr: 12,
+    transparencyLoss: null,
+    transparencyReason: null,
+    zeroPoint: null,
+    zpStars: null,
+    zpSigma: null,
     failures: [],
     contentVersion: null,
     pubState: null,
@@ -175,8 +182,8 @@ describe('FramePanel', () => {
     const own = baseOwn({
       failures: [{ kind: 'solve', text: 'unknown pixel scale' }],
       rules: [
-        { metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false },
-        { metricKey: 'stars', label: 'Stars', value: '500', needs: '≥ 200', pass: true },
+        { metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false, reason: null },
+        { metricKey: 'stars', label: 'Stars', value: '500', needs: '≥ 200', pass: true, reason: null },
       ],
     });
     renderPanel(baseFrame({ own, failures: own.failures }));
@@ -196,7 +203,7 @@ describe('FramePanel', () => {
 
   it('(b) shows a dash and no verdict for a rule that was not evaluated', () => {
     const own = baseOwn({
-      rules: [{ metricKey: 'ecc', label: 'Eccentricity', value: null, needs: '≤ 0.55', pass: null }],
+      rules: [{ metricKey: 'ecc', label: 'Eccentricity', value: null, needs: '≤ 0.55', pass: null, reason: null }],
     });
     renderPanel(baseFrame({ own }));
 
@@ -456,15 +463,40 @@ describe('FramePanel', () => {
     expect(screen.getByText('v2 · v1 superseded')).toBeInTheDocument();
   });
 
-  it('Metrics: SNR to one decimal, no Zero point row', () => {
+  it('Metrics: SNR to one decimal', () => {
     renderPanel(baseFrame({ snr: 23.054622650146484 }));
     expect(screen.getByText('23.1')).toBeInTheDocument();
-    expect(screen.queryByText('Zero point')).toBeNull();
+  });
+
+  it('shows transparency and zero point among the metrics', () => {
+    renderPanel(baseFrame({ own: baseOwn(), transparencyLoss: 0.77, zeroPoint: 21.342, zpStars: 87, zpSigma: 0.041 }));
+    expect(screen.getByText('Transparency').tagName).toBe('DT');
+    expect(screen.getByText('\u22120.77 mag')).toBeInTheDocument();
+    expect(screen.getByText('Zero point').tagName).toBe('DT');
+    expect(screen.getByText('21.34 · 87 stars · ±0.04')).toBeInTheDocument();
+  });
+
+  it('a metric without a transparency value shows a dash and its reason', () => {
+    renderPanel(baseFrame({ transparencyReason: 'published without a transparency value' }));
+    expect(screen.getByText('published without a transparency value')).toBeInTheDocument();
+    expect(screen.getByText('Transparency').nextElementSibling?.textContent).toContain('—');
+  });
+
+  it('a rule without a value shows its reason and no verdict mark', () => {
+    const reason = 'no clear-sky reference yet, 12 of 30 frames';
+    const own = baseOwn({
+      rules: [{ metricKey: 'transparency_loss', label: 'Transparency loss', value: null, needs: '≤ 0.20 mag', pass: null, reason }],
+    });
+    renderPanel(baseFrame({ own }));
+    expect(screen.getByText(reason)).toBeInTheDocument();
+    // Only the three precondition rows carry a mark; the rule row has neither ✓ nor ✕.
+    expect(screen.getAllByText('✓')).toHaveLength(3);
+    expect(screen.queryAllByText('✕')).toHaveLength(0);
   });
 
   it('Gate is a 4-column grid with the thresholds version and precondition rows', () => {
     renderPanel(
-      baseFrame({ own: own({ failures: [{ kind: 'solve', text: 'No WCS' }], rules: [{ metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false }] }) }),
+      baseFrame({ own: own({ failures: [{ kind: 'solve', text: 'No WCS' }], rules: [{ metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false, reason: null }] }) }),
       { thresholdsVersion: 3 },
     );
     expect(screen.getByRole('heading', { name: /Gate thresholds v3/ })).toBeInTheDocument();
@@ -519,6 +551,21 @@ describe('FramePanel', () => {
   it('a moderation frame shows only the status chip in the title row', () => {
     renderPanel(baseFrame({ own: null, lib: null, device: null, pubState: 'pending' }));
     expect(screen.getByText('pending')).toBeInTheDocument();
-    expect(screen.queryByText('—')).toBeNull();
+    // The title row carries the chip alone: no device cell beside it.
+    expect(screen.getByText('pending').parentElement).not.toHaveTextContent('—');
+    // The whole panel shows exactly one dash: the Transparency metric (no loss, no reason). The
+    // Zero point row is own-only, and the title row carries no device cell.
+    expect(screen.getAllByText('—')).toHaveLength(1);
+  });
+
+  it('a moderation frame has no zero point row', () => {
+    renderPanel(baseFrame({ own: null, lib: null, device: null, pubState: 'pending' }));
+    expect(screen.getByText('Transparency')).toBeInTheDocument();
+    expect(screen.queryByText('Zero point')).toBeNull();
+  });
+
+  it('an own frame without a zero point shows a dash in its zero point row', () => {
+    renderPanel(baseFrame({ own: baseOwn(), zeroPoint: null, zpStars: null, zpSigma: null }));
+    expect(screen.getByText('Zero point').nextElementSibling?.textContent).toBe('—');
   });
 });

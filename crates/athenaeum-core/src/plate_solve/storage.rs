@@ -61,19 +61,21 @@ impl PlateSolveRecord {
     /// solution and converts (as does a forward-only pair — the solver
     /// stores the reverse tables only when it has them).
     pub fn to_solution(&self) -> Option<WcsSolution> {
+        self.try_solution()
+            .map_err(|e| warn!(frame_id = self.frame_id, error = %e, "stored SIP coefficients unusable; the solve is refused"))
+            .ok()
+    }
+
+    /// [`Self::to_solution`] without the log: the reason a stored solve cannot be turned into a transform, for a
+    /// caller that has many frames and says it once itself (the zero-point pass).
+    pub fn try_solution(&self) -> std::result::Result<WcsSolution, String> {
         let sip_forward = self
             .sip_pair(self.sip_a_coeffs.as_deref(), self.sip_b_coeffs.as_deref())
-            .map_err(|e| {
-                warn!(frame_id = self.frame_id, error = %e, "stored SIP forward coefficients unusable; the solve is refused")
-            })
-            .ok()?;
+            .map_err(|e| format!("stored SIP forward coefficients unusable: {e}"))?;
         let sip_reverse = self
             .sip_pair(self.sip_ap_coeffs.as_deref(), self.sip_bp_coeffs.as_deref())
-            .map_err(|e| {
-                warn!(frame_id = self.frame_id, error = %e, "stored SIP reverse coefficients unusable; the solve is refused")
-            })
-            .ok()?;
-        Some(WcsSolution {
+            .map_err(|e| format!("stored SIP reverse coefficients unusable: {e}"))?;
+        Ok(WcsSolution {
             crpix: (self.crpix1, self.crpix2),
             crval: (self.crval1, self.crval2),
             cd: [[self.cd1_1, self.cd1_2], [self.cd2_1, self.cd2_2]],
@@ -165,6 +167,10 @@ pub fn insert_plate_solve(conn: &Connection, record: &PlateSolveRecord) -> Resul
     .context("Failed to insert plate solve record")?;
 
     let id = conn.last_insert_rowid();
+    // A zero point never outlives its solve: the new WCS moves the stars it was matched on. The solve trigger refills
+    // it. On the caller's connection, so it joins the caller's transaction.
+    crate::db::analysis::clear_zero_point(conn, record.frame_id)
+        .context("Failed to clear the zero point of the re-solved frame")?;
     Ok(id)
 }
 
@@ -223,10 +229,12 @@ pub fn get_plate_solve(conn: &Connection, frame_id: i64) -> Result<Option<PlateS
     }
 }
 
-/// Delete plate solve result for a frame.
+/// Delete plate solve result for a frame. The frame's zero point goes with it (see [`insert_plate_solve`]).
 pub fn delete_plate_solve(conn: &Connection, frame_id: i64) -> Result<()> {
     conn.execute("DELETE FROM plate_solves WHERE frame_id = ?1", [frame_id])
         .context("Failed to delete plate solve record")?;
+    crate::db::analysis::clear_zero_point(conn, frame_id)
+        .context("Failed to clear the zero point of the frame whose solve was deleted")?;
     Ok(())
 }
 

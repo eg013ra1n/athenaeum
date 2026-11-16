@@ -8,7 +8,7 @@ const row = (o: Partial<OwnFrameRow>): OwnFrameRow => ({
   starsDetected: null, medianSnr: null, segment: 'ready', contributorState: 'notPublished', contributorReason: null,
   failures: [], contentVersion: null, pubState: null, acceptedReason: null, holdersOnline: null, holdersTotal: null,
   localState: null, publishedAt: null, lastError: null, rules: [], path: '/d/a.fits', accepted: null,
-  calibratedPath: null, calibratedBytes: null, preparedAt: null, withheld: false, ...o,
+  calibratedPath: null, calibratedBytes: null, preparedAt: null, withheld: false, transparency: { zeroPoint: null, zpStars: null, zpSigma: null, lossMag: null, reason: 'not measured yet' }, ...o,
 });
 
 describe('contributionTiles', () => {
@@ -42,7 +42,7 @@ describe('contributionTiles', () => {
   });
 
   const rule = (metricKey: string, label: string, pass: boolean | null): RuleVerdict =>
-    ({ metricKey, label, value: null, needs: '', pass });
+    ({ metricKey, label, value: null, needs: '', pass, reason: null });
   const threshold = (rules: RuleVerdict[]) =>
     row({ segment: 'held', failures: [{ kind: 'threshold', text: 'fails' }], rules });
 

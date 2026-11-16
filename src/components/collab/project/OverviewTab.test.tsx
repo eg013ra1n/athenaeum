@@ -48,6 +48,7 @@ function ownRow(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     calibratedBytes: null,
     preparedAt: null,
     withheld: false,
+    transparency: { zeroPoint: null, zpStars: null, zpSigma: null, lossMag: null, reason: 'not measured yet' },
     ...o,
   };
 }

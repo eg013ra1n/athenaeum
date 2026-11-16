@@ -132,6 +132,8 @@ useEffect(() => {
 
 **Zip archives** — a `.zip` is a catalog file type: the scanner reads a zip's directory and entry headers only, zip-resident rows (`files.archive_zip_path`) are read through `zip_store::materialize`, never by `files.path`; no code writes into a zip, only an explicit Send to Void of the whole zip deletes one; a missing zip makes rows missing, never deleted; a zip in the Black Hole is present but not used. `docs/archive/README.md`, `docs/catalog/README.md`, `docs/file-browser/README.md`.
 
+**Transparency** — a zero point is measured from Analysis' stored stars against the installed catalogue and is current only for its `ZP_VERSION` and catalogue identity; a write is compare-and-set and a new analysis or solve clears it; `transparency_for_frames` is asked once per table, never per row; the gate metric is `transparency_loss` and its three registry copies (hub, portal, app) change together; colour frames are not measured; nothing in `stacking/` reads it. `docs/catalog/README.md`, `docs/transfers/README.md`.
+
 **In-app updates** — core owns the check, `tauri-plugin-updater` owns install (Rust-side only); `install_update`'s `version_comparator` is the one place that normalizes the three version forms. `docs/updates/README.md`.
 
 **Release** — the `release` skill is the procedure; `main` is the trunk and releases are tags on it; nothing is done by hand after the tag. `docs/release/README.md`.

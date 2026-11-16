@@ -175,7 +175,9 @@ export type ImagingNight = { id: number | null, frames_set_id: number, start_tim
 
 export type Session = { id: number | null, imaging_night_id: number, instrume: string, frame_count: number, total_exp_time: number | null, created_at: string | null, uuid: string | null, updated_at: string | null, };
 
-export type SessionWithFrames = { session: Session, frames: Array<FileWithFrame>, };
+export type SessionFrameRow = { file: File, frame: Frame | null, transparency: Transparency, };
+
+export type SessionWithFrames = { session: Session, frames: Array<SessionFrameRow>, };
 
 export type ImagingNightWithSessions = { imaging_night: ImagingNight, sessions: Array<SessionWithFrames>, };
 
@@ -559,9 +561,32 @@ stars_refused: number | null,
  * Why the frame has no measured star (PC-13); `None` = a measured frame, or a legacy row.
  * An unknown text (a row from a newer build) reads `None` with a `warn!`, so the rest of the row survives.
  */
-frame_verdict: FrameVerdict | null, };
+frame_verdict: FrameVerdict | null, 
+/**
+ * The frame's photometric zero point against Gaia G (mag), `analysis::zero_point`; `None` = not measured, refused
+ * or a legacy row. Written by the trigger after an analysis or a solve, never by the analyzer.
+ */
+zero_point: number | null, 
+/**
+ * Stars that survived the clipping of the zero point.
+ */
+zp_stars: number | null, 
+/**
+ * Robust scatter of those stars (mag).
+ */
+zp_sigma: number | null, 
+/**
+ * `zero_point::ZP_VERSION` that judged the frame (a refusal stores it too); `None` = never judged.
+ */
+zp_version: number | null, 
+/**
+ * Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
+ */
+zp_catalog: string | null, };
 
 export type FrameVerdict = "trailed" | "defocused" | "no_stars";
+
+export type Transparency = { zeroPoint: number | null, zpStars: number | null, zpSigma: number | null, lossMag: number | null, reason: string | null, };
 
 export type CalibrationMetadataEdits = { ccd_temp?: number | null, gain?: number | null, offset?: number | null, binning?: string | null, exptime?: number | null, };
 
@@ -1994,6 +2019,11 @@ telescope: string | null,
  */
 medianSnr: number | null, 
 /**
+ * Parsed from `meta.transparencyLoss`: the frame's loss in magnitudes against its publisher's clear sky, frozen
+ * at announce. `None` for a frame announced before it was measured, or announced without a loss.
+ */
+transparencyLoss: number | null, 
+/**
  * The UTC date of `dateObs − 12 h` ([`night_of_date_obs`]) — there is no
  * catalog `imaging_nights` row for another member's frame, so this is
  * the best a cached manifest row can do.
@@ -2315,10 +2345,18 @@ value: string | null,
  */
 needs: string, 
 /**
- * `None` = not evaluated (missing input — the precondition failure
- * already blocks the frame).
+ * `None` = not evaluated. For the metrics whose missing input is also a
+ * layer-1 failure (analysis, pixel scale) the precondition failure
+ * already blocks the frame; for `transparency_loss` it means "not
+ * judged, not blocked": the rule has no value and `reason` says why.
  */
-pass: boolean | null, };
+pass: boolean | null, 
+/**
+ * Why the rule has no value, when the metric can lack one without
+ * blocking the frame (`transparency_loss`); `None` for every other
+ * metric and whenever there is a value.
+ */
+reason: string | null, };
 
 export type ThresholdRuleView = { metricKey: string, op: string, 
 /**
@@ -2428,7 +2466,13 @@ path: string | null,
  * `Some(false)` = excluded by the coordinator. `None` for a frame this
  * account has never published.
  */
-accepted: boolean | null, };
+accepted: boolean | null, 
+/**
+ * The frame's zero point and its transparency loss against the equipment's clear sky (wave 6.5). The numbers
+ * (`zeroPoint`, `zpStars`, `zpSigma`) are always the live stored ones; the loss of a frame this account already
+ * published is the one frozen in its manifest, never today's.
+ */
+transparency: Transparency, };
 
 export type Channel = "stable" | "beta";
 

@@ -101,8 +101,8 @@ const RUN = {
 };
 
 const FRAMES: LightFrameRef[] = [
-  { frameId: 101, filename: 'a.fit', night: null, exptimeSec: null, focalLenMm: null },
-  { frameId: 102, filename: 'b.fit', night: null, exptimeSec: null, focalLenMm: null },
+  { frameId: 101, filename: 'a.fit', night: null, exptimeSec: null, focalLenMm: null, transparency: { lossMag: null, reason: null } },
+  { frameId: 102, filename: 'b.fit', night: null, exptimeSec: null, focalLenMm: null, transparency: { lossMag: null, reason: null } },
 ];
 
 const PROJECT_CONFIG = {
@@ -411,7 +411,7 @@ describe('StackingTab Frames table before the first run', () => {
 describe('StackingTab Frames table writes for a frame set', () => {
   const MANUAL = { ...CONFIG, reference: { mode: 'manual', twoPass: false } };
   const AUTO = { ...CONFIG, reference: { mode: 'auto', twoPass: false } };
-  const THREE: LightFrameRef[] = [...FRAMES, { frameId: 103, filename: 'c.fit', night: null, exptimeSec: null, focalLenMm: null }];
+  const THREE: LightFrameRef[] = [...FRAMES, { frameId: 103, filename: 'c.fit', night: null, exptimeSec: null, focalLenMm: null, transparency: { lossMag: null, reason: null } }];
 
   /** A frame set whose stored config is in `mode` and whose backend holds the reference frame `held`: the plan it
    *  builds reports what is held (whatever the mode, so the tab's own reading of the mode is what is tested). */

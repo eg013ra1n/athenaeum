@@ -53,8 +53,11 @@ struct CatalogDownloadProgress {
 /// root path. Runs the download on a blocking thread and emits
 /// `catalog-download-progress` through `emitter`. The cancel flag is local to
 /// the call and registered nowhere, so the download cannot be cancelled.
+///
+/// A finished install is a new catalogue identity, so every stored zero point is stale: the zero-point backfill is
+/// started again (it does nothing when one already ran for this identity, or none is installed).
 pub async fn download_catalog_layers(
-    ctx: &ServiceContext,
+    ctx: &Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
     target_density: u32,
 ) -> Result<String, ApiError> {
@@ -112,9 +115,12 @@ pub async fn download_catalog_layers(
     .await
     .map_err(|e| ApiError::Internal(format!("download task panicked: {e}")))?;
 
-    result
+    let root = result
         .map(|p| p.display().to_string())
-        .map_err(|e| ApiError::Internal(e.to_string()))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    #[cfg(feature = "solver")]
+    crate::api::analysis::spawn_zero_point_backfill(Arc::clone(ctx));
+    Ok(root)
 }
 
 /// Download and install the named quad-index packs into the app-data directory
@@ -617,6 +623,8 @@ fn solve_and_persist(
     let mut solved = 0usize;
     let mut failed = 0usize;
     let mut error = None;
+    // Frames whose solve was written: their zero points are recomputed once the transaction is done.
+    let mut persisted: Vec<i64> = Vec::new();
     {
         let conn = database.conn();
         // Drop-safe: an early return or panic rolls back instead of leaking
@@ -641,7 +649,10 @@ fn solve_and_persist(
                         dso.as_deref(),
                         ps_config.as_ref(),
                     ) {
-                        Ok(StoreOutcome::Persisted) => solved += 1,
+                        Ok(StoreOutcome::Persisted) => {
+                            solved += 1;
+                            persisted.push(*frame_id);
+                        }
                         Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
                             // The Phase-2 "solved" event already reached the UI;
                             // emit a correction so the frame flips to failed with
@@ -680,6 +691,12 @@ fn solve_and_persist(
                 error = Some(ApiError::Internal(e.to_string()));
             }
         }
+    }
+
+    // A new solve moves the WCS, so the zero point of every frame just solved is recomputed whatever its `zp_version`
+    // says. Only when the solves are really stored; the trigger never fails the batch.
+    if error.is_none() {
+        crate::api::analysis::zero_points_after_solve(ctx, &persisted);
     }
 
     BatchEnd {

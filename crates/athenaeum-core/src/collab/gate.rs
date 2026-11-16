@@ -18,6 +18,7 @@
 //! calibration verdict, filter match, uuid and analysis, then hands them here
 //! as a [`GateFrameInput`].
 
+use crate::models::{Transparency, NOT_MEASURED_REASON};
 use crate::models::FrameAnalysis;
 
 /// The project's target field: a center and an acceptance radius (decimal
@@ -85,6 +86,7 @@ pub const METRIC_REGISTRY: &[(&str, &[&str])] = &[
     ("snr_weight", &["lte", "gte"]),
     ("frame_snr", &["lte", "gte"]),
     ("not_trailed", &["reject_if"]),
+    ("transparency_loss", &["lte"]),
 ];
 
 /// Everything the gate needs about one frame, resolved by the caller.
@@ -112,6 +114,12 @@ pub struct GateFrameInput {
     /// `frames.uuid` (plan ruling P18 — also `ATH_CSRC`). Empty when the
     /// frame carries none.
     pub uuid: String,
+    /// The frame's transparency (wave 6.5): its loss in magnitudes against the
+    /// equipment's clear sky, or the sentence saying why there is none. `None`
+    /// when the caller did not resolve one (no entry reads as "not measured").
+    /// For a frame already published the caller passes the value frozen in its
+    /// manifest, never the live one (spec C5).
+    pub transparency: Option<Transparency>,
 }
 
 /// One threshold rule's verdict for one frame (spec 2026-09-29 §4.1 drawer:
@@ -128,9 +136,15 @@ pub struct RuleVerdict {
     pub value: Option<String>,
     /// "≤ 3.00″", "≥ 200", "not trailed".
     pub needs: String,
-    /// `None` = not evaluated (missing input — the precondition failure
-    /// already blocks the frame).
+    /// `None` = not evaluated. For the metrics whose missing input is also a
+    /// layer-1 failure (analysis, pixel scale) the precondition failure
+    /// already blocks the frame; for `transparency_loss` it means "not
+    /// judged, not blocked": the rule has no value and `reason` says why.
     pub pass: Option<bool>,
+    /// Why the rule has no value, when the metric can lack one without
+    /// blocking the frame (`transparency_loss`); `None` for every other
+    /// metric and whenever there is a value.
+    pub reason: Option<String>,
 }
 
 /// The gate's verdict for one frame: echoed metrics, the publishable flag, and
@@ -163,8 +177,12 @@ pub struct FrameGateRow {
 /// Evaluate one frame against the project target and threshold rules (spec §4).
 ///
 /// Layer 1 (preconditions) is always evaluated and every failure is recorded.
-/// Layer 2 (rules) runs only for metrics whose inputs exist; a missing input
-/// means the layer-1 failure already blocks, so the rule is silently skipped.
+/// Layer 2 (rules) is listed for every metric the function understands. For
+/// the metrics whose input is also a layer-1 precondition (analysis, pixel
+/// scale) a missing input is already blocked there and the rule shows no
+/// value. For `transparency_loss` a missing loss is NOT a layer-1 failure:
+/// the rule is listed with no value, `pass: None` and the transparency's own
+/// `reason`, and the frame is neither judged nor blocked by it.
 pub fn evaluate_frame(
     input: &GateFrameInput,
     target: &ProjectTarget,
@@ -241,6 +259,7 @@ pub fn evaluate_frame(
                         value: trailed.map(|t| if t { "yes" } else { "no" }.to_string()),
                         needs: "not trailed".to_string(),
                         pass: trailed.map(|t| !t),
+                        reason: None,
                     });
                     if trailed == Some(true) {
                         failures.push("frame appears trailed".to_string());
@@ -257,6 +276,7 @@ pub fn evaluate_frame(
                     "median_snr" => analysis.map(|a| a.median_snr),
                     "snr_weight" => analysis.map(|a| a.snr_weight),
                     "frame_snr" => analysis.map(|a| a.frame_snr),
+                    "transparency_loss" => input.transparency.as_ref().and_then(|t| t.loss_mag),
                     _ => {
                         tracing::warn!(metric_key = %rule.metric_key, "unknown gate rule skipped");
                         continue;
@@ -270,6 +290,7 @@ pub fn evaluate_frame(
                     "fwhm_arcsec" => ("FWHM", "″"),
                     "eccentricity" => ("eccentricity", ""),
                     "stars_detected" => ("stars", ""),
+                    "transparency_loss" => ("Transparency loss", " mag"),
                     other => (other, ""),
                 };
                 // "needs" is derived from the op alone, so it exists even when
@@ -280,6 +301,11 @@ pub fn evaluate_frame(
                 // happens to be present too.
                 let needs = match rule.op.as_str() {
                     "lte" => format!("≤ {limit:.2}{unit}"),
+                    // The registry lists `lte` only for a loss (more loss is worse; "at least this much loss" is no rule).
+                    "gte" if key == "transparency_loss" => {
+                        tracing::warn!(metric_key = %rule.metric_key, op = "gte", "unknown gate op skipped");
+                        continue;
+                    }
                     "gte" => format!("≥ {limit:.0}"),
                     other => {
                         tracing::warn!(metric_key = %rule.metric_key, op = %other, "unknown gate op skipped");
@@ -287,14 +313,23 @@ pub fn evaluate_frame(
                     }
                 };
                 let Some(metric) = metric else {
+                    // A loss can be missing with no layer-1 failure behind it: the row says why and blocks nothing.
+                    let reason = (key == "transparency_loss").then(|| {
+                        input
+                            .transparency
+                            .as_ref()
+                            .and_then(|t| t.reason.clone())
+                            .unwrap_or_else(|| NOT_MEASURED_REASON.to_string())
+                    });
                     rule_verdicts.push(RuleVerdict {
                         metric_key: rule.metric_key.clone(),
                         label: label.to_string(),
                         value: None,
                         needs,
                         pass: None,
+                        reason,
                     });
-                    continue; // layer-1 already recorded the blocker
+                    continue; // layer-1 already recorded the blocker (none for a loss)
                 };
                 let (value, failed) = match rule.op.as_str() {
                     "lte" => (format!("{metric:.2}{unit}"), metric > limit),
@@ -307,6 +342,7 @@ pub fn evaluate_frame(
                     value: Some(value),
                     needs,
                     pass: Some(!failed),
+                    reason: None,
                 });
                 if failed {
                     match rule.op.as_str() {
@@ -588,6 +624,11 @@ mod tests {
             measure_version: None,
             stars_refused: None,
             frame_verdict: None,
+            zero_point: None,
+            zp_stars: None,
+            zp_sigma: None,
+            zp_version: None,
+            zp_catalog: None,
         }
     }
 
@@ -602,6 +643,20 @@ mod tests {
             filter_raw: "L".into(),
             filter: crate::collab::filters::FilterResolution::Matched("L".into()),
             uuid: "11111111-1111-1111-1111-111111111111".into(),
+            transparency: None,
+        }
+    }
+
+    fn with_loss(loss_mag: Option<f64>, reason: Option<&str>) -> GateFrameInput {
+        GateFrameInput {
+            transparency: Some(Transparency {
+                zero_point: Some(21.5),
+                zp_stars: Some(80),
+                zp_sigma: Some(0.03),
+                loss_mag,
+                reason: reason.map(str::to_string),
+            }),
+            ..passing_input()
         }
     }
 
@@ -1170,6 +1225,81 @@ mod tests {
     }
 
     #[test]
+    fn a_loss_over_the_limit_fails_the_rule() {
+        let rules = vec![rule("transparency_loss", "lte", serde_json::json!(0.5))];
+        let row = evaluate_frame(&with_loss(Some(0.77), None), &target(), &rules);
+        assert_eq!(row.rules.len(), 1);
+        let v = &row.rules[0];
+        assert_eq!(
+            (v.label.as_str(), v.value.as_deref(), v.needs.as_str(), v.pass, v.reason.as_deref()),
+            ("Transparency loss", Some("0.77 mag"), "≤ 0.50 mag", Some(false), None)
+        );
+        assert!(!row.publishable);
+        assert_eq!(row.failures, vec!["Transparency loss 0.77 mag > 0.50 mag".to_string()]);
+        assert!(row.failures[0].contains("Transparency loss"));
+    }
+
+    #[test]
+    fn a_loss_under_the_limit_passes() {
+        let rules = vec![rule("transparency_loss", "lte", serde_json::json!(0.5))];
+        let row = evaluate_frame(&with_loss(Some(0.05), None), &target(), &rules);
+        assert_eq!(row.rules[0].value.as_deref(), Some("0.05 mag"));
+        assert_eq!(row.rules[0].pass, Some(true));
+        assert!(row.publishable, "{:?}", row.failures);
+        assert!(row.failures.is_empty());
+    }
+
+    #[test]
+    fn no_loss_value_gives_a_reason_and_no_block() {
+        let rules = vec![rule("transparency_loss", "lte", serde_json::json!(0.5))];
+        let reason = "no clear-sky reference yet, 12 of 30 frames";
+        let row = evaluate_frame(&with_loss(None, Some(reason)), &target(), &rules);
+        let v = &row.rules[0];
+        assert_eq!((v.value.as_deref(), v.pass, v.reason.as_deref()), (None, None, Some(reason)));
+        assert_eq!(v.needs, "≤ 0.50 mag");
+        assert!(row.publishable, "a missing loss blocks nothing: {:?}", row.failures);
+        assert!(row.failures.is_empty());
+        // The frame's verdict is what it would be without the rule.
+        let without = evaluate_frame(&with_loss(None, Some(reason)), &target(), &[]);
+        assert_eq!((row.publishable, &row.failures), (without.publishable, &without.failures));
+        // No transparency entry at all reads the same: not judged, not blocked.
+        let row = evaluate_frame(&passing_input(), &target(), &rules);
+        assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
+        assert!(row.rules[0].reason.is_some());
+        assert!(row.publishable);
+    }
+
+    #[test]
+    fn a_blocked_frame_stays_blocked_with_a_loss_rule_that_has_no_value() {
+        let rules = vec![
+            rule("fwhm_arcsec", "lte", serde_json::json!(3.0)),
+            rule("transparency_loss", "lte", serde_json::json!(0.5)),
+        ];
+        let row = evaluate_frame(&input(None), &target(), &rules);
+        assert!(!row.publishable);
+        assert_eq!(row.failures, vec!["no analysis".to_string()]);
+        assert_eq!(row.rules[0].reason, None, "other metrics carry no reason");
+        assert!(row.rules[1].reason.is_some());
+    }
+
+    #[test]
+    fn transparency_loss_allows_lte_only() {
+        // `gte` is outside the registry's ops for this metric: no verdict, no failure, exactly as an unlisted op today.
+        let gte = vec![rule("transparency_loss", "gte", serde_json::json!(0.5))];
+        let row = evaluate_frame(&with_loss(Some(0.77), None), &target(), &gte);
+        assert!(row.rules.is_empty());
+        assert!(row.publishable, "{:?}", row.failures);
+        let unlisted = vec![rule("fwhm_arcsec", "eq", serde_json::json!(3.0))];
+        let row = evaluate_frame(&passing_input(), &target(), &unlisted);
+        assert!(row.rules.is_empty());
+        assert!(row.publishable);
+        assert_eq!(
+            METRIC_REGISTRY.iter().find(|(k, _)| *k == "transparency_loss").map(|(_, o)| *o),
+            Some(&["lte"][..])
+        );
+    }
+
+    #[test]
     fn snr_family_rules_apply_generically() {
         let mut a = analysis(1.2, 0.4, 400, false);
         a.median_snr = 4.0;
@@ -1197,7 +1327,8 @@ mod tests {
                 "median_snr",
                 "snr_weight",
                 "frame_snr",
-                "not_trailed"
+                "not_trailed",
+                "transparency_loss"
             ]
         );
         let mut a = analysis(1.2, 0.4, 400, true);
@@ -1217,7 +1348,9 @@ mod tests {
                     serde_json::json!({"metricKey": key, "op": op, "value": value}),
                 )
                 .unwrap();
-                let row = evaluate_frame(&input(Some(a.clone())), &target(), &[rule]);
+                let mut frame = with_loss(Some(0.77), None);
+                frame.analysis = Some(a.clone());
+                let row = evaluate_frame(&frame, &target(), &[rule]);
                 assert!(
                     !row.publishable,
                     "{key} {op} must be enforceable, failures: {:?}",

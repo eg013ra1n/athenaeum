@@ -11,6 +11,7 @@ import { BLOCKER_ORDER } from './table/model';
 import { useMemberColor } from './MemberColorsContext';
 import ExcludeDialog from './ExcludeDialog';
 import { PANEL_H3 } from './panelStyle';
+import { formatTransparency, formatZeroPoint } from './transparency';
 
 type Holders = 'loading' | 'error' | FrameHolderView[];
 
@@ -197,6 +198,10 @@ export default function FramePanel({
         ['Eccentricity', frame.ecc !== null ? frame.ecc.toFixed(2) : '—'],
         ['Stars', frame.stars !== null ? String(frame.stars) : '—'],
         ['SNR', frame.snr !== null ? frame.snr.toFixed(1) : '—'],
+        ['Transparency', frame.transparencyLoss !== null
+          ? formatTransparency(frame.transparencyLoss)
+          : <><span title={frame.transparencyReason ?? undefined}>—</span>{frame.transparencyReason && <span className="ml-1.5 text-content-faint">{frame.transparencyReason}</span>}</>],
+        ...(frame.own ? [['Zero point', formatZeroPoint(frame)] as [ReactNode, ReactNode]] : []),
       ]} />
 
       {frame.own && (<>
@@ -206,7 +211,7 @@ export default function FramePanel({
           {frame.own.rules.map((r) => (
             <Fragment key={r.metricKey}>
               <span className="text-content-secondary">{r.label}</span>
-              <span className="text-content-secondary">{r.value ?? '—'}</span>
+              <span className="break-words text-content-secondary">{r.value ?? r.reason ?? '—'}</span>
               <span className="text-content-faint">{r.needs}</span>
               <span className={r.pass === true ? 'text-success' : r.pass === false ? 'text-error' : 'text-content-faint'}>{r.pass === true ? '✓' : r.pass === false ? '✕' : '—'}</span>
             </Fragment>

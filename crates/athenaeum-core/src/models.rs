@@ -341,11 +341,21 @@ pub struct MissingMetadataRow {
     pub has_duplicate: bool,
 }
 
+/// DTO: one file of a session in the frame-set detail: the file, its frame, and the frame's transparency (wave 6.5,
+/// display only). `get_imaging_nights_with_sessions` fills `transparency` with [`Transparency::unmeasured`]; the
+/// frame-set detail command replaces it for the set's lights. A structural superset of [`FileWithFrame`].
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+pub struct SessionFrameRow {
+    pub file: File,
+    pub frame: Option<Frame>,
+    pub transparency: Transparency,
+}
+
 /// DTO: Session with its frames
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct SessionWithFrames {
     pub session: Session,
-    pub frames: Vec<FileWithFrame>,
+    pub frames: Vec<SessionFrameRow>,
 }
 
 /// DTO: Imaging night with its sessions
@@ -1099,6 +1109,22 @@ pub struct FrameAnalysis {
     /// An unknown text (a row from a newer build) reads `None` with a `warn!`, so the rest of the row survives.
     #[serde(default, deserialize_with = "lenient_frame_verdict")]
     pub frame_verdict: Option<FrameVerdict>,
+    /// The frame's photometric zero point against Gaia G (mag), `analysis::zero_point`; `None` = not measured, refused
+    /// or a legacy row. Written by the trigger after an analysis or a solve, never by the analyzer.
+    #[serde(default)]
+    pub zero_point: Option<f64>,
+    /// Stars that survived the clipping of the zero point.
+    #[serde(default)]
+    pub zp_stars: Option<i64>,
+    /// Robust scatter of those stars (mag).
+    #[serde(default)]
+    pub zp_sigma: Option<f64>,
+    /// `zero_point::ZP_VERSION` that judged the frame (a refusal stores it too); `None` = never judged.
+    #[serde(default)]
+    pub zp_version: Option<u32>,
+    /// Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
+    #[serde(default)]
+    pub zp_catalog: Option<String>,
 }
 
 /// Deserialize `Option<FrameVerdict>` leniently: null / absent → `None`; an unknown variant → `None` + `warn!`.
@@ -1426,6 +1452,32 @@ impl Default for LightCalParams {
             bias_fallback: BiasFallback::SubtractBias,
             cfa_flat_scaling: true,
         }
+    }
+}
+
+// ── Transparency read model (collab v3 wave 6.5) ───────────────────────────
+// Lives here, ungated, because the gate (`collab::gate`) builds in every feature set; the reading itself is
+// `analysis::transparency` (solver-gated), which re-exports this type.
+
+/// What the tables show for one frame. The stored zero-point numbers are carried whenever the frame has a current one,
+/// even when the loss is absent for lack of a reference. `reason` is `Some(sentence)` exactly when `loss_mag` is `None`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct Transparency {
+    pub zero_point: Option<f64>,
+    pub zp_stars: Option<i64>,
+    pub zp_sigma: Option<f64>,
+    pub loss_mag: Option<f64>,
+    pub reason: Option<String>,
+}
+
+/// The sentence of a frame nobody has asked a transparency of (or whose read failed): not judged, not blocked.
+pub const NOT_MEASURED_REASON: &str = "not measured yet";
+
+impl Transparency {
+    /// A frame with no transparency read at all.
+    pub fn unmeasured() -> Self {
+        Transparency { zero_point: None, zp_stars: None, zp_sigma: None, loss_mag: None, reason: Some(NOT_MEASURED_REASON.to_string()) }
     }
 }
 

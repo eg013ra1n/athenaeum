@@ -43,6 +43,316 @@ use crate::services::ServiceContext;
 /// behavior; wiring a machine-derived value is a future product decision.
 pub const ANALYZE_THREAD_CAP: usize = 16;
 
+// ── Zero-point triggers and backfill (collab v3 wave 6.5) ───────────────────
+
+/// Frames per database checkout of a zero-point trigger and of the backfill.
+#[cfg(feature = "solver")]
+const ZP_CHUNK: usize = crate::analysis::zero_point::BACKFILL_CHUNK;
+
+/// Which frames a trigger refreshes: the two modes are fixed by the named entry points below, never a bare flag.
+#[cfg(feature = "solver")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggerMode {
+    /// Only the frames whose zero point is not current (after an analysis save: the new row carries none).
+    NotCurrent,
+    /// Every frame, current or not (after a solve is stored: the WCS may have moved).
+    All,
+}
+
+/// The trigger's body: run `pass` and never fail, never panic. A panic out of the catalogue read or the measurement is
+/// caught here and said at `warn` (each frame's own failure is counted and said by `zero_point` with the frame id, a
+/// pass's one `warn` with the count): the analysis or solve the trigger follows has already succeeded and must still
+/// return normally.
+#[cfg(feature = "solver")]
+fn isolated_trigger(frames: usize, pass: impl FnOnce() -> usize) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)) {
+        tracing::warn!(frames, error = %panic_text(payload.as_ref()), "zero point trigger panicked");
+    }
+}
+
+/// The message of a caught panic payload.
+#[cfg(feature = "solver")]
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_owned())
+}
+
+/// After an analysis is saved: refresh the zero point of the frames among `frame_ids` that do not have a current one,
+/// on `conn` against `catalog`. The body of [`zero_points_after_analysis`]; never fails, never panics.
+#[cfg(feature = "solver")]
+pub(crate) fn zero_points_after_analysis_with<F>(conn: &rusqlite::Connection, catalog: &str, frame_ids: &[i64], cone: F)
+where
+    F: FnMut(
+        &solvemyastro::WcsSolution,
+        usize,
+        usize,
+        f64,
+        f64,
+    ) -> anyhow::Result<Vec<solvemyastro::CatalogStar>>,
+{
+    isolated_trigger(frame_ids.len(), || {
+        crate::analysis::zero_point::ensure_zero_points_with(conn, catalog, frame_ids, cone)
+    });
+}
+
+/// After a solve is stored: recompute the zero point of every one of `frame_ids`, whatever its `zp_version` says (the
+/// WCS may have moved). The body of [`zero_points_after_solve`]; never fails, never panics.
+#[cfg(feature = "solver")]
+pub(crate) fn zero_points_after_solve_with<F>(conn: &rusqlite::Connection, catalog: &str, frame_ids: &[i64], cone: F)
+where
+    F: FnMut(
+        &solvemyastro::WcsSolution,
+        usize,
+        usize,
+        f64,
+        f64,
+    ) -> anyhow::Result<Vec<solvemyastro::CatalogStar>>,
+{
+    isolated_trigger(frame_ids.len(), || {
+        crate::analysis::zero_point::recompute_zero_points_with(conn, catalog, frame_ids, cone)
+    });
+}
+
+/// Refresh the zero points of `frame_ids` against the installed star catalogue, in chunks of one database checkout.
+/// Without an installed catalogue it does nothing (`zero_point_catalog` says so once, at `debug`). A pool that cannot
+/// hand out a connection is a `warn`, not a panic. Never fails.
+#[cfg(feature = "solver")]
+fn run_zero_point_trigger(ctx: &ServiceContext, frame_ids: &[i64], mode: TriggerMode) {
+    if frame_ids.is_empty() {
+        return;
+    }
+    let (Some(dir), Some(database)) = (ctx.app_data_dir(), ctx.db.get()) else {
+        return;
+    };
+    let Some(catalog) = crate::analysis::zero_point::zero_point_catalog(&dir) else {
+        return;
+    };
+    for chunk in frame_ids.chunks(ZP_CHUNK) {
+        let conn = match database.try_conn() {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(frames = chunk.len(), error = %e, "zero point trigger skipped: no database connection");
+                return;
+            }
+        };
+        let cone = crate::analysis::zero_point::catalog_cone(&catalog.layers);
+        match mode {
+            TriggerMode::NotCurrent => zero_points_after_analysis_with(&conn, &catalog.identity, chunk, cone),
+            TriggerMode::All => zero_points_after_solve_with(&conn, &catalog.identity, chunk, cone),
+        }
+    }
+}
+
+/// The trigger after an analysis save: only the frames whose zero point is not current (the new row carries none).
+/// Never fails, never panics.
+#[cfg(feature = "solver")]
+pub(crate) fn zero_points_after_analysis(ctx: &ServiceContext, frame_ids: &[i64]) {
+    run_zero_point_trigger(ctx, frame_ids, TriggerMode::NotCurrent);
+}
+
+/// The trigger after a solve is stored: every one of `frame_ids`, current or not. Never fails, never panics.
+#[cfg(feature = "solver")]
+pub(crate) fn zero_points_after_solve(ctx: &ServiceContext, frame_ids: &[i64]) {
+    run_zero_point_trigger(ctx, frame_ids, TriggerMode::All);
+}
+
+/// Measure the zero point of every frame that has a current analysis and a solve and no current zero point, in chunks of
+/// 200, and return how many it wrote. Existing catalogues come to hold zero points through this: a frame analysed before
+/// the feature existed, or against another catalogue, would otherwise show an empty column until re-analysed, and no
+/// read path may compute them. A long-running operation: it runs in a `zero_point_backfill` span (id field `catalog`, the
+/// installed catalogue's identity) and logs one summary `info` line; with no catalogue installed it returns 0 at `debug`.
+#[cfg(feature = "solver")]
+pub fn backfill_zero_points(ctx: &ServiceContext) -> Result<usize, ApiError> {
+    use crate::analysis::zero_point::{catalog_cone, refresh_listed_with, stale_zero_point_frames, ZpPassStats};
+    let started = std::time::Instant::now();
+    let database = db(ctx)?;
+    let Some(dir) = ctx.app_data_dir() else {
+        return Ok(0);
+    };
+    let Some(catalog) = crate::analysis::zero_point::zero_point_catalog(&dir) else {
+        tracing::debug!("zero point backfill skipped: no star catalogue installed");
+        return Ok(0);
+    };
+    let span = tracing::info_span!("zero_point_backfill", catalog = %catalog.identity);
+    let _guard = span.enter();
+    let (mut after, mut seen) = (0_i64, 0_usize);
+    let mut pass = ZpPassStats::default();
+    loop {
+        // The non-panicking checkout: an exhausted pool is an error of this pass, never a panic on the backfill thread.
+        let conn = database
+            .try_conn()
+            .map_err(|e| ApiError::Internal(format!("no database connection for the zero point backfill: {e}")))?;
+        let ids = stale_zero_point_frames(&conn, &catalog.identity, after, ZP_CHUNK)
+            .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        let Some(&last) = ids.last() else { break };
+        after = last;
+        seen += ids.len();
+        // The cursor is keyed on the id and the ids come from the stale selection itself: each frame is read once per
+        // pass, with no currency check of its own.
+        pass.add(refresh_listed_with(&conn, &catalog.identity, &ids, catalog_cone(&catalog.layers)));
+    }
+    tracing::info!(
+        frames = seen,
+        zp_measured = pass.stored,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "zero point backfill done"
+    );
+    pass.warn_if_unmeasurable("backfill");
+    Ok(pass.stored)
+}
+
+/// What a request for a backfill should do, as [`BackfillGuard::request`] decides it.
+#[cfg(feature = "solver")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillRequest {
+    /// Start a backfill now.
+    Start,
+    /// One is running: it will run again for the newest catalogue when it ends.
+    Later,
+    /// A backfill already ran (or is running) for this catalogue identity: nothing to do.
+    Skip,
+}
+
+/// Which catalogue identities a backfill has started for, and whether one is running: one backfill at a time, none
+/// started twice for the same identity (the desktop's database init can run twice under StrictMode), and a second
+/// identity (a tier installed since) allowed. Pure, so the decision is testable without a thread.
+#[cfg(feature = "solver")]
+#[derive(Default)]
+struct BackfillGuard {
+    running: bool,
+    started: Vec<String>,
+    again: bool,
+}
+
+#[cfg(feature = "solver")]
+impl BackfillGuard {
+    const fn new() -> Self {
+        BackfillGuard { running: false, started: Vec::new(), again: false }
+    }
+
+    /// A backfill for the catalogue `identity` is wanted.
+    fn request(&mut self, identity: &str) -> BackfillRequest {
+        if self.started.iter().any(|i| i == identity) {
+            return BackfillRequest::Skip;
+        }
+        if self.running {
+            self.again = true;
+            return BackfillRequest::Later;
+        }
+        self.running = true;
+        self.started.push(identity.to_owned());
+        BackfillRequest::Start
+    }
+
+    /// The running backfill ended without finishing (an error, a panic): the guard is free again and nothing is queued.
+    /// The identity stays marked as started: a failing backfill is not retried in a loop, only by the next launch.
+    fn abandon(&mut self) {
+        self.running = false;
+        self.again = false;
+    }
+
+    /// The running backfill is done. `current` is the catalogue identity now installed: when a request came in meanwhile
+    /// and that identity has not been backfilled, the guard stays busy and this returns true (run again).
+    fn finish(&mut self, current: Option<&str>) -> bool {
+        let again = std::mem::take(&mut self.again);
+        match current {
+            Some(identity) if again && !self.started.iter().any(|i| i == identity) => {
+                self.started.push(identity.to_owned());
+                true
+            }
+            _ => {
+                self.running = false;
+                false
+            }
+        }
+    }
+}
+
+/// Releases the running flag of the guard on EVERY exit path of the backfill thread (a panic, an early return): without
+/// it a dead backfill would leave every later tier install answering "later" until restart. [`Self::disarm`] is called
+/// after [`BackfillGuard::finish`] has itself released the flag, so a normal end is not released twice.
+#[cfg(feature = "solver")]
+struct BackfillRelease<'a> {
+    guard: &'a std::sync::Mutex<BackfillGuard>,
+    armed: bool,
+}
+
+#[cfg(feature = "solver")]
+impl<'a> BackfillRelease<'a> {
+    fn new(guard: &'a std::sync::Mutex<BackfillGuard>) -> Self {
+        BackfillRelease { guard, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "solver")]
+impl Drop for BackfillRelease<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.guard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).abandon();
+        }
+    }
+}
+
+/// The identity of the installed star catalogue, `None` when there is none.
+#[cfg(feature = "solver")]
+fn installed_identity(ctx: &ServiceContext) -> Option<String> {
+    let dir = ctx.app_data_dir()?;
+    crate::analysis::transparency::installed_catalog_identity(&dir)
+}
+
+/// Run [`backfill_zero_points`] on its own thread, off the UI path: at startup, and again when a star-catalogue tier
+/// install finishes (a new catalogue identity makes every stored zero point stale). One backfill runs at a time and none
+/// starts twice for the same catalogue identity, so a second call for the same catalogue (the desktop's database init
+/// can run twice under StrictMode) does nothing. With no catalogue installed it does nothing. An error is logged at
+/// `warn`, never raised.
+#[cfg(feature = "solver")]
+pub fn spawn_zero_point_backfill(ctx: Arc<ServiceContext>) {
+    static GUARD: std::sync::Mutex<BackfillGuard> = std::sync::Mutex::new(BackfillGuard::new());
+    let lock = || GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(identity) = installed_identity(&ctx) else {
+        tracing::debug!("zero point backfill not started: no star catalogue installed");
+        return;
+    };
+    match lock().request(&identity) {
+        BackfillRequest::Start => {}
+        BackfillRequest::Later => {
+            tracing::debug!(catalog = %identity, "zero point backfill queued behind the running one");
+            return;
+        }
+        BackfillRequest::Skip => return,
+    }
+    let spawned = std::thread::Builder::new().name("zero-point-backfill".into()).spawn(move || {
+        let mut release = BackfillRelease::new(&GUARD);
+        loop {
+            // A panic out of the catalogue read or the measurement ends this run, not the thread unannounced.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backfill_zero_points(&ctx))) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "zero point backfill failed"),
+                Err(payload) => tracing::warn!(error = %panic_text(payload.as_ref()), "zero point backfill panicked"),
+            }
+            let current = installed_identity(&ctx);
+            if !lock().finish(current.as_deref()) {
+                release.disarm();
+                break;
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        // Nothing runs: let the same identity be asked for again.
+        let mut guard = lock();
+        guard.running = false;
+        guard.started.retain(|i| i != &identity);
+        tracing::warn!(error = %e, "zero point backfill thread did not start");
+    }
+}
+
 // ── Response DTOs / progress payloads (single-sourced) ──────────────────────
 
 #[derive(Clone, serde::Serialize)]
@@ -419,6 +729,13 @@ pub fn analyze_frame_set(
 
     let skipped = total.saturating_sub(analyzed + failed);
 
+    // The zero point of the frames just analysed (their rows carry none yet). It never fails the analysis.
+    #[cfg(feature = "solver")]
+    {
+        let ids: Vec<i64> = analyses.iter().map(|a| a.frame_id).collect();
+        zero_points_after_analysis(ctx, &ids);
+    }
+
     // Release the compute-queue slot before emitting the completion event
     // (not after) so the next queued job is admitted the moment CPU work
     // ends, rather than waiting on event serialization.
@@ -483,6 +800,24 @@ pub fn get_analysis_for_frame_set(
 /// (not TOP-DOWN/BOTTOM-UP-literal) convention this applies.
 fn detect_flip_vertical(path: &str) -> bool {
     crate::orientation::flip_vertical_for_path(std::path::Path::new(path))
+}
+
+/// Store one frame's analysis row and its star rows in ONE transaction (as the batch path does): a reader (the zero
+/// point trigger, the gate) can never see the row with a partial star list. Sets each star's `frame_analysis_id`; on any
+/// failure the transaction rolls back and no analysis row is left behind.
+fn persist_frame_analysis(
+    conn: &rusqlite::Connection,
+    analysis: &FrameAnalysis,
+    stars: &mut [StarMetric],
+) -> Result<i64, ApiError> {
+    let tx = conn.unchecked_transaction()?;
+    let analysis_id = db_analysis::upsert_frame_analysis(conn, analysis)?;
+    for s in stars.iter_mut() {
+        s.frame_analysis_id = analysis_id;
+    }
+    db_analysis::upsert_star_metrics(conn, analysis_id, stars)?;
+    tx.commit()?;
+    Ok(analysis_id)
 }
 
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise
@@ -576,15 +911,31 @@ pub async fn get_frame_star_metrics(
     analysis.frame_id = frame_id;
     analysis.file_id = file_id;
 
-    // Persist
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let analysis_id = db_analysis::upsert_frame_analysis(&conn, &analysis)?;
-
-    for s in &mut stars {
-        s.frame_analysis_id = analysis_id;
+    // Persist: the row and its stars commit together, so no reader sees an analysis with a partial star list.
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        persist_frame_analysis(&conn, &analysis, &mut stars)?;
     }
-    db_analysis::upsert_star_metrics(&conn, analysis_id, &stars)?;
+
+    // The zero point of the frame just analysed; it never fails the call. The response carries what was stored.
+    #[cfg(feature = "solver")]
+    {
+        tokio::task::block_in_place(|| zero_points_after_analysis(ctx, &[frame_id]));
+        match db(ctx).and_then(|d| {
+            db_analysis::get_frame_analysis(&d.conn(), frame_id).map_err(|e| ApiError::Internal(e.to_string()))
+        }) {
+            Ok(Some(stored)) => {
+                analysis.zero_point = stored.zero_point;
+                analysis.zp_stars = stored.zp_stars;
+                analysis.zp_sigma = stored.zp_sigma;
+                analysis.zp_version = stored.zp_version;
+                analysis.zp_catalog = stored.zp_catalog;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(frame_id, error = %e, "zero point not read back after the analysis"),
+        }
+    }
 
     Ok(StarMetricsResponse {
         image_width: analysis.width,
@@ -745,6 +1096,11 @@ mod tests {
             measure_version: Some(crate::star_measure::MEASURE_VERSION),
             stars_refused: Some(25),
             frame_verdict: Some(FrameVerdict::Trailed),
+            zero_point: None,
+            zp_stars: None,
+            zp_sigma: None,
+            zp_version: None,
+            zp_catalog: None,
         };
         tweak(&mut a);
         db_analysis::upsert_frame_analysis(&conn, &a).unwrap();
@@ -935,5 +1291,172 @@ mod tests {
         let file_id: i64 = db(&rig.ctx).unwrap().conn().query_row("SELECT file_id FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap();
         let plot = compute_flat_contour_plot(&rig.ctx, file_id, FlatContourOpts::default()).await.expect("flat plot through the zip cache");
         assert_eq!((plot.width > 0, plot.height > 0), (true, true));
+    }
+
+    /// Review Focus 2: no star catalogue installed (a fresh install, the Docker build). The analysis is saved, no
+    /// error surfaces, and the zero point columns stay NULL. The catalogue is looked for once per pass
+    /// (`run_zero_point_trigger` calls `zero_point_catalog` once), so the skip is logged once at `debug`, not per
+    /// frame; a log capture is not asserted here because a per-thread subscriber is unreliable in a parallel test binary.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn no_catalogue_leaves_the_analysis_saved_and_logs_once() {
+        let rig = zip_rig();
+        let (_zip_a, frame_a) = rig.zipped_light("night-a", 1);
+        let (_zip_b, frame_b) = rig.zipped_light("night-b", 2);
+        let r = analyze_frame_set(&rig.ctx, 1, Some(true), 2, &crate::events::NullEmitter)
+            .expect("the analysis succeeds without a catalogue");
+        assert_eq!((r.analyzed, r.failed), (2, 0), "errors: {:?}", r.errors);
+        let handle = db(&rig.ctx).unwrap();
+        let conn = handle.conn();
+        for id in [frame_a, frame_b] {
+            let a = db_analysis::get_frame_analysis(&conn, id).unwrap().expect("the analysis row exists");
+            assert_eq!(
+                (a.zero_point, a.zp_stars, a.zp_sigma, a.zp_version, a.zp_catalog),
+                (None, None, None, None, None)
+            );
+        }
+    }
+
+    /// A tier installed since the first backfill is a new catalogue identity: it may start another backfill.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn a_new_catalogue_identity_allows_another_backfill() {
+        let mut guard = BackfillGuard::new();
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
+        assert!(!guard.finish(Some("tiers-a")), "nothing was asked meanwhile");
+        assert_eq!(guard.request("tiers-b"), BackfillRequest::Start, "a second identity after an install is allowed");
+
+        // One at a time: a request while one runs waits, and the running thread runs again for the newest identity.
+        assert_eq!(guard.request("tiers-c"), BackfillRequest::Later);
+        assert!(guard.finish(Some("tiers-c")), "the queued identity is backfilled next");
+        assert!(guard.running, "still busy: the second run owns the guard");
+        assert!(!guard.finish(Some("tiers-c")));
+        assert!(!guard.running);
+    }
+
+    /// A backfill that dies (an error, a panic) frees the guard: the next tier install starts a backfill instead of
+    /// answering "later" until restart. Pure: the guard's own method and the drop guard the thread wears.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn a_backfill_that_dies_releases_the_guard() {
+        let mut guard = BackfillGuard::new();
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
+        assert_eq!(guard.request("tiers-b"), BackfillRequest::Later);
+        guard.abandon();
+        assert!(!guard.running && !guard.again, "nothing runs and nothing is queued");
+        assert_eq!(guard.request("tiers-c"), BackfillRequest::Start, "a later install is not told to wait");
+
+        // The drop guard: a panic on the thread releases the flag; a normal end (disarmed) does not release twice.
+        let shared = std::sync::Mutex::new(BackfillGuard::new());
+        assert_eq!(shared.lock().unwrap().request("tiers-a"), BackfillRequest::Start);
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _release = BackfillRelease::new(&shared);
+            panic!("the backfill died");
+        }));
+        assert!(died.is_err());
+        assert!(!shared.lock().unwrap().running, "released on the unwinding path");
+        assert_eq!(shared.lock().unwrap().request("tiers-b"), BackfillRequest::Start);
+        {
+            let mut release = BackfillRelease::new(&shared);
+            release.disarm();
+        }
+        assert!(shared.lock().unwrap().running, "a disarmed guard leaves the flag alone");
+    }
+
+    /// The analysis row and its stars commit together: a failing star write leaves no analysis row behind.
+    #[test]
+    fn a_single_frame_analysis_commits_its_stars_with_its_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+             VALUES (1,'/x/a.fits','a.fits',0,'2025-01-01','FITS','2025-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames (id,file_id) VALUES (1,1)", []).unwrap();
+        let analysis = FrameAnalysis {
+            id: None,
+            frame_id: 1,
+            file_id: 1,
+            stars_detected: 1,
+            median_fwhm: 3.0,
+            median_eccentricity: 0.1,
+            median_snr: 20.0,
+            median_hfr: 1.5,
+            frame_snr: 30.0,
+            snr_weight: 1.0,
+            psf_signal: 100.0,
+            background: 100.0,
+            noise: 5.0,
+            detection_threshold: 6.0,
+            width: 600,
+            height: 450,
+            source_channels: 1,
+            trail_r_squared: 0.0,
+            possibly_trailed: false,
+            median_beta: None,
+            quality_score: None,
+            config_hash: None,
+            analyzed_at: "2026-10-24T00:00:00Z".into(),
+            measure_version: Some(crate::star_measure::MEASURE_VERSION),
+            stars_refused: None,
+            frame_verdict: None,
+            zero_point: None,
+            zp_stars: None,
+            zp_sigma: None,
+            zp_version: None,
+            zp_catalog: None,
+        };
+        let star = StarMetric {
+            id: None,
+            frame_analysis_id: 0,
+            x: 10.0,
+            y: 20.0,
+            peak: 1000.0,
+            flux: 5000.0,
+            fwhm: 3.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            eccentricity: 0.2,
+            snr: Some(30.0),
+            hfr: Some(1.5),
+            theta: 0.0,
+            beta: None,
+            fit_method: "gaussian".into(),
+            fit_residual: 0.01,
+        };
+        let mut stars = vec![star];
+
+        // One transaction: the row is there with its stars linked to it.
+        let id = persist_frame_analysis(&conn, &analysis, &mut stars).unwrap();
+        assert_eq!(stars[0].frame_analysis_id, id);
+        assert_eq!(db_analysis::get_star_metrics_by_frame_id(&conn, 1).unwrap().len(), 1);
+
+        // A failing star write rolls the row back with it: no analysis without its stars.
+        conn.execute("DELETE FROM frame_analysis", []).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_stars BEFORE INSERT ON star_metrics BEGIN SELECT RAISE(ABORT, 'no stars'); END;",
+        )
+        .unwrap();
+        assert!(persist_frame_analysis(&conn, &analysis, &mut stars).is_err());
+        assert!(db_analysis::get_frame_analysis(&conn, 1).unwrap().is_none(), "no analysis row without its stars");
+        assert!(conn.is_autocommit(), "the transaction ended");
+    }
+
+    /// StrictMode's double init (and an install of the tier already there) asks for the same identity twice.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn the_same_identity_does_not_start_twice() {
+        let mut guard = BackfillGuard::new();
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Skip, "while it runs");
+        assert!(!guard.finish(Some("tiers-a")));
+        assert_eq!(guard.request("tiers-a"), BackfillRequest::Skip, "and after it is done");
+        // A queued request for an identity that was backfilled meanwhile ends the run.
+        assert_eq!(guard.request("tiers-b"), BackfillRequest::Start);
+        assert_eq!(guard.request("tiers-c"), BackfillRequest::Later);
+        assert!(!guard.finish(Some("tiers-b")), "the current identity is the one just done");
+        assert!(!guard.running);
     }
 }

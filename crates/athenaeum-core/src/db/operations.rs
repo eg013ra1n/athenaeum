@@ -3488,9 +3488,10 @@ pub fn get_imaging_nights_with_sessions(
             let frames = frames_stmt.query_map(params![session_id], |row| {
                 let (file, frame) = map_file_frame_row(row)?;
                 let frame = require_joined_frame(frame)?;
-                Ok(crate::models::FileWithFrame {
+                Ok(crate::models::SessionFrameRow {
                     file,
                     frame: Some(frame),
+                    transparency: crate::models::Transparency::unmeasured(),
                 })
             })?;
 

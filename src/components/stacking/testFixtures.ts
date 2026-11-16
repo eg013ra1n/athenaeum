@@ -13,7 +13,7 @@ export const CANNOT_OPEN = 'cannot be opened (offline, moved or renamed)';
 
 export const pf = (over: Partial<PlanProjectFrame> = {}): PlanProjectFrame => ({
   handle: 1, frameUuid: 'u1', fileName: 'a.fits', publisher: 'Alice', filterCanonical: 'L', exptimeSec: 300, focalLenMm: null,
-  colorMode: 'mono', hasWcs: true, onDisk: true, reason: null, ...over,
+  colorMode: 'mono', hasWcs: true, onDisk: true, reason: null, transparencyLoss: null, ...over,
 });
 
 /** Five plan rows: usable with a WCS (u1), not on this device (u2), unsupported (u3), usable without a WCS (u4), and
