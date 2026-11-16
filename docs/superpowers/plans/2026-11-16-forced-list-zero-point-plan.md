@@ -74,10 +74,12 @@ record hash (`cap`, was 1 000). Map: the list stars with `G ≤ G_b + 2` (`map_w
 (`map_min_kept_share`), kept = within `max(1 px, 0.5·FWHM_ref)` (`centre_tolerance_px`, `centre_tolerance_fwhm`, as r0).
 Aperture `R = max(4·FWHM_ref, 2·F)` (`aperture_radius_ref` 4.0, `aperture_radius_fwhm` 2.0; `F` the Analysis median
 FWHM); pedestal radii (3, 4, 6)·`FWHM_ref` (`pedestal_radii_ref: [f64; 3]`, the probe's flag `a,b,c`), its line
-clipped at 3 σ (`pedestal_clip_sigma`) for four rounds (`pedestal_clip_rounds`), at least 20 points left
+clipped at 3 σ about zero (`pedestal_clip_sigma`; G2 review M1) for four rounds (`pedestal_clip_rounds`, a probe flag), at
+least 20 points left
 (`pedestal_min_points`); annulus 2 000 px (`annulus_area_px`) from `max(4·F, 6·FWHM_ref)` (`annulus_start_fwhm` 4.0;
 the outer pedestal radius) plus 2 px (`annulus_gap_px`); peak radius 1.5·`FWHM_ref` (`peak_radius_ref`). Statistic: the
-screen and its clip at 4 σ (`clip_sigma`, as r0, also the `4·n` noise allowance); ≥ 50 members of non-zero weight
+screen and its clip at 4 σ (`clip_sigma`, as r0, also the `4·n` noise allowance; its upper rule a taper of width
+`screen_taper_sigma` σ, default 1.0, G2 review H1); ≥ 50 members of non-zero weight
 (`min_stars`); σ ≤ 1.0 mag (`max_sigma_mag`); a window slope from ≥ 10 members on the bright ramp
 (`slope_min_ramp_members`; the faint ramp's term is taken as it is, H1). Gone: `c_stars`, the list's
 `max_std_error_mag` (`ZpParams` keeps its own for the anchor). Probe-only, the identity by default and never set by the
@@ -488,20 +490,23 @@ itself is `render`-gated, `lib.rs:38`).
    (the Analysis median FWHM, what the emulation read), taken in the first callback.
 6. `sky_pedestal(apertures, members, fwhm_ref, params) -> Option<f64>`: `D = extra[2] − extra[1]` on `extra[0]` over the
    members, a straight line by least squares, `pedestal_clip_rounds` rounds dropping residuals over `pedestal_clip_sigma
-   · 1.4826 · MAD`; fewer than `pedestal_min_points` left or no spread in `extra[0]` → `None`; ε = intercept /
+   · 1.4826 · MAD` about zero (G2 review M1: not about the median residual); fewer than `pedestal_min_points` left or no spread in `extra[0]` → `None`; ε = intercept /
    (π·(R₆² − R₄²)), `R₆` and `R₄` the two outer pedestal radii in px.
 7. `forced_zero_point(list, measured, placement, exptime, params) -> ForcedOutcome`, rewritten to spec §5.3: members (in
    the window, `on_frame`, `peak < clip_level` when the plane has one); ε (`None` → `TooScattered { kept, sigma: NaN }`);
    `f = sum − ε·π·R²`; the screen (`clipped_median` over the positive-flux members' `zp_i` at `clip_sigma`, minimum 1, no
    standard-error limit, for `m` and `σ`), then its low rule (dropped when `f + 4·n` is below `t·10^(0.4·(m − 4σ − G))`,
-   `n = sky_scatter·√(π·R²)`) and its upper limit (M1): a member above `t·10^(0.4·(m + 4σ − G))` is not dropped, its `f`
-   counts at that limit, so the ZP moves continuously as `m` and `σ` jitter (this differs from the emulation, which
-   dropped it); the ZP as the weighted ratio of sums, `Σ w·f ≤ 0` → `TooScattered { kept, sigma }`; the window slope
+   `n = sky_scatter·√(π·R²)`) and its upper rule, a taper (G2 review H1; the F5 plan review's M1, counting a member at the limit, is
+   withdrawn: measured on g0 it biased the ZP by +0.006…+0.026 per set against the drop, following σ, see the ledger's
+   "H1"): a member with `zp_i > m + 4σ` keeps its own `f` at the weight × `clamp(1 − (zp_i − m − 4σ)/(τ·σ), 0, 1)`,
+   τ = `ForcedListParams::screen_taper_sigma` (1.0; τ ≤ 1e-9 is a plain drop, as the emulation), a member of zero weight
+   dropped and not counted, so the ZP moves continuously as `m` and `σ` jitter; the window slope's ramp sums carry the
+   taper (`taper·f`, `taper·10^(−0.4·G)`) and `stars` counts the weights above zero; the ZP as the weighted ratio of sums, `Σ w·f ≤ 0` → `TooScattered { kept, sigma }`; the window slope
    (`None` under `slope_min_ramp_members` on the bright ramp; the faint ramp's term taken as it is, zero when the
    catalogue ends before `G_f − ρ`, H1); valid with ≥ `min_stars` members of non-zero weight and `σ ≤ max_sigma_mag`,
    else `TooFewStars { list, kept }` / `TooScattered { kept, sigma }`. `ForcedZeroPoint { zero_point, stars, sigma }`
-   (stars = members of non-zero weight); `ForcedOutcome { result, list_stars, members, capped (the members counted at
-   the upper limit), pedestal: Option<f64>, window_bright, window_slope: Option<f64>, per_star: Vec<ForcedStarZp {
+   (stars = members of non-zero weight); `ForcedOutcome { result, list_stars, members, tapered (the members above
+   `m + 4σ`), pedestal: Option<f64>, window_bright, window_slope: Option<f64>, per_star: Vec<ForcedStarZp {
    index, zp, weight, member, screened_in }> }` (the `c` fields and `fitted_kept` go).
 8. `ForcedRefusal`: `PoorSolve { kept_share: f64 }` added (code `poor_solve`, stored); `NoApertureCorrection` removed;
    `TooScattered { kept, sigma }` (its `std_error` goes with the standard-error rule). `code()` and `is_stored()` follow.
@@ -535,7 +540,11 @@ itself is `render`-gated, `lib.rs:38`).
 
 **Tests** (`forced_tests` and the analyzer's `mod forced`).
 - New: `a_shifted_and_quadratically_distorted_field_is_mapped_to_under_five_hundredths_of_a_pixel`;
-  `a_field_shifted_three_pixels_over_a_third_of_the_frame_is_poor_solve`; `fewer_than_thirty_map_members_is_poor_solve`;
+  `a_field_shifted_three_pixels_over_a_third_of_the_frame_is_poor_solve` (as built, and
+  corrected by the G2 review: a 3 px shift over a third of the frame as a single block **passes** the gate, on purpose —
+  a quadratic map follows a block that size, 0.80–0.95 of the map stars kept, and the stars stay inside the aperture
+  radius, so the ZP moves ≤ 0.002 mag; the gate is for frames whose apertures miss, the eight bad frames at 0.31–0.64;
+  the refusing case is every third 500 px stripe shifted 3 px, kept 0.4975, `poor_solve`); `fewer_than_thirty_map_members_is_poor_solve`;
   `a_list_with_fewer_than_forty_map_stars_is_too_few_stars_not_poor_solve`;
   `a_pedestal_added_under_every_aperture_is_recovered_and_leaves_the_zero_point_unmoved`;
   `an_unfittable_pedestal_refuses_too_scattered`; `a_star_at_a_window_edge_changes_the_zero_point_continuously`;
@@ -544,8 +553,9 @@ itself is `render`-gated, `lib.rs:38`).
   `the_analytic_window_slope_matches_a_moved_window` (synthetic apertures with a G trend: `s` against
   `anchor_shift_mag` ±0.1 within 0.01); `fewer_than_ten_bright_ramp_members_give_no_slope`;
   `a_window_cut_by_the_catalogue_keeps_its_slope` (H1: a catalogue ending before `G_f − ρ`, the faint ramp empty: a
-  slope from the bright ramp alone, never NULL for it); `a_member_above_the_screen_counts_at_its_limit` (M1: one star's
-  flux raised across `m + 4σ` moves the ZP with no step; one far below `m − 4σ` past its noise is dropped);
+  slope from the bright ramp alone, never NULL for it); `a_member_above_the_screen_is_tapered_and_the_zero_point_moves_continuously` (H1: one star's flux raised across
+  `m + 4σ` moves the ZP with a step a third of a plain drop's jump at most; past the taper it is dropped; one far below
+  `m − 4σ` past its noise is dropped too) and `a_zero_taper_is_a_plain_drop_with_no_division_by_zero`;
   `a_non_positive_sum_refuses_too_scattered`; `an_empty_map_request_carries_the_list_size` (analyzer);
   `sixty_members_are_valid_and_forty_are_too_few_stars`; `decimate_keeps_the_same_tenth_in_every_frame`;
   `common_window_of_one_frame_reads_its_zero_point`; `a_set_without_a_slope_is_not_reduced`.
@@ -597,8 +607,8 @@ and its guard `memrun.sh` beside it.
    mosaic anchor's reported `c`), `zero_point`, `sigma`, `refusal`, `centre_median_px` (now `MapGate::centre_median_px`,
    B7's figure), `zero_point_today`, `today_refusal`, `identity`, `call_ms`, `plain_ms`, `list_kb`, `rss_mb`. Gone:
    `accepted`, `kept`, `c`, `c_stars`, `c_se`, `std_error`, `ring_missing`, `zero_point_6f`. New: `map_stars`,
-   `map_members`, `map_offset_px`, `map_residual_px`, `map_kept_share`, `aperture_radius_px`, `members`, `capped` (M1:
-   the members counted at the screen's upper limit), `pedestal`, `window_slope`, `slope_remeasured`, `zero_point_6r`,
+   `map_members`, `map_offset_px`, `map_residual_px`, `map_kept_share`, `aperture_radius_px`, `members`, `tapered` (H1:
+   the members above the screen's upper limit, weight tapered), `pedestal`, `window_slope`, `slope_remeasured`, `zero_point_6r`,
    `annulus_off`, `list_fit_ms`, `list_refit_ms`, `list_ap_ms`. The f0 and g0 TSVs are not re-judged by the new verdict.
 3. `<x>.stars.tsv`, compact (a list now holds 2 000–9 000 stars a frame): `frame_id`, `key` (hex), `g`, `weight`,
    `member`, `screened_in`. `--dump-ap 1` writes `<x>.ap.tsv` with every aperture figure per list star (diagnosis only;
@@ -627,7 +637,7 @@ and its guard `memrun.sh` beside it.
      written (|s| ≤ 0.03 where its error ≤ 0.015); B8's today slope by the same per-night fit on the same frames;
    - B7: `centre_median_px` (the map refits);
    - B4 unchanged (no allowance, RR2): its line also prints Δk's standard error from the two fits, for the owner;
-   - reported: per night the list, members, the members capped (M1), map members and kept share, the pedestal, the
+   - reported: per night the list, members, the members tapered (H1), map members and kept share, the pedestal, the
      analytic slope beside the re-measured one, refusals; the cost line prints per set the median `list_fit_ms`,
      `list_refit_ms`, `list_ap_ms` and the list alone (`call_ms − plain_ms` on the identity frames) and names every set
      whose list alone is above 70 ms.
@@ -673,8 +683,10 @@ and each through the guard (RR4):
    and object from the catalogue copy before the run and notes it in the ledger), into `out/g1x/`, and `verdict --forced`
    on its TSV alone: a reported row, never judged (the nine are the sets the aperture rule was chosen on).
 An opus judge writes `task-G4-report-r0.md`: every bar from the TSVs, every miss explained on the frames it sits on (a
-stretched JPG and its list stars first), g1 against the expected table (saying that the screen's upper limit, M1,
-differs from the emulation, which dropped those members, with the members capped per night), the cost, and these
+stretched JPG and its list stars first), g1 against the expected table (saying that the screen's upper rule, the taper of H1, differs from
+the emulation, which dropped those members, with the members tapered per night; one row at `--screen_taper_sigma 0` is the
+emulation's rule, and one at `--pedestal_clip_rounds 10` shows the pedestal clip's convergence; the mosaic's √2 in the
+low rule's noise allowance, G2 review L6, is told as the emulation's own), the cost, and these
 figures, each by a script in `out/g1/` run through `memrun.sh`:
 - the window slope (M3, H1): per set and round, the analytic − re-measured slope (median, MAD), κ after the reduction at
   ±0.5 mag, `(ZP(Δ) − s̄·Δ − ZP(0)) / Δ` (median, 10–90 %), the share of frames with a slope, and the faint edge's move
@@ -1200,9 +1212,15 @@ by construction; G1 → G2 is the build order; the expected table matches the ve
 - **H2** (two exposures in one pool) — the exposure (0.1 s) joins the pool key, set and rig-wide: spec §5.6; G3 step 7's
   reduction; 6a step 3 and `two_exposures_in_one_set_are_two_references`; G3 step 5 and G4 the residual at anchor shifts
   of ±0.44, ±1.0 and ±1.75 mag.
-- **M1** (the screen's upper cut is a step) — a member above `m + 4σ` counts at the limit: spec §5.3; G2 step 7 (`capped`)
-  and `a_member_above_the_screen_counts_at_its_limit`; G3's `capped` column and per-night line; G4 says it differs from
-  the emulation.
+- **M1** (the screen's upper cut is a step) — **WITHDRAWN** by the G2 review (H1, controller ruling 2026-11-16). The
+  answer, a member above `m + 4σ` counted at the limit, measured on g0 against the emulation's drop: a bias of +0.0064
+  (QHY H), +0.015 / +0.017 (Duo vdB / LDN 1272), +0.017 / +0.018 (QHY L), +0.022 / +0.026 (ATR) in the level of the ZP,
+  0.0012–0.0044 rms frame to frame (up to 0.045 in one frame), and a correlation of the shift with σ of +0.66 / +0.73 on
+  ATR; the ledger's `progress.md`, tail, "H1". It removed the steps and put a bias that follows σ in their place. The
+  answer now: a taper, spec §5.3 and G2 step 7 — a member with `zp_i > m + 4σ` keeps its own flux at the weight ×
+  `clamp(1 − (zp_i − m − 4σ)/(τ·σ), 0, 1)`, τ = `screen_taper_sigma` 1.0 (level +0.001…+0.007, rms 0.0004–0.0028, max
+  0.021, continuous); τ → 0 is the emulation's drop, so G4 reports both rows. `tapered` replaces `capped` (G2 step 7;
+  G3's column and per-night line); the test is `a_member_above_the_screen_is_tapered_and_the_zero_point_moves_continuously`.
 - **M2** (6r is not an independent referee) — B3 prints three slopes, a stack miss 6r does not echo is no pass and goes
   to the owner: spec §6 (paragraph, M2 beside RR2, RR3); G3 step 7 and its test; G4's class-line paragraph and STOP list.
 - **M3** (the ±0.1 re-measure moved the edges) — `anchor_shift_mag` before the window rule, re-measures at ±0.1 and ±0.5:

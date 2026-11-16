@@ -196,13 +196,26 @@ Members: the list stars in the window whose annulus is on the frame and whose hi
 floor (any peak when the plane shows no clipped evidence).
 
 - **Pedestal** ε: over the members (every weight), `D = S(6·FWHM_ref) − S(4·FWHM_ref)` against `S(3·FWHM_ref)`, a
-  straight line with four rounds of 3 σ (MAD) clipping; ε = intercept / (π·(6² − 4²)·FWHM_ref²). Each flux is
+  straight line with four rounds (`pedestal_clip_rounds`) dropping the residuals beyond 3 σ about zero, σ = 1.4826 × the
+  median deviation of the residuals from their median (G2 review M1: the clip is about zero, as emulated, not about the
+  median residual; four rounds stop unconverged on most QHY L and ATR frames, which G4 reports with a
+  `--pedestal_clip_rounds 10` row); ε = intercept / (π·(6² − 4²)·FWHM_ref²). Each flux is
   `f = S(R) − ε·π·R²`.
 - **Screen**: `zp_i = G + 2.5·log10(f / t)` over the positive fluxes gives a 4 σ-clipped median `m` and `σ` (today's
   code). A member is dropped when `f + 4·n` is below `t·10^(0.4·(m − 4σ − G))`, with `n = sky scatter·√(π·R²)`; a
-  negative flux inside its noise stays. Above `t·10^(0.4·(m + 4σ − G))` a member is not dropped: its flux counts at that
-  limit, so a star that the jitter of `m` and `σ` carries across it moves the ZP continuously (the emulation dropped it:
-  on the Duo's LDN 1272 ten stars near that limit, in some frames and out of others, moved the ZP 0.006–0.009 mag each).
+  negative flux inside its noise stays. The upper rule is a taper (G2 review H1): a member with `zp_i > m + 4σ` keeps its
+  own flux and gets the weight × `clamp(1 − (zp_i − m − 4σ)/(τ·σ), 0, 1)`, τ = `screen_taper_sigma`, default 1.0 (τ ≤ 1e-9
+  is a plain drop); a member whose weight reaches zero is dropped and not counted. A star that the jitter of `m` and `σ`
+  carries across the limit then moves the ZP continuously (a plain drop does not: on the Duo's LDN 1272 ten stars near that
+  limit, in some frames and out of others, moved the ZP 0.006–0.009 mag each). The first answer, counting such a member at
+  the limit `10^(0.4·4σ)` times its expected flux (F5 plan review M1), is **withdrawn**: measured on g0 it biased the ZP
+  by +0.006 (QHY H) to +0.026 (ATR) per set against the drop, 0.0012–0.0044 rms frame to frame (up to 0.045), following σ
+  (r +0.7 on ATR), the very figure B3 and B5 judge. The taper measured +0.001…+0.007 in level, 0.0004–0.0028 rms (max
+  0.021), with the pair rms at or under the better of the drop and the cap. The window slope and `zp_stars` use the
+  tapered weights.
+  On a mosaic the area-scaled sum has √2 times the noise of the same disc read on a mono plane (the green sites are half
+  the disc's area), so the low rule's allowance `4·n` is √2 tight there; the emulation has the same property and the code
+  does not correct it (G2 review L6; G4 reports it).
 - **Zero point**: `2.5·log10( Σ w·f / (t·Σ w·10^(−0.4·G)) )` over the members left; `Σ w·f ≤ 0` refuses
   `too_scattered`.
 - **Window slope**: `s = 1.0857·[ (Σ_faint ramp f − Σ_bright ramp f)/(ρ·Σ w·f) − (the same with 10^(−0.4·G)) ]`, the
@@ -338,7 +351,7 @@ Referees (the controller's rulings after F5, `progress.md`; no threshold moved):
   through the job's memory guard.
 
 Reported, not judged: the budget's reported `c` (the mosaic anchor); list size, map figures, pedestal, window slope, the
-members the screen counts at its upper limit (M1, per night) and refusals per frame; on every tenth frame, re-measures
+members the screen tapers (H1, per night) and refusals per frame; on every tenth frame, re-measures
 with the anchor shifted by ±0.1 and ±0.5 mag (the analytic slope against the re-measured one, κ after the reduction) and
 by ±0.44, ±1.0 and ±1.75 mag (the reduced ZP's residual at an exposure step, §5.6); the decimated round (§5.3's figures:
 map stars, the first pass's member share, the refit kept share, false `poor_solve`, the corpus' eight bad frames, the

@@ -512,6 +512,10 @@ pub struct ForcedListParams {
     pub clip_sigma: f64,
     pub min_stars: usize,
     pub max_sigma_mag: f64,
+    /// The screen's upper rule is a taper: a member `d` mag above `m + clip_sigma * sigma` keeps its own flux at the
+    /// weight `clamp(1 - d / (screen_taper_sigma * sigma), 0, 1)`, so a star the jitter of `m` and `sigma` carries across
+    /// the limit moves the zero point continuously. `screen_taper_sigma <= 1e-9` is a plain drop (the F5 emulation's rule).
+    pub screen_taper_sigma: f64,
     /// The window slope needs at least this many members on the bright ramp.
     pub slope_min_ramp_members: usize,
     /// Probe only (RR4's round), the identity by default: a list star stays when `key % decimate == 0`.
@@ -563,6 +567,7 @@ impl Default for ForcedListParams {
             clip_sigma: 4.0,
             min_stars: 50,
             max_sigma_mag: 1.0,
+            screen_taper_sigma: 1.0,
             slope_min_ramp_members: 10,
             decimate: 1,
             anchor_shift_mag: 0.0,
@@ -1161,7 +1166,8 @@ fn fit_line(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
 
 /// The sky pedestal `epsilon` (flux per pixel; the sums carry `+ epsilon * pi * r^2`): over `members` (indices of
 /// `apertures`, every weight), `D = S(c) - S(b)` against `S(a)` at the three pedestal radii, a straight line with
-/// `pedestal_clip_rounds` rounds of clipping at `pedestal_clip_sigma` robust sigmas about the median residual;
+/// `pedestal_clip_rounds` rounds of clipping the residuals over `pedestal_clip_sigma` robust sigmas (1.4826 times the
+/// median deviation of the residuals from their median) about zero;
 /// `epsilon = intercept / (pi * (c^2 - b^2))`. `None` for fewer than `pedestal_min_points` left, or no spread in `S(a)`.
 pub fn sky_pedestal(
     apertures: &[ListAperture],
@@ -1195,8 +1201,8 @@ pub fn sky_pedestal(
         let scale = pts.iter().map(|p| p.0.abs() + p.1.abs()).sum::<f64>() / pts.len() as f64;
         let sigma = (MAD_TO_SIGMA * median(&mut dev)).max(1e-9 * (scale + 1.0));
         let limit = params.pedestal_clip_sigma * sigma;
-        let kept: Vec<(f64, f64)> =
-            pts.iter().zip(&res).filter(|(_, r)| (**r - m).abs() <= limit).map(|(p, _)| *p).collect();
+        // About zero, the fit's own centre: a skewed tail does not move the window it is judged against.
+        let kept: Vec<(f64, f64)> = pts.iter().zip(&res).filter(|(_, r)| r.abs() <= limit).map(|(p, _)| *p).collect();
         if kept.len() == pts.len() {
             break;
         }
@@ -1217,11 +1223,12 @@ pub struct ForcedStarZp {
     pub index: usize,
     /// `G + 2.5·log10(f / t)` of a member with a positive flux (NaN otherwise).
     pub zp: f64,
-    /// The window weight of a member (0 for a star that is no member).
+    /// The weight a member enters the sums with: its window weight times the screen's taper (0 for a star that is no
+    /// member).
     pub weight: f64,
     /// In the window, on the frame and under the plane's clip floor.
     pub member: bool,
-    /// A member the screen kept.
+    /// A member the screen kept (a member whose taper reached zero is dropped, as one far below the field is).
     pub screened_in: bool,
 }
 
@@ -1244,8 +1251,8 @@ pub struct ForcedOutcome {
     pub list_stars: u32,
     /// Members: in the window, on the frame and under the clip floor, whatever their weight, before the screen.
     pub members: u32,
-    /// Members the screen's upper limit counted at the limit (M1).
-    pub capped: u32,
+    /// Members above `m + clip_sigma * sigma`: their weight was tapered (or, at zero, they were dropped).
+    pub tapered: u32,
     /// The sky pedestal (working units per pixel), when it was fitted.
     pub pedestal: Option<f64>,
     pub window_bright: f64,
@@ -1259,7 +1266,7 @@ pub struct ForcedOutcome {
 /// The statistic (spec §5.3) over the apertures of `measured` (one per list star, at the positions `placement` moved).
 /// Members: in the window, on the frame, under the clip floor; the sky pedestal is read off them and taken out of every
 /// sum; a screen at `clip_sigma` drops the members far below the field's median (a negative flux inside its noise
-/// stays) and counts one far above at its limit; the zero point is the weighted ratio of sums; valid with at least
+/// stays) and tapers the weight of one far above it (`screen_taper_sigma`); the zero point is the weighted ratio of sums; valid with at least
 /// `min_stars` members of non-zero weight and a scatter within `max_sigma_mag`.
 pub fn forced_zero_point(
     list: &ForcedList,
@@ -1269,12 +1276,12 @@ pub fn forced_zero_point(
     params: &ForcedListParams,
 ) -> ForcedOutcome {
     let list_stars = list.stars.len() as u32;
-    let outcome = |result, members: u32, capped: u32, pedestal, window_slope, per_star: Vec<ForcedStarZp>| {
+    let outcome = |result, members: u32, tapered: u32, pedestal, window_slope, per_star: Vec<ForcedStarZp>| {
         ForcedOutcome {
             result,
             list_stars,
             members,
-            capped,
+            tapered,
             pedestal,
             window_bright: list.window_bright,
             window_slope,
@@ -1317,6 +1324,8 @@ pub fn forced_zero_point(
         }
     }
     let n_members = members.len() as u32;
+    // What a refusal before the screen reports as `kept`: the members that carry a weight.
+    let n_weighted = members.iter().filter(|&&i| per_star[i].weight > 0.0).count() as u32;
     let too_few = |kept: u32| ForcedRefusal::TooFewStars { list: list_stars, kept };
     if members.len() < params.min_stars {
         return outcome(Err(too_few(n_members)), n_members, 0, None, None, per_star);
@@ -1325,7 +1334,7 @@ pub fn forced_zero_point(
     // The pedestal, over every member whatever its weight; with none there is no zero point (never one with
     // epsilon = 0, which would carry the annulus' bias).
     let Some(eps) = sky_pedestal(&measured.apertures, &members, list.fwhm_ref_px, params) else {
-        let r = ForcedRefusal::TooScattered { kept: n_members, sigma: f64::NAN };
+        let r = ForcedRefusal::TooScattered { kept: n_weighted, sigma: f64::NAN };
         return outcome(Err(r), n_members, 0, None, None, per_star);
     };
     let t = exptime_s;
@@ -1342,59 +1351,74 @@ pub fn forced_zero_point(
     let (m, sigma) = match clipped_median(&zps, params.clip_sigma, 1, f64::INFINITY).verdict {
         Ok(z) => (z.zero_point, z.sigma),
         Err(_) => {
-            let r = ForcedRefusal::TooScattered { kept: n_members, sigma: f64::NAN };
+            let r = ForcedRefusal::TooScattered { kept: n_weighted, sigma: f64::NAN };
             return outcome(Err(r), n_members, 0, Some(eps), None, per_star);
         }
     };
     let sig = sigma.max(CLIP_SIGMA_FLOOR_MAG);
 
-    // Per member: dropped far below the median beyond its own noise; counted at the limit far above it (M1), so a star
-    // that the jitter of the median and the scatter carries across the limit moves the zero point continuously.
+    // Per member: dropped far below the median beyond its own noise; far above it (`zp_i > m + clip_sigma * sigma`) it
+    // keeps its own flux at a weight that falls to zero over `screen_taper_sigma * sigma`, so a star that the jitter of
+    // the median and the scatter carries across the limit moves the zero point continuously.
     struct Kept {
         g: f64,
+        /// The weight in the sums: the window weight times the taper.
         w: f64,
+        /// The taper alone (what the window's ramps move with).
+        taper: f64,
         f: f64,
     }
     let mut left: Vec<Kept> = Vec::with_capacity(members.len());
-    let mut capped = 0u32;
+    let mut tapered = 0u32;
+    let upper = m + params.clip_sigma * sig;
     for (&i, &f) in members.iter().zip(&flux) {
         let g = f64::from(list.stars[i].g_mag);
         let noise = measured.apertures[i].sky_scatter * area.sqrt();
         let lo = t * 10f64.powf(0.4 * (m - params.clip_sigma * sig - g));
-        let hi = t * 10f64.powf(0.4 * (m + params.clip_sigma * sig - g));
         if f + params.clip_sigma * noise < lo {
+            per_star[i].weight = 0.0;
             continue;
         }
-        let used = if f > hi {
-            capped += 1;
-            hi
-        } else {
-            f
-        };
+        let mut taper = 1.0;
+        if per_star[i].zp > upper {
+            tapered += 1;
+            taper = if params.screen_taper_sigma <= 1e-9 {
+                0.0
+            } else {
+                (1.0 - (per_star[i].zp - upper) / (params.screen_taper_sigma * sig)).clamp(0.0, 1.0)
+            };
+            if taper <= 0.0 {
+                per_star[i].weight = 0.0;
+                continue;
+            }
+        }
+        let w = per_star[i].weight * taper;
+        per_star[i].weight = w;
         per_star[i].screened_in = true;
-        left.push(Kept { g, w: per_star[i].weight, f: used });
+        left.push(Kept { g, w, taper, f });
     }
 
     let stars = left.iter().filter(|k| k.w > 0.0).count() as u32;
     if (stars as usize) < params.min_stars {
-        return outcome(Err(too_few(stars)), n_members, capped, Some(eps), None, per_star);
+        return outcome(Err(too_few(stars)), n_members, tapered, Some(eps), None, per_star);
     }
     let sw_f: f64 = left.iter().map(|k| k.w * k.f).sum();
     let sw_c: f64 = left.iter().map(|k| k.w * 10f64.powf(-0.4 * k.g)).sum();
     if !(sw_f > 0.0 && sw_f.is_finite() && sw_c > 0.0) {
         let r = ForcedRefusal::TooScattered { kept: stars, sigma };
-        return outcome(Err(r), n_members, capped, Some(eps), None, per_star);
+        return outcome(Err(r), n_members, tapered, Some(eps), None, per_star);
     }
     let zero_point = 2.5 * (sw_f / (t * sw_c)).log10();
 
     // The window slope: the zero point's change per magnitude the window moves fainter, from the members on the two
-    // ramps. A window the catalogue cut has no faint ramp, and that edge does not move, so its term is zero.
+    // ramps (each at its taper: the window moves its window weight, the screen's taper stays). A window the catalogue
+    // cut has no faint ramp, and that edge does not move, so its term is zero.
     let rho = params.window_ramp_mag;
     let bright: Vec<&Kept> = left.iter().filter(|k| k.g - list.window_bright < rho).collect();
     let faint: Vec<&Kept> = left.iter().filter(|k| list.window_faint - k.g < rho).collect();
     let window_slope = (bright.len() >= params.slope_min_ramp_members && rho > 0.0).then(|| {
-        let sum_f = |v: &[&Kept]| v.iter().map(|k| k.f).sum::<f64>();
-        let sum_c = |v: &[&Kept]| v.iter().map(|k| 10f64.powf(-0.4 * k.g)).sum::<f64>();
+        let sum_f = |v: &[&Kept]| v.iter().map(|k| k.taper * k.f).sum::<f64>();
+        let sum_c = |v: &[&Kept]| v.iter().map(|k| k.taper * 10f64.powf(-0.4 * k.g)).sum::<f64>();
         (2.5 / std::f64::consts::LN_10)
             * ((sum_f(&faint) - sum_f(&bright)) / (rho * sw_f) - (sum_c(&faint) - sum_c(&bright)) / (rho * sw_c))
     });
@@ -1404,7 +1428,7 @@ pub fn forced_zero_point(
     } else {
         Ok(ForcedZeroPoint { zero_point, stars, sigma })
     };
-    outcome(result, n_members, capped, Some(eps), window_slope, per_star)
+    outcome(result, n_members, tapered, Some(eps), window_slope, per_star)
 }
 
 // ---- the reduction ----------------------------------------------------------------------------------------------
@@ -1436,9 +1460,10 @@ impl CommonWindow {
 }
 
 /// Reduce a set of `(zero point, G_b, slope)` frames in place to their common window (the probe's form of the same
-/// rule; a set with no frame is left as it is).
+/// rule; a set with no frame is left as it is). A frame whose zero point is not finite (a refused frame) takes no part
+/// in the pivot or the slope: it would put its own window into the median.
 pub fn reduce_to_common_window(frames: &mut [(f64, f64, Option<f64>)]) {
-    let pairs: Vec<(f64, Option<f64>)> = frames.iter().map(|f| (f.1, f.2)).collect();
+    let pairs: Vec<(f64, Option<f64>)> = frames.iter().filter(|f| f.0.is_finite()).map(|f| (f.1, f.2)).collect();
     let Some(window) = common_window(&pairs) else {
         return;
     };
@@ -3404,7 +3429,79 @@ mod forced_tests {
         assert!(!ForcedRefusal::Internal.is_stored());
     }
 
+    #[test]
+    fn the_refusal_codes_are_stable_and_one_is_not_stored() {
+        let all = [
+            (ForcedRefusal::NoExposure, "no_exposure"),
+            (ForcedRefusal::NoAnchor { kept: 3 }, "no_anchor"),
+            (ForcedRefusal::PoorSolve { kept_share: 0.5 }, "poor_solve"),
+            (ForcedRefusal::TooFewStars { list: 1, kept: 1 }, "too_few_stars"),
+            (ForcedRefusal::TooScattered { kept: 1, sigma: 1.0 }, "too_scattered"),
+            (ForcedRefusal::ColourCamera, "colour_camera"),
+            (ForcedRefusal::UnreadableSolve, "unreadable_solve"),
+            (ForcedRefusal::FrameVerdict, "frame_verdict"),
+            (ForcedRefusal::CatalogueUnreadable, "catalogue_unreadable"),
+            (ForcedRefusal::Internal, "internal"),
+        ];
+        for (r, code) in all {
+            assert_eq!(r.code(), code);
+            assert_eq!(r.is_stored(), !["catalogue_unreadable", "internal"].contains(&code), "{code}");
+        }
+        assert!(ForcedRefusal::PoorSolve { kept_share: f64::NAN }.is_stored(), "an outcome a re-read would repeat");
+        // The list's aperture correction is gone, and its code with it.
+        assert!(all.iter().all(|(_, code)| *code != "no_aperture_correction"));
+    }
+
     // ---- the pedestal ---------------------------------------------------------------------------------------------
+
+    /// `n_good` apertures whose pedestal points `(S(a), S(c) - S(b))` lie on `2 + 0.01 a` with unit noise, and `n_bad`
+    /// gross outliers of +/-40 (alternating) among them; the list indices in step with the apertures.
+    fn pedestal_points(n_good: usize, n_bad: usize) -> (Vec<ListAperture>, Vec<usize>) {
+        let mut rng = Rng(41);
+        let total = n_good + n_bad;
+        let stride = total / n_bad.max(1);
+        let mut bad = 0usize;
+        let apertures: Vec<ListAperture> = (0..total)
+            .map(|i| {
+                let a = 100.0 + 10.0 * i as f64;
+                let mut d = 2.0 + 0.01 * a + rng.normal();
+                if n_bad > 0 && i % stride == stride / 2 && bad < n_bad {
+                    d += if bad % 2 == 0 { 40.0 } else { -40.0 };
+                    bad += 1;
+                }
+                ListAperture::test_new(0.0, vec![a, 0.0, d], 1000.0, 4.0, 1000.0)
+            })
+            .collect();
+        assert_eq!(bad, n_bad, "every outlier was placed");
+        (apertures, (0..total).collect())
+    }
+
+    #[test]
+    fn a_pedestal_left_with_too_few_points_after_clipping_is_none() {
+        let (aps, members) = pedestal_points(24, 6);
+        // The outer radii are 4 and 6 FWHM_ref (10 and 15 px at 2.5).
+        let area = std::f64::consts::PI * (15.0f64 * 15.0 - 10.0 * 10.0);
+        let eps = sky_pedestal(&aps, &members, 2.5, &params()).expect("24 good points of 30");
+        assert!((eps - 2.0 / area).abs() < 3.0 / area, "the outliers are clipped: {eps} against {}", 2.0 / area);
+        // Thirty points are plenty, but the six outliers go and 24 are left: under 25 is no pedestal.
+        let strict = ForcedListParams { pedestal_min_points: 25, ..params() };
+        assert_eq!(sky_pedestal(&aps, &members, 2.5, &strict), None);
+    }
+
+    #[test]
+    fn the_pedestal_clip_reads_its_rounds() {
+        let (aps, members) = pedestal_points(24, 6);
+        let none = ForcedListParams { pedestal_clip_rounds: 0, ..params() };
+        let many = ForcedListParams { pedestal_clip_rounds: 10, ..params() };
+        let (a, b, c) = (
+            sky_pedestal(&aps, &members, 2.5, &none),
+            sky_pedestal(&aps, &members, 2.5, &params()),
+            sky_pedestal(&aps, &members, 2.5, &many),
+        );
+        assert_ne!(a, b, "no clipping is another fit");
+        assert!((b.unwrap() - c.unwrap()).abs() < 1e-3, "four rounds have converged here: {b:?} {c:?}");
+        assert_eq!(ForcedListParams::default().pedestal_clip_rounds, 4);
+    }
 
     #[test]
     fn a_pedestal_added_under_every_aperture_is_recovered_and_leaves_the_zero_point_unmoved() {
@@ -3439,11 +3536,15 @@ mod forced_tests {
     /// 300 stars from 14.5 to 16.5 with 0.05 mag of scatter and one probe star last, at `g_probe` and `delta` mag too
     /// bright; the statistic of it.
     fn with_probe(g_probe: f64, delta: f64) -> ForcedOutcome {
+        with_probe_under(g_probe, delta, &params())
+    }
+
+    fn with_probe_under(g_probe: f64, delta: f64, p: &ForcedListParams) -> ForcedOutcome {
         let mut gs = even(300, 14.5, 16.5);
         gs.push(g_probe);
         let list = hand_list(&gs);
         let m = measured_for(&list, &|i, _| if i == 300 { 21.8 + delta } else { 21.8 }, 0.05, 0.0, 99);
-        statistic(&list, &m)
+        forced_zero_point(&list, &m, &plain_placement(&list), EXPTIME, p)
     }
 
     fn zp_of(o: &ForcedOutcome) -> f64 {
@@ -3461,22 +3562,66 @@ mod forced_tests {
         assert!(inside > 5e-4, "{inside}");
     }
 
+    /// The probe star's `delta` (mag too bright) at which it crosses `m + 4 sigma`, read off the screen's own figures.
+    fn crossing() -> f64 {
+        let o = with_probe(14.6, 0.0);
+        let sigma = o.result.expect("valid").sigma;
+        // The field's median is the truth (21.8) within the scatter's sampling: the limit is 4 sigma above it.
+        4.0 * sigma
+    }
+
     #[test]
-    fn a_member_above_the_screen_counts_at_its_limit() {
-        // The star rises through m + 4 sigma (about 0.2 mag): the zero point climbs with no step and stops at the limit.
-        let curve: Vec<f64> = (0..=80).map(|k| zp_of(&with_probe(14.6, f64::from(k) * 0.01))).collect();
-        let step = curve.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
-        assert!(step < 4e-4, "largest step {step}: a dropped star would jump by about 0.009");
-        let (high, higher) = (with_probe(14.6, 0.8), with_probe(14.6, 1.5));
-        assert!((zp_of(&high) - zp_of(&higher)).abs() < 1e-5, "counted at the limit, not at its own flux");
-        assert_eq!((high.capped, higher.capped), (1, 1));
-        assert!(high.per_star[300].screened_in);
-        // One far below (2 mag, beyond its noise) is dropped, and the zero point is that of the other 300.
-        let low = with_probe(14.6, -2.0);
-        assert!(!low.per_star[300].screened_in && low.per_star[300].member);
+    fn a_member_above_the_screen_is_tapered_and_the_zero_point_moves_continuously() {
+        // The probe star rises through m + 4 sigma (about 0.2 mag). Fine steps across the limit and the taper (sigma
+        // wide, 0.05 mag here): the largest step is small beside the jump of a plain drop at the same place.
+        let edge = crossing();
+        let delta_at = |k: i32| edge - 0.1 + f64::from(k) * 0.002;
+        let largest_step = |p: &ForcedListParams| {
+            let curve: Vec<f64> = (0..=100).map(|k| zp_of(&with_probe_under(14.6, delta_at(k), p))).collect();
+            curve.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max)
+        };
+        let step = largest_step(&params());
+        let jump = largest_step(&ForcedListParams { screen_taper_sigma: 0.0, ..params() });
+        assert!(jump > 0.001, "a plain drop jumps by {jump}");
+        assert!(step < jump / 3.0, "largest step of the taper {step}, the drop's jump {jump}");
+        // Through the whole taper and beyond: no step at the start (the weight is 1 at the limit) or at the end (0).
+        let o = with_probe(14.6, edge + 0.025);
+        assert_eq!(o.tapered, 1);
+        let w = o.per_star[300].weight;
+        assert!(o.per_star[300].screened_in && w > 0.0 && w < 1.0, "inside the taper: weight {w}");
+        // Past the taper's end the star is gone, and the zero point is that of the other 300.
+        let (far, farther) = (with_probe(14.6, 0.8), with_probe(14.6, 1.5));
+        assert!(!far.per_star[300].screened_in && far.per_star[300].member && far.per_star[300].weight == 0.0);
+        assert_eq!((far.tapered, farther.tapered), (1, 1));
         let list = hand_list(&even(300, 14.5, 16.5));
         let others = statistic(&list, &measured_for(&list, &|_, _| 21.8, 0.05, 0.0, 99));
+        // (The star still sits in the pedestal's fit, whatever its flux, so the others differ by a hair.)
+        let (d_far, d_others) = ((zp_of(&far) - zp_of(&farther)).abs(), (zp_of(&far) - zp_of(&others)).abs());
+        assert!(d_far < 1e-4 && d_others < 1e-4, "{d_far} {d_others}");
+        // One far below (2 mag, beyond its noise) is dropped as well: the low side stays a drop.
+        let low = with_probe(14.6, -2.0);
+        assert!(!low.per_star[300].screened_in && low.per_star[300].member && low.tapered == 0);
         assert!((zp_of(&low) - zp_of(&others)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_zero_taper_is_a_plain_drop_with_no_division_by_zero() {
+        let drop = ForcedListParams { screen_taper_sigma: 0.0, ..params() };
+        let edge = crossing();
+        let (under, over) = (with_probe_under(14.6, edge - 0.03, &drop), with_probe_under(14.6, edge + 0.03, &drop));
+        assert!(under.per_star[300].screened_in && under.per_star[300].weight == 1.0 && under.tapered == 0);
+        assert!(!over.per_star[300].screened_in && over.per_star[300].weight == 0.0 && over.tapered == 1);
+        let list = hand_list(&even(300, 14.5, 16.5));
+        let others = statistic(&list, &measured_for(&list, &|_, _| 21.8, 0.05, 0.0, 99));
+        assert!(zp_of(&over).is_finite() && (zp_of(&over) - zp_of(&others)).abs() < 1e-5);
+        // A negative width is no width either, and the default is a width of one sigma.
+        let negative = ForcedListParams { screen_taper_sigma: -1.0, ..params() };
+        assert_eq!(zp_of(&with_probe_under(14.6, edge + 0.03, &negative)), zp_of(&over));
+        assert_eq!(params().screen_taper_sigma, 1.0);
+        // A wider taper keeps the same star at a larger weight.
+        let wide = ForcedListParams { screen_taper_sigma: 3.0, ..params() };
+        let (w1, w3) = (with_probe(14.6, edge + 0.025), with_probe_under(14.6, edge + 0.025, &wide));
+        assert!(w3.per_star[300].weight > w1.per_star[300].weight);
     }
 
     #[test]
@@ -3500,16 +3645,53 @@ mod forced_tests {
 
     #[test]
     fn a_non_positive_sum_refuses_too_scattered() {
-        let list = hand_list(&even(300, 14.0, 17.0));
+        // Half the members sit at their truth, the other half at -1.5 times it with a sky so noisy that the low rule keeps
+        // them: the screen has a field (the positive half), and the weighted sum of fluxes is below zero.
+        let list = hand_list(&even(600, 14.0, 17.0));
         let mut m = measured_for(&list, &|_, _| 21.8, 0.05, 0.0, 99);
         for (i, a) in m.apertures.iter_mut().enumerate() {
+            if i % 2 == 1 {
+                let v = -1.5 * EXPTIME * 10f64.powf(0.4 * (21.8 - f64::from(list.stars[i].g_mag)));
+                *a = ListAperture::test_new(v, vec![v; 3], 1000.0, 1e5, 1000.0);
+            }
+        }
+        let o = statistic(&list, &m);
+        assert!(
+            matches!(o.result, Err(ForcedRefusal::TooScattered { kept: 600, sigma }) if sigma.is_finite() && sigma < 0.2),
+            "{:?}",
+            o.result
+        );
+        assert_eq!(o.result.unwrap_err().code(), "too_scattered");
+        // All 300 negative members were kept by the screen, so it was the sum that refused.
+        assert!(o.per_star.iter().filter(|p| p.screened_in).count() == 600);
+        // Every flux negative: no field at all, so no scatter either.
+        let mut all_neg = measured_for(&list, &|_, _| 21.8, 0.05, 0.0, 99);
+        for (i, a) in all_neg.apertures.iter_mut().enumerate() {
             let v = -(1000.0 + 37.0 * i as f64);
             a.sum = v;
             a.extra_sums = vec![v; 3];
         }
+        assert!(matches!(
+            statistic(&list, &all_neg).result,
+            Err(ForcedRefusal::TooScattered { sigma, .. }) if sigma.is_nan()
+        ));
+    }
+
+    #[test]
+    fn too_few_stars_after_the_screen_reports_the_survivors() {
+        let list = hand_list(&even(300, 14.0, 17.0));
+        let mut m = measured_for(&list, &|_, _| 21.8, 0.05, 0.0, 99);
+        // Sixty members (weight 1, G 15.0 to 15.6); twenty of them sit 3 mag low under a quiet sky: the screen drops them.
+        members_only(&list, &mut m, 100..160);
+        for a in &mut m.apertures[100..120] {
+            let k = 10f64.powf(-1.2);
+            a.sum *= k;
+            a.extra_sums.iter_mut().for_each(|v| *v *= k);
+        }
         let o = statistic(&list, &m);
-        assert!(matches!(o.result, Err(ForcedRefusal::TooScattered { .. })), "{:?}", o.result);
-        assert_eq!(o.result.unwrap_err().code(), "too_scattered");
+        assert_eq!(o.members, 60);
+        assert_eq!(o.result, Err(ForcedRefusal::TooFewStars { list: 300, kept: 40 }));
+        assert_eq!(o.per_star.iter().filter(|p| p.member && !p.screened_in).count(), 20);
     }
 
     // ---- the window slope and the reduction -----------------------------------------------------------------------
@@ -3535,8 +3717,39 @@ mod forced_tests {
     #[test]
     fn a_window_cut_by_the_catalogue_keeps_its_slope() {
         // The catalogue ends at 15.6, 1.4 mag before the faint edge: the faint ramp [16.5, 17] is empty.
-        let (s, ok) = slope_of(&even(400, 14.0, 15.6));
-        assert!(ok && s.is_some_and(f64::is_finite), "{s:?}");
+        let list = hand_list(&even(400, 14.0, 15.6));
+        let m = measured_for(&list, &|_, g| 22.0 - 0.15 * (g - 15.0), 0.0, 0.0, 17);
+        let o = statistic(&list, &m);
+        let s = o.window_slope.expect("a slope from the bright ramp alone");
+        // The slope against both edges moved by hand, 0.1 mag each way (the faint one moves nothing here).
+        let at = |shift: f64| {
+            let mut l = list.clone();
+            l.window_bright += shift;
+            l.window_faint += shift;
+            zp_of(&forced_zero_point(&l, &m, &plain_placement(&l), EXPTIME, &params()))
+        };
+        let moved = (at(0.1) - at(-0.1)) / 0.2;
+        assert!(moved < -0.02, "the field's offsets fall with G, so a fainter bright edge lowers the zero point: {moved}");
+        assert!((s - moved).abs() < 0.01, "analytic {s}, both edges moved {moved}");
+    }
+
+    #[test]
+    fn a_tapered_member_moves_the_window_slope_as_it_moves_the_window() {
+        // Every 40th star is 0.6 mag too bright: far enough above m + 4 sigma (sigma is the trend's own 0.13) to be
+        // tapered. The slope reads those members at their taper, and the moved window agrees with it.
+        let list = hand_list(&even(600, 14.0, 17.0));
+        let trend = |i: usize, g: f64| 22.0 - 0.15 * (g - 15.0) + if i % 40 == 11 { 0.6 } else { 0.0 };
+        let m = measured_for(&list, &trend, 0.0, 0.0, 3);
+        let o = statistic(&list, &m);
+        assert!(o.tapered > 0 && o.per_star.iter().any(|p| p.screened_in && p.weight > 0.0 && p.weight < 1.0), "{}", o.tapered);
+        let at = |shift: f64| {
+            let mut l = list.clone();
+            l.window_bright += shift;
+            l.window_faint += shift;
+            zp_of(&forced_zero_point(&l, &m, &plain_placement(&l), EXPTIME, &params()))
+        };
+        let (s, moved) = (o.window_slope.expect("a slope"), (at(0.1) - at(-0.1)) / 0.2);
+        assert!((s - moved).abs() < 0.02, "analytic {s}, moved {moved}");
     }
 
     #[test]
@@ -3591,6 +3804,16 @@ mod forced_tests {
         let mut one = [(21.9, 13.7, None)];
         reduce_to_common_window(&mut one);
         assert_eq!(one[0].0, 21.9);
+    }
+
+    #[test]
+    fn a_refused_frame_takes_no_part_in_the_pivot() {
+        // The NaN frame's window (G_b 20) would drag the median pivot from 14.0 to 14.5.
+        let mut frames = [(21.9, 13.0, Some(-0.2)), (21.8, 14.0, Some(-0.2)), (f64::NAN, 20.0, None), (21.7, 15.0, Some(-0.2))];
+        reduce_to_common_window(&mut frames);
+        assert!((frames[1].0 - 21.8).abs() < 1e-12, "the median window of the three valid frames is its own: {}", frames[1].0);
+        assert!((frames[0].0 - (21.9 + 0.2 * (13.0 - 14.0))).abs() < 1e-12);
+        assert!(frames[2].0.is_nan(), "a refused frame stays refused");
     }
 
     #[test]
@@ -3671,6 +3894,56 @@ mod forced_tests {
         assert_eq!((narrow.radius_px, narrow.annulus_start_px), (10.0, 17.0));
     }
 
+    #[test]
+    fn the_annulus_clears_every_disc_for_every_frame_fwhm() {
+        // rustafits refuses a placement whose annulus starts closer than its largest radius plus 0.75 px.
+        let mut list = hand_list(&even(100, 14.0, 17.0));
+        let map = QuadMap { cx: 0.0, cy: 0.0, half: 1.0, ax: [0.0; 6], ay: [0.0; 6], members: 400, offset_px: 0.0, residual_px: 0.0 };
+        for fwhm_ref in [2.0, 2.5, 5.0] {
+            list.fwhm_ref_px = fwhm_ref;
+            for f in [0.5, 1.0, 2.0, 3.0, 4.5, 6.0, 8.0, 12.0, 20.0, 40.0, f64::NAN] {
+                let p = placement(&list, &map, f, &params());
+                let r_max = p.extra_radii_px.iter().copied().fold(p.radius_px, f64::max);
+                assert!(
+                    p.annulus_start_px >= r_max + 0.75,
+                    "FWHM_ref {fwhm_ref}, F {f}: annulus at {} against radius {r_max}",
+                    p.annulus_start_px
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_maps_clip_drops_gross_outliers() {
+        let list = hand_list(&vec![15.0; 400]);
+        // A wide radius, so it is the clip and not the radius rule that drops them.
+        let wide = ForcedListParams { map_radius_fwhm: 20.0, ..params() };
+        let mut fits = first_pass(&list, &distortion, 0.03, 5);
+        for (k, f) in fits.iter_mut().enumerate().filter(|(k, _)| k % 20 == 7) {
+            let (ex, ey) = [(6.0, 0.0), (0.0, 6.0), (-6.0, 0.0), (0.0, -6.0)][(k / 20) % 4];
+            f.x += ex;
+            f.y += ey;
+            let s = &list.stars[list.map[k]];
+            f.centre_offset_px = (f.x - s.x).hypot(f.y - s.y);
+        }
+        let worst = |map: &QuadMap| {
+            let mut rng = Rng(8);
+            (0..2000)
+                .map(|_| {
+                    let (x, y) = (150.0 + 3700.0 * rng.unit(), 150.0 + 2700.0 * rng.unit());
+                    let ((tx, ty), (mx, my)) = (distortion(x, y), map.shift(x, y));
+                    (tx - mx).hypot(ty - my)
+                })
+                .fold(0.0, f64::max)
+        };
+        let map = position_map(&list, &fits, &wide).unwrap();
+        assert!((370..=380).contains(&map.members), "the 20 outliers go: {}", map.members);
+        assert!(worst(&map) < 0.05, "the clipped map follows the truth: {}", worst(&map));
+        let unclipped = position_map(&list, &fits, &ForcedListParams { map_clip_rounds: 0, ..wide }).unwrap();
+        assert_eq!(unclipped.members, 400);
+        assert!(worst(&unclipped) > 0.05, "without the clip they pull it: {}", worst(&unclipped));
+    }
+
     /// The second pass over a placement for a truth: each refit sits on its star, `kept` by the tolerance from its seed.
     fn second_pass(list: &ForcedList, p: &ListPlacement, truth: &dyn Fn(f64, f64) -> (f64, f64)) -> Vec<ListFit> {
         list.map
@@ -3695,12 +3968,23 @@ mod forced_tests {
         // solve puts it: no smooth map follows that. (One third as a single block does not fail: a quadratic map
         // follows a block that size, 0.90 of the stars kept, and the stars are then where the map puts them.)
         let truth = |x: f64, _y: f64| if ((x / 500.0).floor() as i64) % 3 == 0 { (3.0, 0.0) } else { (0.0, 0.0) };
+        // (One third as a single block passes the gate on purpose: see below.)
         let verdict = position_map(&list, &first_pass(&list, &truth, 0.03, 5), &params()).and_then(|map| {
             let p = placement(&list, &map, 8.0, &params());
             map_gate(&list, &second_pass(&list, &p, &truth), &p, &params())
         });
         assert!(matches!(verdict, Err(ForcedRefusal::PoorSolve { .. })), "{verdict:?}");
         assert_eq!(verdict.unwrap_err().code(), "poor_solve");
+        // A single 3 px block over a third of the frame passes (a quadratic map follows a block that size, 0.80 to 0.95 of
+        // the stars kept): its stars stay inside the aperture radius R, so the zero point moves by at most 0.002 mag
+        // (the G2 review's simulation at F 2 to 4.4 px). The gate is for the frames whose apertures miss, like the
+        // eight bad frames (0.31 to 0.64 kept), and stripes refuse it.
+        let block = |x: f64, _y: f64| if x < 1333.0 { (3.0, 0.0) } else { (0.0, 0.0) };
+        let through = position_map(&list, &first_pass(&list, &block, 0.03, 5), &params()).and_then(|map| {
+            let p = placement(&list, &map, 8.0, &params());
+            map_gate(&list, &second_pass(&list, &p, &block), &p, &params())
+        });
+        assert!(through.as_ref().is_ok_and(|g| (0.80..=0.95).contains(&g.kept_share)), "{through:?}");
         // The same field with one smooth shift passes both.
         let smooth = |_: f64, _: f64| (3.0, -1.0);
         let ok = position_map(&list, &first_pass(&list, &smooth, 0.03, 5), &params()).and_then(|map| {

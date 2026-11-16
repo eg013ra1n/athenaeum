@@ -290,6 +290,7 @@ impl Args {
             clip_sigma: self.peek_parsed("clip_sigma")?.unwrap_or(d.clip_sigma),
             min_stars: self.peek_parsed("min_stars")?.unwrap_or(d.min_stars),
             max_sigma_mag: self.take_parsed("max_sigma_mag")?.unwrap_or(d.max_sigma_mag),
+            screen_taper_sigma: self.take_parsed("screen_taper_sigma")?.unwrap_or(d.screen_taper_sigma),
             slope_min_ramp_members: self.take_parsed("slope_min_ramp_members")?.unwrap_or(d.slope_min_ramp_members),
             decimate: self.take_parsed("decimate")?.unwrap_or(d.decimate),
             anchor_shift_mag: self.take_parsed("anchor_shift_mag")?.unwrap_or(d.anchor_shift_mag),
@@ -2865,11 +2866,11 @@ const IDENTITY_EVERY_DEFAULT: usize = 10;
 /// One light of a `forced` run. A light that was not measured carries one of [`UNMEASURED`] in `refusal`.
 ///
 /// `layout` is `mono`, `cfa` or `rgb`. `anchor_stars` is the anchor's survivors, or the matches it found when the anchor
-/// refused. `accepted` / `kept` count the list's fits that were accepted / kept by the fitter (before the 4 sigma clip);
-/// `zp_stars` the survivors of the clip. `c*` are the list's aperture correction, `c_budget` the budget's reported one
-/// (mosaic only). `ring_missing` counts accepted list fits within 12 F of an edge, F the ring width the list was read at
-/// (their ring is truncated). `zero_point_6f` is written empty (the 6F referee went with the F5 emulation in G2;
-/// G3 re-measures it).
+/// refused. `accepted` / `kept` are the first fit pass's map stars accepted / kept by the fitter (the per-night line
+/// only: the verdict reads the stars TSV's `kept`, a member of non-zero weight the screen kept); `zp_stars` the members
+/// of non-zero weight the screen kept. `c*` are written empty (the list has no aperture correction any more), `c_budget`
+/// is the budget's reported one (mosaic only). `ring_missing` counts the accepted first-pass fits within 12 F of an edge, F the ring width they were read at. `zero_point_6f` is written empty (the 6F
+/// referee went with the F5 emulation in G2; G3 re-measures it).
 #[derive(Debug, Clone, Default)]
 struct ForcedRow {
     frame_id: Option<i64>,
@@ -3542,7 +3543,8 @@ const B4_MIN_POINTS: usize = 10;
 /// B6: valid over measured per night; 6.5's QHY268M sets must be complete.
 const B6_MIN: f64 = 0.90;
 const B6_COMPLETE: f64 = 1.00;
-/// B7: median |fitted - projected| over frames, in units of `FWHM_ref`.
+/// B7: median |refit - moved seed| over frames (the map's refits' distance from where the map placed them), in units of
+/// `FWHM_ref`.
 const B7_MAX_FWHM_REF: f64 = 0.25;
 /// B8: today's slope plus this many of its errors bounds the forced slope.
 const B8_SIGMAS: f64 = 2.0;
@@ -4379,7 +4381,7 @@ fn forced_verdict_lines(
         &mut lines,
         "B7",
         bar_line(
-            "B7 median |fitted - projected| centre",
+            "B7 median |refit - moved seed| centre",
             &format!("(<= {B7_MAX_FWHM_REF:.2} FWHM_ref)"),
             &entries,
         ),
@@ -4771,6 +4773,7 @@ mod tests {
             ("clip_sigma", |p| p.clip_sigma),
             ("min_stars", |p| p.min_stars as f64),
             ("max_sigma_mag", |p| p.max_sigma_mag),
+            ("screen_taper_sigma", |p| p.screen_taper_sigma),
             ("slope_min_ramp_members", |p| p.slope_min_ramp_members as f64),
             ("decimate", |p| p.decimate as f64),
             ("anchor_shift_mag", |p| p.anchor_shift_mag),

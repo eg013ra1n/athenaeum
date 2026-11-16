@@ -248,6 +248,8 @@ mod forced {
     thread_local! {
         /// A test's switch: the placement callback panics on this thread (the catch is otherwise out of reach).
         pub(super) static PLACEMENT_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The same for the gate and the statistic, which run after the fitter returned.
+        pub(super) static STATISTIC_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The fit's working-unit full scale, as the saturation test reads it (`saturation_plane`'s `norm`).
@@ -452,16 +454,32 @@ mod forced {
                             // The map's own refusal (too few members, or a refusal of the second callback).
                             (Some(r), _) => run.result = Err(r),
                             (None, Some((map, placement))) => {
-                                match map_gate(list_ref, &lm.refits, &placement, params) {
-                                    Ok(gate) => {
-                                        // `exptime_s` was valid to get here.
-                                        let t = zp.exptime_s.unwrap_or(f64::NAN);
-                                        let outcome = forced_zero_point(list_ref, &lm, &placement, t, params);
+                                // The gate and the statistic are pure but not exempt from a bug: a panic here must not
+                                // lose the Analysis measurement either (`pm` is returned whatever the verdict).
+                                let composed = catch_unwind(AssertUnwindSafe(|| {
+                                    #[cfg(test)]
+                                    if STATISTIC_PANICS.with(|c| c.get()) {
+                                        panic!("the statistic panicked (test)");
+                                    }
+                                    let gate = map_gate(list_ref, &lm.refits, &placement, params)?;
+                                    // `exptime_s` was valid to get here.
+                                    let t = zp.exptime_s.unwrap_or(f64::NAN);
+                                    Ok::<_, ForcedRefusal>((gate, forced_zero_point(list_ref, &lm, &placement, t, params)))
+                                }));
+                                match composed {
+                                    Ok(Ok((gate, outcome))) => {
                                         run.result = outcome.result;
                                         run.gate = Some(gate);
                                         run.outcome = Some(outcome);
                                     }
-                                    Err(r) => run.result = Err(r),
+                                    Ok(Err(r)) => run.result = Err(r),
+                                    Err(payload) => {
+                                        tracing::error!(
+                                            error = %panic_text(&*payload),
+                                            "forced list: the gate or the statistic panicked"
+                                        );
+                                        run.result = Err(ForcedRefusal::Internal);
+                                    }
                                 }
                                 run.map = Some(map);
                                 run.placement = Some(placement);
@@ -949,7 +967,7 @@ mod tests {
     mod forced {
         use super::*;
         use crate::analysis::zero_point::{anchor_zero_point, ForcedListParams, ForcedRefusal};
-        use crate::analysis::analyzer::forced::PLACEMENT_PANICS;
+        use crate::analysis::analyzer::forced::{PLACEMENT_PANICS, STATISTIC_PANICS};
         use solvemyastro::{CatalogStar, WcsSolution};
 
         const ZP_TRUE: f64 = 24.0;
@@ -1087,8 +1105,8 @@ mod tests {
             assert!(pm.stars.len() >= 400);
         }
 
-        /// L1: the one path where the budget reports an aperture correction: a Bayer mosaic. The list is fitted on the green
-        /// sites, the anchor is the budget fits' zero point times the reported `c` (c = 1.22 here: without it the anchor
+        /// L1: the one path where the budget reports an aperture correction: a Bayer mosaic. The map stars are fitted on the
+        /// green sites and every list star is summed on them, the anchor is the budget fits' zero point times the reported `c` (c = 1.22 here: without it the anchor
         /// misses by 0.21 mag), and the zero point lands within 0.01 mag of the truth the catalogue was made from (0.002
         /// measured).
         #[test]
@@ -1317,6 +1335,28 @@ mod tests {
             same_analysis("placement panic", &pm, &plain);
             let r = run.expect("a solved frame is judged").result.unwrap_err();
             assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::Internal, "internal", false));
+        }
+
+        #[test]
+        fn a_panicking_statistic_keeps_the_measurement() {
+            let (frame, cat, wcs) = solved_mono(300, 1400, 1000, 71);
+            let plain = measure_raw_frame(&frame, &cfg(), None);
+            STATISTIC_PANICS.with(|c| c.set(true));
+            let (pm, run) = measure_with_zero_point(
+                &frame,
+                &cfg(),
+                None,
+                Some(&inputs(&wcs)),
+                &ForcedListParams::default(),
+                |_, _, _, _, _| Ok(cat.clone()),
+            );
+            STATISTIC_PANICS.with(|c| c.set(false));
+            same_analysis("statistic panic", &pm, &plain);
+            let run = run.expect("a solved frame is judged");
+            let r = run.result.unwrap_err();
+            assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::Internal, "internal", false));
+            // The figures the gate had not produced are absent; the map and the placement stand.
+            assert!(run.gate.is_none() && run.outcome.is_none() && run.map.is_some() && run.placement.is_some());
         }
     }
 }
