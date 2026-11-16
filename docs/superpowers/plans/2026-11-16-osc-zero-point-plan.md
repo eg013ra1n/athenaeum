@@ -1,5 +1,7 @@
 # OSC zero point — plan
 
+> Tasks 4–8 are superseded by `2026-11-16-forced-list-zero-point-plan.md` (forced-list spec, 2026-11-16); Tasks 1–3 stand.
+
 Spec: `docs/superpowers/specs/2026-11-16-osc-zero-point-design.md` (rulings O1–O7, bars §6). Worktree
 `.claude/worktrees/osc-zp`, branch `collab-v3-wave6-5-osc`; rustafits branch `osc-green-aperture` inside the worktree's
 submodule (its commits carry no trailer). Ledger (main checkout): `.superpowers/sdd/2026-11-16-osc-zp/progress.md`.
