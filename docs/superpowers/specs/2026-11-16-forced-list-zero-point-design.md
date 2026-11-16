@@ -1,8 +1,9 @@
 # Forced-list zero point — mono and OSC (design)
 
 Date: 2026-11-16. Status: draft for the owner; amended the same day by the model re-audit (F5) after the first Phase A
-stopped (§4.5). Follows `2026-11-15-collab-v3-wave6-5-zero-point-design.md` (§5.1, §6, §9; merged to local `main`, not
-pushed) and `2026-11-16-osc-zero-point-design.md` (O1–O7; its Phase A stopped).
+stopped (§4.5), and by the plan review of that amendment (fable, `review-g0-spec-plan-fable.md`). Follows
+`2026-11-15-collab-v3-wave6-5-zero-point-design.md` (§5.1, §6, §9; merged to local `main`, not pushed) and
+`2026-11-16-osc-zero-point-design.md` (O1–O7; its Phase A stopped).
 Evidence: ledger `.superpowers/sdd/2026-11-16-osc-zp/` (`task-3c-report-r0.md`, `research-web.md`, `task-F4-report-r0.md`,
 `task-F5-report-r0.md`, the controller's rulings RR1–RR4 in `progress.md`); data and the emulations in
 `~/.athenaeum-acc/2026-11-16-osc-zp/out/` (`3c/`, `r1/`, `4d/emul4d.py`, `4d/emul4d-r3.txt`; the first Phase A `f0/`, its
@@ -86,7 +87,8 @@ the cap, §5.1: on real frames it churned a sum.)
   and the offset depends on G (10-18: G 12.5–13 reads 18.42 against 19.13 at 13–13.5, red giants). Emulated ZP shift
   −0.008 / +0.005 mag at L = 0.5, +0.012 / +0.040 at L = 1: the loss reads up to 4 % small. Phase A measured more: a
   real change L reads (1 + κ)·L with κ −0.18 in LDN 1272 (reddened background stars), −0.12 ATR LDN 1272, −0.08 LBN 582
-  (F4). FL8 takes it out on read (§5.6): |κ| ≤ 0.022 in every field after it.
+  (F4). FL8 takes it out on read (§5.6): after it κ's median is within ±0.022 in every field, its 10–90 % up to
+  0.074 (QHY L).
 - **(b) Per rig, fixed from data.** Removes that cost but needs a stored window per rig and exposure, frozen by the
   first frame measured (order-dependent; two machines differ under sync) or chosen on read (a moving window turns
   stored ZPs stale, and re-measuring costs a file read). Rejected.
@@ -197,11 +199,16 @@ floor (any peak when the plane shows no clipped evidence).
   straight line with four rounds of 3 σ (MAD) clipping; ε = intercept / (π·(6² − 4²)·FWHM_ref²). Each flux is
   `f = S(R) − ε·π·R²`.
 - **Screen**: `zp_i = G + 2.5·log10(f / t)` over the positive fluxes gives a 4 σ-clipped median `m` and `σ` (today's
-  code). A member is dropped when `f` is above `t·10^(0.4·(m + 4σ − G))`, or `f + 4·n` is below
-  `t·10^(0.4·(m − 4σ − G))`, with `n = sky scatter·√(π·R²)`. A negative flux inside its noise stays.
-- **Zero point**: `2.5·log10( Σ w·f / (t·Σ w·10^(−0.4·G)) )` over the members left.
+  code). A member is dropped when `f + 4·n` is below `t·10^(0.4·(m − 4σ − G))`, with `n = sky scatter·√(π·R²)`; a
+  negative flux inside its noise stays. Above `t·10^(0.4·(m + 4σ − G))` a member is not dropped: its flux counts at that
+  limit, so a star that the jitter of `m` and `σ` carries across it moves the ZP continuously (the emulation dropped it:
+  on the Duo's LDN 1272 ten stars near that limit, in some frames and out of others, moved the ZP 0.006–0.009 mag each).
+- **Zero point**: `2.5·log10( Σ w·f / (t·Σ w·10^(−0.4·G)) )` over the members left; `Σ w·f ≤ 0` refuses
+  `too_scattered`.
 - **Window slope**: `s = 1.0857·[ (Σ_faint ramp f − Σ_bright ramp f)/(ρ·Σ w·f) − (the same with 10^(−0.4·G)) ]`, the
-  ramps the members with `w < 1` at each edge: the ZP's change per magnitude the window moves fainter.
+  ramps the members with `w < 1` at each edge: the ZP's change per magnitude the window moves fainter. When the
+  catalogue ends before `G_f − ρ` the faint ramp is empty and its term is zero, since that edge does not move (QHY L: the
+  catalogue ends at G 15.20 in a window `[14.06, 17.06]`, the faint ramp empty in all 295 frames).
 - Valid with ≥ 50 members of non-zero weight and `σ ≤ 1.0` mag; `zp_stars` counts those members, `zp_sigma` is `σ`.
   Refusals: `no_exposure`, `no_anchor`, `poor_solve`, `too_few_stars` (with the list size: a shallow catalogue or sparse
   field is told from a measurement that failed), `too_scattered`; stored besides (plan, Review rulings) `colour_camera`,
@@ -211,16 +218,20 @@ floor (any peak when the plane shows no clipped evidence).
 it, §6):
 
 - **the map**: when the list holds fewer than 40 map stars (30 / 0.75), a map of fewer than 30 members is
-  `too_few_stars`, not `poor_solve` (a sparse field, not a bad solve); from 40 map stars on, §5.2's rule.
+  `too_few_stars`, not `poor_solve` (a sparse field, not a bad solve); from 40 map stars on, §5.2's rule. At 40 map stars
+  a good frame at 0.86 kept falls under 0.75 in about 2 % of draws and a bad one at 0.64 passes in about 7 % (3 σ between
+  them asks about 100): 40 stands on zero false refusals in Phase A's decimated round (M5, §6).
 - **the pedestal** is fitted over every member whatever its weight and is never replaced: its error on the ZP is about
   0.03 / √n mag at n members (an estimate at the corpus' sky noise: 0.004 at 50), inside B2, so it needs no fallback
   above the validity floor. A fit left with fewer than 20 points after its clipping, or with no spread in
   `S(3·FWHM_ref)`, refuses the frame `too_scattered`: there is never a ZP with ε = 0, which would carry the annulus bias of
-  §4.3.
-- **the window slope** needs at least 10 members on each ramp; with fewer the frame stores no slope (`zp_window_slope`
-  NULL) and its ZP stays valid. On read it is reduced with its frame set's median slope (§5.6); a set in which no frame
-  has a slope reads its ZPs unreduced (`s̄` = 0).
-- **the faint edge** deepens to `G_b + 4.5` as before (unjudged).
+  §4.3. Phase A gives per set the rms of the reduced ZP's decimated − full difference against n, and the pedestal's part.
+- **the window slope** needs at least 10 members on the bright ramp (the faint ramp's term is taken as it is, zero on a
+  window cut by the catalogue, above); with fewer the frame stores no slope (`zp_window_slope` NULL) and its ZP stays
+  valid. On read it is reduced with its frame set's median slope (§5.6); a set in which no frame has a slope reads its
+  ZPs unreduced (`s̄` = 0). Phase A gives the share of frames with a slope per set and round.
+- **the faint edge** deepens to `G_b + 4.5` as before (unjudged); where it is set by count the slope's faint term is
+  wrong (that edge moves by count, not with the window), which Phase A's anchor-shifted re-measures measure (§6).
 
 ### 5.4 Where it runs (no new command: Tauri and Axum call the same core)
 
@@ -250,17 +261,27 @@ it, §6):
 
 ### 5.6 Loss, gate, UI
 
-- **Reduction on read** (FL8): for the frames of one rig and frame set holding a current ZP, `P` = median
-  `zp_window_bright`, `s̄` = median `zp_window_slope` (over the frames that have one; 0 when none); a frame reads
-  `ZP − s̄·(G_b − P)`. A single frame reads its ZP. The rig-wide fallback reduces each frame set within itself first.
-  Stored values are never rewritten: the cell shows the stored ZP, the loss is taken from the reduced ones. Checked
-  against a ZP measured in a fixed window: rms 0.0008–0.0014 mag (max 0.004); κ after it ≤ 0.022 in every field (was
-  −0.18); the 10-18 flip step then reads 0.138 / 0.159 against the stack's 0.139 / 0.167.
-- `transparency.rs` keeps its arithmetic (rig, frame set, 90th percentile, 30 frames, 2 nights, fallback), reads only
-  version-3 ZPs, reduced as above; mosaics join the references (`is_mosaic`); other colour files keep `ColourCamera`.
+- **Reduction on read** (FL8): for the frames of one rig, frame set and exposure (rounded to 0.1 s) holding a current
+  ZP, `P` = median `zp_window_bright`, `s̄` = median `zp_window_slope` (over the frames that have one; 0 when none); a
+  frame reads `ZP − s̄·(G_b − P)`. A single frame reads its ZP. The rig-wide fallback, keyed by rig and exposure, reduces
+  each frame set and exposure within itself first. The exposure is in the key because `G_b` carries `+2.5·log10(t)`:
+  120 s beside 300 s is a 1.0 mag window step, 60 s beside 300 s 1.75, while the linear reduction is measured to ±0.5
+  only. The cost: a set shot at two exposures has two references, and the smaller may fall under the reference's
+  minimum; Phase A gives the reduced ZP's residual at anchor shifts of 0.44, 1.0 and 1.75 mag so the split can be lifted
+  later. Stored values are never rewritten. `Transparency::zero_point` carries the reduced value, so a row's ZP and its
+  loss are one quantity (shown stored, two frames could read their ZPs in one order and their losses in the other, by
+  `s̄·ΔG_b`, 0.05 mag on the corpus); the cell drops its `± zp_sigma`, now the field's per-star scatter (0.13–0.59 mag)
+  beside a ZP good to 0.005. Checked against a ZP measured in a fixed window: rms 0.0008–0.0014 mag (max 0.004); κ after
+  it, by a 0.5 mag window move, has its median within ±0.022 in every field (was −0.18) and its 10–90 % within 0.042 on
+  the Duo's LDN 1272 and 0.057–0.074 on QHY L (where the reduction turns a raw +0.003…+0.011 into −0.016…−0.022); the
+  10-18 flip step then reads 0.138 / 0.159 against the stack's 0.139 / 0.167.
+- `transparency.rs` keeps its arithmetic (rig, frame set, 90th percentile, 30 frames, 2 nights, fallback), its pools
+  keyed by exposure as well, reads only version-3 ZPs, reduced as above; mosaics join the references (`is_mosaic`); other
+  colour files keep `ColourCamera`.
 - `NotMeasured` says "transparency not measured yet — run Analyze on its frame set"; `NoStarMetrics` goes (no stored
   star rows are read); a refusal says why in one sentence: `poor_solve` reads "the stars are not where the plate solve
-  puts them — solve this frame again"; too few catalogue stars, install the deeper tier, when the list was small. Gate: O7
+  puts them — solve this frame again" (the advice stands only if a new solve of a refused frame measures; refused again,
+  the sentence ends before it, M5, §6); too few catalogue stars, install the deeper tier, when the list was small. Gate: O7
   stays; a frame without a current ZP gets no verdict and is not blocked. New fields and codes go into the logging
   dictionary.
 
@@ -277,7 +298,7 @@ owner.
 
 | Check | Bar | Establishes / cannot establish |
 | ---- | ---- | ---- |
-| B1 members of non-zero weight a frame shares with its successor | every pair ≥ 80 % | the 3c mechanism is gone (today 5–7.5 %); not that the ZP is right |
+| B1 members of non-zero weight left by the screen that a frame shares with its successor | every pair ≥ 80 % | the 3c mechanism is gone (today 5–7.5 %); not that the ZP is right |
 | B2 stability, median \|ΔZP\| | ≤ 0.015 on the common-set nights; elsewhere ≤ 0.020 and not above today's (vdB 0.021–0.024, 6.5 L / H 0.024) | frame-to-frame noise; not a slow drift or a constant bias |
 | B3 ZP − 2.5·log10(t_flux / t), common set | rms ≤ 0.015; FWHM slope within ±0.04 mag/px | agreement with an independent calibrated photometry; not seeing independence below the ~0.04–0.06 mag/px spread of the references' own unconverged apertures (3c) |
 | B4 ZP = a + kX (+ s·[after flip], reported), per night | \|k − k_stack\| ≤ 0.02 where ΔX ≥ 0.4, one pier side at a time (F7): the ATR2600M L common set (LBN 582 10-18) and the Duo's 10-18 after the flip (before it ΔX is 0.07) | the ZP follows real light loss in size; not haze or cloud |
@@ -288,9 +309,10 @@ owner.
 | B9 the Analysis measurement with and without a list | every `StarFit`, `FrameSummary`, `PlaneMeasurement` field bit-identical | no Analysis number moves (rustafits test + probe) |
 
 A bar judged on no night of its class is a STOP (no silent pass); B1 counts pairs where both frames are valid; B2–B5 and
-B8 are judged on the reduced ZP (§5.6), per rig and object (the probe's frame set); B3 is judged one pier side at a time
-on a two-sided night (F7), and its slope is also fitted against the same ratio of sums at `6·FWHM_ref` with its pedestal on
-the same members, a miss called only when both agree; B6 exempts frames with a plane verdict (plan, Review rulings).
+B8 are judged on the reduced ZP (§5.6), per rig, object (the probe's frame set) and exposure; B3 is judged one pier side
+at a time on a two-sided night (F7) and prints three FWHM slopes, ZP − stack, ZP − 6r and 6r − stack (6r: the same ratio
+of sums at `6·FWHM_ref` with its pedestal on the same members), a slope beyond ±0.04 against the stack being no pass
+whether or not 6r echoes it (M2 below); B6 exempts frames with a plane verdict (plan, Review rulings).
 
 Referees (the controller's rulings after F5, `progress.md`; no threshold moved):
 
@@ -301,21 +323,35 @@ Referees (the controller's rulings after F5, `progress.md`; no threshold moved):
   night is a STOP.
 - **RR2** — B4 gets no allowance for the stack's own error (that would move a threshold). A miss inside Δk's own standard
   error goes to the owner as a stated limit, with its numbers.
+- **M2 (plan review)** — 6r is not independent: it shares the list, positions, annulus, pedestal, screen and weights and
+  differs by the light between 4 and 6·`FWHM_ref` only (above F = 4 px, `R = 2F` nearly reaches it), so B3's slope could
+  pass on the referee alone (the Duo's 10-18 sat at −0.0376 of 0.04 in the emulation). A slope beyond ±0.04 against the
+  stack that 6r does not echo is no pass: it goes to the owner as a stated limit with the three slopes (RR2's rule).
+- **M5 (plan review)** — the 40 map stars of a sparse list (§5.3) stand on zero false `poor_solve` refusals in the
+  decimated round (a frame valid in the full round refused in the decimated one); any goes to the owner with the round's
+  figures (RR2's rule). `poor_solve`'s advice to solve again stands only if the acceptance's new solve of a refused frame
+  measures; refused again, its sentence says only that the stars are not where the plate solve puts them.
 - **RR3** — B3's cross-check stays as written, on a repaired referee: the same sum at `6·FWHM_ref` (the r0 6F referee's
-  aperture outgrew the list's isolation).
+  aperture outgrew the list's isolation); M2 sets what its echo means.
 - **RR4** — Phase A again takes an identity pass (B9) and a decimated-list round (every 10th list star by its key: the
   sparse field no corpus set has; reported, not judged); the list's cost above 70 ms a frame is a STOP; every run goes
   through the job's memory guard.
 
-Reported, not judged: the budget's reported `c` (the mosaic anchor); list size, map figures, pedestal, window slope (and,
-on every tenth frame, a ±0.1 mag re-measure beside it) and refusals per frame; the decimated round; the cost. Unjudged
-(no data in the corpus): a window move beyond 0.14 mag within a set, the largest the corpus holds (haze; its largest dip
-is 0.09 mag; a cloudy night is owed), where the linear reduction is unverified; a list under ~500 stars (§5.3); under 16
-bit, long focal length, high latitude; the faint-edge extension.
+Reported, not judged: the budget's reported `c` (the mosaic anchor); list size, map figures, pedestal, window slope, the
+members the screen counts at its upper limit (M1, per night) and refusals per frame; on every tenth frame, re-measures
+with the anchor shifted by ±0.1 and ±0.5 mag (the analytic slope against the re-measured one, κ after the reduction) and
+by ±0.44, ±1.0 and ±1.75 mag (the reduced ZP's residual at an exposure step, §5.6); the decimated round (§5.3's figures:
+map stars, the first pass's member share, the refit kept share, false `poor_solve`, the corpus' eight bad frames, the
+reduced ZP against the full round's with its pedestal part, the share of frames with a slope); one solved set outside
+the nine; the cost. Unjudged (no data in the corpus): a window move beyond 0.5 mag within a set (the corpus' real moves
+reach 0.14 mag, its haze dip 0.09; F5 measured the reduction at ±0.5 by moving the window, Phase A by moving the anchor;
+a cloudy night is owed), where the linear reduction is unverified; a window cut by the catalogue's depth (QHY L: 1.1 mag
+wide, 64 % of members on the bright ramp); a list under ~500 stars (§5.3); under 16 bit, long focal length, high
+latitude; the faint-edge extension.
 Acceptance on a catalogue copy (headless web): a solved set analysed stores version-3 ZPs; a set solved after analysis
-fills in by the solve pass; an offline file says "run Analyze"; a frame refused `poor_solve` says to solve it again; an
-existing stack is bit-identical and recomputes no cached stage; a low-altitude frame reads its loss; a rig without a
-reference is not blocked and says why.
+fills in by the solve pass; an offline file says "run Analyze"; a frame refused `poor_solve` says to solve it again, and
+solved again measures or loses that advice (M5); an existing stack is bit-identical and recomputes no cached stage; a
+low-altitude frame reads its loss; a rig without a reference is not blocked and says why.
 
 ## 7. Order of work
 
