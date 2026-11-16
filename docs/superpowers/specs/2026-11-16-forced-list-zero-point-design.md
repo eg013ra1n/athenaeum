@@ -153,11 +153,29 @@ budget's fits from the same measurement. Positions are 0-based in file row order
   entering at an edge enters with weight 0, so a ZP changes continuously as the window moves.
 - **Region**: inside 0.9 of the half-diagonal (6.5) and at least `13·FWHM_ref` from every edge (the map fits' ring sky
   fits; a list star whose aperture annulus leaves the frame is no member, §5.3).
-- **Isolation, by the catalogue only**: no neighbour with ΔG ≤ 4 within `8·FWHM_ref` (was 4: the aperture and its
+- **Isolation, by the catalogue and by the frame's own detections**: no neighbour with ΔG ≤ 4 within `8·FWHM_ref` (was 4: the aperture and its
   pedestal radii reach `6·FWHM_ref`), no star brighter than `G_b − 2` within `10·FWHM_ref` (halo, bleed, spikes).
   Contamination goes with distance over PSF width; `FWHM_ref` is arcsec on a well-sampled rig, pixels at the sampling
   floor, and never moves with seeing, so isolation never churns (6.5's 3 × the frame's FWHM did). ΔG 4 is 2.5 % of the
   light.
+  The image carries what the catalogue lacks (G7, from G6): the tiers drop every Gaia source with RUWE ≥ 1.4 at ingest
+  (`gaia_bulk.rs`, `GAIA_RUWE_MAX`), a position-quality cut that is wrong for a neighbour test, and they end at each
+  cell's tier depth (G 14.4–17.4 here); 7.6–10.9 % of a frame's list weight sat beside such a star (G 10–13, RUWE
+  1.5–21 on the nine checked), lifting a field's level by +0.018 (vdB 152) … +0.045 (Duo LDN 1272), a level and no
+  seeing slope. So a list star is also dropped when a **detected seed** that is not its own lies within
+  `8·FWHM_ref` with `G_seed ≤ G + 4` and a peak of at least 10 σ_sky (`detected_neighbour_min_peak_sigma`, the plane's
+  noise): the catalogue rule's constants, asked of the image. A star's own seed is the nearest one within
+  `max(1.5 px, FWHM_ref)` of its projection (`own_seed_radius_px`). A seed's magnitude is its flux read through the
+  frame's own calibration `k`, the median of `flux·10^(0.4·G)` over the shallow-window candidates (the catalogue rule's
+  survivors with `G ≤ G_b + 3`) that have exactly one seed within the own-seed radius, that seed being nearer to no other
+  such candidate: `G_seed = −2.5·log10(flux / k)`. Fewer than 20 such pairs (`seed_calibration_min_pairs`) skip the rule
+  for the frame with a `warn!`, never a refusal; the row's `seed_calibration_pairs` says how many there were and
+  `detected_neighbours_removed` how many candidates this rule removed that the catalogue rule had kept. The rule runs
+  before the faint edge's count and the cap, so the window deepens on the stars that are left. It needs the plane's
+  matched-filter seeds (`PlaneMeasurement::detected`): a plane that handed its seeds in, as a mosaic does (the green-site
+  measurement keeps them inside rustafits), has none and the rule is skipped there with a `debug!`; a rustafits change
+  to hand the native seeds to the first callback turns it on (open; see the G7 report). Not mirrored for the `G_b − 2`
+  halo rule. A judged round (g2) compares the list with and without it (`--detected_neighbours false`).
 - **No cap.** The hash cap churned a sum (cap 1 000: B2 0.0163 on 09-13; no cap 0.0077; ramped edges 0.0047). A guard of
   12 000 stars stays, by the same hash of the catalogue record (G, position at 1″): above it a star stays when its key
   falls under `12 000 / n`. No rig here reaches it; unjudged.
@@ -198,14 +216,20 @@ floor (any peak when the plane shows no clipped evidence).
 - **Pedestal** ε: over the members (every weight), `D = S(6·FWHM_ref) − S(4·FWHM_ref)` against `S(3·FWHM_ref)`, a
   straight line with four rounds (`pedestal_clip_rounds`) dropping the residuals beyond 3 σ about zero, σ = 1.4826 × the
   median deviation of the residuals from their median (G2 review M1: the clip is about zero, as emulated, not about the
-  median residual; four rounds stop unconverged on most QHY L and ATR frames, which G4 reports with a
-  `--pedestal_clip_rounds 10` row); ε = intercept / (π·(6² − 4²)·FWHM_ref²). Each flux is
+  median residual; four rounds stop unconverged on most QHY L and ATR frames, but ten move the ZP ≤ 0.005, G4);
+  the line is refitted after the last round, where the emulation keeps the fit from before its last clip (one rank step
+  apart; the kept share and the collapse to `None` are `pedestal_kept_share` in the row, G3); ε = intercept /
+  (π·(6² − 4²)·FWHM_ref²). Each flux is
   `f = S(R) − ε·π·R²`.
 - **Screen**: `zp_i = G + 2.5·log10(f / t)` over the positive fluxes gives a 4 σ-clipped median `m` and `σ` (today's
   code). A member is dropped when `f + 4·n` is below `t·10^(0.4·(m − 4σ − G))`, with `n = sky scatter·√(π·R²)`; a
   negative flux inside its noise stays. The upper rule is a taper (G2 review H1): a member with `zp_i > m + 4σ` keeps its
-  own flux and gets the weight × `clamp(1 − (zp_i − m − 4σ)/(τ·σ), 0, 1)`, τ = `screen_taper_sigma`, default 1.0 (τ ≤ 1e-9
-  is a plain drop); a member whose weight reaches zero is dropped and not counted. A star that the jitter of `m` and `σ`
+  own flux and gets the weight × `clamp(1 − (zp_i − m − 4σ)/(τ·σ), 0, 1)`, τ = `screen_taper_sigma`, **default 0: a
+  plain drop** (G4/G7: the taper's level and rms against the drop are equal on 14 of 15 nights and worse on the
+  thinnest, Duo 09-13 B2 0.0049 against 0.0034, B3 slope −0.0354 against −0.0238, so the drop, as emulated, ships; the
+  taper stays reachable by `--screen_taper_sigma 1`; a NaN τ is a start-up error of the params,
+  `ForcedListParams::validate`, never a stored `too_scattered`); a member whose weight reaches zero is dropped and not
+  counted. A star that the jitter of `m` and `σ`
   carries across the limit then moves the ZP continuously (a plain drop does not: on the Duo's LDN 1272 ten stars near that
   limit, in some frames and out of others, moved the ZP 0.006–0.009 mag each). The first answer, counting such a member at
   the limit `10^(0.4·4σ)` times its expected flux (F5 plan review M1), is **withdrawn**: measured on g0 it biased the ZP
@@ -218,8 +242,9 @@ floor (any peak when the plane shows no clipped evidence).
   does not correct it (G2 review L6; G4 reports it).
 - **Zero point**: `2.5·log10( Σ w·f / (t·Σ w·10^(−0.4·G)) )` over the members left; `Σ w·f ≤ 0` refuses
   `too_scattered`.
-- **Window slope**: `s = 1.0857·[ (Σ_faint ramp f − Σ_bright ramp f)/(ρ·Σ w·f) − (the same with 10^(−0.4·G)) ]`, the
-  ramps the members with `w < 1` at each edge: the ZP's change per magnitude the window moves fainter. When the
+- **Window slope**: `s = 1.0857·[ (Σ_faint ramp τ_i·f − Σ_bright ramp τ_i·f)/(ρ·Σ w·f) − (the same with τ_i·10^(−0.4·G)) ]`,
+  the ramps the members within ρ of each edge (window weight under 1; `τ_i` is the member's screen taper, 1 for all of
+  them at the default τ = 0): the ZP's change per magnitude the window moves fainter. When the
   catalogue ends before `G_f − ρ` the faint ramp is empty and its term is zero, since that edge does not move (QHY L: the
   catalogue ends at G 15.20 in a window `[14.06, 17.06]`, the faint ramp empty in all 295 frames).
 - Valid with ≥ 50 members of non-zero weight and `σ ≤ 1.0` mag; `zp_stars` counts those members, `zp_sigma` is `σ`.

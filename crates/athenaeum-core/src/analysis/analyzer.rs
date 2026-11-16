@@ -333,6 +333,8 @@ mod forced {
                 anchor: anchor.zero_point,
                 full_scale: full_scale_working(&frame.domain),
                 exptime_s: exptime,
+                detected: &pm.detected,
+                noise_sigma: pm.noise.sigma,
             },
             params,
             pool,
@@ -535,6 +537,8 @@ mod forced {
             tracing::debug!(
                 list = run.list.as_ref().map_or(0, |l| l.stars.len()),
                 members = run.outcome.as_ref().map_or(0, |o| o.members as usize),
+                detected_neighbours_removed = run.list.as_ref().map_or(0, |l| l.detected_neighbours_removed),
+                seed_calibration_pairs = run.list.as_ref().map_or(0, |l| l.seed_calibration_pairs),
                 map_members = run.map.as_ref().map_or(0, |m| m.members),
                 map_kept_share = run.gate.as_ref().map_or(f64::NAN, |g| g.kept_share),
                 map_residual_px = run.map.as_ref().map_or(f64::NAN, |m| m.residual_px),

@@ -268,6 +268,14 @@ impl Args {
             isolation_radius_fwhm: self.take_parsed("isolation_radius_fwhm")?.unwrap_or(d.isolation_radius_fwhm),
             bright_dmag: self.take_parsed("bright_dmag")?.unwrap_or(d.bright_dmag),
             bright_radius_fwhm: self.take_parsed("bright_radius_fwhm")?.unwrap_or(d.bright_radius_fwhm),
+            detected_neighbours: self.take_parsed("detected_neighbours")?.unwrap_or(d.detected_neighbours),
+            own_seed_radius_px: self.take_parsed("own_seed_radius_px")?.unwrap_or(d.own_seed_radius_px),
+            detected_neighbour_min_peak_sigma: self
+                .take_parsed("detected_neighbour_min_peak_sigma")?
+                .unwrap_or(d.detected_neighbour_min_peak_sigma),
+            seed_calibration_min_pairs: self
+                .take_parsed("seed_calibration_min_pairs")?
+                .unwrap_or(d.seed_calibration_min_pairs),
             cap: self.take_parsed("cap")?.unwrap_or(d.cap),
             map_window_mag: self.take_parsed("map_window_mag")?.unwrap_or(d.map_window_mag),
             map_max_stars: self.take_parsed("map_max_stars")?.unwrap_or(d.map_max_stars),
@@ -2859,7 +2867,7 @@ fn cmd_bigap(mut args: Args) -> Result<()> {
 // figure of every list star (`<x>.ap.tsv`). Today's zero point (6.5's matcher over the budget fits, times the reported
 // `c` on a mosaic) is measured on the same frame for the comparisons of B2 and B8. The catalogue is opened read-only.
 
-const FORCED_HEADER: &str = "frame_id\tfile_name\tobject\tfilter\tnight\tdate_obs\texptime\trig\tlayout\tairmass\tpier\trotation_deg\tstars_detected\tmedian_fwhm\tscale\tfwhm_ref\tanchor\tanchor_stars\twindow_bright\twindow_faint\tlist_before_cap\tlist_stars\tmap_stars\tmap_members\tmap_offset_px\tmap_residual_px\tmap_kept_share\taperture_radius_px\tmembers\ttapered\tzp_stars\tpedestal\tpedestal_kept_share\tpedestal_zp_mag\tannulus_off\tc_budget\tzero_point\tsigma\trefusal\tcentre_median_px\twindow_slope\tslope_remeasured\tzero_point_6r\tzero_point_today\ttoday_refusal\tidentity\tcall_ms\tplain_ms\tlist_fit_ms\tlist_refit_ms\tlist_ap_ms\tlist_kb\trss_mb";
+const FORCED_HEADER: &str = "frame_id\tfile_name\tobject\tfilter\tnight\tdate_obs\texptime\trig\tlayout\tairmass\tpier\trotation_deg\tstars_detected\tmedian_fwhm\tscale\tfwhm_ref\tanchor\tanchor_stars\twindow_bright\twindow_faint\tlist_before_cap\tlist_stars\tdetected_neighbours_removed\tseed_calibration_pairs\tmap_stars\tmap_members\tmap_offset_px\tmap_residual_px\tmap_kept_share\taperture_radius_px\tmembers\ttapered\tzp_stars\tpedestal\tpedestal_kept_share\tpedestal_zp_mag\tannulus_off\tc_budget\tzero_point\tsigma\trefusal\tcentre_median_px\twindow_slope\tslope_remeasured\tzero_point_6r\tzero_point_today\ttoday_refusal\tidentity\tcall_ms\tplain_ms\tlist_fit_ms\tlist_refit_ms\tlist_ap_ms\tlist_kb\trss_mb";
 
 const FORCED_STARS_HEADER: &str = "frame_id\tkey\tg\tweight\tmember\tscreened_in";
 
@@ -2919,6 +2927,9 @@ struct ForcedRow {
     window_faint: Option<f64>,
     list_before_cap: Option<i64>,
     list_stars: Option<i64>,
+    /// List candidates the frame's own detections removed (G7), and the (star, seed) pairs their flux calibration had.
+    detected_neighbours_removed: Option<i64>,
+    seed_calibration_pairs: Option<i64>,
     map_stars: Option<i64>,
     map_members: Option<i64>,
     map_offset_px: Option<f64>,
@@ -2985,6 +2996,8 @@ impl ForcedRow {
             num(self.window_faint, 3),
             int(self.list_before_cap),
             int(self.list_stars),
+            int(self.detected_neighbours_removed),
+            int(self.seed_calibration_pairs),
             int(self.map_stars),
             int(self.map_members),
             num(self.map_offset_px, 4),
@@ -3050,6 +3063,8 @@ impl ForcedRow {
             window_faint: x("window_faint"),
             list_before_cap: i("list_before_cap"),
             list_stars: i("list_stars"),
+            detected_neighbours_removed: i("detected_neighbours_removed"),
+            seed_calibration_pairs: i("seed_calibration_pairs"),
             map_stars: i("map_stars"),
             map_members: i("map_members"),
             map_offset_px: x("map_offset_px"),
@@ -3457,6 +3472,8 @@ fn forced_frame(
         row.window_faint = Some(l.window_faint);
         row.list_before_cap = Some(l.list_before_cap as i64);
         row.list_stars = Some(l.stars.len() as i64);
+        row.detected_neighbours_removed = Some(i64::from(l.detected_neighbours_removed));
+        row.seed_calibration_pairs = Some(i64::from(l.seed_calibration_pairs));
         row.map_stars = Some(l.map.len() as i64);
     }
     if let Some(m) = &run.map {
@@ -3691,6 +3708,7 @@ fn cmd_forced(mut args: Args) -> Result<()> {
         .unwrap_or(IDENTITY_EVERY_DEFAULT);
     let dump_ap = args.take_parsed::<u8>("dump-ap")?.unwrap_or(0) != 0;
     let (fp, params, given) = take_forced_params(&mut args)?;
+    fp.validate().map_err(|e| anyhow!("--{e}"))?;
     check_annulus_rule(&fp)?;
 
     let conn = open_read_only(&db)?;
@@ -4829,9 +4847,11 @@ fn forced_verdict_lines(
         .iter()
         .map(|n| {
             format!(
-                "{}: list {}, members {} (tapered {}), map {}/{} kept {}, pedestal {} (clip kept min {} med {}, r with the reduced ZP {})",
+                "{}: list {} (seed rule removed {}, {} pairs), members {} (tapered {}), map {}/{} kept {}, pedestal {} (clip kept min {} med {}, r with the reduced ZP {})",
                 n.label(),
                 show(med(&n.rows, &|r| r.list_stars.map(|v| v as f64)), 0),
+                show(med(&n.rows, &|r| r.detected_neighbours_removed.map(|v| v as f64)), 0),
+                show(med(&n.rows, &|r| r.seed_calibration_pairs.map(|v| v as f64)), 0),
                 show(med(&n.rows, &|r| r.members.map(|v| v as f64)), 0),
                 show(med(&n.rows, &|r| r.tapered.map(|v| v as f64)), 0),
                 show(med(&n.rows, &|r| r.map_members.map(|v| v as f64)), 0),
@@ -5168,6 +5188,9 @@ mod tests {
             ("isolation_radius_fwhm", |p| p.isolation_radius_fwhm),
             ("bright_dmag", |p| p.bright_dmag),
             ("bright_radius_fwhm", |p| p.bright_radius_fwhm),
+            ("own_seed_radius_px", |p| p.own_seed_radius_px),
+            ("detected_neighbour_min_peak_sigma", |p| p.detected_neighbour_min_peak_sigma),
+            ("seed_calibration_min_pairs", |p| p.seed_calibration_min_pairs as f64),
             ("cap", |p| p.cap as f64),
             ("map_window_mag", |p| p.map_window_mag),
             ("map_max_stars", |p| p.map_max_stars as f64),
@@ -5213,7 +5236,8 @@ mod tests {
             fwhm_floor_px: _, fwhm_ref_arcsec: _, anchor_min_matches: _, window_peak_fraction: _,
             window_bright_margin_mag: _, window_faint_width_mag: _, window_faint_max_mag: _, min_isolated: _,
             window_ramp_mag: _, region_fraction: _, edge_margin_fwhm: _, isolation_dmag: _, isolation_radius_fwhm: _,
-            bright_dmag: _, bright_radius_fwhm: _, cap: _, map_window_mag: _, map_max_stars: _, map_min_snr: _,
+            bright_dmag: _, bright_radius_fwhm: _, detected_neighbours: _, own_seed_radius_px: _,
+            detected_neighbour_min_peak_sigma: _, seed_calibration_min_pairs: _, cap: _, map_window_mag: _, map_max_stars: _, map_min_snr: _,
             map_radius_fwhm: _, map_clip_rounds: _, map_clip_sigma: _, map_clip_floor_px: _, map_min_members: _,
             map_min_kept_share: _, centre_tolerance_px: _, centre_tolerance_fwhm: _, aperture_radius_ref: _,
             aperture_radius_fwhm: _, pedestal_radii_ref: _, pedestal_clip_sigma: _, pedestal_clip_rounds: _,
@@ -5221,7 +5245,11 @@ mod tests {
             clip_sigma: _, min_stars: _, max_sigma_mag: _, screen_taper_sigma: _, slope_min_ramp_members: _,
             decimate: _, anchor_shift_mag: _,
         } = d;
-        assert_eq!(flags.len() + 1, 44, "43 numeric fields have a flag each, the array field has its own");
+        // The one boolean field: read as true / false.
+        let (fp, _, _) = parsed(&["--detected_neighbours", "false"]).unwrap();
+        assert!(d.detected_neighbours && !fp.detected_neighbours);
+        assert_eq!(ForcedListParams { detected_neighbours: d.detected_neighbours, ..fp }, d);
+        assert_eq!(flags.len() + 2, 48, "46 numeric fields have a flag each, the array and the boolean have their own");
     }
 
     #[test]
@@ -6365,6 +6393,8 @@ mod tests {
         full.window_bright = Some(13.4);
         full.window_faint = Some(16.4);
         full.list_stars = Some(998);
+        full.detected_neighbours_removed = Some(37);
+        full.seed_calibration_pairs = Some(640);
         full.map_stars = Some(400);
         full.map_members = Some(371);
         full.map_offset_px = Some(1.2345);
@@ -6395,6 +6425,7 @@ mod tests {
             (back.pier, back.rotation_deg, back.airmass, back.anchor_stars, back.list_stars),
             (Some(1), Some(-90.4), Some(1.2345), Some(31), Some(998))
         );
+        assert_eq!((back.detected_neighbours_removed, back.seed_calibration_pairs), (Some(37), Some(640)));
         assert_eq!(
             (back.map_stars, back.map_members, back.map_offset_px, back.map_residual_px, back.map_kept_share),
             (Some(400), Some(371), Some(1.2345), Some(0.0612), Some(0.9125))

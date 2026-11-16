@@ -31,7 +31,7 @@ use crate::plate_solve::layers::{catalog_identity, open_catalog_layers, CatalogO
 use crate::plate_solve::storage::get_plate_solve;
 use crate::stacking::groups::{color_mode_of, ColorMode};
 use crate::star_measure::analysis_mode::{ListAperture, ListFit, ListMeasurement, ListPlacement, ListRequest};
-use crate::star_measure::MEASURE_VERSION;
+use crate::star_measure::{Seed, MEASURE_VERSION};
 
 /// Version of the measurement; a stored zero point is current only at this value. Version 2: the validity rule changed
 /// (fifty stars and a standard error within 0.035 mag) after version 1 was written to catalogues by development builds.
@@ -471,6 +471,18 @@ pub struct ForcedListParams {
     /// A catalogue star with `G <= G_b - bright_dmag` within `bright_radius_fwhm` (halo, bleed, spikes) drops a star.
     pub bright_dmag: f64,
     pub bright_radius_fwhm: f64,
+    /// The frame's own detections isolate too (the catalogue lacks what the image carries: sources dropped for a
+    /// high RUWE, stars below the tiers' depth, galaxies): a detected seed other than the star's own, within
+    /// `isolation_radius_fwhm * FWHM_ref` of it, with `G_seed <= G + isolation_dmag` and a peak of at least
+    /// `detected_neighbour_min_peak_sigma` plane sigmas, drops the star. `G_seed` is the seed's flux read through a
+    /// per-frame calibration to the catalogue G. Skipped when the plane handed no seeds.
+    pub detected_neighbours: bool,
+    /// A star's own seed is the nearest one within `max(own_seed_radius_px, FWHM_ref)` of its projection.
+    pub own_seed_radius_px: f64,
+    /// A neighbouring seed counts from this peak (background-subtracted, in plane sigmas).
+    pub detected_neighbour_min_peak_sigma: f64,
+    /// The seed flux calibration needs at least this many (star, own seed) pairs; fewer skip the rule for the frame.
+    pub seed_calibration_min_pairs: usize,
     /// A guard: a list above this many stars is thinned by a hash of the catalogue record. No rig reaches it.
     pub cap: usize,
     /// The map stars are the list stars with `G <= G_b + map_window_mag`, at most `map_max_stars` of them in key order.
@@ -514,7 +526,9 @@ pub struct ForcedListParams {
     pub max_sigma_mag: f64,
     /// The screen's upper rule is a taper: a member `d` mag above `m + clip_sigma * sigma` keeps its own flux at the
     /// weight `clamp(1 - d / (screen_taper_sigma * sigma), 0, 1)`, so a star the jitter of `m` and `sigma` carries across
-    /// the limit moves the zero point continuously. `screen_taper_sigma <= 1e-9` is a plain drop (the F5 emulation's rule).
+    /// the limit moves the zero point continuously. `screen_taper_sigma <= 1e-9` is a plain drop, the default (the F5
+    /// emulation's rule, measured better than the taper on the thinnest night, G4/G7); the taper stays reachable by the
+    /// flag. NaN is refused by [`ForcedListParams::validate`].
     pub screen_taper_sigma: f64,
     /// The window slope needs at least this many members on the bright ramp.
     pub slope_min_ramp_members: usize,
@@ -542,6 +556,10 @@ impl Default for ForcedListParams {
             isolation_radius_fwhm: 8.0,
             bright_dmag: 2.0,
             bright_radius_fwhm: 10.0,
+            detected_neighbours: true,
+            own_seed_radius_px: 1.5,
+            detected_neighbour_min_peak_sigma: 10.0,
+            seed_calibration_min_pairs: 20,
             cap: 12_000,
             map_window_mag: 2.0,
             map_max_stars: 400,
@@ -567,11 +585,30 @@ impl Default for ForcedListParams {
             clip_sigma: 4.0,
             min_stars: 50,
             max_sigma_mag: 1.0,
-            screen_taper_sigma: 1.0,
+            screen_taper_sigma: 0.0,
             slope_min_ramp_members: 10,
             decimate: 1,
             anchor_shift_mag: 0.0,
         }
+    }
+}
+
+impl ForcedListParams {
+    /// A start-up check of the constants a caller may set (the probe's flags): a NaN taper is an error of the params, never
+    /// a stored `too_scattered`. Errors are logged by the caller before it exits.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.screen_taper_sigma.is_nan() {
+            return Err("screen_taper_sigma is NaN (0 drops, a positive value tapers)".to_string());
+        }
+        for (name, v) in [
+            ("own_seed_radius_px", self.own_seed_radius_px),
+            ("detected_neighbour_min_peak_sigma", self.detected_neighbour_min_peak_sigma),
+        ] {
+            if v.is_nan() {
+                return Err(format!("{name} is NaN"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -716,6 +753,11 @@ pub struct ForcedListInput<'a> {
     /// The fit's working-unit full scale (`Domain::RawAdu::full_scale`, `ADU_SCALE` for a calibrated plane).
     pub full_scale: f64,
     pub exptime_s: f64,
+    /// The seeds the plane's matched filter found (`PlaneMeasurement::detected`; empty when the plane handed seeds,
+    /// as a mosaic does), in the pixels of `wcs`. The list isolates from them too ([`ForcedListParams::detected_neighbours`]).
+    pub detected: &'a [Seed],
+    /// The plane's pixel noise (working units), the scale of a seed's peak.
+    pub noise_sigma: f64,
 }
 
 /// One star of the list.
@@ -746,6 +788,11 @@ pub struct ForcedList {
     /// The frame's size (px): the map's coordinates are about its centre.
     pub width: usize,
     pub height: usize,
+    /// List candidates removed by the frame's own detections alone (the catalogue rule had kept them).
+    pub detected_neighbours_removed: u32,
+    /// (star, own seed) pairs the seed flux calibration was taken over (0 when the rule did not run: no seeds, switched
+    /// off, or the calibration had fewer than `seed_calibration_min_pairs`, in which case this is the pairs found).
+    pub seed_calibration_pairs: u32,
     /// The map stars: indices into `stars` (`G <= G_b + map_window_mag`, the first `map_max_stars` in key order).
     pub map: Vec<usize>,
     /// What the first fit pass is asked: the map stars' positions in `map` order and the centre tolerance.
@@ -823,8 +870,7 @@ pub fn forced_list_in(
     let faint_limit = g_b + params.window_faint_max_mag;
     let decimate = params.decimate.max(1);
 
-    // Isolated candidates of the deepest window. Under a probe's decimation the same share of the catalogue stays in
-    // every frame: the thinning is on the key, before the faint edge's count.
+    // Isolated candidates of the deepest window, by the catalogue alone.
     let isolated: Vec<(f64, usize, u64)> = on(pool, || {
         cat.par_iter()
             .enumerate()
@@ -853,11 +899,20 @@ pub fn forced_list_in(
                 if crowded {
                     return None;
                 }
-                let key = cap_key(cat[i].2, sky[i].0, sky[i].1);
-                (key % decimate == 0).then_some((g, i, key))
+                Some((g, i, cap_key(cat[i].2, sky[i].0, sky[i].1)))
             })
             .collect()
     });
+
+    // The frame's own detections isolate too, then the probe's decimation thins what is left (the same share of the
+    // catalogue stays in every frame: the thinning is on the key, before the faint edge's count).
+    let seed_rule = seed_isolation(input, params, &cat, &isolated, g_b, fwhm_ref, near_r, pool);
+    let isolated: Vec<(f64, usize, u64)> = isolated
+        .into_iter()
+        .enumerate()
+        .filter(|(n, (_, _, key))| !seed_rule.removed.get(*n).copied().unwrap_or(false) && key % decimate == 0)
+        .map(|(_, e)| e)
+        .collect();
 
     // The faint edge: G_b + 3, deepened by catalogue count up to G_b + 4.5 while the window is thin.
     let shallow_edge = g_b + params.window_faint_width_mag;
@@ -908,9 +963,173 @@ pub fn forced_list_in(
         scale_arcsec: scale,
         width: input.width,
         height: input.height,
+        detected_neighbours_removed: seed_rule.removed_count,
+        seed_calibration_pairs: seed_rule.pairs,
         map,
         request,
     })
+}
+
+/// What the frame's own detections did to the candidates ([`seed_isolation`]).
+struct SeedRule {
+    /// Per candidate (the order of the catalogue-isolated list): removed by this rule.
+    removed: Vec<bool>,
+    removed_count: u32,
+    /// (star, own seed) pairs of the flux calibration.
+    pairs: u32,
+}
+
+impl SeedRule {
+    fn none(pairs: u32) -> Self {
+        SeedRule { removed: Vec::new(), removed_count: 0, pairs }
+    }
+}
+
+/// The list's isolation from the frame's own detections (spec §5.1). The catalogue misses what the image has (sources
+/// dropped at ingest for RUWE >= 1.4, stars under the tiers' depth, galaxies); a candidate is dropped when a detected seed
+/// that is not its own lies within `isolation_radius_fwhm * FWHM_ref` of it with `G_seed <= G + isolation_dmag` and a peak
+/// of at least `detected_neighbour_min_peak_sigma` plane sigmas: the catalogue rule's own question, asked of the image.
+///
+/// A seed's magnitude is read through the frame's calibration `k`, the median of `flux * 10^(0.4 G)` over the candidates
+/// of the shallow window with exactly one seed within `max(own_seed_radius_px, FWHM_ref)` of their projection, that seed
+/// being nearer to no other such candidate: `G_seed = -2.5 log10(flux / k)`. Fewer pairs than
+/// `seed_calibration_min_pairs`, no seeds, or the rule switched off: nothing is removed (never a refusal).
+#[allow(clippy::too_many_arguments)]
+fn seed_isolation(
+    input: &ForcedListInput,
+    params: &ForcedListParams,
+    cat: &[(f64, f64, f32)],
+    isolated: &[(f64, usize, u64)],
+    g_b: f64,
+    fwhm_ref: f64,
+    near_r: f64,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> SeedRule {
+    use rayon::prelude::*;
+    if !params.detected_neighbours {
+        return SeedRule::none(0);
+    }
+    if input.detected.is_empty() {
+        tracing::debug!("forced list: the plane handed no seeds; no isolation from the frame's own detections");
+        return SeedRule::none(0);
+    }
+    let own_r = params.own_seed_radius_px.max(fwhm_ref);
+    let floor = params.detected_neighbour_min_peak_sigma * input.noise_sigma;
+    if !(own_r.is_finite() && near_r.is_finite() && floor.is_finite() && own_r > 0.0) {
+        tracing::warn!(own_r, near_r, floor, "forced list: the seed rule's constants are unusable; the rule is skipped");
+        return SeedRule::none(0);
+    }
+    // Seeds with a usable position and flux, as grid points.
+    let seeds: Vec<&Seed> = input
+        .detected
+        .iter()
+        .filter(|s| s.x.is_finite() && s.y.is_finite() && s.flux.is_finite() && s.flux > 0.0 && s.peak.is_finite())
+        .collect();
+    if seeds.is_empty() {
+        tracing::debug!("forced list: no seed has a usable flux; no isolation from the frame's own detections");
+        return SeedRule::none(0);
+    }
+    let cell = own_r.max(near_r).max(1.0);
+    let seed_pts: Vec<(f64, f64, f32)> = seeds.iter().map(|s| (s.x, s.y, 0.0)).collect();
+    let seed_grid = Grid::new(&seed_pts, cell);
+
+    // The calibration set: the candidates of the shallow window, the list's common case.
+    let shallow = g_b + params.window_faint_width_mag;
+    let cal: Vec<usize> = (0..isolated.len()).filter(|&n| isolated[n].0 <= shallow).collect();
+    let cal_pts: Vec<(f64, f64, f32)> = cal.iter().map(|&n| cat[isolated[n].1]).collect();
+    let cal_grid = Grid::new(&cal_pts, cell);
+    let calibrate = || -> Vec<f64> {
+        cal_pts
+            .par_iter()
+            .enumerate()
+            .filter_map(|(c, &(x, y, g))| {
+                let mut own = None;
+                for j in seed_grid.near(x, y) {
+                    let d = (seed_pts[j].0 - x).hypot(seed_pts[j].1 - y);
+                    if d <= own_r {
+                        if own.is_some() {
+                            return None; // two seeds in the radius: not a clean pair
+                        }
+                        own = Some((j, d));
+                    }
+                }
+                let (j, d) = own?;
+                // The seed must be nearer to no other candidate.
+                let stolen = cal_grid.near(seed_pts[j].0, seed_pts[j].1).any(|c2| {
+                    c2 != c && (cal_pts[c2].0 - seed_pts[j].0).hypot(cal_pts[c2].1 - seed_pts[j].1) <= d
+                });
+                (!stolen).then(|| seeds[j].flux * 10f64.powf(0.4 * f64::from(g)))
+            })
+            .collect()
+    };
+    let ratios = match pool {
+        Some(p) => p.install(calibrate),
+        None => calibrate(),
+    };
+    let pairs = ratios.len() as u32;
+    if ratios.len() < params.seed_calibration_min_pairs.max(1) {
+        tracing::warn!(
+            pairs,
+            needed = params.seed_calibration_min_pairs,
+            seeds = seeds.len(),
+            "forced list: too few star-seed pairs to calibrate the seeds' flux; no isolation from the frame's own detections"
+        );
+        return SeedRule::none(pairs);
+    }
+    let mut ratios = ratios;
+    let k = median(&mut ratios);
+    if !(k.is_finite() && k > 0.0) {
+        tracing::warn!(k, pairs, "forced list: the seed flux calibration is unusable; no isolation from the frame's own detections");
+        return SeedRule::none(pairs);
+    }
+
+    // The test, on every candidate of the deepest window.
+    let removed: Vec<bool> = match pool {
+        Some(p) => p.install(|| seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, own_r, near_r, floor, params)),
+        None => seed_flags(isolated, cat, &seeds, &seed_pts, &seed_grid, k, own_r, near_r, floor, params),
+    };
+    let removed_count = removed.iter().filter(|r| **r).count() as u32;
+    SeedRule { removed, removed_count, pairs }
+}
+
+/// The per-candidate test of [`seed_isolation`], on the rayon pool the caller is on.
+#[allow(clippy::too_many_arguments)]
+fn seed_flags(
+    isolated: &[(f64, usize, u64)],
+    cat: &[(f64, f64, f32)],
+    seeds: &[&Seed],
+    seed_pts: &[(f64, f64, f32)],
+    seed_grid: &Grid,
+    k: f64,
+    own_r: f64,
+    near_r: f64,
+    floor: f64,
+    params: &ForcedListParams,
+) -> Vec<bool> {
+    use rayon::prelude::*;
+    isolated
+        .par_iter()
+        .map(|&(g, i, _)| {
+            let (x, y, _) = cat[i];
+            // The star's own seed: the nearest within `own_r`.
+            let mut own: Option<(usize, f64)> = None;
+            for j in seed_grid.near(x, y) {
+                let d = (seed_pts[j].0 - x).hypot(seed_pts[j].1 - y);
+                if d <= own_r && own.map_or(true, |(_, best)| d < best) {
+                    own = Some((j, d));
+                }
+            }
+            let own = own.map(|(j, _)| j);
+            seed_grid.near(x, y).any(|j| {
+                if Some(j) == own {
+                    return false;
+                }
+                let s = seeds[j];
+                let d = (s.x - x).hypot(s.y - y);
+                d <= near_r && s.peak >= floor && -2.5 * (s.flux / k).log10() <= g + params.isolation_dmag
+            })
+        })
+        .collect()
 }
 
 /// A star's weight in the window: 0 at an edge, 1 `window_ramp_mag` inside it, so a zero point changes continuously as
@@ -1444,7 +1663,7 @@ pub fn forced_zero_point(
         let mut taper = 1.0;
         if per_star[i].zp > upper {
             tapered += 1;
-            taper = if params.screen_taper_sigma <= 1e-9 {
+            taper = if !(params.screen_taper_sigma > 1e-9) {
                 0.0
             } else {
                 (1.0 - (per_star[i].zp - upper) / (params.screen_taper_sigma * sig)).clamp(0.0, 1.0)
@@ -2975,7 +3194,17 @@ mod forced_tests {
     }
 
     fn input<'a>(catalog: &'a [CatalogStar], wcs: &'a WcsSolution, w: usize, h: usize) -> ForcedListInput<'a> {
-        ForcedListInput { catalog, wcs, width: w, height: h, anchor: ANCHOR, full_scale: FULL, exptime_s: EXPTIME }
+        ForcedListInput {
+            catalog,
+            wcs,
+            width: w,
+            height: h,
+            anchor: ANCHOR,
+            full_scale: FULL,
+            exptime_s: EXPTIME,
+            detected: &[],
+            noise_sigma: 1.0,
+        }
     }
 
     /// xorshift64* uniform draws.
@@ -3132,6 +3361,230 @@ mod forced_tests {
         assert!(target_survives(0.0, 10.1, Some(gb - 2.1)));
         // 1.9 mag brighter than G_b is not a halo source (the dG rule alone, at that distance, keeps it).
         assert!(target_survives(0.0, 9.9, Some(gb - 1.9)));
+    }
+
+    // ---- isolation from the frame's own detections ------------------------------------------------------------------
+
+    const K0: f64 = 4.0e9;
+
+    /// A seed of a star of magnitude `g` at `(x, y)`, flux read through the test's calibration `K0`.
+    fn seed_of(x: f64, y: f64, g: f64, peak: f64) -> Seed {
+        Seed { x, y, peak, flux: K0 * 10f64.powf(-0.4 * g) }
+    }
+
+    /// A 1000 x 1000 frame holding a lattice of 36 px of catalogue stars, all at `G_b + 1`, each with its own seed 0.3 px
+    /// off its position (`own_seeds` of them), plus an optional bright image-only star at `(bx, by)` (in no catalogue)
+    /// with its seed. Returns the catalogue, the seeds, the frame's solve and the lattice's positions.
+    #[allow(clippy::type_complexity)]
+    fn seeded_field(
+        side: usize,
+        extra: Option<(f64, f64, f64, f64)>,
+    ) -> (Vec<CatalogStar>, Vec<Seed>, WcsSolution, Vec<(f64, f64)>, f64) {
+        let wcs = wcs_at(1000, 1000, 1.0, (0.0, 0.0), 0.0);
+        let g = g_b(&wcs) + 1.0;
+        let (mut cat, mut seeds, mut pos) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..side {
+            for j in 0..side {
+                let (x, y) = (300.0 + 36.0 * i as f64, 300.0 + 36.0 * j as f64);
+                cat.push(at(&wcs, x, y, g as f32));
+                seeds.push(seed_of(x + 0.3, y - 0.2, g, 100.0));
+                pos.push((x, y));
+            }
+        }
+        if let Some((x, y, g_seed, peak)) = extra {
+            seeds.push(seed_of(x, y, g_seed, peak));
+        }
+        (cat, seeds, wcs, pos, g)
+    }
+
+    fn seeded_list(cat: &[CatalogStar], wcs: &WcsSolution, seeds: &[Seed], p: &ForcedListParams) -> ForcedList {
+        let i = ForcedListInput { detected: seeds, noise_sigma: 1.0, ..input(cat, wcs, 1000, 1000) };
+        forced_list(&i, p).unwrap()
+    }
+
+    fn at_pos(l: &ForcedList, x: f64, y: f64) -> bool {
+        l.stars.iter().any(|s| (s.x - x).abs() < 0.01 && (s.y - y).abs() < 0.01)
+    }
+
+    #[test]
+    fn a_bright_star_absent_from_the_cone_removes_the_list_stars_around_it_and_no_others() {
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(8, None);
+        let base = seeded_list(&cat, &wcs, &[], &params());
+        assert_eq!(base.stars.len(), 64);
+        assert_eq!((base.detected_neighbours_removed, base.seed_calibration_pairs), (0, 0));
+        // A G_b - 3 star between two lattice stars, 18 px from each (the radius is 8 * 2.5 = 20 px), 36 px from the rest.
+        let (bx, by) = (pos[0].0 + 18.0, pos[0].1);
+        seeds.push(seed_of(bx, by, g - 4.0, 1000.0));
+        let l = seeded_list(&cat, &wcs, &seeds, &params());
+        let near: Vec<(f64, f64)> = pos.iter().copied().filter(|p| (p.0 - bx).hypot(p.1 - by) <= 20.0).collect();
+        assert_eq!(near.len(), 2, "the premise: two stars in the radius");
+        assert_eq!(l.detected_neighbours_removed, 2);
+        assert_eq!(l.seed_calibration_pairs, 64, "every lattice star has exactly one seed in its radius");
+        assert_eq!(l.stars.len(), 62);
+        for &(x, y) in &pos {
+            assert_eq!(at_pos(&l, x, y), !near.contains(&(x, y)), "star at ({x}, {y})");
+        }
+        // Switched off, the list is the catalogue rule's.
+        let off = seeded_list(&cat, &wcs, &seeds, &ForcedListParams { detected_neighbours: false, ..params() });
+        assert_eq!((off.stars.len(), off.detected_neighbours_removed, off.seed_calibration_pairs), (64, 0, 0));
+    }
+
+    #[test]
+    fn a_stars_own_seed_never_removes_it() {
+        let (cat, seeds, wcs, _, _) = seeded_field(8, None);
+        let l = seeded_list(&cat, &wcs, &seeds, &params());
+        assert_eq!((l.stars.len(), l.detected_neighbours_removed, l.seed_calibration_pairs), (64, 0, 64));
+        // Its own seed 1.4 px off (a proper-motion error, inside the 2.5 px radius) is still its own.
+        let shifted: Vec<Seed> = seeds.iter().map(|s| Seed { x: s.x + 1.1, y: s.y + 0.9, ..*s }).collect();
+        let l = seeded_list(&cat, &wcs, &shifted, &params());
+        assert_eq!((l.stars.len(), l.detected_neighbours_removed), (64, 0));
+    }
+
+    #[test]
+    fn a_neighbour_the_peak_floor_or_the_magnitude_rule_spares_does_not_remove() {
+        let (cat, seeds, wcs, pos, g) = seeded_field(8, None);
+        let (bx, by) = (pos[0].0 + 18.0, pos[0].1);
+        let with = |g_seed: f64, peak: f64| {
+            let mut s = seeds.clone();
+            s.push(seed_of(bx, by, g_seed, peak));
+            seeded_list(&cat, &wcs, &s, &params()).detected_neighbours_removed
+        };
+        // The floor is 10 sigma (sigma 1): 9.9 keeps, 10 removes.
+        assert_eq!(with(g - 1.0, 9.9), 0);
+        assert_eq!(with(g - 1.0, 10.0), 2);
+        // dG: a neighbour 3.9 mag fainter than the star removes it, 4.1 mag fainter keeps it.
+        assert_eq!(with(g + 3.9, 50.0), 2);
+        assert_eq!(with(g + 4.1, 50.0), 0);
+        // Distance: a bright seed 27 px from the nearest lattice stars (20.5 px along, 18 px across) is outside 8 FWHM_ref.
+        let mut far = seeds.clone();
+        far.push(seed_of(pos[0].0 + 20.5, pos[0].1 + 18.0, g - 4.0, 1000.0));
+        assert!(pos.iter().all(|p| (p.0 - (pos[0].0 + 20.5)).hypot(p.1 - (pos[0].1 + 18.0)) > 20.0), "the premise");
+        assert_eq!(seeded_list(&cat, &wcs, &far, &params()).detected_neighbours_removed, 0);
+        // And the same seed 19.5 px from a star removes it.
+        let mut near = seeds.clone();
+        near.push(seed_of(pos[0].0 + 19.5, pos[0].1 - 36.0 * 0.0 + 0.0, g - 4.0, 1000.0));
+        assert!(seeded_list(&cat, &wcs, &near, &params()).detected_neighbours_removed >= 1);
+        // A lower peak floor lets the faint peak through: the constant is the rule's.
+        let mut s = seeds.clone();
+        s.push(seed_of(bx, by, g - 1.0, 9.9));
+        let lax = ForcedListParams { detected_neighbour_min_peak_sigma: 5.0, ..params() };
+        assert_eq!(seeded_list(&cat, &wcs, &s, &lax).detected_neighbours_removed, 2);
+    }
+
+    #[test]
+    fn under_twenty_pairs_the_rule_is_skipped_and_the_list_is_the_catalogues() {
+        // Four lattice stars (16 < 20 is wrong: 2 x 2 = 4 stars, 4 pairs) with a bright seed beside one of them.
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(4, None);
+        seeds.push(seed_of(pos[0].0 + 18.0, pos[0].1, g - 4.0, 1000.0));
+        let base = seeded_list(&cat, &wcs, &[], &params());
+        let l = seeded_list(&cat, &wcs, &seeds, &params());
+        assert_eq!(l.stars, base.stars, "the rule did not run");
+        assert_eq!((l.detected_neighbours_removed, l.seed_calibration_pairs), (0, 16));
+        // The pairs are the number found, and the floor of 20 is the params' constant.
+        let few = ForcedListParams { seed_calibration_min_pairs: 16, ..params() };
+        let l = seeded_list(&cat, &wcs, &seeds, &few);
+        assert_eq!((l.detected_neighbours_removed, l.seed_calibration_pairs), (2, 16));
+    }
+
+    #[test]
+    fn a_plane_with_no_seeds_skips_the_rule() {
+        let (cat, _, wcs, _, _) = seeded_field(8, None);
+        let l = seeded_list(&cat, &wcs, &[], &params());
+        assert_eq!((l.stars.len(), l.detected_neighbours_removed, l.seed_calibration_pairs), (64, 0, 0));
+    }
+
+    #[test]
+    fn a_seed_that_two_stars_share_is_no_calibration_pair() {
+        // Two catalogue stars 3 px apart (the catalogue rule would drop them, so they are made faint-isolated by dG): a
+        // seed between them is within the radius of both and nearer to neither alone: it calibrates nothing.
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(8, None);
+        let mut cat = cat;
+        cat.push(at(&wcs, pos[63].0 + 3.0, pos[63].1, (g + 4.5) as f32));
+        seeds.push(seed_of(pos[63].0 + 1.5, pos[63].1, g, 100.0));
+        let l = seeded_list(&cat, &wcs, &seeds, &params());
+        assert!(l.seed_calibration_pairs <= 63, "{}", l.seed_calibration_pairs);
+    }
+
+    #[test]
+    fn the_seed_rule_does_not_depend_on_the_pool() {
+        let (cat, mut seeds, wcs, pos, g) = seeded_field(8, None);
+        seeds.push(seed_of(pos[10].0 + 18.0, pos[10].1, g - 4.0, 1000.0));
+        let i = ForcedListInput { detected: &seeds, noise_sigma: 1.0, ..input(&cat, &wcs, 1000, 1000) };
+        let alone = forced_list(&i, &params()).unwrap();
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap());
+        let pooled = forced_list_in(&i, &params(), Some(&pool)).unwrap();
+        assert_eq!(alone, pooled);
+        assert!(alone.detected_neighbours_removed > 0);
+    }
+
+    #[test]
+    fn the_screen_taper_defaults_to_a_drop_and_a_nan_one_is_a_params_error() {
+        assert_eq!(params().screen_taper_sigma, 0.0);
+        assert!(params().validate().is_ok());
+        let nan = ForcedListParams { screen_taper_sigma: f64::NAN, ..params() };
+        let e = nan.validate().unwrap_err();
+        assert!(e.contains("screen_taper_sigma"), "{e}");
+        // The statistic never stores it as a scatter: a NaN width reads as a drop.
+        let edge = crossing();
+        let over = with_probe_under(14.6, edge + 0.03, &nan);
+        assert!(over.result.is_ok(), "{:?}", over.result);
+        assert_eq!(zp_of(&over), zp_of(&with_probe_under(14.6, edge + 0.03, &params())));
+    }
+
+    /// The pedestal's clip is about zero (a port of the lab's reference: sigma from the median deviation about the
+    /// fit's median residual, the window about ZERO, four rounds, a break when nothing drops, the fit refitted after the
+    /// last round). A one-sided tail is where the two centres differ.
+    #[test]
+    fn the_pedestal_clip_is_about_zero_not_about_the_median() {
+        let mut rng = Rng(77);
+        let apertures: Vec<ListAperture> = (0..200)
+            .map(|i| {
+                let a = 100.0 + 10.0 * i as f64;
+                let d = 2.0 + 0.01 * a + rng.normal() + if i % 10 == 3 { 30.0 } else { 0.0 };
+                ListAperture::test_new(0.0, vec![a, 0.0, d], 1000.0, 4.0, 1000.0)
+            })
+            .collect();
+        let members: Vec<usize> = (0..200).collect();
+        let p = ForcedListParams { pedestal_clip_rounds: 10, ..params() };
+        let area = std::f64::consts::PI * (15.0f64 * 15.0 - 10.0 * 10.0);
+        let reference = |about_median: bool| -> f64 {
+            let mut pts: Vec<(f64, f64)> =
+                apertures.iter().map(|a| (a.extra_sums[0], a.extra_sums[2] - a.extra_sums[1])).collect();
+            let ols = |pts: &[(f64, f64)]| {
+                let n = pts.len() as f64;
+                let (sx, sy) = (pts.iter().map(|q| q.0).sum::<f64>(), pts.iter().map(|q| q.1).sum::<f64>());
+                let sxx: f64 = pts.iter().map(|q| q.0 * q.0).sum();
+                let sxy: f64 = pts.iter().map(|q| q.0 * q.1).sum();
+                let b = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+                ((sy - b * sx) / n, b)
+            };
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.total_cmp(b));
+                let n = v.len();
+                if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+            };
+            for _ in 0..10 {
+                let (a, b) = ols(&pts);
+                let res: Vec<f64> = pts.iter().map(|q| q.1 - (a + b * q.0)).collect();
+                let m = med(&mut res.clone());
+                let sigma = 1.4826 * med(&mut res.iter().map(|r| (r - m).abs()).collect());
+                let centre = if about_median { m } else { 0.0 };
+                let kept: Vec<(f64, f64)> =
+                    pts.iter().zip(&res).filter(|(_, r)| (**r - centre).abs() <= 3.0 * sigma).map(|(q, _)| *q).collect();
+                if kept.len() == pts.len() {
+                    break;
+                }
+                pts = kept;
+            }
+            ols(&pts).0 / area
+        };
+        let (about_zero, about_median) = (reference(false), reference(true));
+        let got = sky_pedestal(&apertures, &members, 2.5, &p).expect("a pedestal");
+        assert!((got - about_zero).abs() < 1e-9 * about_zero.abs().max(1e-12) + 1e-12, "{got} against the port {about_zero}");
+        assert!(
+            (about_zero - about_median).abs() > 0.05 / area,
+            "the premise: the two centres give different intercepts ({about_zero} {about_median})"
+        );
     }
 
     #[test]
@@ -3359,6 +3812,8 @@ mod forced_tests {
             scale_arcsec: 1.0,
             width: 4000,
             height: 3000,
+            detected_neighbours_removed: 0,
+            seed_calibration_pairs: 0,
             map,
         }
     }
@@ -3406,6 +3861,11 @@ mod forced_tests {
 
     fn statistic(list: &ForcedList, m: &ListMeasurement) -> ForcedOutcome {
         forced_zero_point(list, m, &plain_placement(list), EXPTIME, &params())
+    }
+
+    /// The default with the screen's taper switched on (the default is a plain drop).
+    fn tapered() -> ForcedListParams {
+        ForcedListParams { screen_taper_sigma: 1.0, ..params() }
     }
 
     fn even(n: usize, g0: f64, g1: f64) -> Vec<f64> {
@@ -3659,6 +4119,10 @@ mod forced_tests {
         forced_zero_point(&list, &m, &plain_placement(&list), EXPTIME, p)
     }
 
+    fn with_probe_tapered(g_probe: f64, delta: f64) -> ForcedOutcome {
+        with_probe_under(g_probe, delta, &tapered())
+    }
+
     fn zp_of(o: &ForcedOutcome) -> f64 {
         o.result.as_ref().expect("a valid zero point").zero_point
     }
@@ -3692,17 +4156,17 @@ mod forced_tests {
             let curve: Vec<f64> = (0..=100).map(|k| zp_of(&with_probe_under(14.6, delta_at(k), p))).collect();
             curve.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max)
         };
-        let step = largest_step(&params());
+        let step = largest_step(&tapered());
         let jump = largest_step(&ForcedListParams { screen_taper_sigma: 0.0, ..params() });
         assert!(jump > 0.001, "a plain drop jumps by {jump}");
-        assert!(step < jump / 3.0, "largest step of the taper {step}, the drop's jump {jump}");
+        assert!(step < jump / 8.0, "largest step of the taper {step}, the drop's jump {jump}");
         // Through the whole taper and beyond: no step at the start (the weight is 1 at the limit) or at the end (0).
-        let o = with_probe(14.6, edge + 0.025);
+        let o = with_probe_tapered(14.6, edge + 0.025);
         assert_eq!(o.tapered, 1);
         let w = o.per_star[300].weight;
         assert!(o.per_star[300].screened_in && w > 0.0 && w < 1.0, "inside the taper: weight {w}");
         // Past the taper's end the star is gone, and the zero point is that of the other 300.
-        let (far, farther) = (with_probe(14.6, 0.8), with_probe(14.6, 1.5));
+        let (far, farther) = (with_probe_tapered(14.6, 0.8), with_probe_tapered(14.6, 1.5));
         assert!(!far.per_star[300].screened_in && far.per_star[300].member && far.per_star[300].weight == 0.0);
         assert_eq!((far.tapered, farther.tapered), (1, 1));
         let list = hand_list(&even(300, 14.5, 16.5));
@@ -3711,7 +4175,7 @@ mod forced_tests {
         let (d_far, d_others) = ((zp_of(&far) - zp_of(&farther)).abs(), (zp_of(&far) - zp_of(&others)).abs());
         assert!(d_far < 1e-4 && d_others < 1e-4, "{d_far} {d_others}");
         // One far below (2 mag, beyond its noise) is dropped as well: the low side stays a drop.
-        let low = with_probe(14.6, -2.0);
+        let low = with_probe_tapered(14.6, -2.0);
         assert!(!low.per_star[300].screened_in && low.per_star[300].member && low.tapered == 0);
         assert!((zp_of(&low) - zp_of(&others)).abs() < 1e-5);
     }
@@ -3726,13 +4190,14 @@ mod forced_tests {
         let list = hand_list(&even(300, 14.5, 16.5));
         let others = statistic(&list, &measured_for(&list, &|_, _| 21.8, 0.05, 0.0, 99));
         assert!(zp_of(&over).is_finite() && (zp_of(&over) - zp_of(&others)).abs() < 1e-5);
-        // A negative width is no width either, and the default is a width of one sigma.
+        // A negative width is no width either, and the default is no taper.
         let negative = ForcedListParams { screen_taper_sigma: -1.0, ..params() };
         assert_eq!(zp_of(&with_probe_under(14.6, edge + 0.03, &negative)), zp_of(&over));
-        assert_eq!(params().screen_taper_sigma, 1.0);
+        assert_eq!(params().screen_taper_sigma, 0.0, "the default is the plain drop");
+        assert_eq!(tapered().screen_taper_sigma, 1.0);
         // A wider taper keeps the same star at a larger weight.
         let wide = ForcedListParams { screen_taper_sigma: 3.0, ..params() };
-        let (w1, w3) = (with_probe(14.6, edge + 0.025), with_probe_under(14.6, edge + 0.025, &wide));
+        let (w1, w3) = (with_probe_under(14.6, edge + 0.025, &tapered()), with_probe_under(14.6, edge + 0.025, &wide));
         assert!(w3.per_star[300].weight > w1.per_star[300].weight);
     }
 
@@ -3852,13 +4317,13 @@ mod forced_tests {
         let list = hand_list(&even(600, 14.0, 17.0));
         let trend = |i: usize, g: f64| 22.0 - 0.15 * (g - 15.0) + if i % 40 == 11 { 0.6 } else { 0.0 };
         let m = measured_for(&list, &trend, 0.0, 0.0, 3);
-        let o = statistic(&list, &m);
+        let o = forced_zero_point(&list, &m, &plain_placement(&list), EXPTIME, &tapered());
         assert!(o.tapered > 0 && o.per_star.iter().any(|p| p.screened_in && p.weight > 0.0 && p.weight < 1.0), "{}", o.tapered);
         let at = |shift: f64| {
             let mut l = list.clone();
             l.window_bright += shift;
             l.window_faint += shift;
-            zp_of(&forced_zero_point(&l, &m, &plain_placement(&l), EXPTIME, &params()))
+            zp_of(&forced_zero_point(&l, &m, &plain_placement(&l), EXPTIME, &tapered()))
         };
         let (s, moved) = (o.window_slope.expect("a slope"), (at(0.1) - at(-0.1)) / 0.2);
         assert!((s - moved).abs() < 0.02, "analytic {s}, moved {moved}");

@@ -79,7 +79,7 @@ least 20 points left
 (`pedestal_min_points`); annulus 2 000 px (`annulus_area_px`) from `max(4·F, 6·FWHM_ref)` (`annulus_start_fwhm` 4.0;
 the outer pedestal radius) plus 2 px (`annulus_gap_px`); peak radius 1.5·`FWHM_ref` (`peak_radius_ref`). Statistic: the
 screen and its clip at 4 σ (`clip_sigma`, as r0, also the `4·n` noise allowance; its upper rule a taper of width
-`screen_taper_sigma` σ, default 1.0, G2 review H1); ≥ 50 members of non-zero weight
+`screen_taper_sigma` σ, default 0 = a plain drop since G7, G2 review H1); ≥ 50 members of non-zero weight
 (`min_stars`); σ ≤ 1.0 mag (`max_sigma_mag`); a window slope from ≥ 10 members on the bright ramp
 (`slope_min_ramp_members`; the faint ramp's term is taken as it is, H1). Gone: `c_stars`, the list's
 `max_std_error_mag` (`ZpParams` keeps its own for the anchor). Probe-only, the identity by default and never set by the
@@ -499,7 +499,7 @@ itself is `render`-gated, `lib.rs:38`).
    `n = sky_scatter·√(π·R²)`) and its upper rule, a taper (G2 review H1; the F5 plan review's M1, counting a member at the limit, is
    withdrawn: measured on g0 it biased the ZP by +0.006…+0.026 per set against the drop, following σ, see the ledger's
    "H1"): a member with `zp_i > m + 4σ` keeps its own `f` at the weight × `clamp(1 − (zp_i − m − 4σ)/(τ·σ), 0, 1)`,
-   τ = `ForcedListParams::screen_taper_sigma` (1.0; τ ≤ 1e-9 is a plain drop, as the emulation), a member of zero weight
+   τ = `ForcedListParams::screen_taper_sigma` (default 0 since G7: τ ≤ 1e-9, or NaN, is a plain drop, as the emulation; `validate()` refuses a NaN at start-up), a member of zero weight
    dropped and not counted, so the ZP moves continuously as `m` and `σ` jitter; the window slope's ramp sums carry the
    taper (`taper·f`, `taper·10^(−0.4·G)`) and `stars` counts the weights above zero; the ZP as the weighted ratio of sums, `Σ w·f ≤ 0` → `TooScattered { kept, sigma }`; the window slope
    (`None` under `slope_min_ramp_members` on the bright ramp; the faint ramp's term taken as it is, zero when the
@@ -554,8 +554,16 @@ itself is `render`-gated, `lib.rs:38`).
   `anchor_shift_mag` ±0.1 within 0.01); `fewer_than_ten_bright_ramp_members_give_no_slope`;
   `a_window_cut_by_the_catalogue_keeps_its_slope` (H1: a catalogue ending before `G_f − ρ`, the faint ramp empty: a
   slope from the bright ramp alone, never NULL for it); `a_member_above_the_screen_is_tapered_and_the_zero_point_moves_continuously` (H1: one star's flux raised across
-  `m + 4σ` moves the ZP with a step a third of a plain drop's jump at most; past the taper it is dropped; one far below
+  `m + 4σ` moves the ZP with a step an eighth of a plain drop's jump at most, under τ = 1; past the taper it is dropped; one far below
   `m − 4σ` past its noise is dropped too) and `a_zero_taper_is_a_plain_drop_with_no_division_by_zero`;
+  G2 fix round and G7: `the_screen_taper_defaults_to_a_drop_and_a_nan_one_is_a_params_error`,
+  `the_pedestal_clip_is_about_zero_not_about_the_median` (a one-sided tail against an inline port of the reference's clip,
+  1e-9; the median-centred clip gives another intercept), `a_tapered_member_moves_the_window_slope_as_it_moves_the_window`,
+  `the_pedestal_reports_the_share_its_clip_kept`, `the_pedestal_clip_reads_its_rounds`; the seed rule (G7):
+  `a_bright_star_absent_from_the_cone_removes_the_list_stars_around_it_and_no_others`,
+  `a_stars_own_seed_never_removes_it`, `a_neighbour_the_peak_floor_or_the_magnitude_rule_spares_does_not_remove`,
+  `under_twenty_pairs_the_rule_is_skipped_and_the_list_is_the_catalogues`, `a_plane_with_no_seeds_skips_the_rule`,
+  `a_seed_that_two_stars_share_is_no_calibration_pair`, `the_seed_rule_does_not_depend_on_the_pool`;
   `a_non_positive_sum_refuses_too_scattered`; `an_empty_map_request_carries_the_list_size` (analyzer);
   `sixty_members_are_valid_and_forty_are_too_few_stars`; `decimate_keeps_the_same_tenth_in_every_frame`;
   `common_window_of_one_frame_reads_its_zero_point`; `a_set_without_a_slope_is_not_reduced`.
@@ -1221,6 +1229,17 @@ by construction; G1 → G2 is the build order; the expected table matches the ve
   `clamp(1 − (zp_i − m − 4σ)/(τ·σ), 0, 1)`, τ = `screen_taper_sigma` 1.0 (level +0.001…+0.007, rms 0.0004–0.0028, max
   0.021, continuous); τ → 0 is the emulation's drop, so G4 reports both rows. `tapered` replaces `capped` (G2 step 7;
   G3's column and per-night line); the test is `a_member_above_the_screen_is_tapered_and_the_zero_point_moves_continuously`.
+  **Ruled again after G4 (G7): τ default 0.** g0 / g1 / g1t0 against each other: taper − drop is equal on 14 nights (level
+  +0.001…+0.005, rms ≤ 0.0054, max 0.013, B2 within ±0.0006) and worse on the thinnest, Duo 09-13 (B2 0.0049 against
+  0.0034, B3 slope −0.0354 against −0.0238, rms 0.0077 against 0.0059); the continuity gain did not show in B2. The drop,
+  as emulated, ships; the taper stays reachable by `--screen_taper_sigma 1`. A NaN τ is refused at start-up
+  (`ForcedListParams::validate`; the probe calls it), never stored as `too_scattered`.
+- **G7** (the list isolates from the frame's own detections) — spec §5.1: the tiers drop RUWE ≥ 1.4 (G6), so bright
+  neighbours of 7.6–10.9 % of the list's weight were missing from the cone; the image carries them. Rule, constants
+  (`detected_neighbours`, `own_seed_radius_px` 1.5, `detected_neighbour_min_peak_sigma` 10, `seed_calibration_min_pairs`
+  20; each a probe flag) and the row's `detected_neighbours_removed` / `seed_calibration_pairs` are in the spec; the code is
+  `zero_point.rs::seed_isolation`. A mosaic hands its seeds inside rustafits (`PlaneMeasurement::detected` is empty there):
+  the rule is skipped on a mosaic until rustafits hands the native seeds to the first callback (open).
 - **M2** (6r is not an independent referee) — B3 prints three slopes, a stack miss 6r does not echo is no pass and goes
   to the owner: spec §6 (paragraph, M2 beside RR2, RR3); G3 step 7 and its test; G4's class-line paragraph and STOP list.
 - **M3** (the ±0.1 re-measure moved the edges) — `anchor_shift_mag` before the window rule, re-measures at ±0.1 and ±0.5:
