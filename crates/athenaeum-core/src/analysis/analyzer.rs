@@ -11,13 +11,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
+use solvemyastro::{CatalogStar, WcsSolution};
 
 use super::config::{AnalysisConfig, AnalysisPsfModel};
+use super::zero_point::{
+    anchor_zero_point, forced_list, forced_zero_point, pixel_scale_arcsec, Anchor, ForcedList, ForcedListInput,
+    ForcedListParams, ForcedOutcome, ForcedRefusal, ForcedZeroPoint,
+};
 use crate::models::{FrameAnalysis, FrameVerdict, StarMetric};
-use crate::star_measure::analysis_mode::{self, FrameOptions, FrameSummary, Verdict};
+use crate::star_measure::analysis_mode::{self, FrameOptions, FrameSummary, ListMeasurement, Verdict};
 use crate::star_measure::raw::read_raw_frame;
 pub use crate::star_measure::raw::{RawFrame, RawPlanes};
-use crate::star_measure::{PlaneMeasurement, PsfModel, MEASURE_VERSION};
+use crate::star_measure::{Domain, PlaneMeasurement, PsfModel, ADU_SCALE, MEASURE_VERSION};
 
 /// The measurement's options for an Analysis config: the three knobs that reach the measurement (`FrameOptions` is
 /// `#[non_exhaustive]`, so it is built from its default and the fields assigned).
@@ -64,21 +69,10 @@ pub fn measure_raw_frame_with(
     analysis_mode::measure_raw_frame_with(frame, &frame_options(config), pool, diagnostics)
 }
 
-/// Write a measurement into the Analysis rows (spec 4.2 with PC-6..PC-9).
-///
-/// The frame figures are [`FrameSummary::from_measurement`]'s: medians read 0.0 when the frame has no fit in its
-/// statistic (PC-7); `snr_weight`, `psf_signal` and `trail_r_squared` read the same fits. `median_beta` is the frame's
-/// fitted beta under `Auto` and NULL otherwise (PC-9). A star's non-finite `snr` / `hfr` is `None` (PC-8). The row
-/// carries the measurement version, the refusal count and the frame verdict (PC-13): trailed / defocused as the
-/// module judged, else no_stars when no fit stands in the frame statistic, else none.
-pub fn map_measurement(
-    pm: &PlaneMeasurement,
-    frame: &RawFrame,
-    config: &AnalysisConfig,
-    config_hash: &str,
-) -> (FrameAnalysis, Vec<StarMetric>) {
-    let stars: Vec<StarMetric> = pm
-        .stars
+/// The measured stars as `StarMetric` rows (ids still unset): what [`map_measurement`] stores and what the zero point's
+/// anchor reads. A star's non-finite `snr` / `hfr` is `None` (PC-8).
+pub fn star_metrics(pm: &PlaneMeasurement) -> Vec<StarMetric> {
+    pm.stars
         .iter()
         .map(|f| StarMetric {
             id: None,
@@ -98,7 +92,23 @@ pub fn map_measurement(
             fit_method: "moffat".to_string(),
             fit_residual: f.residual,
         })
-        .collect();
+        .collect()
+}
+
+/// Write a measurement into the Analysis rows (spec 4.2 with PC-6..PC-9).
+///
+/// The frame figures are [`FrameSummary::from_measurement`]'s: medians read 0.0 when the frame has no fit in its
+/// statistic (PC-7); `snr_weight`, `psf_signal` and `trail_r_squared` read the same fits. `median_beta` is the frame's
+/// fitted beta under `Auto` and NULL otherwise (PC-9). A star's non-finite `snr` / `hfr` is `None` (PC-8). The row
+/// carries the measurement version, the refusal count and the frame verdict (PC-13): trailed / defocused as the
+/// module judged, else no_stars when no fit stands in the frame statistic, else none.
+pub fn map_measurement(
+    pm: &PlaneMeasurement,
+    frame: &RawFrame,
+    config: &AnalysisConfig,
+    config_hash: &str,
+) -> (FrameAnalysis, Vec<StarMetric>) {
+    let stars = star_metrics(pm);
 
     let s = FrameSummary::from_measurement(pm, &frame_options(config));
 
@@ -161,6 +171,192 @@ pub fn analyze_frame(
     frame.drop_unmeasured_planes();
     let (analysis, stars) = analyze_raw_frame(&frame, config, pool, config_hash);
     Ok((analysis, stars, frame.flip_vertical))
+}
+
+// ---------------------------------------------------------------------------
+// The forced-list zero point's composition (forced-list spec §5.1-§5.3)
+// ---------------------------------------------------------------------------
+
+/// What a solved frame hands the zero point: its sky-to-pixel transform, `EXPTIME` and observation epoch (decimal year).
+#[derive(Debug, Clone, Copy)]
+pub struct ZpInputs<'a> {
+    pub wcs: &'a WcsSolution,
+    pub exptime_s: Option<f64>,
+    pub epoch: f64,
+}
+
+/// What [`measure_with_zero_point`] found beside the measurement: the zero point or its refusal, and every figure behind
+/// it (the probe's rows, the analysis row's stored figures).
+#[derive(Debug, Clone)]
+pub struct ForcedRun {
+    /// The zero point, or why there is none ([`ForcedRefusal::is_stored`] says whether the refusal is written).
+    pub result: Result<ForcedZeroPoint, ForcedRefusal>,
+    /// The frame's preliminary zero point, when the budget gave one.
+    pub anchor: Option<Anchor>,
+    /// The list and its window, when one was built.
+    pub list: Option<ForcedList>,
+    /// What the fitter measured at the list's positions.
+    pub measured: Option<ListMeasurement>,
+    /// The statistic with its per-star rows, when the list was measured.
+    pub outcome: Option<ForcedOutcome>,
+}
+
+impl ForcedRun {
+    fn refused(r: ForcedRefusal) -> Self {
+        ForcedRun { result: Err(r), anchor: None, list: None, measured: None, outcome: None }
+    }
+}
+
+/// The fit's working-unit full scale, as the saturation test reads it (`saturation_plane`'s `norm`).
+fn full_scale_working(domain: &Domain) -> f64 {
+    match domain {
+        Domain::Calibrated { .. } => f64::from(ADU_SCALE),
+        Domain::RawAdu { full_scale, .. } => *full_scale,
+    }
+}
+
+/// The part of the composition that runs on the measurement: the plane's verdict, the exposure, the cone, the anchor and
+/// the list. `Err` is the frame's refusal.
+fn prepare_forced_list<F>(
+    frame: &RawFrame,
+    pm: &PlaneMeasurement,
+    opts: &FrameOptions,
+    zp: &ZpInputs,
+    params: &ForcedListParams,
+    cone: F,
+) -> Result<(Anchor, ForcedList), ForcedRefusal>
+where
+    F: FnOnce(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    // A plane with no stars in its statistic gives nothing a re-read would change (trailed and defocused planes never
+    // reach the callback).
+    if FrameSummary::from_measurement(pm, opts).verdict.is_some() {
+        return Err(ForcedRefusal::FrameVerdict);
+    }
+    let exptime = match zp.exptime_s {
+        Some(t) if t.is_finite() && t > 0.0 => t,
+        _ => return Err(ForcedRefusal::NoExposure),
+    };
+    let scale = pixel_scale_arcsec(zp.wcs);
+    let (cx, cy) = ((frame.w as f64 - 1.0) / 2.0, (frame.h as f64 - 1.0) / 2.0);
+    let (ra, dec) = zp.wcs.pixel_to_sky(cx, cy);
+    if !(scale.is_finite() && scale > 0.0 && ra.is_finite() && dec.is_finite()) {
+        return Err(ForcedRefusal::UnreadableSolve);
+    }
+    let catalog = cone(zp.wcs, frame.w, frame.h, params.region_fraction, zp.epoch).map_err(|e| {
+        tracing::warn!(error = %e, "forced list: the catalogue cone could not be read");
+        ForcedRefusal::CatalogueUnreadable
+    })?;
+    let rows = star_metrics(pm);
+    let anchor = anchor_zero_point(
+        &rows,
+        pm.reported_aperture_correction,
+        zp.wcs,
+        &catalog,
+        Some(exptime),
+        frame.w,
+        frame.h,
+        pm.frame.fwhm_px.unwrap_or(0.0),
+        params,
+    )?;
+    let list = forced_list(
+        &ForcedListInput {
+            catalog: &catalog,
+            wcs: zp.wcs,
+            width: frame.w,
+            height: frame.h,
+            anchor: anchor.zero_point,
+            full_scale: full_scale_working(&frame.domain),
+            exptime_s: exptime,
+        },
+        params,
+    )?;
+    Ok((anchor, list))
+}
+
+/// Measure a raw frame exactly as [`measure_raw_frame`] does and, when the frame is solved (`inputs`), its forced-list
+/// zero point: the Analysis measurement, then the anchor from its own fits, the list from the catalogue, the list fitted
+/// on the same plane (rustafits' list entry) and the statistic. Pure of any database or file; the probe and the analyzer
+/// call this one function, so what the probe judges is what ships. `cone` reads the catalogue stars (`wcs`, width,
+/// height, region fraction, epoch) and is called at most once; a trailed or defocused plane and a three-plane file never
+/// call it. The Analysis numbers are bit-identical with and without `inputs`.
+pub fn measure_with_zero_point<F>(
+    frame: &RawFrame,
+    config: &AnalysisConfig,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    inputs: Option<&ZpInputs>,
+    params: &ForcedListParams,
+    cone: F,
+) -> (PlaneMeasurement, Option<ForcedRun>)
+where
+    F: FnOnce(&WcsSolution, usize, usize, f64, f64) -> Result<Vec<CatalogStar>>,
+{
+    let opts = frame_options(config);
+    let Some(zp) = inputs else {
+        return (analysis_mode::measure_raw_frame(frame, &opts, pool), None);
+    };
+    let mut refused: Option<ForcedRefusal> = None;
+    let mut built: Option<(Anchor, ForcedList)> = None;
+    let mut requested = 0usize;
+    let (pm, measured) = analysis_mode::measure_raw_frame_and_list(frame, &opts, pool, |pm| {
+        match prepare_forced_list(frame, pm, &opts, zp, params, cone) {
+            Ok((anchor, list)) => {
+                requested = list.stars.len();
+                let request = (!list.stars.is_empty()).then(|| list.request.clone());
+                built = Some((anchor, list));
+                request
+            }
+            Err(r) => {
+                refused = Some(r);
+                None
+            }
+        }
+    });
+
+    let run = match measured {
+        Some(lm) if lm.refusal.is_some() => {
+            let mut run = ForcedRun::refused(ForcedRefusal::ColourCamera);
+            run.measured = Some(lm);
+            run
+        }
+        Some(lm) => match built {
+            Some((anchor, list)) => {
+                // `exptime_s` was valid to get here.
+                let t = zp.exptime_s.unwrap_or(f64::NAN);
+                let outcome = forced_zero_point(&list, &lm, t, params);
+                ForcedRun {
+                    result: outcome.result,
+                    anchor: Some(anchor),
+                    list: Some(list),
+                    measured: Some(lm),
+                    outcome: Some(outcome),
+                }
+            }
+            None => {
+                tracing::error!("forced list measured without a list built");
+                ForcedRun::refused(ForcedRefusal::CatalogueUnreadable)
+            }
+        },
+        None => {
+            let reason = if let Some(r) = refused {
+                r
+            } else if pm.trailed || pm.defocused {
+                ForcedRefusal::FrameVerdict
+            } else if requested == 0 {
+                // The list is empty: nothing in the window, or the catalogue holds nothing there.
+                ForcedRefusal::TooFewStars { list: 0, kept: 0 }
+            } else {
+                tracing::warn!(list = requested, "forced list was not measured: the request or the plane's mask was refused");
+                ForcedRefusal::TooFewStars { list: requested as u32, kept: 0 }
+            };
+            let (anchor, list) = match built {
+                Some((a, l)) => (Some(a), Some(l)),
+                None => (None, None),
+            };
+            ForcedRun { result: Err(reason), anchor, list, measured: None, outcome: None }
+        }
+    };
+    (pm, Some(run))
 }
 
 #[cfg(test)]
@@ -577,4 +773,160 @@ mod tests {
         assert!(near(&g_only), "the G star is measured");
         assert!(!near(&r_only), "the R star is absent");
     }
+
+    // ---- the forced-list composition ----------------------------------------------------------------------------
+
+    const ZP_TRUE: f64 = 24.0;
+    const T_EXP: f64 = 10.0;
+
+    fn wcs_1as(w: usize, h: usize) -> WcsSolution {
+        let s = 1.0 / 3600.0;
+        WcsSolution {
+            crpix: ((w as f64 - 1.0) / 2.0, (h as f64 - 1.0) / 2.0),
+            crval: (150.0, 20.0),
+            cd: [[-s, 0.0], [0.0, s]],
+            sip_forward: None,
+            sip_reverse: None,
+        }
+    }
+
+    /// A mono frame of `n` isolated Moffat stars (FWHM 3.5, beta 4) with the catalogue that matches them: G from the
+    /// star's total flux at the true zero point.
+    fn solved_mono(n: usize, w: usize, h: usize, seed: u64) -> (RawFrame, Vec<CatalogStar>, WcsSolution) {
+        let stars = grid_stars(n, w, h, 3.5, seed);
+        let wcs = wcs_1as(w, h);
+        let cat: Vec<CatalogStar> = stars
+            .iter()
+            .map(|s| {
+                let total = std::f64::consts::PI * s.amp * s.alpha_x * s.alpha_y / 3.0;
+                let g = ZP_TRUE - 2.5 * (total / T_EXP).log10();
+                let (ra, dec) = wcs.pixel_to_sky(s.x, s.y);
+                CatalogStar { ra, dec, mag: g as f32 }
+            })
+            .collect();
+        let mut p = moffat_field(w, h, &stars, 4.0, 1000.0);
+        add_noise(&mut p, 5.0, seed + 1);
+        let frame = RawFrame { planes: RawPlanes::Mono(p), w, h, domain: RAW, flip_vertical: false, channels: 1 };
+        (frame, cat, wcs)
+    }
+
+    fn inputs(wcs: &WcsSolution) -> ZpInputs<'_> {
+        ZpInputs { wcs, exptime_s: Some(T_EXP), epoch: 2025.5 }
+    }
+
+    #[test]
+    fn the_composition_measures_a_synthetic_frame() {
+        let (frame, cat, wcs) = solved_mono(500, 2000, 1500, 31);
+        let asked = std::cell::Cell::new(0);
+        let (pm, run) = measure_with_zero_point(
+            &frame,
+            &cfg(),
+            None,
+            Some(&inputs(&wcs)),
+            &ForcedListParams::default(),
+            |_, w, h, frac, _| {
+                asked.set(asked.get() + 1);
+                assert_eq!((w, h, frac), (2000, 1500, 0.9));
+                Ok(cat.clone())
+            },
+        );
+        assert_eq!(asked.get(), 1, "the cone is read once");
+        let run = run.expect("a solved frame is judged");
+        let z = run.result.unwrap_or_else(|r| panic!("refused: {r:?}; anchor {:?}", run.anchor));
+        assert!((z.zero_point - ZP_TRUE).abs() < 0.02, "zero point {}", z.zero_point);
+        assert!(z.stars >= 50, "survivors {}", z.stars);
+        let anchor = run.anchor.expect("anchor");
+        assert!((anchor.zero_point - ZP_TRUE).abs() < 0.05, "anchor {}", anchor.zero_point);
+        let list = run.list.expect("list");
+        assert!(list.stars.len() >= 50 && list.window_bright < 15.0, "{} stars, G_b {}", list.stars.len(), list.window_bright);
+        let o = run.outcome.expect("outcome");
+        assert!(o.aperture_correction.is_some_and(|c| c > 1.0 && c < 1.5), "c {:?}", o.aperture_correction);
+        assert!(pm.stars.len() >= 400);
+    }
+
+    #[test]
+    fn the_analysis_numbers_do_not_move_with_a_zero_point() {
+        let (frame, cat, wcs) = solved_mono(300, 1400, 1000, 41);
+        let plain = measure_raw_frame(&frame, &cfg(), None);
+        let (with, run) = measure_with_zero_point(
+            &frame,
+            &cfg(),
+            None,
+            Some(&inputs(&wcs)),
+            &ForcedListParams::default(),
+            |_, _, _, _, _| Ok(cat.clone()),
+        );
+        assert!(run.is_some());
+        let (without, none) = measure_with_zero_point(
+            &frame,
+            &cfg(),
+            None,
+            None,
+            &ForcedListParams::default(),
+            |_, _, _, _, _| panic!("no solve, no cone"),
+        );
+        assert!(none.is_none());
+        for (name, pm) in [("with", &with), ("without", &without)] {
+            assert_eq!(format!("{:?}", pm.stars), format!("{:?}", plain.stars), "{name}: stars");
+            assert_eq!(
+                (pm.beta.to_bits(), pm.aperture_correction.map(f64::to_bits), pm.aperture_stars, pm.seeds),
+                (plain.beta.to_bits(), plain.aperture_correction.map(f64::to_bits), plain.aperture_stars, plain.seeds),
+                "{name}"
+            );
+            assert_eq!(format!("{:?}", pm.frame), format!("{:?}", plain.frame), "{name}: frame");
+        }
+    }
+
+    #[test]
+    fn a_three_plane_frame_and_a_trailed_plane_give_their_refusal_codes() {
+        let wcs = wcs_1as(600, 450);
+        let no_cone = |_: &WcsSolution, _: usize, _: usize, _: f64, _: f64| -> Result<Vec<CatalogStar>> {
+            panic!("the cone is not read for this frame")
+        };
+        // A debayered three-plane file.
+        let (mono, _, _) = solved_mono(100, 600, 450, 3);
+        let RawPlanes::Mono(p) = &mono.planes else { unreachable!() };
+        let rgb = RawFrame {
+            planes: RawPlanes::Rgb([p.clone(), p.clone(), p.clone()]),
+            w: 600,
+            h: 450,
+            domain: RAW,
+            flip_vertical: false,
+            channels: 3,
+        };
+        let (_, run) = measure_with_zero_point(&rgb, &cfg(), None, Some(&inputs(&wcs)), &ForcedListParams::default(), no_cone);
+        assert_eq!(run.unwrap().result, Err(ForcedRefusal::ColourCamera));
+        // A trailed plane.
+        let trailed: Vec<f32> = crate::test_support::trailed_field(600, 450, 9).iter().map(|v| v * 65535.0).collect();
+        let frame =
+            RawFrame { planes: RawPlanes::Mono(trailed), w: 600, h: 450, domain: RAW, flip_vertical: false, channels: 1 };
+        let (pm, run) = measure_with_zero_point(&frame, &cfg(), None, Some(&inputs(&wcs)), &ForcedListParams::default(), no_cone);
+        assert!(pm.trailed);
+        let r = run.unwrap().result.unwrap_err();
+        assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::FrameVerdict, "frame_verdict", true));
+    }
+
+    #[test]
+    fn exposure_solve_and_catalogue_refusals_are_told_apart() {
+        let (frame, cat, wcs) = solved_mono(300, 1400, 1000, 51);
+        let judged = |zp: ZpInputs, cone: Result<Vec<CatalogStar>>| {
+            let cone = std::cell::Cell::new(Some(cone));
+            measure_with_zero_point(&frame, &cfg(), None, Some(&zp), &ForcedListParams::default(), |_, _, _, _, _| {
+                cone.take().unwrap()
+            })
+            .1
+            .unwrap()
+            .result
+        };
+        let none = ZpInputs { exptime_s: None, ..inputs(&wcs) };
+        assert_eq!(judged(none, Ok(cat.clone())), Err(ForcedRefusal::NoExposure));
+        let mut bad = wcs_1as(1400, 1000);
+        bad.cd = [[0.0, 0.0], [0.0, 0.0]];
+        assert_eq!(judged(inputs(&bad), Ok(cat.clone())), Err(ForcedRefusal::UnreadableSolve));
+        let r = judged(inputs(&wcs), Err(anyhow::anyhow!("tile unreadable"))).unwrap_err();
+        assert_eq!((r, r.is_stored()), (ForcedRefusal::CatalogueUnreadable, false));
+        // An empty cone: no matches for the anchor.
+        assert!(matches!(judged(inputs(&wcs), Ok(Vec::new())), Err(ForcedRefusal::NoAnchor { matched: 0 })));
+    }
 }
+
