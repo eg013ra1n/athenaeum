@@ -2198,8 +2198,8 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO frames (id, file_id, imagetyp, is_master, instrume, telescop, focallen, gain, xbinning,
-                                     filter, date_obs)
-                 VALUES (?1, ?1, ?2, 0, 'CamA', 'Scope', 540.0, 56.0, 1, 'L', ?3)",
+                                     filter, date_obs, exptime)
+                 VALUES (?1, ?1, ?2, 0, 'CamA', 'Scope', 540.0, 56.0, 1, 'L', ?3, 120.0)",
                 params![id, imagetyp, format!("2026-03-0{}T21:{:02}:00Z", night + 1, id % 60)],
             )
             .unwrap();
@@ -2316,7 +2316,7 @@ mod tests {
         assert_eq!((t.zero_point, t.zp_stars, t.zp_sigma, t.loss_mag), (None, None, None, None), "{t:?}");
         assert_eq!(
             t.reason.as_deref(),
-            Some("zero point not measured yet — the star catalogue may not be installed")
+            Some("transparency not measured yet — run Analyze on its frame set")
         );
         #[allow(clippy::type_complexity)]
         let columns: (

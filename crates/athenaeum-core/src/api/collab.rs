@@ -409,6 +409,7 @@ struct FrameRow {
     filter: Option<String>,
     uuid: Option<String>,
     instrume: Option<String>,
+    bayerpat: Option<String>,
 }
 
 /// The signed-in e-mail, lower-cased — the scope of `collab_filter_mappings`
@@ -526,7 +527,7 @@ fn frame_gate_inputs(
     let mut rows_by_id: HashMap<i64, FrameRow> = HashMap::new();
     {
         let sql = format!(
-            "SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen, filter, uuid, instrume \
+            "SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen, filter, uuid, instrume, bayerpat \
              FROM frames WHERE id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -543,6 +544,7 @@ fn frame_gate_inputs(
                     filter: r.get(7)?,
                     uuid: r.get(8)?,
                     instrume: r.get(9)?,
+                    bayerpat: r.get(10)?,
                 },
             ))
         })?;
@@ -672,6 +674,12 @@ fn frame_gate_inputs(
             }
         };
 
+        // O7: a one-shot-colour frame (a mosaic) with no filter name is not judged on its loss.
+        let colour_without_filter = filter_raw.is_empty()
+            && crate::analysis::zero_point::is_mosaic(
+                frow.and_then(|f| f.bayerpat.as_deref()),
+                analyses.get(frame_id).map(|a| a.source_channels),
+            );
         out.push((
             GateFrameInput {
                 frame_id: *frame_id,
@@ -684,6 +692,7 @@ fn frame_gate_inputs(
                 filter,
                 uuid,
                 transparency: transparency.remove(frame_id),
+                colour_without_filter,
             },
             instrume,
         ));
@@ -6995,6 +7004,7 @@ pub(crate) mod tests {
             filter: crate::collab::filters::FilterResolution::Matched("L".into()),
             uuid: "u".into(),
             transparency,
+            colour_without_filter: false,
         }
     }
 
@@ -7095,7 +7105,10 @@ pub(crate) mod tests {
             cached_project(&conn);
             sign_in_as(&conn, "me@example.org");
             lte_rule_project(&conn, 0.5);
-            seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 2)
+            // Solved lights with a current analysis, so the catalogue is what is missing.
+            let frames = seed_unmeasured_zero_points(&conn, 2);
+            let set_id: i64 = conn.query_row("SELECT id FROM frames_set LIMIT 1", [], |r| r.get(0)).unwrap();
+            (set_id, frames)
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
         let with_rule = evaluate_project_gate(&ctx, "p-1").unwrap();
@@ -7103,7 +7116,10 @@ pub(crate) mod tests {
             let row = row_of(&with_rule, *id);
             assert_eq!(row.rules.len(), 1);
             assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
-            assert!(row.rules[0].reason.is_some());
+            assert_eq!(
+                row.rules[0].reason.as_deref(),
+                Some("the star catalogue is not installed — install it to measure transparency")
+            );
             assert!(!row.failures.iter().any(|f| f.contains("Transparency")), "{:?}", row.failures);
         }
         let conn = crate::api::db(&ctx).unwrap().conn();
@@ -7240,7 +7256,40 @@ pub(crate) mod tests {
         stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<Result<_, _>>().unwrap()
     }
 
-    const NOT_MEASURED_YET: &str = "zero point not measured yet — the star catalogue may not be installed";
+    const NOT_MEASURED_YET: &str = "transparency not measured yet — run Analyze on its frame set";
+    const ANALYSIS_DIFFERS: &str = "its analysis differs from the current one — run Analyze on its frame set";
+
+    /// O7 reaches the gate's rows: a one-shot-colour frame (a mosaic) with no filter name is listed without a verdict and
+    /// the colour sentence; the same frame with a filter, and a mono frame with none, keep the ordinary reason. Nothing
+    /// blocks either way.
+    #[test]
+    fn the_gate_does_not_judge_a_colour_frame_without_a_filter() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            lte_rule_project(&conn, 0.5);
+            let frames = seed_unmeasured_zero_points(&conn, 3);
+            // 0: mosaic, no filter. 1: mosaic with a filter. 2: mono, no filter.
+            conn.execute("UPDATE frames SET bayerpat = 'RGGB', filter = NULL WHERE id = ?1", [frames[0]]).unwrap();
+            conn.execute("UPDATE frames SET bayerpat = 'RGGB' WHERE id = ?1", [frames[1]]).unwrap();
+            conn.execute("UPDATE frames SET filter = '  ' WHERE id = ?1", [frames[2]]).unwrap();
+            let set_id: i64 = conn.query_row("SELECT id FROM frames_set LIMIT 1", [], |r| r.get(0)).unwrap();
+            (set_id, frames)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        let reason = |id: i64| row_of(&report, id).rules[0].reason.clone();
+        assert_eq!(reason(frames[0]).as_deref(), Some(crate::collab::gate::COLOUR_WITHOUT_FILTER_REASON));
+        assert_ne!(reason(frames[1]).as_deref(), Some(crate::collab::gate::COLOUR_WITHOUT_FILTER_REASON));
+        assert_ne!(reason(frames[2]).as_deref(), Some(crate::collab::gate::COLOUR_WITHOUT_FILTER_REASON));
+        for id in &frames {
+            let row = row_of(&report, *id);
+            assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
+            assert!(!row.failures.iter().any(|f| f.contains("Transparency")), "{:?}", row.failures);
+        }
+    }
 
     /// F6: the gate reads stored zero points only. A project with a `transparency_loss` rule, 250 solved frames without a
     /// current zero point and an installed catalogue: an interactive gate and a publish run's gate both leave every
@@ -7286,7 +7335,9 @@ pub(crate) mod tests {
             let read = crate::analysis::transparency::transparency_for_frames(&conn, Some(&identity), &frames).unwrap();
             for id in &frames {
                 assert_eq!(read[id].loss_mag, None, "frame {id} has no loss");
-                assert_eq!(read[id].reason.as_deref(), Some(NOT_MEASURED_YET), "frame {id}");
+                // The frame holding another catalogue's zero point says so; the rest were never measured.
+                let want = if *id == frames[0] { ANALYSIS_DIFFERS } else { NOT_MEASURED_YET };
+                assert_eq!(read[id].reason.as_deref(), Some(want), "frame {id}");
             }
         }
     }
@@ -10255,6 +10306,8 @@ pub(crate) mod tests {
                 // The two new frames: solved, analysed at the current version; only the first has a zero point.
                 for (i, id) in fx.frame_ids.iter().enumerate() {
                     seed_plate_solve(&conn, *id, 0.78, 10.68, 41.27);
+                    // The exposure is part of the reference's key: the reference frames below are 300 s.
+                    conn.execute("UPDATE frames SET exptime = 300.0 WHERE id = ?1", [id]).unwrap();
                     conn.execute("UPDATE frame_analysis SET measure_version = ?1 WHERE frame_id = ?2", rusqlite::params![v, id]).unwrap();
                     if i == 0 {
                         conn.execute(
@@ -10286,7 +10339,7 @@ pub(crate) mod tests {
                         .unwrap();
                         let file_id = conn.last_insert_rowid();
                         conn.execute(
-                            "INSERT INTO frames (file_id, imagetyp, instrume, focallen, filter) VALUES (?1, 'Light', 'ASI2600MM', 1000.0, 'L')",
+                            "INSERT INTO frames (file_id, imagetyp, instrume, focallen, filter, exptime) VALUES (?1, 'Light', 'ASI2600MM', 1000.0, 'L', 300.0)",
                             [file_id],
                         )
                         .unwrap();

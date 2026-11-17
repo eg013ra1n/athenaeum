@@ -1131,6 +1131,26 @@ pub fn get_analysis_for_frame_set(
     Ok(rows)
 }
 
+/// The one count of "N to update" and its reasons for a frame set's zero points, for the Analysis tab (plan Task 6a/6b):
+/// [`crate::analysis::transparency::count_zero_point_updates`] over the set's analysis rows, with the installed
+/// catalogue's identity and the set's solved frames. `to_update` is exactly what a run of Analyze (without Re-Analyze)
+/// measures for the zero point; frames that wait on a catalogue that is not installed, or whose measurement failed,
+/// are reported apart and never counted in it. Reads no pixel and no star: a stat of the tier files, one chunked solve query.
+#[cfg(feature = "solver")]
+pub fn zero_point_updates(
+    ctx: &ServiceContext,
+    frame_set_id: i64,
+) -> Result<crate::analysis::transparency::ZeroPointUpdates, ApiError> {
+    let identity = installed_identity(ctx);
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rows = db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)?;
+    let ids: Vec<i64> = rows.iter().map(|a| a.frame_id).collect();
+    let solved = crate::plate_solve::storage::frames_with_solve(&conn, &ids)
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    Ok(crate::analysis::transparency::count_zero_point_updates(&rows, &solved, identity.as_deref()))
+}
+
 /// Delegates to the central orientation helper — see
 /// `crate::orientation::flip_vertical_for_path` doc for the astronomical
 /// (not TOP-DOWN/BOTTOM-UP-literal) convention this applies.
@@ -2252,6 +2272,36 @@ mod tests {
             // The flag is never in the stored row.
             let handle = db(&ctx).unwrap();
             assert!(!db_analysis::get_frame_analysis(&handle.conn(), 2).unwrap().unwrap().zp_outdated);
+        }
+
+        /// The count of the Analysis tab is Analyze's own selection: the same frames, no catalogue is "install it", never
+        /// "to update".
+        #[test]
+        fn the_update_count_matches_what_analyze_selects() {
+            let (tmp, ctx, hash) = seeded_selection();
+            // No catalogue: nothing to update; the four solved frames wait for the catalogue.
+            let none = zero_point_updates(&ctx, 1).unwrap();
+            assert_eq!((none.to_update, none.no_catalogue, none.measurement_failed), (0, 4, 0));
+            let identity = install_fake_catalogue(&tmp);
+            {
+                let handle = db(&ctx).unwrap();
+                handle
+                    .conn()
+                    .execute("UPDATE frame_analysis SET zp_catalog = ?1 WHERE frame_id IN (1, 5)", [&identity])
+                    .unwrap();
+            }
+            let got = zero_point_updates(&ctx, 1).unwrap();
+            // 2 (version 2) and 3 (another catalogue) are to update; 1 and 5 are current; 4 is unsolved.
+            assert_eq!((got.to_update, got.no_catalogue, got.measurement_failed), (2, 0, 0));
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            let analyze: Vec<i64> = select_frame_jobs(&conn, 1, &hash, Some(&identity), false)
+                .unwrap()
+                .iter()
+                .map(|j| j.frame_id)
+                .filter(|id| *id != 5) // 5 is selected for its stale config, not for its zero point
+                .collect();
+            assert_eq!(analyze.len(), got.to_update, "{analyze:?}");
         }
 
         /// Blink never re-reads a file for an outdated zero point: the row is served as it is stored. The file does not
