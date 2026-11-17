@@ -339,8 +339,8 @@ it, §6):
   colour files keep `ColourCamera`.
 - `NotMeasured` says "transparency not measured yet — run Analyze on its frame set"; `NoStarMetrics` goes (no stored
   star rows are read); a refusal says why in one sentence: `poor_solve` reads "the stars are not where the plate solve
-  puts them — solve this frame again" (the advice stands only if a new solve of a refused frame measures; refused again,
-  the sentence ends before it, M5, §6); too few catalogue stars, install the deeper tier, when the list was small. Gate: O7
+  puts them — the solve is too poor to measure transparency" (no "solve this frame again": Task 7 solved frame 29375
+  again and it was refused again at rms 0.527 px, so the advice would loop; M5, §6); too few catalogue stars, install the deeper tier, when the list was small. Gate: O7
   stays; a frame without a current ZP gets no verdict and is not blocked. New fields and codes go into the logging
   dictionary.
 

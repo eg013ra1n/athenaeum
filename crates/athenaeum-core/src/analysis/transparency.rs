@@ -136,7 +136,7 @@ impl LossReason {
             }
             LossReason::Refused(refusal) => match refusal {
                 Refusal::PoorSolve => {
-                    "the stars are not where the plate solve puts them — solve this frame again".to_string()
+                    "the stars are not where the plate solve puts them — the solve is too poor to measure transparency".to_string()
                 }
                 Refusal::TooFewStars { list_stars: Some(n) } if *n < SHORT_LIST_STARS => {
                     "too few catalogue stars in the field — a deeper star catalogue tier may help".to_string()
@@ -1954,7 +1954,7 @@ mod tests {
         let mut w = World::new();
         let good = w.series(&Spec::default(), 2, &ramp(30));
         let table: Vec<(&str, Option<i64>, &str)> = vec![
-            ("poor_solve", Some(400), "the stars are not where the plate solve puts them — solve this frame again"),
+            ("poor_solve", Some(400), "the stars are not where the plate solve puts them — the solve is too poor to measure transparency"),
             ("too_few_stars", Some(30), "too few catalogue stars in the field — a deeper star catalogue tier may help"),
             ("too_few_stars", Some(49), "too few catalogue stars in the field — a deeper star catalogue tier may help"),
             ("too_few_stars", Some(50), "too few of the field's catalogue stars could be measured"),
