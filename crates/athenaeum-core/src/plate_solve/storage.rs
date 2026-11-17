@@ -174,59 +174,101 @@ pub fn insert_plate_solve(conn: &Connection, record: &PlateSolveRecord) -> Resul
     Ok(id)
 }
 
-/// Get plate solve result for a frame.
-pub fn get_plate_solve(conn: &Connection, frame_id: i64) -> Result<Option<PlateSolveRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, frame_id, crpix1, crpix2, crval1, crval2,
+const PLATE_SOLVE_COLUMNS: &str = "id, frame_id, crpix1, crpix2, crval1, crval2,
                     cd1_1, cd1_2, cd2_1, cd2_2,
                     sip_order, sip_a_coeffs, sip_b_coeffs, sip_ap_coeffs, sip_bp_coeffs,
                     matched_stars, total_detected,
                     rms_residual_px, rms_residual_arcsec,
                     pixel_scale_arcsec, field_rotation_deg,
                     solve_time_ms, catalog_used, algorithm_used, solved_at,
-                    expected_catalog_stars_in_fov, inlier_ratio
-             FROM plate_solves WHERE frame_id = ?1",
-        )
+                    expected_catalog_stars_in_fov, inlier_ratio";
+
+fn row_to_plate_solve(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlateSolveRecord> {
+    Ok(PlateSolveRecord {
+        id: row.get(0)?,
+        frame_id: row.get(1)?,
+        crpix1: row.get(2)?,
+        crpix2: row.get(3)?,
+        crval1: row.get(4)?,
+        crval2: row.get(5)?,
+        cd1_1: row.get(6)?,
+        cd1_2: row.get(7)?,
+        cd2_1: row.get(8)?,
+        cd2_2: row.get(9)?,
+        sip_order: row.get(10)?,
+        sip_a_coeffs: row.get(11)?,
+        sip_b_coeffs: row.get(12)?,
+        sip_ap_coeffs: row.get(13)?,
+        sip_bp_coeffs: row.get(14)?,
+        matched_stars: row.get(15)?,
+        total_detected: row.get(16)?,
+        rms_residual_px: row.get(17)?,
+        rms_residual_arcsec: row.get(18)?,
+        pixel_scale_arcsec: row.get(19)?,
+        field_rotation_deg: row.get(20)?,
+        solve_time_ms: row.get(21)?,
+        catalog_used: row.get(22)?,
+        algorithm_used: row.get(23)?,
+        solved_at: row.get(24)?,
+        expected_catalog_stars_in_fov: row.get(25)?,
+        inlier_ratio: row.get(26)?,
+    })
+}
+
+/// Get plate solve result for a frame.
+pub fn get_plate_solve(conn: &Connection, frame_id: i64) -> Result<Option<PlateSolveRecord>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {PLATE_SOLVE_COLUMNS} FROM plate_solves WHERE frame_id = ?1"))
         .context("Failed to prepare plate solve query")?;
 
-    let result = stmt.query_row([frame_id], |row| {
-        Ok(PlateSolveRecord {
-            id: row.get(0)?,
-            frame_id: row.get(1)?,
-            crpix1: row.get(2)?,
-            crpix2: row.get(3)?,
-            crval1: row.get(4)?,
-            crval2: row.get(5)?,
-            cd1_1: row.get(6)?,
-            cd1_2: row.get(7)?,
-            cd2_1: row.get(8)?,
-            cd2_2: row.get(9)?,
-            sip_order: row.get(10)?,
-            sip_a_coeffs: row.get(11)?,
-            sip_b_coeffs: row.get(12)?,
-            sip_ap_coeffs: row.get(13)?,
-            sip_bp_coeffs: row.get(14)?,
-            matched_stars: row.get(15)?,
-            total_detected: row.get(16)?,
-            rms_residual_px: row.get(17)?,
-            rms_residual_arcsec: row.get(18)?,
-            pixel_scale_arcsec: row.get(19)?,
-            field_rotation_deg: row.get(20)?,
-            solve_time_ms: row.get(21)?,
-            catalog_used: row.get(22)?,
-            algorithm_used: row.get(23)?,
-            solved_at: row.get(24)?,
-            expected_catalog_stars_in_fov: row.get(25)?,
-            inlier_ratio: row.get(26)?,
-        })
-    });
+    let result = stmt.query_row([frame_id], row_to_plate_solve);
 
     match result {
         Ok(record) => Ok(Some(record)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e).context("Failed to fetch plate solve record"),
     }
+}
+
+/// The plate solves of many frames, keyed by frame id, one statement per chunk of 500 ids (never one per frame): what
+/// the Analysis run reads beside its frame list. A frame without a solve is absent.
+pub fn get_plate_solves_for_frames(
+    conn: &Connection,
+    frame_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, PlateSolveRecord>> {
+    let mut out = std::collections::HashMap::with_capacity(frame_ids.len());
+    for chunk in frame_ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn
+            .prepare(&format!("SELECT {PLATE_SOLVE_COLUMNS} FROM plate_solves WHERE frame_id IN ({marks})"))
+            .context("Failed to prepare the plate solves query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), row_to_plate_solve)
+            .context("Failed to query the plate solves")?;
+        for row in rows {
+            let record = row.context("Failed to read a plate solve record")?;
+            out.insert(record.frame_id, record);
+        }
+    }
+    Ok(out)
+}
+
+/// The frames among `frame_ids` that have a plate solve, one statement per chunk of 500 ids.
+pub fn frames_with_solve(conn: &Connection, frame_ids: &[i64]) -> Result<std::collections::HashSet<i64>> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in frame_ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn
+            .prepare(&format!("SELECT frame_id FROM plate_solves WHERE frame_id IN ({marks})"))
+            .context("Failed to prepare the solved frames query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))
+            .context("Failed to query the solved frames")?;
+        for row in rows {
+            out.insert(row.context("Failed to read a solved frame id")?);
+        }
+    }
+    Ok(out)
 }
 
 /// Delete plate solve result for a frame. The frame's zero point goes with it (see [`insert_plate_solve`]).

@@ -93,6 +93,37 @@ impl StoredZeroPoint {
     }
 }
 
+impl StoredZeroPoint {
+    /// A refusal that carries only its code (`no_anchor`, `no_exposure`, `unreadable_solve`, `colour_camera`,
+    /// `frame_verdict`): every figure NULL.
+    pub fn code_only(version: u32, code: &str) -> Self {
+        StoredZeroPoint {
+            zero_point: None,
+            stars: None,
+            sigma: None,
+            version,
+            refusal: Some(code.to_string()),
+            list_stars: None,
+            window_bright: None,
+            window_slope: None,
+        }
+    }
+}
+
+/// Set every `zp_*` field of an analysis row not yet stored to `None` (the nine columns): a judgement that was
+/// superseded before it was written.
+pub fn clear_zero_point_fields(analysis: &mut FrameAnalysis) {
+    analysis.zero_point = None;
+    analysis.zp_stars = None;
+    analysis.zp_sigma = None;
+    analysis.zp_version = None;
+    analysis.zp_catalog = None;
+    analysis.zp_refusal = None;
+    analysis.zp_list_stars = None;
+    analysis.zp_window_bright = None;
+    analysis.zp_window_slope = None;
+}
+
 /// Store the outcome of a zero-point judgement on a frame's analysis row: the nine figures (NULL where the outcome has
 /// none), `zp_version` and the catalogue identity it was judged against, so the frame is not retried until either
 /// changes.

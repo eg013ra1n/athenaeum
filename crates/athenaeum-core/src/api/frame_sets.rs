@@ -2296,7 +2296,8 @@ mod tests {
             let conn = crate::api::db(&ctx).unwrap().conn();
             conn.execute(
                 "UPDATE frame_analysis SET zero_point = NULL, zp_stars = NULL, zp_sigma = NULL, zp_version = NULL,
-                                           zp_catalog = NULL WHERE frame_id = ?1",
+                                           zp_catalog = NULL, zp_refusal = NULL, zp_list_stars = NULL,
+                                           zp_window_bright = NULL, zp_window_slope = NULL WHERE frame_id = ?1",
                 [target],
             )
             .unwrap();
@@ -2317,16 +2318,41 @@ mod tests {
             t.reason.as_deref(),
             Some("zero point not measured yet — the star catalogue may not be installed")
         );
-        let columns: (Option<f64>, Option<i64>, Option<f64>, Option<i64>, Option<String>) = {
+        #[allow(clippy::type_complexity)]
+        let columns: (
+            Option<f64>,
+            Option<i64>,
+            Option<f64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<f64>,
+            Option<f64>,
+        ) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             conn.query_row(
-                "SELECT zero_point, zp_stars, zp_sigma, zp_version, zp_catalog FROM frame_analysis WHERE frame_id = ?1",
+                "SELECT zero_point, zp_stars, zp_sigma, zp_version, zp_catalog,
+                        zp_refusal, zp_list_stars, zp_window_bright, zp_window_slope
+                 FROM frame_analysis WHERE frame_id = ?1",
                 [target],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
             )
             .unwrap()
         };
-        assert_eq!(columns, (None, None, None, None, None), "the read path computed nothing");
+        assert_eq!(columns, (None, None, None, None, None, None, None, None, None), "the read path computed nothing");
     }
 
     /// A master `Light` row keeps the placeholder: it is not a light of the read (it was not among the ids asked), so
