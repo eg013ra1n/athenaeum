@@ -10,7 +10,7 @@ use tauri::State;
 use athenaeum_core::analysis::config::AnalysisConfig;
 use athenaeum_core::api::analysis as api;
 use athenaeum_core::flat_analysis::FlatContourOpts;
-use athenaeum_core::models::{FrameAnalysis, StarMetricsResponse};
+use athenaeum_core::models::{FrameAnalysis, StarMetricsResponse, ZeroPointUpdates};
 
 use crate::tauri_events::TauriProgressEmitter;
 
@@ -82,6 +82,17 @@ pub async fn get_analysis_for_frame_set(
     frame_set_id: i64,
 ) -> Result<Vec<FrameAnalysis>, String> {
     api::get_analysis_for_frame_set(&state.ctx, frame_set_id).map_err(|e| e.to_string())
+}
+
+/// The count of "N to update" for a frame set's zero points (what Analyze would measure), apart from the frames that
+/// wait on a catalogue that is not installed and those whose measurement failed.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_zero_point_updates(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+) -> Result<ZeroPointUpdates, String> {
+    api::zero_point_updates(&state.ctx, frame_set_id).map_err(|e| e.to_string())
 }
 
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.

@@ -850,6 +850,10 @@ mod tests {
                 zp_sigma: None,
                 zp_version: None,
                 zp_catalog: None,
+                zp_refusal: None,
+                zp_list_stars: None,
+                zp_window_bright: None,
+                zp_window_slope: None,
             };
             crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
         };
@@ -930,6 +934,10 @@ mod tests {
                 zp_sigma: None,
                 zp_version: None,
                 zp_catalog: None,
+                zp_refusal: None,
+                zp_list_stars: None,
+                zp_window_bright: None,
+                zp_window_slope: None,
             };
             crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
         }

@@ -140,11 +140,6 @@ pub async fn initialize_database(
         });
     }
 
-    // Zero points for frames analysed and solved before the feature existed (or against another star catalogue),
-    // measured in chunks on a background thread, once per launch. Placed here (DB guaranteed ready), beside the
-    // content index; mirrors the web host's `main.rs`.
-    athenaeum_core::api::analysis::spawn_zero_point_backfill(Arc::clone(&state.ctx));
-
     // Second re-arm trigger: the background monitor scans on its own timer and
     // calls the scanner directly, never crossing the command boundary where the
     // interactive re-arm sits. `ScanCompletionHook` is the seam core exposes for

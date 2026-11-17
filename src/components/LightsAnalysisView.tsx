@@ -1,9 +1,10 @@
 import { useState, useEffect, useMemo, useCallback, useRef, type ReactNode } from 'react';
-import { Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, Crosshair } from 'lucide-react';
+import { Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, Crosshair, Info } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
+  ZeroPointUpdates,
   FrameSetReference,
 } from '../types/models';
 import { useNotifications } from '../contexts/NotificationContext';
@@ -13,6 +14,7 @@ import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/Ligh
 import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
+import { analysisCountText, NO_UPDATES } from './analysisCount';
 import { stackedFrameSnr } from './analysis/stackedSnr';
 import { autoOutlierLimit } from './analysis/outlierLimit';
 import { rowVerdict } from './analysis/unusable';
@@ -21,6 +23,7 @@ import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-s
 import { ZipExtractionLine } from './zip/ZipExtractionLine';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
+import { useZeroPointPassComplete } from '../hooks/useZeroPointPassComplete';
 import { BlinkToolButton, ToolDivider, ToolSelection, ToolSplit, ToolToggle } from './toolbar/LabeledToolbar';
 
 interface LightsAnalysisViewProps {
@@ -149,6 +152,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   const analysisProgress = currentAnalysis?.progress ?? null;
 
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
+  // What Analyze would measure for the zero points, and what waits on a catalogue (core counts, this only shows).
+  const [zeroPointUpdates, setZeroPointUpdates] = useState<ZeroPointUpdates>(NO_UPDATES);
   const [csvExportedMsg, setCsvExportedMsg] = useState<string | null>(null);
   const csvTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const plateSolveRef = useRef<PlateSolveBatchPanelHandle>(null);
@@ -267,7 +272,19 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     } catch (err) {
       console.error('Failed to load analysis data:', err);
     }
+    try {
+      setZeroPointUpdates(await api.invoke<ZeroPointUpdates>('get_zero_point_updates', { frameSetId }));
+    } catch (err) {
+      console.error('Failed to load the zero point update count:', err);
+      setZeroPointUpdates(NO_UPDATES);
+    }
   }, [frameSetId]);
+
+  // The pass after a solve batch measures the solved frames' transparency after `plate-solve-complete` has already
+  // reloaded the tab: its end reloads the "N to update" count and the zero point cells again.
+  useZeroPointPassComplete(() => {
+    loadAnalysisData();
+  });
 
   // Enqueue analysis via global queue
   const handleAnalyzeAll = useCallback((force?: boolean) => {
@@ -540,7 +557,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
 
   const analyzedCount = analysisData.size;
   const totalLightFrames = allFrames.length;
-  const allAnalyzed = analyzedCount >= totalLightFrames;
+  const countText = analysisCountText(analyzedCount, totalLightFrames, zeroPointUpdates);
+  const allAnalyzed = countText.settled;
   const hasSelection = selectedFrameIds.size > 0;
 
   return (
@@ -670,8 +688,16 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                   <BarChart3 size={12} />
                   {analyzing ? 'Analyzing...' : 'Analyze'}
                 </button>
-                <span className="text-[10px] text-content-muted leading-tight">
-                  {analyzedCount > 0 ? `${analyzedCount}/${totalLightFrames}` : 'Analyze'}
+                <span className="text-[10px] text-content-muted leading-tight text-center" title={countText.title ?? undefined}>
+                  {countText.count || countText.update ? (
+                    <>
+                      {countText.count}
+                      {countText.count && countText.update ? <br /> : null}
+                      {countText.update}
+                    </>
+                  ) : (
+                    'Analyze'
+                  )}
                 </span>
               </div>
             ) : (
@@ -684,7 +710,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                 >
                   <BarChart3 size={12} />
                 </button>
-                <span className="text-[10px] text-content-muted leading-tight">Re-Analyze</span>
+                <span className="text-[10px] text-content-muted leading-tight" title={countText.title ?? undefined}>Re-Analyze</span>
               </div>
             )}
 
@@ -795,10 +821,20 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
             )}
           </div>
 
+          {countText.catalogue && (
+            <div className="inline-flex items-center gap-1 text-xs text-warning flex-shrink-0" title={countText.title ?? undefined}>
+              <Info size={14} className="shrink-0" aria-hidden />
+              {countText.catalogue}
+            </div>
+          )}
+
           <PlateSolveBatchPanel
             ref={plateSolveRef}
             hideTriggerButtons
-            onSolveComplete={() => onRefresh?.()}
+            onSolveComplete={() => {
+              onRefresh?.();
+              loadAnalysisData();
+            }}
           />
 
           {/* Analyze and Plate solve read the frames: those inside zips are extracted first. */}

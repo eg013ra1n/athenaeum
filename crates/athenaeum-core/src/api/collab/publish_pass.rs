@@ -814,9 +814,9 @@ fn publish_select(pass: &PublishPass<'_>) -> Result<Selection, ApiError> {
         let db = db(ctx)?;
         let conn = db.conn();
         let project = crate::api::collab_exchange::live_project(&conn, project_id)?;
-        // The run measures every frame it is about before the gate is read, with no limit: a frame it announces carries a
-        // frozen loss, so none may be announced merely because its zero point was not measured yet.
-        let gated = project_gate(&conn, &project, GateMeasure::publish(only))?;
+        // The gate reads stored zero points only (F6): a frame without a current one is announced with no loss and is not
+        // blocked; the run measures nothing.
+        let gated = project_gate(&conn, &project)?;
         let binding =
             crate::db::collab::publishing_device(&conn, project_id).map_err(|e| {
                 tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the publishing device failed");
@@ -1250,11 +1250,11 @@ fn publish_split(
         // never renamed on disk. A prepared frame lands where its calibrate
         // wrote it (spec §4.3) — its name was picked then.
         // The new frames' transparency, read ONCE for the whole batch (never per frame): each frame's meta gets its own
-        // entry. When the project's rules judge transparency, the gate that opened this run measured every frame the run
-        // is about (no limit), so a measurable frame arrives here with its zero point current; a frame without a value
-        // is one that cannot be measured (no solve, no analysis, no catalogue, a refusal) and is announced without a
-        // loss. A project whose rules do not judge transparency measures nothing here: its frames carry whatever the
-        // column already holds.
+        // entry. The run measures nothing: a frame's zero point is the one Analysis or the pass after a solve batch stored
+        // (the auto-publish worker holds its run while that pass works, `collab_autopublish`). A frame without a value is
+        // one that cannot be measured (no solve, no analysis, no catalogue, a refusal) or that the user published by hand
+        // before the pass ended, and is announced without a loss. A project whose rules do not judge transparency reads
+        // nothing here: its frames carry whatever the column already holds.
         let new_transparency = {
             let new_ids: Vec<i64> = targeted
                 .iter()
@@ -2388,7 +2388,7 @@ async fn publish_announce(
                         match refresh_project_thresholds(ctx, &client, &token, project_id).await {
                             Ok(refreshed) => {
                                 gate_version = refreshed.thresholds_version.unwrap_or(0);
-                                regate(ctx, &refreshed, pass.only)
+                                regate(ctx, &refreshed)
                             }
                             Err(err) => Err(err),
                         };

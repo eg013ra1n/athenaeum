@@ -215,6 +215,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_analysis_config", post(analysis::set_analysis_config))
         .route("/api/reset_analysis_config", post(analysis::reset_analysis_config))
         .route("/api/get_analysis_for_frame_set", post(analysis::get_analysis_for_frame_set))
+        .route("/api/get_zero_point_updates", post(analysis::get_zero_point_updates))
         .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
         .route("/api/cancel_analysis", post(analysis::cancel_analysis))
         .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))

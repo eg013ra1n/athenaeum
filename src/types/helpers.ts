@@ -429,6 +429,13 @@ export interface PlateSolveCompleteEvent {
   total_time_ms: number;
 }
 
+/** `zero-point-pass-complete`: the pass that measures the transparency of the frames a plate-solve batch solved has
+ *  ended (`frames` selected over its rounds, `measured` stored). Emitted once per pass, never per frame. */
+export interface ZeroPointPassCompleteEvent {
+  frames: number;
+  measured: number;
+}
+
 export interface CatalogStatusInfo {
   name: string;
   density: number;

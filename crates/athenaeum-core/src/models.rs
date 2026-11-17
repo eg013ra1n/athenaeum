@@ -1125,6 +1125,20 @@ pub struct FrameAnalysis {
     /// Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
     #[serde(default)]
     pub zp_catalog: Option<String>,
+    /// Why the frame has no zero point: the refusal code of a stored refusal (`too_scattered`, `too_few_stars`,
+    /// `poor_solve`, `no_anchor`, `no_exposure`, `unreadable_solve`, `colour_camera`, `frame_verdict`); `None` on a
+    /// valid zero point and on a frame never judged. Forced-list zero point, spec §5.5.
+    #[serde(default)]
+    pub zp_refusal: Option<String>,
+    /// The forced list's size before it was measured; `None` when no list was built.
+    #[serde(default)]
+    pub zp_list_stars: Option<i64>,
+    /// The window's bright edge `G_b` (Gaia G mag) the zero point was measured in; `None` when no list was built.
+    #[serde(default)]
+    pub zp_window_bright: Option<f64>,
+    /// The zero point's change per magnitude the window moves fainter; `None` when the statistic gave none.
+    #[serde(default)]
+    pub zp_window_slope: Option<f64>,
 }
 
 /// Deserialize `Option<FrameVerdict>` leniently: null / absent → `None`; an unknown variant → `None` + `warn!`.
@@ -1479,6 +1493,24 @@ impl Transparency {
     pub fn unmeasured() -> Self {
         Transparency { zero_point: None, zp_stars: None, zp_sigma: None, loss_mag: None, reason: Some(NOT_MEASURED_REASON.to_string()) }
     }
+}
+
+/// What the zero points of a frame set need, for the count the Analysis tab shows beside Analyze ("N to update").
+/// Only `to_update` is work Analyze does for the zero point; the other two are frames Analyze cannot help. Counted by
+/// `analysis::transparency::count_zero_point_updates` (solver-gated); declared here, ungated, for the TS registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeroPointUpdates {
+    /// Solved frames whose zero point is not current for the installed catalogue (never judged, another `ZP_VERSION`
+    /// or another catalogue): a run of Analyze (without Re-Analyze) measures exactly these.
+    pub to_update: usize,
+    /// Solved frames the zero point cannot be measured for because no star catalogue is installed, or the installed one
+    /// could not be read (the stored `catalogue_unreadable`). Never part of `to_update`: the way on is installing the
+    /// catalogue; a new catalogue identity or Re-Analyze reads the frame again.
+    pub no_catalogue: usize,
+    /// Frames whose stored judgement says the measurement itself failed (`internal`): the log says why. Never part of
+    /// `to_update`; Re-Analyze reads them again.
+    pub measurement_failed: usize,
 }
 
 #[cfg(test)]

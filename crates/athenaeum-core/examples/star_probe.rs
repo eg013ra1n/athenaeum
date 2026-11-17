@@ -1094,6 +1094,10 @@ fn legacy_analyze(path: &str) -> Result<(FrameAnalysis, Vec<StarMetric>, bool), 
         zp_sigma: None,
         zp_version: None,
         zp_catalog: None,
+        zp_refusal: None,
+        zp_list_stars: None,
+        zp_window_bright: None,
+        zp_window_slope: None,
     };
     Ok((analysis, stars, flip_vertical))
 }

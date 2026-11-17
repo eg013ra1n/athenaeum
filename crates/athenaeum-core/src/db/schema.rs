@@ -2005,6 +2005,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             zp_sigma REAL,
             zp_version INTEGER,
             zp_catalog TEXT,
+            zp_refusal TEXT,
+            zp_list_stars INTEGER,
+            zp_window_bright REAL,
+            zp_window_slope REAL,
             FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
             UNIQUE(frame_id)
@@ -2100,6 +2104,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("zp_sigma", "REAL"),
         ("zp_version", "INTEGER"),
         ("zp_catalog", "TEXT"),
+        // Forced-list zero point (spec §5.5): the refusal code, the list's size and the window it was measured in.
+        ("zp_refusal", "TEXT"),
+        ("zp_list_stars", "INTEGER"),
+        ("zp_window_bright", "REAL"),
+        ("zp_window_slope", "REAL"),
     ] {
         let has: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name = ?1",

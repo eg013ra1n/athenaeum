@@ -120,7 +120,15 @@ pub struct GateFrameInput {
     /// For a frame already published the caller passes the value frozen in its
     /// manifest, never the live one (spec C5).
     pub transparency: Option<Transparency>,
+    /// The frame is a one-shot-colour mosaic (`BAYERPAT` and one plane) with no `FILTER` name: its clear-sky level may
+    /// mix filtered and unfiltered nights, so `transparency_loss` is listed for it with no value and blocks nothing
+    /// (O7). The frame's own `Transparency` (column, panel, manifest key) is unchanged.
+    pub colour_without_filter: bool,
 }
+
+/// Why the gate gives no `transparency_loss` verdict to a one-shot-colour frame with no filter name.
+pub const COLOUR_WITHOUT_FILTER_REASON: &str =
+    "colour frame without a filter name: its clear-sky level may mix filtered and unfiltered nights";
 
 /// One threshold rule's verdict for one frame (spec 2026-09-29 §4.1 drawer:
 /// rule · value · needs · ✓/✕). Produced inside `evaluate_frame`, in the same
@@ -312,6 +320,18 @@ pub fn evaluate_frame(
                         continue;
                     }
                 };
+                if key == "transparency_loss" && input.colour_without_filter {
+                    // O7: listed, not judged, nothing blocks.
+                    rule_verdicts.push(RuleVerdict {
+                        metric_key: rule.metric_key.clone(),
+                        label: label.to_string(),
+                        value: None,
+                        needs,
+                        pass: None,
+                        reason: Some(COLOUR_WITHOUT_FILTER_REASON.to_string()),
+                    });
+                    continue;
+                }
                 let Some(metric) = metric else {
                     // A loss can be missing with no layer-1 failure behind it: the row says why and blocks nothing.
                     let reason = (key == "transparency_loss").then(|| {
@@ -629,6 +649,10 @@ mod tests {
             zp_sigma: None,
             zp_version: None,
             zp_catalog: None,
+            zp_refusal: None,
+            zp_list_stars: None,
+            zp_window_bright: None,
+            zp_window_slope: None,
         }
     }
 
@@ -644,6 +668,7 @@ mod tests {
             filter: crate::collab::filters::FilterResolution::Matched("L".into()),
             uuid: "11111111-1111-1111-1111-111111111111".into(),
             transparency: None,
+            colour_without_filter: false,
         }
     }
 
@@ -1267,6 +1292,50 @@ mod tests {
         assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
         assert!(row.rules[0].reason.is_some());
         assert!(row.publishable);
+    }
+
+    /// O7: a one-shot-colour frame with no filter name is not judged on its loss: the rule is listed with no value and
+    /// the sentence, nothing blocks, and a loss that would have failed the rule is not a failure.
+    #[test]
+    fn an_osc_frame_without_a_filter_gets_no_transparency_verdict() {
+        let rules = vec![rule("transparency_loss", "lte", serde_json::json!(0.5))];
+        let osc = GateFrameInput { colour_without_filter: true, filter_raw: String::new(), ..with_loss(Some(0.9), None) };
+        let row = evaluate_frame(&osc, &target(), &rules);
+        assert_eq!(row.rules.len(), 1);
+        let v = &row.rules[0];
+        assert_eq!(
+            (v.label.as_str(), v.value.as_deref(), v.needs.as_str(), v.pass, v.reason.as_deref()),
+            ("Transparency loss", None, "≤ 0.50 mag", None, Some(COLOUR_WITHOUT_FILTER_REASON))
+        );
+        assert_eq!(
+            COLOUR_WITHOUT_FILTER_REASON,
+            "colour frame without a filter name: its clear-sky level may mix filtered and unfiltered nights"
+        );
+        assert!(!row.failures.iter().any(|f| f.contains("Transparency")), "{:?}", row.failures);
+        // The frame's verdict is what it would be with no rule.
+        let without = evaluate_frame(&osc, &target(), &[]);
+        assert_eq!((row.publishable, &row.failures), (without.publishable, &without.failures));
+        // Its own transparency (the column, the panel, the manifest key) is untouched by the gate.
+        assert_eq!(osc.transparency.as_ref().and_then(|t| t.loss_mag), Some(0.9));
+    }
+
+    #[test]
+    fn an_osc_frame_with_a_filter_is_judged() {
+        let rules = vec![rule("transparency_loss", "lte", serde_json::json!(0.5))];
+        // A mosaic that names its filter (a one-shot-colour camera behind a dual-band filter): judged like any frame.
+        let row = evaluate_frame(&with_loss(Some(0.9), None), &target(), &rules);
+        assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass, row.rules[0].reason.as_deref()), (Some("0.90 mag"), Some(false), None));
+        assert!(!row.publishable);
+    }
+
+    #[test]
+    fn a_mono_frame_without_a_filter_is_judged() {
+        let rules = vec![rule("transparency_loss", "lte", serde_json::json!(0.5))];
+        let mono = GateFrameInput { filter_raw: String::new(), ..with_loss(Some(0.9), None) };
+        assert!(!mono.colour_without_filter);
+        let row = evaluate_frame(&mono, &target(), &rules);
+        assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (Some("0.90 mag"), Some(false)));
+        assert_eq!(row.failures, vec!["Transparency loss 0.90 mag > 0.50 mag".to_string()]);
     }
 
     #[test]

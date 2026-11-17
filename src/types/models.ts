@@ -582,11 +582,47 @@ zp_version: number | null,
 /**
  * Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
  */
-zp_catalog: string | null, };
+zp_catalog: string | null, 
+/**
+ * Why the frame has no zero point: the refusal code of a stored refusal (`too_scattered`, `too_few_stars`,
+ * `poor_solve`, `no_anchor`, `no_exposure`, `unreadable_solve`, `colour_camera`, `frame_verdict`); `None` on a
+ * valid zero point and on a frame never judged. Forced-list zero point, spec §5.5.
+ */
+zp_refusal: string | null, 
+/**
+ * The forced list's size before it was measured; `None` when no list was built.
+ */
+zp_list_stars: number | null, 
+/**
+ * The window's bright edge `G_b` (Gaia G mag) the zero point was measured in; `None` when no list was built.
+ */
+zp_window_bright: number | null, 
+/**
+ * The zero point's change per magnitude the window moves fainter; `None` when the statistic gave none.
+ */
+zp_window_slope: number | null, };
 
 export type FrameVerdict = "trailed" | "defocused" | "no_stars";
 
 export type Transparency = { zeroPoint: number | null, zpStars: number | null, zpSigma: number | null, lossMag: number | null, reason: string | null, };
+
+export type ZeroPointUpdates = { 
+/**
+ * Solved frames whose zero point is not current for the installed catalogue (never judged, another `ZP_VERSION`
+ * or another catalogue): a run of Analyze (without Re-Analyze) measures exactly these.
+ */
+toUpdate: number, 
+/**
+ * Solved frames the zero point cannot be measured for because no star catalogue is installed, or the installed one
+ * could not be read (the stored `catalogue_unreadable`). Never part of `to_update`: the way on is installing the
+ * catalogue; a new catalogue identity or Re-Analyze reads the frame again.
+ */
+noCatalogue: number, 
+/**
+ * Frames whose stored judgement says the measurement itself failed (`internal`): the log says why. Never part of
+ * `to_update`; Re-Analyze reads them again.
+ */
+measurementFailed: number, };
 
 export type CalibrationMetadataEdits = { ccd_temp?: number | null, gain?: number | null, offset?: number | null, binning?: string | null, exptime?: number | null, };
 

@@ -4,8 +4,18 @@
 //! Compared across frames of one rig (camera, telescope, focal length, gain, binning, filter) the best ones mark the
 //! rig's clear sky, and a frame's loss is how far its zero point sits below that mark, in magnitudes. The reference is
 //! computed on read, never stored: the nearest-rank 90th percentile of the rig's own lights, from at least 30 frames
-//! over at least 2 sky nights (one evening is one night however many targets were shot on it), in the frame's own frame set when that has one and otherwise (`RIG_WIDE_FALLBACK`)
-//! across the whole rig.
+//! over at least 2 sky nights (one evening is one night however many targets were shot on it), in the frame's own frame
+//! set when that has one and otherwise (`RIG_WIDE_FALLBACK`) across the whole rig; never across mosaics (a one-shot
+//! colour camera's rig is not compared beyond its own frame set, R8).
+//!
+//! The zero points are read in a common window (forced-list spec §5.6, FL8): the list a frame was measured on is the
+//! catalogue's stars between its window's two edges, so two frames' zero points differ by the window they saw as well as
+//! by the sky. Each pool (one rig, one frame set, one exposure; the rig-wide pool is one rig and one exposure, filled with
+//! the set pools' reduced values) takes the median bright edge and the median slope of its members and reads every zero
+//! point there (`zero_point::reduce_to_common_window`'s rule): the reference is the 90th percentile of the reduced values,
+//! a frame's loss is the reference less its own reduced value, and the zero point a row shows is that reduced value. The
+//! exposure (0.1 s) is in the key because the list's window follows the exposure. The read writes nothing: the stored
+//! columns are as the Analysis left them.
 //!
 //! Only lights the catalogue uses feed a reference: none in the Black Hole, and a duplicate copy once. A frame received through a collaboration project never does (the
 //! scanner never creates a `frames` row for one, so none is normally there; the read still excludes a row whose file is
@@ -25,12 +35,12 @@ use anyhow::{Context, Result};
 use rusqlite::types::Value;
 use rusqlite::Connection;
 
-use crate::analysis::zero_point::{is_colour_frame, ZP_VERSION};
+use crate::analysis::zero_point::{common_window, is_colour_frame, is_mosaic, zp_outdated, CommonWindow, ZP_VERSION};
 use crate::db::MAX_BIND_PARAMS;
 use crate::plate_solve::layers::{catalog_identity, CatalogOpenError};
 use crate::star_measure::MEASURE_VERSION;
 
-pub use crate::models::Transparency;
+pub use crate::models::{Transparency, ZeroPointUpdates};
 
 /// The share of a rig's zero points that sits at or below its clear-sky reference (nearest rank).
 pub const REFERENCE_PERCENTILE: f64 = 0.90;
@@ -41,6 +51,55 @@ pub const REFERENCE_MIN_NIGHTS: u32 = 2;
 /// A frame whose own frame set has no reference uses the whole rig's. The probe's cross-target spread was 0.025 mag.
 pub const RIG_WIDE_FALLBACK: bool = true;
 
+/// Why a measured frame was refused a zero point, read from the code the Analysis stored (`zp_refusal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The stars are not where the plate solve puts them (`poor_solve`).
+    PoorSolve,
+    /// Too few of the list's stars could be measured (`too_few_stars`); `list_stars` is the size of the list.
+    TooFewStars { list_stars: Option<i64> },
+    /// The star brightnesses scatter too widely (`too_scattered`).
+    TooScattered,
+    /// No exposure time in the header (`no_exposure`).
+    NoExposure,
+    /// The frame's own measurement has a verdict (`frame_verdict`: trailed, out of focus or empty).
+    FrameVerdict,
+    /// Too few catalogue stars matched to set the measurement (`no_anchor`, `unreadable_solve`).
+    NoAnchor,
+    /// The measurement itself failed on this computer (`internal`, or a code this build does not know): the log says
+    /// why, and running Analyze again is not what fixes it. (`catalogue_unreadable` reads [`LossReason::NoCatalogue`].)
+    MeasurementFailed,
+}
+
+impl Refusal {
+    /// Whether a stored code says the measurement itself failed (not a verdict on the frame).
+    pub fn is_failure_code(code: &str) -> bool {
+        code == "internal"
+    }
+
+    /// Whether a stored code says the star catalogue could not be read: the frame waits for the catalogue like one with
+    /// none installed.
+    pub fn is_catalogue_code(code: &str) -> bool {
+        code == "catalogue_unreadable"
+    }
+
+    /// The refusal of a stored code; `colour_camera` is not one (it reads [`LossReason::ColourCamera`]).
+    pub fn from_code(code: &str, list_stars: Option<i64>) -> Refusal {
+        match code {
+            "poor_solve" => Refusal::PoorSolve,
+            "too_few_stars" => Refusal::TooFewStars { list_stars },
+            "too_scattered" => Refusal::TooScattered,
+            "no_exposure" => Refusal::NoExposure,
+            "frame_verdict" => Refusal::FrameVerdict,
+            "no_anchor" | "unreadable_solve" => Refusal::NoAnchor,
+            _ => Refusal::MeasurementFailed,
+        }
+    }
+}
+
+/// A list shorter than this says the catalogue tier is the limit, not the frame (`too_few_stars`'s two sentences).
+const SHORT_LIST_STARS: i64 = 50;
+
 /// Why a frame has no loss. The reasons are listed in the order the first match wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LossReason {
@@ -50,15 +109,16 @@ pub enum LossReason {
     StaleAnalysis,
     /// No plate solve.
     NotSolved,
-    /// The frame is OSC or CFA (or an externally debayered colour file): colour cameras are not measured yet (Z5).
+    /// The frame is an externally debayered colour file (three planes): not measured. A mosaic (CFA) frame is measured.
     ColourCamera,
-    /// The analysis arrived through personal sync: it counts stars and carries none of their rows, so a zero point
-    /// can never be measured from it here (a frame whose zero point is current is not judged by this).
-    NoStarMetrics,
-    /// The stored zero point is not current (another `ZP_VERSION` or catalogue), or no catalogue is installed.
+    /// No star catalogue is installed, so no zero point can be current: installing it, not Analyze, is the way on.
+    NoCatalogue,
+    /// The frame was never judged (no stored zero point or refusal).
     NotMeasured,
-    /// The zero point is current and says "refused".
-    NoZeroPoint,
+    /// The stored judgement was made at another `ZP_VERSION` or against another catalogue.
+    AnalysisDiffers,
+    /// The stored judgement is a refusal.
+    Refused(Refusal),
     /// `INSTRUME` or `FOCALLEN` is unknown: there is no rig to compare with.
     NoRig,
     /// The rig has no clear-sky reference yet.
@@ -73,15 +133,32 @@ impl LossReason {
             LossReason::StaleAnalysis => "analysed by an older version — analyse the frame again".to_string(),
             LossReason::NotSolved => "not plate-solved".to_string(),
             LossReason::ColourCamera => "not measured for colour cameras yet".to_string(),
-            LossReason::NoStarMetrics => {
-                "analysed on another computer — analyse the frame here to measure transparency".to_string()
+            LossReason::NoCatalogue => {
+                "the star catalogue is not installed — install it to measure transparency".to_string()
             }
-            LossReason::NotMeasured => {
-                "zero point not measured yet — the star catalogue may not be installed".to_string()
+            LossReason::NotMeasured => "transparency not measured yet — run Analyze on its frame set".to_string(),
+            LossReason::AnalysisDiffers => {
+                "its analysis differs from the current one — run Analyze on its frame set".to_string()
             }
-            LossReason::NoZeroPoint => {
-                "too few catalogue stars for a reliable zero point — a deeper star catalogue tier may help".to_string()
-            }
+            LossReason::Refused(refusal) => match refusal {
+                Refusal::PoorSolve => {
+                    "the stars are not where the plate solve puts them — the solve is too poor to measure transparency".to_string()
+                }
+                Refusal::TooFewStars { list_stars: Some(n) } if *n < SHORT_LIST_STARS => {
+                    "too few catalogue stars in the field — a deeper star catalogue tier may help".to_string()
+                }
+                Refusal::TooFewStars { .. } => "too few of the field's catalogue stars could be measured".to_string(),
+                Refusal::TooScattered => {
+                    "the star brightnesses scatter too widely for a reliable zero point".to_string()
+                }
+                Refusal::NoExposure => "no exposure time in the header".to_string(),
+                Refusal::FrameVerdict => "no stars to measure on this frame (trailed, out of focus or empty)".to_string(),
+                Refusal::NoAnchor => {
+                    "too few catalogue stars matched to set the measurement — a deeper star catalogue tier may help"
+                        .to_string()
+                }
+                Refusal::MeasurementFailed => "the measurement failed — see the log".to_string(),
+            },
             LossReason::NoRig => "camera or focal length unknown — nothing to compare with".to_string(),
             LossReason::NoReference { have_frames, have_nights } => {
                 if *have_frames < REFERENCE_MIN_FRAMES {
@@ -140,8 +217,12 @@ struct AnalysisFacts {
     zp_sigma: Option<f64>,
     zp_version: Option<u32>,
     zp_catalog: Option<String>,
-    /// The analysis counts stars and has no `star_metrics` row (one that arrived through personal sync).
-    no_star_rows: bool,
+    /// The stored refusal code (`None` on a valid zero point or one never judged).
+    zp_refusal: Option<String>,
+    zp_list_stars: Option<i64>,
+    /// The window's bright edge the zero point was measured in (the reduction's input; the slope it is read with is its
+    /// pool's median, never the frame's own).
+    zp_window_bright: Option<f64>,
 }
 
 /// One asked frame: its header facts, its analysis (if any) and whether it has a solve.
@@ -153,6 +234,7 @@ struct FrameRow {
     xbinning: Option<i64>,
     filter: Option<String>,
     bayerpat: Option<String>,
+    exptime: Option<f64>,
     analysis: Option<AnalysisFacts>,
     solved: bool,
 }
@@ -201,12 +283,10 @@ fn load_frame_rows(conn: &Connection, stmts: &Stmts, ids: &[i64]) -> Result<Hash
     for chunk in ids.chunks(MAX_BIND_PARAMS) {
         let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT f.id, f.instrume, f.telescop, f.focallen, f.gain, f.xbinning, f.filter, f.bayerpat,
+            "SELECT f.id, f.instrume, f.telescop, f.focallen, f.gain, f.xbinning, f.filter, f.bayerpat, f.exptime,
                     fa.id, fa.measure_version, fa.source_channels, fa.zero_point, fa.zp_stars, fa.zp_sigma,
-                    fa.zp_version, fa.zp_catalog,
-                    EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = f.id),
-                    (fa.stars_detected > 0
-                     AND NOT EXISTS (SELECT 1 FROM star_metrics sm WHERE sm.frame_analysis_id = fa.id))
+                    fa.zp_version, fa.zp_catalog, fa.zp_refusal, fa.zp_list_stars, fa.zp_window_bright,
+                    EXISTS (SELECT 1 FROM plate_solves ps WHERE ps.frame_id = f.id)
              FROM frames f
              LEFT JOIN frame_analysis fa ON fa.frame_id = f.id
              WHERE f.id IN ({marks})"
@@ -214,17 +294,19 @@ fn load_frame_rows(conn: &Connection, stmts: &Stmts, ids: &[i64]) -> Result<Hash
         let mut stmt = stmts.prepare(conn, &sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                let analysis_id: Option<i64> = r.get(8)?;
+                let analysis_id: Option<i64> = r.get(9)?;
                 let analysis = if analysis_id.is_some() {
                     Some(AnalysisFacts {
-                        measure_version: r.get(9)?,
-                        source_channels: r.get(10)?,
-                        zero_point: r.get(11)?,
-                        zp_stars: r.get(12)?,
-                        zp_sigma: r.get(13)?,
-                        zp_version: r.get(14)?,
-                        zp_catalog: r.get(15)?,
-                        no_star_rows: r.get::<_, Option<bool>>(17)?.unwrap_or(false),
+                        measure_version: r.get(10)?,
+                        source_channels: r.get(11)?,
+                        zero_point: r.get(12)?,
+                        zp_stars: r.get(13)?,
+                        zp_sigma: r.get(14)?,
+                        zp_version: r.get(15)?,
+                        zp_catalog: r.get(16)?,
+                        zp_refusal: r.get(17)?,
+                        zp_list_stars: r.get(18)?,
+                        zp_window_bright: r.get(19)?,
                     })
                 } else {
                     None
@@ -239,8 +321,9 @@ fn load_frame_rows(conn: &Connection, stmts: &Stmts, ids: &[i64]) -> Result<Hash
                         xbinning: r.get(5)?,
                         filter: r.get(6)?,
                         bayerpat: r.get(7)?,
+                        exptime: r.get(8)?,
                         analysis,
-                        solved: r.get(16)?,
+                        solved: r.get(20)?,
                     },
                 ))
             })
@@ -288,30 +371,65 @@ fn load_frame_sets(conn: &Connection, stmts: &Stmts, ids: &[i64]) -> Result<Hash
 /// two rows and one key: the sky does not care which target the telescope pointed at.
 const SKY_NIGHT_SQL: &str = "DATE(n.start_time, '-12 hours')";
 
-/// The zero points one reference is taken from: frames by id (a frame in two sets counts once) and the sky nights
-/// (`SKY_NIGHT_SQL` keys) they were taken on.
+/// The exposure a pool is keyed by: the frame's `EXPTIME` in tenths of a second (H2: the list's window follows the
+/// exposure, so two exposures of one set are two references). `None` for no usable exposure.
+fn exposure_key(exptime: Option<f64>) -> Option<i64> {
+    exptime.filter(|e| e.is_finite() && *e > 0.0).map(|e| (e * 10.0).round() as i64)
+}
+
+/// One frame of a set's pool, as stored.
+struct Member {
+    night: Option<String>,
+    zero_point: f64,
+    window_bright: Option<f64>,
+    window_slope: Option<f64>,
+}
+
+/// The zero points one reference is taken from. A set pool (one rig, one frame set, one exposure) keeps its members as
+/// stored, takes their common window ([`Pool::finish`]) and holds each member's zero point read in it; the rig-wide pool
+/// (one rig, one exposure) holds the set pools' reduced values only. `values` is what the reference is a percentile of:
+/// frames by id (a frame in two sets counts once) and the sky nights (`SKY_NIGHT_SQL` keys) they were taken on.
 #[derive(Default)]
 struct Pool {
-    zero_points: HashMap<i64, f64>,
+    members: HashMap<i64, Member>,
+    window: Option<CommonWindow>,
+    values: HashMap<i64, f64>,
     nights: HashSet<String>,
 }
 
 impl Pool {
-    fn add(&mut self, frame_id: i64, night: Option<&str>, zero_point: f64) {
-        self.zero_points.insert(frame_id, zero_point);
-        if let Some(night) = night {
-            self.nights.insert(night.to_owned());
+    fn add(&mut self, frame_id: i64, member: Member) {
+        if let Some(night) = &member.night {
+            self.nights.insert(night.clone());
+        }
+        self.members.insert(frame_id, member);
+    }
+
+    /// The common window of the members that have a window edge (a version-3 row whose edge is NULL, none should exist,
+    /// counts in no window and reads its own zero point), and every member's zero point read in it.
+    fn finish(&mut self) {
+        let pairs: Vec<(f64, Option<f64>)> =
+            self.members.values().filter_map(|m| m.window_bright.map(|g| (g, m.window_slope))).collect();
+        self.window = common_window(&pairs);
+        self.values = self.members.iter().map(|(id, m)| (*id, self.reduce(m.zero_point, m.window_bright))).collect();
+    }
+
+    /// A zero point read in this pool's window; its own when the pool has none or the frame has no edge.
+    fn reduce(&self, zero_point: f64, window_bright: Option<f64>) -> f64 {
+        match (self.window, window_bright.filter(|g| g.is_finite())) {
+            (Some(window), Some(g_b)) => window.reduce(zero_point, g_b),
+            _ => zero_point,
         }
     }
 
     /// The reference, or the counts that fell short of it.
     fn reference(&self) -> std::result::Result<f64, (u32, u32)> {
-        let frames = self.zero_points.len() as u32;
+        let frames = self.values.len() as u32;
         let nights = self.nights.len() as u32;
         if frames < REFERENCE_MIN_FRAMES || nights < REFERENCE_MIN_NIGHTS {
             return Err((frames, nights));
         }
-        let mut sorted: Vec<f64> = self.zero_points.values().copied().collect();
+        let mut sorted: Vec<f64> = self.values.values().copied().collect();
         sorted.sort_by(f64::total_cmp);
         Ok(nearest_rank(&sorted, REFERENCE_PERCENTILE))
     }
@@ -326,11 +444,36 @@ fn nearest_rank(sorted: &[f64], p: f64) -> f64 {
     sorted[rank - 1]
 }
 
-/// One rig's lights, whole and by frame set.
+/// One rig's lights: by (frame set, exposure) and, filled from those once they are reduced, by exposure alone.
 #[derive(Default)]
 struct RigPools {
-    all: Pool,
-    by_set: HashMap<i64, Pool>,
+    by_set: HashMap<(i64, i64), Pool>,
+    rig_wide: HashMap<i64, Pool>,
+}
+
+impl RigPools {
+    /// Reduce every set pool within itself, then fill each exposure's rig-wide pool with those reduced values (never with
+    /// the raw zero points). The sets are visited in id order so a frame in two sets keeps the value of the lower one.
+    fn finish(&mut self) {
+        for pool in self.by_set.values_mut() {
+            pool.finish();
+        }
+        let mut keys: Vec<(i64, i64)> = self.by_set.keys().copied().collect();
+        keys.sort_unstable();
+        for (set, exposure) in keys {
+            let pool = &self.by_set[&(set, exposure)];
+            let wide = self.rig_wide.entry(exposure).or_default();
+            for (id, value) in &pool.values {
+                if wide.values.contains_key(id) {
+                    continue;
+                }
+                wide.values.insert(*id, *value);
+                if let Some(night) = pool.members.get(id).and_then(|m| m.night.as_ref()) {
+                    wide.nights.insert(night.clone());
+                }
+            }
+        }
+    }
 }
 
 /// The Collaboration folder's path, if one is designated. Frames under it were received, not shot.
@@ -382,7 +525,8 @@ fn load_pools(
         let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!(
             "SELECT f.id, f.instrume, f.telescop, f.focallen, f.gain, f.xbinning, f.filter, f.bayerpat,
-                    fa.source_channels, fa.zero_point, n.frames_set_id, {night}
+                    fa.source_channels, fa.zero_point, n.frames_set_id, {night},
+                    f.exptime, fa.zp_window_bright, fa.zp_window_slope
              FROM frames f
              JOIN frame_analysis fa ON fa.frame_id = f.id
              JOIN files fi ON fi.id = f.file_id
@@ -422,7 +566,12 @@ fn load_pools(
             let bayerpat: Option<String> = r.get(7)?;
             let source_channels: Option<i64> = r.get(8)?;
             let zero_point: f64 = r.get(9)?;
-            if !zero_point.is_finite() || is_colour_frame(bayerpat.as_deref(), source_channels) {
+            // A mosaic (one-shot colour, measured on its own plane) feeds a reference; any other colour frame is not
+            // measured at all.
+            if !zero_point.is_finite()
+                || (is_colour_frame(bayerpat.as_deref(), source_channels)
+                    && !is_mosaic(bayerpat.as_deref(), source_channels))
+            {
                 continue;
             }
             let filter: Option<String> = r.get(6)?;
@@ -433,30 +582,64 @@ fn load_pools(
             };
             let set_id: i64 = r.get(10)?;
             let night: Option<String> = r.get(11)?;
-            let rig_pools = pools.entry(rig).or_default();
-            rig_pools.all.add(frame_id, night.as_deref(), zero_point);
-            rig_pools.by_set.entry(set_id).or_default().add(frame_id, night.as_deref(), zero_point);
+            // A frame with a zero point always has an exposure (`no_exposure` otherwise).
+            let Some(exposure) = exposure_key(r.get(12)?) else {
+                continue;
+            };
+            let member = Member { night, zero_point, window_bright: r.get(13)?, window_slope: r.get(14)? };
+            pools.entry(rig).or_default().by_set.entry((set_id, exposure)).or_default().add(frame_id, member);
         }
+    }
+    for rig_pools in pools.values_mut() {
+        rig_pools.finish();
     }
     Ok(pools)
 }
 
-/// The reference for a rig in a frame set: the set's own when it has one, else the rig's across sets
-/// (`RIG_WIDE_FALLBACK`). The `Err` counts are those of the widest pool tried.
-fn resolve_reference(pools: &HashMap<RigKey, RigPools>, rig: &RigKey, set: Option<i64>) -> std::result::Result<f64, (u32, u32)> {
-    let Some(rig_pools) = pools.get(rig) else {
+/// Where a frame is compared: its rig, its frame set (if any), its exposure and whether it is a mosaic.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    rig: RigKey,
+    set: Option<i64>,
+    exposure: Option<i64>,
+    mosaic: bool,
+}
+
+/// The reference for a frame: its (rig, frame set, exposure) pool's own when it has one, else the rig's across sets at
+/// the same exposure (`RIG_WIDE_FALLBACK`, never for a mosaic: R8). The `Err` counts are those of the widest pool tried.
+fn resolve_reference(pools: &HashMap<RigKey, RigPools>, key: &PoolKey) -> std::result::Result<f64, (u32, u32)> {
+    let (Some(rig_pools), Some(exposure)) = (pools.get(&key.rig), key.exposure) else {
         return Err((0, 0));
     };
-    if let Some(set_pool) = set.and_then(|s| rig_pools.by_set.get(&s)) {
+    let fallback = RIG_WIDE_FALLBACK && !key.mosaic;
+    if let Some(set_pool) = key.set.and_then(|s| rig_pools.by_set.get(&(s, exposure))) {
         match set_pool.reference() {
             Ok(r) => return Ok(r),
-            Err(counts) if !RIG_WIDE_FALLBACK => return Err(counts),
+            Err(counts) if !fallback => return Err(counts),
             Err(_) => {}
         }
-    } else if set.is_some() && !RIG_WIDE_FALLBACK {
+    } else if !fallback {
         return Err((0, 0));
     }
-    rig_pools.all.reference()
+    match rig_pools.rig_wide.get(&exposure) {
+        Some(pool) => pool.reference(),
+        None => Err((0, 0)),
+    }
+}
+
+/// A frame's zero point read in the common window of its own (rig, frame set, exposure) pool; its own value when the
+/// frame is in no set, its pool is empty or it has no window edge.
+fn reduced_zero_point(
+    pools: &HashMap<RigKey, RigPools>,
+    key: &PoolKey,
+    zero_point: f64,
+    window_bright: Option<f64>,
+) -> f64 {
+    let pool = key
+        .exposure
+        .zip(key.set)
+        .and_then(|(exposure, set)| pools.get(&key.rig)?.by_set.get(&(set, exposure)));
+    pool.map_or(zero_point, |p| p.reduce(zero_point, window_bright))
 }
 
 // ---------------------------------------------------------------------------
@@ -466,10 +649,18 @@ fn resolve_reference(pools: &HashMap<RigKey, RigPools>, rig: &RigKey, set: Optio
 /// A frame judged up to the reference.
 enum Stage {
     Done(Transparency),
-    NeedsReference { zero_point: f64, zp_stars: Option<i64>, zp_sigma: Option<f64>, rig: RigKey },
+    NeedsReference {
+        zero_point: f64,
+        window_bright: Option<f64>,
+        zp_stars: Option<i64>,
+        zp_sigma: Option<f64>,
+        rig: RigKey,
+        exposure: Option<i64>,
+        mosaic: bool,
+    },
 }
 
-/// Reasons 1 to 8 of [`LossReason`], in order; a frame that clears them all waits for a reference.
+/// Reasons 1 to 9 of [`LossReason`], in order; a frame that clears them all waits for a reference.
 fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
     let done = |reason: LossReason| Stage::Done(Transparency::without_numbers(reason));
     let Some(row) = row else {
@@ -484,19 +675,31 @@ fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
     if !row.solved {
         return done(LossReason::NotSolved);
     }
-    if is_colour_frame(row.bayerpat.as_deref(), analysis.source_channels) {
+    let mosaic = is_mosaic(row.bayerpat.as_deref(), analysis.source_channels);
+    if is_colour_frame(row.bayerpat.as_deref(), analysis.source_channels) && !mosaic {
         return done(LossReason::ColourCamera);
     }
-    let current = analysis.zp_version == Some(ZP_VERSION)
-        && catalog.is_some_and(|c| analysis.zp_catalog.as_deref() == Some(c));
-    if !current {
-        if analysis.no_star_rows {
-            return done(LossReason::NoStarMetrics);
-        }
+    let Some(catalog) = catalog else {
+        return done(LossReason::NoCatalogue);
+    };
+    let Some(version) = analysis.zp_version else {
         return done(LossReason::NotMeasured);
+    };
+    if version != ZP_VERSION || analysis.zp_catalog.as_deref() != Some(catalog) {
+        return done(LossReason::AnalysisDiffers);
+    }
+    if let Some(code) = analysis.zp_refusal.as_deref() {
+        if code == "colour_camera" {
+            return done(LossReason::ColourCamera);
+        }
+        if Refusal::is_catalogue_code(code) {
+            return done(LossReason::NoCatalogue);
+        }
+        return done(LossReason::Refused(Refusal::from_code(code, analysis.zp_list_stars)));
     }
     let Some(zero_point) = analysis.zero_point.filter(|z| z.is_finite()) else {
-        return done(LossReason::NoZeroPoint);
+        // Current, with neither a value nor a code: a row no build writes. Not a reason to run Analyze.
+        return done(LossReason::Refused(Refusal::MeasurementFailed));
     };
     let numbers = |reason: LossReason| {
         Stage::Done(Transparency {
@@ -517,7 +720,15 @@ fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
     ) else {
         return numbers(LossReason::NoRig);
     };
-    Stage::NeedsReference { zero_point, zp_stars: analysis.zp_stars, zp_sigma: analysis.zp_sigma, rig }
+    Stage::NeedsReference {
+        zero_point,
+        window_bright: analysis.zp_window_bright,
+        zp_stars: analysis.zp_stars,
+        zp_sigma: analysis.zp_sigma,
+        rig,
+        exposure: exposure_key(row.exptime),
+        mosaic,
+    }
 }
 
 fn read(
@@ -557,31 +768,32 @@ fn read(
         _ => (HashMap::new(), HashMap::new()),
     };
 
-    let mut memo: HashMap<(RigKey, Option<i64>), std::result::Result<f64, (u32, u32)>> = HashMap::new();
+    let mut memo: HashMap<PoolKey, std::result::Result<f64, (u32, u32)>> = HashMap::new();
     let mut out = HashMap::with_capacity(stages.len());
     let mut with_loss = 0usize;
     for (id, stage) in stages {
         let transparency = match stage {
             Stage::Done(t) => t,
-            Stage::NeedsReference { zero_point, zp_stars, zp_sigma, rig } => {
-                let set = sets.get(&id).copied();
-                let reference =
-                    *memo.entry((rig.clone(), set)).or_insert_with(|| resolve_reference(&pools, &rig, set));
+            Stage::NeedsReference { zero_point, window_bright, zp_stars, zp_sigma, rig, exposure, mosaic } => {
+                let key = PoolKey { rig, set: sets.get(&id).copied(), exposure, mosaic };
+                // The zero point a row shows is the one its loss is taken from: read in its pool's common window.
+                let shown = reduced_zero_point(&pools, &key, zero_point, window_bright);
+                let reference = memo.entry(key.clone()).or_insert_with(|| resolve_reference(&pools, &key)).clone();
                 match reference {
                     Ok(reference) => {
                         with_loss += 1;
                         Transparency {
-                            zero_point: Some(zero_point),
+                            zero_point: Some(shown),
                             zp_stars,
                             zp_sigma,
-                            loss_mag: Some((reference - zero_point).max(0.0)),
+                            loss_mag: Some((reference - shown).max(0.0)),
                             reason: None,
                         }
                     }
                     Err((have_frames, have_nights)) => {
                         let reason = LossReason::NoReference { have_frames, have_nights };
                         Transparency {
-                            zero_point: Some(zero_point),
+                            zero_point: Some(shown),
                             zp_stars,
                             zp_sigma,
                             loss_mag: None,
@@ -608,6 +820,43 @@ pub fn transparency_for_frames(
     frame_ids: &[i64],
 ) -> Result<HashMap<i64, Transparency>> {
     read(conn, &Stmts(Cell::new(0)), catalog, frame_ids)
+}
+
+impl ZeroPointUpdates {
+    /// The non-empty groups as `(sentence, frames)`, in the wording a frame's own loss reason uses.
+    pub fn reasons(&self) -> Vec<(String, usize)> {
+        [
+            (LossReason::NotMeasured.sentence(), self.to_update),
+            (LossReason::NoCatalogue.sentence(), self.no_catalogue),
+            (LossReason::Refused(Refusal::MeasurementFailed).sentence(), self.measurement_failed),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .collect()
+    }
+}
+
+/// The one count of "to update" and its reasons, over a frame set's analysis rows. `solved` is the frames among them
+/// that have a plate solve; `catalog` the installed catalogue's identity (`None`: none installed). The predicate of
+/// `to_update` is Analyze's own ([`zp_outdated`]), so the number shown is the number a run measures.
+pub fn count_zero_point_updates(
+    rows: &[crate::models::FrameAnalysis],
+    solved: &HashSet<i64>,
+    catalog: Option<&str>,
+) -> ZeroPointUpdates {
+    let mut out = ZeroPointUpdates::default();
+    for row in rows.iter().filter(|r| solved.contains(&r.frame_id)) {
+        if catalog.is_none() {
+            out.no_catalogue += 1;
+        } else if zp_outdated(row, true, catalog) {
+            out.to_update += 1;
+        } else if row.zp_refusal.as_deref().is_some_and(Refusal::is_catalogue_code) {
+            out.no_catalogue += 1;
+        } else if row.zp_refusal.as_deref().is_some_and(Refusal::is_failure_code) {
+            out.measurement_failed += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -644,6 +893,14 @@ mod tests {
         fingerprint: Option<String>,
         /// The analysis has a star row (`false`: it arrived through personal sync, which brings the summary only).
         star_rows: bool,
+        /// `EXPTIME` (s); the exposure a pool is keyed by.
+        exptime: Option<f64>,
+        /// The stored refusal code and the list's size (a refusal's own columns).
+        zp_refusal: Option<&'static str>,
+        zp_list_stars: Option<i64>,
+        /// The window the zero point was measured in.
+        window_bright: Option<f64>,
+        window_slope: Option<f64>,
     }
 
     impl Default for Spec {
@@ -671,6 +928,11 @@ mod tests {
                 filename: None,
                 fingerprint: None,
                 star_rows: true,
+                exptime: Some(120.0),
+                zp_refusal: None,
+                zp_list_stars: None,
+                window_bright: None,
+                window_slope: None,
             }
         }
     }
@@ -731,11 +993,11 @@ mod tests {
             self.conn
                 .execute(
                     "INSERT INTO frames (id, file_id, imagetyp, is_master, instrume, telescop, focallen, gain,
-                                         xbinning, filter, bayerpat)
-                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                         xbinning, filter, bayerpat, exptime)
+                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     rusqlite::params![
                         id, s.imagetyp, s.is_master, s.instrume, s.telescop, s.focallen, s.gain, s.xbinning,
-                        s.filter, s.bayerpat
+                        s.filter, s.bayerpat, s.exptime
                     ],
                 )
                 .unwrap();
@@ -810,6 +1072,10 @@ mod tests {
             zp_sigma: s.zp.map(|_| 0.03),
             zp_version: s.zp_version,
             zp_catalog: s.zp_catalog.map(str::to_owned),
+            zp_refusal: s.zp_refusal.map(str::to_owned),
+            zp_list_stars: s.zp_list_stars,
+            zp_window_bright: s.window_bright,
+            zp_window_slope: s.window_slope,
         }
     }
 
@@ -1111,16 +1377,20 @@ mod tests {
     }
 
     #[test]
-    fn a_colour_camera_frame_says_so() {
+    fn a_debayered_colour_frame_says_so() {
         let mut w = World::new();
         let own = w.series(&Spec::default(), 2, &ramp(30));
-        // OSC by header, and an externally debayered file (no BAYERPAT, three planes); both stored with a value that
-        // would move the reference if it counted.
-        let osc = w.seed(&Spec { bayerpat: Some("RGGB"), zp: Some(25.0), ..Spec::default() });
+        // An externally debayered file (no BAYERPAT, three planes) and a header-OSC frame that was stored as a colour
+        // camera by an earlier judgement; both carry a value that would move the reference if it counted.
         let debayered = w.seed(&Spec { source_channels: 3, zp: Some(25.0), ..Spec::default() });
-        w.series(&Spec { bayerpat: Some("RGGB"), ..Spec::default() }, 2, &vec![25.0; 20]);
-        let got = ask(&w, Some("A"), &[own[0], osc, debayered]);
-        for id in [osc, debayered] {
+        let stored = w.seed(&Spec {
+            bayerpat: Some("RGGB"),
+            zp: None,
+            zp_refusal: Some("colour_camera"),
+            ..Spec::default()
+        });
+        let got = ask(&w, Some("A"), &[own[0], debayered, stored]);
+        for id in [debayered, stored] {
             let t = &got[&id];
             assert_eq!(t.reason.as_deref(), Some("not measured for colour cameras yet"));
             assert_eq!((t.zero_point, t.loss_mag), (None, None));
@@ -1128,30 +1398,59 @@ mod tests {
         assert!((loss(&got[&own[0]]) - 0.26).abs() < 1e-9, "colour frames did not feed the reference");
     }
 
+    /// A mosaic (CFA, one plane) is measured: it reads its loss against a reference of mosaics and feeds that reference.
+    /// It never borrows the rig-wide pool (R8): a set of its own is the only reference it has.
     #[test]
-    fn a_synced_analysis_says_to_analyse_here() {
+    fn a_mosaic_frame_reads_its_loss_and_feeds_the_reference() {
+        let mut w = World::new();
+        let osc = Spec { bayerpat: Some("RGGB"), filter: None, ..Spec::default() };
+        let own = w.series(&osc, 2, &ramp(30));
+        // The mono rig of the same camera name does not feed the mosaics' reference (the filter differs: another rig).
+        w.series(&Spec::default(), 2, &vec![25.0; 40]);
+        let got = ask(&w, Some("A"), &[own[0], own[29]]);
+        assert!((loss(&got[&own[0]]) - 0.26).abs() < 1e-9, "the mosaic's own frame set is its reference");
+        assert_eq!(got[&own[29]].loss_mag, Some(0.0));
+
+        // The rig-wide fallback stays off: a mosaic frame in a short set has no reference although the rig has enough.
+        let short = w.series(&Spec { set: Some(2), ..osc.clone() }, 2, &vec![20.0; 5]);
+        let got = ask(&w, Some("A"), &[short[0]]);
+        assert_eq!(got[&short[0]].loss_mag, None);
+        assert_eq!(got[&short[0]].reason.as_deref(), Some("no clear-sky reference yet, 5 of 30 frames"));
+        // A mono frame in the same position does fall back to the rig.
+        let mono_short = w.series(&Spec { set: Some(3), ..Spec::default() }, 2, &vec![20.0; 5]);
+        let got = ask(&w, Some("A"), &[mono_short[0]]);
+        assert!(got[&mono_short[0]].loss_mag.is_some(), "{:?}", got[&mono_short[0]].reason);
+    }
+
+    #[test]
+    fn a_synced_analysis_with_a_current_zero_point_reads_its_loss() {
         let mut w = World::new();
         let own = w.series(&Spec::default(), 2, &ramp(30));
-        // Stars counted, no star rows, no zero point: the catalogue is not the reason, and the sentence says what is.
-        let synced = w.seed(&Spec { star_rows: false, zp: None, zp_version: None, zp_catalog: None, ..Spec::default() });
-        // The same shape but with a zero point already current is judged by that value, not by the missing rows.
+        // An analysis that arrived through personal sync (the summary, no star rows) carries its zero point: it is judged
+        // by that value, not by the missing rows. One that carries none was never judged here.
         let measured = w.seed(&Spec { star_rows: false, zp: Some(20.2), ..Spec::default() });
-        // No stars counted at all is not a synced analysis: it keeps the ordinary reasons.
-        let empty = w.seed(&Spec { star_rows: false, zp: None, zp_version: None, zp_catalog: None, ..Spec::default() });
-        w.conn.execute("UPDATE frame_analysis SET stars_detected = 0 WHERE frame_id = ?1", [empty]).unwrap();
-        let got = ask(&w, Some("A"), &[synced, measured, empty, own[0]]);
-        let t = &got[&synced];
-        assert_eq!(
-            t.reason.as_deref(),
-            Some("analysed on another computer — analyse the frame here to measure transparency")
-        );
-        assert_eq!((t.zero_point, t.loss_mag), (None, None));
+        let unjudged = w.seed(&Spec { star_rows: false, zp: None, zp_version: None, zp_catalog: None, ..Spec::default() });
+        let got = ask(&w, Some("A"), &[measured, unjudged, own[0]]);
         assert!(got[&measured].loss_mag.is_some(), "{:?}", got[&measured]);
-        assert_eq!(
-            got[&empty].reason.as_deref(),
-            Some("zero point not measured yet — the star catalogue may not be installed")
-        );
+        let t = &got[&unjudged];
+        assert_eq!(t.reason.as_deref(), Some("transparency not measured yet — run Analyze on its frame set"));
+        assert_eq!((t.zero_point, t.loss_mag), (None, None));
         assert!(got[&own[0]].loss_mag.is_some());
+    }
+
+    #[test]
+    fn a_version_two_zero_point_says_the_analysis_differs() {
+        let mut w = World::new();
+        let ids = w.series(&Spec { zp_version: Some(2), ..Spec::default() }, 2, &ramp(40));
+        let got = ask(&w, Some("A"), &ids);
+        for id in &ids {
+            let t = &got[id];
+            assert_eq!(
+                t.reason.as_deref(),
+                Some("its analysis differs from the current one — run Analyze on its frame set")
+            );
+            assert_eq!((t.zero_point, t.zp_stars, t.zp_sigma, t.loss_mag), (None, None, None, None));
+        }
     }
 
     #[test]
@@ -1163,7 +1462,7 @@ mod tests {
             let t = &got[id];
             assert_eq!(
                 t.reason.as_deref(),
-                Some("zero point not measured yet — the star catalogue may not be installed")
+                Some("its analysis differs from the current one — run Analyze on its frame set")
             );
             assert_eq!((t.zero_point, t.zp_stars, t.zp_sigma, t.loss_mag), (None, None, None, None));
         }
@@ -1200,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn no_installed_catalogue_gives_not_measured() {
+    fn no_installed_catalogue_says_so() {
         let mut w = World::new();
         let ids = w.series(&Spec::default(), 2, &ramp(40));
         let got = ask(&w, None, &ids);
@@ -1208,7 +1507,7 @@ mod tests {
             let t = &got[id];
             assert_eq!(
                 t.reason.as_deref(),
-                Some("zero point not measured yet — the star catalogue may not be installed")
+                Some("the star catalogue is not installed — install it to measure transparency")
             );
             assert_eq!((t.zero_point, t.loss_mag), (None, None));
         }
@@ -1265,6 +1564,9 @@ mod tests {
         let mut w = World::new();
         let good = w.series(&Spec::default(), 2, &ramp(30));
         let base = Spec::default();
+        let never = "transparency not measured yet — run Analyze on its frame set";
+        let differs = "its analysis differs from the current one — run Analyze on its frame set";
+        let few = "too few catalogue stars in the field — a deeper star catalogue tier may help";
         let cases: Vec<(Spec, &str)> = vec![
             (Spec { analysed: false, ..base.clone() }, "not analysed yet"),
             (
@@ -1272,53 +1574,23 @@ mod tests {
                 "analysed by an older version — analyse the frame again",
             ),
             (Spec { solved: false, ..base.clone() }, "not plate-solved"),
-            (Spec { bayerpat: Some("RGGB"), ..base.clone() }, "not measured for colour cameras yet"),
-            (
-                Spec { star_rows: false, zp: None, zp_version: None, zp_catalog: None, ..base.clone() },
-                "analysed on another computer — analyse the frame here to measure transparency",
-            ),
-            (
-                Spec { zp: None, zp_version: None, zp_catalog: None, ..base.clone() },
-                "zero point not measured yet — the star catalogue may not be installed",
-            ),
-            (
-                Spec { zp: None, ..base.clone() },
-                "too few catalogue stars for a reliable zero point — a deeper star catalogue tier may help",
-            ),
-            (
-                Spec { instrume: None, ..base.clone() },
-                "camera or focal length unknown — nothing to compare with",
-            ),
+            (Spec { source_channels: 3, ..base.clone() }, "not measured for colour cameras yet"),
+            (Spec { zp: None, zp_version: None, zp_catalog: None, ..base.clone() }, never),
+            (Spec { zp_version: Some(ZP_VERSION - 1), ..base.clone() }, differs),
+            (Spec { zp_catalog: Some("other"), ..base.clone() }, differs),
+            (Spec { zp: None, zp_refusal: Some("too_few_stars"), zp_list_stars: Some(30), ..base.clone() }, few),
+            (Spec { instrume: None, ..base.clone() }, "camera or focal length unknown — nothing to compare with"),
             // Precedence: the earlier row wins when a frame matches two.
-            (
-                Spec { star_rows: false, bayerpat: Some("RGGB"), zp: None, zp_version: None, ..base.clone() },
-                "not measured for colour cameras yet",
-            ),
-            (
-                Spec { star_rows: false, zp: None, zp_version: None, instrume: None, ..base.clone() },
-                "analysed on another computer — analyse the frame here to measure transparency",
-            ),
+            (Spec { source_channels: 3, zp: None, zp_version: None, ..base.clone() }, "not measured for colour cameras yet"),
+            (Spec { zp: None, zp_version: None, instrume: None, ..base.clone() }, never),
+            (Spec { zp_version: Some(ZP_VERSION - 1), instrume: None, ..base.clone() }, differs),
+            (Spec { zp: None, zp_refusal: Some("too_scattered"), instrume: None, ..base.clone() }, "the star brightnesses scatter too widely for a reliable zero point"),
             (
                 Spec { measure_version: Some(MEASURE_VERSION - 1), solved: false, ..base.clone() },
                 "analysed by an older version — analyse the frame again",
             ),
             (Spec { analysed: false, solved: false, ..base.clone() }, "not analysed yet"),
-            (
-                Spec { solved: false, bayerpat: Some("RGGB"), ..base.clone() },
-                "not plate-solved",
-            ),
-            (
-                Spec { bayerpat: Some("RGGB"), zp: None, zp_version: None, ..base.clone() },
-                "not measured for colour cameras yet",
-            ),
-            (
-                Spec { zp: None, zp_version: None, instrume: None, ..base.clone() },
-                "zero point not measured yet — the star catalogue may not be installed",
-            ),
-            (
-                Spec { zp: None, instrume: None, ..base.clone() },
-                "too few catalogue stars for a reliable zero point — a deeper star catalogue tier may help",
-            ),
+            (Spec { solved: false, source_channels: 3, ..base.clone() }, "not plate-solved"),
         ];
         let ids: Vec<i64> = cases.iter().map(|(spec, _)| w.seed(spec)).collect();
         let mut asked = ids.clone();
@@ -1333,6 +1605,303 @@ mod tests {
         // An id the catalogue does not know reads as not analysed.
         let missing = ask(&w, Some("A"), &[9_999_999]);
         assert_eq!(missing[&9_999_999].reason.as_deref(), Some("not analysed yet"));
+    }
+
+    // ---- the reduction on read (spec §5.6, FL8; H2) ----
+
+    /// One frame per `(zero point, G_b, slope)` row, alternating over `nights` nights from the base's night.
+    fn windowed(w: &mut World, base: &Spec, nights: i64, rows: &[(f64, f64, Option<f64>)]) -> Vec<i64> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, &(zp, g_b, slope))| {
+                w.seed(&Spec {
+                    zp: Some(zp),
+                    window_bright: Some(g_b),
+                    window_slope: slope,
+                    night: base.night + (i as i64) % nights,
+                    ..base.clone()
+                })
+            })
+            .collect()
+    }
+
+    fn median_of(values: &[f64]) -> f64 {
+        let mut v = values.to_vec();
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    }
+
+    /// The expected reduction of one pool: each `(zp, g_b)` read at the median edge with the slope `slope`.
+    fn reduced(rows: &[(f64, f64, Option<f64>)], slope: f64) -> Vec<f64> {
+        let pivot = median_of(&rows.iter().map(|r| r.1).collect::<Vec<_>>());
+        rows.iter().map(|r| r.0 - slope * (r.1 - pivot)).collect()
+    }
+
+    fn reference_of(values: &[f64]) -> f64 {
+        let mut v = values.to_vec();
+        v.sort_by(f64::total_cmp);
+        nearest_rank(&v, REFERENCE_PERCENTILE)
+    }
+
+    /// A set of 40 frames over two nights with a `G_b` spread of 0.3 mag and a slope of -0.15 mag per mag.
+    fn forty_rows() -> Vec<(f64, f64, Option<f64>)> {
+        (0..40).map(|i| (20.0 + 0.013 * ((i * 7) % 40) as f64, 13.0 + 0.3 * (i as f64 / 39.0), Some(-0.15))).collect()
+    }
+
+    #[test]
+    fn the_loss_reads_the_reduced_zero_point() {
+        let mut w = World::new();
+        let rows = forty_rows();
+        let ids = windowed(&mut w, &Spec::default(), 2, &rows);
+        let red = reduced(&rows, -0.15);
+        let reference = reference_of(&red);
+        let got = ask(&w, Some("A"), &ids);
+        for (i, id) in ids.iter().enumerate() {
+            let t = &got[id];
+            assert!((loss(t) - (reference - red[i]).max(0.0)).abs() < 1e-9, "frame {i}: {} vs {}", loss(t), reference - red[i]);
+            // The cell shows the quantity the loss is taken from, and the stored column is as the Analysis left it.
+            assert!((t.zero_point.unwrap() - red[i]).abs() < 1e-9, "the shown zero point is the reduced one");
+            let stored: f64 = w.conn.query_row("SELECT zero_point FROM frame_analysis WHERE frame_id = ?1", [id], |r| r.get(0)).unwrap();
+            assert_eq!(stored, rows[i].0, "the stored zero point is untouched");
+        }
+        // The reduction moves the answer: the same frames read unreduced give another reference.
+        assert!((reference - reference_of(&rows.iter().map(|r| r.0).collect::<Vec<_>>())).abs() > 1e-3);
+    }
+
+    #[test]
+    fn the_cell_shows_the_reduced_zero_point() {
+        let mut w = World::new();
+        // Five frames: no reference, so only the cell is in play. The slope is -0.4: a frame 0.5 mag below the median edge
+        // reads 0.2 mag lower after the reduction.
+        let rows = [(21.0, 13.0, Some(-0.4)), (21.0, 13.5, Some(-0.4)), (21.0, 14.0, Some(-0.4)), (21.0, 14.5, Some(-0.4)), (21.0, 15.0, Some(-0.4))];
+        let ids = windowed(&mut w, &Spec::default(), 2, &rows);
+        let got = ask(&w, Some("A"), &ids);
+        let red = reduced(&rows, -0.4);
+        for (i, id) in ids.iter().enumerate() {
+            assert!((got[id].zero_point.unwrap() - red[i]).abs() < 1e-9);
+            assert!(got[id].loss_mag.is_none());
+        }
+        assert!((got[&ids[0]].zero_point.unwrap() - (21.0 - 0.4 * 1.0)).abs() < 1e-9, "pivot 14.0, frame at 13.0");
+        let stored: f64 = w.conn.query_row("SELECT zero_point FROM frame_analysis WHERE frame_id = ?1", [ids[0]], |r| r.get(0)).unwrap();
+        assert_eq!(stored, 21.0);
+    }
+
+    #[test]
+    fn a_frame_set_of_one_frame_reads_its_own_zero_point() {
+        let mut w = World::new();
+        let base = forty_rows();
+        let main = windowed(&mut w, &Spec::default(), 2, &base[..30]);
+        // Set 2 holds one frame: its window is its own, so the reduction does nothing to it.
+        let lone_row = (20.7, 14.2, Some(-0.2));
+        let lone = windowed(&mut w, &Spec { set: Some(2), ..Spec::default() }, 1, &[lone_row])[0];
+        let got = ask(&w, Some("A"), &[main[0], lone]);
+        assert_eq!(got[&lone].zero_point, Some(20.7), "a window of one frame is that frame's window");
+        // The rig-wide pool holds the first set reduced in its own window and the lone frame as it is.
+        let mut values = reduced(&base[..30], -0.15);
+        values.push(20.7);
+        let reference = reference_of(&values);
+        assert!((loss(&got[&lone]) - (reference - 20.7).max(0.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_rig_wide_fallback_reduces_each_set_first() {
+        let mut w = World::new();
+        // Two short sets (20 frames over two nights each, too few for a reference of their own) with different windows.
+        let rows_a: Vec<(f64, f64, Option<f64>)> =
+            (0..20).map(|i| (20.0 + 0.01 * i as f64, if i % 2 == 0 { 13.0 } else { 13.4 }, Some(-0.2))).collect();
+        let rows_b: Vec<(f64, f64, Option<f64>)> =
+            (0..20).map(|i| (20.5 + 0.01 * i as f64, if i % 2 == 0 { 15.0 } else { 15.8 }, Some(-0.3))).collect();
+        let a = windowed(&mut w, &Spec::default(), 2, &rows_a);
+        let b = windowed(&mut w, &Spec { set: Some(2), ..Spec::default() }, 2, &rows_b);
+        let got = ask(&w, Some("A"), &[a[0], b[0]]);
+        let (red_a, red_b) = (reduced(&rows_a, -0.2), reduced(&rows_b, -0.3));
+        let pooled: Vec<f64> = red_a.iter().chain(&red_b).copied().collect();
+        let reference = reference_of(&pooled);
+        assert!((loss(&got[&a[0]]) - (reference - red_a[0]).max(0.0)).abs() < 1e-9, "set A reads the rig-wide reference");
+        assert!((loss(&got[&b[0]]) - (reference - red_b[0]).max(0.0)).abs() < 1e-9);
+        // Not the raw values, and not one window over both sets.
+        let raw: Vec<f64> = rows_a.iter().chain(&rows_b).map(|r| r.0).collect();
+        assert!((reference - reference_of(&raw)).abs() > 1e-3, "the raw zero points would give another reference");
+        let union: Vec<(f64, f64, Option<f64>)> = rows_a.iter().chain(&rows_b).copied().collect();
+        let one_window = reference_of(&reduced(&union, -0.15));
+        assert!((reference - one_window).abs() > 1e-3, "each set is reduced within itself, not in one window");
+    }
+
+    #[test]
+    fn a_frame_without_a_slope_is_reduced_with_its_sets_median() {
+        let mut w = World::new();
+        let mut rows = forty_rows();
+        // One frame has an edge and no slope: it is reduced with the median of the slopes that exist, its own edge counts
+        // in the pivot.
+        rows[10].2 = None;
+        let ids = windowed(&mut w, &Spec::default(), 2, &rows);
+        let got = ask(&w, Some("A"), &ids);
+        let pivot = median_of(&rows.iter().map(|r| r.1).collect::<Vec<_>>());
+        let expected = rows[10].0 + 0.15 * (rows[10].1 - pivot);
+        assert!((got[&ids[10]].zero_point.unwrap() - expected).abs() < 1e-9);
+        let red = reduced(&rows, -0.15);
+        let reference = reference_of(&red);
+        assert!((loss(&got[&ids[10]]) - (reference - expected).max(0.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_set_without_any_slope_reads_unreduced() {
+        let mut w = World::new();
+        let rows: Vec<(f64, f64, Option<f64>)> = forty_rows().into_iter().map(|(z, g, _)| (z, g, None)).collect();
+        let ids = windowed(&mut w, &Spec::default(), 2, &rows);
+        let got = ask(&w, Some("A"), &ids);
+        let reference = reference_of(&rows.iter().map(|r| r.0).collect::<Vec<_>>());
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(got[id].zero_point, Some(rows[i].0), "no slope: the stored value is shown");
+            assert!((loss(&got[id]) - (reference - rows[i].0).max(0.0)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_frame_without_a_window_edge_reads_its_own_zero_point() {
+        let mut w = World::new();
+        let rows = forty_rows();
+        let mut ids = windowed(&mut w, &Spec::default(), 2, &rows[..39]);
+        // A version-3 row with no edge (none should exist) counts in no window but still feeds the reference as it is.
+        ids.push(w.seed(&Spec { zp: Some(20.6), night: 2, ..Spec::default() }));
+        let got = ask(&w, Some("A"), &[ids[39], ids[0]]);
+        assert_eq!(got[&ids[39]].zero_point, Some(20.6));
+        let mut values = reduced(&rows[..39], -0.15);
+        values.push(20.6);
+        let reference = reference_of(&values);
+        assert!((loss(&got[&ids[39]]) - (reference - 20.6).max(0.0)).abs() < 1e-9);
+        assert!((loss(&got[&ids[0]]) - (reference - values[0]).max(0.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_read_writes_nothing() {
+        let mut w = World::new();
+        let ids = windowed(&mut w, &Spec::default(), 2, &forty_rows());
+        let snapshot = |w: &World| -> Vec<String> {
+            let mut stmt = w
+                .conn
+                .prepare(
+                    "SELECT frame_id || '|' || IFNULL(zero_point,'') || '|' || IFNULL(zp_stars,'') || '|' || IFNULL(zp_sigma,'')
+                            || '|' || IFNULL(zp_version,'') || '|' || IFNULL(zp_catalog,'') || '|' || IFNULL(zp_refusal,'')
+                            || '|' || IFNULL(zp_list_stars,'') || '|' || IFNULL(zp_window_bright,'') || '|' || IFNULL(zp_window_slope,'')
+                     FROM frame_analysis ORDER BY frame_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        let before = snapshot(&w);
+        let got = ask(&w, Some("A"), &ids);
+        assert!(got.values().all(|t| t.loss_mag.is_some()));
+        assert_eq!(snapshot(&w), before, "every zp_* column is byte-identical after a read");
+        assert_eq!(before.len(), 40);
+    }
+
+    /// H2: one set at two exposures is two references, and neither is reduced by the other's window; the rig-wide pool is
+    /// per exposure too.
+    #[test]
+    fn two_exposures_in_one_set_are_two_references() {
+        let short: Vec<(f64, f64, Option<f64>)> =
+            (0..40).map(|i| (20.0 + 0.011 * ((i * 7) % 40) as f64, 13.0 + 0.3 * (i as f64 / 39.0), Some(-0.15))).collect();
+        // The long exposure reaches fainter stars: another zero point level, its window further down, another slope.
+        let long: Vec<(f64, f64, Option<f64>)> =
+            (0..40).map(|i| (22.0 + 0.017 * ((i * 11) % 40) as f64, 14.5 + 0.5 * (i as f64 / 39.0), Some(-0.3))).collect();
+        let few_short: Vec<(f64, f64, Option<f64>)> = (0..3).map(|i| (20.2 + 0.01 * i as f64, 13.1, Some(-0.15))).collect();
+        let few_long: Vec<(f64, f64, Option<f64>)> = (0..3).map(|i| (22.3 + 0.01 * i as f64, 14.6, Some(-0.3))).collect();
+        let at = |s: f64, set: i64| Spec { exptime: Some(s), set: Some(set), ..Spec::default() };
+
+        let build = |with_short: bool, with_long: bool| {
+            let mut w = World::new();
+            let mut ids = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            if with_short {
+                ids.0 = windowed(&mut w, &at(120.0, 1), 2, &short);
+                ids.2 = windowed(&mut w, &at(120.0, 2), 2, &few_short);
+            }
+            if with_long {
+                ids.1 = windowed(&mut w, &at(300.0, 1), 2, &long);
+                ids.3 = windowed(&mut w, &at(300.0, 2), 2, &few_long);
+            }
+            (w, ids)
+        };
+        let (both, ids) = build(true, true);
+        let (only_short, short_ids) = build(true, false);
+        let (only_long, long_ids) = build(false, true);
+        let asked = |w: &World, v: &[i64]| ask(w, Some("A"), v);
+        let got = asked(&both, &[ids.0[0], ids.1[0], ids.2[0], ids.3[0]]);
+        let alone_short = asked(&only_short, &[short_ids.0[0], short_ids.2[0]]);
+        let alone_long = asked(&only_long, &[long_ids.1[0], long_ids.3[0]]);
+        // Each exposure reads exactly what it reads alone: the set references (frames 0 and 1) and the rig-wide ones
+        // (the three-frame sets fall back to the rig at their own exposure).
+        for (mixed, alone) in [
+            (&got[&ids.0[0]], &alone_short[&short_ids.0[0]]),
+            (&got[&ids.2[0]], &alone_short[&short_ids.2[0]]),
+            (&got[&ids.1[0]], &alone_long[&long_ids.1[0]]),
+            (&got[&ids.3[0]], &alone_long[&long_ids.3[0]]),
+        ] {
+            assert_eq!(mixed.loss_mag, alone.loss_mag, "{mixed:?} vs {alone:?}");
+            assert_eq!(mixed.zero_point, alone.zero_point);
+            assert!(mixed.loss_mag.is_some(), "{mixed:?}");
+        }
+        // The reference is the exposure's own, not one over both.
+        let red = reduced(&short, -0.15);
+        let reference = reference_of(&red);
+        assert!((loss(&got[&ids.0[0]]) - (reference - red[0]).max(0.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exposures_that_round_to_one_tenth_of_a_second_share_a_pool() {
+        assert_eq!(exposure_key(Some(120.0)), exposure_key(Some(120.04)));
+        assert_ne!(exposure_key(Some(120.0)), exposure_key(Some(120.1)));
+        assert_eq!(exposure_key(None), None);
+        assert_eq!(exposure_key(Some(0.0)), None);
+        assert_eq!(exposure_key(Some(f64::NAN)), None);
+    }
+
+    // ---- the count Analyze's tab shows (6b) ----
+
+    fn analysis_row(id: i64, zp_version: Option<u32>, catalog: Option<&str>, refusal: Option<&str>) -> FrameAnalysis {
+        let spec = Spec { zp_version, zp_catalog: catalog.map(|_| "x"), zp: None, zp_refusal: None, ..Spec::default() };
+        let mut a = analysis(id, &spec);
+        a.zp_catalog = catalog.map(str::to_owned);
+        a.zp_refusal = refusal.map(str::to_owned);
+        a
+    }
+
+    #[test]
+    fn the_update_count_is_analyzes_selection_and_leaves_out_what_analyze_cannot_help() {
+        let rows = vec![
+            analysis_row(1, Some(ZP_VERSION), Some("A"), None),                      // current
+            analysis_row(2, Some(ZP_VERSION - 1), Some("A"), None),                  // another version
+            analysis_row(3, Some(ZP_VERSION), Some("Z"), None),                      // another catalogue
+            analysis_row(4, None, None, None),                                       // never judged
+            analysis_row(5, Some(ZP_VERSION), Some("A"), Some("poor_solve")),        // a verdict: current
+            analysis_row(6, Some(ZP_VERSION), Some("A"), Some("internal")),          // the measurement failed
+            analysis_row(7, Some(ZP_VERSION), Some("A"), Some("catalogue_unreadable")),
+            analysis_row(8, None, None, None),                                       // not solved: not counted
+        ];
+        let solved: HashSet<i64> = (1..=7).collect();
+        let got = count_zero_point_updates(&rows, &solved, Some("A"));
+        assert_eq!(got, ZeroPointUpdates { to_update: 3, no_catalogue: 1, measurement_failed: 1 });
+        assert_eq!(
+            got.reasons(),
+            vec![
+                ("transparency not measured yet — run Analyze on its frame set".to_string(), 3),
+                ("the star catalogue is not installed — install it to measure transparency".to_string(), 1),
+                ("the measurement failed — see the log".to_string(), 1),
+            ]
+        );
+        // The count is Analyze's own predicate.
+        let by_predicate = rows.iter().filter(|r| solved.contains(&r.frame_id) && zp_outdated(r, true, Some("A"))).count();
+        assert_eq!(got.to_update, by_predicate);
+
+        // No catalogue installed: nothing is "to update", the solved frames say the catalogue is missing.
+        let none = count_zero_point_updates(&rows, &solved, None);
+        assert_eq!(none, ZeroPointUpdates { to_update: 0, no_catalogue: 7, measurement_failed: 0 });
+        assert_eq!(
+            none.reasons(),
+            vec![("the star catalogue is not installed — install it to measure transparency".to_string(), 7)]
+        );
+        assert!(count_zero_point_updates(&rows, &HashSet::new(), Some("A")).reasons().is_empty());
     }
 
     #[test]
@@ -1369,6 +1938,67 @@ mod tests {
             LossReason::NoReference { have_frames: 29, have_nights: 5 }.sentence(),
             "no clear-sky reference yet, 29 of 30 frames"
         );
+        assert_eq!(
+            LossReason::NoCatalogue.sentence(),
+            "the star catalogue is not installed — install it to measure transparency"
+        );
+        assert_eq!(LossReason::NotMeasured.sentence(), "transparency not measured yet — run Analyze on its frame set");
+        assert_eq!(
+            LossReason::AnalysisDiffers.sentence(),
+            "its analysis differs from the current one — run Analyze on its frame set"
+        );
+        assert_eq!(LossReason::NotAnalysed.sentence(), "not analysed yet");
+        assert_eq!(LossReason::NotSolved.sentence(), "not plate-solved");
+        assert_eq!(LossReason::ColourCamera.sentence(), "not measured for colour cameras yet");
+        assert_eq!(LossReason::NoRig.sentence(), "camera or focal length unknown — nothing to compare with");
+        // No sentence of a state that is not Analyze's to fix says "Analyze".
+        for reason in [LossReason::NoCatalogue, LossReason::Refused(Refusal::MeasurementFailed)] {
+            assert!(!reason.sentence().contains("Analyze"), "{}", reason.sentence());
+        }
+    }
+
+    /// Every stored refusal code has its sentence (spec §5.6); a code this build does not know reads as a failure.
+    #[test]
+    fn each_refusal_says_why() {
+        let mut w = World::new();
+        let good = w.series(&Spec::default(), 2, &ramp(30));
+        let table: Vec<(&str, Option<i64>, &str)> = vec![
+            ("poor_solve", Some(400), "the stars are not where the plate solve puts them — the solve is too poor to measure transparency"),
+            ("too_few_stars", Some(30), "too few catalogue stars in the field — a deeper star catalogue tier may help"),
+            ("too_few_stars", Some(49), "too few catalogue stars in the field — a deeper star catalogue tier may help"),
+            ("too_few_stars", Some(50), "too few of the field's catalogue stars could be measured"),
+            ("too_few_stars", Some(400), "too few of the field's catalogue stars could be measured"),
+            ("too_few_stars", None, "too few of the field's catalogue stars could be measured"),
+            ("too_scattered", Some(400), "the star brightnesses scatter too widely for a reliable zero point"),
+            ("no_exposure", None, "no exposure time in the header"),
+            ("frame_verdict", None, "no stars to measure on this frame (trailed, out of focus or empty)"),
+            (
+                "no_anchor",
+                None,
+                "too few catalogue stars matched to set the measurement — a deeper star catalogue tier may help",
+            ),
+            (
+                "unreadable_solve",
+                None,
+                "too few catalogue stars matched to set the measurement — a deeper star catalogue tier may help",
+            ),
+            ("colour_camera", None, "not measured for colour cameras yet"),
+            ("internal", None, "the measurement failed — see the log"),
+            ("catalogue_unreadable", None, "the star catalogue is not installed — install it to measure transparency"),
+            ("a_code_from_the_future", None, "the measurement failed — see the log"),
+        ];
+        let ids: Vec<i64> = table
+            .iter()
+            .map(|(code, list, _)| w.seed(&Spec { zp: None, zp_refusal: Some(code), zp_list_stars: *list, ..Spec::default() }))
+            .collect();
+        let got = ask(&w, Some("A"), &ids);
+        for (id, (code, list, sentence)) in ids.iter().zip(&table) {
+            let t = &got[id];
+            assert_eq!(t.reason.as_deref(), Some(*sentence), "{code} {list:?}");
+            assert_eq!((t.zero_point, t.loss_mag), (None, None), "{code}");
+        }
+        assert_eq!(got.len(), ids.len());
+        assert!(ask(&w, Some("A"), &good[..1])[&good[0]].loss_mag.is_some());
     }
 
     #[test]
