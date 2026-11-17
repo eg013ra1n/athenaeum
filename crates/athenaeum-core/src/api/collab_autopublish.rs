@@ -109,6 +109,12 @@ pub(crate) fn reset_dirty_state_for_test() {
     dirty_sets().lock().unwrap().clear();
 }
 
+/// Test-only: whether a broad request ([`request_auto_publish`]`(None)`) is waiting to be drained.
+#[cfg(test)]
+pub(crate) fn all_dirty_for_test() -> bool {
+    ALL_DIRTY.load(Ordering::SeqCst)
+}
+
 /// Test-only peek at [`DIRTY`] that does NOT drain it (unlike
 /// [`drain_due_projects`]) — a project-mapping save's assertion that
 /// `request_auto_publish` actually ran, without racing the real drain.
@@ -424,6 +430,25 @@ where
     }
 }
 
+/// One tick of the worker, after the debounce: drain the dirty state and run the publish pass over it, unless the pass
+/// after a solve batch is working. A solve batch clears the zero points of the frames it solves and that pass measures
+/// them again; a publish run now would announce those frames with no loss, and a published frame is judged on its
+/// manifest for good. So the tick returns BEFORE draining (the dirty marks stay) and the pass, when it ends, asks for a
+/// run again ([`crate::api::analysis::spawn_solve_zero_point_pass`]). A manual Publish is the user's own call and is not
+/// held.
+async fn auto_publish_tick<F, Fut>(ctx: &ServiceContext, emitter: Option<Arc<dyn ProgressEmitter>>, publish: F)
+where
+    F: Fn(String, Option<Arc<dyn ProgressEmitter>>) -> Fut,
+    Fut: std::future::Future<Output = Result<PublishResult, ApiError>>,
+{
+    if crate::api::analysis::solve_pass_active(ctx) {
+        tracing::info!("auto-publish: the zero point pass after a solve batch is running; run held until it ends");
+        return;
+    }
+    let due = drain_due_projects(ctx);
+    run_publish_pass(ctx, emitter, due, publish).await;
+}
+
 /// Arm the auto-publish worker for this process. NOT independently
 /// guarded — the one caller, `api::collab_live::spawn_collab_live`, spawns
 /// it once per process behind its own swap-guard.
@@ -440,9 +465,8 @@ pub(crate) fn spawn_auto_publish_worker(
             let ctx = Arc::clone(&ctx);
             let emitter = emitter.clone();
             async move {
-                let due = drain_due_projects(&ctx);
                 let publish_ctx = Arc::clone(&ctx);
-                run_publish_pass(&ctx, emitter, due, move |project_id, emitter| {
+                auto_publish_tick(&ctx, emitter, move |project_id, emitter| {
                     let ctx = Arc::clone(&publish_ctx);
                     async move { auto_publish_collab_frames(&ctx, &project_id, emitter).await }
                 })
@@ -735,6 +759,74 @@ mod tests {
             *seen.lock().unwrap(),
             vec!["p-x".to_string(), "p-y".to_string()]
         );
+    }
+
+    /// H1: a solve batch clears the zero points of the frames it solves and the pass after it measures them again. A
+    /// publish run while that pass works would announce those frames with no loss, and a published frame is judged on its
+    /// manifest for good. The tick holds its run (and drains nothing: the dirty marks stay), and when the pass ends it
+    /// asks for a run, which then publishes every frame with its loss.
+    #[tokio::test]
+    async fn a_run_is_held_while_the_zero_point_pass_works_and_runs_after_it() {
+        let _guard = test_lock();
+        reset_dirty_state();
+        let (tmp, ctx) = test_ctx();
+        let ctx = Arc::new(ctx);
+        crate::api::account::store_token_for_test(&ctx, "test-token").unwrap();
+        let root = tmp.path().join("collab-root");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            root.to_string_lossy().to_string(),
+            &crate::api::PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            conn.execute("INSERT INTO frames_set (id, name) VALUES (42, 'S')", []).unwrap();
+            insert_project(&conn, "p-held", PublishMode::Automatic);
+            crate::db::collab::link_set(&conn, "p-held", 42).unwrap();
+        }
+
+        // A pass that stays open until the test lets it go.
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        struct Done(Mutex<std::sync::mpsc::Sender<()>>);
+        impl ProgressEmitter for Done {
+            fn emit_json(&self, _: &str, _: serde_json::Value) {
+                let _ = self.0.lock().unwrap().send(());
+            }
+        }
+        crate::api::analysis::spawn_pass_with(
+            Arc::clone(&ctx),
+            Arc::new(Done(Mutex::new(done_tx))),
+            vec![1],
+            move |_, _| {
+                go_rx.lock().unwrap().recv().unwrap();
+                Ok(Default::default())
+            },
+        );
+        request_auto_publish(Some("p-held"));
+
+        let published: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = |published: &Arc<Mutex<Vec<String>>>| {
+            let published = Arc::clone(published);
+            move |project_id: String, _emitter: Option<Arc<dyn ProgressEmitter>>| {
+                published.lock().unwrap().push(project_id);
+                async move { Ok(PublishResult::default()) }
+            }
+        };
+        auto_publish_tick(&ctx, None, record(&published)).await;
+        assert!(published.lock().unwrap().is_empty(), "nothing is announced while the pass works");
+        assert!(is_dirty_for_test("p-held"), "the dirty mark stays for the run that follows the pass");
+
+        go_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(30)).expect("the pass ends");
+        assert!(all_dirty_for_test(), "the pass asked for the run it held back");
+        auto_publish_tick(&ctx, None, record(&published)).await;
+        assert_eq!(*published.lock().unwrap(), vec!["p-held".to_string()], "after the pass the run publishes");
+        reset_dirty_state();
     }
 
     /// Signed out, no Collaboration root, or `CollabApiOutdated` are

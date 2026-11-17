@@ -54,8 +54,8 @@ struct CatalogDownloadProgress {
 /// `catalog-download-progress` through `emitter`. The cancel flag is local to
 /// the call and registered nowhere, so the download cannot be cancelled.
 ///
-/// A finished install is a new catalogue identity, so every stored zero point is stale: the zero-point backfill is
-/// started again (it does nothing when one already ran for this identity, or none is installed).
+/// A finished install is a new catalogue identity, so every stored zero point reads as outdated: the Analysis tab shows
+/// "N to update" and the next Analyze measures those frames (nothing is read at install time).
 pub async fn download_catalog_layers(
     ctx: &Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -375,14 +375,6 @@ struct BatchEnd {
     error: Option<ApiError>,
 }
 
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
-    panic
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_string())
-}
-
 /// Phases 2 and 3 of a plate-solve batch, blocking: solve the frames on a
 /// scoped worker pool, persist the solved ones in one transaction, then end the
 /// batch. The batch is ended on every path (success, cancel, failed commit,
@@ -399,14 +391,14 @@ pub fn run_plate_solve_batch(
     let start = std::time::Instant::now();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        solve_and_persist(&ctx, emitter.as_ref(), batch, start)
+        solve_and_persist(&ctx, emitter.as_ref(), &emitter, batch, start)
     }));
     let end = match outcome {
         Ok(end) => end,
         Err(panic) => {
             // A panic outside a frame (the per-frame ones are caught in the
             // worker): no frame result is trustworthy, report every frame failed.
-            let msg = panic_message(panic.as_ref());
+            let msg = crate::api::analysis::panic_message(panic.as_ref());
             tracing::error!(error = %msg, "plate solve batch worker panicked");
             BatchEnd {
                 solved: 0,
@@ -442,6 +434,8 @@ pub fn run_plate_solve_batch(
 fn solve_and_persist(
     ctx: &Arc<ServiceContext>,
     emitter: &dyn ProgressEmitter,
+    // The owned handle the pass after the batch keeps to announce its end (`zero-point-pass-complete`).
+    #[cfg_attr(not(feature = "solver"), allow(unused_variables))] pass_emitter: &Arc<dyn ProgressEmitter>,
     batch: PreparedPlateSolveBatch,
     start: std::time::Instant,
 ) -> BatchEnd {
@@ -549,7 +543,7 @@ fn solve_and_persist(
                                     }
                                 }
                                 Err(panic) => {
-                                    let msg = panic_message(panic.as_ref());
+                                    let msg = crate::api::analysis::panic_message(panic.as_ref());
                                     tracing::error!(frame_id, filename = %filename, error = %msg, "plate solve panicked");
                                     WorkResult::Failed {
                                         frame_id,
@@ -696,7 +690,7 @@ fn solve_and_persist(
     // failed commit (the solves were rolled back).
     #[cfg(feature = "solver")]
     if error.is_none() && !persisted.is_empty() {
-        crate::api::analysis::spawn_solve_zero_point_pass(Arc::clone(ctx), persisted);
+        crate::api::analysis::spawn_solve_zero_point_pass(Arc::clone(ctx), Arc::clone(pass_emitter), persisted);
     }
 
     BatchEnd {
@@ -874,7 +868,7 @@ pub fn run_autofind_objects(
             Err(e)
         }
         Err(panic) => {
-            let msg = panic_message(panic.as_ref());
+            let msg = crate::api::analysis::panic_message(panic.as_ref());
             tracing::error!(error = %msg, "autofind batch worker panicked");
             emit_event(emitter.as_ref(), "autofind-objects-complete", &failure_event(0));
             Err(ApiError::Internal(format!("autofind batch panicked: {msg}")))

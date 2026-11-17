@@ -446,7 +446,6 @@ fn row_to_analysis(row: &rusqlite::Row) -> Result<FrameAnalysis> {
         zp_list_stars: row.get(32)?,
         zp_window_bright: row.get(33)?,
         zp_window_slope: row.get(34)?,
-        zp_outdated: false,
     })
 }
 
@@ -516,7 +515,6 @@ mod tests {
             zp_list_stars: None,
             zp_window_bright: None,
             zp_window_slope: None,
-            zp_outdated: false,
         }
     }
 
@@ -873,27 +871,6 @@ mod tests {
         full_zp(&mut a);
         let back: FrameAnalysis = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
         assert_eq!(zp_row(&back), zp_row(&a));
-    }
-
-    #[test]
-    fn zp_outdated_never_reaches_the_wire_or_the_database() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        let (file_id, frame_id) = insert_frame(&conn, "/x/a.fits");
-        let a = analysis(frame_id, file_id);
-        // False: the key is absent from the JSON.
-        let j = serde_json::to_value(&a).unwrap();
-        assert!(j.get("zp_outdated").is_none(), "a current row carries no zp_outdated key");
-        // True serializes (the listing's form), and a row read back is false whatever was written.
-        let mut flagged = a.clone();
-        flagged.zp_outdated = true;
-        let jt = serde_json::to_value(&flagged).unwrap();
-        assert_eq!(jt.get("zp_outdated"), Some(&serde_json::json!(true)));
-        let decoded: FrameAnalysis = serde_json::from_value(jt).unwrap();
-        assert!(decoded.zp_outdated);
-        upsert_frame_analysis(&conn, &decoded).unwrap();
-        assert!(!get_frame_analysis(&conn, frame_id).unwrap().unwrap().zp_outdated);
-        assert!(!get_frame_analyses_by_ids(&conn, &[frame_id]).unwrap()[0].zp_outdated);
     }
 
     fn figures(zero_point: Option<f64>) -> StoredZeroPoint {

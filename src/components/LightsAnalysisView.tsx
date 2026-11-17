@@ -23,6 +23,7 @@ import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-s
 import { ZipExtractionLine } from './zip/ZipExtractionLine';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
+import { useZeroPointPassComplete } from '../hooks/useZeroPointPassComplete';
 import { BlinkToolButton, ToolDivider, ToolSelection, ToolSplit, ToolToggle } from './toolbar/LabeledToolbar';
 
 interface LightsAnalysisViewProps {
@@ -278,6 +279,12 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
       setZeroPointUpdates(NO_UPDATES);
     }
   }, [frameSetId]);
+
+  // The pass after a solve batch measures the solved frames' transparency after `plate-solve-complete` has already
+  // reloaded the tab: its end reloads the "N to update" count and the zero point cells again.
+  useZeroPointPassComplete(() => {
+    loadAnalysisData();
+  });
 
   // Enqueue analysis via global queue
   const handleAnalyzeAll = useCallback((force?: boolean) => {

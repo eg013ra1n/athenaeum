@@ -449,7 +449,6 @@ mod tests {
                 zp_list_stars: None,
                 zp_window_bright: None,
                 zp_window_slope: None,
-                zp_outdated: false,
             },
         )
         .unwrap();

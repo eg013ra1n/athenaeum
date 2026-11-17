@@ -13,8 +13,8 @@
 //! of catalogue stars from this frame's own preliminary zero point (the anchor, `measure_zero_point` over the fitted
 //! stars), measures it in plain apertures at the positions the frame's own map gives, and writes the nine `zp_*` columns
 //! beside the analysis row (`StoredZeroPoint`). A zero point is current when it was judged at `ZP_VERSION` against the
-//! installed catalogue's identity (`zp_outdated`); a refusal that a re-read would repeat is stored too, so a hopeless
-//! frame is not retried on every Analyze.
+//! installed catalogue's identity ([`zp_outdated`]); a refusal is stored too, so a hopeless frame is not retried on every
+//! Analyze.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -620,8 +620,10 @@ impl ForcedListParams {
     }
 }
 
-/// Why a frame has no forced-list zero point. Every code but `catalogue_unreadable` and `internal` is stored (an outcome
-/// a re-read of the same file and solve would repeat); those two are failures of this run and store nothing.
+/// Why a frame has no forced-list zero point. Every code is stored, `catalogue_unreadable` and `internal` too: a frame
+/// whose run failed reads as judged at this `ZP_VERSION` and catalogue, so Analyze does not read it again on every run (a
+/// re-read of the same file and catalogue would fail the same way). Re-Analyze (force), a new catalogue identity or a
+/// build that bumps `ZP_VERSION` measures it again.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ForcedRefusal {
     /// `EXPTIME` missing, not finite, or not positive.
@@ -643,12 +645,13 @@ pub enum ForcedRefusal {
     UnreadableSolve,
     /// The plane has a verdict (trailed, defocused, no stars) that a re-read would repeat; the analysis row carries it.
     FrameVerdict,
-    /// The catalogue could not be read this time (an error or a panic of the cone); nothing is stored, a later run tries
-    /// again.
+    /// The catalogue could not be read (an error or a panic of the cone). Stored: the count reports it as waiting for the
+    /// catalogue, and a new catalogue identity or Re-Analyze reads it again.
     CatalogueUnreadable,
     /// An invariant between this code and the fitter broke (the request was refused although it was built, the fits do
-    /// not match the list, the composition panicked): a bug, not a verdict on the frame. Logged, nothing is stored, so a
-    /// build that fixes it measures the frame again.
+    /// not match the list, the composition or a frame's worker panicked): a bug, not a verdict on the frame. Logged with
+    /// `error!` and stored; the count reports it as a failed measurement, and Re-Analyze or a build that bumps
+    /// `ZP_VERSION` measures the frame again.
     Internal,
 }
 
@@ -667,11 +670,6 @@ impl ForcedRefusal {
             ForcedRefusal::CatalogueUnreadable => "catalogue_unreadable",
             ForcedRefusal::Internal => "internal",
         }
-    }
-
-    /// Whether the outcome is written to the catalogue (false: a failure of this run, retried later).
-    pub fn is_stored(&self) -> bool {
-        !matches!(self, ForcedRefusal::CatalogueUnreadable | ForcedRefusal::Internal)
     }
 }
 
@@ -1898,7 +1896,7 @@ pub fn is_mosaic(bayerpat: Option<&str>, source_channels: Option<i64>) -> bool {
 
 /// Whether a stored zero point is not current for a frame: a catalogue is installed (`catalog` is its identity), the frame
 /// has a plate solve, and the analysis carries another `ZP_VERSION` or another catalogue's zero point (or none). The one
-/// predicate of Analyze's selection and of the listing's `zp_outdated` flag (spec §5.4). A stored refusal at the current
+/// predicate of Analyze's selection and of the count "N to update" (spec §5.4). A stored refusal at the current
 /// version and identity is current: it does not change on a re-read until a new solve clears it.
 pub fn zp_outdated(analysis: &crate::models::FrameAnalysis, solved: bool, catalog: Option<&str>) -> bool {
     let Some(identity) = catalog else {
@@ -1931,7 +1929,7 @@ pub(crate) fn catalog_cone<'a>(
 pub struct ZpPassStats {
     /// Frames that wrote a row (a value or a stored refusal).
     pub stored: usize,
-    /// Frames whose solve cannot be read: nothing stored, `debug` per frame.
+    /// Frames whose file could not be read (offline, missing, corrupt): nothing stored, `debug` per frame.
     pub unreadable: usize,
     /// Frames whose check or refresh failed (a database or catalogue error): left as they were, `debug` per frame.
     pub failed: usize,
@@ -1940,16 +1938,6 @@ pub struct ZpPassStats {
 }
 
 impl ZpPassStats {
-    /// Fold the stats of another chunk into this pass.
-    pub fn add(&mut self, other: ZpPassStats) {
-        self.stored += other.stored;
-        self.unreadable += other.unreadable;
-        self.failed += other.failed;
-        if self.first_error.is_none() {
-            self.first_error = other.first_error;
-        }
-    }
-
     /// The pass's one `warn`: the count of frames that could not be measured, when there are any. `pass` names the
     /// caller (`solve`).
     pub fn warn_if_unmeasurable(&self, pass: &'static str) {
@@ -2388,7 +2376,6 @@ mod tests {
             zp_list_stars: None,
             zp_window_bright: None,
             zp_window_slope: None,
-            zp_outdated: false,
         }
     }
 
@@ -3526,11 +3513,10 @@ mod forced_tests {
             assert_eq!(o.result, Err(ForcedRefusal::Internal), "{what}");
             assert_ne!(o.result.unwrap_err().code(), "too_few_stars");
         }
-        assert!(!ForcedRefusal::Internal.is_stored());
     }
 
     #[test]
-    fn the_refusal_codes_are_stable_and_one_is_not_stored() {
+    fn the_refusal_codes_are_stable() {
         let all = [
             (ForcedRefusal::NoExposure, "no_exposure"),
             (ForcedRefusal::NoAnchor { kept: 3 }, "no_anchor"),
@@ -3545,9 +3531,7 @@ mod forced_tests {
         ];
         for (r, code) in all {
             assert_eq!(r.code(), code);
-            assert_eq!(r.is_stored(), !["catalogue_unreadable", "internal"].contains(&code), "{code}");
         }
-        assert!(ForcedRefusal::PoorSolve { kept_share: f64::NAN }.is_stored(), "an outcome a re-read would repeat");
         // The list's aperture correction is gone, and its code with it.
         assert!(all.iter().all(|(_, code)| *code != "no_aperture_correction"));
     }

@@ -272,6 +272,13 @@ star has no weight, is in no sum, in neither the pedestal's line nor `zp_stars`,
   Refusals: `no_exposure`, `no_anchor`, `poor_solve`, `too_few_stars` (with the list size: a shallow catalogue or sparse
   field is told from a measurement that failed), `too_scattered`; stored besides (plan, Review rulings) `colour_camera`,
   `unreadable_solve`, `frame_verdict`. `no_aperture_correction` goes.
+  **Failures of the run are stored too** (final review M3, reversing the first ruling that stored nothing): `internal`
+  (an invariant between this code and the fitter broke, or a frame's measurement panicked: logged with `error!`) and
+  `catalogue_unreadable` (the cone errored or panicked). Stored at the current `ZP_VERSION` and catalogue identity, such a
+  frame is not "to update": the count puts `internal` under `measurement_failed` and `catalogue_unreadable` under
+  `no_catalogue` (§5.6), a plain Analyze does not select it again, and Re-Analyze (force), a new catalogue identity or a
+  `ZP_VERSION` bump does. Without this one frame that fails the same way on every read, or a catalogue whose identity
+  stats but whose tiers do not open, would pin the set on "N to update" and keep Re-Analyze out of reach.
 
 **On a sparse list** (under ~500 stars; no corpus set is one, so this is unjudged, and Phase A's decimated round reports
 it, §6):
@@ -314,6 +321,7 @@ it, §6):
   `ALTER TABLE` loop, `FrameAnalysis`, `ts_export.rs`, `src/types/models.ts`; personal sync carries them as appended
   optional fields (the analysis summary rides the package manifest as opaque JSON; no wire golden pin changes, plan
   Task 5a).
+- `zp_refusal` takes every code of §5.3, `internal` and `catalogue_unreadable` included (M3).
 - Current = `zp_version` 3 and `zp_catalog` the installed identity; an analysis upsert or a new solve clears `zp_*` (a
   new WCS moves the list) and §5.4 fills them again. No per-star table: it would spare a file read only when the
   statistic alone changes, double `star_metrics`' rows, and not travel by personal sync.
@@ -343,6 +351,14 @@ it, §6):
   again and it was refused again at rms 0.527 px, so the advice would loop; M5, §6); too few catalogue stars, install the deeper tier, when the list was small. Gate: O7
   stays; a frame without a current ZP gets no verdict and is not blocked. New fields and codes go into the logging
   dictionary.
+- **Failures of the run read** (M3): `internal` reads "the measurement failed — see the log" and counts under
+  `measurement_failed`; `catalogue_unreadable` reads the no-catalogue sentence and counts under `no_catalogue`.
+  "N to update" counts over Analyze's own frame list (the used copy of each light, M1), so the number is the number a
+  plain Analyze measures and a second disk or zip copy never pins it.
+- **The pass after a solve batch** (H1, M2): until it ends the auto-publish worker holds its run (a frame announced before
+  its zero point is back is judged on its manifest without a loss for good), and when it ends it emits
+  `zero-point-pass-complete` (the Analysis tab reads its count and cells again) and asks for the held run. A manual
+  Publish during the pass is the user's own call and is not held.
 
 ## 6. Truth check — bars fixed now, judged in the probe before anything is stored
 

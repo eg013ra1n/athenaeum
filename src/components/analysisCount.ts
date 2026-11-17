@@ -50,7 +50,7 @@ export function analysisCountText(
   }
   if (updates.measurementFailed > 0) {
     lines.push(
-      `the zero point measurement failed on ${updates.measurementFailed} ${pluralize(updates.measurementFailed, 'frame')} — see the logs`,
+      `the measurement failed on ${updates.measurementFailed} ${pluralize(updates.measurementFailed, 'frame')} — see the log`,
     );
   }
   return { settled, count, update, catalogue, title: lines.length > 0 ? lines.join('\n') : null };

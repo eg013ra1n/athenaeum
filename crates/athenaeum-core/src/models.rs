@@ -1139,10 +1139,6 @@ pub struct FrameAnalysis {
     /// The zero point's change per magnitude the window moves fainter; `None` when the statistic gave none.
     #[serde(default)]
     pub zp_window_slope: Option<f64>,
-    /// Whether the stored zero point is not current (an older version, another catalogue) on a solved frame while a
-    /// catalogue is installed. Computed by the Analysis listing, never a column and never on the sync wire.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub zp_outdated: bool,
 }
 
 /// Deserialize `Option<FrameVerdict>` leniently: null / absent → `None`; an unknown variant → `None` + `warn!`.
@@ -1508,11 +1504,12 @@ pub struct ZeroPointUpdates {
     /// Solved frames whose zero point is not current for the installed catalogue (never judged, another `ZP_VERSION`
     /// or another catalogue): a run of Analyze (without Re-Analyze) measures exactly these.
     pub to_update: usize,
-    /// Solved frames the zero point cannot be measured for because no star catalogue is installed. Never part of
-    /// `to_update`: the way on is installing the catalogue.
+    /// Solved frames the zero point cannot be measured for because no star catalogue is installed, or the installed one
+    /// could not be read (the stored `catalogue_unreadable`). Never part of `to_update`: the way on is installing the
+    /// catalogue; a new catalogue identity or Re-Analyze reads the frame again.
     pub no_catalogue: usize,
-    /// Frames whose stored judgement says the measurement itself failed (`internal`, `catalogue_unreadable`): the logs
-    /// say why. Never part of `to_update`.
+    /// Frames whose stored judgement says the measurement itself failed (`internal`): the log says why. Never part of
+    /// `to_update`; Re-Analyze reads them again.
     pub measurement_failed: usize,
 }
 

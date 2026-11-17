@@ -600,12 +600,7 @@ zp_window_bright: number | null,
 /**
  * The zero point's change per magnitude the window moves fainter; `None` when the statistic gave none.
  */
-zp_window_slope: number | null, 
-/**
- * Whether the stored zero point is not current (an older version, another catalogue) on a solved frame while a
- * catalogue is installed. Computed by the Analysis listing, never a column and never on the sync wire.
- */
-zp_outdated?: boolean, };
+zp_window_slope: number | null, };
 
 export type FrameVerdict = "trailed" | "defocused" | "no_stars";
 
@@ -618,13 +613,14 @@ export type ZeroPointUpdates = {
  */
 toUpdate: number, 
 /**
- * Solved frames the zero point cannot be measured for because no star catalogue is installed. Never part of
- * `to_update`: the way on is installing the catalogue.
+ * Solved frames the zero point cannot be measured for because no star catalogue is installed, or the installed one
+ * could not be read (the stored `catalogue_unreadable`). Never part of `to_update`: the way on is installing the
+ * catalogue; a new catalogue identity or Re-Analyze reads the frame again.
  */
 noCatalogue: number, 
 /**
- * Frames whose stored judgement says the measurement itself failed (`internal`, `catalogue_unreadable`): the logs
- * say why. Never part of `to_update`.
+ * Frames whose stored judgement says the measurement itself failed (`internal`): the log says why. Never part of
+ * `to_update`; Re-Analyze reads them again.
  */
 measurementFailed: number, };
 

@@ -57,7 +57,7 @@ enum PassRequest {
 /// One pass after a solve batch at a time, and the frames asked for while one runs. Pure, so the decision is testable
 /// without a thread.
 #[cfg(feature = "solver")]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SolvePassGuard {
     running: bool,
     pending: std::collections::BTreeSet<i64>,
@@ -65,10 +65,6 @@ struct SolvePassGuard {
 
 #[cfg(feature = "solver")]
 impl SolvePassGuard {
-    const fn new() -> Self {
-        SolvePassGuard { running: false, pending: std::collections::BTreeSet::new() }
-    }
-
     /// A pass over `ids` (the frames a batch has just solved) is wanted.
     fn request(&mut self, ids: &[i64]) -> PassRequest {
         if self.running {
@@ -97,19 +93,63 @@ impl SolvePassGuard {
     }
 }
 
-/// Releases the running flag of the guard on EVERY exit path of the pass thread (a panic, an early return): without it a
-/// dead pass would leave every later batch queueing behind it until restart. [`Self::disarm`] is called after
-/// [`SolvePassGuard::finish`] has itself released the flag, so a normal end is not released twice.
+/// The guards of the passes after a solve batch, one per catalogue database (the key is the database's path), so two
+/// contexts over different databases never share a queue or run each other's frames. Module-level: the auto-publish
+/// worker asks [`solve_pass_active`] without being handed the pass.
 #[cfg(feature = "solver")]
-struct PassRelease<'a> {
-    guard: &'a std::sync::Mutex<SolvePassGuard>,
+static SOLVE_PASSES: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, SolvePassGuard>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The registry key of `ctx`: its database file (empty before the database is opened).
+#[cfg(feature = "solver")]
+fn pass_key(ctx: &ServiceContext) -> std::path::PathBuf {
+    ctx.db.get().map(|d| d.path().to_path_buf()).unwrap_or_default()
+}
+
+/// Run `f` on the guard of `key`.
+#[cfg(feature = "solver")]
+fn with_pass_guard<R>(key: &std::path::Path, f: impl FnOnce(&mut SolvePassGuard) -> R) -> R {
+    let mut passes = SOLVE_PASSES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(passes.entry(key.to_path_buf()).or_default())
+}
+
+/// Whether a pass after a solve batch is running or has frames pending for `ctx`'s catalogue. A solve batch clears the
+/// zero points of the frames it solves and the pass measures them again: until it ends those frames have no loss, so the
+/// auto-publish worker holds its run while this is true (`api::collab_autopublish`) and the pass asks for a run when it
+/// ends. A manual Publish is the user's own call and is not held.
+#[cfg(feature = "solver")]
+pub fn solve_pass_active(ctx: &ServiceContext) -> bool {
+    with_pass_guard(&pass_key(ctx), |guard| guard.running)
+}
+
+/// The `zero-point-pass-complete` event: the pass after a solve batch has ended, so the Analysis tab reads its count and
+/// the zero point cells again. `frames` is what the pass selected over its rounds, `measured` what it stored.
+#[cfg(feature = "solver")]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeroPointPassComplete {
+    pub frames: usize,
+    pub measured: usize,
+}
+
+/// Ends the pass thread on EVERY exit path (a normal end, a panic, an early return): the running flag is freed when the
+/// thread did not already free it ([`Self::disarm`] is called after [`SolvePassGuard::finish`] released it, so a normal
+/// end is not released twice; without the release a dead pass would leave every later batch queueing behind it until
+/// restart), and then, the guard being free, the pass announces its end: one `zero-point-pass-complete` event for the
+/// Analysis tab and one request for an auto-publish run, which was held while the pass worked.
+#[cfg(feature = "solver")]
+struct PassRelease {
+    key: std::path::PathBuf,
+    emitter: Arc<dyn ProgressEmitter>,
     armed: bool,
+    frames: usize,
+    measured: usize,
 }
 
 #[cfg(feature = "solver")]
-impl<'a> PassRelease<'a> {
-    fn new(guard: &'a std::sync::Mutex<SolvePassGuard>) -> Self {
-        PassRelease { guard, armed: true }
+impl PassRelease {
+    fn new(key: std::path::PathBuf, emitter: Arc<dyn ProgressEmitter>) -> Self {
+        PassRelease { key, emitter, armed: true, frames: 0, measured: 0 }
     }
 
     fn disarm(&mut self) {
@@ -118,11 +158,17 @@ impl<'a> PassRelease<'a> {
 }
 
 #[cfg(feature = "solver")]
-impl Drop for PassRelease<'_> {
+impl Drop for PassRelease {
     fn drop(&mut self) {
         if self.armed {
-            self.guard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).abandon();
+            with_pass_guard(&self.key, SolvePassGuard::abandon);
         }
+        emit_event(
+            self.emitter.as_ref(),
+            "zero-point-pass-complete",
+            &ZeroPointPassComplete { frames: self.frames, measured: self.measured },
+        );
+        crate::api::collab_autopublish::request_auto_publish(None);
     }
 }
 
@@ -290,6 +336,33 @@ struct AnalyzedFrame {
     solve_id: Option<i64>,
 }
 
+/// One light of a set as Analyze reads it: frame id, file id, path, exposure, observation time.
+type SetLight = (i64, i64, String, Option<f64>, Option<String>);
+
+/// The lights of `frame_set_id` an Analysis run can measure: the used copy of each (a second copy of a frame the set
+/// already holds is never measured, stacked or exported, `db::frame_is_used_copy_sql`). Analyze's selection and the
+/// "N to update" count both start from this list, so the count cannot hold a frame Analyze never reads.
+fn frame_set_lights(conn: &rusqlite::Connection, frame_set_id: i64) -> Result<Vec<SetLight>, ApiError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT f.id as frame_id, fi.id as file_id, fi.path, f.exptime, f.date_obs
+         FROM frames f
+         INNER JOIN files fi ON fi.id = f.file_id
+         INNER JOIN session_members sm ON sm.frame_id = f.id
+         INNER JOIN sessions s ON s.id = sm.session_id
+         INNER JOIN imaging_nights n ON n.id = s.imaging_night_id
+         WHERE n.frames_set_id = ?1
+           AND f.imagetyp = 'Light'
+           AND {used_copy}",
+        used_copy = crate::db::frame_is_used_copy_sql("n.frames_set_id"),
+    ))?;
+    let rows: Vec<SetLight> = stmt
+        .query_map(rusqlite::params![frame_set_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 /// The frames of `frame_set_id` an Analysis run measures: its lights (a second copy of a frame the set already holds is
 /// not measured: it is never stacked or exported, `db::frame_is_used_copy_sql`, and a zip copy would be extracted for
 /// nothing). With `force` every one; otherwise the frames whose analysis is stale ([`row_is_stale`]) or has none, and the
@@ -303,23 +376,7 @@ fn select_frame_jobs(
     catalog: Option<&str>,
     force: bool,
 ) -> Result<Vec<FrameJob>, ApiError> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT f.id as frame_id, fi.id as file_id, fi.path, f.exptime, f.date_obs
-         FROM frames f
-         INNER JOIN files fi ON fi.id = f.file_id
-         INNER JOIN session_members sm ON sm.frame_id = f.id
-         INNER JOIN sessions s ON s.id = sm.session_id
-         INNER JOIN imaging_nights n ON n.id = s.imaging_night_id
-         WHERE n.frames_set_id = ?1
-           AND f.imagetyp = 'Light'
-           AND {used_copy}",
-        used_copy = crate::db::frame_is_used_copy_sql("n.frames_set_id"),
-    ))?;
-    let rows: Vec<(i64, i64, String, Option<f64>, Option<String>)> = stmt
-        .query_map(rusqlite::params![frame_set_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let rows = frame_set_lights(conn, frame_set_id)?;
 
     let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
     #[cfg(feature = "solver")]
@@ -424,6 +481,88 @@ fn analyze_job_file(
     Ok((analysis, stars, flip, None))
 }
 
+/// The text of a caught panic's payload.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Test-only: the frame id whose measurement panics ([`analyze_job_file_guarded`]'s catch is otherwise out of reach: the
+/// workers are their own threads). No frame has a negative id.
+#[cfg(test)]
+static PANIC_ON_FRAME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Test-only: the read without the zero point panics too, for the frame of [`PANIC_ON_FRAME`].
+#[cfg(test)]
+static PANIC_AGAIN: AtomicBool = AtomicBool::new(false);
+
+/// [`analyze_job_file`] with a panic caught: a frame whose measurement panics (a bug in the star fitter, the list entry or
+/// this code) is logged with `error!` and does not take the batch down with it (a panic in a worker would end the whole
+/// Analyze and leave its frame set "already in progress" until restart). A solved frame is read once more WITHOUT the
+/// zero point: when that works the Analysis rows are stored and the zero point carries `internal` (the count reports it
+/// as a failed measurement, Re-Analyze reads it again); when it panics too the frame fails like an unreadable file.
+fn analyze_job_file_guarded(
+    path: &str,
+    job: &FrameJob,
+    config: &AnalysisConfig,
+    pool: &Arc<rayon::ThreadPool>,
+    config_hash: &str,
+    #[cfg(feature = "solver")] source: Option<&ZpSource<'_>>,
+) -> anyhow::Result<(FrameAnalysis, Vec<StarMetric>, bool, Option<i64>)> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let first = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if PANIC_ON_FRAME.load(Ordering::SeqCst) == job.frame_id {
+            panic!("the measurement panicked (test)");
+        }
+        analyze_job_file(
+            path,
+            job,
+            config,
+            pool,
+            config_hash,
+            #[cfg(feature = "solver")]
+            source,
+        )
+    }));
+    let payload = match first {
+        Ok(measured) => return measured,
+        Err(payload) => payload,
+    };
+    let text = panic_message(payload.as_ref());
+    tracing::error!(frame_id = job.frame_id, path = %path, error = %text, "frame measurement panicked");
+    #[cfg(feature = "solver")]
+    if let (Some(work), Some(source)) = (&job.zp, source) {
+        let plain = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if PANIC_AGAIN.load(Ordering::SeqCst) {
+                panic!("the plain measurement panicked (test)");
+            }
+            analyzer::analyze_frame(path, config, Some(pool), config_hash)
+        }));
+        match plain {
+            Ok(Ok((mut analysis, stars, flip))) => {
+                crate::db::analysis::StoredZeroPoint::code_only(crate::analysis::zero_point::ZP_VERSION, "internal")
+                    .apply_to(&mut analysis, source.identity);
+                return Ok((analysis, stars, flip, Some(work.solve_id)));
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(payload) => {
+                tracing::error!(
+                    frame_id = job.frame_id,
+                    path = %path,
+                    error = %panic_message(payload.as_ref()),
+                    "frame measurement panicked again without the zero point"
+                );
+            }
+        }
+    }
+    Err(anyhow::anyhow!("the measurement panicked: {text}"))
+}
+
 /// A frame a run could not measure (its file is unreachable or unreadable): the caller says how loudly.
 struct JobFailure {
     frame_id: i64,
@@ -478,7 +617,7 @@ fn measure_jobs(
                 let (frame_id, file_id, path) = (job.frame_id, job.file_id, job.path.clone());
 
                 let result = match crate::zip_store::materialize::materialize_one(ctx, &path).and_then(|(local, pin)| {
-                    let measured = analyze_job_file(
+                    let measured = analyze_job_file_guarded(
                         &local.to_string_lossy(),
                         &job,
                         config,
@@ -777,43 +916,53 @@ pub(crate) fn solve_zero_point_pass_with(
     Ok(stats)
 }
 
+/// Start the pass after a solve batch on its own thread (`zero-point-solve-pass`) over the frames the batch solved. One
+/// pass runs at a time per catalogue; frames asked for while it runs join its pending set and it takes them before it
+/// ends ([`SolvePassGuard`]). A panic or an error ends that round, never the thread unannounced, and the guard is released
+/// on every exit path. When the pass ends it emits `zero-point-pass-complete` through `emitter` and asks for an
+/// auto-publish run ([`PassRelease`]); until then [`solve_pass_active`] is true.
 #[cfg(feature = "solver")]
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_string())
+pub fn spawn_solve_zero_point_pass(ctx: Arc<ServiceContext>, emitter: Arc<dyn ProgressEmitter>, frame_ids: Vec<i64>) {
+    spawn_pass_with(ctx, emitter, frame_ids, |ctx, ids| solve_zero_point_pass(ctx, ids));
 }
 
-/// Start the pass after a solve batch on its own thread (`zero-point-solve-pass`) over the frames the batch solved. One
-/// pass runs at a time; frames asked for while it runs join its pending set and it takes them before it ends
-/// ([`SolvePassGuard`]). A panic or an error ends that round, never the thread unannounced, and the guard is released on
-/// every exit path.
+/// [`spawn_solve_zero_point_pass`] with the work of one round given by the caller: the tests hold a round open or make it
+/// fail.
 #[cfg(feature = "solver")]
-pub fn spawn_solve_zero_point_pass(ctx: Arc<ServiceContext>, frame_ids: Vec<i64>) {
-    static GUARD: std::sync::Mutex<SolvePassGuard> = std::sync::Mutex::new(SolvePassGuard::new());
-    let lock = || GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+pub(crate) fn spawn_pass_with<W>(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    frame_ids: Vec<i64>,
+    work: W,
+) where
+    W: Fn(&ServiceContext, &[i64]) -> Result<crate::analysis::zero_point::ZpPassStats, ApiError> + Send + 'static,
+{
     if frame_ids.is_empty() {
         return;
     }
-    match lock().request(&frame_ids) {
+    let key = pass_key(&ctx);
+    match with_pass_guard(&key, |guard| guard.request(&frame_ids)) {
         PassRequest::Start => {}
         PassRequest::Queued => {
             tracing::debug!(frames = frame_ids.len(), "zero point solve pass queued behind the running one");
             return;
         }
     }
+    let thread_key = key.clone();
+    let thread_emitter = Arc::clone(&emitter);
     let spawned = std::thread::Builder::new().name("zero-point-solve-pass".into()).spawn(move || {
-        let mut release = PassRelease::new(&GUARD);
+        let mut release = PassRelease::new(thread_key.clone(), thread_emitter);
         let mut ids = frame_ids;
         loop {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solve_zero_point_pass(&ctx, &ids))) {
-                Ok(Ok(_)) => {}
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&ctx, &ids))) {
+                Ok(Ok(stats)) => {
+                    release.frames += ids.len();
+                    release.measured += stats.stored;
+                }
                 Ok(Err(e)) => tracing::warn!(error = %e, "zero point solve pass failed"),
-                Err(payload) => tracing::warn!(error = %panic_text(payload.as_ref()), "zero point solve pass panicked"),
+                Err(payload) => tracing::warn!(error = %panic_message(payload.as_ref()), "zero point solve pass panicked"),
             }
-            match lock().finish() {
+            match with_pass_guard(&thread_key, SolvePassGuard::finish) {
                 Some(next) => ids = next,
                 None => {
                     release.disarm();
@@ -823,17 +972,17 @@ pub fn spawn_solve_zero_point_pass(ctx: Arc<ServiceContext>, frame_ids: Vec<i64>
         }
     });
     if let Err(e) = spawned {
-        // Nothing runs: the guard is free for the next batch.
-        lock().abandon();
+        // Nothing runs: the guard is free for the next batch, and an auto-publish run held for this pass is not waiting.
+        with_pass_guard(&key, SolvePassGuard::abandon);
         tracing::warn!(error = %e, "zero point solve pass thread did not start");
+        crate::api::collab_autopublish::request_auto_publish(None);
     }
 }
 
 /// Analyze all LIGHT frames in a frame set.
 ///
-/// Uses rayon par_iter inside pool.install() for natural work-stealing
-/// across frames — actually N dedicated worker threads pulling from a
-/// shared queue (see comment inline below); emits `analysis-progress`
+/// Measures the frames on N dedicated worker threads pulling from one
+/// queue ([`measure_jobs`], each frame's own work on the shared image pool); emits `analysis-progress`
 /// during processing and `analysis-complete` at the end via `emitter`.
 ///
 /// Fully synchronous — deliberately NOT `async` (see module doc for why:
@@ -1104,31 +1253,14 @@ pub fn cancel_analysis(ctx: &ServiceContext, frame_set_id: i64) -> Result<(), Ap
     }
 }
 
-/// Get all stored analysis results for a frame set. Each row's `zp_outdated` says whether its zero point is not current
-/// ([`crate::analysis::zero_point::zp_outdated`]: a catalogue is installed, the frame is solved, and the row carries
-/// another zero-point version or catalogue): the installed identity is a stat of the tier files and the solves are one
-/// chunked query, so the listing reads no pixel and no star.
+/// Get all stored analysis results for a frame set.
 pub fn get_analysis_for_frame_set(
     ctx: &ServiceContext,
     frame_set_id: i64,
 ) -> Result<Vec<FrameAnalysis>, ApiError> {
-    #[cfg(feature = "solver")]
-    let identity = installed_identity(ctx);
     let db = db(ctx)?;
     let conn = db.conn();
-    #[allow(unused_mut)]
-    let mut rows = db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)?;
-    #[cfg(feature = "solver")]
-    if let Some(identity) = identity.as_deref() {
-        let ids: Vec<i64> = rows.iter().map(|a| a.frame_id).collect();
-        let solved = crate::plate_solve::storage::frames_with_solve(&conn, &ids)
-            .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
-        for a in &mut rows {
-            a.zp_outdated =
-                crate::analysis::zero_point::zp_outdated(a, solved.contains(&a.frame_id), Some(identity));
-        }
-    }
-    Ok(rows)
+    Ok(db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)?)
 }
 
 /// The one count of "N to update" and its reasons for a frame set's zero points, for the Analysis tab (plan Task 6a/6b):
@@ -1144,7 +1276,12 @@ pub fn zero_point_updates(
     let identity = installed_identity(ctx);
     let db = db(ctx)?;
     let conn = db.conn();
-    let rows = db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)?;
+    // Analyze's own frames: the used copy of each light, never a second copy that only an older build analysed.
+    let lights: std::collections::HashSet<i64> = frame_set_lights(&conn, frame_set_id)?.into_iter().map(|l| l.0).collect();
+    let rows: Vec<FrameAnalysis> = db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)?
+        .into_iter()
+        .filter(|a| lights.contains(&a.frame_id))
+        .collect();
     let ids: Vec<i64> = rows.iter().map(|a| a.frame_id).collect();
     let solved = crate::plate_solve::storage::frames_with_solve(&conn, &ids)
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
@@ -1476,7 +1613,6 @@ mod tests {
             zp_list_stars: None,
             zp_window_bright: None,
             zp_window_slope: None,
-            zp_outdated: false,
         };
         tweak(&mut a);
         db_analysis::upsert_frame_analysis(&conn, &a).unwrap();
@@ -1709,7 +1845,7 @@ mod tests {
     #[cfg(feature = "solver")]
     #[test]
     fn the_solve_pass_runs_one_at_a_time_and_takes_queued_frames() {
-        let mut guard = SolvePassGuard::new();
+        let mut guard = SolvePassGuard::default();
         assert_eq!(guard.request(&[1, 2]), PassRequest::Start);
         assert_eq!(guard.request(&[3, 2]), PassRequest::Queued);
         assert_eq!(guard.request(&[4]), PassRequest::Queued);
@@ -1727,28 +1863,128 @@ mod tests {
     #[cfg(feature = "solver")]
     #[test]
     fn a_solve_pass_that_dies_releases_the_guard() {
-        let mut guard = SolvePassGuard::new();
+        let mut guard = SolvePassGuard::default();
         assert_eq!(guard.request(&[1]), PassRequest::Start);
         assert_eq!(guard.request(&[2]), PassRequest::Queued);
         guard.abandon();
         assert!(!guard.running && guard.pending.is_empty(), "nothing runs and nothing is queued");
         assert_eq!(guard.request(&[3]), PassRequest::Start, "a later batch is not told to wait");
+    }
 
-        // The drop guard: a panic on the thread releases the flag; a normal end (disarmed) does not release twice.
-        let shared = std::sync::Mutex::new(SolvePassGuard::new());
-        assert_eq!(shared.lock().unwrap().request(&[1]), PassRequest::Start);
-        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _release = PassRelease::new(&shared);
-            panic!("the pass died");
-        }));
-        assert!(died.is_err());
-        assert!(!shared.lock().unwrap().running, "released on the unwinding path");
-        assert_eq!(shared.lock().unwrap().request(&[2]), PassRequest::Start);
-        {
-            let mut release = PassRelease::new(&shared);
-            release.disarm();
+    /// Hands every event of the pass to a channel, so a test can wait for the pass to end without polling.
+    #[cfg(feature = "solver")]
+    struct ChannelEmitter(std::sync::Mutex<std::sync::mpsc::Sender<(String, serde_json::Value)>>);
+
+    #[cfg(feature = "solver")]
+    impl ProgressEmitter for ChannelEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            let _ = self.0.lock().unwrap().send((event_name.to_string(), payload));
         }
-        assert!(shared.lock().unwrap().running, "a disarmed guard leaves the flag alone");
+    }
+
+    #[cfg(feature = "solver")]
+    fn pass_ctx() -> (tempfile::TempDir, Arc<ServiceContext>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
+        (tmp, ctx)
+    }
+
+    #[cfg(feature = "solver")]
+    fn pass_emitter() -> (Arc<dyn ProgressEmitter>, std::sync::mpsc::Receiver<(String, serde_json::Value)>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Arc::new(ChannelEmitter(std::sync::Mutex::new(tx))), rx)
+    }
+
+    /// M2 and H1's two ends: while the pass works it is active (the auto-publish worker holds its run); frames asked for
+    /// meanwhile are taken by the same thread; and when it ends the guard is free BEFORE `zero-point-pass-complete` is
+    /// emitted and an auto-publish run is requested (what the held run waits for).
+    #[cfg(feature = "solver")]
+    #[test]
+    fn the_pass_is_active_until_it_ends_then_announces_its_end_and_asks_for_a_publish() {
+        let _guard = crate::api::collab_autopublish::test_lock();
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
+        let (_tmp, ctx) = pass_ctx();
+        let (emitter, events) = pass_emitter();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let rounds: Arc<std::sync::Mutex<Vec<Vec<i64>>>> = Arc::default();
+        let seen = Arc::clone(&rounds);
+        spawn_pass_with(Arc::clone(&ctx), Arc::clone(&emitter), vec![1], move |_, ids| {
+            seen.lock().unwrap().push(ids.to_vec());
+            go_rx.lock().unwrap().recv().unwrap();
+            Ok(crate::analysis::zero_point::ZpPassStats { stored: 2, ..Default::default() })
+        });
+        assert!(solve_pass_active(&ctx), "running");
+        // A second batch while it runs joins its pending set; it starts nothing of its own.
+        spawn_pass_with(Arc::clone(&ctx), Arc::clone(&emitter), vec![7, 1], |_, _| unreachable!("queued, not started"));
+        assert!(solve_pass_active(&ctx));
+        go_tx.send(()).unwrap();
+        assert!(solve_pass_active(&ctx), "the queued frames keep it active");
+        go_tx.send(()).unwrap();
+        let (name, payload) = events.recv_timeout(std::time::Duration::from_secs(30)).expect("the pass ends with an event");
+        assert_eq!(name, "zero-point-pass-complete");
+        assert_eq!(payload, serde_json::json!({"frames": 3, "measured": 4}));
+        assert!(!solve_pass_active(&ctx), "the guard is free when the end is announced");
+        assert_eq!(*rounds.lock().unwrap(), vec![vec![1], vec![1, 7]], "the queued frames ride a second round");
+        assert!(
+            crate::api::collab_autopublish::all_dirty_for_test(),
+            "the pass asked for the auto-publish run it held back"
+        );
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
+    }
+
+    /// A round that fails or panics still ends the pass: the guard is free, the end is announced, and a later batch
+    /// starts a pass of its own.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn a_failing_or_panicking_round_still_ends_the_pass_with_an_event() {
+        let _guard = crate::api::collab_autopublish::test_lock();
+        let (_tmp, ctx) = pass_ctx();
+        let (emitter, events) = pass_emitter();
+        for panics in [false, true] {
+            spawn_pass_with(Arc::clone(&ctx), Arc::clone(&emitter), vec![1], move |_, _| {
+                if panics {
+                    panic!("the round panicked (test)");
+                }
+                Err(ApiError::Internal("the round failed (test)".into()))
+            });
+            let (name, payload) = events.recv_timeout(std::time::Duration::from_secs(30)).expect("an event");
+            assert_eq!(name, "zero-point-pass-complete");
+            assert_eq!(payload, serde_json::json!({"frames": 0, "measured": 0}));
+            assert!(!solve_pass_active(&ctx), "panics={panics}: the guard is free");
+        }
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
+    }
+
+    /// L3: the guard belongs to the catalogue database: a pass running on one context never queues, holds or runs the
+    /// frames of another.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn the_pass_guard_is_per_database() {
+        let _guard = crate::api::collab_autopublish::test_lock();
+        let (_t1, a) = pass_ctx();
+        let (_t2, b) = pass_ctx();
+        let (emitter, events) = pass_emitter();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        spawn_pass_with(Arc::clone(&a), Arc::clone(&emitter), vec![1], move |_, _| {
+            go_rx.lock().unwrap().recv().unwrap();
+            Ok(Default::default())
+        });
+        assert!(solve_pass_active(&a));
+        assert!(!solve_pass_active(&b), "another database's pass is not held by this one");
+        let ran_on: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>> = Arc::default();
+        let seen = Arc::clone(&ran_on);
+        spawn_pass_with(Arc::clone(&b), Arc::clone(&emitter), vec![2], move |ctx, _| {
+            seen.lock().unwrap().push(pass_key(ctx));
+            Ok(Default::default())
+        });
+        events.recv_timeout(std::time::Duration::from_secs(30)).expect("b's pass ends on its own");
+        assert_eq!(*ran_on.lock().unwrap(), vec![pass_key(&b)], "b's frames ran on b's context");
+        assert!(solve_pass_active(&a), "a's pass is still running");
+        go_tx.send(()).unwrap();
+        events.recv_timeout(std::time::Duration::from_secs(30)).expect("a's pass ends");
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
     }
 
     /// The analysis row and its stars commit together: a failing star write leaves no analysis row behind.
@@ -1799,7 +2035,6 @@ mod tests {
             zp_list_stars: None,
             zp_window_bright: None,
             zp_window_slope: None,
-            zp_outdated: false,
         };
         let star = StarMetric {
             id: None,
@@ -2064,7 +2299,6 @@ mod tests {
             assert_eq!((version, catalog.as_deref(), refusal), (Some(crate::analysis::zero_point::ZP_VERSION), Some("CAT-A"), None));
             assert!(list.is_some_and(|n| n >= 50), "list {list:?}");
             assert!(g_b.is_some_and(f64::is_finite), "window edge {g_b:?}");
-            assert!(!a.zp_outdated);
 
             // The same catalogue and config: nothing to do. Another identity (a tier installed): the frame is selected
             // again, and the run replaces the nine columns with the new identity; a forced run replaces them too.
@@ -2206,7 +2440,6 @@ mod tests {
                 zp_list_stars: None,
                 zp_window_bright: None,
                 zp_window_slope: None,
-                zp_outdated: false,
             }
         }
 
@@ -2250,30 +2483,6 @@ mod tests {
             crate::analysis::transparency::installed_catalog_identity(tmp.path()).expect("the fake catalogue reads")
         }
 
-        #[test]
-        fn the_listing_flags_rows_whose_zero_point_is_not_current() {
-            let (tmp, ctx, _hash) = seeded_selection();
-            // No catalogue installed: nothing is outdated.
-            let none = get_analysis_for_frame_set(&ctx, 1).unwrap();
-            assert!(none.iter().all(|a| !a.zp_outdated), "no catalogue, no flag");
-            let identity = install_fake_catalogue(&tmp);
-            {
-                // Frame 1 now carries the installed catalogue's identity: the one current, solved frame.
-                let handle = db(&ctx).unwrap();
-                handle
-                    .conn()
-                    .execute("UPDATE frame_analysis SET zp_catalog = ?1 WHERE frame_id IN (1, 5)", [&identity])
-                    .unwrap();
-            }
-            let rows = get_analysis_for_frame_set(&ctx, 1).unwrap();
-            let flag = |id: i64| rows.iter().find(|a| a.frame_id == id).unwrap().zp_outdated;
-            // 1 current; 2 version 2; 3 another catalogue; 4 unsolved (never flagged); 5 current zero point.
-            assert_eq!((flag(1), flag(2), flag(3), flag(4), flag(5)), (false, true, true, false, false));
-            // The flag is never in the stored row.
-            let handle = db(&ctx).unwrap();
-            assert!(!db_analysis::get_frame_analysis(&handle.conn(), 2).unwrap().unwrap().zp_outdated);
-        }
-
         /// The count of the Analysis tab is Analyze's own selection: the same frames, no catalogue is "install it", never
         /// "to update".
         #[test]
@@ -2302,6 +2511,161 @@ mod tests {
                 .filter(|id| *id != 5) // 5 is selected for its stale config, not for its zero point
                 .collect();
             assert_eq!(analyze.len(), got.to_update, "{analyze:?}");
+        }
+
+        /// M1: a second copy of a frame is never measured, so it is never "to update" either: an old build analysed and
+        /// solved it, its zero point is not current, and a count over every analysis row of the set would hold "1 to
+        /// update" for ever (Analyze never reads it, the button would never become Re-Analyze).
+        #[test]
+        fn a_second_copy_is_not_counted_as_to_update() {
+            let (tmp, ctx, hash) = seeded_selection();
+            let identity = install_fake_catalogue(&tmp);
+            {
+                let handle = db(&ctx).unwrap();
+                let conn = handle.conn();
+                conn.execute("UPDATE frame_analysis SET zp_catalog = ?1 WHERE frame_id IN (1, 5)", [&identity]).unwrap();
+                // Frame 6 is a second disk copy of frame 2 (same name, size and header): frame 2, the lower id, is the
+                // used copy. An older build analysed and solved frame 6 too.
+                conn.execute(
+                    "INSERT INTO files (id, path, filename, size, modified_at, format, created_at)
+                     VALUES (6, '/dup/L_002.fits', 'L_002.fits', 1, '2026-07-01', 'FITS', '2026-07-01')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO frames (id, file_id, imagetyp, exptime, date_obs)
+                     VALUES (6, 6, 'Light', ?1, '2026-07-01T22:00:00+00:00')",
+                    [T_EXP],
+                )
+                .unwrap();
+                conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 6)", []).unwrap();
+                for file_id in [2, 6] {
+                    conn.execute(
+                        "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'SIMPLE = T', 'fp-dup')",
+                        [file_id],
+                    )
+                    .unwrap();
+                }
+                insert_plate_solve(&conn, &solve_record(6, &wcs_1as(100, 100), false)).unwrap();
+                let mut a = seed_analysis_row(6);
+                a.config_hash = Some(hash.clone());
+                a.zp_version = Some(2);
+                a.zp_catalog = Some(identity.clone());
+                a.zero_point = Some(21.0);
+                db_analysis::upsert_frame_analysis(&conn, &a).unwrap();
+            }
+            let got = zero_point_updates(&ctx, 1).unwrap();
+            assert_eq!(
+                (got.to_update, got.no_catalogue, got.measurement_failed),
+                (2, 0, 0),
+                "frames 2 and 3 only: the copy (6) is never measured"
+            );
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            assert!(!selected(&conn, &hash, Some(&identity), true).contains(&6), "Analyze never reads the copy");
+            assert_eq!(
+                selected(&conn, &hash, Some(&identity), false),
+                vec![2, 3, 5],
+                "the used copy is read, the second copy is not"
+            );
+        }
+
+        /// M3: a run that failed on a frame (`internal`, an unreadable catalogue) is stored as that code at the current
+        /// version and catalogue: the count reports it apart (never "to update"), Analyze does not select it again, and
+        /// Re-Analyze (force) or a new catalogue identity does.
+        #[test]
+        fn a_failed_measurement_is_counted_apart_and_only_force_or_a_new_catalogue_reads_it_again() {
+            let (tmp, ctx, hash) = seeded_selection();
+            let identity = install_fake_catalogue(&tmp);
+            {
+                let handle = db(&ctx).unwrap();
+                handle
+                    .conn()
+                    .execute(
+                        "UPDATE frame_analysis SET zp_catalog = ?1, zp_version = ?2, zp_refusal = CASE frame_id
+                             WHEN 2 THEN 'internal' WHEN 3 THEN 'catalogue_unreadable' END, zero_point = NULL
+                         WHERE frame_id IN (1, 2, 3, 5)",
+                        rusqlite::params![&identity, crate::analysis::zero_point::ZP_VERSION],
+                    )
+                    .unwrap();
+            }
+            let got = zero_point_updates(&ctx, 1).unwrap();
+            assert_eq!(
+                (got.to_update, got.no_catalogue, got.measurement_failed),
+                (0, 1, 1),
+                "3 waits for the catalogue, 2 failed, nothing is to update"
+            );
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            // Frame 5 is selected for its stale config only.
+            assert_eq!(selected(&conn, &hash, Some(&identity), false), vec![5], "Analyze leaves 2 and 3 alone");
+            assert_eq!(selected(&conn, &hash, Some(&identity), true), vec![1, 2, 3, 4, 5], "Re-Analyze reads them");
+            assert_eq!(
+                selected(&conn, &hash, Some("another-identity"), false),
+                vec![1, 2, 3, 5],
+                "a new catalogue identity reads every solved frame again"
+            );
+        }
+
+        /// M3 end to end: a cone that cannot be read stores `catalogue_unreadable`; the next Analyze leaves the frame, and
+        /// Re-Analyze measures it again.
+        #[test]
+        fn an_unreadable_catalogue_is_stored_and_not_retried_until_force() {
+            let rig = Rig::new();
+            let (plane, cat, wcs) = scene(150, 1000, 750, 8);
+            let frame = rig.add_frame(&fits_of(&plane, 1000, 750), Some(T_EXP), Some((&wcs, false)));
+            let broken = |_: &WcsSolution, _: usize, _: usize, _: f64, _: f64| -> anyhow::Result<Vec<CatalogStar>> {
+                Err(anyhow::anyhow!("the tier cannot be read (test)"))
+            };
+            let source = ZpSource { identity: "CAT-A", cone: &broken };
+            let run = |force: bool, source: &ZpSource<'_>| {
+                analyze_frame_set_with(&rig.ctx, 1, Some(force), 2, &crate::events::NullEmitter, Some(source)).unwrap()
+            };
+            let r = run(false, &source);
+            assert_eq!((r.analyzed, r.failed), (1, 0), "errors: {:?}", r.errors);
+            let a = rig.row(frame);
+            assert!(a.stars_detected > 50, "the analysis itself is kept");
+            assert_eq!(
+                (a.zero_point, a.zp_version, a.zp_catalog.as_deref(), a.zp_refusal.as_deref()),
+                (None, Some(crate::analysis::zero_point::ZP_VERSION), Some("CAT-A"), Some("catalogue_unreadable"))
+            );
+            assert_eq!(run(false, &source).analyzed, 0, "not retried by a plain Analyze");
+            assert_eq!(rig.run(true, &("CAT-A", cat)).analyzed, 1, "Re-Analyze reads it again");
+            assert!(rig.row(frame).zero_point.is_some(), "and it now has its zero point");
+        }
+
+        /// L4: a panic inside one frame's measurement is caught, logged and stored as `internal` (the Analysis rows are
+        /// kept: the frame is read again without the zero point), and the batch goes on with the other frames. When the
+        /// plain read panics too the frame fails like an unreadable file.
+        #[test]
+        fn a_panic_in_one_frame_does_not_end_the_batch() {
+            let rig = Rig::new();
+            let (plane, cat, wcs) = scene(150, 1000, 750, 9);
+            let ok = rig.add_frame(&fits_of(&plane, 1000, 750), Some(T_EXP), Some((&wcs, false)));
+            rig.next.set(9_000_001);
+            let bad = rig.add_frame(&fits_of(&plane, 1000, 750), Some(T_EXP), Some((&wcs, false)));
+            let bad_unsolved = rig.add_frame(&fits_of(&plane, 1000, 750), Some(T_EXP), None);
+            PANIC_ON_FRAME.store(bad, Ordering::SeqCst);
+            let r = rig.run(true, &("CAT-A", cat.clone()));
+            PANIC_ON_FRAME.store(-1, Ordering::SeqCst);
+            assert_eq!((r.analyzed, r.failed), (3, 0), "the batch went on: {:?}", r.errors);
+            assert!(rig.row(ok).zero_point.is_some(), "the other frame has its zero point");
+            let a = rig.row(bad);
+            assert!(a.stars_detected > 50, "the panicking frame keeps its Analysis rows");
+            assert_eq!(
+                (a.zero_point, a.zp_version, a.zp_catalog.as_deref(), a.zp_refusal.as_deref()),
+                (None, Some(crate::analysis::zero_point::ZP_VERSION), Some("CAT-A"), Some("internal"))
+            );
+            assert!(rig.row(bad_unsolved).stars_detected > 50);
+
+            // The plain read panics too: the frame fails (and only it).
+            PANIC_ON_FRAME.store(bad, Ordering::SeqCst);
+            PANIC_AGAIN.store(true, Ordering::SeqCst);
+            let r = rig.run(true, &("CAT-A", cat));
+            PANIC_AGAIN.store(false, Ordering::SeqCst);
+            PANIC_ON_FRAME.store(-1, Ordering::SeqCst);
+            assert_eq!((r.analyzed, r.failed), (2, 1), "errors: {:?}", r.errors);
+            assert!(r.errors[0].contains("panicked"), "{:?}", r.errors);
         }
 
         /// Blink never re-reads a file for an outdated zero point: the row is served as it is stored. The file does not

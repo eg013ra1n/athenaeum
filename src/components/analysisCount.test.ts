@@ -50,7 +50,7 @@ it('a failed measurement is told in the hover text and does not count as an upda
   const t = analysisCountText(30, 30, updates({ measurementFailed: 2 }));
   expect(t.settled).toBe(true);
   expect(t.update).toBeNull();
-  expect(t.title).toBe('the zero point measurement failed on 2 frames — see the logs');
+  expect(t.title).toBe('the measurement failed on 2 frames — see the log');
 });
 
 it('every group has its own line in the hover text', () => {

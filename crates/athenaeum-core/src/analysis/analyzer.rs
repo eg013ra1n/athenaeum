@@ -148,7 +148,6 @@ pub fn map_measurement(
         zp_list_stars: None,
         zp_window_bright: None,
         zp_window_slope: None,
-        zp_outdated: false,
     };
     (analysis, stars)
 }
@@ -181,9 +180,9 @@ pub fn analyze_frame(
 /// [`analyze_raw_frame`] and, when the frame is solved (`zp`), its forced-list zero point: the Analysis rows are the
 /// ones [`analyze_raw_frame`] writes (the same measurement, bit for bit, whether `zp` is given or not), and the nine
 /// `zp_*` columns of the row are filled from the statistic by [`stored_zero_point`] (`zp_version`, the catalogue
-/// identity). A refusal that a re-read would not change is stored as its code; a failure of this run (`internal`, an
-/// unreadable catalogue) leaves the nine NULL with a `debug` line saying why, and the next Analyze tries again. The
-/// third element is the composition's run for a caller that wants its figures (the tests, the probe).
+/// identity). Every outcome is stored: a refusal as its code, and so is a failure of this run (`internal`, an
+/// unreadable catalogue), so the count reports it apart and Analyze does not read the frame again until Re-Analyze or a
+/// new catalogue identity. The third element is the composition's run for a caller that wants its figures (the tests, the probe).
 #[cfg(feature = "solver")]
 pub fn analyze_raw_frame_with_zero_point(
     frame: &RawFrame,
@@ -207,13 +206,7 @@ pub fn analyze_raw_frame_with_zero_point(
     );
     let (mut analysis, stars) = map_measurement(&pm, frame, config, config_hash);
     if let Some(run) = &run {
-        match stored_zero_point(run) {
-            Some(figures) => figures.apply_to(&mut analysis, z.identity),
-            None => tracing::debug!(
-                zp_reason = run.result.err().map(|r| r.code()),
-                "zero point not stored: this run could not judge the frame"
-            ),
-        }
+        stored_zero_point(run).apply_to(&mut analysis, z.identity);
     }
     (analysis, stars, run)
 }
@@ -275,7 +268,7 @@ mod forced {
     /// behind it (the probe's rows, the analysis row's stored figures).
     #[derive(Debug, Clone)]
     pub struct ForcedRun {
-        /// The zero point, or why there is none ([`ForcedRefusal::is_stored`] says whether the refusal is written).
+        /// The zero point, or why there is none (every refusal is stored).
         pub result: Result<ForcedZeroPoint, ForcedRefusal>,
         /// The frame's preliminary zero point, when the budget gave one.
         pub anchor: Option<Anchor>,
@@ -324,18 +317,18 @@ mod forced {
         pub cone: &'a ConeFn<'a>,
     }
 
-    /// The nine figures a run stores (spec §5.5), `None` for a failure of this run (`catalogue_unreadable`, `internal`:
-    /// nothing is stored and the next Analyze tries again). A refusal that carries the list (`too_scattered`,
+    /// The nine figures a run stores (spec §5.5): every outcome has them, a failure of this run (`catalogue_unreadable`,
+    /// `internal`) as its code alone. A refusal that carries the list (`too_scattered`,
     /// `too_few_stars`, `poor_solve`) stores its size and `G_b`; `too_scattered` and `too_few_stars` store their members
     /// and (when the screen was read) their scatter; every other stored refusal stores its code alone.
-    pub fn stored_zero_point(run: &ForcedRun) -> Option<StoredZeroPoint> {
+    pub fn stored_zero_point(run: &ForcedRun) -> StoredZeroPoint {
         let list_stars = run.list.as_ref().map(|l| l.stars.len() as i64).or(match run.result {
             Err(ForcedRefusal::TooFewStars { list, .. }) => Some(i64::from(list)),
             _ => None,
         });
         let window_bright = run.list.as_ref().map(|l| l.window_bright);
         match run.result {
-            Ok(z) => Some(StoredZeroPoint {
+            Ok(z) => StoredZeroPoint {
                 zero_point: Some(z.zero_point),
                 stars: Some(i64::from(z.stars)),
                 sigma: Some(z.sigma),
@@ -344,8 +337,7 @@ mod forced {
                 list_stars,
                 window_bright,
                 window_slope: run.outcome.as_ref().and_then(|o| o.window_slope),
-            }),
-            Err(r) if !r.is_stored() => None,
+            },
             Err(r) => {
                 let (stars, sigma) = match r {
                     ForcedRefusal::TooScattered { kept, sigma } => {
@@ -360,7 +352,7 @@ mod forced {
                     r,
                     ForcedRefusal::TooScattered { .. } | ForcedRefusal::TooFewStars { .. } | ForcedRefusal::PoorSolve { .. }
                 );
-                Some(StoredZeroPoint {
+                StoredZeroPoint {
                     zero_point: None,
                     stars,
                     sigma,
@@ -369,7 +361,7 @@ mod forced {
                     list_stars: if with_list { list_stars } else { None },
                     window_bright: if with_list { window_bright } else { None },
                     window_slope: None,
-                })
+                }
             }
         }
     }
@@ -401,7 +393,7 @@ mod forced {
 
     /// The part of the composition that runs on the measurement: the plane's verdict, the exposure, the cone, the anchor
     /// and the list. `Err` is the frame's refusal. A panic of `cone` is caught here: it is a failure of this run
-    /// (`CatalogueUnreadable`, nothing stored), never the loss of the Analysis measurement the caller already holds.
+    /// (`CatalogueUnreadable`, stored as such), never the loss of the Analysis measurement the caller already holds.
     fn prepare_forced_list<F>(
         frame: &RawFrame,
         pm: &PlaneMeasurement,
@@ -478,8 +470,8 @@ mod forced {
     /// probe and the analyzer call this one function, so what the probe judges is what ships. `cone` reads the catalogue
     /// stars (`wcs`, width, height, region fraction, epoch) and is called at most once; a trailed or defocused plane and
     /// a three-plane file never call it. The Analysis numbers are bit-identical with and without `inputs`. Nothing in the
-    /// zero-point half loses them: a cone that errors or panics is `catalogue_unreadable` (not stored), and any other
-    /// panic of the composition is `internal` (not stored).
+    /// zero-point half loses them: a cone that errors or panics is `catalogue_unreadable`, and any other
+    /// panic of the composition is `internal` (both stored as their codes).
     pub fn measure_with_zero_point<F>(
         frame: &RawFrame,
         config: &AnalysisConfig,
@@ -1489,7 +1481,7 @@ mod tests {
                 measure_with_zero_point(&frame, &cfg(), None, Some(&inputs(&wcs)), &ForcedListParams::default(), no_cone);
             assert!(pm.trailed);
             let r = run.unwrap().result.unwrap_err();
-            assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::FrameVerdict, "frame_verdict", true));
+            assert_eq!((r, r.code()), (ForcedRefusal::FrameVerdict, "frame_verdict"));
         }
 
         /// L4: a colour file is `colour_camera` even when its plane is trailed: rustafits returns `None` for a trailed
@@ -1517,7 +1509,7 @@ mod tests {
             );
             assert!(pm.trailed || pm.defocused, "premise: the plane has a verdict of its own");
             let r = run.unwrap().result.unwrap_err();
-            assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::ColourCamera, "colour_camera", true));
+            assert_eq!((r, r.code()), (ForcedRefusal::ColourCamera, "colour_camera"));
         }
 
         #[test]
@@ -1538,13 +1530,13 @@ mod tests {
             bad.cd = [[0.0, 0.0], [0.0, 0.0]];
             assert_eq!(judged(inputs(&bad), Ok(cat.clone())), Err(ForcedRefusal::UnreadableSolve));
             let r = judged(inputs(&wcs), Err(anyhow::anyhow!("tile unreadable"))).unwrap_err();
-            assert_eq!((r, r.is_stored()), (ForcedRefusal::CatalogueUnreadable, false));
+            assert_eq!(r, ForcedRefusal::CatalogueUnreadable);
             // An empty cone: no matches for the anchor.
             assert!(matches!(judged(inputs(&wcs), Ok(Vec::new())), Err(ForcedRefusal::NoAnchor { kept: 0 })));
         }
 
         /// M2: a panic inside the cone (the rustafits callback) must not take the Analysis measurement down with it: the
-        /// call still returns the measurement, bit-identical, and a refusal that stores nothing.
+        /// call still returns the measurement, bit-identical, and a refusal (`catalogue_unreadable`).
         #[test]
         fn a_panicking_cone_keeps_the_measurement_and_stores_nothing() {
             let (frame, _, wcs) = solved_mono(300, 1400, 1000, 71);
@@ -1567,7 +1559,7 @@ mod tests {
                 same_analysis(what, &pm, &plain);
                 let run = run.expect("a solved frame is judged");
                 let r = run.result.unwrap_err();
-                assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::CatalogueUnreadable, "catalogue_unreadable", false));
+                assert_eq!((r, r.code()), (ForcedRefusal::CatalogueUnreadable, "catalogue_unreadable"));
                 assert!(run.list.is_none() && run.measured.is_none() && run.anchor.is_none());
             }
         }
@@ -1586,7 +1578,7 @@ mod tests {
             assert!(run.measured.is_none());
         }
 
-        /// A panic of the placement callback keeps the Analysis measurement and stores nothing.
+        /// A panic of the placement callback keeps the Analysis measurement and stores `internal`.
         #[test]
         fn a_panicking_placement_keeps_the_measurement() {
             let (frame, cat, wcs) = solved_mono(300, 1400, 1000, 71);
@@ -1603,7 +1595,7 @@ mod tests {
             PLACEMENT_PANICS.with(|c| c.set(false));
             same_analysis("placement panic", &pm, &plain);
             let r = run.expect("a solved frame is judged").result.unwrap_err();
-            assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::Internal, "internal", false));
+            assert_eq!((r, r.code()), (ForcedRefusal::Internal, "internal"));
         }
 
         #[test]
@@ -1623,7 +1615,7 @@ mod tests {
             same_analysis("statistic panic", &pm, &plain);
             let run = run.expect("a solved frame is judged");
             let r = run.result.unwrap_err();
-            assert_eq!((r, r.code(), r.is_stored()), (ForcedRefusal::Internal, "internal", false));
+            assert_eq!((r, r.code()), (ForcedRefusal::Internal, "internal"));
             // The figures the gate had not produced are absent; the map and the placement stand.
             assert!(run.gate.is_none() && run.outcome.is_none() && run.map.is_some() && run.placement.is_some());
         }
@@ -1721,8 +1713,8 @@ mod tests {
             );
         }
 
-        /// A panic of the list part never fails the analysis: the rows are the analysis' own, the nine stay NULL (a
-        /// failure of this run is stored as nothing), and the next Analyze tries again.
+        /// A panic of the list part never fails the analysis: the rows are the analysis' own, the nine carry the failure
+        /// as its code (`internal`, `catalogue_unreadable`), which Analyze does not read again until Re-Analyze.
         #[test]
         fn a_panicking_list_does_not_fail_the_analysis() {
             let (frame, cat, wcs) = solved_mono(300, 1400, 1000, 71);
@@ -1733,17 +1725,20 @@ mod tests {
                 analyze_raw_frame_with_zero_point(&frame, &cfg(), None, "h", Some(&zp_frame(&wcs, &cone, Some(T_EXP))));
             STATISTIC_PANICS.with(|c| c.set(false));
             assert_eq!(run.expect("judged").result.unwrap_err(), ForcedRefusal::Internal);
-            assert_eq!(nine(&a), "(None, None, None, None, None, None, None, None, None)");
+            assert_eq!(nine(&a), "(None, None, None, Some(3), Some(\"CAT\"), Some(\"internal\"), None, None, None)");
             assert_eq!(format!("{stars:?}"), format!("{plain_stars:?}"));
             assert_eq!(a.stars_detected, plain.stars_detected);
-            // A cone that panics is the same: `catalogue_unreadable`, nothing stored.
+            // A cone that panics is `catalogue_unreadable`, stored as its code.
             let boom = |_: &WcsSolution, _: usize, _: usize, _: f64, _: f64| -> anyhow::Result<Vec<CatalogStar>> {
                 panic!("the catalogue read panicked")
             };
             let (a, _, run) =
                 analyze_raw_frame_with_zero_point(&frame, &cfg(), None, "h", Some(&zp_frame(&wcs, &boom, Some(T_EXP))));
             assert_eq!(run.expect("judged").result.unwrap_err(), ForcedRefusal::CatalogueUnreadable);
-            assert_eq!(nine(&a), "(None, None, None, None, None, None, None, None, None)");
+            assert_eq!(
+                nine(&a),
+                "(None, None, None, Some(3), Some(\"CAT\"), Some(\"catalogue_unreadable\"), None, None, None)"
+            );
         }
 
         /// The stored figures of every outcome, by the plan's table (5a): the code only for a refusal that carries no list,
@@ -1787,33 +1782,32 @@ mod tests {
                 placement: None,
                 outcome: o,
             };
-            let fig = |r: &ForcedRun| stored_zero_point(r).map(|f| format!("{f:?}"));
             // measured
             let ok = run(Ok(ForcedZeroPoint { zero_point: 21.5, stars: 80, sigma: 0.04 }), true, Some(outcome(Some(0.04), Some(-0.02))));
-            let f = stored_zero_point(&ok).unwrap();
+            let f = stored_zero_point(&ok);
             assert_eq!((f.zero_point, f.stars, f.sigma, f.refusal.clone()), (Some(21.5), Some(80), Some(0.04), None));
             assert_eq!((f.list_stars, f.window_bright, f.window_slope, f.version), (Some(n), Some(g_b), Some(-0.02), 3));
             // measured, no slope under ten bright-ramp members
             let ok = run(Ok(ForcedZeroPoint { zero_point: 21.5, stars: 80, sigma: 0.04 }), true, Some(outcome(Some(0.04), None)));
-            assert_eq!(stored_zero_point(&ok).unwrap().window_slope, None);
+            assert_eq!(stored_zero_point(&ok).window_slope, None);
             // too_scattered: no value, members and sigma, no slope
             let r = run(Err(ForcedRefusal::TooScattered { kept: 70, sigma: 1.2 }), true, Some(outcome(Some(1.2), Some(0.1))));
-            let f = stored_zero_point(&r).unwrap();
+            let f = stored_zero_point(&r);
             assert_eq!((f.zero_point, f.stars, f.sigma, f.refusal.as_deref()), (None, Some(70), Some(1.2), Some("too_scattered")));
             assert_eq!((f.list_stars, f.window_bright, f.window_slope), (Some(n), Some(g_b), None));
             // too_scattered when the pedestal could not be fitted: sigma NULL
             let r = run(Err(ForcedRefusal::TooScattered { kept: 70, sigma: f64::NAN }), true, Some(outcome(None, None)));
-            assert_eq!(stored_zero_point(&r).unwrap().sigma, None);
+            assert_eq!(stored_zero_point(&r).sigma, None);
             // too_few_stars: the screen's scatter when it was read, NULL before it
             let r = run(Err(ForcedRefusal::TooFewStars { list: n as u32, kept: 30 }), true, Some(outcome(Some(0.2), None)));
-            let f = stored_zero_point(&r).unwrap();
+            let f = stored_zero_point(&r);
             assert_eq!((f.stars, f.sigma, f.refusal.as_deref(), f.list_stars), (Some(30), Some(0.2), Some("too_few_stars"), Some(n)));
             let r = run(Err(ForcedRefusal::TooFewStars { list: 12, kept: 0 }), false, None);
-            let f = stored_zero_point(&r).unwrap();
+            let f = stored_zero_point(&r);
             assert_eq!((f.stars, f.sigma, f.list_stars, f.window_bright), (Some(0), None, Some(12), None), "a list refused before it was built");
             // poor_solve: members and sigma NULL, the list and the window kept
             let r = run(Err(ForcedRefusal::PoorSolve { kept_share: 0.4 }), true, None);
-            let f = stored_zero_point(&r).unwrap();
+            let f = stored_zero_point(&r);
             assert_eq!((f.stars, f.sigma, f.refusal.as_deref(), f.list_stars, f.window_bright), (None, None, Some("poor_solve"), Some(n), Some(g_b)));
             // the code-only refusals, even where a list exists
             for (refusal, code) in [
@@ -1823,16 +1817,21 @@ mod tests {
                 (ForcedRefusal::ColourCamera, "colour_camera"),
                 (ForcedRefusal::FrameVerdict, "frame_verdict"),
             ] {
-                let f = stored_zero_point(&run(Err(refusal), true, None)).unwrap();
+                let f = stored_zero_point(&run(Err(refusal), true, None));
                 assert_eq!(
                     (f.zero_point, f.stars, f.sigma, f.refusal.as_deref(), f.list_stars, f.window_bright, f.window_slope),
                     (None, None, None, Some(code), None, None, None),
                     "{code}"
                 );
             }
-            // a failure of this run stores nothing
-            for refusal in [ForcedRefusal::Internal, ForcedRefusal::CatalogueUnreadable] {
-                assert_eq!(fig(&run(Err(refusal), true, None)), None, "{refusal:?}");
+            // a failure of this run is stored as its code (M3): the count reports it apart, Analyze does not re-read it
+            for (refusal, code) in [(ForcedRefusal::Internal, "internal"), (ForcedRefusal::CatalogueUnreadable, "catalogue_unreadable")] {
+                let f = stored_zero_point(&run(Err(refusal), true, None));
+                assert_eq!(
+                    (f.zero_point, f.stars, f.sigma, f.refusal.as_deref(), f.list_stars, f.window_bright, f.window_slope, f.version),
+                    (None, None, None, Some(code), None, None, None, 3),
+                    "{code}"
+                );
             }
         }
     }

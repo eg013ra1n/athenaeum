@@ -66,15 +66,21 @@ pub enum Refusal {
     FrameVerdict,
     /// Too few catalogue stars matched to set the measurement (`no_anchor`, `unreadable_solve`).
     NoAnchor,
-    /// The measurement itself failed on this computer (`internal`, `catalogue_unreadable`, or a code this build does
-    /// not know): the logs say why, and running Analyze again is not what fixes it.
+    /// The measurement itself failed on this computer (`internal`, or a code this build does not know): the log says
+    /// why, and running Analyze again is not what fixes it. (`catalogue_unreadable` reads [`LossReason::NoCatalogue`].)
     MeasurementFailed,
 }
 
 impl Refusal {
     /// Whether a stored code says the measurement itself failed (not a verdict on the frame).
     pub fn is_failure_code(code: &str) -> bool {
-        matches!(code, "internal" | "catalogue_unreadable")
+        code == "internal"
+    }
+
+    /// Whether a stored code says the star catalogue could not be read: the frame waits for the catalogue like one with
+    /// none installed.
+    pub fn is_catalogue_code(code: &str) -> bool {
+        code == "catalogue_unreadable"
     }
 
     /// The refusal of a stored code; `colour_camera` is not one (it reads [`LossReason::ColourCamera`]).
@@ -151,9 +157,7 @@ impl LossReason {
                     "too few catalogue stars matched to set the measurement — a deeper star catalogue tier may help"
                         .to_string()
                 }
-                Refusal::MeasurementFailed => {
-                    "the zero point measurement failed on this frame — see the logs".to_string()
-                }
+                Refusal::MeasurementFailed => "the measurement failed — see the log".to_string(),
             },
             LossReason::NoRig => "camera or focal length unknown — nothing to compare with".to_string(),
             LossReason::NoReference { have_frames, have_nights } => {
@@ -688,6 +692,9 @@ fn judge(row: Option<&FrameRow>, catalog: Option<&str>) -> Stage {
         if code == "colour_camera" {
             return done(LossReason::ColourCamera);
         }
+        if Refusal::is_catalogue_code(code) {
+            return done(LossReason::NoCatalogue);
+        }
         return done(LossReason::Refused(Refusal::from_code(code, analysis.zp_list_stars)));
     }
     let Some(zero_point) = analysis.zero_point.filter(|z| z.is_finite()) else {
@@ -843,6 +850,8 @@ pub fn count_zero_point_updates(
             out.no_catalogue += 1;
         } else if zp_outdated(row, true, catalog) {
             out.to_update += 1;
+        } else if row.zp_refusal.as_deref().is_some_and(Refusal::is_catalogue_code) {
+            out.no_catalogue += 1;
         } else if row.zp_refusal.as_deref().is_some_and(Refusal::is_failure_code) {
             out.measurement_failed += 1;
         }
@@ -1067,7 +1076,6 @@ mod tests {
             zp_list_stars: s.zp_list_stars,
             zp_window_bright: s.window_bright,
             zp_window_slope: s.window_slope,
-            zp_outdated: false,
         }
     }
 
@@ -1873,12 +1881,13 @@ mod tests {
         ];
         let solved: HashSet<i64> = (1..=7).collect();
         let got = count_zero_point_updates(&rows, &solved, Some("A"));
-        assert_eq!(got, ZeroPointUpdates { to_update: 3, no_catalogue: 0, measurement_failed: 2 });
+        assert_eq!(got, ZeroPointUpdates { to_update: 3, no_catalogue: 1, measurement_failed: 1 });
         assert_eq!(
             got.reasons(),
             vec![
                 ("transparency not measured yet — run Analyze on its frame set".to_string(), 3),
-                ("the zero point measurement failed on this frame — see the logs".to_string(), 2),
+                ("the star catalogue is not installed — install it to measure transparency".to_string(), 1),
+                ("the measurement failed — see the log".to_string(), 1),
             ]
         );
         // The count is Analyze's own predicate.
@@ -1974,9 +1983,9 @@ mod tests {
                 "too few catalogue stars matched to set the measurement — a deeper star catalogue tier may help",
             ),
             ("colour_camera", None, "not measured for colour cameras yet"),
-            ("internal", None, "the zero point measurement failed on this frame — see the logs"),
-            ("catalogue_unreadable", None, "the zero point measurement failed on this frame — see the logs"),
-            ("a_code_from_the_future", None, "the zero point measurement failed on this frame — see the logs"),
+            ("internal", None, "the measurement failed — see the log"),
+            ("catalogue_unreadable", None, "the star catalogue is not installed — install it to measure transparency"),
+            ("a_code_from_the_future", None, "the measurement failed — see the log"),
         ];
         let ids: Vec<i64> = table
             .iter()
