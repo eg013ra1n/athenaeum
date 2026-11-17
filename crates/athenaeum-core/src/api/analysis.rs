@@ -44,94 +44,72 @@ pub const ANALYZE_THREAD_CAP: usize = 16;
 
 // ── The zero point rides the analysis (forced-list spec §5.4) ───────────────
 
-// The guard of the pass after a solve batch (Task 5c renames it and wires it): one pass at a time, none started twice.
-// Kept here, unused until then, with its tests.
-
-/// What a request for a backfill should do, as [`BackfillGuard::request`] decides it.
+/// What a request for the pass after a solve batch should do, as [`SolvePassGuard::request`] decides it.
 #[cfg(feature = "solver")]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackfillRequest {
-    /// Start a backfill now.
+enum PassRequest {
+    /// Start a pass now: the caller owns the guard until [`SolvePassGuard::finish`] or [`SolvePassGuard::abandon`].
     Start,
-    /// One is running: it will run again for the newest catalogue when it ends.
-    Later,
-    /// A backfill already ran (or is running) for this catalogue identity: nothing to do.
-    Skip,
+    /// One is running: the frames were added to its pending set and it takes them before it ends.
+    Queued,
 }
 
-/// Which catalogue identities a backfill has started for, and whether one is running: one backfill at a time, none
-/// started twice for the same identity (the desktop's database init can run twice under StrictMode), and a second
-/// identity (a tier installed since) allowed. Pure, so the decision is testable without a thread.
+/// One pass after a solve batch at a time, and the frames asked for while one runs. Pure, so the decision is testable
+/// without a thread.
 #[cfg(feature = "solver")]
-#[allow(dead_code)]
 #[derive(Default)]
-struct BackfillGuard {
+struct SolvePassGuard {
     running: bool,
-    started: Vec<String>,
-    again: bool,
+    pending: std::collections::BTreeSet<i64>,
 }
 
 #[cfg(feature = "solver")]
-#[allow(dead_code)]
-impl BackfillGuard {
+impl SolvePassGuard {
     const fn new() -> Self {
-        BackfillGuard { running: false, started: Vec::new(), again: false }
+        SolvePassGuard { running: false, pending: std::collections::BTreeSet::new() }
     }
 
-    /// A backfill for the catalogue `identity` is wanted.
-    fn request(&mut self, identity: &str) -> BackfillRequest {
-        if self.started.iter().any(|i| i == identity) {
-            return BackfillRequest::Skip;
-        }
+    /// A pass over `ids` (the frames a batch has just solved) is wanted.
+    fn request(&mut self, ids: &[i64]) -> PassRequest {
         if self.running {
-            self.again = true;
-            return BackfillRequest::Later;
+            self.pending.extend(ids.iter().copied());
+            return PassRequest::Queued;
         }
         self.running = true;
-        self.started.push(identity.to_owned());
-        BackfillRequest::Start
+        PassRequest::Start
     }
 
-    /// The running backfill ended without finishing (an error, a panic): the guard is free again and nothing is queued.
-    /// The identity stays marked as started: a failing backfill is not retried in a loop, only by the next launch.
+    /// The running pass ended without finishing (an error, a panic): the guard is free again. The frames queued meanwhile
+    /// are dropped with it: they read as "to update" and the next Analyze (or the next batch) measures them.
     fn abandon(&mut self) {
         self.running = false;
-        self.again = false;
+        self.pending.clear();
     }
 
-    /// The running backfill is done. `current` is the catalogue identity now installed: when a request came in meanwhile
-    /// and that identity has not been backfilled, the guard stays busy and this returns true (run again).
-    fn finish(&mut self, current: Option<&str>) -> bool {
-        let again = std::mem::take(&mut self.again);
-        match current {
-            Some(identity) if again && !self.started.iter().any(|i| i == identity) => {
-                self.started.push(identity.to_owned());
-                true
-            }
-            _ => {
-                self.running = false;
-                false
-            }
+    /// The running pass is done with its frames. The frames asked for meanwhile come back (the guard stays busy: the
+    /// caller runs them next); with none, the guard is free and this returns `None`.
+    fn finish(&mut self) -> Option<Vec<i64>> {
+        if self.pending.is_empty() {
+            self.running = false;
+            return None;
         }
+        Some(std::mem::take(&mut self.pending).into_iter().collect())
     }
 }
 
-/// Releases the running flag of the guard on EVERY exit path of the backfill thread (a panic, an early return): without
-/// it a dead backfill would leave every later tier install answering "later" until restart. [`Self::disarm`] is called
-/// after [`BackfillGuard::finish`] has itself released the flag, so a normal end is not released twice.
+/// Releases the running flag of the guard on EVERY exit path of the pass thread (a panic, an early return): without it a
+/// dead pass would leave every later batch queueing behind it until restart. [`Self::disarm`] is called after
+/// [`SolvePassGuard::finish`] has itself released the flag, so a normal end is not released twice.
 #[cfg(feature = "solver")]
-#[allow(dead_code)]
-struct BackfillRelease<'a> {
-    guard: &'a std::sync::Mutex<BackfillGuard>,
+struct PassRelease<'a> {
+    guard: &'a std::sync::Mutex<SolvePassGuard>,
     armed: bool,
 }
 
 #[cfg(feature = "solver")]
-#[allow(dead_code)]
-impl<'a> BackfillRelease<'a> {
-    fn new(guard: &'a std::sync::Mutex<BackfillGuard>) -> Self {
-        BackfillRelease { guard, armed: true }
+impl<'a> PassRelease<'a> {
+    fn new(guard: &'a std::sync::Mutex<SolvePassGuard>) -> Self {
+        PassRelease { guard, armed: true }
     }
 
     fn disarm(&mut self) {
@@ -140,8 +118,7 @@ impl<'a> BackfillRelease<'a> {
 }
 
 #[cfg(feature = "solver")]
-#[allow(dead_code)]
-impl Drop for BackfillRelease<'_> {
+impl Drop for PassRelease<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.guard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).abandon();
@@ -447,6 +424,88 @@ fn analyze_job_file(
     Ok((analysis, stars, flip, None))
 }
 
+/// A frame a run could not measure (its file is unreachable or unreadable): the caller says how loudly.
+struct JobFailure {
+    frame_id: i64,
+    path: String,
+    error: String,
+}
+
+/// How many frames a run measures at once: the configured `batch_concurrency` (0 = about one worker per 3 pool threads)
+/// within `cap`.
+fn worker_count(config: &AnalysisConfig, cap: usize) -> usize {
+    let cap = cap.max(1);
+    if config.batch_concurrency == 0 {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        (cores / 3).max(2).min(cap)
+    } else {
+        (config.batch_concurrency as usize).clamp(1, cap)
+    }
+}
+
+/// Measure `jobs` on `concurrency` worker threads pulling from one queue: with par_iter every frame competes for the
+/// pool and runs single-threaded, while a few workers give each frame more pool threads for its PSF fitting and
+/// background estimation and let work-stealing fill the serial gaps between stages. Analyze and the pass after a solve
+/// batch share it. A zip-resident frame is extracted here, per frame, so an unreachable zip fails only its own frames
+/// (the pin keeps the cache file until the frame is measured). `on_done(path)` is called once per frame, measured or
+/// failed; a set `cancel` stops the workers taking new frames.
+fn measure_jobs(
+    ctx: &ServiceContext,
+    jobs: Vec<FrameJob>,
+    config: &AnalysisConfig,
+    config_hash: &str,
+    concurrency: usize,
+    cancel: &AtomicBool,
+    #[cfg(feature = "solver")] source: Option<&ZpSource<'_>>,
+    on_done: &(dyn Fn(&str) + Sync),
+) -> Vec<Result<AnalyzedFrame, JobFailure>> {
+    let pool = Arc::clone(&ctx.image_pool);
+    let total = jobs.len();
+    let work = std::sync::Mutex::new(jobs.into_iter());
+    let results_lock: std::sync::Mutex<Vec<Result<AnalyzedFrame, JobFailure>>> =
+        std::sync::Mutex::new(Vec::with_capacity(total));
+
+    std::thread::scope(|s| {
+        for _ in 0..concurrency {
+            s.spawn(|| loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let item = work.lock().unwrap().next();
+                let Some(job) = item else {
+                    break;
+                };
+                let (frame_id, file_id, path) = (job.frame_id, job.file_id, job.path.clone());
+
+                let result = match crate::zip_store::materialize::materialize_one(ctx, &path).and_then(|(local, pin)| {
+                    let measured = analyze_job_file(
+                        &local.to_string_lossy(),
+                        &job,
+                        config,
+                        &pool,
+                        config_hash,
+                        #[cfg(feature = "solver")]
+                        source,
+                    );
+                    drop(pin);
+                    measured
+                }) {
+                    Ok((mut analysis, stars, _flip, solve_id)) => {
+                        analysis.frame_id = frame_id;
+                        analysis.file_id = file_id;
+                        Ok(AnalyzedFrame { frame_id, analysis, stars, solve_id })
+                    }
+                    Err(e) => Err(JobFailure { frame_id, path: path.clone(), error: e.to_string() }),
+                };
+                on_done(&path);
+                results_lock.lock().unwrap().push(result);
+            });
+        }
+    });
+
+    results_lock.into_inner().unwrap()
+}
+
 /// Keep a zero point only while the frame's solve is still the one it was measured against (`solve_id`, `None` = no
 /// zero point was attempted): the read happens inside the caller's transaction, so a new or deleted solve landing
 /// meanwhile has either cleared the frame's `zp_*` already or is seen here, and the nine fields go NULL.
@@ -488,6 +547,286 @@ fn persist_analyzed_frames(conn: &rusqlite::Connection, frames: &mut [AnalyzedFr
     }
     tx.commit()?;
     Ok(())
+}
+
+// ── The pass after a solve batch (forced-list spec §5.4, plan Task 5c, ruling R7) ───────────────────────────────
+
+/// The frames among `ids` the pass after a solve batch measures: lights of a frame set (a second copy of a frame the set
+/// already holds is never measured, as in Analyze) with a plate solve, an analysis that is current ([`row_is_stale`]:
+/// a stale one is the next Analyze's whole job) and a zero point that is not current for `catalog`
+/// ([`crate::analysis::zero_point::zp_outdated`]). Each comes with the id of the analysis row it was selected on: the
+/// write lands only on that row. One statement for the frames and one for the solves.
+#[cfg(feature = "solver")]
+fn select_pass_jobs(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+    config_hash: &str,
+    catalog: &str,
+) -> Result<Vec<(FrameJob, i64)>, ApiError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marks = vec!["?"; ids.len()].join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT f.id, fi.id, fi.path, f.exptime, f.date_obs
+         FROM frames f
+         INNER JOIN files fi ON fi.id = f.file_id
+         INNER JOIN session_members sm ON sm.frame_id = f.id
+         INNER JOIN sessions s ON s.id = sm.session_id
+         INNER JOIN imaging_nights n ON n.id = s.imaging_night_id
+         WHERE f.id IN ({marks})
+           AND f.imagetyp = 'Light'
+           AND {used_copy}",
+        used_copy = crate::db::frame_is_used_copy_sql("n.frames_set_id"),
+    ))?;
+    let rows: Vec<(i64, i64, String, Option<f64>, Option<String>)> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let found: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let mut solves = crate::plate_solve::storage::get_plate_solves_for_frames(conn, &found)
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let mut jobs = Vec::new();
+    for (frame_id, file_id, path, exptime, date_obs) in rows {
+        let Some(record) = solves.remove(&frame_id) else {
+            continue;
+        };
+        let analysis = match db_analysis::get_frame_analysis(conn, frame_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(frame_id, error = %e, "analysis row unreadable; the zero point pass leaves the frame");
+                continue;
+            }
+        };
+        let (Some(analysis_id), false) = (analysis.id, row_is_stale(&analysis, config_hash)) else {
+            continue;
+        };
+        if !crate::analysis::zero_point::zp_outdated(&analysis, true, Some(catalog)) {
+            continue;
+        }
+        let Some(zp) = zp_work(&record, exptime, date_obs.as_deref()) else {
+            continue;
+        };
+        jobs.push((FrameJob { frame_id, file_id, path, zp: Some(zp) }, analysis_id));
+    }
+    Ok(jobs)
+}
+
+/// Write the pass's judgements: for each measured frame only its nine `zp_*` columns, on the analysis row it was selected
+/// on and while its solve is still the one it was judged against ([`db_analysis::set_zero_point`], compare-and-set on both
+/// ids). A re-analysis or a new solve meanwhile wins: nothing is written for that frame. A run that could not judge a
+/// frame (nothing to store) counts as failed and is left for the next Analyze.
+#[cfg(feature = "solver")]
+fn persist_pass_zero_points(
+    conn: &rusqlite::Connection,
+    frames: &[AnalyzedFrame],
+    analysis_ids: &std::collections::HashMap<i64, i64>,
+    stats: &mut crate::analysis::zero_point::ZpPassStats,
+) -> Result<(), ApiError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for f in frames {
+        let (Some(figures), Some(catalog), Some(&analysis_id)) = (
+            db_analysis::StoredZeroPoint::of_row(&f.analysis),
+            f.analysis.zp_catalog.as_deref(),
+            analysis_ids.get(&f.frame_id),
+        ) else {
+            stats.failed += 1;
+            stats.first_error.get_or_insert_with(|| "the run could not judge the frame".to_string());
+            tracing::debug!(frame_id = f.frame_id, "zero point not stored: the run could not judge the frame");
+            continue;
+        };
+        match db_analysis::set_zero_point(conn, f.frame_id, analysis_id, f.solve_id, &figures, catalog) {
+            Ok(true) => stats.stored += 1,
+            Ok(false) => tracing::debug!(frame_id = f.frame_id, "zero point superseded"),
+            Err(e) => {
+                stats.failed += 1;
+                stats.first_error.get_or_insert_with(|| format!("{e:#}"));
+                tracing::debug!(frame_id = f.frame_id, error = %e, "zero point not stored: the write failed");
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The pass after a solve batch, blocking: measure the zero point of the frames `frame_ids` the batch just solved
+/// (Analyze's own worker, [`measure_jobs`], so there is one measurement and one set of `zp_*` figures), chunk by chunk of
+/// [`crate::analysis::zero_point::PASS_CHUNK`] under the global compute queue (never beside Analyze or a stack). A frame
+/// without a current analysis is left to Analyze; one already current is skipped. No star catalogue installed: nothing
+/// to do (`debug`). A file that is offline or unreadable is a `debug` and counted; the pass says one
+/// `warn_if_unmeasurable("solve")` for them and ends with one `info`.
+#[cfg(feature = "solver")]
+pub fn solve_zero_point_pass(
+    ctx: &ServiceContext,
+    frame_ids: &[i64],
+) -> Result<crate::analysis::zero_point::ZpPassStats, ApiError> {
+    solve_zero_point_pass_with(ctx, frame_ids, None)
+}
+
+/// [`solve_zero_point_pass`] with the catalogue given by the caller (`None` = the installed one): the tests give a
+/// synthetic cone and identity.
+#[cfg(feature = "solver")]
+pub(crate) fn solve_zero_point_pass_with(
+    ctx: &ServiceContext,
+    frame_ids: &[i64],
+    given: Option<&ZpSource<'_>>,
+) -> Result<crate::analysis::zero_point::ZpPassStats, ApiError> {
+    use crate::analysis::zero_point::{catalog_cone, zero_point_catalog, ZpCatalog, ZpPassStats, PASS_CHUNK};
+
+    let started = std::time::Instant::now();
+    let mut stats = ZpPassStats::default();
+    let Some(identity) = given.map(|g| g.identity.to_owned()).or_else(|| installed_identity(ctx)) else {
+        tracing::debug!(zp_reason = "no_catalogue", "zero point solve pass skipped: no star catalogue installed");
+        return Ok(stats);
+    };
+    let span = tracing::info_span!("zero_point_solve_pass", catalog = %identity);
+    let _in_span = span.enter();
+
+    let (config, config_hash) = {
+        let handle = db(ctx)?;
+        let config = config::load_config(&handle.conn());
+        let hash = config.config_hash();
+        (config, hash)
+    };
+    let concurrency = worker_count(&config, ctx.image_pool.current_num_threads());
+    // Never set: the pass has no cancel button, the queue ticket needs a flag.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut opened: Option<ZpCatalog> = None;
+    let mut frames = 0usize;
+
+    for chunk in frame_ids.chunks(PASS_CHUNK) {
+        // The compute queue is taken before the frames are read: what Analyze or a stack held it for is read fresh.
+        let permit = match ctx.compute_queue.acquire(
+            crate::services::compute_queue::ComputeJobKind::Analysis,
+            "Analysis: zero points after a solve",
+            cancel.clone(),
+        ) {
+            Ok((permit, _job_id)) => permit,
+            Err(_cancelled) => {
+                tracing::warn!("zero point solve pass cancelled in the compute queue");
+                break;
+            }
+        };
+        let selected = {
+            let handle = db(ctx)?;
+            let conn = handle.conn();
+            select_pass_jobs(&conn, chunk, &config_hash, &identity)?
+        };
+        if selected.is_empty() {
+            drop(permit);
+            continue;
+        }
+        let analysis_ids: std::collections::HashMap<i64, i64> = selected.iter().map(|(j, a)| (j.frame_id, *a)).collect();
+        let jobs: Vec<FrameJob> = selected.into_iter().map(|(job, _)| job).collect();
+        frames += jobs.len();
+
+        // The installed catalogue's tiers, opened once and only when a frame needs them.
+        if given.is_none() && opened.is_none() {
+            opened = ctx.app_data_dir().and_then(|dir| zero_point_catalog(&dir));
+            if opened.is_none() {
+                tracing::debug!("zero point solve pass ended: the star catalogue could not be opened");
+                break;
+            }
+        }
+        let own_cone;
+        let own_source;
+        let source: &ZpSource<'_> = match given {
+            Some(g) => g,
+            None => {
+                let Some(catalog) = opened.as_ref() else { break };
+                own_cone = catalog_cone(&catalog.layers);
+                own_source = ZpSource { identity: &catalog.identity, cone: &own_cone };
+                &own_source
+            }
+        };
+
+        let results = measure_jobs(ctx, jobs, &config, &config_hash, concurrency, &cancel, Some(source), &|_: &str| {});
+        let mut measured: Vec<AnalyzedFrame> = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Ok(frame) => measured.push(frame),
+                Err(failure) => {
+                    stats.unreadable += 1;
+                    stats.first_error.get_or_insert_with(|| format!("{}: {}", failure.path, failure.error));
+                    tracing::debug!(
+                        frame_id = failure.frame_id,
+                        path = %failure.path,
+                        error = %failure.error,
+                        "zero point not measured: the file cannot be read"
+                    );
+                }
+            }
+        }
+        {
+            let handle = db(ctx)?;
+            let conn = handle.conn();
+            persist_pass_zero_points(&conn, &measured, &analysis_ids, &mut stats)?;
+        }
+        drop(permit);
+    }
+
+    stats.warn_if_unmeasurable("solve");
+    tracing::info!(
+        frames,
+        zp_measured = stats.stored,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "zero point solve pass done"
+    );
+    Ok(stats)
+}
+
+#[cfg(feature = "solver")]
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Start the pass after a solve batch on its own thread (`zero-point-solve-pass`) over the frames the batch solved. One
+/// pass runs at a time; frames asked for while it runs join its pending set and it takes them before it ends
+/// ([`SolvePassGuard`]). A panic or an error ends that round, never the thread unannounced, and the guard is released on
+/// every exit path.
+#[cfg(feature = "solver")]
+pub fn spawn_solve_zero_point_pass(ctx: Arc<ServiceContext>, frame_ids: Vec<i64>) {
+    static GUARD: std::sync::Mutex<SolvePassGuard> = std::sync::Mutex::new(SolvePassGuard::new());
+    let lock = || GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if frame_ids.is_empty() {
+        return;
+    }
+    match lock().request(&frame_ids) {
+        PassRequest::Start => {}
+        PassRequest::Queued => {
+            tracing::debug!(frames = frame_ids.len(), "zero point solve pass queued behind the running one");
+            return;
+        }
+    }
+    let spawned = std::thread::Builder::new().name("zero-point-solve-pass".into()).spawn(move || {
+        let mut release = PassRelease::new(&GUARD);
+        let mut ids = frame_ids;
+        loop {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solve_zero_point_pass(&ctx, &ids))) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "zero point solve pass failed"),
+                Err(payload) => tracing::warn!(error = %panic_text(payload.as_ref()), "zero point solve pass panicked"),
+            }
+            match lock().finish() {
+                Some(next) => ids = next,
+                None => {
+                    release.disarm();
+                    break;
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        // Nothing runs: the guard is free for the next batch.
+        lock().abandon();
+        tracing::warn!(error = %e, "zero point solve pass thread did not start");
+    }
 }
 
 /// Analyze all LIGHT frames in a frame set.
@@ -649,99 +988,37 @@ pub(crate) fn analyze_frame_set_with(
 
     let total = frames_to_analyze.len();
 
-    // One shared rayon pool for every frame.
-    let pool = Arc::clone(&ctx.image_pool);
-    let config_hash = Arc::new(analysis_config.config_hash());
-    let completed = Arc::new(AtomicUsize::new(0));
-    let cancel_flag_worker = Arc::clone(&cancel_flag);
-    let cap = thread_budget.max(1);
-    let concurrency = if analysis_config.batch_concurrency == 0 {
-        // Auto: ~1 worker per 3 pool threads
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        (cores / 3).max(2).min(cap)
-    } else {
-        (analysis_config.batch_concurrency as usize).clamp(1, cap)
-    };
-
-    // Use N worker threads pulling from a shared queue instead of par_iter.
-    // With par_iter, all frames compete for the pool — each gets ~1 thread and runs
-    // single-threaded, causing batch-of-N behavior. With limited workers, each frame
-    // gets more pool threads for internal parallelism (PSF fitting, background estimation),
-    // and work-stealing fills serial gaps between pipeline stages.
-    let work = std::sync::Mutex::new(frames_to_analyze.into_iter());
-    let results_lock: std::sync::Mutex<Vec<Result<AnalyzedFrame, String>>> =
-        std::sync::Mutex::new(Vec::with_capacity(total));
-
-    std::thread::scope(|s| {
-        for _ in 0..concurrency {
-            s.spawn(|| loop {
-                if cancel_flag_worker.load(Ordering::Relaxed) {
-                    break;
-                }
-                let item = work.lock().unwrap().next();
-                let Some(job) = item else {
-                    break;
-                };
-                let (frame_id, file_id, path) = (job.frame_id, job.file_id, job.path.clone());
-
-                // A zip-resident frame is extracted here, per frame, so an unreachable zip fails only its own
-                // frames. The pin keeps the cache file until the frame is measured.
-                let result = match crate::zip_store::materialize::materialize_one(ctx, &path).and_then(
-                    |(local, pin)| {
-                        let measured = analyze_job_file(
-                            &local.to_string_lossy(),
-                            &job,
-                            &analysis_config,
-                            &pool,
-                            &config_hash,
-                            #[cfg(feature = "solver")]
-                            source.as_ref(),
-                        );
-                        drop(pin);
-                        measured
-                    },
-                ) {
-                    Ok((mut analysis, stars, _flip, solve_id)) => {
-                        analysis.frame_id = frame_id;
-                        analysis.file_id = file_id;
-                        Ok(AnalyzedFrame { frame_id, analysis, stars, solve_id })
-                    }
-                    Err(e) => {
-                        let msg = format!("{}: {}", path, e);
-                        tracing::warn!(frame_id, path = %path, error = %e, "frame analysis failed");
-                        Err(msg)
-                    }
-                };
-
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let filename = std::path::Path::new(&path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.clone());
-                emit_event(
-                    emitter,
-                    "analysis-progress",
-                    &AnalysisProgressEvent {
-                        frame_set_id,
-                        current: done,
-                        total,
-                        current_file: filename,
-                        percent: if total > 0 {
-                            (done as f64 / total as f64) * 100.0
-                        } else {
-                            100.0
-                        },
-                    },
-                );
-
-                results_lock.lock().unwrap().push(result);
-            });
-        }
-    });
-
-    let results = results_lock.into_inner().unwrap();
+    let config_hash = analysis_config.config_hash();
+    let completed = AtomicUsize::new(0);
+    let concurrency = worker_count(&analysis_config, thread_budget);
+    let results = measure_jobs(
+        ctx,
+        frames_to_analyze,
+        &analysis_config,
+        &config_hash,
+        concurrency,
+        &cancel_flag,
+        #[cfg(feature = "solver")]
+        source.as_ref(),
+        &|path: &str| {
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string());
+            emit_event(
+                emitter,
+                "analysis-progress",
+                &AnalysisProgressEvent {
+                    frame_set_id,
+                    current: done,
+                    total,
+                    current_file: filename,
+                    percent: if total > 0 { (done as f64 / total as f64) * 100.0 } else { 100.0 },
+                },
+            );
+        },
+    );
 
     let was_cancelled = cancel_flag.load(Ordering::Relaxed);
 
@@ -753,11 +1030,19 @@ pub(crate) fn analyze_frame_set_with(
 
     // Partition results
     let mut all_analyses: Vec<AnalyzedFrame> = Vec::new();
-    let mut errors = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for result in results {
         match result {
             Ok(frame) => all_analyses.push(frame),
-            Err(msg) => errors.push(msg),
+            Err(failure) => {
+                tracing::warn!(
+                    frame_id = failure.frame_id,
+                    path = %failure.path,
+                    error = %failure.error,
+                    "frame analysis failed"
+                );
+                errors.push(format!("{}: {}", failure.path, failure.error));
+            }
         }
     }
     let analyzed = all_analyses.len();
@@ -1399,47 +1684,48 @@ mod tests {
         }
     }
 
-    /// A tier installed since the first backfill is a new catalogue identity: it may start another backfill.
+    /// One pass at a time: a request while one runs joins its pending set (duplicates folded), the running thread takes
+    /// the pending frames when it finishes a round, and the guard is free only when nothing is pending.
     #[cfg(feature = "solver")]
     #[test]
-    fn a_new_catalogue_identity_allows_another_backfill() {
-        let mut guard = BackfillGuard::new();
-        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
-        assert!(!guard.finish(Some("tiers-a")), "nothing was asked meanwhile");
-        assert_eq!(guard.request("tiers-b"), BackfillRequest::Start, "a second identity after an install is allowed");
-
-        // One at a time: a request while one runs waits, and the running thread runs again for the newest identity.
-        assert_eq!(guard.request("tiers-c"), BackfillRequest::Later);
-        assert!(guard.finish(Some("tiers-c")), "the queued identity is backfilled next");
-        assert!(guard.running, "still busy: the second run owns the guard");
-        assert!(!guard.finish(Some("tiers-c")));
+    fn the_solve_pass_runs_one_at_a_time_and_takes_queued_frames() {
+        let mut guard = SolvePassGuard::new();
+        assert_eq!(guard.request(&[1, 2]), PassRequest::Start);
+        assert_eq!(guard.request(&[3, 2]), PassRequest::Queued);
+        assert_eq!(guard.request(&[4]), PassRequest::Queued);
+        assert_eq!(guard.finish(), Some(vec![2, 3, 4]), "the queued frames come back once, in order");
+        assert!(guard.running, "still busy: the second round owns the guard");
+        assert_eq!(guard.request(&[9]), PassRequest::Queued, "a request during the second round queues too");
+        assert_eq!(guard.finish(), Some(vec![9]));
+        assert_eq!(guard.finish(), None, "nothing pending: the guard is free");
         assert!(!guard.running);
+        assert_eq!(guard.request(&[5]), PassRequest::Start);
     }
 
-    /// A backfill that dies (an error, a panic) frees the guard: the next tier install starts a backfill instead of
-    /// answering "later" until restart. Pure: the guard's own method and the drop guard the thread wears.
+    /// A pass that dies (an error, a panic) frees the guard and drops what was queued behind it: the next batch starts
+    /// a pass instead of queueing until restart. Pure: the guard's own method and the drop guard the thread wears.
     #[cfg(feature = "solver")]
     #[test]
-    fn a_backfill_that_dies_releases_the_guard() {
-        let mut guard = BackfillGuard::new();
-        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
-        assert_eq!(guard.request("tiers-b"), BackfillRequest::Later);
+    fn a_solve_pass_that_dies_releases_the_guard() {
+        let mut guard = SolvePassGuard::new();
+        assert_eq!(guard.request(&[1]), PassRequest::Start);
+        assert_eq!(guard.request(&[2]), PassRequest::Queued);
         guard.abandon();
-        assert!(!guard.running && !guard.again, "nothing runs and nothing is queued");
-        assert_eq!(guard.request("tiers-c"), BackfillRequest::Start, "a later install is not told to wait");
+        assert!(!guard.running && guard.pending.is_empty(), "nothing runs and nothing is queued");
+        assert_eq!(guard.request(&[3]), PassRequest::Start, "a later batch is not told to wait");
 
         // The drop guard: a panic on the thread releases the flag; a normal end (disarmed) does not release twice.
-        let shared = std::sync::Mutex::new(BackfillGuard::new());
-        assert_eq!(shared.lock().unwrap().request("tiers-a"), BackfillRequest::Start);
+        let shared = std::sync::Mutex::new(SolvePassGuard::new());
+        assert_eq!(shared.lock().unwrap().request(&[1]), PassRequest::Start);
         let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _release = BackfillRelease::new(&shared);
-            panic!("the backfill died");
+            let _release = PassRelease::new(&shared);
+            panic!("the pass died");
         }));
         assert!(died.is_err());
         assert!(!shared.lock().unwrap().running, "released on the unwinding path");
-        assert_eq!(shared.lock().unwrap().request("tiers-b"), BackfillRequest::Start);
+        assert_eq!(shared.lock().unwrap().request(&[2]), PassRequest::Start);
         {
-            let mut release = BackfillRelease::new(&shared);
+            let mut release = PassRelease::new(&shared);
             release.disarm();
         }
         assert!(shared.lock().unwrap().running, "a disarmed guard leaves the flag alone");
@@ -1529,22 +1815,6 @@ mod tests {
         assert!(persist_frame_analysis(&conn, &mut analysis, &mut stars, None).is_err());
         assert!(db_analysis::get_frame_analysis(&conn, 1).unwrap().is_none(), "no analysis row without its stars");
         assert!(conn.is_autocommit(), "the transaction ended");
-    }
-
-    /// StrictMode's double init (and an install of the tier already there) asks for the same identity twice.
-    #[cfg(feature = "solver")]
-    #[test]
-    fn the_same_identity_does_not_start_twice() {
-        let mut guard = BackfillGuard::new();
-        assert_eq!(guard.request("tiers-a"), BackfillRequest::Start);
-        assert_eq!(guard.request("tiers-a"), BackfillRequest::Skip, "while it runs");
-        assert!(!guard.finish(Some("tiers-a")));
-        assert_eq!(guard.request("tiers-a"), BackfillRequest::Skip, "and after it is done");
-        // A queued request for an identity that was backfilled meanwhile ends the run.
-        assert_eq!(guard.request("tiers-b"), BackfillRequest::Start);
-        assert_eq!(guard.request("tiers-c"), BackfillRequest::Later);
-        assert!(!guard.finish(Some("tiers-b")), "the current identity is the one just done");
-        assert!(!guard.running);
     }
 
     // ---- the zero point rides the analysis (forced-list spec §5.4, plan Task 5b) ----
@@ -2079,6 +2349,147 @@ mod tests {
             // A new solve clears the nine columns: the frame is outdated again and Analyze measures it.
             insert_plate_solve(&conn, &solve_record(2, &wcs, false)).unwrap();
             assert_eq!(selected(&conn, &hash, Some("A"), false), vec![2, 3, 5]);
+        }
+        // ---- the pass after a solve batch (plan Task 5c) ----
+
+        fn pass(rig: &Rig, ids: &[i64], catalogue: &(&str, Vec<CatalogStar>)) -> crate::analysis::zero_point::ZpPassStats {
+            let cone = |_: &WcsSolution, _: usize, _: usize, _: f64, _: f64| Ok(catalogue.1.clone());
+            let source = ZpSource { identity: catalogue.0, cone: &cone };
+            solve_zero_point_pass_with(&rig.ctx, ids, Some(&source)).unwrap()
+        }
+
+        #[test]
+        fn the_solve_pass_measures_solved_frames_with_a_current_analysis() {
+            let rig = Rig::new();
+            let (plane, cat, wcs) = scene(500, 2000, 1500, 31);
+            // Frame 1: analysed with a solve under CAT-A. Frames 2 and 3 are solved too: 2's analysis is stale (another
+            // config), 3 has none: both are the next Analyze's, never the pass's.
+            let one = rig.add_frame(&fits_of(&plane, 2000, 1500), Some(T_EXP), Some((&wcs, false)));
+            assert_eq!(rig.run(false, &("CAT-A", cat.clone())).analyzed, 1);
+            let two = rig.add_frame(b"x", Some(T_EXP), Some((&wcs, false)));
+            let three = rig.add_frame(b"x", Some(T_EXP), Some((&wcs, false)));
+            {
+                let handle = db(&rig.ctx).unwrap();
+                let mut a = seed_analysis_row(two);
+                a.config_hash = Some("another-hash".into());
+                db_analysis::upsert_frame_analysis(&handle.conn(), &a).unwrap();
+            }
+            let before = rig.row(one);
+            assert_eq!(before.zp_catalog.as_deref(), Some("CAT-A"));
+
+            let ids = [one, two, three];
+            let current = pass(&rig, &ids, &("CAT-A", cat.clone()));
+            assert_eq!(current.stored, 0, "a zero point that is already current is skipped");
+            assert_eq!(zp_columns(&rig.row(one)), zp_columns(&before), "the row is untouched");
+
+            // A tier installed since: the identity changes, the frame's own nine columns are rewritten and nothing else.
+            let stats = pass(&rig, &ids, &("CAT-B", cat));
+            assert_eq!((stats.stored, stats.unreadable, stats.failed), (1, 0, 0));
+            let after = rig.row(one);
+            assert_eq!(after.id, before.id, "the analysis row is not replaced");
+            assert_eq!((after.stars_detected, &after.analyzed_at), (before.stars_detected, &before.analyzed_at));
+            assert_eq!(after.zp_catalog.as_deref(), Some("CAT-B"));
+            assert_eq!(after.zp_version, Some(crate::analysis::zero_point::ZP_VERSION));
+            assert!((after.zero_point.unwrap() - ZP_TRUE).abs() < 0.05, "zero point {:?}", after.zero_point);
+            assert_eq!(rig.row(two).zp_version, None, "a stale analysis is skipped");
+            let handle = db(&rig.ctx).unwrap();
+            assert!(db_analysis::get_frame_analysis(&handle.conn(), three).unwrap().is_none(), "no analysis, no row made");
+        }
+
+        #[test]
+        fn the_solve_pass_skips_an_offline_file_and_warns_once() {
+            let rig = Rig::new();
+            let wcs = wcs_1as(100, 100);
+            let offline = [rig.add_frame(b"x", Some(T_EXP), Some((&wcs, false))), rig.add_frame(b"x", Some(T_EXP), Some((&wcs, false)))];
+            {
+                let handle = db(&rig.ctx).unwrap();
+                let conn = handle.conn();
+                let hash = config::load_config(&conn).config_hash();
+                for id in offline {
+                    let mut a = seed_analysis_row(id);
+                    a.config_hash = Some(hash.clone());
+                    db_analysis::upsert_frame_analysis(&conn, &a).unwrap();
+                }
+            }
+            for id in offline {
+                std::fs::remove_file(rig.tmp.path().join("astro").join(format!("L_{id:03}.fits"))).unwrap();
+            }
+            let stats = pass(&rig, &offline, &("CAT-A", Vec::new()));
+            assert_eq!((stats.stored, stats.unreadable, stats.failed), (0, 2, 0));
+            assert!(stats.first_error.is_some(), "the one warn carries the first failure");
+            for id in offline {
+                assert_eq!(rig.row(id).zp_version, None, "nothing was written for an offline file");
+            }
+        }
+
+        #[test]
+        fn the_pass_selection_takes_only_outdated_frames_with_a_current_analysis() {
+            let (_tmp, ctx, hash) = seeded_selection();
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            // 1 current, 2 version 2, 3 another catalogue, 4 unsolved, 5 outdated under a stale config; 6 is not asked.
+            let pick = |ids: &[i64]| -> Vec<i64> {
+                let mut got: Vec<i64> = select_pass_jobs(&conn, ids, &hash, "A").unwrap().iter().map(|(j, _)| j.frame_id).collect();
+                got.sort_unstable();
+                got
+            };
+            assert_eq!(pick(&[1, 2, 3, 4, 5, 6]), vec![2, 3]);
+            assert_eq!(pick(&[2]), vec![2], "only the frames asked for");
+            assert!(pick(&[]).is_empty());
+            let jobs = select_pass_jobs(&conn, &[2], &hash, "A").unwrap();
+            let analysis_id = db_analysis::get_frame_analysis(&conn, 2).unwrap().unwrap().id.unwrap();
+            assert_eq!(jobs[0].1, analysis_id, "the job carries the analysis row it was selected on");
+            assert!(jobs[0].0.zp.is_some());
+        }
+
+        /// A re-analysis or a new solve between the selection and the write wins: nothing of the pass is stored for that
+        /// frame; the frame the pass read alone is written.
+        #[test]
+        fn a_reanalysis_during_the_pass_wins() {
+            let (_tmp, ctx, hash) = seeded_selection();
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            let selection = select_pass_jobs(&conn, &[2, 3], &hash, "A").unwrap();
+            let analysis_ids: std::collections::HashMap<i64, i64> = selection.iter().map(|(j, a)| (j.frame_id, *a)).collect();
+            let solve_id = |id: i64| -> i64 {
+                conn.query_row("SELECT id FROM plate_solves WHERE frame_id = ?1", [id], |r| r.get(0)).unwrap()
+            };
+            let judged = |id: i64| -> AnalyzedFrame {
+                let mut analysis = seed_analysis_row(id);
+                db_analysis::StoredZeroPoint {
+                    zero_point: Some(21.5),
+                    stars: Some(80),
+                    sigma: Some(0.03),
+                    version: crate::analysis::zero_point::ZP_VERSION,
+                    refusal: None,
+                    list_stars: Some(400),
+                    window_bright: Some(12.5),
+                    window_slope: Some(-0.02),
+                }
+                .apply_to(&mut analysis, "A");
+                AnalyzedFrame { frame_id: id, analysis, stars: Vec::new(), solve_id: Some(solve_id(id)) }
+            };
+            let frames = [judged(2), judged(3)];
+            // Frame 2 is re-analysed (the row gets a new id) and frame 3 re-solved, both after the selection.
+            let mut reanalysed = seed_analysis_row(2);
+            reanalysed.config_hash = Some(hash.clone());
+            db_analysis::upsert_frame_analysis(&conn, &reanalysed).unwrap();
+            insert_plate_solve(&conn, &solve_record(3, &wcs_1as(100, 100), false)).unwrap();
+            let mut stats = crate::analysis::zero_point::ZpPassStats::default();
+            persist_pass_zero_points(&conn, &frames, &analysis_ids, &mut stats).unwrap();
+            assert_eq!((stats.stored, stats.failed), (0, 0), "both were superseded");
+            let none = (None, None, None, None, None, None, None, None, None);
+            assert_eq!(zp_columns(&db_analysis::get_frame_analysis(&conn, 2).unwrap().unwrap()), none);
+            assert_eq!(zp_columns(&db_analysis::get_frame_analysis(&conn, 3).unwrap().unwrap()), none);
+
+            // The same judgement on an untouched frame is written, the nine columns alone.
+            let selection = select_pass_jobs(&conn, &[2], &hash, "A").unwrap();
+            let ids: std::collections::HashMap<i64, i64> = selection.iter().map(|(j, a)| (j.frame_id, *a)).collect();
+            let mut stats = crate::analysis::zero_point::ZpPassStats::default();
+            persist_pass_zero_points(&conn, &[judged(2)], &ids, &mut stats).unwrap();
+            assert_eq!(stats.stored, 1);
+            let a = db_analysis::get_frame_analysis(&conn, 2).unwrap().unwrap();
+            assert_eq!((a.zero_point, a.zp_window_slope, a.zp_catalog.as_deref()), (Some(21.5), Some(-0.02), Some("A")));
         }
     }
 }

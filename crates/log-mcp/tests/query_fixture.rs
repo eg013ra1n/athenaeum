@@ -164,6 +164,31 @@ fn list_operations_includes_registration_span_close() {
 }
 
 #[test]
+fn list_operations_lists_the_zero_point_solve_pass_and_not_its_old_kind() {
+    // The pass after a solve batch opens `info_span!("zero_point_solve_pass", catalog = %identity)`, entered on its own
+    // thread; it replaced `zero_point_backfill`, which is no longer an operation kind.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("athenaeum-desktop.2026-11-16.jsonl");
+    let mut f = std::fs::File::create(&path).expect("create fixture file");
+    writeln!(
+        f,
+        r#"{{"timestamp":"2026-11-16T11:00:00.000000Z","level":"INFO","target":"athenaeum_core::api::analysis","fields":{{"message":"close","time.busy":"3.4s","time.idle":"12.0µs"}},"span":{{"catalog":"smac_gaia-a1b2","name":"zero_point_solve_pass"}},"spans":[]}}"#
+    )
+    .expect("write fixture line");
+    writeln!(
+        f,
+        r#"{{"timestamp":"2026-11-16T11:00:01.000000Z","level":"INFO","target":"athenaeum_core::api::analysis","fields":{{"message":"close","time.busy":"1s","time.idle":"1.0µs"}},"span":{{"catalog":"smac_gaia-a1b2","name":"zero_point_backfill"}},"spans":[]}}"#
+    )
+    .expect("write fixture line");
+
+    let ops = query::list_operations(&dirs(&dir), None, None, query::clamp_limit(None)).expect("list_operations");
+    assert_eq!(ops.len(), 1, "only the solve pass is an operation kind: {ops:?}");
+    assert_eq!(ops[0].kind, "zero_point_solve_pass");
+    assert_eq!(ops[0].id, "smac_gaia-a1b2");
+    assert_eq!(ops[0].duration.as_deref(), Some("3.4s"));
+}
+
+#[test]
 fn tail_logs_truncates_to_last_n() {
     // Regression test: tail must return the LAST N lines, not the FIRST N.
     let dir = tempfile::TempDir::new().expect("tempdir");

@@ -110,6 +110,22 @@ impl StoredZeroPoint {
     }
 }
 
+impl StoredZeroPoint {
+    /// The figures a freshly measured analysis row carries (`None` when its run stored none: `zp_version` is the mark).
+    pub fn of_row(analysis: &FrameAnalysis) -> Option<Self> {
+        Some(StoredZeroPoint {
+            zero_point: analysis.zero_point,
+            stars: analysis.zp_stars,
+            sigma: analysis.zp_sigma,
+            version: analysis.zp_version?,
+            refusal: analysis.zp_refusal.clone(),
+            list_stars: analysis.zp_list_stars,
+            window_bright: analysis.zp_window_bright,
+            window_slope: analysis.zp_window_slope,
+        })
+    }
+}
+
 /// Set every `zp_*` field of an analysis row not yet stored to `None` (the nine columns): a judgement that was
 /// superseded before it was written.
 pub fn clear_zero_point_fields(analysis: &mut FrameAnalysis) {

@@ -621,8 +621,8 @@ fn solve_and_persist(
     let mut solved = 0usize;
     let mut failed = 0usize;
     let mut error = None;
-    // Frames whose solve was written: the pass after a solve batch (Task 5c) measures their zero points once the
-    // transaction is done. (A new solve has already cleared each one's `zp_*`: `insert_plate_solve`.)
+    // Frames whose solve was written: the pass after a solve batch measures their zero points once the transaction is
+    // committed. (A new solve has already cleared each one's `zp_*`: `insert_plate_solve`.)
     let mut persisted: Vec<i64> = Vec::new();
     {
         let conn = database.conn();
@@ -690,6 +690,13 @@ fn solve_and_persist(
                 error = Some(ApiError::Internal(e.to_string()));
             }
         }
+    }
+
+    // The pass after a solve batch: Analyze's own worker over the newly solved frames, on its own thread. Not after a
+    // failed commit (the solves were rolled back).
+    #[cfg(feature = "solver")]
+    if error.is_none() && !persisted.is_empty() {
+        crate::api::analysis::spawn_solve_zero_point_pass(Arc::clone(ctx), persisted);
     }
 
     BatchEnd {
