@@ -1125,6 +1125,24 @@ pub struct FrameAnalysis {
     /// Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
     #[serde(default)]
     pub zp_catalog: Option<String>,
+    /// Why the frame has no zero point: the refusal code of a stored refusal (`too_scattered`, `too_few_stars`,
+    /// `poor_solve`, `no_anchor`, `no_exposure`, `unreadable_solve`, `colour_camera`, `frame_verdict`); `None` on a
+    /// valid zero point and on a frame never judged. Forced-list zero point, spec §5.5.
+    #[serde(default)]
+    pub zp_refusal: Option<String>,
+    /// The forced list's size before it was measured; `None` when no list was built.
+    #[serde(default)]
+    pub zp_list_stars: Option<i64>,
+    /// The window's bright edge `G_b` (Gaia G mag) the zero point was measured in; `None` when no list was built.
+    #[serde(default)]
+    pub zp_window_bright: Option<f64>,
+    /// The zero point's change per magnitude the window moves fainter; `None` when the statistic gave none.
+    #[serde(default)]
+    pub zp_window_slope: Option<f64>,
+    /// Whether the stored zero point is not current (an older version, another catalogue) on a solved frame while a
+    /// catalogue is installed. Computed by the Analysis listing, never a column and never on the sync wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zp_outdated: bool,
 }
 
 /// Deserialize `Option<FrameVerdict>` leniently: null / absent → `None`; an unknown variant → `None` + `warn!`.

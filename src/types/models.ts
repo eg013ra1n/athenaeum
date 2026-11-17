@@ -582,7 +582,30 @@ zp_version: number | null,
 /**
  * Identity of the star catalogue the zero point was measured against (`plate_solve::layers::catalog_identity`).
  */
-zp_catalog: string | null, };
+zp_catalog: string | null, 
+/**
+ * Why the frame has no zero point: the refusal code of a stored refusal (`too_scattered`, `too_few_stars`,
+ * `poor_solve`, `no_anchor`, `no_exposure`, `unreadable_solve`, `colour_camera`, `frame_verdict`); `None` on a
+ * valid zero point and on a frame never judged. Forced-list zero point, spec §5.5.
+ */
+zp_refusal: string | null, 
+/**
+ * The forced list's size before it was measured; `None` when no list was built.
+ */
+zp_list_stars: number | null, 
+/**
+ * The window's bright edge `G_b` (Gaia G mag) the zero point was measured in; `None` when no list was built.
+ */
+zp_window_bright: number | null, 
+/**
+ * The zero point's change per magnitude the window moves fainter; `None` when the statistic gave none.
+ */
+zp_window_slope: number | null, 
+/**
+ * Whether the stored zero point is not current (an older version, another catalogue) on a solved frame while a
+ * catalogue is installed. Computed by the Analysis listing, never a column and never on the sync wire.
+ */
+zp_outdated?: boolean, };
 
 export type FrameVerdict = "trailed" | "defocused" | "no_stars";
 

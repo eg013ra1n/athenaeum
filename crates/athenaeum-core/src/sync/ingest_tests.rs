@@ -3051,11 +3051,25 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
     current["zp_sigma"] = serde_json::json!(0.04);
     current["zp_version"] = serde_json::json!(crate::analysis::zero_point::ZP_VERSION);
     current["zp_catalog"] = serde_json::json!("tier_500:1:2");
-    // A verdict a newer build wrote (C6 review m8): the verdict reads None, the rest of the row is kept.
+    // A summary from a build with the five 6.5 keys and none of the forced-list four: they default to None.
+    let six_five = current.clone();
+    // The forced-list zero point's four appended optional fields (spec §5.5).
+    current["zp_refusal"] = serde_json::json!("poor_solve");
+    current["zp_list_stars"] = serde_json::json!(412);
+    current["zp_window_bright"] = serde_json::json!(12.7);
+    current["zp_window_slope"] = serde_json::json!(-0.021);
+    // A verdict a newer build wrote (C6 review m8): the verdict reads None, the rest of the row is kept; and an
+    // unknown `zp_*` key of a later build is ignored.
     let mut future = current.clone();
     future["frame_verdict"] = serde_json::json!("some_future_verdict");
+    future["zp_future_figure"] = serde_json::json!(1.5);
     for (uuid, summary, want) in [
         ("an-old", legacy, (None, None, None)),
+        (
+            "a-six-five",
+            six_five,
+            (Some(5u32), Some(17i64), Some(crate::models::FrameVerdict::Defocused)),
+        ),
         (
             "a-new",
             current,
@@ -3084,11 +3098,18 @@ fn an_analysis_summary_with_and_without_the_c6_keys_ingests() {
         assert_eq!((a.stars_detected, a.median_fwhm), (300, 3.0), "{uuid}");
         assert_eq!((a.measure_version, a.stars_refused, a.frame_verdict), want, "{uuid}");
         let zp = (a.zero_point, a.zp_stars, a.zp_sigma, a.zp_version, a.zp_catalog);
+        let window = (a.zp_refusal.as_deref(), a.zp_list_stars, a.zp_window_bright, a.zp_window_slope);
         if uuid == "an-old" {
             assert_eq!(zp, (None, None, None, None, None), "{uuid}: an older summary has no zero point");
+            assert_eq!(window, (None, None, None, None), "{uuid}");
         } else {
             let want_zp = (Some(21.3), Some(87), Some(0.04), Some(crate::analysis::zero_point::ZP_VERSION), Some("tier_500:1:2".to_string()));
             assert_eq!(zp, want_zp, "{uuid}");
+            if uuid == "a-six-five" {
+                assert_eq!(window, (None, None, None, None), "{uuid}: the four forced-list keys default");
+            } else {
+                assert_eq!(window, (Some("poor_solve"), Some(412), Some(12.7), Some(-0.021)), "{uuid}");
+            }
         }
     }
 }

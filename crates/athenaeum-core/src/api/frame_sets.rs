@@ -2128,6 +2128,11 @@ mod tests {
             zp_sigma: Some(0.03),
             zp_version: Some(crate::analysis::zero_point::ZP_VERSION),
             zp_catalog: Some(catalog.to_string()),
+            zp_refusal: None,
+            zp_list_stars: None,
+            zp_window_bright: None,
+            zp_window_slope: None,
+            zp_outdated: false,
         };
         crate::plate_solve::storage::insert_plate_solve(
             conn,

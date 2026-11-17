@@ -1997,7 +1997,18 @@ fn store_outcome(
     matched: Option<u32>,
     reason: Option<&str>,
 ) -> Result<bool> {
-    let written = db_analysis::set_zero_point(conn, frame_id, judged.analysis_id, judged.solve_id, value, catalog)
+    // 6.5's writer (removed in the next commit): its figures, the four forced-list columns NULL.
+    let figures = db_analysis::StoredZeroPoint {
+        zero_point: value.map(|v| v.zero_point),
+        stars: value.map(|v| i64::from(v.stars)),
+        sigma: value.map(|v| v.sigma),
+        version: ZP_VERSION,
+        refusal: None,
+        list_stars: None,
+        window_bright: None,
+        window_slope: None,
+    };
+    let written = db_analysis::set_zero_point(conn, frame_id, judged.analysis_id, judged.solve_id, &figures, catalog)
         .with_context(|| format!("storing the zero point of frame {frame_id}"))?;
     if !written {
         tracing::debug!(frame_id, "zero point superseded");
@@ -2754,6 +2765,11 @@ mod tests {
             zp_sigma: None,
             zp_version: None,
             zp_catalog: None,
+            zp_refusal: None,
+            zp_list_stars: None,
+            zp_window_bright: None,
+            zp_window_slope: None,
+            zp_outdated: false,
         }
     }
 
@@ -3049,8 +3065,17 @@ mod tests {
         let old_solve = get_plate_solve(&conn, 1).unwrap().unwrap().id.unwrap();
         // The frame is re-analysed: the REPLACE gives the row a new id.
         db_analysis::upsert_frame_analysis(&conn, &fresh_analysis(1, Some(MEASURE_VERSION))).unwrap();
-        let z = ZeroPoint { zero_point: 21.0, stars: 50, sigma: 0.02 };
-        let written = db_analysis::set_zero_point(&conn, 1, old_analysis, Some(old_solve), Some(&z), "A").unwrap();
+        let z = db_analysis::StoredZeroPoint {
+            zero_point: Some(21.0),
+            stars: Some(50),
+            sigma: Some(0.02),
+            version: ZP_VERSION,
+            refusal: None,
+            list_stars: None,
+            window_bright: None,
+            window_slope: None,
+        };
+        let written = db_analysis::set_zero_point(&conn, 1, old_analysis, Some(old_solve), &z, "A").unwrap();
         assert!(!written, "the write after a re-analysis must not land");
         assert_eq!(zp_row_raw(&conn, 1), (None, None, None, None, None), "the new row's zero point stays NULL");
         // The same through the refresh: the cone replaces the analysis (a re-analysis landing mid-judgement).
