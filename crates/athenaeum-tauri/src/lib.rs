@@ -393,6 +393,7 @@ pub fn run() {
             commands::analyze_frame_set,
             commands::cancel_analysis,
             commands::get_analysis_for_frame_set,
+            commands::get_zero_point_updates,
             commands::get_frame_star_metrics,
             commands::compute_flat_contour_plot,
             // Compute queue commands

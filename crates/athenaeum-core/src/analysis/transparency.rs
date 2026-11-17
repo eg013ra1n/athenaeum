@@ -40,7 +40,7 @@ use crate::db::MAX_BIND_PARAMS;
 use crate::plate_solve::layers::{catalog_identity, CatalogOpenError};
 use crate::star_measure::MEASURE_VERSION;
 
-pub use crate::models::Transparency;
+pub use crate::models::{Transparency, ZeroPointUpdates};
 
 /// The share of a rig's zero points that sits at or below its clear-sky reference (nearest rank).
 pub const REFERENCE_PERCENTILE: f64 = 0.90;
@@ -813,21 +813,6 @@ pub fn transparency_for_frames(
     frame_ids: &[i64],
 ) -> Result<HashMap<i64, Transparency>> {
     read(conn, &Stmts(Cell::new(0)), catalog, frame_ids)
-}
-
-/// What the zero points of a frame set need, for the count the Analysis tab shows beside Analyze ("N to update").
-/// Only `to_update` is work Analyze does for the zero point; the other two are frames Analyze cannot help.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ZeroPointUpdates {
-    /// Solved frames whose zero point is not current for the installed catalogue ([`zp_outdated`]: never judged, another
-    /// `ZP_VERSION` or another catalogue): a run of Analyze (without Re-Analyze) measures exactly these.
-    pub to_update: usize,
-    /// Solved frames the zero point cannot be measured for because no star catalogue is installed. Never part of
-    /// `to_update`: the way on is installing the catalogue.
-    pub no_catalogue: usize,
-    /// Frames whose stored judgement says the measurement itself failed (`internal`, `catalogue_unreadable`): the logs
-    /// say why. Never part of `to_update`.
-    pub measurement_failed: usize,
 }
 
 impl ZeroPointUpdates {

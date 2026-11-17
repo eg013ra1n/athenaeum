@@ -10,7 +10,7 @@ use serde::Deserialize;
 use athenaeum_core::analysis::config::AnalysisConfig;
 use athenaeum_core::api::analysis as api;
 use athenaeum_core::flat_analysis::FlatContourOpts;
-use athenaeum_core::models::{FrameAnalysis, StarMetricsResponse};
+use athenaeum_core::models::{FrameAnalysis, StarMetricsResponse, ZeroPointUpdates};
 
 use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
@@ -101,6 +101,15 @@ pub async fn get_analysis_for_frame_set(
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<Vec<FrameAnalysis>>, (StatusCode, String)> {
     api::get_analysis_for_frame_set(&state.ctx, args.frame_set_id).map(Json).map_err(api_err)
+}
+
+/// POST /api/get_zero_point_updates
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_zero_point_updates(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
+) -> Result<Json<ZeroPointUpdates>, (StatusCode, String)> {
+    api::zero_point_updates(&state.ctx, args.frame_set_id).map(Json).map_err(api_err)
 }
 
 // ── Frame set analysis (with SSE progress) ───────────────────────────────────

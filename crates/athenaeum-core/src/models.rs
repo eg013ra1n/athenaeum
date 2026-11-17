@@ -1499,6 +1499,23 @@ impl Transparency {
     }
 }
 
+/// What the zero points of a frame set need, for the count the Analysis tab shows beside Analyze ("N to update").
+/// Only `to_update` is work Analyze does for the zero point; the other two are frames Analyze cannot help. Counted by
+/// `analysis::transparency::count_zero_point_updates` (solver-gated); declared here, ungated, for the TS registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeroPointUpdates {
+    /// Solved frames whose zero point is not current for the installed catalogue (never judged, another `ZP_VERSION`
+    /// or another catalogue): a run of Analyze (without Re-Analyze) measures exactly these.
+    pub to_update: usize,
+    /// Solved frames the zero point cannot be measured for because no star catalogue is installed. Never part of
+    /// `to_update`: the way on is installing the catalogue.
+    pub no_catalogue: usize,
+    /// Frames whose stored judgement says the measurement itself failed (`internal`, `catalogue_unreadable`): the logs
+    /// say why. Never part of `to_update`.
+    pub measurement_failed: usize,
+}
+
 #[cfg(test)]
 mod frame_verdict_tests {
     use super::*;

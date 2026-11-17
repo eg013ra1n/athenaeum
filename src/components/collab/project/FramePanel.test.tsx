@@ -473,7 +473,7 @@ describe('FramePanel', () => {
     expect(screen.getByText('Transparency').tagName).toBe('DT');
     expect(screen.getByText('\u22120.77 mag')).toBeInTheDocument();
     expect(screen.getByText('Zero point').tagName).toBe('DT');
-    expect(screen.getByText('21.34 · 87 stars · ±0.04')).toBeInTheDocument();
+    expect(screen.getByText('21.34 · 87 stars')).toBeInTheDocument();
   });
 
   it('a metric without a transparency value shows a dash and its reason', () => {

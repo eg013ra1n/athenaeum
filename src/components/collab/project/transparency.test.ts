@@ -16,8 +16,8 @@ it('shows a dash for no value', () => {
   expect(formatTransparency(undefined)).toBe('—');
 });
 
-it('formats a zero point with its star count and scatter', () => {
-  expect(formatZeroPoint({ zeroPoint: 21.342, zpStars: 87, zpSigma: 0.041 })).toBe('21.34 · 87 stars · ±0.04');
+it('formats the reduced zero point with its star count and no scatter', () => {
+  expect(formatZeroPoint({ zeroPoint: 21.342, zpStars: 87, zpSigma: 0.041 })).toBe('21.34 · 87 stars');
 });
 
 it('shows a dash for no zero point', () => {
@@ -26,12 +26,12 @@ it('shows a dash for no zero point', () => {
 });
 
 it('formats a single star in the singular', () => {
-  expect(formatZeroPoint({ zeroPoint: 21.34, zpStars: 1, zpSigma: 0.04 })).toBe('21.34 · 1 star · ±0.04');
-  expect(formatZeroPoint({ zeroPoint: 21.34, zpStars: 87, zpSigma: 0.04 })).toBe('21.34 · 87 stars · ±0.04');
+  expect(formatZeroPoint({ zeroPoint: 21.34, zpStars: 1, zpSigma: 0.04 })).toBe('21.34 · 1 star');
+  expect(formatZeroPoint({ zeroPoint: 21.34, zpStars: 87, zpSigma: 0.04 })).toBe('21.34 · 87 stars');
 });
 
 it('drops the parts a zero point does not have', () => {
-  expect(formatZeroPoint({ zeroPoint: 21.34, zpStars: null, zpSigma: 0.04 })).toBe('21.34 · ±0.04');
+  expect(formatZeroPoint({ zeroPoint: 21.34, zpStars: null, zpSigma: 0.04 })).toBe('21.34');
   expect(formatZeroPoint({ zeroPoint: 21.34, zpStars: 87, zpSigma: null })).toBe('21.34 · 87 stars');
 });
 

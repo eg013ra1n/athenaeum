@@ -611,6 +611,23 @@ export type FrameVerdict = "trailed" | "defocused" | "no_stars";
 
 export type Transparency = { zeroPoint: number | null, zpStars: number | null, zpSigma: number | null, lossMag: number | null, reason: string | null, };
 
+export type ZeroPointUpdates = { 
+/**
+ * Solved frames whose zero point is not current for the installed catalogue (never judged, another `ZP_VERSION`
+ * or another catalogue): a run of Analyze (without Re-Analyze) measures exactly these.
+ */
+toUpdate: number, 
+/**
+ * Solved frames the zero point cannot be measured for because no star catalogue is installed. Never part of
+ * `to_update`: the way on is installing the catalogue.
+ */
+noCatalogue: number, 
+/**
+ * Frames whose stored judgement says the measurement itself failed (`internal`, `catalogue_unreadable`): the logs
+ * say why. Never part of `to_update`.
+ */
+measurementFailed: number, };
+
 export type CalibrationMetadataEdits = { ccd_temp?: number | null, gain?: number | null, offset?: number | null, binning?: string | null, exptime?: number | null, };
 
 export type StarMetric = { id: number | null, frame_analysis_id: number, x: number, y: number, peak: number, flux: number, fwhm: number, fwhm_x: number, fwhm_y: number, eccentricity: number, 
