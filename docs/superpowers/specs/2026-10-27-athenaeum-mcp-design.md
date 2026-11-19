@@ -89,8 +89,8 @@ one build pass for the other.
   follows the `duplicates.use_content_hash` setting; `duplicates::find_duplicates` is dead code). The MCP adds no other
   definition of "same file".
 - Each group says what matched (which of the three keys) and where each copy lives, with the folder's role. Roles from
-  the catalog are facts: the scan-root kind (`normal`, `calibration_library`, `sync_incoming`, `collaboration`,
-  `master_stash`). Inside a `normal` root the catalog cannot tell a shooting folder from a processing folder, so the MCP
+  the catalog are facts: the scan-root kind (`normal`, `calibration_library`, `sync_incoming`, `collaboration`).
+  Inside a `normal` root the catalog cannot tell a shooting folder from a processing folder, so the MCP
   states that split as an inference with its evidence ("this folder holds MasterLight XISF and a processing project,
   looks like a processing folder"), never as a fact. *(Builder-check call: no new data, no root labelling in v1.)*
 - **Raw sub-frames matched by header fingerprint are byte-verified before they enter a Black Hole plan.** Only the
@@ -219,7 +219,8 @@ file or a setting, and never starts a long operation (a scan, an analysis, a pla
   - how good — the measurements the app stores and shows (the Analysis tab, the frame panel: FWHM, star counts and
     the like, transparency loss where measured) as ranges, medians and outliers, with the frames named. A value that
     was not measured is said to be not measured, never estimated;
-  - calibration — which light groups have darks, flats and bias linked, which have none, and the reason the app shows;
+  - calibration — which light groups have darks, flats and bias linked, which have none, and the reason where the app
+    states one (the export readiness sentences); no reason is invented where the app has none;
   - storage — files and bytes per folder and scan root, the archive state (WIP, soft-archived, zipped), the Black Hole;
   - missing metadata and duplicates as counts (§6.2 and §6.3 give the detail and the plans).
 - **The numbers are the app's numbers.** The question tools read through the same core functions as the app's pages,
@@ -286,10 +287,10 @@ file or a setting, and never starts a long operation (a scan, an analysis, a pla
 
 ## 10. Groundwork the builder will meet
 
-- **Batch plate solving is orchestrated in the host wrappers, twice.** `plate_solve_batch` in
-  `crates/athenaeum-tauri/src/commands/plate_solve.rs` and its mirror in `crates/athenaeum-web/src/routes/plate_solve.rs`
-  each carry the loading, input gate, worker and result-writing logic. Lift it into `athenaeum-core` so the UI and
-  the MCP run one path; both wrappers become thin.
+- **Batch plate solving is already in core** (`api::plate_solve::prepare_plate_solve_batch` /
+  `run_plate_solve_batch`; corrected 2026-11-19 by the plan's reuse audit). What each host still carries — the three
+  resolvers for catalog layers, index packs and the DSO catalog, and the cancel body — moves into core, and core gains
+  the busy query the one-slot rule needs (§6.5): today a second batch silently replaces the first one's cancel handle.
 - **The Black Hole move has side effects in the wrapper.** `bulk_move_to_black_hole` (Tauri `commands/duplicates.rs`,
   and its Axum mirror) calls `collab_autopublish::note_black_hole_change` and emits `blackhole-changed` after the core
   call. The MCP must get exactly the same behaviour, so that part moves into core as well (the event through the
