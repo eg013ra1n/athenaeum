@@ -99,10 +99,9 @@ This update arrives inside the app: click **Download and install** when it is of
 - **Ask an AI assistant to work with your catalog.** Athenaeum will connect to AI assistants that support MCP,
   such as Claude. Ask in plain words — "find my duplicate frames and plan what to send to the Black Hole", "fill
   in the missing metadata" — then review the plan and apply it. Off until you turn it on.
-- **Frame and group weights from star photometry, measured against Gaia.** Athenaeum will compare the brightness
-  of each frame's stars with their Gaia catalog magnitudes, so it knows how much light the frame really collected.
-  A frame shot through haze or low in the sky gets the weight it deserves, and frames from different cameras,
-  telescopes and nights in a project are compared fairly by their equivalent exposure.
+- **See how clear the sky was for every frame.** Athenaeum will compare the brightness of each frame's stars with
+  their Gaia catalog magnitudes and show how much light the frame lost to haze, cloud or a low target, for mono and
+  colour cameras alike. In a collaboration project the coordinator can set one limit that is fair to every telescope.
 
 ## Coming in 0.7.3
 
