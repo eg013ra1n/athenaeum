@@ -260,3 +260,5 @@ axum = "0.8"
 # The fake hub's axum front binds a `TcpListener`; core's own tokio (above)
 # has no "net" feature, so add it here, dev-only.
 tokio = { version = "1", features = ["net"] }
+# The MCP server tests (`mcp::server_tests`) talk to the server as a client over `tokio::io::duplex`.
+rmcp = { version = "3.11", default-features = false, features = ["client"] }
