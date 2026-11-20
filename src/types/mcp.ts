@@ -47,3 +47,91 @@ lastError: string | null,
  */
 blockedReason: string | null, };
 
+export type McpSource = { 
+/**
+ * The build: the server name (`athenaeum` / `athenaeum-dev`).
+ */
+build: string, version: string, 
+/**
+ * The catalog database's full path.
+ */
+catalog: string, };
+
+export type PlanState = { "kind": "preparing", done: number, total: number, } | { "kind": "waiting" } | { "kind": "applying" } | { "kind": "applied" } | { "kind": "cancelled" } | { "kind": "replaced" } | { "kind": "expired" } | { "kind": "failed", error: string, };
+
+export type PlanKind = "black_hole" | "metadata" | "plate_solve";
+
+export type PlanColumn = { key: string, label: string, };
+
+export type PlanItem = { 
+/**
+ * `item:<file_id>` (metadata `item:<frame_id>:<field>`).
+ */
+id: string, fileName: string, folder: string, 
+/**
+ * Column key to the text shown in that column.
+ */
+values: { [key in string]: string }, 
+/**
+ * What applying does to this item, in words.
+ */
+action: string, 
+/**
+ * Why the planner proposes it (a byte check, a rule).
+ */
+evidence: string | null, 
+/**
+ * Included in the plan's proposal; the user's tick overrides it.
+ */
+selected: boolean, 
+/**
+ * Why this item cannot be included; a locked item never is.
+ */
+locked: string | null, 
+/**
+ * May be the group's chosen copy (`chosen` must be one).
+ */
+candidate: boolean, sizeBytes: number | null, };
+
+export type PlanGroup = { 
+/**
+ * `group:<n>`.
+ */
+id: string, title: string, note: string | null, 
+/**
+ * Set when the user picks one candidate of the group: the label of that choice ("Copy that stays").
+ */
+chooseOne: string | null, 
+/**
+ * The id of the chosen candidate.
+ */
+chosen: string | null, items: Array<PlanItem>, };
+
+export type ReportLine = { itemId: string, fileName: string, folder: string, reason: string, };
+
+export type PlanReport = { applied: Array<ReportLine>, skipped: Array<ReportLine>, failed: Array<ReportLine>, 
+/**
+ * The run a plan started (a plate-solve batch).
+ */
+runId: string | null, };
+
+export type McpPlanView = { planId: string, kind: PlanKind, title: string, source: McpSource, state: PlanState, 
+/**
+ * Set when `state` is `replaced`: the plan that took its place.
+ */
+replacedBy: string | null, 
+/**
+ * `YYYY-MM-DD HH:MM:SS` (local time), display only; set once the plan waits.
+ */
+expiresAt: string | null, columns: Array<PlanColumn>, groups: Array<PlanGroup>, notes: Array<string>, report: PlanReport | null, };
+
+export type GroupSelection = { groupId: string, chosen: string | null, 
+/**
+ * The ids of the items the user included.
+ */
+included: Array<string>, };
+
+export type PlanSelection = { groups: Array<GroupSelection>, };
+
+export type PlanAnswer = { "action": "apply", selection: PlanSelection, } | { "action": "cancel" };
+

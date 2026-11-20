@@ -25,4 +25,6 @@ pub mod light_headers;
 #[cfg(feature = "render")]
 pub mod light_resolve;
 pub mod paths;
+// Masters built twice (the `_2` / `_3` suffix): the copies of one master and which of them calibration links use.
+pub mod rebuilt_copies;
 pub mod register;

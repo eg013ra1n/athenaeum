@@ -24,7 +24,8 @@ An assistant (Claude desktop, Claude Code, ...) asks Athenaeum about one astroph
 | On/off lifecycle, the key, `McpStatus`, the client config text | `mcp/lifecycle.rs`; commands' logic in `api/mcp.rs` |
 | `Answer`, `to_tool_result` (line 1 + both halves) | `mcp/answer.rs` |
 | `AthenaeumMcp` (the rmcp handler, `INSTRUCTIONS`) | `mcp/server.rs` |
-| Tool bodies, argument types, the scope step | `mcp/tools/{mod,catalog}.rs` |
+| Tool bodies, argument types, the scope step | `mcp/tools/{mod,catalog,plans}.rs` |
+| The Black Hole plan: planner, applier, fixtures | `mcp/plans/black_hole.rs`, `black_hole_tests.rs` |
 | Tests (a client over `tokio::io::duplex`, both protocol revisions) | `mcp/tests/server_tests.rs` |
 
 `McpHost::new` opens nothing; `on_catalog_open` opens the reader and reconciles the local channel to the stored setting. Before it, `reader()` and `source()` are `Conflict("Athenaeum is starting ...")` and every tool answers that in
@@ -47,7 +48,7 @@ Every answer is two halves that each read on their own.
 - **The default state says what it leaves out:** the last line is `Black Hole files are left out (N)`, structured
   `blackHoleLeftOut`.
 
-## Tools (M1: the catalog questions)
+## Tools (the catalog questions, the plan tools, and `plan_status`)
 
 | Tool | Answers |
 | ---- | ------- |
@@ -56,10 +57,13 @@ Every answer is two halves that each read on their own.
 | `file_details` | One file: header values, stored measurements and whether they are current, transparency, calibration links, copies, plate solve |
 | `find_duplicates` | Duplicate groups with a copy in the scope, each copy with file name, folder, scan root kind and a processing-folder note |
 | `find_missing_metadata` | The Missing Metadata view's rows inside the scope: counts per category, folders, a page of files |
+| `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many calibration links point at each (`linkCount`: light frames, and master sets that use it as a dark or bias); not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); like `find_duplicates`, a group is in the scope when one of its copies is, and it is then listed whole (every copy, its handle the lowest file id of the whole group, so `plan_black_hole` finds it) |
+| `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window. A plan with copies to byte-check answers at once with state `preparing` (the checks run on a thread of their own); the answer of a published plan lists every copy and its fate |
+| `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied") |
 
 Each tool is a core fn `mcp::tools::<name>(host, args) -> Result<Answer, ApiError>` wearing
-`#[tracing::instrument(skip_all, fields(tool = "<name>"), err)]`; the `#[tool]` method is a two-line adapter that runs it with
-`spawn_blocking` (it reads SQLite) and wraps it with `to_tool_result`.
+`#[tracing::instrument(skip_all, fields(tool = "<name>"), err)]`; `AthenaeumMcp::all_tools()` (`server.rs`) joins the tool routers (`catalog_tools() + plan_tools()`, and `tools.json` is written from it); the `#[tool]` method is a two-line adapter that runs it with
+`spawn_blocking` (it reads SQLite) and wraps it with `to_tool_result`. No test keeps a list of tool names: core's tests read `all_tools()`, the bridge's read `McpHost::tool_list_json()`, so a new tool cannot leave a stale list.
 
 **One frame set.** A `query_frames` scope that is exactly one frame set (`frameSet` and nothing else, default state) answers the
 frame set's own page figures (`catalog_query::frame_set_totals`): its frame count and integration time are the page's (the
@@ -224,9 +228,123 @@ build's own target before each `npx tauri build` (`docs/release/README.md`). The
 The web image has no bridge (the Dockerfile drops the crate from the workspace). The bridge is versioned with the app (`bump.sh`,
 `check_versions.sh`).
 
+## Plans (the store and the apply framework)
+
+`mcp/plans/` (`McpHost.plans`). A plan is what an assistant prepares and only the user applies, in Athenaeum's window. Nothing an
+MCP client can call applies or cancels a plan: `PlanStore::answer` is reached only from the window's two commands, `get_mcp_plan {planId?}` (the plan by id, the newest when absent, `null` when there is none: a page that opens later finds the waiting plan) and `answer_mcp_plan {planId, answer}` (`api/mcp.rs`, both hosts, `commands/mcp.rs` / `routes/mcp.rs`); `no_tool_applies_a_plan` pins that no tool name or input schema can decide a plan, and is re-run with every planning tool.
+
+| Item | Where |
+| ---- | ---- |
+| The store: `begin`, `progress`, `publish`, `fail`, `view`, `answer`, `plan_opened_text`, `PLAN_TTL`, `PLAN_ITEM_CAP` | `plans/mod.rs` |
+| The DTOs the window reads (`McpPlanView`, `PlanState`, `PlanAnswer`, ...), `DiskStamp`, `ItemSnapshot`, `PlanContent` | `plans/model.rs` (TS in `src/types/mcp.ts`) |
+| The generic selection check and the re-check at apply | `plans/apply.rs` |
+
+- **One undecided plan.** `begin` makes the old `preparing` / `waiting` plan `replaced` (`replacedBy` = the new id, its cancel flag set). A
+  replaced, cancelled, expired or applied plan stays readable by its id for 24 h (at most 100 finished plans). `view(None)` is the newest plan
+  that is `preparing`, `waiting` or `applying` (a page that reloads during an apply finds it, even when a newer plan failed), else the newest plan.
+  A failed apply always carries a report (an empty one says nothing was recorded as moved; `plan_status` reads `No file was recorded as moved before
+  it stopped.`); only a plan that failed while it was being prepared has none. Turning assistant access off does not end a waiting or preparing
+  plan: the user still decides it in the window.
+- **Expiry is on tokio time.** `publish` stores a `tokio::time::Instant` deadline (`PLAN_TTL`, one hour); the sleeper and the apply check
+  both read it, so a test pauses time. `expiresAt` is display text (local time, `YYYY-MM-DD HH:MM:SS`).
+- **Apply.** `Apply` only from `waiting`, unexpired. The generic check (known groups and items, no locked item included, `chosen` a
+  candidate, something selected) and the kind's `PlanApplier::validate` run first; then the plan is `applying` and a thread re-stamps every
+  included item and each group's kept copy (`disk_stamp`; a zip-resident row stamps its zip, `files.archive_zip_path`; paths are never
+  `canonicalize`d) and re-reads the catalog values captured at planning (`catalog_values`). A changed item is skipped with its reason
+  (`changed on disk since the plan (size A → B)`, `missing`, `catalog changed: OBJECT is now 'X'`); a changed or missing kept copy skips its
+  whole group. The applier acts on what is fresh; the report merges both sets of skips.
+- **Events.** `mcp-plan-updated {"planId"}` on begin (and for the plan it replaced), publish, fail, apply start, applied, cancel and expiry;
+  no other name, and `bring_to_front` once per `begin`.
+- **Logging.** Span `mcp_plan_apply` (`plan_id`, `kind`), ending `info!(via = "mcp", plan_id, kind, applied, skipped, failed, "mcp plan applied")`.
+  `log-mcp` lists it as an operation keyed by `plan_id`.
+
+## Black Hole plans (`plan_black_hole`)
+
+`mcp/plans/black_hole.rs`. An assistant names groups (`dup:<key>:<hash>` from `find_duplicates`, `rebuilt:<id>` from `find_rebuilt_masters`);
+only those groups enter the plan. The handles are read before the plan begins, so a mistyped or stale handle (or the other source's) is an
+`Invalid` in words and never replaces the plan the user is looking at. So does a request that is too large: `resolve` sums the distinct copies
+of the named groups and refuses more than `PLAN_ITEM_CAP` (2 000) in words before `begin`, so no file is stamped and the waiting plan stays.
+
+- **One keeper per group** ("Copy that stays", `chooseOne`): `chosen` is the one copy under `keepInFolder` (separator-strict: the folder or
+  anything below it, never a folder that merely starts like it) or among `keepFiles` (`file:<n>` or the stored path). None or several: `chosen`
+  is null, nothing is selected and the group's note says `no instruction picks the copy that stays here (2 copies under <folder>)`. The other
+  copies are include/exclude items, selected iff a keeper is set. The kept copy is a choice, not a lock: it is shown by `chosen` alone, the
+  planned keeper is an ordinary candidate item (not selected, not locked), and the window may keep another copy and include the planned one
+  (the apply byte-checks that pair first). A file sits in one group only: a file already placed in an earlier group is left out of later ones,
+  with a note; `validate` refuses a selection that includes any group's `chosen`.
+- **Locked, with the reason (only real reasons):** a master with calibration links (`calibration links point at it; it stays in v1`, counted by
+  `rebuilt_copies::master_link_count`, the one link count: light frames plus master sets that use it, such as a master dark behind a master
+  flat with no light yet); a copy whose master set superseded raw frames (`raw frames were superseded by it; it stays in v1`: moving it would
+  un-supersede them, `master_unregister`); a zip-resident copy (`inside a zip; a zip moves to the Black Hole only as a whole`); a copy whose
+  file cannot be stamped (`not reachable ...`); a byte-checked copy whose bytes differ from the keeper's, whichever key matched it (`differs in bytes from the copy that
+  stays`, with a group note). A group whose every copy sits in an earlier group of the plan is titled `group whose copies are in another group of this plan`.
+- **The answer is the plan, as data and in words** (`describe_plan`, one function for the planning answer and for `plan_status` of a waiting
+  plan): per group its title, the copy that stays (`chosen`: file name and folder), and `items` with `fileName`, `folder`, `values` (the
+  columns), `selected`, `locked` (the reason or null) and `candidate`; the text lists, under each group, the copy that stays and every other
+  copy as `moves`, `not selected` or `locked: <reason>`. At most 50 groups are shown with their items (the rest summed) and at most 20 items
+  per group (the rest summed).
+- **Byte checks** (`Header`, `Content` and `Master` groups; a rebuilt master is not a copy of its keeper's bytes and is not checked): a stored
+  full-file hash may predate an in-place overwrite, so the disk decides, and `files.content_hash` samples 3 x 512 KB. Each unlocked copy is
+  compared with the keeper by `verify_duplicate_pair`, which answers from the stored hashes when both files still match their rows (about a
+  stat) and reads the bytes otherwise. The evidence says which: `byte-identical to the copy that stays (compared just now)` for a byte compare,
+  `same full-file hash as the copy that stays, files unchanged since` for a stored-hash answer (`VerifyFn` returns the pair's method). The
+  tool answers right after the plan begins, with the handle and state `preparing` (`Athenaeum is checking N copies byte for byte; ... Ask
+  plan_status.`), because a client cancels a tool call after about a minute and a cancelled call gives the assistant no handle. The checks run
+  on a thread of their own, progress per pair, the plan's cancel flag read between pairs (a plan the user cancels or a newer plan replaces
+  stops there); when they end the plan is published (`waiting`). A plan with nothing to byte-check is published before the tool answers. The
+  worker enters the caller's tokio runtime, so the published plan gets its expiry timer; an error or a panic while preparing (on the tool's thread or
+  the worker) ends the plan `failed` with a sentence, because `sweep` never expires a preparing plan. Both halves of the answer report the state taken
+  before the worker starts (`preparing`, 0 of N). No
+  reader guard and no pooled connection is held across a comparison. A byte compare that finds a pair identical banks the pair's
+  full-file hash (`files.strong_hash`, `updated_at`), as the Duplicates page's verify does, so planning writes that cache and nothing else
+  (M2 smoke, 2026-11-20: 11 rows).
+- **A master moved to the Black Hole leaves the master library.** The move is the app's own (`bulk_move_to_black_hole`), which unregisters
+  the master's calibration set first (`master_unregister`), as the Black Hole flow does from the file browser. Only a master that no
+  calibration link points at reaches a plan's ticks, so no light or master loses its calibration (M2 smoke: 2 sets and their frame rows went).
+- **Apply** (after the store's stamp re-check of the included items and the kept copy): a byte-checked group whose `chosen` is not the copy the
+  plan compared against is compared again first (a differing pair is skipped); then, immediately before the move, a group whose keeper is in
+  the Black Hole now is skipped as a whole, every master item is re-checked for links and for superseding (skipped with the lock's reason) and
+  an item already in the Black Hole is skipped. The rest goes through `api::black_hole::bulk_move_to_black_hole(ctx, ids, "assistant", None,
+  emitter)`: one `blackhole-changed` with `count` = moved, no per-file progress events; `BulkMoveResult.failed` fills the report's `failed`.
+- **`validate`** is in memory (no SQLite, so the hosts' `answer_mcp_plan` wrappers need no `spawn_blocking` for it): an included item needs a
+  `chosen` (`pick the copy that stays ...`) and `chosen` is never included, in its own group or any other.
+- Columns: IMAGETYP, OBJECT, FILTER, EXPTIME, DATE-OBS, INSTRUME, size, modified.
+
+## The plan window
+
+`src/components/mcp/{PlanWindow,PlanView,planSelection}`, state in `src/contexts/McpPlanContext.tsx` (provider and window sit in `Layout.tsx`, once).
+The window is the one place a plan is looked over and decided: ticks, the copy that stays, **Apply** or **Cancel**. A `DialogShell size="lg"`.
+
+- **Reads.** On mount `get_mcp_plan({ planId: null })` (a page opened later finds the plan that waits; the key is always sent); on every
+  `mcp-plan-updated {planId}` `get_mcp_plan({ planId })` (required listener pattern; progress events come about every 250 ms). Only an undecided
+  plan (`preparing`, `waiting`, `applying`) opens a closed window; an event for a finished plan does nothing.
+- **Never swapped under the cursor.** An event for another plan while one is shown only records that a newer one waits; the shown plan stays
+  as it was. When the shown plan becomes `replaced` it shows the banner "The assistant prepared a newer plan" and **Open the new plan**
+  (Apply disabled); while a plan applies, a newer one waits unseen. Close on a finished plan opens a waiting newer plan, if there is one.
+- **No keypress or stray click answers a plan.** No button has the initial focus (the title line does, `data-autofocus` + `tabIndex={-1}`):
+  the window opens by itself over any page. A scrim click never dismisses the window in any state (`DialogShell closeOnScrim={false}`;
+  the report is the only place the user sees what moved); Escape and the cross send `cancel` while a plan is `preparing` or `waiting`.
+  Apply arms one second after the window shows a waiting plan.
+- **An applying plan never locks the app.** While it applies, Escape, the cross and a **Close** button hide the window and the apply carries
+  on; the footer says "Applying… you can close this window; the report opens when it is done." The hidden plan stays tracked, and when it
+  reaches its end state (`applied`, or `failed` with its report) the window opens again with the report. That report is the one outcome of
+  the user's own click, so there is no `notify()`. A newer plan waits unseen meanwhile and opens when the report is closed.
+- **Events are not trusted alone.** The web build drops events (an EventSource reconnect, a lagged broadcast). While the tracked plan is
+  `preparing`, `waiting` or `applying` (shown or hidden) the context re-reads it with `get_mcp_plan({ planId })` every 3 s and once when the
+  tab becomes visible; the timer ends with the plan and on unmount. The re-read never swaps the shown plan for another id.
+- **States.** `preparing`: `done of total` and Cancel; `waiting`: groups, totals ("N files · X GB"), Cancel, Apply (disabled while
+  `selectionProblems` is non-empty, the problems are listed beside the totals); `applying`: read-only, only Close (it hides the window; above); `applied`: the report
+  (applied / skipped / failed with each reason) until dismissed, also for a plan that `failed` while applying; `replaced`, `expired`, `failed`: state text and Close.
+- **Selection rules** (`planSelection.ts`, pure): the initial selection is the plan's `selected` items and `chosen` copies; a locked item can never be
+  ticked, but it may be the copy that stays (a lock forbids moving a copy, not keeping it; only a non-candidate cannot be chosen); the kept copy (the group's current `chosen`) is never included, and choosing a ticked copy unticks it; a group with
+  ticked items and no `chosen` is "pick the copy that stays in <group title>". The selection starts over once, when a `preparing` plan turns
+  `waiting`. Outside `waiting` the window shows the plan's own selection (`initialSelection(plan)`, what the backend recorded), never its local
+  ticks, so a second page sees what another page applied. A group with some copies ticked shows half-ticked; one click unticks them all.
+- A failed command is logged (`console.error`) and raises one `notify()`; the window stays. No notification for progress.
+
 ## Logging
 
-One new log field: `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
-`find_missing_metadata`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
+New log fields: `via`, `plan_id`, `kind`, `applied`, `skipped`, `failed` (plans, above) and `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
+`find_missing_metadata`, `plan_status`, `find_rebuilt_masters`, `plan_black_hole`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
 name: it logs with `state` (`off`/`starting`/`serving`/`elsewhere`/`failed`), `addr` (the endpoint's text), `reason`
 (`timeout`, `too_long`, or a handshake refusal's word), `error` and `path`; never the key.

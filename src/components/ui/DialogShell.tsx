@@ -4,14 +4,18 @@ import { X } from 'lucide-react';
 import { Button } from './Button';
 import { isTopDialog, isTopOverlay, popOverlay, pushOverlay } from './overlayStack';
 
+const SIZE_CLASS = { sm: 'w-[440px]', md: 'w-[560px]', lg: 'flex max-h-[90vh] w-[960px] flex-col' } as const;
+
 const FOCUSABLE = 'button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
-/** Spec §7 — the one modal shell: scrim, centred window, header, body, footer. */
-export function DialogShell({ title, size = 'sm', onClose, busy = false, footer, children }: {
+/** Spec §7 — the one modal shell: scrim, centred window, header, body, footer. `lg` is the 960 px plan window: it keeps within 92vw / 90vh and only its body scrolls. */
+export function DialogShell({ title, size = 'sm', onClose, busy = false, closeOnScrim = true, footer, children }: {
   title: ReactNode;
-  size?: 'sm' | 'md';
+  size?: 'sm' | 'md' | 'lg';
   onClose: () => void;
   busy?: boolean;
+  /** A click on the scrim closes the dialog (default). A dialog whose close is a decision (a plan) turns it off; Esc and the cross stay. */
+  closeOnScrim?: boolean;
   footer?: ReactNode;
   children: ReactNode;
 }) {
@@ -62,7 +66,7 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
       onClick={(e) => {
         const fromScrim = pressOnScrim.current && e.target === e.currentTarget;
         pressOnScrim.current = false;
-        if (fromScrim && !busyRef.current) onClose();
+        if (fromScrim && closeOnScrim && !busyRef.current) onClose();
       }}
     >
       <div
@@ -72,14 +76,14 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
         aria-labelledby={titleId}
         tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
-        className={`max-w-[92vw] rounded-lg border border-border bg-surface-elevated px-4 py-3.5 text-[12.5px] leading-[1.4] text-content-muted shadow-[0_8px_24px_rgba(0,0,0,0.35)] ${size === 'md' ? 'w-[560px]' : 'w-[440px]'}`}
+        className={`max-w-[92vw] rounded-lg border border-border bg-surface-elevated px-4 py-3.5 text-[12.5px] leading-[1.4] text-content-muted shadow-[0_8px_24px_rgba(0,0,0,0.35)] ${SIZE_CLASS[size]}`}
       >
-        <div className="mb-2.5 flex items-start gap-2">
+        <div className="mb-2.5 flex shrink-0 items-start gap-2">
           <h2 id={titleId} className="min-w-0 flex-1 text-[13px] font-semibold text-content">{title}</h2>
           <Button size="sm" aria-label="Close" onClick={onClose} disabled={busy}><X size={12} /></Button>
         </div>
-        <div>{children}</div>
-        {footer !== undefined && <div className="mt-3.5 flex justify-end gap-2">{footer}</div>}
+        <div className={size === 'lg' ? 'min-h-0 flex-1 overflow-y-auto' : undefined}>{children}</div>
+        {footer !== undefined && <div className="mt-3.5 flex shrink-0 justify-end gap-2">{footer}</div>}
       </div>
     </div>,
     document.body,

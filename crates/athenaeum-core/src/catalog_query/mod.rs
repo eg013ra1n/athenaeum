@@ -177,7 +177,7 @@ pub struct FrameSetTotals {
 // ---- helpers over one frame ----
 
 /// The parent of a catalog path, split on the path's own separator; the root keeps its separator.
-fn parent_of(path: &str) -> String {
+pub(crate) fn parent_of(path: &str) -> String {
     let sep = native_separator_of(path);
     match path.rfind(sep) {
         None => String::new(),

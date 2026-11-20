@@ -6,6 +6,7 @@
 //! scope names nothing the catalog holds, and counts the Black Hole files the default state leaves out.
 
 mod catalog;
+pub(crate) mod plans;
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+pub use plans::{find_rebuilt_masters, plan_black_hole, plan_status, PlanStatusArgs};
 pub use catalog::{catalog_overview, file_details, find_duplicates, find_missing_metadata, query_frames};
 
 use super::{to_tool_result, Answer, McpHost};
@@ -90,7 +92,7 @@ pub struct FileArgs {
 /// Run a tool body on a blocking thread (it reads SQLite) and wrap what it answers.
 pub(crate) async fn run<F>(host: &Arc<McpHost>, body: F) -> CallToolResult
 where
-    F: FnOnce(&McpHost) -> Result<Answer, ApiError> + Send + 'static,
+    F: FnOnce(&Arc<McpHost>) -> Result<Answer, ApiError> + Send + 'static,
 {
     let worker = Arc::clone(host);
     let answer = match tokio::task::spawn_blocking(move || body(&worker)).await {

@@ -9,7 +9,7 @@
 // behaviour stay native) plus the mockup `.cb` box drawn as a sibling span
 // driven by the `peer` state: 13 px, radius 3, accent fill when checked.
 
-import type { ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 
 export interface CheckboxProps {
   checked: boolean;
@@ -26,15 +26,23 @@ export interface CheckboxProps {
   /** Accessible name that overrides the visible label (e.g. a switch whose
    *  label reads "On"/"Off" but which is named by what it controls). */
   ariaLabel?: string;
+  /** Some, not all: shows a dash and sets the input's `indeterminate` (read as "mixed"). Only shown while unchecked. */
+  indeterminate?: boolean;
 }
 
-export function Checkbox({ checked, onChange, label, description, disabled, size = 'md', role = 'checkbox', ariaLabel }: CheckboxProps) {
+export function Checkbox({ checked, onChange, label, description, disabled, size = 'md', role = 'checkbox', ariaLabel, indeterminate = false }: CheckboxProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const mixed = indeterminate && !checked;
+  useEffect(() => {
+    if (inputRef.current) inputRef.current.indeterminate = mixed;
+  }, [mixed]);
   const labelFont = size === 'sm' ? 'text-[12px] leading-4' : 'text-sm';
   // Centre the 13px box on the first label line: md = 20px line -> 3.5px, sm = 16px line -> 1.5px.
   const boxMargin = size === 'sm' ? 'mt-[1.5px]' : 'mt-[3.5px]';
   return (
     <label className={`relative flex items-start gap-2 ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}>
       <input
+        ref={inputRef}
         type="checkbox"
         role={role}
         aria-label={ariaLabel}
@@ -46,11 +54,16 @@ export function Checkbox({ checked, onChange, label, description, disabled, size
       <span
         data-testid="cb-box"
         aria-hidden
-        className={`relative ${boxMargin} inline-block h-[13px] w-[13px] shrink-0 rounded-[3px] border border-border bg-surface peer-checked:border-accent peer-checked:bg-accent peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-accent`}
+        className={`relative ${boxMargin} inline-block h-[13px] w-[13px] shrink-0 rounded-[3px] border border-border bg-surface peer-checked:border-accent peer-checked:bg-accent ${mixed ? 'border-accent bg-accent' : ''} peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-accent`}
       >
         {checked && (
           <svg width="9" height="9" viewBox="0 0 9 9" className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-surface">
             <path d="M1.5 4.5 3.5 6.5 7.5 2" stroke="currentColor" strokeWidth="2" fill="none" />
+          </svg>
+        )}
+        {mixed && (
+          <svg width="9" height="9" viewBox="0 0 9 9" className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-surface">
+            <path d="M2 4.5h5" stroke="currentColor" strokeWidth="2" fill="none" />
           </svg>
         )}
       </span>

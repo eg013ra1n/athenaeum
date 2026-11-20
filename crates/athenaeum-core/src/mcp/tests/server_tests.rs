@@ -229,7 +229,13 @@ fn assert_handles_are_named(v: &Value, whence: &str) {
     }
 }
 
-const TOOLS: [&str; 5] = ["catalog_overview", "file_details", "find_duplicates", "find_missing_metadata", "query_frames"];
+/// The tools the server offers, by name, from the router itself: a new tool never leaves a stale list here.
+fn tools() -> Vec<String> {
+    let mut names: Vec<String> =
+        crate::mcp::AthenaeumMcp::all_tools().list_all().into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+    names
+}
 
 // ---- tests ----
 
@@ -247,7 +253,7 @@ async fn both_revisions_list_the_same_tools() {
         seen.push(names);
         client.close().await;
     }
-    assert_eq!(seen[0], TOOLS.map(String::from).to_vec());
+    assert_eq!(seen[0], tools());
     assert_eq!(seen[0], seen[1], "both protocol revisions list the same tools");
     assert!(seen[0].iter().all(|n| !n.contains("apply")), "no tool applies a plan: {:?}", seen[0]);
 }
@@ -263,6 +269,16 @@ async fn the_server_introduces_itself() {
     assert_eq!(info.instructions.as_deref(), Some(INSTRUCTIONS));
     assert!(info.capabilities.tools.is_some());
     client.close().await;
+}
+
+/// What a client is told once: questions change nothing, changes are plans only the user applies in the window, and
+/// the outcome comes from `plan_status`, never from the assistant's own claim.
+#[test]
+fn the_instructions_say_plans_are_the_users() {
+    assert_eq!(
+        INSTRUCTIONS,
+        "Athenaeum answers about one astrophotography catalog; every answer starts with the build and catalog it came from. Questions change nothing. Changes are plans: a planning tool opens the plan in Athenaeum's window, where only the user can apply it — no tool applies a plan. Ask plan_status for the outcome and never report a plan as applied before plan_status says so. Name frames by file name and folder, not by handles."
+    );
 }
 
 #[tokio::test]

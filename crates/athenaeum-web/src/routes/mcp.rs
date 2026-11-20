@@ -1,4 +1,4 @@
-//! Assistant access (MCP) on the web build: the three commands the Settings page calls and the `/mcp` service an
+//! Assistant access (MCP) on the web build: the three commands the Settings page calls, the plan window's two, and the `/mcp` service an
 //! assistant connects to. The logic is core's (`athenaeum_core::api::mcp`, `mcp::McpHost`); this is the wrapper plus
 //! `/mcp`'s own gate. The mirror of `crates/athenaeum-tauri/src/commands/mcp.rs`.
 //!
@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use athenaeum_core::api::mcp as api;
-use athenaeum_core::mcp::{McpHost, McpStatus};
+use athenaeum_core::mcp::{McpHost, McpPlanView, McpStatus, PlanAnswer};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -31,6 +31,20 @@ const WRONG_KEY: &str = "Wrong or missing assistant access key.";
 #[serde(rename_all = "camelCase")]
 pub struct SetMcpEnabledReq {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMcpPlanReq {
+    #[serde(default)]
+    plan_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerMcpPlanReq {
+    plan_id: String,
+    answer: PlanAnswer,
 }
 
 fn host(state: &WebAppState) -> Result<&Arc<McpHost>, (StatusCode, String)> {
@@ -59,6 +73,24 @@ pub async fn set_mcp_enabled(
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn regenerate_mcp_token(State(state): State<WebAppState>) -> Result<Json<McpStatus>, (StatusCode, String)> {
     api::regenerate_mcp_token(host(&state)?).map(Json).map_err(api_err)
+}
+
+/// POST /api/get_mcp_plan: the plan by id, or the newest (`planId` absent); `null` when there is none.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_mcp_plan(
+    State(state): State<WebAppState>,
+    Json(req): Json<GetMcpPlanReq>,
+) -> Result<Json<Option<McpPlanView>>, (StatusCode, String)> {
+    Ok(Json(api::get_mcp_plan(host(&state)?, req.plan_id)))
+}
+
+/// POST /api/answer_mcp_plan: the user's Apply or Cancel from the plan window.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn answer_mcp_plan(
+    State(state): State<WebAppState>,
+    Json(req): Json<AnswerMcpPlanReq>,
+) -> Result<Json<McpPlanView>, (StatusCode, String)> {
+    api::answer_mcp_plan(host(&state)?, req.plan_id, req.answer).map(Json).map_err(api_err)
 }
 
 /// The Streamable HTTP service at `/mcp`, behind [`require_mcp_access`]. Nothing cancels the service: a cancelled
@@ -269,6 +301,58 @@ mod tests {
         assert_ne!(old, new);
         assert_eq!(mcp(&fx.app, Some(&old), None).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(mcp(&fx.app, Some(&new), None).await.0, StatusCode::OK);
+        fx.finish();
+    }
+
+    /// Every `/api` command of assistant access sits behind `ATHENAEUM_API_KEY`: the key is the router's own state
+    /// (`test_state`), so no process variable is set and no parallel test can see one.
+    #[tokio::test]
+    async fn every_mcp_api_route_needs_the_api_key() {
+        let fx = Fixture::new(Some("k"));
+        let routes = [
+            ("get_mcp_status", "{}"),
+            ("set_mcp_enabled", r#"{"enabled":false}"#),
+            ("regenerate_mcp_token", "{}"),
+            ("get_mcp_plan", "{}"),
+            ("answer_mcp_plan", r#"{"planId":"plan-nope","answer":{"action":"cancel"}}"#),
+        ];
+        for (command, body) in routes {
+            let (status, text) = api(&fx.app, command, body, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{command} without the key: {text}");
+            let (status, text) = api(&fx.app, command, body, Some("wrong")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{command} with a wrong key: {text}");
+            let (status, text) = api(&fx.app, command, body, Some("k")).await;
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "{command} with the key: {text}");
+        }
+        fx.finish();
+    }
+
+    #[tokio::test]
+    async fn the_plan_commands_answer_over_the_router() {
+        let fx = Fixture::new(Some("k"));
+        // No plan yet: the newest plan is null, not an error.
+        let (status, body) = api(&fx.app, "get_mcp_plan", "{}", Some("k")).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "null"));
+        let (status, body) = api(&fx.app, "get_mcp_plan", r#"{"planId":"plan-nope"}"#, Some("k")).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "null"));
+        // A plan the page opens: read it, cancel it, read it again.
+        let host = fx.state.mcp.get().expect("the host");
+        let (id, _) = host.plans.begin(host, athenaeum_core::mcp::PlanKind::BlackHole, "Move duplicates");
+        let (status, body) = api(&fx.app, "get_mcp_plan", "{}", Some("k")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((plan["planId"].as_str(), plan["state"]["kind"].as_str()), (Some(id.as_str()), Some("preparing")));
+        let cancel = format!(r#"{{"planId":"{id}","answer":{{"action":"cancel"}}}}"#);
+        let (status, body) = api(&fx.app, "answer_mcp_plan", &cancel, Some("k")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(plan["state"]["kind"], "cancelled");
+        // A plan that is decided cannot be cancelled again (400); one that is gone is a 404.
+        let (status, _) = api(&fx.app, "answer_mcp_plan", &cancel, Some("k")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let gone = r#"{"planId":"plan-nope","answer":{"action":"cancel"}}"#;
+        let (status, _) = api(&fx.app, "answer_mcp_plan", gone, Some("k")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         fx.finish();
     }
 

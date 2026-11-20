@@ -11,6 +11,7 @@
 pub mod answer;
 pub mod channel;
 pub mod lifecycle;
+pub mod plans;
 pub mod server;
 pub mod tools;
 
@@ -34,6 +35,7 @@ use crate::services::ServiceContext;
 
 pub use answer::{to_tool_result, Answer};
 pub use lifecycle::{desktop_client_config, McpStatus, NEEDS_API_KEY};
+pub use plans::{McpPlanView, PlanAnswer, PlanKind, PlanStore};
 pub use server::AthenaeumMcp;
 
 /// Which host embeds the server.
@@ -65,7 +67,7 @@ pub fn mcp_server_name() -> &'static str {
 }
 
 /// What an answer says it came from; the structured half's `source`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct McpSource {
     /// The build: the server name (`athenaeum` / `athenaeum-dev`).
@@ -91,6 +93,8 @@ pub struct McpHost {
     app_data_dir: OnceLock<PathBuf>,
     /// The local channel's state (`lifecycle.rs`).
     channel: Mutex<lifecycle::Channel>,
+    /// The app-wide plans an assistant prepares and only the user applies (`plans/`).
+    pub plans: plans::PlanStore,
 }
 
 impl McpHost {
@@ -113,6 +117,7 @@ impl McpHost {
             reader: OnceLock::new(),
             app_data_dir: OnceLock::new(),
             channel: Mutex::new(lifecycle::Channel::default()),
+            plans: plans::PlanStore::default(),
         })
     }
 
@@ -152,7 +157,7 @@ impl McpHost {
         &self.emitter
     }
 
-    /// Show Athenaeum's window (a plan opens there; Task 12).
+    /// Show Athenaeum's window (a plan opens there: `PlanStore::begin` calls it once per plan).
     pub fn bring_to_front(&self) {
         (self.bring_to_front)();
     }

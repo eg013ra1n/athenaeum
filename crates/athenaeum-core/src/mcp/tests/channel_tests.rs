@@ -17,7 +17,13 @@ use crate::events::NullEmitter;
 use crate::services::ServiceContext;
 
 const VERSION: &str = "9.9.9-test";
-const TOOLS: [&str; 5] = ["catalog_overview", "file_details", "find_duplicates", "find_missing_metadata", "query_frames"];
+/// The tools the server offers, by name, from the router itself: a new tool never leaves a stale list here.
+fn tools() -> Vec<String> {
+    let mut names: Vec<String> =
+        crate::mcp::AthenaeumMcp::all_tools().list_all().into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+    names
+}
 
 // ---- the rig ----
 
@@ -243,7 +249,7 @@ async fn tools_json_is_written_on_enable() {
     let served = serde_json::to_value(client.list_all_tools().await.expect("tools")).expect("to json");
     let _ = client.cancel().await;
     assert_eq!(on_disk["tools"], served, "tools.json is the server's own tools/list");
-    assert_eq!(on_disk["tools"].as_array().expect("tools").len(), TOOLS.len());
+    assert_eq!(on_disk["tools"].as_array().expect("tools").len(), tools().len());
     // No temp file is left beside it.
     let names: Vec<String> = std::fs::read_dir(rig.dir()).expect("dir").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).collect();
     assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
@@ -258,7 +264,7 @@ async fn frozen_v1_handshake_is_still_served() {
     let line = format!("ATHENAEUM-MCP/1 {}", rig.token());
     let (stream, reply) = shake(&rig.endpoint(), &line).await;
     assert_eq!(reply, format!("OK {} {VERSION}", mcp_server_name()));
-    assert_eq!(tool_names(stream).await, TOOLS.map(String::from).to_vec());
+    assert_eq!(tool_names(stream).await, tools());
     // A later channel protocol is refused in words, not served.
     let (_s, reply) = shake(&rig.endpoint(), &format!("ATHENAEUM-MCP/9 {}", rig.token())).await;
     assert!(reply.starts_with("ERR version "), "{reply}");
@@ -371,7 +377,7 @@ async fn enable_then_handshake_ok_then_mcp_flows() {
     }
     let (stream, reply) = shake(&rig.endpoint(), &format!("{HANDSHAKE_PREFIX} {}", rig.token())).await;
     assert_eq!(reply, format!("OK {} {VERSION}", mcp_server_name()));
-    assert_eq!(tool_names(stream).await, TOOLS.map(String::from).to_vec());
+    assert_eq!(tool_names(stream).await, tools());
     rig.finish().await;
 }
 
@@ -607,6 +613,42 @@ async fn a_quitting_instance_that_does_not_serve_leaves_the_files_alone() {
     let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
     assert!(reply.starts_with("OK "), "a bridge still gets in: {reply}");
     first.finish().await;
+}
+
+#[tokio::test]
+async fn a_failed_instance_turning_off_leaves_the_serving_instances_files() {
+    let first = desktop();
+    first.host.set_enabled(true).expect("on");
+    let endpoint = first.endpoint();
+    let token = first.token();
+    // A second instance of the build whose engage fails with an I/O error: its key file cannot be read.
+    std::fs::remove_file(first.file("token")).expect("take the key file away");
+    std::fs::create_dir(first.file("token")).expect("a folder in the key file's place");
+    let second = host_over(&first.ctx, HostKind::Desktop, false);
+    let status = second.set_enabled(true).expect("a channel that cannot start is a status, not an error");
+    assert_eq!(status.state, "failed", "{:?}", status.last_error);
+    // It turns off. The files it removes are its own, and it owns none: the serve lock is the first instance's.
+    second.set_enabled(false).expect("off in the failed instance");
+    assert!(first.file("enabled").exists(), "the serving instance's marker stays");
+    assert!(first.file("tools.json").exists(), "the serving instance's tool list stays");
+    assert!(first.file("endpoint").exists());
+    assert!(first.host.is_serving());
+    let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
+    assert!(reply.starts_with("OK "), "a bridge still gets in: {reply}");
+    second.shutdown();
+    drop(second);
+    first.finish().await;
+}
+
+#[tokio::test]
+async fn files_nobody_serves_are_removed_when_the_setting_goes_off() {
+    let rig = desktop();
+    std::fs::create_dir_all(rig.dir()).expect("the channel folder");
+    std::fs::write(rig.file("enabled"), "1").expect("a marker left by a crash");
+    std::fs::write(rig.file("tools.json"), "{}").expect("a tool list left by a crash");
+    rig.host.set_enabled(false).expect("off");
+    assert!(!rig.file("enabled").exists() && !rig.file("tools.json").exists(), "no instance serves, so they go");
+    rig.finish().await;
 }
 
 /// Sets a flag when it is dropped.

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use athenaeum_core::api::mcp as api;
-use athenaeum_core::mcp::{desktop_client_config, McpHost, McpStatus};
+use athenaeum_core::mcp::{desktop_client_config, McpHost, McpPlanView, McpStatus, PlanAnswer};
 use tauri::{AppHandle, Manager, State};
 
 use crate::mcp_bridge::{bridge_path_for, copies_to_app_data, refresh_bridge_copy, CopyOutcome};
@@ -119,4 +119,19 @@ pub async fn set_mcp_enabled(app_handle: AppHandle, host: State<'_, McpHostState
 pub async fn regenerate_mcp_token(app_handle: AppHandle, host: State<'_, McpHostState>) -> Result<McpStatus, String> {
     let status = api::regenerate_mcp_token(&host.0).map_err(|e| e.to_string())?;
     Ok(with_bridge(&app_handle, status))
+}
+
+/// The plan the window shows: the one by id, or the newest (`None`), so a window that opens later finds the plan that
+/// waits. `null` when there is none.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_mcp_plan(host: State<'_, McpHostState>, plan_id: Option<String>) -> Result<Option<McpPlanView>, String> {
+    Ok(api::get_mcp_plan(&host.0, plan_id))
+}
+
+/// The user's answer in the plan window: apply a selection, or cancel. The only way a plan is applied or cancelled.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn answer_mcp_plan(host: State<'_, McpHostState>, plan_id: String, answer: PlanAnswer) -> Result<McpPlanView, String> {
+    api::answer_mcp_plan(&host.0, plan_id, answer).map_err(|e| e.to_string())
 }

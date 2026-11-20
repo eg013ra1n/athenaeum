@@ -416,6 +416,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_mcp_status", post(mcp::get_mcp_status))
         .route("/api/set_mcp_enabled", post(mcp::set_mcp_enabled))
         .route("/api/regenerate_mcp_token", post(mcp::regenerate_mcp_token))
+        .route("/api/get_mcp_plan", post(mcp::get_mcp_plan))
+        .route("/api/answer_mcp_plan", post(mcp::answer_mcp_plan))
         .route("/api/get_log_path", post(get_log_path))
         .route("/api/get_database_path", post(get_database_path))
         // Category A — Desktop-only stubs
