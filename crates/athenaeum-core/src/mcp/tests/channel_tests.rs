@@ -17,7 +17,7 @@ use crate::events::NullEmitter;
 use crate::services::ServiceContext;
 
 const VERSION: &str = "9.9.9-test";
-const TOOLS: [&str; 5] = ["catalog_overview", "file_details", "find_duplicates", "find_missing_metadata", "query_frames"];
+const TOOLS: [&str; 6] = ["catalog_overview", "file_details", "find_duplicates", "find_missing_metadata", "plan_status", "query_frames"];
 
 // ---- the rig ----
 
@@ -607,6 +607,42 @@ async fn a_quitting_instance_that_does_not_serve_leaves_the_files_alone() {
     let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
     assert!(reply.starts_with("OK "), "a bridge still gets in: {reply}");
     first.finish().await;
+}
+
+#[tokio::test]
+async fn a_failed_instance_turning_off_leaves_the_serving_instances_files() {
+    let first = desktop();
+    first.host.set_enabled(true).expect("on");
+    let endpoint = first.endpoint();
+    let token = first.token();
+    // A second instance of the build whose engage fails with an I/O error: its key file cannot be read.
+    std::fs::remove_file(first.file("token")).expect("take the key file away");
+    std::fs::create_dir(first.file("token")).expect("a folder in the key file's place");
+    let second = host_over(&first.ctx, HostKind::Desktop, false);
+    let status = second.set_enabled(true).expect("a channel that cannot start is a status, not an error");
+    assert_eq!(status.state, "failed", "{:?}", status.last_error);
+    // It turns off. The files it removes are its own, and it owns none: the serve lock is the first instance's.
+    second.set_enabled(false).expect("off in the failed instance");
+    assert!(first.file("enabled").exists(), "the serving instance's marker stays");
+    assert!(first.file("tools.json").exists(), "the serving instance's tool list stays");
+    assert!(first.file("endpoint").exists());
+    assert!(first.host.is_serving());
+    let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
+    assert!(reply.starts_with("OK "), "a bridge still gets in: {reply}");
+    second.shutdown();
+    drop(second);
+    first.finish().await;
+}
+
+#[tokio::test]
+async fn files_nobody_serves_are_removed_when_the_setting_goes_off() {
+    let rig = desktop();
+    std::fs::create_dir_all(rig.dir()).expect("the channel folder");
+    std::fs::write(rig.file("enabled"), "1").expect("a marker left by a crash");
+    std::fs::write(rig.file("tools.json"), "{}").expect("a tool list left by a crash");
+    rig.host.set_enabled(false).expect("off");
+    assert!(!rig.file("enabled").exists() && !rig.file("tools.json").exists(), "no instance serves, so they go");
+    rig.finish().await;
 }
 
 /// Sets a flag when it is dropped.

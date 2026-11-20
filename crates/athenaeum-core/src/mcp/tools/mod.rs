@@ -6,6 +6,7 @@
 //! scope names nothing the catalog holds, and counts the Black Hole files the default state leaves out.
 
 mod catalog;
+pub(crate) mod plans;
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+pub use plans::{plan_status, PlanStatusArgs};
 pub use catalog::{catalog_overview, file_details, find_duplicates, find_missing_metadata, query_frames};
 
 use super::{to_tool_result, Answer, McpHost};

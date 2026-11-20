@@ -269,7 +269,11 @@ impl McpHost {
 
     fn stored_enabled(&self) -> Result<bool, ApiError> {
         let database = crate::api::db(&self.ctx)?;
-        let conn = database.conn();
+        // `try_conn`, not `conn`: a pool timeout must be an error here, never a panic that ends the 30 s watch task.
+        let conn = database.try_conn().map_err(|e| {
+            tracing::warn!(error = %e, "mcp setting could not be read: no catalog connection was free");
+            ApiError::Conflict(format!("the catalog is busy; the assistant setting could not be read: {e}"))
+        })?;
         let value = crate::db::get_setting(&conn, crate::settings::keys::MCP_ENABLED).map_err(|e| {
             tracing::error!(error = %e, "mcp setting could not be read");
             ApiError::Internal(e.to_string())
@@ -422,7 +426,7 @@ impl McpHost {
 
     /// The server's `tools/list` result, as written to `tools.json`: what a bridge serves when the app is not running.
     pub fn tool_list_json(&self) -> String {
-        let tools = AthenaeumMcp::catalog_tools().list_all();
+        let tools = AthenaeumMcp::all_tools().list_all();
         match serde_json::to_value(&tools) {
             Ok(tools) => serde_json::json!({ "tools": tools }).to_string(),
             Err(e) => {
@@ -689,12 +693,12 @@ impl McpHost {
     }
 
     /// Cancels the listener and every connection and removes what this instance made. A second instance's
-    /// (`elsewhere`) files are not ours and stay. `forget` also removes the marker and the tool list.
+    /// (`elsewhere`) files are not ours and stay. `forget` also removes the marker and the tool list, and only while
+    /// the serve lock is held: this instance's own, or one taken for the moment when no instance serves (a failed or
+    /// never-bound instance turning off). While another instance holds the lock the marker and the tool list are its.
     fn close_channel(&self, ch: &mut Channel, forget: bool) {
-        // The serve lock says who made `endpoint`; read before it is released below. The marker and the tool list on
-        // `forget` also go for an instance that never served (a failed start), but never for one that waits `elsewhere`.
+        // The serve lock says who made `endpoint`; read before it is released below.
         let owned = ch.lock.is_some();
-        let owns_marker = owned || ch.state != State::Elsewhere;
         // Dropping the run closes the listener and every connection before this returns.
         drop(ch.run.take());
         if let Some(endpoint) = ch.endpoint.take() {
@@ -707,15 +711,41 @@ impl McpHost {
                 remove_file_quiet(&dir.join("endpoint"));
             }
         }
-        if forget && owns_marker {
-            if let Ok(dir) = self.channel_dir() {
-                remove_file_quiet(&dir.join("enabled"));
-                remove_file_quiet(&dir.join("tools.json"));
-            }
+        if forget {
+            self.forget_marker(owned);
         }
         // Last: another instance may take the lock the moment it is released, so this instance's files go first.
         ch.lock = None;
         ch.watch = None;
+    }
+
+    /// Removes the `enabled` marker and `tools.json`, holding the serve lock while it does. `owned`: this instance
+    /// holds it already. Otherwise it is tried: free means no instance serves and the files are stale; taken means
+    /// another instance serves and they are its.
+    fn forget_marker(&self, owned: bool) {
+        let Ok(dir) = self.channel_dir() else { return };
+        let files = [dir.join("enabled"), dir.join("tools.json")];
+        if !owned && !files.iter().any(|f| f.exists()) {
+            return;
+        }
+        let _briefly = if owned {
+            None
+        } else {
+            match acquire_serve_lock(&dir) {
+                Ok(lock) => Some(lock),
+                Err(LockError::Elsewhere) => {
+                    tracing::debug!("mcp marker left in place: another instance of this build serves");
+                    return;
+                }
+                Err(LockError::Io(e)) => {
+                    tracing::warn!(error = %e, "mcp marker left in place: the serve lock could not be tried");
+                    return;
+                }
+            }
+        };
+        for file in &files {
+            remove_file_quiet(file);
+        }
     }
 
     // ---- what a connection asks ----
