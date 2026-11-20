@@ -7,8 +7,20 @@
 //! the night's. A frame with `frames.is_master = 1` is a master everywhere: its type reads as the master kind, and
 //! only raw LIGHT frames count in `lights` and `integration_s`.
 
+mod calibration;
+mod details;
+mod quality;
+mod storage;
+
+#[cfg(test)]
+mod summary_tests;
 #[cfg(test)]
 mod tests;
+
+pub use calibration::{calibration_summary, CalibrationLine, FRAME_SETS_PAGE};
+pub use details::{file_details, FileDetails};
+pub use quality::{quality_summary, QualityMetric, QualitySummary, OUTLIERS_SHOWN};
+pub use storage::{storage_summary, StorageLine, StorageSummary};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
