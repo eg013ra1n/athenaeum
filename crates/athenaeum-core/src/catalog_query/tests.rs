@@ -181,11 +181,33 @@ fn format_duration_reads_in_the_unit_that_fits() {
 }
 
 #[test]
-fn the_black_hole_sentence_needs_a_real_excess() {
-    assert_eq!(black_hole_in_total(1800.0, 1500.0, (1, 300.0)), Some((1, 300.0)));
-    assert_eq!(black_hole_in_total(1500.0, 1500.0, (1, 300.0)), None);
-    assert_eq!(black_hole_in_total(1500.4, 1500.0, (1, 300.0)), None, "within 0.5 s");
-    assert_eq!(black_hole_in_total(1800.0, 1500.0, (0, 0.0)), None, "nothing to name");
+fn paths_split_on_their_own_separator_on_every_host() {
+    assert_eq!(parent_of("C:\\data\\n\\a.fits"), "C:\\data\\n");
+    assert_eq!(parent_of("C:\\a.fits"), "C:\\");
+    assert_eq!(parent_of("/a.fits"), "/");
+    assert_eq!(parent_of("\\\\server\\share\\n\\a.fits"), "\\\\server\\share\\n");
+    let roots = vec![("C:\\data\\".to_string(), "C:\\data".to_string(), "main".to_string())];
+    assert_eq!(scan_root_of(&roots, "C:\\data\\n\\a.fits"), Some(("C:\\data".to_string(), "main".to_string())));
+    assert_eq!(scan_root_of(&roots, "C:\\database\\a.fits"), None, "a longer name is not inside the root");
+}
+
+#[test]
+fn a_missing_filter_has_one_spelling() {
+    let conn = catalog();
+    let dir = if cfg!(windows) { "C:\\data\\n" } else { "/data/n" };
+    let (_, f) = light(&conn, dir, "x.fits", "  ");
+    let set = set_of(&conn, "IC 5146", false, None, &[f]);
+    let t = frame_set_totals(&conn, set).unwrap();
+    assert_eq!(t.by_filter, vec![("(no filter)".to_string(), 1, 300.0)]);
+    assert_eq!(none_of("filter"), "(no filter)");
+}
+
+#[test]
+fn every_state_name_round_trips() {
+    for s in FrameState::ALL {
+        assert_eq!(state_from_name(state_name(s)), Some(s));
+    }
+    assert_eq!(state_from_name("nope"), None);
 }
 
 // ---- a real catalog ----
@@ -403,7 +425,7 @@ fn frame_set_totals_equal_the_page() {
     assert_eq!(t.frames, 6);
     assert_eq!(t.integration_s, total);
     assert_eq!(t.integration_s, 1800.0);
-    assert_eq!(t.black_hole_in_total, None);
+    assert_eq!(t.black_hole_left_out, None);
     assert_eq!(t.by_filter, vec![("H".to_string(), 3, 900.0), ("O".to_string(), 3, 900.0)]);
 }
 
@@ -419,15 +441,30 @@ fn black_hole_member_left_out() {
     assert_eq!(t.integration_s, total, "the figure is the page's, whatever the stored column still says");
     assert_eq!(t.integration_s, 1500.0);
     assert_eq!(t.by_filter, vec![("H".to_string(), 2, 600.0), ("O".to_string(), 3, 900.0)]);
-    assert_eq!(t.black_hole_in_total, None, "the page's figure leaves the Black Hole out: nothing to say");
+    assert_eq!(t.black_hole_left_out, Some((1, 300.0)), "the member the page leaves out is named");
 }
 
 #[test]
-fn no_black_hole_note_when_the_total_leaves_them_out() {
+fn no_black_hole_note_when_none_is_in_the_black_hole() {
     let conn = catalog();
-    let (set, rows) = six_lights(&conn, None);
-    black_hole(&conn, rows[3].0);
-    assert_eq!(frame_set_totals(&conn, set).unwrap().black_hole_in_total, None);
+    let (set, _) = six_lights(&conn, None);
+    assert_eq!(frame_set_totals(&conn, set).unwrap().black_hole_left_out, None);
+}
+
+#[test]
+fn a_member_that_is_not_a_light_is_no_black_hole_note() {
+    let conn = catalog();
+    let dir = if cfg!(windows) { "C:\\data\\n" } else { "/data/n" };
+    let (_, l) = light(&conn, dir, "l.fits", "H");
+    let (_, d) = add(
+        &conn,
+        dir,
+        &Add { name: "d.fits", filter: "H", kind: ImageType::Dark, exptime: 300.0, date_obs: "2024-10-05T22:00:00Z", zip: None },
+    );
+    let set = set_of(&conn, "IC 5146", false, None, &[l, d]);
+    let t = frame_set_totals(&conn, set).unwrap();
+    assert_eq!(t.frames, 2);
+    assert_eq!(t.black_hole_left_out, None, "a dark with an exposure is not a Black Hole member");
 }
 
 #[test]

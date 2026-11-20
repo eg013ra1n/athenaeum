@@ -148,8 +148,9 @@ pub struct FrameSetTotals {
     pub frames: usize,
     /// The page's integration time, seconds.
     pub integration_s: f64,
-    /// Black Hole members' (lights, seconds) when the total counts them.
-    pub black_hole_in_total: Option<(usize, f64)>,
+    /// The set's members now in the Black Hole, which the page's figures leave out: (frames, seconds). `None`
+    /// when there are none.
+    pub black_hole_left_out: Option<(usize, f64)>,
     /// Per filter: (filter, frames, seconds) over the same members.
     pub by_filter: Vec<(String, usize, f64)>,
 }
@@ -204,9 +205,7 @@ fn state_name(state: FrameState) -> &'static str {
 }
 
 fn state_from_name(name: &str) -> Option<FrameState> {
-    [FrameState::Catalog, FrameState::SoftArchived, FrameState::Zipped, FrameState::BlackHole]
-        .into_iter()
-        .find(|s| state_name(*s) == name)
+    FrameState::ALL.into_iter().find(|s| state_name(*s) == name)
 }
 
 const NO_VALUE: &str = "(no ";
@@ -559,24 +558,16 @@ fn scan_root_of(roots: &[(String, String, String)], file_path: &str) -> Option<(
 
 // ---- frame set parity ----
 
-/// The Black Hole sentence's numbers: `Some(black hole members)` when the page's total exceeds the raw lights
-/// outside the Black Hole by more than half a second and there are Black Hole lights to name.
-fn black_hole_in_total(total_s: f64, lights_outside_s: f64, in_black_hole: (usize, f64)) -> Option<(usize, f64)> {
-    (total_s - lights_outside_s > 0.5 && in_black_hole.0 > 0).then_some(in_black_hole)
-}
-
 /// SQL on `frames f`: a member of set `?1`.
 const MEMBER_OF_SET: &str = "f.id IN (SELECT msm.frame_id FROM session_members msm \
      JOIN sessions ms ON ms.id = msm.session_id \
      JOIN imaging_nights mn ON mn.id = ms.imaging_night_id \
      WHERE mn.frames_set_id = ?1)";
 
-const RAW_LIGHT: &str = "f.imagetyp = 'Light' AND COALESCE(f.is_master, 0) = 0";
-
 /// A frame set's figures from the catalog's own page query: `frames` is the member count and `integration_s` the
 /// total the page shows (`get_frames_sets_by_project`), so the two cannot differ from the page. `by_filter` reads
-/// the same members. `black_hole_in_total` is `Some` when that total counts Black Hole lights the page's rule
-/// leaves out, which the page's present rule never does (see the Task 2 report).
+/// the same members. `black_hole_left_out` counts the set's members now in the Black Hole (used copy, every member
+/// type), which the page's figures leave out.
 pub fn frame_set_totals(conn: &Connection, frames_set_id: i64) -> Result<FrameSetTotals> {
     let (set, members) = crate::db::get_frames_sets_by_project(conn, 0)
         .context("read frame sets")?
@@ -588,8 +579,9 @@ pub fn frame_set_totals(conn: &Connection, frames_set_id: i64) -> Result<FrameSe
     let used = frame_is_used_copy_sql("?1");
     let usable = format!("{MEMBER_OF_SET} AND {FRAME_NOT_IN_BLACK_HOLE_SQL} AND {used}");
 
+    let no_filter = none_of("filter");
     let by_filter_sql = format!(
-        "SELECT COALESCE(NULLIF(TRIM(f.filter), ''), 'no filter'), COUNT(*), COALESCE(SUM(f.exptime), 0) \
+        "SELECT COALESCE(NULLIF(TRIM(f.filter), ''), '{no_filter}'), COUNT(*), COALESCE(SUM(f.exptime), 0) \
          FROM frames f WHERE {usable} GROUP BY 1 ORDER BY 1"
     );
     let mut stmt = conn.prepare(&by_filter_sql).with_context(|| format!("prepare set filters: {by_filter_sql}"))?;
@@ -600,23 +592,14 @@ pub fn frame_set_totals(conn: &Connection, frames_set_id: i64) -> Result<FrameSe
         .context("read set filters")?;
     drop(stmt);
 
-    let outside_sql = format!("SELECT COALESCE(SUM(f.exptime), 0) FROM frames f WHERE {usable} AND {RAW_LIGHT}");
-    let lights_outside_s: f64 = conn
-        .query_row(&outside_sql, [frames_set_id], |r| r.get(0))
-        .with_context(|| format!("read set light time: {outside_sql}"))?;
+    let left_out_sql = format!(
+        "SELECT COUNT(*), COALESCE(SUM(f.exptime), 0) FROM frames f \
+         WHERE {MEMBER_OF_SET} AND NOT {FRAME_NOT_IN_BLACK_HOLE_SQL} AND {used}"
+    );
+    let (left_out_n, left_out_s): (i64, f64) = conn
+        .query_row(&left_out_sql, [frames_set_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .with_context(|| format!("read set Black Hole members: {left_out_sql}"))?;
+    let black_hole_left_out = (left_out_n > 0).then_some((left_out_n as usize, left_out_s));
 
-    let black_hole_in_total = if integration_s - lights_outside_s > 0.5 {
-        let bh_sql = format!(
-            "SELECT COUNT(*), COALESCE(SUM(f.exptime), 0) FROM frames f \
-             WHERE {MEMBER_OF_SET} AND NOT {FRAME_NOT_IN_BLACK_HOLE_SQL} AND {RAW_LIGHT}"
-        );
-        let (n, s): (i64, f64) = conn
-            .query_row(&bh_sql, [frames_set_id], |r| Ok((r.get(0)?, r.get(1)?)))
-            .with_context(|| format!("read set Black Hole lights: {bh_sql}"))?;
-        black_hole_in_total(integration_s, lights_outside_s, (n as usize, s))
-    } else {
-        None
-    };
-
-    Ok(FrameSetTotals { frames: members, integration_s, black_hole_in_total, by_filter })
+    Ok(FrameSetTotals { frames: members, integration_s, black_hole_left_out, by_filter })
 }

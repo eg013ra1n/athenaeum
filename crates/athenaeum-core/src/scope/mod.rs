@@ -42,7 +42,7 @@ pub enum FrameState {
 impl FrameState {
     /// What a scope without a `state` covers: everything but the Black Hole.
     pub const DEFAULT: [FrameState; 3] = [FrameState::Catalog, FrameState::SoftArchived, FrameState::Zipped];
-    const ALL: [FrameState; 4] =
+    pub(crate) const ALL: [FrameState; 4] =
         [FrameState::Catalog, FrameState::SoftArchived, FrameState::Zipped, FrameState::BlackHole];
 
     fn label(self) -> &'static str {
