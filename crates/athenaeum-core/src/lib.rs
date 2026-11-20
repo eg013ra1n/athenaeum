@@ -51,6 +51,7 @@ pub mod orientation;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod catalog;
 pub mod scope;
+pub mod catalog_query;
 // plate_solve + registration consume both astroimage and solvemyastro.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod plate_solve;

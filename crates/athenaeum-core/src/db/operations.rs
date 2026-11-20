@@ -1258,7 +1258,7 @@ pub(crate) const FILE_FRAME_SELECT: &str =
 /// Number of columns in [`FILE_FRAME_SELECT`], i.e. the index of the first
 /// column a caller appends after the shared block. Pinned against the real
 /// prepared statement by `shared_projection_column_count_matches_const`.
-const FILE_FRAME_COLUMNS: usize = 51;
+pub(crate) const FILE_FRAME_COLUMNS: usize = 51;
 
 /// Index of `fr.id` inside [`FILE_FRAME_SELECT`] — `NULL` there means the
 /// LEFT JOIN found no `frames` row for the file.
