@@ -25,6 +25,7 @@ An assistant (Claude desktop, Claude Code, ...) asks Athenaeum about one astroph
 | `Answer`, `to_tool_result` (line 1 + both halves) | `mcp/answer.rs` |
 | `AthenaeumMcp` (the rmcp handler, `INSTRUCTIONS`) | `mcp/server.rs` |
 | Tool bodies, argument types, the scope step | `mcp/tools/{mod,catalog,plans}.rs` |
+| The Black Hole plan: planner, applier, fixtures | `mcp/plans/black_hole.rs`, `black_hole_tests.rs` |
 | Tests (a client over `tokio::io::duplex`, both protocol revisions) | `mcp/tests/server_tests.rs` |
 
 `McpHost::new` opens nothing; `on_catalog_open` opens the reader and reconciles the local channel to the stored setting. Before it, `reader()` and `source()` are `Conflict("Athenaeum is starting ...")` and every tool answers that in
@@ -47,7 +48,7 @@ Every answer is two halves that each read on their own.
 - **The default state says what it leaves out:** the last line is `Black Hole files are left out (N)`, structured
   `blackHoleLeftOut`.
 
-## Tools (the catalog questions, and `plan_status`)
+## Tools (the catalog questions, the plan tools, and `plan_status`)
 
 | Tool | Answers |
 | ---- | ------- |
@@ -56,7 +57,9 @@ Every answer is two halves that each read on their own.
 | `file_details` | One file: header values, stored measurements and whether they are current, transparency, calibration links, copies, plate solve |
 | `find_duplicates` | Duplicate groups with a copy in the scope, each copy with file name, folder, scan root kind and a processing-folder note |
 | `find_missing_metadata` | The Missing Metadata view's rows inside the scope: counts per category, folders, a page of files |
-| `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`) |
+| `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many frames calibration links point at each; not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); the scope narrows which masters are considered |
+| `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window |
+| `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied") |
 
 Each tool is a core fn `mcp::tools::<name>(host, args) -> Result<Answer, ApiError>` wearing
 `#[tracing::instrument(skip_all, fields(tool = "<name>"), err)]`; `AthenaeumMcp::all_tools()` (`server.rs`) joins the tool routers (`catalog_tools() + plan_tools()`, and `tools.json` is written from it); the `#[tool]` method is a two-line adapter that runs it with
@@ -251,9 +254,37 @@ MCP client can call applies or cancels a plan: `PlanStore::answer` is reached on
 - **Logging.** Span `mcp_plan_apply` (`plan_id`, `kind`), ending `info!(via = "mcp", plan_id, kind, applied, skipped, failed, "mcp plan applied")`.
   `log-mcp` lists it as an operation keyed by `plan_id`.
 
+## Black Hole plans (`plan_black_hole`)
+
+`mcp/plans/black_hole.rs`. An assistant names groups (`dup:<key>:<hash>` from `find_duplicates`, `rebuilt:<id>` from `find_rebuilt_masters`);
+only those groups enter the plan. The handles are read before the plan begins, so a mistyped or stale handle (or the other source's) is an
+`Invalid` in words and never replaces the plan the user is looking at.
+
+- **One keeper per group** ("Copy that stays", `chooseOne`): `chosen` is the one copy under `keepInFolder` (separator-strict: the folder or
+  anything below it, never a folder that merely starts like it) or among `keepFiles` (`file:<n>` or the stored path). None or several: `chosen`
+  is null, nothing is selected and the group's note says `no instruction picks the copy that stays here (2 copies under <folder>)`. The other
+  copies are include/exclude items, selected iff a keeper is set.
+- **Locked, with the reason:** the keeper (`stays`); a master with calibration links (`calibration links point at it; it stays in v1`, counted by
+  `rebuilt_copies::master_link_count`, the one link count); a copy whose master set superseded raw frames (`raw frames were superseded by it; it
+  stays in v1`: moving it would un-supersede them, `master_unregister`); a zip-resident copy (`inside a zip; a zip moves to the Black Hole only as
+  a whole`); a copy whose file cannot be stamped (`not reachable ...`); a header-key copy whose bytes differ from the keeper's (`differs in bytes
+  from the copy that stays`, with a group note).
+- **Byte checks** (header-key groups only; the other keys decide on bytes already): while the plan is `preparing`, each unlocked copy is compared
+  with the keeper by `verify_duplicate_pair` on the tool's blocking thread, progress per pair, the plan's cancel flag read between pairs (a plan the
+  user cancels or a newer plan replaces stops there and answers in words). No reader guard and no pooled connection is held across a comparison.
+- **Apply** (after the store's stamp re-check of the included items and the kept copy): a group whose keeper is in the Black Hole now is skipped as a
+  whole; every master item is re-checked for links and for superseding (skipped with the lock's reason); an item already in the Black Hole is
+  skipped; a header-key group whose `chosen` is not the copy the plan compared against is compared again (a differing pair is skipped). The rest
+  goes through `api::black_hole::bulk_move_to_black_hole(ctx, ids, "assistant", None, emitter)`: one `blackhole-changed` with `count` = moved, no
+  per-file progress events; `BulkMoveResult.failed` fills the report's `failed`.
+- **`validate`** is in memory (no SQLite, so the hosts' `answer_mcp_plan` wrappers need no `spawn_blocking` for it): an included item needs a
+  `chosen` (`pick the copy that stays ...`) and `chosen` is never included. The window shows what it asked for: a locked keeper cannot be swapped
+  inside one plan; ask for a new plan with another `keepFiles`.
+- Columns: IMAGETYP, OBJECT, FILTER, EXPTIME, DATE-OBS, INSTRUME, size, modified.
+
 ## Logging
 
 New log fields: `via`, `plan_id`, `kind`, `applied`, `skipped`, `failed` (plans, above) and `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
-`find_missing_metadata`, `plan_status`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
+`find_missing_metadata`, `plan_status`, `find_rebuilt_masters`, `plan_black_hole`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
 name: it logs with `state` (`off`/`starting`/`serving`/`elsewhere`/`failed`), `addr` (the endpoint's text), `reason`
 (`timeout`, `too_long`, or a handshake refusal's word), `error` and `path`; never the key.

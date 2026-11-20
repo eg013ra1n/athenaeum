@@ -229,7 +229,16 @@ fn assert_handles_are_named(v: &Value, whence: &str) {
     }
 }
 
-const TOOLS: [&str; 6] = ["catalog_overview", "file_details", "find_duplicates", "find_missing_metadata", "plan_status", "query_frames"];
+const TOOLS: [&str; 8] = [
+    "catalog_overview",
+    "file_details",
+    "find_duplicates",
+    "find_missing_metadata",
+    "find_rebuilt_masters",
+    "plan_black_hole",
+    "plan_status",
+    "query_frames",
+];
 
 // ---- tests ----
 

@@ -17,7 +17,16 @@ use crate::events::NullEmitter;
 use crate::services::ServiceContext;
 
 const VERSION: &str = "9.9.9-test";
-const TOOLS: [&str; 6] = ["catalog_overview", "file_details", "find_duplicates", "find_missing_metadata", "plan_status", "query_frames"];
+const TOOLS: [&str; 8] = [
+    "catalog_overview",
+    "file_details",
+    "find_duplicates",
+    "find_missing_metadata",
+    "find_rebuilt_masters",
+    "plan_black_hole",
+    "plan_status",
+    "query_frames",
+];
 
 // ---- the rig ----
 

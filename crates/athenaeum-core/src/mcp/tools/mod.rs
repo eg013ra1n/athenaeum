@@ -16,7 +16,7 @@ use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-pub use plans::{plan_status, PlanStatusArgs};
+pub use plans::{find_rebuilt_masters, plan_black_hole, plan_status, PlanStatusArgs};
 pub use catalog::{catalog_overview, file_details, find_duplicates, find_missing_metadata, query_frames};
 
 use super::{to_tool_result, Answer, McpHost};
