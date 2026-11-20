@@ -224,9 +224,35 @@ build's own target before each `npx tauri build` (`docs/release/README.md`). The
 The web image has no bridge (the Dockerfile drops the crate from the workspace). The bridge is versioned with the app (`bump.sh`,
 `check_versions.sh`).
 
+## Plans (the store and the apply framework)
+
+`mcp/plans/` (`McpHost.plans`). A plan is what an assistant prepares and only the user applies, in Athenaeum's window. Nothing an
+MCP client can call applies or cancels a plan: `PlanStore::answer` is reached only from the window's command.
+
+| Item | Where |
+| ---- | ---- |
+| The store: `begin`, `progress`, `publish`, `fail`, `view`, `answer`, `plan_opened_text`, `PLAN_TTL`, `PLAN_ITEM_CAP` | `plans/mod.rs` |
+| The DTOs the window reads (`McpPlanView`, `PlanState`, `PlanAnswer`, ...), `DiskStamp`, `ItemSnapshot`, `PlanContent` | `plans/model.rs` (TS in `src/types/mcp.ts`) |
+| The generic selection check and the re-check at apply | `plans/apply.rs` |
+
+- **One undecided plan.** `begin` makes the old `preparing` / `waiting` plan `replaced` (`replacedBy` = the new id, its cancel flag set). A
+  replaced, cancelled, expired or applied plan stays readable by its id for 24 h (at most 100 finished plans); `view(None)` is the newest.
+- **Expiry is on tokio time.** `publish` stores a `tokio::time::Instant` deadline (`PLAN_TTL`, one hour); the sleeper and the apply check
+  both read it, so a test pauses time. `expiresAt` is display text (local time, `YYYY-MM-DD HH:MM:SS`).
+- **Apply.** `Apply` only from `waiting`, unexpired. The generic check (known groups and items, no locked item included, `chosen` a
+  candidate, something selected) and the kind's `PlanApplier::validate` run first; then the plan is `applying` and a thread re-stamps every
+  included item and each group's kept copy (`disk_stamp`; a zip-resident row stamps its zip, `files.archive_zip_path`; paths are never
+  `canonicalize`d) and re-reads the catalog values captured at planning (`catalog_values`). A changed item is skipped with its reason
+  (`changed on disk since the plan (size A → B)`, `missing`, `catalog changed: OBJECT is now 'X'`); a changed or missing kept copy skips its
+  whole group. The applier acts on what is fresh; the report merges both sets of skips.
+- **Events.** `mcp-plan-updated {"planId"}` on begin (and for the plan it replaced), publish, fail, apply start, applied, cancel and expiry;
+  no other name, and `bring_to_front` once per `begin`.
+- **Logging.** Span `mcp_plan_apply` (`plan_id`, `kind`), ending `info!(via = "mcp", plan_id, kind, applied, skipped, failed, "mcp plan applied")`.
+  `log-mcp` lists it as an operation keyed by `plan_id`.
+
 ## Logging
 
-One new log field: `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
+New log fields: `via`, `plan_id`, `kind`, `applied`, `skipped`, `failed` (plans, above) and `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
 `find_missing_metadata`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
 name: it logs with `state` (`off`/`starting`/`serving`/`elsewhere`/`failed`), `addr` (the endpoint's text), `reason`
 (`timeout`, `too_long`, or a handshake refusal's word), `error` and `path`; never the key.

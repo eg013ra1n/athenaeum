@@ -60,7 +60,8 @@ inactive.
 Operation kinds and their id fields: `scan` (`root_id`), `archive_op`
 (`operation_id`), `file_op` (`operation_id`), `solve` (`frame_id`), `export`
 (`frame_set_id`), `registration` (`frame_set_id`), `zero_point_solve_pass`
-(`catalog`, the installed star catalogue's identity; the pass after a solve batch, `api::analysis`).
+(`catalog`, the installed star catalogue's identity; the pass after a solve batch, `api::analysis`), `mcp_plan_apply`
+(`plan_id`; the apply of an assistant's plan, `mcp::plans`).
 
 ## Querying with log-mcp
 

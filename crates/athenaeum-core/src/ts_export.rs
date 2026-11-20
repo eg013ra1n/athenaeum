@@ -484,9 +484,21 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::stacking_aligned::AlignedState,
             crate::api::stacking_aligned::AlignedFrameStatus,
         ]))),
-        // Assistant access (MCP plan Task 6): the Settings section's status. Task 12 adds the plan types here.
+        // Assistant access: the Settings section's status (Task 6) and the plan window's types (Task 12).
         ("mcp.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::mcp::McpStatus,
+            crate::mcp::McpSource,
+            crate::mcp::plans::PlanState,
+            crate::mcp::plans::PlanKind,
+            crate::mcp::plans::PlanColumn,
+            crate::mcp::plans::PlanItem,
+            crate::mcp::plans::PlanGroup,
+            crate::mcp::plans::ReportLine,
+            crate::mcp::plans::PlanReport,
+            crate::mcp::plans::McpPlanView,
+            crate::mcp::plans::GroupSelection,
+            crate::mcp::plans::PlanSelection,
+            crate::mcp::plans::PlanAnswer,
         ]))),
     ]
 }
