@@ -57,7 +57,7 @@ Every answer is two halves that each read on their own.
 | `file_details` | One file: header values, stored measurements and whether they are current, transparency, calibration links, copies, plate solve |
 | `find_duplicates` | Duplicate groups with a copy in the scope, each copy with file name, folder, scan root kind and a processing-folder note |
 | `find_missing_metadata` | The Missing Metadata view's rows inside the scope: counts per category, folders, a page of files |
-| `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many calibration links point at each (light frames, and master sets that use it as a dark or bias); not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); like `find_duplicates`, a group is in the scope when one of its copies is, and it is then listed whole (every copy, its handle the lowest file id of the whole group, so `plan_black_hole` finds it) |
+| `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many calibration links point at each (`linkCount`: light frames, and master sets that use it as a dark or bias); not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); like `find_duplicates`, a group is in the scope when one of its copies is, and it is then listed whole (every copy, its handle the lowest file id of the whole group, so `plan_black_hole` finds it) |
 | `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window. A plan with copies to byte-check answers at once with state `preparing` (the checks run on a thread of their own); the answer of a published plan lists every copy and its fate |
 | `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied") |
 
@@ -271,8 +271,8 @@ only those groups enter the plan. The handles are read before the plan begins, s
   `rebuilt_copies::master_link_count`, the one link count: light frames plus master sets that use it, such as a master dark behind a master
   flat with no light yet); a copy whose master set superseded raw frames (`raw frames were superseded by it; it stays in v1`: moving it would
   un-supersede them, `master_unregister`); a zip-resident copy (`inside a zip; a zip moves to the Black Hole only as a whole`); a copy whose
-  file cannot be stamped (`not reachable ...`); a byte-checked copy whose bytes differ from the keeper's (`differs in bytes from the copy that
-  stays`, with a group note).
+  file cannot be stamped (`not reachable ...`); a byte-checked copy whose bytes differ from the keeper's, whichever key matched it, header or content (`differs in bytes from the copy that
+  stays`, with a group note). A group whose every copy sits in an earlier group of the plan is titled `group whose copies are in another group of this plan`.
 - **The answer is the plan, as data and in words** (`describe_plan`, one function for the planning answer and for `plan_status` of a waiting
   plan): per group its title, the copy that stays (`chosen`: file name and folder), and `items` with `fileName`, `folder`, `values` (the
   columns), `selected`, `locked` (the reason or null) and `candidate`; the text lists, under each group, the copy that stays and every other
@@ -283,7 +283,10 @@ only those groups enter the plan. The handles are read before the plan begins, s
   tool answers right after the plan begins, with the handle and state `preparing` (`Athenaeum is checking N copies byte for byte; ... Ask
   plan_status.`), because a client cancels a tool call after about a minute and a cancelled call gives the assistant no handle. The checks run
   on a thread of their own, progress per pair, the plan's cancel flag read between pairs (a plan the user cancels or a newer plan replaces
-  stops there); when they end the plan is published (`waiting`). A plan with nothing to byte-check is published before the tool answers. No
+  stops there); when they end the plan is published (`waiting`). A plan with nothing to byte-check is published before the tool answers. The
+  worker enters the caller's tokio runtime, so the published plan gets its expiry timer; an error or a panic while preparing (on the tool's thread or
+  the worker) ends the plan `failed` with a sentence, because `sweep` never expires a preparing plan. Both halves of the answer report the state taken
+  before the worker starts (`preparing`, 0 of N). No
   reader guard and no pooled connection is held across a comparison.
 - **Apply** (after the store's stamp re-check of the included items and the kept copy): a byte-checked group whose `chosen` is not the copy the
   plan compared against is compared again first (a differing pair is skipped); then, immediately before the move, a group whose keeper is in

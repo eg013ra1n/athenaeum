@@ -1090,3 +1090,114 @@ fn master_used_by_another_master_is_locked() {
     let moved: Vec<i64> = black_hole_rows(&rig2).into_iter().map(|(id, _)| id).collect();
     assert_eq!(moved, vec![n3.file_id]);
 }
+
+// ---- fix round 2 ----
+
+/// An instant comparison: every pair is identical.
+fn identical() -> VerifyFn {
+    Arc::new(|_h: &McpHost, _a: i64, _b: i64| Ok(true))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_byte_checked_plan_gets_its_timer() {
+    let rig = rig();
+    let a = header_copy(&rig, "t-a", "t20.fits", b"AAAA");
+    header_copy(&rig, "t-b", "t20.fits", b"AAAA");
+    let (logs, buf) = super::super::tests::capture();
+    let answer = prepare(
+        &rig.host,
+        args(BlackHoleSource::Duplicates, &[header_handle("t20.fits")], Some(&a.dir()), &[]),
+        identical(),
+    )
+    .expect("an answer");
+    let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+    // The worker publishes the plan; no read of the plan runs between here and the clock moving on.
+    settle(&rig, &id);
+    assert_eq!(rig.host.plans.view(Some(&id)).expect("the plan").state, PlanState::Waiting);
+    let before = rig.events.named("mcp-plan-updated").len();
+    tokio::time::advance(crate::mcp::plans::PLAN_TTL + Duration::from_secs(1)).await;
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    // The expiry came from the timer, not from a read of the plan.
+    let after = rig.events.named("mcp-plan-updated").len();
+    drop(logs);
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    assert!(!log.contains("has no timer"), "{log}");
+    assert_eq!(after, before + 1, "the window is told when the plan expires");
+    assert_eq!(rig.host.plans.view(Some(&id)).expect("the plan").state, PlanState::Expired);
+}
+
+#[test]
+fn a_panic_while_preparing_fails_the_plan() {
+    let rig = rig();
+    let a = header_copy(&rig, "x-a", "t21.fits", b"AAAA");
+    header_copy(&rig, "x-b", "t21.fits", b"AAAA");
+    let verify: VerifyFn = Arc::new(|_h: &McpHost, _a: i64, _b: i64| -> Result<bool, ApiError> { panic!("a comparison went wrong") });
+    let answer = prepare(
+        &rig.host,
+        args(BlackHoleSource::Duplicates, &[header_handle("t21.fits")], Some(&a.dir()), &[]),
+        verify,
+    )
+    .expect("an answer");
+    let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+    // `settle` is bounded: a plan left `preparing` fails here with the state it saw.
+    let view = settle(&rig, &id);
+    match &view.state {
+        PlanState::Failed { error } => assert!(error.contains("ask for it again"), "{error}"),
+        other => panic!("expected a failed plan, got {other:?}"),
+    }
+
+    // The tool's own thread: a panic in a step ends the plan the same way and comes back as an error.
+    let (id2, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "x");
+    let out: Result<(), ApiError> = guard(&rig.host, &id2, || panic!("loading went wrong"));
+    assert!(out.is_err(), "the caller is told");
+    match rig.host.plans.view(Some(&id2)).expect("the plan").state {
+        PlanState::Failed { error } => assert!(error.contains("ask for it again"), "{error}"),
+        other => panic!("expected a failed plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_answers_two_halves_agree() {
+    let rig = rig();
+    let a = header_copy(&rig, "h-a", "t22.fits", b"AAAA");
+    header_copy(&rig, "h-b", "t22.fits", b"AAAA");
+    header_copy(&rig, "h-c", "t22.fits", b"AAAA");
+    // Instant checks: the worker may have published before the answer is built; the answer still says what it said.
+    for _ in 0..20 {
+        let answer = prepare(
+            &rig.host,
+            args(BlackHoleSource::Duplicates, &[header_handle("t22.fits")], Some(&a.dir()), &[]),
+            identical(),
+        )
+        .expect("an answer");
+        assert!(answer.text.contains("is being prepared"), "{}", answer.text);
+        assert_eq!(answer.data["state"], json!({ "kind": "preparing", "done": 0, "total": 2 }), "{}", answer.text);
+        let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+        settle(&rig, &id);
+    }
+}
+
+#[test]
+fn a_group_emptied_by_an_earlier_group_says_so() {
+    let rig = rig();
+    let a = header_copy(&rig, "e-a", "t23.fits", b"AAAA");
+    let b = header_copy(&rig, "e-b", "t23.fits", b"AAAA");
+    let spec = |ids: &[i64]| GroupSpec {
+        matched: "same header, size and name".to_string(),
+        title: None,
+        byte_checked: true,
+        file_ids: ids.to_vec(),
+    };
+    let specs = vec![
+        ("dup:header:one".to_string(), spec(&[a.file_id, b.file_id])),
+        ("dup:master:two".to_string(), spec(&[a.file_id, b.file_id])),
+        ("dup:master:three".to_string(), spec(&[999_999])),
+    ];
+    let loaded = load_groups(&rig.host, &specs).expect("loaded");
+    let out = assemble(&specs, loaded, &args(BlackHoleSource::Duplicates, &[], Some(&a.dir()), &[]));
+    assert!(out.groups[1].items.is_empty());
+    assert_eq!(out.groups[1].title, "group whose copies are in another group of this plan");
+    assert_eq!(out.groups[2].title, "group with no copy left in the catalog");
+}

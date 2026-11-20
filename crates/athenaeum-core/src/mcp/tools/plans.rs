@@ -50,7 +50,7 @@ impl AthenaeumMcp {
     }
 
     #[tool(
-        description = "Masters of the calibration library that were built more than once: the same camera, frame type, gain, offset, binning, size, exposure, temperature, filter and night, typically the _2 / _3 copy a rebuild wrote beside the first. They are not duplicates by any hash, so find_duplicates does not list them. Each group lists its copies with how many frames calibration links point at each; a linked copy stays. The scope narrows which masters are considered (Black Hole files are never listed). Use the group handles with plan_black_hole (source rebuilt_masters). It changes nothing.",
+        description = "Masters of the calibration library that were built more than once: the same camera, frame type, gain, offset, binning, size, exposure, temperature, filter and night, typically the _2 / _3 copy a rebuild wrote beside the first. They are not duplicates by any hash, so find_duplicates does not list them. Each group lists its copies with how many calibration links point at each (light frames and master sets); a linked copy stays. The scope selects the groups that have a copy in it; each group is listed whole (Black Hole files are never listed). Use the group handles with plan_black_hole (source rebuilt_masters). It changes nothing.",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn find_rebuilt_masters(&self, Parameters(args): Parameters<ScopeArgs>) -> CallToolResult {
@@ -58,7 +58,7 @@ impl AthenaeumMcp {
     }
 
     #[tool(
-        description = "Prepare a plan that moves copies to the Black Hole (a soft delete the user can restore from the Black Hole page). Name the groups in `groups` by the handles find_duplicates (source duplicates) or find_rebuilt_masters (source rebuilt_masters) gave; only those groups enter. In each group one copy stays: say which with keepInFolder (the one copy under that folder, the folder itself or below) or keepFiles (file handles or full paths). A group where the instructions pick no single copy gets nothing selected and the user picks the copy that stays in the window. The other copies are proposed; a copy a calibration link points at, a copy inside a zip and a header-duplicate whose bytes differ from the kept copy are locked and never move. The plan opens in Athenaeum's window and nothing moves until the user presses Apply there; you cannot apply it. Ask plan_status for the outcome. A new plan replaces a plan the user has not decided yet. Header and content duplicates are byte-checked against the kept copy, which can take a while: the answer then comes at once with the plan's handle and the state preparing, and the plan opens in Athenaeum's window when the checks end; ask plan_status. A plan that waits for the user is listed in full (each copy and what happens to it) by this answer or by plan_status.",
+        description = "Prepare a plan that moves copies to the Black Hole (a soft delete the user can restore from the Black Hole page). Name the groups in `groups` by the handles find_duplicates (source duplicates) or find_rebuilt_masters (source rebuilt_masters) gave; only those groups enter. In each group one copy stays: say which with keepInFolder (the one copy under that folder, the folder itself or below) or keepFiles (file handles or full paths). A group where the instructions pick no single copy gets nothing selected and the user picks the copy that stays in the window. The other copies are proposed; a copy a calibration link points at, a copy inside a zip and a copy whose bytes differ from the kept copy, whichever key matched it (header or content), are locked and never move. The plan opens in Athenaeum's window and nothing moves until the user presses Apply there; you cannot apply it. Ask plan_status for the outcome. A new plan replaces a plan the user has not decided yet. Header and content duplicates are byte-checked against the kept copy, which can take a while: the answer then comes at once with the plan's handle and the state preparing, and the plan opens in Athenaeum's window when the checks end; ask plan_status. A plan that waits for the user is listed in full (each copy and what happens to it) by this answer or by plan_status.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn plan_black_hole(&self, Parameters(args): Parameters<PlanBlackHoleArgs>) -> CallToolResult {
@@ -199,10 +199,10 @@ pub fn plan_status(host: &McpHost, args: PlanStatusArgs) -> Result<Answer, ApiEr
 // ---- find_rebuilt_masters ----
 
 fn copy_words(c: &crate::calibration_library::rebuilt_copies::RebuiltCopy) -> String {
-    let linked = if c.linked_lights == 0 {
+    let linked = if c.link_count == 0 {
         "nothing is linked to it".to_string()
     } else {
-        format!("{} at it, so it stays", count_of(c.linked_lights, "calibration link points", "calibration links point"))
+        format!("{} at it, so it stays", count_of(c.link_count, "calibration link points", "calibration links point"))
     };
     format!("{} in {}; {linked}", c.line.file_name, c.line.folder)
 }
@@ -536,8 +536,8 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         assert_eq!(g["handle"], json!(bh::rebuilt_handle(&m1)));
         assert_eq!(g["fileName"], "MasterDark-tool-1.xisf");
         assert!(g["folder"].is_string());
-        assert_eq!(g["copies"][0]["linkedLights"], 3);
-        assert_eq!(g["copies"][1]["linkedLights"], 0);
+        assert_eq!(g["copies"][0]["linkCount"], 3);
+        assert_eq!(g["copies"][1]["linkCount"], 0);
         client.close().await;
     }
 
@@ -557,7 +557,7 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         let g = &data["groups"][0];
         assert_eq!(g["handle"], json!(bh::rebuilt_handle(&m1)), "the handle is the whole group's lowest file id");
         assert_eq!(g["copies"].as_array().map(Vec::len), Some(3), "every copy of the group is listed: {g}");
-        assert_eq!(g["copies"][0]["linkedLights"], 2);
+        assert_eq!(g["copies"][0]["linkCount"], 2);
         let said = text_of(&r);
         assert!(said.contains("MasterDark-sc-1.xisf in ") && said.contains("2 calibration links point at it, so it stays"), "{said}");
         client.close().await;

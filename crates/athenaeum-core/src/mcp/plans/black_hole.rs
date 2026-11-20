@@ -564,6 +564,7 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
         let title = match (&spec.title, copies.first()) {
             (Some(t), _) => t.clone(),
             (None, Some(first)) => format!("{}: {}", first.name, plural(copies.len(), "copy", "copies")),
+            (None, None) if before > 0 => "group whose copies are in another group of this plan".to_string(),
             (None, None) => "group with no copy left in the catalog".to_string(),
         };
         out.group_infos.insert(gid.clone(), GroupInfo { byte_checked: spec.byte_checked, planned_chosen: chosen_id.clone() });
@@ -649,45 +650,36 @@ pub fn prepare(host: &Arc<McpHost>, args: PlanBlackHoleArgs, verify: VerifyFn) -
     let specs = resolve(host, &args)?;
     let title = title_of(args.source);
     let (id, cancel) = host.plans.begin(host, PlanKind::BlackHole, title);
-    let out = match load_groups(host, &specs) {
-        Ok(loaded) => assemble(&specs, loaded, &args),
-        Err(e) => {
-            host.plans.fail(&id, e.to_string());
-            return Err(e);
-        }
-    };
+    let out = guard(host, &id, || {
+        let loaded = load_groups(host, &specs)?;
+        Ok(assemble(&specs, loaded, &args))
+    })?;
     let item_count: usize = out.groups.iter().map(|g| g.items.len()).sum();
     // A plan that is too large fails at its publish: do not byte-check what will not be shown.
     let pairs = if item_count > PLAN_ITEM_CAP { 0 } else { out.pairs.len() };
     if pairs == 0 {
-        return match check_and_publish(host, &id, &cancel, out, title, &verify, 0) {
-            Ok(Ok(())) => ready_answer(host, &id),
-            Ok(Err(Stopped::Ended)) => Ok(ended_answer(host, &id)),
-            Err(e) => {
-                host.plans.fail(&id, e.to_string());
-                Err(e)
-            }
+        let published = guard(host, &id, || check_and_publish(host, &id, &cancel, out, title, &verify, 0))?;
+        return match published {
+            Ok(()) => ready_answer(host, &id),
+            Err(Stopped::Ended) => Ok(ended_answer(host, &id)),
         };
     }
 
+    // The answer reports the state the plan was in when the checks were handed over, in both halves.
     host.plans.progress(&id, 0, pairs);
     let worker_host = Arc::clone(host);
     let worker_id = id.clone();
     // A tracing dispatcher is per thread: carry the caller's so the checks' lines land with it.
     let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+    // So is the tokio runtime: the plan's expiry timer is spawned on it when the worker publishes.
+    let runtime = tokio::runtime::Handle::try_current().ok();
     let spawned = std::thread::Builder::new().name("mcp-plan-prepare".to_string()).spawn(move || {
+        let _enter = runtime.as_ref().map(tokio::runtime::Handle::enter);
         tracing::dispatcher::with_default(&dispatch, || {
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            // A failure or a panic ends the plan inside `guard`; there is nobody to return it to.
+            let _ = guard(&worker_host, &worker_id, || {
                 check_and_publish(&worker_host, &worker_id, &cancel, out, title, &verify, pairs)
-            }));
-            match outcome {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => worker_host.plans.fail(&worker_id, e.to_string()),
-                Err(_) => {
-                    tracing::error!(plan_id = %worker_id, "plan preparation panicked");
-                    worker_host.plans.fail(&worker_id, "preparing the plan stopped unexpectedly; ask for it again".to_string());
-                }
-            }
+            });
         });
     });
     if let Err(e) = spawned {
@@ -696,7 +688,25 @@ pub fn prepare(host: &Arc<McpHost>, args: PlanBlackHoleArgs, verify: VerifyFn) -
         host.plans.fail(&id, error.clone());
         return Err(ApiError::Internal(error));
     }
-    Ok(preparing_answer(host, &id, pairs))
+    Ok(preparing_answer(&id, pairs))
+}
+
+/// Runs one step of preparing a plan. An error or a panic ends the plan `failed` (a preparing plan is never swept,
+/// so nothing else would end it) and is returned to the caller as an error.
+fn guard<T>(host: &McpHost, id: &str, step: impl FnOnce() -> Result<T, ApiError>) -> Result<T, ApiError> {
+    match std::panic::catch_unwind(AssertUnwindSafe(step)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => {
+            host.plans.fail(id, e.to_string());
+            Err(e)
+        }
+        Err(_) => {
+            tracing::error!(plan_id = %id, "plan preparation panicked");
+            let message = "preparing the plan stopped unexpectedly; ask for it again".to_string();
+            host.plans.fail(id, message.clone());
+            Err(ApiError::Internal(message))
+        }
+    }
 }
 
 /// Byte-checks the pairs (when there are any) and publishes the plan.
@@ -764,8 +774,8 @@ fn ended_answer(host: &McpHost, id: &str) -> Answer {
 }
 
 /// The answer while the byte checks run: the handle, `preparing`, and where to ask.
-fn preparing_answer(host: &McpHost, id: &str, pairs: usize) -> Answer {
-    let state = host.plans.view(Some(id)).map_or(PlanState::Preparing { done: 0, total: pairs }, |v| v.state);
+fn preparing_answer(id: &str, pairs: usize) -> Answer {
+    let state = PlanState::Preparing { done: 0, total: pairs };
     Answer::new(
         format!(
             "Plan {id} is being prepared. Athenaeum is checking {} byte for byte; the plan opens in Athenaeum's window when it is ready. Ask plan_status.",

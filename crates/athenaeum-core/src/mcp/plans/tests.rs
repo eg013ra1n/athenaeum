@@ -614,7 +614,7 @@ fn second_dispatcher() {
 
 /// A scoped log capture: the lines of everything logged on this thread (and the apply thread, which inherits the
 /// caller's dispatcher).
-fn capture() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
+pub(super) fn capture() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
     #[derive(Clone)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for Buf {

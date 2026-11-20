@@ -8,7 +8,7 @@
 //! CCD temperature to 0.1 degrees C, the filter after `normalize_value`, and the shooting date is the same night.
 //!
 //! The finder only reads. Which copy stays is never decided here: a copy a calibration link points at (directly, or
-//! through the sub-calibration chain a master flat's dark is part of) says so in `linked_lights`, and the caller keeps
+//! through the sub-calibration chain a master flat's dark is part of) says so in `link_count`, and the caller keeps
 //! it.
 
 use std::collections::BTreeMap;
@@ -36,7 +36,7 @@ pub struct RebuiltCopy {
     /// How many calibration links point at this copy's set, directly or through the sub-calibration chain: light
     /// frames (a master dark behind a master flat counts the lights the flat serves) and the master sets built from
     /// it. 0: nothing uses this copy.
-    pub linked_lights: usize,
+    pub link_count: usize,
 }
 
 /// The copies of one master, two or more.
@@ -115,7 +115,7 @@ fn links_to_set(conn: &Connection, set_id: i64) -> Result<usize> {
 }
 
 /// How many calibration links point at the master in `file_id`: through the set that holds it, directly or through the
-/// sub-calibration chain (the rule `RebuiltCopy::linked_lights` reports). Light frames count, and so do master sets
+/// sub-calibration chain (the rule `RebuiltCopy::link_count` reports). Light frames count, and so do master sets
 /// built from it (a master dark behind a master flat with no light yet). 0 when the file has no frame or its frame is
 /// in no calibration set. Any master file, a duplicate group's included.
 pub fn master_link_count(conn: &Connection, file_id: i64) -> Result<usize> {
@@ -216,8 +216,8 @@ pub fn find_rebuilt_master_copies(
         let mut copies = Vec::with_capacity(members.len());
         for (file_id, frame_id, line) in members {
             let calibration_set_id = set_of_frame(conn, frame_id)?;
-            let linked_lights = master_link_count(conn, file_id)?;
-            copies.push(RebuiltCopy { file_id, line, calibration_set_id, linked_lights });
+            let link_count = master_link_count(conn, file_id)?;
+            copies.push(RebuiltCopy { file_id, line, calibration_set_id, link_count });
         }
         out.push(RebuiltMasterGroup { handle, params_label: label, copies });
     }
@@ -377,9 +377,9 @@ mod tests {
         assert_eq!(g.copies[0].line.file_name, "MasterDark_300s.xisf");
         assert_eq!(g.copies[0].line.folder, lib_dir());
         assert_eq!(g.copies[0].calibration_set_id, Some(set));
-        assert_eq!(g.copies[0].linked_lights, 3);
-        assert_eq!(g.copies[1].linked_lights, 0);
-        assert_eq!(g.copies[2].linked_lights, 0);
+        assert_eq!(g.copies[0].link_count, 3);
+        assert_eq!(g.copies[1].link_count, 0);
+        assert_eq!(g.copies[2].link_count, 0);
         assert_eq!(g.copies[1].calibration_set_id, None);
         assert!(g.params_label.contains("300 s") && g.params_label.contains("-10.0"), "{}", g.params_label);
     }
@@ -439,8 +439,8 @@ mod tests {
         assert_eq!(master_link_count(&conn, second).expect("count"), 0);
         let groups = find_rebuilt_master_copies(&conn, None).expect("find");
         assert_eq!(groups.len(), 1, "{groups:?}");
-        assert!(groups[0].copies[0].linked_lights > 0, "{groups:?}");
-        assert_eq!(groups[0].copies[0].linked_lights, master_link_count(&conn, first).expect("count"));
+        assert!(groups[0].copies[0].link_count > 0, "{groups:?}");
+        assert_eq!(groups[0].copies[0].link_count, master_link_count(&conn, first).expect("count"));
     }
 
     #[test]

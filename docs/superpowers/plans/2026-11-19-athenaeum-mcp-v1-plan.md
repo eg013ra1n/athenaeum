@@ -775,7 +775,7 @@ Modify `crates/athenaeum-tauri/src/commands/duplicates.rs:27-52` and `crates/ath
 pub fn bulk_move_to_black_hole(ctx: &ServiceContext, file_ids: &[i64], from_where: &str,
     progress: Option<&dyn ProgressEmitter> /* the UI passes its emitter; the assistant None */,
     events: &dyn ProgressEmitter) -> Result<BulkMoveResult, ApiError>;
-pub struct RebuiltCopy { pub file_id: i64, pub line: FileLine, pub calibration_set_id: Option<i64>, pub linked_lights: usize }
+pub struct RebuiltCopy { pub file_id: i64, pub line: FileLine, pub calibration_set_id: Option<i64>, pub link_count: usize }
 pub struct RebuiltMasterGroup { pub handle: String, pub params_label: String, pub copies: Vec<RebuiltCopy> }
 pub fn find_rebuilt_master_copies(conn: &Connection, filter: Option<&ScopeFilter>) -> anyhow::Result<Vec<RebuiltMasterGroup>>;
 ```
@@ -790,7 +790,7 @@ IMAGETYP, gain, offset, binning, width, height exactly; exposure to 1 ms; CCD te
   `{"action":"bulk-blackholed","count":2}`; collab dirty state set, under `test_lock()`);
   `assistant_move_emits_no_progress_events` (`progress: None` → the capture holds only `blackhole-changed`);
   `rebuilt_copies_found_with_suffixes` (`MasterDark_300s.xisf`, `_2`, `_3`, same parameters, one linked → one group of
-  3, `linked_lights > 0` only on the linked one); `different_temperature_is_another_master` (−10.0 vs −15.0).
+  3, `link_count > 0` only on the linked one); `different_temperature_is_another_master` (−10.0 vs −15.0).
 - [ ] **Step 2: Run** `cargo test -p athenaeum-core black_hole rebuilt_copies` → FAIL.
 - [ ] **Step 3: Implement**; thin the two wrappers.
 - [ ] **Step 4: Run** `cargo test -p athenaeum-core && cargo test -p athenaeum-web duplicates` → PASS.
@@ -911,7 +911,8 @@ pub struct PlanBlackHoleArgs { pub source: BlackHoleSource, pub groups: Vec<Stri
 Rules: only named groups enter. Each group is a choose-one "Copy that stays": `chosen` = the one copy under
 `keep_in_folder` (separator-strict) or in `keep_files`; none or several → `chosen None`, nothing selected, note "no
 instruction picks the copy that stays here (2 copies under <folder>)". Other copies are include/exclude items,
-selected iff `chosen` is set. Locked with reason: the chosen copy ("stays"); a master with calibration links
+selected iff `chosen` is set. The copy that stays is the group's `chosen`, which the user may change; it is never an
+included item. Locked with reason: a master with calibration links
 ("calibration links point at it; it stays in v1"); a zip-resident copy ("inside a zip; a zip moves to the Black Hole
 only as a whole"). `validate`: an included item needs a `chosen`; `chosen` is never included. Header-key items are
 byte-checked while `preparing` against `chosen` (`verify_duplicate_pair` on a blocking thread, progress per pair,
