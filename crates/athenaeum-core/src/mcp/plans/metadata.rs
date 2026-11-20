@@ -517,6 +517,17 @@ fn is_nothing_group(g: &PlanGroup) -> bool {
     g.items.iter().all(|i| i.evidence.is_none())
 }
 
+/// What a group's title counts: its frames, or, when some are locked, the frames that can be filled now (a group of
+/// the frames nothing could be said for is not counted as one that can be filled).
+fn group_count(g: &PlanGroup) -> String {
+    let fillable = g.items.iter().filter(|i| i.locked.is_none()).count();
+    if fillable == g.items.len() || is_nothing_group(g) {
+        count_of(g.items.len(), "frame", "frames")
+    } else {
+        format!("{fillable} of {} can be filled now", count_of(g.items.len(), "frame", "frames"))
+    }
+}
+
 /// A plan that waits for the user, in words and as data: one function for the planning answer and for `plan_status`.
 pub fn describe_plan(view: &McpPlanView) -> PlanDescription {
     let all = || view.groups.iter().flat_map(|g| g.items.iter());
@@ -539,7 +550,7 @@ pub fn describe_plan(view: &McpPlanView) -> PlanDescription {
     for g in view.groups.iter().take(GROUPS_LISTED) {
         let selected = g.items.iter().filter(|i| i.selected).count();
         let locked_here = g.items.iter().filter(|i| i.locked.is_some()).count();
-        lines.push(format!("- {}: {}", g.title, count_of(g.items.len(), "frame", "frames")));
+        lines.push(format!("- {}: {}", g.title, group_count(g)));
         for i in g.items.iter().take(ITEMS_LISTED) {
             lines.push(format!("    {} in {}: {}", i.file_name, i.folder, fate_of(i)));
         }

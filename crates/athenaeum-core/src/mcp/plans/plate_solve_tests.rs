@@ -60,6 +60,14 @@ fn put(rig: &Rig, dir: &str, name: &str, set: impl FnOnce(&mut Frame)) -> Fx {
     Fx { file_id, frame_id, path, name: name.to_string() }
 }
 
+/// A light with no coordinates and no object name.
+fn light_without_object(rig: &Rig, dir: &str, name: &str) -> Fx {
+    put(rig, dir, name, |f| {
+        f.imagetyp = Some(ImageType::Light);
+        f.instrume = Some("Cam".to_string());
+    })
+}
+
 /// A light with no coordinates.
 fn light(rig: &Rig, dir: &str, name: &str) -> Fx {
     put(rig, dir, name, |f| {
@@ -644,4 +652,59 @@ fn the_plan_is_data_with_caps() {
     assert!(first["fileName"].is_string() && first["folder"].is_string() && first["selected"] == true && first["locked"].is_null(), "{first}");
     assert!(described.summary.contains("51 of 51 frames can be solved"), "{}", described.summary);
     let _ = NullEmitter;
+}
+
+const NAMES_THE_OBJECT: &str = "A solved frame gets its coordinates; a frame with no object name also gets the name of the catalogued object the solve finds in its field, as a solve started in Athenaeum does.";
+
+#[test]
+fn the_solve_plan_says_it_may_name_the_object() {
+    let rig = rig();
+    light(&rig, "names", "n1.fits");
+    let (view, answer) = plan_answer(&rig, args(&rig, "names"));
+    // Both halves of the planning answer, and of what plan_status says of the waiting plan.
+    assert!(answer.text.contains(NAMES_THE_OBJECT), "{}", answer.text);
+    let in_data = |data: &Value| data["notes"].as_array().is_some_and(|n| n.iter().any(|x| x == NAMES_THE_OBJECT));
+    assert!(in_data(&answer.data), "{}", answer.data);
+    let status = crate::mcp::tools::plans::status_answer(&view);
+    assert!(status.text.contains(NAMES_THE_OBJECT), "{}", status.text);
+    assert!(in_data(&status.data), "{}", status.data);
+    // The tool's own description says it too.
+    let tools = crate::mcp::AthenaeumMcp::all_tools().list_all();
+    let tool = tools.iter().find(|t| t.name == "plan_plate_solve").expect("the plan_plate_solve tool");
+    let described = tool.description.as_deref().unwrap_or_default();
+    assert!(described.contains(NAMES_THE_OBJECT), "{described}");
+}
+
+#[test]
+fn the_final_status_counts_the_frames_that_got_an_object_name() {
+    let rig = rig();
+    rig.host.solves.start("solve-n", "plan-n", 4, Default::default());
+    rig.host.solves.note_complete("solve-n", 4, 0, 10);
+    rig.host.solves.note_named("solve-n", 3);
+    rig.host.solves.finish("solve-n", Ok(()));
+    let status = solve_status(&rig.host, "solve-n").expect("an answer");
+    assert!(status.text.contains("3 frames also got an object name"), "{}", status.text);
+    assert_eq!(status.data["objectNamed"], 3);
+    // A run whose count was not known says nothing of it, and a run that kept no result named nothing.
+    rig.host.solves.start("solve-m", "plan-m", 2, Default::default());
+    rig.host.solves.note_complete("solve-m", 2, 0, 10);
+    rig.host.solves.finish("solve-m", Ok(()));
+    let status = solve_status(&rig.host, "solve-m").expect("an answer");
+    assert!(!status.text.contains("object name"), "{}", status.text);
+    assert!(status.data["objectNamed"].is_null(), "{}", status.data);
+}
+
+#[test]
+fn the_object_count_reads_the_catalog_by_frame() {
+    let rig = rig();
+    let bare = light_without_object(&rig, "count", "c1.fits");
+    let also_bare = light_without_object(&rig, "count", "c2.fits");
+    let named = light(&rig, "count", "c3.fits");
+    let database = rig.ctx.db.get().expect("db");
+    let conn = database.conn();
+    let ids = [bare.frame_id, also_bare.frame_id, named.frame_id];
+    let before = unnamed_among(&conn, &ids).expect("unnamed frames");
+    assert_eq!(before, vec![bare.frame_id, also_bare.frame_id]);
+    assert!(crate::plate_solve::storage::update_frame_object_if_missing(&conn, bare.frame_id, "RCW 145").expect("update"));
+    assert_eq!(named_among(&conn, &before).expect("count"), 1);
 }

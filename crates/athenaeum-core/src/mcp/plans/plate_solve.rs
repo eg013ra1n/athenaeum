@@ -47,6 +47,8 @@ use crate::scope::Scope;
 use crate::services::{PlateSolveOrigin, SolveProgress};
 
 const TITLE: &str = "Plate solve";
+/// The plan's note on what a solve writes besides the coordinates (the app's own behaviour, `store_result`).
+pub const NAMES_THE_OBJECT: &str = "A solved frame gets its coordinates; a frame with no object name also gets the name of the catalogued object the solve finds in its field, as a solve started in Athenaeum does.";
 /// A plan answer lists at most this many groups with their items (the rest is summed) ...
 const GROUPS_LISTED: usize = GROUPS_SHOWN;
 /// ... and at most this many items of a group.
@@ -132,6 +134,8 @@ pub struct SolveOutcome {
     pub unlisted: usize,
     /// Set when the run itself failed (its results were not kept).
     pub error: Option<String>,
+    /// Frames of the run that had no object name before and have one after; `None` when the catalog could not tell.
+    pub named: Option<usize>,
     pub total_time_ms: u64,
 }
 
@@ -156,6 +160,7 @@ struct RunRecord {
     names: HashMap<i64, (String, String)>,
     failed_frames: Vec<i64>,
     complete: Option<(usize, usize, u64)>,
+    named: Option<usize>,
 }
 
 /// The assistant's plate-solve runs of this host, newest last.
@@ -185,6 +190,7 @@ impl SolveRuns {
             names,
             failed_frames: Vec::new(),
             complete: None,
+            named: None,
         });
         while runs.len() > RUNS_KEPT {
             match runs.iter().position(|r| r.view.outcome.is_some()) {
@@ -222,6 +228,13 @@ impl SolveRuns {
         }
     }
 
+    /// How many frames of the run got an object name from their solve.
+    pub fn note_named(&self, run_id: &str, named: usize) {
+        if let Some(r) = self.lock().iter_mut().find(|r| r.view.run_id == run_id) {
+            r.named = Some(named);
+        }
+    }
+
     /// The cancel was set; the run is still winding down.
     fn note_cancel(&self, run_id: &str) {
         if let Some(r) = self.lock().iter_mut().find(|r| r.view.run_id == run_id) {
@@ -253,6 +266,7 @@ impl SolveRuns {
                 not_attempted: 0,
                 unlisted: total.saturating_sub(failures.len()),
                 failures,
+                named: Some(0),
                 error: Some(e.to_string()),
                 total_time_ms: r.complete.map_or(0, |c| c.2),
             },
@@ -264,6 +278,7 @@ impl SolveRuns {
                     not_attempted: total.saturating_sub(solved + failed),
                     unlisted: failed.saturating_sub(failures.len()),
                     failures,
+                    named: r.named,
                     error: None,
                     total_time_ms: ms,
                 }
@@ -287,6 +302,62 @@ fn end_run(runs: &SolveRuns, run_id: &str, cancel_flag: &AtomicBool, result: Res
         runs.note_cancel_seen(run_id);
     }
     runs.finish(run_id, result);
+}
+
+/// Frame ids per query: well under SQLite's variable limit.
+const IDS_PER_QUERY: usize = 500;
+
+/// Which of `ids` have no object name now, in the order given.
+fn unnamed_among(conn: &rusqlite::Connection, ids: &[i64]) -> rusqlite::Result<Vec<i64>> {
+    let mut found: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for chunk in ids.chunks(IDS_PER_QUERY) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt =
+            conn.prepare(&format!("SELECT id FROM frames WHERE id IN ({marks}) AND (object IS NULL OR object = '')"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            found.insert(row?);
+        }
+    }
+    Ok(ids.iter().copied().filter(|id| found.contains(id)).collect())
+}
+
+/// How many of `ids` have an object name now.
+fn named_among(conn: &rusqlite::Connection, ids: &[i64]) -> rusqlite::Result<usize> {
+    let mut named = 0usize;
+    for chunk in ids.chunks(IDS_PER_QUERY) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let n: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM frames WHERE id IN ({marks}) AND object IS NOT NULL AND object <> ''"),
+            rusqlite::params_from_iter(chunk.iter()),
+            |r| r.get(0),
+        )?;
+        named += usize::try_from(n).unwrap_or(0);
+    }
+    Ok(named)
+}
+
+/// The frames of the run that have no object name yet; `None` (logged) when the catalog cannot say.
+fn frames_without_object(ctx: &crate::services::ServiceContext, frame_ids: &[i64]) -> Option<Vec<i64>> {
+    let database = crate::api::db(ctx).ok()?;
+    let conn = database.conn();
+    match unnamed_among(&conn, frame_ids) {
+        Ok(ids) => Some(ids),
+        Err(e) => {
+            tracing::warn!(error = %e, "plate solve run could not read which frames have no object name");
+            None
+        }
+    }
+}
+
+/// After a run: how many of the frames that had no object name have one, kept for `solve_status`.
+fn note_named_frames(runs: &SolveRuns, ctx: &crate::services::ServiceContext, run_id: &str, unnamed_before: &[i64]) {
+    let Ok(database) = crate::api::db(ctx) else { return };
+    let conn = database.conn();
+    match named_among(&conn, unnamed_before) {
+        Ok(n) => runs.note_named(run_id, n),
+        Err(e) => tracing::warn!(error = %e, run_id, "plate solve run could not count the frames it gave an object name"),
+    }
 }
 
 /// The run's emitter: tells the host what each frame did, then forwards every event unchanged.
@@ -553,6 +624,7 @@ fn build_and_publish(
     notes.push(if catalog.is_installed() { "star catalog: installed".to_string() } else { "star catalog: not installed".to_string() });
     notes.push(format!("quad index packs: {} installed", catalog.packs));
     notes.push(format!("runs {concurrency} frames at a time"));
+    notes.push(NAMES_THE_OBJECT.to_string());
     if not_lights > 0 {
         notes.push(format!(
             "{} {} not a light frame and is left out",
@@ -913,6 +985,8 @@ impl PlanApplier for PlateSolveApplier {
         let emitter: Arc<dyn ProgressEmitter> =
             Arc::new(RunEmitter { inner: Arc::clone(host.emitter()), runs: runs.clone(), run_id: run_id.clone() });
         let ctx = Arc::clone(host.ctx());
+        let unnamed_before = frames_without_object(&ctx, &frame_ids);
+        let counting_ctx = Arc::clone(&ctx);
         // A tracing dispatcher is per thread: carry the caller's so the run's lines land with it.
         let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
         let thread_run = run_id.clone();
@@ -927,6 +1001,10 @@ impl PlanApplier for PlateSolveApplier {
                 if let Err(e) = &result {
                     tracing::error!(error = %e, run_id = %thread_run, "plate solve run failed");
                 }
+                if let (Ok(()), Some(unnamed)) = (&result, &unnamed_before) {
+                    note_named_frames(&runs, &counting_ctx, &thread_run, unnamed);
+                }
+                drop(counting_ctx);
                 end_run(&runs, &thread_run, &cancel_flag, result);
             });
         });
@@ -1029,6 +1107,12 @@ pub fn solve_status(host: &McpHost, run_id: &str) -> Result<Answer, ApiError> {
                     count_of(total, "frame", "frames")
                 )),
             }
+            if let Some(n) = o.named.filter(|n| *n > 0 && o.error.is_none()) {
+                lines.push(format!(
+                    "{} also got an object name from the catalogued object in their field.",
+                    count_of(n, "frame", "frames")
+                ));
+            }
             if cancelled_in_app {
                 lines.push(format!(
                     "The run was cancelled in Athenaeum; {} not attempted.",
@@ -1058,6 +1142,7 @@ pub fn solve_status(host: &McpHost, run_id: &str) -> Result<Answer, ApiError> {
                 "failed": o.failed,
                 "notAttempted": o.not_attempted,
                 "failedWithoutFile": o.unlisted,
+                "objectNamed": o.named,
                 "cancelRequested": cancel_requested,
                 "cancelledInApp": cancelled_in_app,
                 "error": o.error,

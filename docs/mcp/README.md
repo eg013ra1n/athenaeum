@@ -345,7 +345,7 @@ a frame whose stored value is not empty is left alone even where the parser coul
   planned; `fields` are inferred in addition, except the statement's own.
 - **The plan.** One group per (field, value), largest first within a field, its items selected (`item:<frame id>:<field>`; columns
   Field / Now / Proposed). A frame that misses a field and has no evidence is a locked item in a group `<Field>: nothing proposed`, with the
-  reason. A file that cannot be stamped is locked `not reachable ...`. Notes: `these changes take N frames out of their sessions and M out
+  reason. A file that cannot be stamped is locked `not reachable ...`. In the answer's text a group's line counts the frames that can be filled when some are locked (`- Object: LDN 1272: 0 of 5 frames can be filled now`; every item fillable keeps `N frames`; the `nothing proposed` group keeps its plain count; `a_group_with_every_item_locked_says_none_can_be_filled`). Notes: `these changes take N frames out of their sessions and M out
   of calibration links` (`count_frame_metadata_relations`, as the metadata editor's confirm warns; only when a link goes) and that only
   the catalog changes. A date is shown `YYYY-MM-DD HH:MM:SS` in the item, its action and the group title (`Proposal.value` keeps the `T` form), and its group is
   per (field, folder), titled `Date: <folder> (<first> to <last>)`, each item with its own time (`dates_are_grouped_by_folder`); the apply
@@ -379,7 +379,9 @@ the module, the three tools and `McpHost::solves`, and its tool list simply lack
   every item), the input gate (`service::input_gate_reason`, the stored `trailed` verdict at the current `MEASURE_VERSION` while
   `input_gate_enabled`), or a file that cannot be stamped (`not reachable ...`).
 - **Notes**: `N of M frames can be solved`, the refusals by reason, `star catalog: installed|not installed`, `quad index packs: K installed`,
-  `runs X frames at a time` (the configured `batch_concurrency`, else `(cores / 3).clamp(2, 8)`), and the left-out counts. The answer is the plan
+  `runs X frames at a time` (the configured `batch_concurrency`, else `(cores / 3).clamp(2, 8)`), and the left-out counts. The last note says what a solve writes besides the coordinates (`NAMES_THE_OBJECT`, also in the `plan_plate_solve` tool description,
+  `the_solve_plan_says_it_may_name_the_object`): `A solved frame gets its coordinates; a frame with no object name also gets the name of the catalogued
+  object the solve finds in its field, as a solve started in Athenaeum does.` (`store_result` fills `frames.object` through `update_frame_object_if_missing`.) The answer is the plan
   as data and words (`describe_plan`, also what `plan_status` says of a waiting plate-solve plan), at most 50 groups and 20 items per group.
 - **Refused in words before the plan begins** (the waiting plan is never replaced): a scope that names nothing, no light to solve, a plan of more
   than 2 000 items (counted from the scope's rows before any frame is read, `an_unscoped_request_over_the_cap_reads_no_frame`), and a plate-solve batch already running: `BUSY_ASSISTANT` when the running run is the assistant's, `BUSY_UI` when the user
@@ -396,6 +398,8 @@ the module, the three tools and `McpHost::solves`, and its tool list simply lack
   The snapshot counts from the run's own result: the solved and failed counts are the `plate-solve-complete` event's, never the progress events'
   (a failed store or COMMIT sends no event; a run that returns an error solved nothing; the handle's progress holds no solved count, so a running status never promises one). A failed frame is
   named with its file name and folder (the run's emitter records each failed frame), `failedWithoutFile` counts failures no event named, and
+  `objectNamed` counts the frames of the run that had no object name when it started and have one when it ends (read from the catalog by frame id in
+  batches, not per frame; `null`, and no words, when the catalog could not tell; `the_final_status_counts_the_frames_that_got_an_object_name`), and
   `notAttempted` is what a cancel left (`status_reports_progress_and_result`, `the_final_snapshot_counts_from_the_runs_own_result`). A run whose
   cancel flag was set when it ended, without `cancel_solve` having set it, was cancelled in Athenaeum's window: the status says `The run was cancelled
   in Athenaeum; N frames were not attempted.` and carries `cancelledInApp` (`a_cancel_from_the_app_is_named_to_the_assistant`).

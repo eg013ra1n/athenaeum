@@ -409,6 +409,34 @@ fn a_frame_whose_file_cannot_be_stamped_is_locked() {
 }
 
 #[test]
+fn a_group_with_every_item_locked_says_none_can_be_filled() {
+    let rig = rig();
+    // Every file of the group is gone (an unmounted volume): nothing in it can be filled.
+    let a = light(&rig, "all-gone", "a.fits", None);
+    let b = light(&rig, "all-gone", "b.fits", None);
+    std::fs::remove_file(&a.path).expect("remove");
+    std::fs::remove_file(&b.path).expect("remove");
+    let (view, answer) = plan_answer(&rig, args(&rig, "all-gone", &[], Some((FillField::Object, "LDN 1272"))));
+    assert!(view.groups[0].items.iter().all(|i| i.locked.is_some()), "{view:?}");
+    assert!(answer.text.contains("- Object: LDN 1272: 0 of 2 frames can be filled now"), "{}", answer.text);
+    assert!(!answer.text.contains("LDN 1272: 2 frames"), "{}", answer.text);
+    let status = crate::mcp::tools::plans::status_answer(&view);
+    assert!(status.text.contains("- Object: LDN 1272: 0 of 2 frames can be filled now"), "{}", status.text);
+
+    // Some fillable: the title counts them; every one fillable keeps the plain count.
+    light(&rig, "some-gone", "c.fits", None);
+    let d = light(&rig, "some-gone", "d.fits", None);
+    std::fs::remove_file(&d.path).expect("remove");
+    let answer = plan_answer(&rig, args(&rig, "some-gone", &[], Some((FillField::Object, "LDN 1272")))).1;
+    assert!(answer.text.contains("- Object: LDN 1272: 1 of 2 frames can be filled now"), "{}", answer.text);
+    light(&rig, "all-fine", "e.fits", None);
+    light(&rig, "all-fine", "f.fits", None);
+    let answer = plan_answer(&rig, args(&rig, "all-fine", &[], Some((FillField::Object, "LDN 1272")))).1;
+    assert!(answer.text.contains("- Object: LDN 1272: 2 frames"), "{}", answer.text);
+    assert!(!answer.text.contains("can be filled now"), "{}", answer.text);
+}
+
+#[test]
 fn a_request_with_nothing_to_fill_leaves_the_waiting_plan_alone() {
     let rig = rig();
     light(&rig, "wait", "w1.fits", None);
