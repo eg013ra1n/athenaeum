@@ -148,6 +148,10 @@ echoed. A later host still serves `/1`.
   assistant". That instance's files are never removed or rewritten by this one, including by its off switch. Any other lock error is
   `failed` with the OS error. The same 30 s check runs while `elsewhere` with the setting on: it retries the lock and, once it has it,
   binds and becomes `serving` (`elsewhere_becomes_serving_when_the_other_instance_stops`).
+  The check reads the stored `mcp.enabled` first, in every state (the catalog is shared, so the setting is the one truth): stored off,
+  a serving or `elsewhere` instance disengages (`off_in_the_serving_instance_is_not_undone_by_the_other`,
+  `off_in_the_other_instance_reaches_the_server`); only stored on lets an `elsewhere` instance engage. `endpoint` is removed only by the
+  instance that holds the serve lock (`a_quitting_instance_that_does_not_serve_leaves_the_files_alone`).
 - *How a connection closes.* `Run::close` drops the listener, the handshake-phase tasks and every session task inside the call. A
   session that has completed `initialize` has been handed to rmcp's own task, which is only cancelled: its stream closes when that
   task next runs (`regenerate_cuts_off_connected_clients`: end of stream within 2 s). A Windows pipe name is fresh per bind, so a

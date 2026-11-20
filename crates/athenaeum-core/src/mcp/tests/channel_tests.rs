@@ -53,6 +53,13 @@ impl Rig {
         db::get_setting(&conn, "mcp.enabled").expect("read the setting")
     }
 
+    /// Writes the stored setting the way another instance's switch leaves it (the catalog is shared).
+    fn set_kv(&self, value: &str) {
+        let database = self.ctx.db.get().expect("db");
+        let conn = database.conn();
+        db::set_setting(&conn, "mcp.enabled", value).expect("write the setting");
+    }
+
     /// Stop serving and give the connection tasks a moment to end, so no open catalog outlives the temp dir.
     async fn finish(self) {
         self.host.shutdown();
@@ -525,8 +532,10 @@ async fn the_lock_follows_the_channel_off_and_on() {
     let other = host_over(&rig.ctx, HostKind::Desktop, false);
     other.on_catalog_open().expect("open");
     assert_eq!(other.set_enabled(true).expect("on").state, "elsewhere");
-    // Off releases the lock at once: the other one gets the channel on its next check.
+    // Off releases the lock at once: the other one gets the channel on its next check. (The catalog is shared, so the
+    // setting reads false until the user turns access on in the other instance too: stored here as that switch does.)
     rig.host.set_enabled(false).expect("off");
+    rig.set_kv("true");
     other.recheck_endpoint();
     assert_eq!(other.status().state, "serving");
     // And the first one, turned on again, finds it is the one that is elsewhere.
@@ -534,6 +543,70 @@ async fn the_lock_follows_the_channel_off_and_on() {
     other.shutdown();
     drop(other);
     rig.finish().await;
+}
+
+/// A serving instance and a second one `elsewhere` on its app-data dir and catalog (two processes of one build).
+async fn two_instances() -> (Rig, Arc<McpHost>) {
+    let first = desktop();
+    first.host.set_enabled(true).expect("on");
+    let second = host_over(&first.ctx, HostKind::Desktop, false);
+    second.on_catalog_open().expect("open");
+    assert_eq!(second.status().state, "elsewhere");
+    (first, second)
+}
+
+#[tokio::test]
+async fn off_in_the_serving_instance_is_not_undone_by_the_other() {
+    let (first, second) = two_instances().await;
+    first.host.set_enabled(false).expect("off in the serving instance");
+    assert!(!first.file("endpoint").exists());
+    // The other one's 30 s check reads the stored setting, which says off: it does not take the lock and bind.
+    second.recheck_endpoint();
+    let status = second.status();
+    assert_ne!(status.state, "serving", "{:?}", status.last_error);
+    assert_eq!(status.state, "off");
+    assert!(!status.enabled && !second.is_serving());
+    assert!(!first.file("endpoint").exists(), "nothing was bound again");
+    assert_eq!(first.kv().as_deref(), Some("false"));
+    second.shutdown();
+    drop(second);
+    first.finish().await;
+}
+
+#[tokio::test]
+async fn off_in_the_other_instance_reaches_the_server() {
+    let (first, second) = two_instances().await;
+    let endpoint = first.endpoint();
+    let token = first.token();
+    let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
+    assert!(reply.starts_with("OK "), "{reply}");
+    second.set_enabled(false).expect("off in the other instance");
+    assert!(first.host.is_serving(), "the serving instance has not looked yet");
+    // The serving instance's 30 s check reads the stored setting and unbinds.
+    first.host.recheck_endpoint();
+    let status = first.host.status();
+    assert_eq!(status.state, "off", "{:?}", status.last_error);
+    assert!(!status.enabled && !first.host.is_serving());
+    assert!(!first.file("endpoint").exists() && !first.file("enabled").exists());
+    assert!(connect(&endpoint).await.is_err(), "the socket is closed");
+    second.shutdown();
+    drop(second);
+    first.finish().await;
+}
+
+#[tokio::test]
+async fn a_quitting_instance_that_does_not_serve_leaves_the_files_alone() {
+    let (first, second) = two_instances().await;
+    let endpoint = first.endpoint();
+    let token = first.token();
+    second.set_enabled(false).expect("off in the other instance");
+    second.shutdown();
+    drop(second);
+    assert!(first.file("endpoint").exists() && first.file("enabled").exists() && first.file("tools.json").exists());
+    assert!(first.host.is_serving());
+    let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
+    assert!(reply.starts_with("OK "), "a bridge still gets in: {reply}");
+    first.finish().await;
 }
 
 /// Sets a flag when it is dropped.

@@ -180,7 +180,13 @@ export function AssistantAccessSection() {
                       <span className="text-content break-all flex-1">{status.bridgePath}</span>
                     ) : (
                       <span className="text-content-muted flex-1">
-                        not found — build it with <code>cargo build -p athenaeum-mcp</code>
+                        {status.serverName.endsWith('-dev') ? (
+                          <>
+                            not found — build it with <code>cargo build -p athenaeum-mcp</code>
+                          </>
+                        ) : (
+                          'not found — reinstall Athenaeum to restore it'
+                        )}
                       </span>
                     )}
                   </div>
@@ -195,10 +201,10 @@ export function AssistantAccessSection() {
                     </p>
                   </div>
                 )}
-                {status.clientConfig && (
+                {status.bridgeFound && status.clientConfig && (
                   <CopyBlock title="Client configuration" text={status.clientConfig} label="Copy client configuration" />
                 )}
-                {status.claudeCodeCommand && (
+                {status.bridgeFound && status.claudeCodeCommand && (
                   <CopyBlock title="Claude Code command" text={status.claudeCodeCommand} label="Copy Claude Code command" />
                 )}
               </>

@@ -130,6 +130,29 @@ describe('AssistantAccessSection', () => {
     expect(screen.getByText(/cargo build -p athenaeum-mcp/)).toBeTruthy();
   });
 
+  it('a_missing_bridge_in_a_dev_build_says_how_to_build_it_and_hides_the_config', async () => {
+    await renderSection({ ...DESKTOP_ON, serverName: 'athenaeum-dev', bridgeFound: false });
+    expect(await screen.findByText(/cargo build -p athenaeum-mcp/)).toBeTruthy();
+    expect(screen.queryByText(/reinstall Athenaeum/)).toBeNull();
+    expect(screen.queryByText('Client configuration')).toBeNull();
+    expect(screen.queryByText('Claude Code command')).toBeNull();
+  });
+
+  it('a_missing_bridge_in_a_release_build_says_to_reinstall_and_hides_the_config', async () => {
+    await renderSection({ ...DESKTOP_ON, serverName: 'athenaeum', bridgeFound: false });
+    expect(await screen.findByText('not found — reinstall Athenaeum to restore it')).toBeTruthy();
+    expect(screen.queryByText(/cargo build/)).toBeNull();
+    expect(screen.queryByText('Client configuration')).toBeNull();
+    expect(screen.queryByText('Claude Code command')).toBeNull();
+  });
+
+  it('a_found_bridge_shows_the_config_blocks', async () => {
+    await renderSection({ ...DESKTOP_ON, serverName: 'athenaeum' });
+    expect(await screen.findByText('Client configuration')).toBeTruthy();
+    expect(screen.getByText('Claude Code command')).toBeTruthy();
+    expect(screen.queryByText(/not found/)).toBeNull();
+  });
+
   it('elsewhere_and_failed_have_their_copy', async () => {
     const { unmount } = await renderSection({ ...DESKTOP_ON, state: 'elsewhere' });
     expect(

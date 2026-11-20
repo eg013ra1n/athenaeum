@@ -85,7 +85,7 @@ return an `McpStatus` the section keeps and renders: on the desktop the bridge p
 `/AppTranslocation/` gets the Move-to-Applications warning), the client configuration and the Claude Code command, each
 with a copy button; on the web the endpoint `${window.location.origin}/mcp`, the key and the config. A web server without
 `ATHENAEUM_API_KEY` reports `blockedReason`: the toggle is disabled and the section says why. `regenerate` is a button
-(`regenerate_mcp_token`), not a setting. A failed command raises one `notify()` warning with `dedupeKey: 'mcp-settings'`
+(`regenerate_mcp_token`), not a setting. A missing bridge (`bridgeFound` false) says "build it with `cargo build -p athenaeum-mcp`" in a `-dev` build and "reinstall Athenaeum to restore it" otherwise, and hides the client configuration and the Claude Code command. A failed command raises one `notify()` warning with `dedupeKey: 'mcp-settings'`
 (the write handles it, so the toggle's own notification does not fire twice) and the toggle re-reads the real state.
 
 `stacking.compute` (Task 13c) is one KV number, `compute.memory_budget_mb` ("Frame memory budget (MB)",

@@ -184,8 +184,6 @@ impl Drop for Run {
     }
 }
 
-/// The mutable half of the lifecycle, behind one mutex. Connection tasks take it for a moment and never across an
-/// await; `set_enabled` and friends hold it across the setting's write so two switches cannot interleave.
 /// Cancels a token when dropped: the `elsewhere` retry timer lives as long as its guard.
 struct WatchGuard(CancellationToken);
 
@@ -195,6 +193,8 @@ impl Drop for WatchGuard {
     }
 }
 
+/// The mutable half of the lifecycle, behind one mutex. Connection tasks take it for a moment and never across an
+/// await; `set_enabled` and friends hold it across the setting's write so two switches cannot interleave.
 #[derive(Default)]
 pub(super) struct Channel {
     state: State,
@@ -432,13 +432,35 @@ impl McpHost {
         }
     }
 
-    /// The 30-second check, callable on its own. Serving: when the socket file has vanished (a `$TMPDIR` cleaner), bind it
-    /// again; connections already made are not touched. `elsewhere` with the setting on: try the serve lock again and,
-    /// once it is free, bind and serve.
+    /// The 30-second check, callable on its own. It first reads the stored setting (two instances of one build share the
+    /// catalog, so the setting is the one truth): stored off, the instance disengages, whether it serves or waits
+    /// `elsewhere`. Then, serving: when the socket file has vanished (a `$TMPDIR` cleaner), bind it again; connections
+    /// already made are not touched. `elsewhere` with the setting on: try the serve lock again and, once it is free,
+    /// bind and serve.
     pub fn recheck_endpoint(self: &Arc<Self>) {
         let mut ch = self.lock_channel();
+        // Only a desktop instance with an open catalog can be told "off" by the other instance; an unreadable setting
+        // changes nothing (the catalog-open reconcile owns the early `starting` window).
+        let stored = if self.is_desktop() && self.catalog_open() {
+            match self.stored_enabled() {
+                Ok(on) => Some(on),
+                Err(e) => {
+                    tracing::warn!(error = %e, "mcp setting could not be read at the 30 s check");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if stored == Some(false) && matches!(ch.state, State::Starting | State::Serving | State::Elsewhere) {
+            tracing::info!(state = ch.state.word(), "mcp turned off in another instance of this build");
+            ch.enabled = false;
+            self.disengage(&mut ch);
+            return;
+        }
         if ch.state == State::Elsewhere {
-            if ch.enabled && self.is_desktop() && !self.web_blocked() {
+            if stored == Some(true) && self.is_desktop() && !self.web_blocked() {
+                ch.enabled = true;
                 self.engage(&mut ch);
                 if ch.state != State::Elsewhere {
                     tracing::info!(state = ch.state.word(), "mcp channel taken over from another instance");
@@ -512,8 +534,9 @@ impl McpHost {
         if let Some(endpoint) = ch.endpoint.take() {
             remove_endpoint(&endpoint);
         }
-        // What this instance wrote is stale now; another instance's `endpoint` file is not ours to remove.
-        if ch.state != State::Elsewhere {
+        // What this instance wrote is stale now; another instance's `endpoint` file is not ours to remove: this
+        // instance's own only while it holds the serve lock.
+        if ch.lock.is_some() {
             if let Ok(dir) = self.channel_dir() {
                 remove_file_quiet(&dir.join("endpoint"));
             }
@@ -668,7 +691,10 @@ impl McpHost {
     /// Cancels the listener and every connection and removes what this instance made. A second instance's
     /// (`elsewhere`) files are not ours and stay. `forget` also removes the marker and the tool list.
     fn close_channel(&self, ch: &mut Channel, forget: bool) {
-        let owned = ch.state != State::Elsewhere;
+        // The serve lock says who made `endpoint`; read before it is released below. The marker and the tool list on
+        // `forget` also go for an instance that never served (a failed start), but never for one that waits `elsewhere`.
+        let owned = ch.lock.is_some();
+        let owns_marker = owned || ch.state != State::Elsewhere;
         // Dropping the run closes the listener and every connection before this returns.
         drop(ch.run.take());
         if let Some(endpoint) = ch.endpoint.take() {
@@ -679,10 +705,12 @@ impl McpHost {
         if owned {
             if let Ok(dir) = self.channel_dir() {
                 remove_file_quiet(&dir.join("endpoint"));
-                if forget {
-                    remove_file_quiet(&dir.join("enabled"));
-                    remove_file_quiet(&dir.join("tools.json"));
-                }
+            }
+        }
+        if forget && owns_marker {
+            if let Ok(dir) = self.channel_dir() {
+                remove_file_quiet(&dir.join("enabled"));
+                remove_file_quiet(&dir.join("tools.json"));
             }
         }
         // Last: another instance may take the lock the moment it is released, so this instance's files go first.

@@ -11,7 +11,7 @@ use rmcp::{tool_handler, ServerHandler};
 use super::McpHost;
 
 /// What a client is told once, on connecting.
-pub const INSTRUCTIONS: &str = "Athenaeum answers about one astrophotography catalog; every answer starts with the build and catalog it came from. Questions change nothing. Changes are plans: a planning tool opens the plan in Athenaeum's window, where only the user can apply it — no tool applies a plan. Ask plan_status for the outcome and never report a plan as applied before plan_status says so. Name frames by file name and folder, not by handles.";
+pub const INSTRUCTIONS: &str = "Athenaeum answers about one astrophotography catalog; every answer starts with the build and catalog it came from. These tools only read: they change nothing in the catalog or on disk. Name frames by file name and folder, not by handles.";
 
 #[derive(Clone)]
 pub struct AthenaeumMcp {

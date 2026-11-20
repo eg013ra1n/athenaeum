@@ -246,12 +246,12 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     tab: 'general',
     title: 'Assistant access (MCP)',
     description:
-      'Let an AI assistant on this computer read your catalog and prepare changes that you approve in Athenaeum.',
+      'Let an AI assistant on this computer read your catalog and answer questions about it.',
     fields: [
       {
         id: 'enabled',
         label: 'Allow assistant access',
-        help: 'Off by default. When on, an MCP client such as Claude desktop or Claude Code can ask about your catalog through the bridge below. Every change opens here for your approval.',
+        help: 'Off by default. When on, an MCP client such as Claude desktop or Claude Code can ask about your catalog through the bridge below. The assistant can only read; it changes nothing.',
         keywords: ['mcp.enabled', 'mcp', 'assistant', 'claude'],
       },
       {
