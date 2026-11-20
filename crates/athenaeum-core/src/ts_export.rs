@@ -1,4 +1,4 @@
-//! Assembles the 7 frontend type files from the Rust model types.
+//! Assembles the 8 frontend type files from the Rust model types.
 //! Diffed against disk by tests/ts_contract.rs; regenerate with:
 //!   TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 //!
@@ -483,6 +483,10 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::stacking::MasterLightKind,
             crate::api::stacking_aligned::AlignedState,
             crate::api::stacking_aligned::AlignedFrameStatus,
+        ]))),
+        // Assistant access (MCP plan Task 6): the Settings section's status. Task 12 adds the plan types here.
+        ("mcp.ts", js_safe_ints(format!("{HEADER}{}", decls![
+            crate::mcp::McpStatus,
         ]))),
     ]
 }

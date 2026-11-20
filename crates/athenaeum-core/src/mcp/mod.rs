@@ -9,13 +9,19 @@
 //! `docs/mcp/README.md` is the reference.
 
 pub mod answer;
+pub mod channel;
+pub mod lifecycle;
 pub mod server;
 pub mod tools;
 
 #[cfg(test)]
 #[path = "tests/server_tests.rs"]
 mod server_tests;
+#[cfg(test)]
+#[path = "tests/channel_tests.rs"]
+mod channel_tests;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -27,6 +33,7 @@ use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 
 pub use answer::{to_tool_result, Answer};
+pub use lifecycle::{desktop_client_config, McpStatus, NEEDS_API_KEY};
 pub use server::AthenaeumMcp;
 
 /// Which host embeds the server.
@@ -80,6 +87,10 @@ pub struct McpHost {
     has_viewer: Arc<dyn Fn() -> bool + Send + Sync>,
     /// The one `SQLITE_OPEN_READ_ONLY` connection (R11), opened by [`McpHost::on_catalog_open`].
     reader: OnceLock<Mutex<Connection>>,
+    /// The app-data dir when the host knows it before the catalog is open ([`McpHost::set_app_data_dir`]).
+    app_data_dir: OnceLock<PathBuf>,
+    /// The local channel's state (`lifecycle.rs`).
+    channel: Mutex<lifecycle::Channel>,
 }
 
 impl McpHost {
@@ -93,14 +104,22 @@ impl McpHost {
         bring_to_front: Arc<dyn Fn() + Send + Sync>,
         has_viewer: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Arc<Self> {
-        Arc::new(Self { ctx, identity, emitter, bring_to_front, has_viewer, reader: OnceLock::new() })
+        Arc::new(Self {
+            ctx,
+            identity,
+            emitter,
+            bring_to_front,
+            has_viewer,
+            reader: OnceLock::new(),
+            app_data_dir: OnceLock::new(),
+            channel: Mutex::new(lifecycle::Channel::default()),
+        })
     }
 
-    /// The catalog is open: open the one read-only reader connection and nothing else. Calling it again is a no-op.
-    ///
-    /// Task 6 extends this same function with the `mcp.enabled` reconcile and the channel bind; keep it the one
-    /// place a host tells the server its catalog is there.
-    pub fn on_catalog_open(self: &Arc<Self>) -> Result<(), ApiError> {
+    /// Opens the one read-only reader connection; a no-op once it is open. [`McpHost::on_catalog_open`] (in
+    /// `lifecycle.rs`) is the one place a host tells the server its catalog is there: it calls this, then reconciles
+    /// the local channel to the stored `mcp.enabled`.
+    fn open_reader(&self) -> Result<(), ApiError> {
         if self.reader.get().is_some() {
             return Ok(());
         }

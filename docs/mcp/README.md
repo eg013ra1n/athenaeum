@@ -13,20 +13,21 @@ An assistant (Claude desktop, Claude Code, ...) asks Athenaeum about one astroph
   context-taking functions that only read (below). `questions_change_nothing` digests the catalog before and after every tool.
 - **No tool applies a plan.** Changes are plans that open in Athenaeum's window, where only the user can apply them; there is
   no `apply` tool, no in-chat card, no elicitation in v1.
-- **Off by default.** `mcp.enabled` is `"false"` (Task 6 adds the setting, the local channel and the on/off lifecycle).
+- **Off by default.** `mcp.enabled` is `"false"`; see "Assistant access: the local channel" below.
 
 ## Layout
 
 | Item | Where |
 | ---- | ---- |
 | `McpHost` (context, identity, the reader, `on_catalog_open`, `source`) | `mcp/mod.rs` |
+| The local channel: endpoint, handshake, the channel files | `mcp/channel.rs` |
+| On/off lifecycle, the key, `McpStatus`, the client config text | `mcp/lifecycle.rs`; commands' logic in `api/mcp.rs` |
 | `Answer`, `to_tool_result` (line 1 + both halves) | `mcp/answer.rs` |
 | `AthenaeumMcp` (the rmcp handler, `INSTRUCTIONS`) | `mcp/server.rs` |
 | Tool bodies, argument types, the scope step | `mcp/tools/{mod,catalog}.rs` |
 | Tests (a client over `tokio::io::duplex`, both protocol revisions) | `mcp/tests/server_tests.rs` |
 
-`McpHost::new` opens nothing; `on_catalog_open` opens the reader (Task 6 extends the same function with the setting reconcile
-and the bind). Before it, `reader()` and `source()` are `Conflict("Athenaeum is starting ...")` and every tool answers that in
+`McpHost::new` opens nothing; `on_catalog_open` opens the reader and reconciles the local channel to the stored setting. Before it, `reader()` and `source()` are `Conflict("Athenaeum is starting ...")` and every tool answers that in
 words with `catalog not open` on line 1.
 
 ## The answer shape
@@ -94,7 +95,65 @@ page; 25 frame sets per calibration page; 5 outliers per side; 50 duplicate grou
 missing-metadata or storage answer (the rest said as a count; the text lists the 10 largest storage folders). Plan lifetime and
 plan size limits belong to the planning tools.
 
+## Assistant access: the local channel
+
+The desktop serves the assistant over a local channel; an assistant starts the `athenaeum-mcp` bridge, which connects to it. The
+web build serves `/mcp` over HTTP instead (Task 8) and binds nothing here.
+
+**Setting.** `mcp.enabled` (`"false"` default, in `defaults::all()`). Only `set_mcp_enabled` writes it; the generic
+`set_setting` refuses the key with `Invalid("use set_mcp_enabled")`. No other path writes settings in bulk (the Settings page's
+"reset" is `set_setting` per key), so nothing else needed the same refusal. `get_mcp_status` / `set_mcp_enabled` /
+`regenerate_mcp_token` are the three commands (`api/mcp.rs`); `McpStatus` is in `src/types/mcp.ts`.
+
+**Channel files**, in `<app-data>/mcp/`:
+
+| File | Content |
+| ---- | ------- |
+| `token` | The key: 64 hex characters, mode 0600. Kept across off/on; only Regenerate changes it. The web build's key is this file |
+| `endpoint` | `unix:<path>` or `pipe:<name>` (one line) |
+| `enabled` | Marker: the desktop binds early when it exists |
+| `tools.json` | `{"tools":[...]}`, the server's own `tools/list` result, written through a temp file and a rename; a bridge serves it while the app is not running |
+
+**Endpoint.** Unix socket `<app-data>/mcp/mcp.sock` when that path is at most 100 bytes, else
+`<temp dir>/athenaeum-mcp-<8 hex>/mcp.sock` (the directory is made mode 0700; the 8 hex are the first 4 bytes of the SHA-256 of
+the app-data dir's path). On a dev Mac the first path is 102 bytes, so the temp-dir one is the normal one there. Windows: the pipe
+`\\.\pipe\athenaeum-mcp-<8 hex>` (same 8 hex), opened as the first instance, so a second instance of the build is refused.
+
+**Handshake (frozen, append-only).** The bridge writes `ATHENAEUM-MCP/1 <token>\n` (one line, at most 256 bytes, within 5 s); the
+host answers `OK <server name> <version>\n` and the same stream then carries MCP (newline-delimited JSON-RPC, rmcp's
+`serve_server_with_ct`), or `ERR <starting|off|token|version> <message>\n` and closes. `/n` with n above 1 is `ERR version`; a line
+that is not a handshake, too long, or with a wrong key is `ERR token`; the key is compared as SHA-256 digests and never logged or
+echoed. A later host still serves `/1`.
+
+**Lifecycle.**
+
+- *On:* store `"true"`, key (kept if the file exists), `enabled` marker, bind, `endpoint`, `tools.json`: `serving`.
+- *Off:* store `"false"`, cancel every connection (each holds a child of the run's `CancellationToken`), close the listener, delete
+  `endpoint`, `enabled` and `tools.json`, keep `token`: `off`.
+- *Regenerate:* new key, every live connection cancelled (the stream ends), the listener stays.
+- *`start_early`* (desktop `.setup`; the host needs `set_app_data_dir` first, because the database is opened later): binds in `starting`
+  iff the `enabled` marker exists; a connection gets `ERR starting`. *`on_catalog_open`* then reconciles to the stored setting, which
+  wins over the marker (`starting` becomes `serving`, or the channel is closed and its files removed).
+- *`shutdown`* (app exit): closes everything and removes the socket and `endpoint`; the marker, `tools.json` and the key stay.
+- A leftover socket file with nobody listening (a crash) is removed before bind. A 30 s check (`recheck_endpoint`) rebinds when the
+  socket file has vanished (`$TMPDIR` cleaners); live connections are untouched.
+- An endpoint that accepts a connection belongs to another instance of this build: `elsewhere`, `lastError` "another Athenaeum of
+  this build serves the assistant". That instance's files are never removed or rewritten by this one, including by its off switch.
+- Channel tasks run on the caller's tokio runtime, or on a small fallback runtime (`mcp-channel`, 2 workers) when the caller is not
+  inside one (a window's setup closure).
+
+**Web.** Turning it on is refused with `NEEDS_API_KEY` (`Invalid`) when `ATHENAEUM_API_KEY` is not set; `McpStatus.blockedReason`
+carries the same sentence, and a stored `"true"` without a key at boot stays `off` with `lastError` = the sentence. With a key, on
+means `serving` (the key is in `McpStatus.token`; `check_token` and `is_serving` are what the `/mcp` route asks). Nothing binds.
+
+**Client config.** `desktop_client_config(name, bridge, build, app_data_override)` returns
+`{"mcpServers":{"<name>":{"command":"<bridge>","args":["--build","<build>"(,"--app-data-dir","<dir>")]}}}` and
+`claude mcp add <name> -- "<bridge>" --build <build>` (plus ` --app-data-dir "<dir>"`). `McpStatus` fills them with the bridge expected
+next to the app's executable and the app-data dir always passed, so the bridge never guesses.
+
 ## Logging
 
 One new log field: `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
-`find_missing_metadata`). A failed tool is logged by its span's `err`, then returned to the assistant in words.
+`find_missing_metadata`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
+name: it logs with `state` (`off`/`starting`/`serving`/`elsewhere`/`failed`), `addr` (the endpoint's text), `reason`
+(`timeout`, `too_long`, or a handshake refusal's word), `error` and `path`; never the key.
