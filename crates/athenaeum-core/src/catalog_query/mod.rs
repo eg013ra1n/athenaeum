@@ -9,6 +9,8 @@
 
 mod calibration;
 mod details;
+mod findings;
+mod frontend_truth;
 mod quality;
 mod storage;
 
@@ -19,6 +21,11 @@ mod tests;
 
 pub use calibration::{calibration_summary, CalibrationLine, FRAME_SETS_PAGE};
 pub use details::{file_details, CalibrationLink, FileDetails};
+pub use findings::{
+    find_duplicates_in_scope, find_missing_in_scope, processing_folder_note, CopyLine, DuplicateFinding,
+    MissingCategory, MissingFinding,
+};
+pub use frontend_truth::{frame_set_tab, missing_flags, FrameSetTab, MissingFlags};
 pub use quality::{quality_summary, QualityMetric, QualitySummary, OUTLIERS_SHOWN};
 pub use storage::{storage_summary, StorageLine, StorageSummary};
 

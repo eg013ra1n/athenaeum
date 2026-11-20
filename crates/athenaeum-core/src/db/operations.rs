@@ -162,7 +162,8 @@ pub fn scan_root_prefix_predicate(
 ///
 /// Every SQL accessor takes the caller's `files` alias, because the cache
 /// rebuild runs one query aliased `f` and a second aliased `files`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
 pub enum DuplicateKey {
     /// Header identity. RAW SUB-FRAMES ONLY — see [`Self::eligibility`].
     Header,
@@ -1659,65 +1660,90 @@ fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Missing
     })
 }
 
-pub fn get_frames_with_missing_metadata(
-    conn: &Connection,
-    category: &str,
-) -> Result<Vec<MissingMetadataRow>> {
-    // "Missing coordinates" catches three sentinel patterns that FITS
-    // pipelines write instead of leaving fields NULL:
-    //   1. numeric ra/dec = NULL
-    //   2. numeric (ra, dec) = (0, 0) — literal zero, no one images at 0,0
-    //   3. sexagesimal objctra/objctdec that stringify to all-zero after
-    //      stripping whitespace, signs, and colons — e.g. "00 00 00",
-    //      "+00 00 00", "00:00:00". Thousands of LIGHT frames in typical
-    //      libraries have these because the acquisition software wrote a
-    //      placeholder rather than the real RA/Dec.
-    //
-    // A frame counts as "missing coordinates" when BOTH the numeric side
-    // and the sexagesimal side are in one of the above states. The same
-    // clause is inlined into the "all" branch below.
-    let coords_missing_clause =
+/// The predicate of one Missing Metadata category on `frames fr`, and the LIGHT-only prefix some categories carry:
+/// `(missing_clause, imagetyp_filter)`. `category` is `coordinates`, `object`, `datetime`, `instrument`, `frametype`;
+/// anything else is the view's `all` (any of them).
+///
+/// "Missing coordinates" catches three sentinel patterns that FITS pipelines write instead of leaving fields NULL:
+///   1. numeric ra/dec = NULL
+///   2. numeric (ra, dec) = (0, 0) — literal zero, no one images at 0,0
+///   3. sexagesimal objctra/objctdec that stringify to all-zero after stripping whitespace, signs, and colons —
+///      e.g. "00 00 00", "+00 00 00", "00:00:00". Thousands of LIGHT frames in typical libraries have these because
+///      the acquisition software wrote a placeholder rather than the real RA/Dec.
+///
+/// A frame counts as "missing coordinates" when BOTH the numeric side and the sexagesimal side are in one of the
+/// above states. The same clause is inlined into the "all" branch.
+///
+/// LIGHT-only categories: coordinates and object. Darks/flats/bias legitimately have no RA/Dec and no target OBJECT —
+/// surfacing them under those chips would be noise. For instrument/datetime/frametype, all frame types qualify
+/// because the user may need to fix a missing camera/date/type on any kind of frame.
+pub(crate) fn missing_metadata_clause(category: &str) -> (&'static str, &'static str) {
+    const COORDS_MISSING: &str =
         "((fr.ra IS NULL AND fr.dec IS NULL) OR (fr.ra = 0 AND fr.dec = 0)) \
          AND (\
              fr.objctra IS NULL OR fr.objctdec IS NULL \
              OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctra, ' ', ''), '+', ''), '-', ''), ':', '') = '000000' \
              OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctdec, ' ', ''), '+', ''), '-', ''), ':', '') = '000000'\
          )";
-    // LIGHT-only categories: coordinates and object. Darks/flats/bias legitimately
-    // have no RA/Dec and no target OBJECT — surfacing them under those chips would
-    // be noise. For instrument/datetime/frametype, all frame types qualify because
-    // the user may need to fix a missing camera/date/type on any kind of frame.
-    let (missing_clause, imagetyp_filter) = match category {
-        "coordinates" => (coords_missing_clause, "UPPER(fr.imagetyp) = 'LIGHT' AND"),
+    match category {
+        "coordinates" => (COORDS_MISSING, "UPPER(fr.imagetyp) = 'LIGHT' AND"),
         "object" => ("fr.object IS NULL OR fr.object = ''", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
         "datetime" => ("fr.date_obs IS NULL", ""),
         "instrument" => ("fr.instrume IS NULL OR fr.instrume = ''", ""),
         "frametype" => ("(fr.imagetyp IS NULL OR fr.imagetyp = '')", ""),
         _ => (
             "(UPPER(fr.imagetyp) = 'LIGHT' AND ((((fr.ra IS NULL AND fr.dec IS NULL) OR (fr.ra = 0 AND fr.dec = 0)) AND (fr.objctra IS NULL OR fr.objctdec IS NULL OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctra, ' ', ''), '+', ''), '-', ''), ':', '') = '000000' OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctdec, ' ', ''), '+', ''), '-', ''), ':', '') = '000000')) OR (fr.object IS NULL OR fr.object = ''))) OR fr.date_obs IS NULL OR (fr.instrume IS NULL OR fr.instrume = '') OR (fr.imagetyp IS NULL OR fr.imagetyp = '')",
-            ""
+            "",
         ),
-    };
+    }
+}
+
+pub fn get_frames_with_missing_metadata(
+    conn: &Connection,
+    category: &str,
+) -> Result<Vec<MissingMetadataRow>> {
+    missing_metadata_rows(conn, category, None)
+}
+
+/// [`get_frames_with_missing_metadata`] over the frames a scope lets through: the same clause, the same ordering,
+/// the scope's predicate on `fr.id` added. A scope's state decides Black Hole files; the view itself has no such rule.
+pub fn get_frames_with_missing_metadata_in(
+    conn: &Connection,
+    category: &str,
+    filter: &crate::scope::ScopeFilter,
+) -> Result<Vec<MissingMetadataRow>> {
+    missing_metadata_rows(conn, category, Some(filter))
+}
+
+fn missing_metadata_rows(
+    conn: &Connection,
+    category: &str,
+    filter: Option<&crate::scope::ScopeFilter>,
+) -> Result<Vec<MissingMetadataRow>> {
+    let (missing_clause, imagetyp_filter) = missing_metadata_clause(category);
 
     // `has_duplicate` is a LEFT JOIN against the cached `duplicate_group_files`
     // table (populated by the existing duplicate-detection pipeline). No row
     // means the file isn't in any detected duplicate group; any match means it
     // is. Uses the `idx_dup_group_files_file` index for O(1) lookups.
+    let scope_clause = filter.map(|f| format!("AND ({})", f.sql)).unwrap_or_default();
     let query = format!(
         "{select}
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
          LEFT JOIN duplicate_group_files dgf ON dgf.file_id = f.id
-         WHERE {imagetyp_filter} ({missing_clause})
+         WHERE {imagetyp_filter} ({missing_clause}) {scope_clause}
          GROUP BY f.id
          ORDER BY f.modified_at DESC",
         select = missing_metadata_select(),
         imagetyp_filter = imagetyp_filter,
         missing_clause = missing_clause,
+        scope_clause = scope_clause,
     );
 
     let mut stmt = conn.prepare(&query)?;
-    let results = stmt.query_map([], map_missing_metadata_row)?;
+    let params: &[rusqlite::types::Value] = filter.map(|f| f.params.as_slice()).unwrap_or(&[]);
+    let results = stmt.query_map(rusqlite::params_from_iter(params.iter()), map_missing_metadata_row)?;
     results.collect()
 }
 
@@ -2223,6 +2249,7 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
                 file_paths,
                 file_ids,
                 files: Vec::new(),
+                key: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2578,6 +2605,7 @@ pub fn get_cached_duplicates(conn: &Connection, key: DuplicateKey) -> Result<Vec
             file_paths,
             file_ids,
             files: Vec::new(),
+            key: None,
         });
     }
 
@@ -6807,6 +6835,7 @@ mod path_prefix_range_tests {
             ],
             file_ids: file_ids.clone(),
             files: Vec::new(),
+            key: None,
         }];
         enrich_duplicate_groups(&conn, &mut groups).unwrap();
 

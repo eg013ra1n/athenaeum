@@ -119,7 +119,13 @@ imagetyp: string | null,
  */
 dateObs: string | null, };
 
-export type DuplicateGroup = { id: number | null, size: number, content_hash: string, file_count: number, file_paths: Array<string>, file_ids: Array<number>, files: Array<DuplicateFile>, };
+export type DuplicateKey = "header" | "content" | "master";
+
+export type DuplicateGroup = { id: number | null, size: number, content_hash: string, file_count: number, file_paths: Array<string>, file_ids: Array<number>, files: Array<DuplicateFile>, 
+/**
+ * The key that found this group (`header`, `master` or `content`); set by `get_duplicates`.
+ */
+key?: DuplicateKey | null, };
 
 export type BulkMoveResult = { moved: number, 
 /**

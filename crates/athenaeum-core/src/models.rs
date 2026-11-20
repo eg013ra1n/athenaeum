@@ -223,6 +223,10 @@ pub struct DuplicateGroup {
     pub file_ids: Vec<i64>,
     #[serde(default)]
     pub files: Vec<DuplicateFile>,
+    /// The key that found this group (`header`, `master` or `content`); set by `get_duplicates`.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub key: Option<crate::db::DuplicateKey>,
 }
 
 /// Result of a bulk move-to-black-hole operation.

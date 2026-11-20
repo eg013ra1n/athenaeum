@@ -75,7 +75,7 @@ fn file_id_of(conn: &Connection, file: &str) -> Result<Option<i64>, ApiError> {
 }
 
 /// The catalog frames of the given files, in the scope's own shape (so a [`FileLine`] reads as everywhere else).
-fn frames_of_files(conn: &Connection, file_ids: &[i64]) -> Result<Vec<ScopedFrame>, ApiError> {
+pub(super) fn frames_of_files(conn: &Connection, file_ids: &[i64]) -> Result<Vec<ScopedFrame>, ApiError> {
     if file_ids.is_empty() {
         return Ok(Vec::new());
     }

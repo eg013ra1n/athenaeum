@@ -212,11 +212,15 @@ pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiEr
 
     let mut all = Vec::new();
     for &key in keys {
-        let groups = if crate::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
+        let mut groups = if crate::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
             crate::db::get_cached_duplicates(&conn, key)?
         } else {
             crate::db::find_duplicate_groups(&conn, key)?
         };
+        // Say which key found each group: a header group and a master group mean different things to a reader.
+        for group in &mut groups {
+            group.key = Some(key);
+        }
         all.extend(groups);
     }
     all.sort_by(|a, b| b.file_count.cmp(&a.file_count).then(b.size.cmp(&a.size)));
@@ -1474,6 +1478,65 @@ mod duplicate_key_tests {
             groups.is_empty(),
             "content key with no content index must find nothing, got {groups:#?}"
         );
+    }
+
+    /// Each group says which key found it: the header key and the master key in the default mode, the content key
+    /// alone with the setting on; the order is the page's own (most copies, then size).
+    #[test]
+    fn duplicate_groups_carry_their_key() {
+        use crate::db::DuplicateKey;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/vol', 1)", []).unwrap();
+            // (id, path, size, imagetyp, is_master, header, strong_hash, content_hash)
+            let rows: [(i64, &str, i64, &str, i64, Option<&str>, Option<&str>, &str); 4] = [
+                (1, "/vol/a/f.fits", 100, "Flat", 0, Some("HDR"), None, "C1"),
+                (2, "/vol/b/f.fits", 100, "Flat", 0, Some("HDR"), None, "C1"),
+                (3, "/vol/a/m.xisf", 900, "MasterDark", 1, None, Some("S1"), "C2"),
+                (4, "/vol/b/m.xisf", 900, "MasterDark", 1, None, Some("S1"), "C2"),
+            ];
+            for (id, path, size, imagetyp, is_master, header, strong, content) in rows {
+                let filename = path.rsplit('/').next().unwrap();
+                conn.execute(
+                    "INSERT INTO files (id, path, filename, size, modified_at, format, strong_hash, content_hash)
+                     VALUES (?1, ?2, ?3, ?4, '2024-10-05T04:21:46+00:00', 'FITS', ?5, ?6)",
+                    rusqlite::params![id, path, filename, size, strong, content],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, ?2, ?3)",
+                    rusqlite::params![id, imagetyp, is_master],
+                )
+                .unwrap();
+                if let Some(header) = header {
+                    conn.execute(
+                        "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![id, header, crate::fingerprint::compute_header_fingerprint(header)],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+
+        let groups = super::get_duplicates(&ctx).unwrap();
+        let keys: Vec<_> = groups.iter().map(|g| g.key).collect();
+        assert_eq!(keys, vec![Some(DuplicateKey::Master), Some(DuplicateKey::Header)], "bigger group first: {groups:#?}");
+        assert_eq!(serde_json::to_value(groups[0].key).unwrap(), "master");
+        assert_eq!(serde_json::to_value(groups[1].key).unwrap(), "header");
+
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, crate::settings::keys::DUPLICATES_USE_CONTENT_HASH, "true").unwrap();
+        }
+        let groups = super::get_duplicates(&ctx).unwrap();
+        assert!(!groups.is_empty(), "the content key finds the pairs that share a content hash");
+        assert!(groups.iter().all(|g| g.key == Some(DuplicateKey::Content)), "{groups:#?}");
+        assert_eq!(serde_json::to_value(groups[0].key).unwrap(), "content");
+        assert!(groups.windows(2).all(|w| (w[0].file_count, w[0].size) >= (w[1].file_count, w[1].size)), "order unchanged");
     }
 }
 
