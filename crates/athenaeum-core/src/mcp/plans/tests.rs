@@ -250,13 +250,16 @@ fn waiting(rig: &Rig, fx: &Fx, applier: &TestApplier) -> String {
     id
 }
 
-/// Spins (no clock) until the apply thread has ended the plan.
+/// Waits until the apply thread has ended the plan. Bounded: a plan stranded in `applying` fails the test with its
+/// state instead of hanging it.
 async fn settled(rig: &Rig, id: &str) -> McpPlanView {
+    let started = std::time::Instant::now();
     loop {
         let v = rig.host.plans.view(Some(id)).expect("plan");
         if v.state != PlanState::Applying {
             return v;
         }
+        assert!(started.elapsed() < Duration::from_secs(10), "the plan is stranded: {:?}", v.state);
         tokio::task::yield_now().await;
     }
 }
@@ -672,4 +675,240 @@ async fn finished_plans_are_kept_a_day_and_then_forgotten() {
     tokio::time::advance(Duration::from_secs(2 * 3600)).await;
     assert!(rig.host.plans.view(Some(&a)).is_none(), "a replaced plan goes after 24 h");
     assert!(rig.host.plans.view(Some(&b)).is_some(), "an undecided plan is never dropped");
+}
+
+// ---- fix round 1 ----
+
+/// The catalog's pool holds this many connections (`Database::new`).
+const POOL_SIZE: u32 = 8;
+
+#[tokio::test(start_paused = true)]
+async fn the_applier_finds_the_whole_pool_free() {
+    /// Checks out every pooled connection at once, as an applier that calls core's own commands may.
+    struct TakesThePool(Arc<AtomicUsize>);
+    impl PlanApplier for TakesThePool {
+        fn validate(&self, _v: &McpPlanView, _s: &PlanSelection) -> Result<(), String> {
+            Ok(())
+        }
+        fn apply(&self, host: &McpHost, _p: &str, _s: &PlanSelection, fresh: &[String]) -> PlanReport {
+            let database = host.ctx().db.get().expect("catalog");
+            let held: Vec<_> = (0..POOL_SIZE).filter_map(|_| database.try_conn().ok()).collect();
+            self.0.store(held.len(), Ordering::SeqCst);
+            PlanReport {
+                applied: fresh
+                    .iter()
+                    .map(|id| ReportLine { item_id: id.clone(), file_name: id.clone(), folder: String::new(), reason: "done".into() })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+    }
+    let rig = rig();
+    let fx = fixture(&rig);
+    let got = Arc::new(AtomicUsize::new(0));
+    let (id, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t");
+    let mut c = content(&rig, &fx, &TestApplier::default());
+    c.applier = Box::new(TakesThePool(Arc::clone(&got)));
+    rig.host.plans.publish(&id, c).expect("publish");
+    rig.host.plans.answer(&rig.host, &id, apply_of(selection(Some(&fx.keeper), &[&fx.a]))).expect("apply");
+    let done = settled(&rig, &id).await;
+    assert_eq!(done.state, PlanState::Applied);
+    assert_eq!(got.load(Ordering::SeqCst), POOL_SIZE as usize, "the apply holds no pooled connection across the applier");
+}
+
+#[tokio::test(start_paused = true)]
+async fn preparing_progress_emits_throttled_events() {
+    let rig = rig();
+    let (id, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t");
+    rig.forget_events();
+    for i in 0..1000 {
+        rig.host.plans.progress(&id, i, 1001);
+        tokio::time::advance(Duration::from_micros(100)).await; // 100 ms in all
+    }
+    assert!(rig.names().len() <= 2, "{} events", rig.names().len());
+    assert!(!rig.names().is_empty(), "the first call tells the window");
+    assert!(rig.names().iter().all(|(n, p)| n == "mcp-plan-updated" && *p == id));
+    assert_eq!(rig.host.plans.view(Some(&id)).unwrap().state, PlanState::Preparing { done: 999, total: 1001 });
+
+    let before = rig.names().len();
+    rig.host.plans.progress(&id, 1001, 1001);
+    assert_eq!(rig.names().len(), before + 1, "the final call always emits");
+
+    // 250 ms later the next one is due again.
+    tokio::time::advance(Duration::from_millis(250)).await;
+    rig.host.plans.progress(&id, 1, 2);
+    assert_eq!(rig.names().len(), before + 2);
+}
+
+/// A waiting plan whose applier panics, with one item changed on disk so the store has a skip line of its own.
+struct Panics;
+impl PlanApplier for Panics {
+    fn validate(&self, _v: &McpPlanView, _s: &PlanSelection) -> Result<(), String> {
+        Ok(())
+    }
+    fn apply(&self, _h: &McpHost, _p: &str, _s: &PlanSelection, _f: &[String]) -> PlanReport {
+        panic!("the applier broke");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_applier_fails_the_plan_and_keeps_the_skip_lines() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    let (id, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t");
+    let mut c = content(&rig, &fx, &TestApplier::default());
+    c.applier = Box::new(Panics);
+    rig.host.plans.publish(&id, c).expect("publish");
+    std::fs::write(&fx.a.path, vec![7u8; 99]).expect("rewrite");
+    rig.host.plans.answer(&rig.host, &id, apply_of(selection(Some(&fx.keeper), &[&fx.a, &fx.b]))).expect("apply");
+    let done = settled(&rig, &id).await;
+    assert!(matches!(done.state, PlanState::Failed { .. }), "{:?}", done.state);
+    let report = done.report.expect("the failed plan keeps the store's skip lines");
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].item_id, fx.a.item());
+    assert!(report.applied.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panic_outside_the_applier_still_ends_the_plan() {
+    // The re-check has no input a test can make panic; the closing log line of the run is a step after the applier's
+    // own guard, so a log writer that panics on it stands for any panic there.
+    // Once: the fmt layer keeps its half-written line after a panic, so every later line would carry the match too.
+    static BROKEN: AtomicBool = AtomicBool::new(false);
+    #[derive(Clone)]
+    struct Boom;
+    impl std::io::Write for Boom {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if String::from_utf8_lossy(b).contains("mcp plan applied") && !BROKEN.swap(true, Ordering::SeqCst) {
+                panic!("the log writer broke");
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Boom {
+        type Writer = Boom;
+        fn make_writer(&'a self) -> Boom {
+            self.clone()
+        }
+    }
+    let rig = rig();
+    let fx = fixture(&rig);
+    let applier = TestApplier::default();
+    let id = waiting(&rig, &fx, &applier);
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt().with_writer(Boom).with_max_level(tracing::Level::DEBUG).with_ansi(false).finish(),
+    );
+    rig.host.plans.answer(&rig.host, &id, apply_of(selection(Some(&fx.keeper), &[&fx.a]))).expect("apply");
+    let done = settled(&rig, &id).await;
+    drop(guard);
+    assert!(matches!(done.state, PlanState::Failed { .. }), "{:?}", done.state);
+    assert_eq!(applier.calls.load(Ordering::SeqCst), 1, "the applier had run");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_group_the_window_left_out_shows_nothing_applied() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    let (id, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t");
+    let mut c = content(&rig, &fx, &TestApplier::default());
+    // The planner proposes a second group with ticks and a kept copy; the window answers for the first only.
+    let mut second = c.groups[0].clone();
+    second.id = "group:2".to_string();
+    second.chosen = Some(fx.keeper.item());
+    for item in &mut second.items {
+        item.selected = true;
+    }
+    c.groups.push(second);
+    rig.host.plans.publish(&id, c).expect("publish");
+    rig.host.plans.answer(&rig.host, &id, apply_of(selection(Some(&fx.keeper), &[&fx.a]))).expect("apply");
+    let done = settled(&rig, &id).await;
+    assert_eq!(done.state, PlanState::Applied);
+    assert!(done.groups[0].items.iter().any(|i| i.selected));
+    assert_eq!(done.groups[1].chosen, None);
+    assert!(done.groups[1].items.iter().all(|i| !i.selected), "nothing of an omitted group was applied");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreachable_items_are_logged_once_per_plan() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    let (guard, buf) = capture();
+    let (id, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t");
+    let mut c = content(&rig, &fx, &TestApplier::default());
+    for (n, item) in c.groups[0].items.iter_mut().enumerate() {
+        let gone = rig.base.join("not_mounted").join(format!("frame_{n}"));
+        item.locked = stamp_for_plan(&gone).err();
+    }
+    rig.host.plans.publish(&id, c).expect("publish");
+    drop(guard);
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let warns: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+    assert_eq!(warns.len(), 1, "{log}");
+    assert!(warns[0].contains("count=5") && warns[0].contains("keeper_1"), "{}", warns[0]);
+    assert!(warns[0].contains(&id), "{}", warns[0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_applies_racing_one_plan_apply_once() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    for _ in 0..20 {
+        let applier = TestApplier::default();
+        let id = waiting(&rig, &fx, &applier);
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<McpPlanView, ApiError>> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        rig.host.plans.answer(&rig.host, &id, apply_of(selection(Some(&fx.keeper), &[&fx.a])))
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().expect("racer")).collect()
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+        assert!(results.iter().any(|r| matches!(r, Err(ApiError::Invalid(_)))), "{results:?}");
+        assert_eq!(settled(&rig, &id).await.state, PlanState::Applied);
+        assert_eq!(applier.calls.load(Ordering::SeqCst), 1, "the applier ran once");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_racing_an_apply_has_one_winner() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    for _ in 0..20 {
+        let applier = TestApplier::default();
+        let id = waiting(&rig, &fx, &applier);
+        let barrier = std::sync::Barrier::new(2);
+        let (applied, cancelled) = std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                barrier.wait();
+                rig.host.plans.answer(&rig.host, &id, apply_of(selection(Some(&fx.keeper), &[&fx.a])))
+            });
+            let c = s.spawn(|| {
+                barrier.wait();
+                rig.host.plans.answer(&rig.host, &id, PlanAnswer::Cancel)
+            });
+            (a.join().expect("apply"), c.join().expect("cancel"))
+        });
+        let end = settled(&rig, &id).await.state;
+        match (applied.is_ok(), cancelled.is_ok()) {
+            (true, false) => {
+                assert!(matches!(cancelled, Err(ApiError::Invalid(_))));
+                assert_eq!(end, PlanState::Applied);
+                assert_eq!(applier.calls.load(Ordering::SeqCst), 1);
+            }
+            (false, true) => {
+                assert!(matches!(applied, Err(ApiError::Invalid(_))));
+                assert_eq!(end, PlanState::Cancelled);
+                assert_eq!(applier.calls.load(Ordering::SeqCst), 0, "a cancelled plan is never applied");
+            }
+            other => panic!("exactly one of apply and cancel wins, got {other:?}"),
+        }
+    }
 }

@@ -206,7 +206,8 @@ pub const NOT_REACHABLE: &str = "not reachable (its volume may be unmounted)";
 /// [`disk_stamp`] for a planning tool: `Err` is the lock reason for the item.
 pub fn stamp_for_plan(path: &Path) -> Result<DiskStamp, String> {
     disk_stamp(path).map_err(|e| {
-        tracing::warn!(error = %e, path = %path.display(), "plan item could not be stamped");
+        // One file in a plan of up to 2 000: the plan's publish logs the count once, at warn.
+        tracing::debug!(error = %e, path = %path.display(), "plan item could not be stamped");
         NOT_REACHABLE.to_string()
     })
 }

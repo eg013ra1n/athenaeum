@@ -6,7 +6,7 @@
 //! only the window's command calls it: no MCP tool does. The apply re-checks every file against its state at planning
 //! (`apply.rs`) before the plan's [`PlanApplier`] acts on what is still fresh.
 //!
-//! Every change of a plan's state emits `mcp-plan-updated {"planId": …}` through the host's emitter and nothing else:
+//! Every change of a plan's state (and, throttled, its progress while preparing) emits `mcp-plan-updated {"planId": …}` through the host's emitter and nothing else:
 //! the window reads the plan again on that event.
 
 mod apply;
@@ -40,6 +40,8 @@ pub const PLAN_ITEM_CAP: usize = 2_000;
 const KEEP_FINISHED: Duration = Duration::from_secs(24 * 3600);
 /// ... and at most this many finished plans are kept.
 const KEEP_AT_MOST: usize = 100;
+/// Between two progress events of one plan (the last one, `done == total`, is never held back).
+const PROGRESS_EVENT_EVERY: Duration = Duration::from_millis(250);
 /// The one event a plan emits.
 const EVENT: &str = "mcp-plan-updated";
 
@@ -77,6 +79,8 @@ struct Plan {
     emitter: Arc<dyn ProgressEmitter>,
     sleeper: Option<tokio::task::AbortHandle>,
     finished_at: Option<Instant>,
+    /// When `progress` last told the window.
+    last_progress_event: Option<Instant>,
 }
 
 impl Plan {
@@ -115,10 +119,6 @@ struct Inner {
 }
 
 impl Inner {
-    fn find(&mut self, id: &str) -> Option<&mut Plan> {
-        self.plans.iter_mut().find(|p| p.id == id)
-    }
-
     fn notify(&mut self, i: usize) {
         let p = &self.plans[i];
         self.pending.push((Arc::clone(&p.emitter), p.id.clone()));
@@ -218,6 +218,7 @@ impl PlanStore {
             emitter: Arc::clone(host.emitter()),
             sleeper: None,
             finished_at: None,
+            last_progress_event: None,
         };
         self.with(|inner| {
             for i in 0..inner.plans.len() {
@@ -239,11 +240,24 @@ impl PlanStore {
         (id, cancel)
     }
 
-    /// How far the planning tool is; the window learns it on its next read, no event.
+    /// How far the planning tool is. The window shows it, so the first call, the last (`done == total`) and at most
+    /// one in [`PROGRESS_EVENT_EVERY`] between them emit the plan's event; the state itself is always current.
     pub fn progress(&self, id: &str, done: usize, total: usize) {
         self.with(|inner| {
-            if let Some(p) = inner.find(id).filter(|p| matches!(p.state, PlanState::Preparing { .. })) {
-                p.state = PlanState::Preparing { done, total };
+            let Some(i) = inner
+                .plans
+                .iter()
+                .position(|p| p.id == id && matches!(p.state, PlanState::Preparing { .. }))
+            else {
+                return;
+            };
+            let p = &mut inner.plans[i];
+            p.state = PlanState::Preparing { done, total };
+            let now = Instant::now();
+            let due = p.last_progress_event.is_none_or(|t| now.duration_since(t) >= PROGRESS_EVENT_EVERY);
+            if done == total || due {
+                p.last_progress_event = Some(now);
+                inner.notify(i);
             }
         });
     }
@@ -266,6 +280,17 @@ impl PlanStore {
                 p.finish(PlanState::Failed { error: error.clone() });
                 inner.notify(i);
                 return Err(error);
+            }
+            // One line for the plan, not one per file: a missing volume locks every file on it.
+            let mut unreachable = c
+                .groups
+                .iter()
+                .flat_map(|g| g.items.iter())
+                .filter(|i| i.locked.as_deref() == Some(NOT_REACHABLE));
+            if let Some(first) = unreachable.next() {
+                let count = 1 + unreachable.count();
+                let path = std::path::Path::new(&first.folder).join(&first.file_name);
+                tracing::warn!(plan_id = %p.id, count, path = %path.display(), "plan items are not reachable");
             }
             let deadline = Instant::now() + PLAN_TTL;
             p.title = c.title;
@@ -376,12 +401,12 @@ impl PlanStore {
                 return Err(invalid(format!("this plan is {}; it cannot be applied", state_words(&p.state))));
             }
             // What the user chose is what the report and the window show from here on.
-            for g in &selection.groups {
-                if let Some(group) = p.groups.iter_mut().find(|x| x.id == g.group_id) {
-                    group.chosen = g.chosen.clone();
-                    for item in &mut group.items {
-                        item.selected = g.included.contains(&item.id);
-                    }
+            // A group the window left out is not applied: it shows nothing ticked and no kept copy.
+            for group in &mut p.groups {
+                let answer = selection.groups.iter().find(|g| g.group_id == group.id);
+                group.chosen = answer.and_then(|g| g.chosen.clone());
+                for item in &mut group.items {
+                    item.selected = answer.is_some_and(|g| g.included.contains(&item.id));
                 }
             }
             p.state = PlanState::Applying;
@@ -402,33 +427,39 @@ impl PlanStore {
             let view = applying.clone();
             move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    span.in_scope(|| store.run_apply(&host, &id, &view, &selection, &content));
+                    span.in_scope(|| store.run_apply(host, &id, &view, &selection, content));
                 });
             }
         });
         if let Err(e) = spawned {
             tracing::error!(error = %e, plan_id = %applying.plan_id, "mcp plan apply thread could not start");
             let error = format!("the apply could not start: {e}");
-            self.finish_apply(&applying.plan_id, Err(error.clone()));
+            self.finish_apply(&applying.plan_id, Err(apply::Failure { error: error.clone(), report: None }));
             return Err(ApiError::Internal(error));
         }
         Ok(applying)
     }
 
-    fn run_apply(&self, host: &McpHost, id: &str, view: &McpPlanView, sel: &PlanSelection, content: &Content) {
-        let outcome = match crate::api::db(host.ctx()).map_err(|e| e.to_string()).and_then(|d| {
-            d.try_conn().map_err(|e| {
-                tracing::error!(error = %e, "mcp plan apply could not reach the catalog");
-                format!("the catalog is busy: {e}")
+    /// The apply thread's body. Nothing here may strand the plan in `applying`: a panic anywhere in the re-check or
+    /// the applier ends it `failed`. The host and the content are let go before the plan is finished, so a caller that
+    /// sees the end state also sees the catalog's pool unreferenced by this thread.
+    fn run_apply(&self, host: Arc<McpHost>, id: &str, view: &McpPlanView, sel: &PlanSelection, content: Arc<Content>) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply::run(&host, id, view.kind.as_str(), view, sel, &content)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::error!(plan_id = id, "mcp plan apply panicked");
+            Err(apply::Failure {
+                error: "applying the plan stopped unexpectedly; check the files before trying again".to_string(),
+                report: None,
             })
-        }) {
-            Ok(conn) => apply::run(host, id, view.kind.as_str(), view, sel, content, &conn),
-            Err(e) => Err(e),
-        };
+        });
+        drop(host);
+        drop(content);
         self.finish_apply(id, outcome);
     }
 
-    fn finish_apply(&self, id: &str, outcome: Result<PlanReport, String>) {
+    fn finish_apply(&self, id: &str, outcome: Result<PlanReport, apply::Failure>) {
         self.with(|inner| {
             let Some(i) = inner.plans.iter().position(|p| p.id == id) else { return };
             let p = &mut inner.plans[i];
@@ -437,8 +468,9 @@ impl PlanStore {
                     p.report = Some(report);
                     p.finish(PlanState::Applied);
                 }
-                Err(error) => {
+                Err(apply::Failure { error, report }) => {
                     tracing::error!(plan_id = %p.id, kind = p.kind.as_str(), error = %error, "mcp plan apply failed");
+                    p.report = report;
                     p.finish(PlanState::Failed { error });
                 }
             }

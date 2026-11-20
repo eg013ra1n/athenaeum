@@ -114,17 +114,21 @@ fn line(view: &McpPlanView, item_id: &str, reason: impl Into<String>) -> ReportL
     ReportLine { item_id: item_id.to_string(), file_name, folder, reason: reason.into() }
 }
 
-/// Re-stamps every included item and each group's kept copy, hands the fresh items to the applier and merges the
-/// reports. The caller wears the `mcp_plan_apply` span; the closing `info!` is here.
-pub(super) fn run(
-    host: &McpHost,
-    plan_id: &str,
-    kind: &str,
+/// Why an apply ended in `failed`, and what it had already worked out (the store's own skip lines).
+pub(super) struct Failure {
+    pub error: String,
+    pub report: Option<PlanReport>,
+}
+
+/// Re-stamps every included item and each group's kept copy. Returns the ids still fresh and the lines of what was
+/// skipped. Holds a pooled catalog connection only for its own length: the caller releases it before the applier runs,
+/// because an applier reaches the catalog through the pool itself.
+fn recheck(
+    conn: &Connection,
     view: &McpPlanView,
     sel: &PlanSelection,
     content: &Content,
-    conn: &Connection,
-) -> Result<PlanReport, String> {
+) -> (Vec<String>, Vec<ReportLine>) {
     let mut skipped: Vec<ReportLine> = Vec::new();
     let mut fresh: Vec<String> = Vec::new();
     for g in &sel.groups {
@@ -147,15 +151,43 @@ pub(super) fn run(
             }
         }
     }
+    (fresh, skipped)
+}
+
+/// Re-checks the selection (on a connection of its own, released before the next step), hands the fresh items to the
+/// applier and merges the reports. The caller wears the `mcp_plan_apply` span; the closing `info!` is here.
+pub(super) fn run(
+    host: &McpHost,
+    plan_id: &str,
+    kind: &str,
+    view: &McpPlanView,
+    sel: &PlanSelection,
+    content: &Content,
+) -> Result<PlanReport, Failure> {
+    let fail = |error: String| Failure { error, report: None };
+    let (fresh, mut skipped) = {
+        let database = crate::api::db(host.ctx()).map_err(|e| fail(e.to_string()))?;
+        let conn = database.try_conn().map_err(|e| {
+            tracing::error!(error = %e, "mcp plan apply could not reach the catalog");
+            fail(format!("the catalog is busy: {e}"))
+        })?;
+        recheck(&conn, view, sel, content)
+    };
     let mut report = if fresh.is_empty() {
         PlanReport::default()
     } else {
         let applier: &dyn PlanApplier = content.applier.as_ref();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| applier.apply(host, plan_id, sel, &fresh)))
-            .map_err(|_| {
-                tracing::error!("mcp plan applier panicked");
-                "applying the plan stopped unexpectedly; check the files before trying again".to_string()
-            })?
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| applier.apply(host, plan_id, sel, &fresh))) {
+            Ok(report) => report,
+            Err(_) => {
+                tracing::error!(plan_id, "mcp plan applier panicked");
+                // What the store skipped is still true: the report keeps it.
+                return Err(Failure {
+                    error: "applying the plan stopped unexpectedly; check the files before trying again".to_string(),
+                    report: Some(PlanReport { skipped, ..PlanReport::default() }),
+                });
+            }
+        }
     };
     skipped.append(&mut report.skipped);
     report.skipped = skipped;
