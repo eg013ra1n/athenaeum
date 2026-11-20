@@ -406,6 +406,37 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Assistant access (MCP) M1 — catalog questions (2026-11-20)
+
+Branch `mcp/m1-host`, merged to local `main` (spec `docs/superpowers/specs/2026-10-27-athenaeum-mcp-design.md`, plan
+`docs/superpowers/plans/2026-11-19-athenaeum-mcp-v1-plan.md` Tasks 1-10). Reference: `docs/mcp/README.md`. Evidence:
+the ledger `.superpowers/sdd/2026-11-19-mcp-v1/` and the headless smoke on a copy of the dev catalog (40 535 frames,
+82 sets: 11 of 11 cases equal the app, nothing changed; `m1-smoke-report.md` there). Owed by hand, in Claude desktop and
+Claude Code against `npm run tauri dev` (dev catalog) and the installed release:
+- **S1 off, and client before app.** Access off in both builds: every question answers the off sentence only. Then
+  quit Athenaeum, start Claude desktop first: the real five tools are listed, a call answers "not running"; start
+  Athenaeum: the next call answers.
+- **S2 duplicates.** `find_duplicates` over the whole catalog equals the Duplicates page, with the content setting
+  off and on.
+- **S11 dev and release at once.** Both on: each answer names its own build (`athenaeum` / `athenaeum-dev`) and its
+  own catalog path; a dev config pointed at the release says it reached the other build.
+- **S13 scope.** One camera + one year: the missing-metadata answer equals the Missing Metadata view on non-Black-Hole
+  rows (the view lists Black Hole files — see "App gaps found while planning the MCP"); a misspelled camera names the
+  nearest values.
+- **S14 questions.** A frame set's counts and integration per filter equal its page (try LDN 1272: two sets share the
+  name, each answered with its own page's figures); an outlier named by file; a never-measured value said so (the dev
+  catalog's analyses predate MEASURE_VERSION 8, so expect "measured by an earlier version").
+- **Windows session.** The named pipe; the client config points at `<app-data>\bin\athenaeum-mcp.exe`; update the app
+  while Claude holds the bridge: the copy is kept, refreshed at the next start, the old bridge still answers. The
+  Windows channel code is compile-checked here (`x86_64-pc-windows-gnu`), never run; the tag pipeline's Windows job is
+  the first run of its tests.
+- **Linux AppImage session.** The copied bridge under `<app-data>/bin`.
+- **The installers.** The first tag build is the first proof that the release-profile bundles carry the bridge
+  (macOS .app and the .deb fail their job if not; Windows relies on the `npx tauri build --config` form).
+Told, not fixed: a whole-catalog calibration question takes ~40 s cold (~4 s warm) — the app's own per-set readiness
+for one page of 25 sets; the web `get_mcp_status` still returns the key after access is off (behind the API key; the
+page hides it).
+
 ### Forced-list zero point (2026-11-16)
 
 Branch `collab-v3-wave6-5-osc` (spec `docs/superpowers/specs/2026-11-16-forced-list-zero-point-design.md`, plan `docs/superpowers/plans/2026-11-16-forced-list-zero-point-plan.md`). Reference: `docs/catalog/README.md` (Zero point and transparency). Evidence: the ledger `.superpowers/sdd/2026-11-16-osc-zp/` (`progress.md`, the per-task reports) and the data under `~/.athenaeum-acc/2026-11-16-osc-zp/out/` (not committed). Owed or told:
