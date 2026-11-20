@@ -60,6 +60,9 @@ Every answer is two halves that each read on their own.
 | `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many calibration links point at each (`linkCount`: light frames, and master sets that use it as a dark or bias); not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); like `find_duplicates`, a group is in the scope when one of its copies is, and it is then listed whole (every copy, its handle the lowest file id of the whole group, so `plan_black_hole` finds it) |
 | `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window. A plan with copies to byte-check answers at once with state `preparing` (the checks run on a thread of their own); the answer of a published plan lists every copy and its fate |
 | `plan_metadata_fill { scope, fields?, statement? }` | Prepares a metadata plan: fills the object (lights only), camera, date or frame type that frames in the scope miss, from evidence or from `statement {field, value}` (the user's own word); see "Metadata plans" below. Refused in words, leaving the waiting plan alone, when the scope names nothing, nothing can be proposed or the plan would hold more than 2 000 items. The plan is published before the tool answers, and the answer lists every group and frame |
+| `plan_plate_solve { scope, onlyUnsolved? }` | Prepares a plate-solve plan over the lights of the scope (those that miss coordinates unless `onlyUnsolved` is false); see "Plate-solve plans" below. Refused in words, leaving the waiting plan alone, when the scope names nothing, no light is left to solve or the plan would hold more than 2 000 items, and refused while any plate-solve batch runs (the running run's own words). Solver builds only |
+| `solve_status { runId }` | A run's progress while it runs (frames done of total, solved and failed so far, the file being solved, each failure by file name and folder) and its result after it (solved, failed with every failed file and its error, frames a cancel left unattempted). Changes nothing; knows the runs the assistant started since Athenaeum opened (the last 20). Solver builds only |
+| `cancel_solve { runId }` | Sets the cancel flag of the assistant's own run, and only while slot 0 holds that exact `runId`; a run started in Athenaeum's window, an ended run or an unknown id is answered in words and nothing is stopped. It stops a run, it never decides a plan (the one tool name that says "cancel"; `no_tool_applies_a_plan` allows it by name). Solver builds only |
 | `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied") |
 
 Each tool is a core fn `mcp::tools::<name>(host, args) -> Result<Answer, ApiError>` wearing
@@ -359,6 +362,38 @@ a frame whose stored value is not empty is left alone even where the parser coul
   A date is stored `<value>Z`, as the Set Date modal stores it. One `frames-metadata-changed {"count": <frames>}` follows when anything
   was written; the closing line is `info!(via = "mcp", plan_id, count, "mcp metadata fill applied")`.
 
+## Plate-solve plans (`plan_plate_solve`, `solve_status`, `cancel_solve`)
+
+`mcp/plans/plate_solve.rs` (the plan, its applier, the host's run log), `mcp/tools/fill.rs` (the three tools), core's `api::plate_solve` (the
+slot, the run, the cancel). `cfg(all(feature = "render", feature = "solver"))`, as `api::plate_solve` is: `--no-default-features` builds without
+the module, the three tools and `McpHost::solves`, and its tool list simply lacks them.
+
+- **Items** are the raw lights of the scope (a master or another type is left out and counted: `N frames are not a light frame and are left out`);
+  with `onlyUnsolved` (the default) only lights that miss coordinates by the Missing Metadata view's own test (`missing_flags`), the others counted
+  (`N light frames already have coordinates and are left out (onlyUnsolved)`). One group per folder, each item with Object / Filter / Exposure /
+  Coordinates. An item is locked (never ticked) with the reason: no star catalog (`the star catalog is not installed (Settings → Plate Solving)`,
+  every item), the input gate (`service::input_gate_reason`, the stored `trailed` verdict at the current `MEASURE_VERSION` while
+  `input_gate_enabled`), or a file that cannot be stamped (`not reachable ...`).
+- **Notes**: `N of M frames can be solved`, the refusals by reason, `star catalog: installed|not installed`, `quad index packs: K installed`,
+  `runs X frames at a time` (the configured `batch_concurrency`, else `(cores / 3).clamp(2, 8)`), and the left-out counts. The answer is the plan
+  as data and words (`describe_plan`, also what `plan_status` says of a waiting plate-solve plan), at most 50 groups and 20 items per group.
+- **Refused in words before the plan begins** (the waiting plan is never replaced): a scope that names nothing, no light to solve, a plan of more
+  than 2 000 items, and a plate-solve batch already running: `BUSY_ASSISTANT` when the running run is the assistant's, `BUSY_UI` when the user
+  started it in Athenaeum (`planning_refused_while_a_ui_batch_runs`).
+- **Applied means started.** Apply re-checks each file and the frame's type and coordinates (the store), resolves the catalogs again, claims the slot
+  with `prepare_plate_solve_batch(.., Assistant)` and starts `run_plate_solve_batch` on a thread named `mcp-plate-solve` (never the store's apply
+  thread). The plan ends `applied` with `report.runId = solve-<uuid>` and `plan_status` says `started a plate solve of N frames (run solve-...);
+  ask solve_status for its progress`, never that frames were solved; its report counts `started`, `skipped` and `could not start`. A batch the user
+  started in the window meanwhile (or a catalog removed) starts nothing: every selected item is a `failed` line with the busy text (`BUSY_UI`) and
+  `plan_status` says `did not start a plate solve: ...`. Log: `info!(via = "mcp", plan_id, run_id, count, "plate solve run started from the assistant")`.
+- **`solve_status`** reads the handle's progress while the slot holds the run, and the snapshot the host keeps (`SolveRuns`, the last 20 runs) after.
+  The snapshot counts from the run's own result: the solved and failed counts are the `plate-solve-complete` event's, never the progress events'
+  (a failed store or COMMIT sends no event, so `SolveProgress.solved` can overcount; a run that returns an error solved nothing). A failed frame is
+  named with its file name and folder (the run's emitter records each failed frame), `failedWithoutFile` counts failures no event named, and
+  `notAttempted` is what a cancel left (`status_reports_progress_and_result`, `the_final_snapshot_counts_from_the_runs_own_result`).
+- **`cancel_solve`** goes through `cancel_plate_solve_run` (check and set under the slot's lock) and only for a run in the host's own log, so
+  the window's run is never touched whatever id is named (`cancel_solve_stops_only_its_run`).
+
 ## The plan window
 
 `src/components/mcp/{PlanWindow,PlanView,planSelection}`, state in `src/contexts/McpPlanContext.tsx` (provider and window sit in `Layout.tsx`, once).
@@ -394,6 +429,6 @@ The window is the one place a plan is looked over and decided: ticks, the copy t
 ## Logging
 
 New log fields: `via`, `plan_id`, `kind`, `applied`, `skipped`, `failed` (plans, above) and `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
-`find_missing_metadata`, `plan_status`, `find_rebuilt_masters`, `plan_black_hole`, `plan_metadata_fill`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
+`find_missing_metadata`, `plan_status`, `find_rebuilt_masters`, `plan_black_hole`, `plan_metadata_fill`, `plan_plate_solve`, `solve_status`, `cancel_solve`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
 name: it logs with `state` (`off`/`starting`/`serving`/`elsewhere`/`failed`), `addr` (the endpoint's text), `reason`
 (`timeout`, `too_long`, or a handshake refusal's word), `error` and `path`; never the key.

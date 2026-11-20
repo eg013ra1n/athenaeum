@@ -77,6 +77,9 @@ fn state_words(v: &McpPlanView) -> String {
             None => "waiting for you in Athenaeum's window".to_string(),
         },
         PlanState::Applying => "being carried out: Apply was pressed in Athenaeum's window and it is not finished".to_string(),
+        // A plate-solve plan that was applied STARTED a run: it never says the frames were solved.
+        #[cfg(all(feature = "render", feature = "solver"))]
+        PlanState::Applied if v.kind == PlanKind::PlateSolve => crate::mcp::plans::plate_solve::started_words(v),
         PlanState::Applied => "applied".to_string(),
         PlanState::Cancelled => "cancelled in Athenaeum's window; nothing changed".to_string(),
         PlanState::Replaced => match &v.replaced_by {
@@ -153,6 +156,13 @@ pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
             }
         }
     } else if let Some(report) = &v.report {
+        #[cfg(all(feature = "render", feature = "solver"))]
+        if v.kind == PlanKind::PlateSolve {
+            text.push_str(&crate::mcp::plans::plate_solve::report_text(report));
+        } else {
+            text.push_str(&report_text(report));
+        }
+        #[cfg(not(all(feature = "render", feature = "solver")))]
         text.push_str(&report_text(report));
     }
     // A plan that waits for the user: every copy and what would happen to it, as the planning answer says it.
@@ -160,6 +170,8 @@ pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
     let described = match v.kind {
         PlanKind::BlackHole if waiting => Some(describe_plan(v)),
         PlanKind::Metadata if waiting => Some(metadata::describe_plan(v)),
+        #[cfg(all(feature = "render", feature = "solver"))]
+        PlanKind::PlateSolve if waiting => Some(crate::mcp::plans::plate_solve::describe_plan(v)),
         _ => None,
     };
     if let Some(d) = &described {
@@ -451,9 +463,15 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         for want in ["plan_status", "plan_black_hole", "find_rebuilt_masters", "plan_metadata_fill"] {
             assert!(names.iter().any(|n| n == want), "{want} is not offered: {names:?}");
         }
+        // The plate-solve tools exist only with the solver: `cancel_solve` stops a RUN (the assistant's own), it never
+        // decides a plan, so it is the one name allowed to say "cancel".
+        let solver = cfg!(all(feature = "render", feature = "solver"));
+        for want in ["plan_plate_solve", "solve_status", "cancel_solve"] {
+            assert_eq!(names.iter().any(|n| n == want), solver, "{want}: {names:?}");
+        }
         for n in &names {
             for word in ["apply", "cancel", "replace", "confirm", "approve"] {
-                assert!(!n.contains(word), "a tool named {n} could decide a plan: {names:?}");
+                assert!(n == "cancel_solve" && word == "cancel" || !n.contains(word), "a tool named {n} could decide a plan: {names:?}");
             }
         }
         for t in &tools {

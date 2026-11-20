@@ -13,6 +13,8 @@ mod apply;
 pub mod black_hole;
 pub mod metadata;
 mod model;
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod plate_solve;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
@@ -26,6 +28,8 @@ use tokio::time::Instant;
 
 pub use black_hole::{BlackHoleSource, PlanBlackHoleArgs};
 pub use metadata::PlanMetadataArgs;
+#[cfg(all(feature = "render", feature = "solver"))]
+pub use plate_solve::{PlanPlateSolveArgs, SolveRunArgs};
 pub use model::{
     catalog_values, disk_stamp, stamp_for_plan, stamp_target, DiskStamp, GroupSelection, ItemSnapshot, McpPlanView,
     PlanAnswer, PlanColumn, PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState,

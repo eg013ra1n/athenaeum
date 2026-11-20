@@ -364,6 +364,23 @@ pub fn cancel_plate_solve(ctx: &ServiceContext) -> bool {
     }
 }
 
+/// Set the cancel flag of the running batch only when slot 0 holds `run_id`, checked and set under the slot's one
+/// lock (the assistant cancels its own run and nothing else). Returns whether it did.
+pub fn cancel_plate_solve_run(ctx: &ServiceContext, run_id: &str) -> bool {
+    let solves = ctx.active_plate_solves.lock().unwrap();
+    match solves.get(&0) {
+        Some(handle) if handle.run_id == run_id => {
+            handle.cancel_flag.store(true, Ordering::Relaxed);
+            tracing::info!(run_id = %handle.run_id, "plate solve cancel flag set");
+            true
+        }
+        _ => {
+            tracing::info!(run_id, "plate solve cancel left alone, the slot does not hold that run");
+            false
+        }
+    }
+}
+
 /// Wraps the run's emitter: copies each `plate-solve-progress` event into the
 /// handle's [`SolveProgress`], then forwards every event unchanged.
 struct RecordingEmitter {

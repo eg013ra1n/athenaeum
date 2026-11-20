@@ -96,6 +96,9 @@ pub struct McpHost {
     channel: Mutex<lifecycle::Channel>,
     /// The app-wide plans an assistant prepares and only the user applies (`plans/`).
     pub plans: plans::PlanStore,
+    /// The plate-solve runs the assistant started, for `solve_status` after a run's handle is gone.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    pub solves: plans::plate_solve::SolveRuns,
 }
 
 impl McpHost {
@@ -119,6 +122,8 @@ impl McpHost {
             app_data_dir: OnceLock::new(),
             channel: Mutex::new(lifecycle::Channel::default()),
             plans: plans::PlanStore::default(),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            solves: plans::plate_solve::SolveRuns::default(),
         })
     }
 

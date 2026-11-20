@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 pub use fill::plan_metadata_fill;
+#[cfg(all(feature = "render", feature = "solver"))]
+pub use fill::{cancel_solve, plan_plate_solve, solve_status};
 pub use plans::{find_rebuilt_masters, plan_black_hole, plan_status, PlanStatusArgs};
 pub use catalog::{catalog_overview, file_details, find_duplicates, find_missing_metadata, query_frames};
 
