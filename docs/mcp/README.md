@@ -297,6 +297,28 @@ only those groups enter the plan. The handles are read before the plan begins, s
   `chosen` (`pick the copy that stays ...`) and `chosen` is never included, in its own group or any other.
 - Columns: IMAGETYP, OBJECT, FILTER, EXPTIME, DATE-OBS, INSTRUME, size, modified.
 
+## The plan window
+
+`src/components/mcp/{PlanWindow,PlanView,planSelection}`, state in `src/contexts/McpPlanContext.tsx` (provider and window sit in `Layout.tsx`, once).
+The window is the one place a plan is looked over and decided: ticks, the copy that stays, **Apply** or **Cancel**. A `DialogShell size="lg"`.
+
+- **Reads.** On mount `get_mcp_plan({ planId: null })` (a page opened later finds the plan that waits; the key is always sent); on every
+  `mcp-plan-updated {planId}` `get_mcp_plan({ planId })` (required listener pattern; progress events come about every 250 ms). Only an undecided
+  plan (`preparing`, `waiting`, `applying`) opens a closed window; an event for a finished plan does nothing.
+- **Never swapped under the cursor.** An event for another plan while one is shown only records that a newer one waits; the shown plan stays
+  as it was with the banner "The assistant prepared a newer plan" and **Open the new plan**, and its Apply is disabled. The same banner shows
+  when the shown plan itself becomes `replaced`. Close on a finished plan opens a waiting newer plan, if there is one.
+- **Apply never has initial focus.** `data-autofocus` is on Cancel (Close when there is no Cancel), also after a plan switch (the dialog is
+  keyed by plan id). Escape, the cross and the scrim decline a plan that still waits (they send `cancel`); a finished plan just closes.
+- **States.** `preparing`: `done of total` and Cancel; `waiting`: groups, totals ("N files · X GB"), Cancel, Apply (disabled while
+  `selectionProblems` is non-empty, the problems are listed beside the totals); `applying`: read-only, nothing to press; `applied`: the report
+  (applied / skipped / failed with each reason) until dismissed; `replaced`, `expired`, `failed`: state text and Close.
+- **Selection rules** (`planSelection.ts`, pure): the initial selection is the plan's `selected` items and `chosen` copies; a locked item can be
+  neither ticked nor chosen; the kept copy (the group's current `chosen`) is never included, and choosing a ticked copy unticks it; a group with
+  ticked items and no `chosen` is "pick the copy that stays in <group title>". The selection starts over once, when a `preparing` plan turns
+  `waiting`.
+- A failed command is logged (`console.error`) and raises one `notify()`; the window stays. No notification for progress.
+
 ## Logging
 
 New log fields: `via`, `plan_id`, `kind`, `applied`, `skipped`, `failed` (plans, above) and `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,

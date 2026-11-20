@@ -28,6 +28,13 @@ describe('DialogShell', () => {
     expect(d).toHaveAttribute('aria-modal', 'true');
     expect(d.contains(document.activeElement)).toBe(true);
   });
+  it('lg is a 960 px window within 92vw whose body scrolls', () => {
+    render(<DialogShell title="Plan" size="lg" onClose={() => {}}><p>body</p></DialogShell>);
+    const d = screen.getByRole('dialog', { name: 'Plan' });
+    expect(d.className).toContain('w-[960px]');
+    expect(d.className).toContain('max-w-[92vw]');
+    expect(screen.getByText('body').parentElement?.className).toContain('overflow-y-auto');
+  });
   it('traps Tab at the last focusable element', () => {
     render(<DialogShell title="T" onClose={() => {}} footer={<button>Last</button>}><button>First</button></DialogShell>);
     const last = screen.getByText('Last');

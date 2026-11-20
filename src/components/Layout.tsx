@@ -32,6 +32,8 @@ import { AutoUpdateCheck } from './AutoUpdateCheck';
 import { useProjectMatches } from '../hooks/useProjectMatches';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import DeviceReplaceDialog, { DeviceReplaceProvider } from './collab/DeviceReplaceDialog';
+import { McpPlanProvider } from '../contexts/McpPlanContext';
+import { PlanWindow } from './mcp/PlanWindow';
 import { useContentIndexNotifications } from '../hooks/useContentIndex';
 import Logo from '../assets/athenaeum.png';
 
@@ -109,6 +111,7 @@ export default function Layout() {
         <MasterBuildProvider>
         <StackingProvider>
         <DeviceReplaceProvider>
+        <McpPlanProvider>
         <div className="flex h-screen bg-surface text-content">
           {/* Sidebar Navigation */}
           <aside
@@ -190,9 +193,12 @@ export default function Layout() {
           {/* The Collaboration folder's owner (L9): the replace prompt / take-over,
               opened on its own or from the status line's "Replace a device…". */}
           <DeviceReplaceDialog />
+          {/* What an assistant prepared over MCP: the one window where the user ticks, applies or cancels. */}
+          <PlanWindow />
           <ContentIndexListener />
           <GlobalNavKeys />
         </div>
+        </McpPlanProvider>
         </DeviceReplaceProvider>
         </StackingProvider>
         </MasterBuildProvider>
