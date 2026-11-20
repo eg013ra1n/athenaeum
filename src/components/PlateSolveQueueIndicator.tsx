@@ -7,18 +7,18 @@ interface PlateSolveQueueIndicatorProps {
 }
 
 export function PlateSolveQueueIndicator({ collapsed }: PlateSolveQueueIndicatorProps) {
-  const { currentBatch, queueLength, hasActiveBatches, cancelAll, assistantRun } = usePlateSolveProgressContext();
+  const { currentBatch, queueLength, hasActiveBatches, cancelAll, foreignRun } = usePlateSolveProgressContext();
 
-  // The assistant's run holds the one slot, so it is the only run to show while it goes.
-  const progress = assistantRun ? { current: assistantRun.done, total: assistantRun.total } : currentBatch?.progress;
+  // A run this page did not start holds the one slot, so it is the only run to show while it goes.
+  const progress = foreignRun ? { current: foreignRun.done, total: foreignRun.total } : currentBatch?.progress;
   const percent = progress && progress.total > 0 ? (progress.current / progress.total) * 100 : 0;
-  const label = assistantRun ? 'Plate solve (assistant)' : currentBatch?.label || 'Plate solve';
+  const label = foreignRun ? (foreignRun.origin === 'assistant' ? 'Plate solve (assistant)' : 'Plate solve') : currentBatch?.label || 'Plate solve';
 
   return (
     <QueueIndicator
       collapsed={collapsed}
       icon={Crosshair}
-      active={hasActiveBatches || assistantRun != null}
+      active={hasActiveBatches || foreignRun != null}
       label={label}
       percent={percent}
       current={progress?.current}

@@ -119,20 +119,20 @@ describe('usePlateSolveQueue', () => {
       const { result } = renderHook(() => usePlateSolveQueue());
       // Read on mount: a run that started before this page opened shows at once.
       await waitFor(() =>
-        expect(result.current.assistantRun).toEqual({
-          runId: 'solve-a', done: 2, total: 10, currentFile: 'b.fits', isCancelling: false,
+        expect(result.current.foreignRun).toEqual({
+          runId: 'solve-a', origin: 'assistant', done: 2, total: 10, currentFile: 'b.fits', isCancelling: false,
         }),
       );
       // Progress events move it; a late event never steps the counter back.
       await waitFor(() => expect(handlers['plate-solve-progress']).toBeDefined());
       act(() => handlers['plate-solve-progress']({ frame_id: 4, current: 5, total: 10, status: 'solving', filename: 'e.fits' }));
       act(() => handlers['plate-solve-progress']({ frame_id: 3, current: 4, total: 10, status: 'solving', filename: 'd.fits' }));
-      expect(result.current.assistantRun).toMatchObject({ done: 5, total: 10, currentFile: 'd.fits' });
+      expect(result.current.foreignRun).toMatchObject({ done: 5, total: 10, currentFile: 'd.fits' });
       // Progress is never notified.
       expect(notifyMock).not.toHaveBeenCalled();
       // Cleared on complete.
       act(() => handlers['plate-solve-complete']({ solved: 10, failed: 0, total: 10, total_time_ms: 5 }));
-      expect(result.current.assistantRun).toBeNull();
+      expect(result.current.foreignRun).toBeNull();
     });
 
     it('a_run_started_after_the_page_opened_shows_from_the_started_event', async () => {
@@ -140,12 +140,12 @@ describe('usePlateSolveQueue', () => {
       routeInvoke({ get_plate_solve_activity: () => activity() });
       const { result } = renderHook(() => usePlateSolveQueue());
       await waitFor(() => expect(handlers['plate-solve-started']).toBeDefined());
-      expect(result.current.assistantRun).toBeNull();
-      // A run started in Athenaeum is the queue's own: not shown as the assistant's.
+      expect(result.current.foreignRun).toBeNull();
+      // A run begun in Athenaeum that this queue did not start (My Frames, another tab) is shown too.
       act(() => handlers['plate-solve-started']({ origin: 'ui', runId: 'solve-u', total: 3 }));
-      expect(result.current.assistantRun).toBeNull();
+      expect(result.current.foreignRun).toMatchObject({ runId: 'solve-u', origin: 'ui', total: 3 });
       act(() => handlers['plate-solve-started']({ origin: 'assistant', runId: 'solve-b', total: 7 }));
-      expect(result.current.assistantRun).toMatchObject({ runId: 'solve-b', done: 0, total: 7, currentFile: null });
+      expect(result.current.foreignRun).toMatchObject({ runId: 'solve-b', done: 0, total: 7, currentFile: null });
     });
 
     it('own_batch_refused_with_notify_naming_the_assistant_run', async () => {
@@ -236,8 +236,8 @@ describe('usePlateSolveQueue', () => {
       });
       expect(batchCalls()).toHaveLength(0);
       expect(result.current.queueLength).toBe(1);
-      // Not an assistant run: no assistant line.
-      expect(result.current.assistantRun).toBeNull();
+      // A run this page did not start: shown, with its origin.
+      expect(result.current.foreignRun).toMatchObject({ runId: 'solve-u', origin: 'ui', done: 2, total: 5 });
       current = activity();
       await act(async () => handlers['plate-solve-complete']({ solved: 5, failed: 0, total: 5, total_time_ms: 5 }));
       await waitFor(() => expect(batchCalls()).toHaveLength(1));
@@ -270,10 +270,10 @@ describe('usePlateSolveQueue', () => {
         cancel_plate_solve: () => undefined,
       });
       const { result } = renderHook(() => usePlateSolveQueue());
-      await waitFor(() => expect(result.current.assistantRun).not.toBeNull());
-      await act(async () => { await result.current.cancelAssistantRun(); });
-      expect(api.invoke).toHaveBeenCalledWith('cancel_plate_solve');
-      expect(result.current.assistantRun?.isCancelling).toBe(true);
+      await waitFor(() => expect(result.current.foreignRun).not.toBeNull());
+      await act(async () => { await result.current.cancelForeignRun(); });
+      expect(api.invoke).toHaveBeenCalledWith('cancel_plate_solve', { runId: 'solve-a' });
+      expect(result.current.foreignRun?.isCancelling).toBe(true);
       expect(notifyMock).not.toHaveBeenCalled();
     });
 
@@ -310,15 +310,15 @@ describe('usePlateSolveQueue', () => {
       const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
       const { result } = renderHook(() => usePlateSolveQueue());
       await tick(0);
-      expect(result.current.assistantRun).toMatchObject({ runId: 'solve-a', done: 1 });
+      expect(result.current.foreignRun).toMatchObject({ runId: 'solve-a', done: 1 });
       // The line follows the activity without any event.
       current = activity({ running: true, origin: 'assistant', runId: 'solve-a', done: 3, total: 4, currentFile: 'c.fits' });
       await tick(3100);
-      expect(result.current.assistantRun).toMatchObject({ done: 3, total: 4, currentFile: 'c.fits' });
+      expect(result.current.foreignRun).toMatchObject({ done: 3, total: 4, currentFile: 'c.fits' });
       // The run ends and its complete event is lost: the next re-read hides the line.
       current = activity();
       await tick(3100);
-      expect(result.current.assistantRun).toBeNull();
+      expect(result.current.foreignRun).toBeNull();
       // Hidden: the timer is gone.
       const reads = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_plate_solve_activity').length;
       const before = reads();
@@ -331,12 +331,12 @@ describe('usePlateSolveQueue', () => {
       let current = activity({ running: true, origin: 'assistant', runId: 'solve-a', done: 1, total: 4 });
       routeInvoke({ get_plate_solve_activity: () => current, cancel_plate_solve: () => undefined });
       const { result } = renderHook(() => usePlateSolveQueue());
-      await waitFor(() => expect(result.current.assistantRun).not.toBeNull());
-      // The assistant's run ended and a batch started in Athenaeum took the slot: the line is stale.
+      await waitFor(() => expect(result.current.foreignRun).not.toBeNull());
+      // The assistant's run ended and another run took the slot: the line is stale, it moves and nothing is cancelled.
       current = activity({ running: true, origin: 'ui', runId: 'solve-u', done: 0, total: 9 });
-      await act(async () => { await result.current.cancelAssistantRun(); });
-      expect(api.invoke).not.toHaveBeenCalledWith('cancel_plate_solve');
-      expect(result.current.assistantRun).toBeNull();
+      await act(async () => { await result.current.cancelForeignRun(); });
+      expect(api.invoke).not.toHaveBeenCalledWith('cancel_plate_solve', expect.anything());
+      expect(result.current.foreignRun).toMatchObject({ runId: 'solve-u', origin: 'ui', isCancelling: false });
     });
 
     it('cancel_does_nothing_when_another_assistant_run_holds_the_slot', async () => {
@@ -344,12 +344,12 @@ describe('usePlateSolveQueue', () => {
       let current = activity({ running: true, origin: 'assistant', runId: 'solve-a', done: 1, total: 4 });
       routeInvoke({ get_plate_solve_activity: () => current, cancel_plate_solve: () => undefined });
       const { result } = renderHook(() => usePlateSolveQueue());
-      await waitFor(() => expect(result.current.assistantRun?.runId).toBe('solve-a'));
+      await waitFor(() => expect(result.current.foreignRun?.runId).toBe('solve-a'));
       // A newer assistant run (another id) took the slot: the line moves to it and nothing is cancelled.
       current = activity({ running: true, origin: 'assistant', runId: 'solve-b', done: 0, total: 2 });
-      await act(async () => { await result.current.cancelAssistantRun(); });
-      expect(api.invoke).not.toHaveBeenCalledWith('cancel_plate_solve');
-      expect(result.current.assistantRun).toMatchObject({ runId: 'solve-b', isCancelling: false });
+      await act(async () => { await result.current.cancelForeignRun(); });
+      expect(api.invoke).not.toHaveBeenCalledWith('cancel_plate_solve', expect.anything());
+      expect(result.current.foreignRun).toMatchObject({ runId: 'solve-b', isCancelling: false });
     });
 
     it('cancelling_a_held_batch_ends_it', async () => {
@@ -377,10 +377,10 @@ describe('usePlateSolveQueue', () => {
       let current = activity({ running: true, origin: 'assistant', runId: 'solve-a', done: 6, total: 10 });
       routeInvoke({ get_plate_solve_activity: () => current });
       const { result } = renderHook(() => usePlateSolveQueue());
-      await waitFor(() => expect(result.current.assistantRun).not.toBeNull());
+      await waitFor(() => expect(result.current.foreignRun).not.toBeNull());
       current = activity();
       await act(async () => handlers['plate-solve-complete']({ solved: 8, failed: 2, total: 10, total_time_ms: 5 }));
-      expect(result.current.assistantRun).toBeNull();
+      expect(result.current.foreignRun).toBeNull();
       expect(notifyMock).toHaveBeenCalledTimes(1);
       expect(notifyMock).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -420,12 +420,161 @@ describe('usePlateSolveQueue', () => {
       });
       const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
       const { result } = renderHook(() => usePlateSolveQueue());
-      await waitFor(() => expect(result.current.assistantRun).not.toBeNull());
-      await act(async () => { await result.current.cancelAssistantRun(); });
+      await waitFor(() => expect(result.current.foreignRun).not.toBeNull());
+      await act(async () => { await result.current.cancelForeignRun(); });
       expect(errors).toHaveBeenCalled();
       expect(notifyMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Could not cancel the plate solve', hasErrors: true }));
-      expect(result.current.assistantRun?.isCancelling).toBe(false);
+      expect(result.current.foreignRun?.isCancelling).toBe(false);
       errors.mockRestore();
+    });
+  });
+  describe('a batch cancelled while it starts, and runs that are not the queue\'s', () => {
+    const never = () => new Promise(() => {});
+
+    it('a_batch_cancelled_while_starting_never_runs_and_the_next_one_does', async () => {
+      captureListeners();
+      let gate: Promise<unknown> | null = null;
+      let release: (v: unknown) => void = () => {};
+      routeInvoke(
+        { get_catalog_status: [{ installed: true }], get_plate_solve_activity: () => gate ?? activity() },
+        never,
+      );
+      const { result } = renderHook(() => usePlateSolveQueue());
+      await act(async () => {});
+      // The activity read of the first batch is still pending when the user cancels it.
+      gate = new Promise((r) => { release = r; });
+      let a = -1;
+      let b = -1;
+      act(() => { a = result.current.enqueuePlateSolve([1]); });
+      act(() => { b = result.current.enqueuePlateSolve([2]); });
+      await act(async () => { await result.current.cancelBatch(a); });
+      gate = null;
+      await act(async () => { release(activity()); });
+      await waitFor(() => expect(batchCalls()).toHaveLength(1));
+      expect(batchCalls()[0][1]).toEqual({ frameIds: [2] });
+      expect(result.current.queueLength).toBe(1);
+      expect(result.current.activeBatches.get(a)).toMatchObject({ isComplete: true, isCancelling: false });
+      expect(result.current.activeBatches.get(b)).toMatchObject({ isComplete: false });
+    });
+
+    it('a_batch_cancelled_during_the_catalog_check_never_runs_and_the_next_one_does', async () => {
+      captureListeners();
+      let gate: Promise<unknown> | null = null;
+      let release: (v: unknown) => void = () => {};
+      routeInvoke(
+        { get_catalog_status: () => gate ?? [{ installed: true }], get_plate_solve_activity: () => activity(), cancel_plate_solve: () => undefined },
+        never,
+      );
+      gate = new Promise((r) => { release = r; });
+      const { result } = renderHook(() => usePlateSolveQueue());
+      let a = -1;
+      let b = -1;
+      act(() => { a = result.current.enqueuePlateSolve([1]); });
+      act(() => { b = result.current.enqueuePlateSolve([2]); });
+      await waitFor(() => expect(vi.mocked(api.invoke)).toHaveBeenCalledWith('get_catalog_status'));
+      await act(async () => { await result.current.cancelBatch(a); });
+      gate = null;
+      await act(async () => { release([{ installed: true }]); });
+      await waitFor(() => expect(batchCalls()).toHaveLength(1));
+      expect(batchCalls()[0][1]).toEqual({ frameIds: [2] });
+      // Nothing had reached the backend, so nothing there was cancelled.
+      expect(api.invoke).not.toHaveBeenCalledWith('cancel_plate_solve', expect.anything());
+      expect(result.current.queueLength).toBe(1);
+      expect(result.current.activeBatches.get(a)).toMatchObject({ isComplete: true });
+      expect(result.current.activeBatches.get(b)).toMatchObject({ isComplete: false });
+    });
+
+    /** A batch held on a UI run (solve-a) that then ends: the batch runs and its own run is solve-own. */
+    async function runningBehindAnEndedRun() {
+      const handlers = captureListeners();
+      let current = activity({ running: true, origin: 'ui', runId: 'solve-a', done: 1, total: 5 });
+      // The web command: it returns at once, and the batch ends with its complete event.
+      routeInvoke({ get_catalog_status: [{ installed: true }], get_plate_solve_activity: () => current }, () => undefined);
+      const hook = renderHook(() => usePlateSolveQueue());
+      await waitFor(() => expect(handlers['plate-solve-complete']).toBeDefined());
+      let id = -1;
+      act(() => { id = hook.result.current.enqueuePlateSolve([1, 2]); });
+      await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(1));
+      current = activity();
+      await act(async () => handlers['plate-solve-complete']({ run_id: 'solve-a', solved: 5, failed: 0, total: 5, total_time_ms: 5 }));
+      await waitFor(() => expect(batchCalls()).toHaveLength(1));
+      act(() => handlers['plate-solve-started']({ origin: 'ui', runId: 'solve-own', total: 2 }));
+      return { ...hook, handlers, id };
+    }
+
+    it('a_late_complete_for_another_run_is_ignored', async () => {
+      const { result, handlers, id } = await runningBehindAnEndedRun();
+      // The ended run's complete arrives a second time (or late): the batch it is not is not ended by it.
+      await act(async () => handlers['plate-solve-complete']({ run_id: 'solve-a', solved: 5, failed: 0, total: 5, total_time_ms: 5 }));
+      expect(result.current.activeBatches.get(id)).toMatchObject({ isComplete: false, summary: null });
+      expect(result.current.queueLength).toBe(1);
+      // The batch's own run ends it.
+      await act(async () => handlers['plate-solve-complete']({ run_id: 'solve-own', solved: 2, failed: 0, total: 2, total_time_ms: 5 }));
+      await waitFor(() => expect(result.current.queueLength).toBe(0));
+      expect(result.current.activeBatches.get(id)).toMatchObject({ isComplete: true, summary: { solved: 2, total: 2 } });
+    });
+
+    it('foreign_progress_never_lands_on_the_queues_batch', async () => {
+      const { result, handlers, id } = await runningBehindAnEndedRun();
+      act(() => handlers['plate-solve-progress']({ run_id: 'solve-a', frame_id: 9, current: 4, total: 5, status: 'solved', matched_stars: 3, rms_arcsec: 1 }));
+      let batch = result.current.activeBatches.get(id)!;
+      expect(batch.frameStatuses.has(9)).toBe(false);
+      expect(batch.progress).toBeNull();
+      act(() => handlers['plate-solve-progress']({ run_id: 'solve-own', frame_id: 1, current: 1, total: 2, status: 'solved', matched_stars: 3, rms_arcsec: 1 }));
+      batch = result.current.activeBatches.get(id)!;
+      expect(batch.progress).toEqual({ current: 1, total: 2 });
+      expect(batch.frameStatuses.get(1)).toMatchObject({ kind: 'solved' });
+    });
+
+    it('the_queues_own_run_is_not_shown_as_a_run_it_did_not_start', async () => {
+      const { result, handlers } = await runningBehindAnEndedRun();
+      expect(result.current.foreignRun).toBeNull();
+      act(() => handlers['plate-solve-progress']({ run_id: 'solve-own', frame_id: 1, current: 1, total: 2, status: 'solving', filename: 'a.fits' }));
+      expect(result.current.foreignRun).toBeNull();
+    });
+
+    it('a_ui_run_this_page_did_not_start_is_shown_with_cancel', async () => {
+      const handlers = captureListeners();
+      routeInvoke({
+        get_plate_solve_activity: () => activity({ running: true, origin: 'ui', runId: 'solve-u', done: 2, total: 5, currentFile: 'x.fits' }),
+        cancel_plate_solve: () => undefined,
+      });
+      const { result } = renderHook(() => usePlateSolveQueue());
+      await waitFor(() =>
+        expect(result.current.foreignRun).toEqual({
+          runId: 'solve-u', origin: 'ui', done: 2, total: 5, currentFile: 'x.fits', isCancelling: false,
+        }),
+      );
+      // Its events move the line; another run's events do not.
+      await waitFor(() => expect(handlers['plate-solve-progress']).toBeDefined());
+      act(() => handlers['plate-solve-progress']({ run_id: 'solve-u', frame_id: 3, current: 3, total: 5, status: 'solving', filename: 'y.fits' }));
+      expect(result.current.foreignRun).toMatchObject({ done: 3, currentFile: 'y.fits' });
+      act(() => handlers['plate-solve-progress']({ run_id: 'solve-other', frame_id: 3, current: 5, total: 5, status: 'solving', filename: 'z.fits' }));
+      expect(result.current.foreignRun).toMatchObject({ done: 3, currentFile: 'y.fits' });
+      // Cancel names the run.
+      await act(async () => { await result.current.cancelForeignRun(); });
+      expect(api.invoke).toHaveBeenCalledWith('cancel_plate_solve', { runId: 'solve-u' });
+      expect(result.current.foreignRun?.isCancelling).toBe(true);
+      // A started event of a run begun elsewhere shows too.
+      act(() => handlers['plate-solve-started']({ origin: 'ui', runId: 'solve-v', total: 4 }));
+      expect(result.current.foreignRun).toMatchObject({ runId: 'solve-v', origin: 'ui', total: 4, isCancelling: false });
+    });
+
+    it('a_run_whose_end_was_only_seen_by_a_re_read_says_its_result_was_not_received', async () => {
+      captureListeners();
+      let current = activity({ running: true, origin: 'assistant', runId: 'solve-a', done: 4, total: 4 });
+      routeInvoke({ get_plate_solve_activity: () => current });
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+      const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+      renderHook(() => usePlateSolveQueue());
+      await tick(0);
+      current = activity();
+      await tick(3100);
+      expect(notifyMock).toHaveBeenCalledTimes(1);
+      const n = notifyMock.mock.calls[0][0];
+      expect(n.title).toBe('Plate solve from the assistant ended');
+      expect(n.detail).toBe('Its result was not received here — ask the assistant for solve_status.');
+      expect(JSON.stringify(n)).not.toMatch(/were done/);
     });
   });
 });

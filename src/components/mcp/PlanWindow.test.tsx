@@ -550,6 +550,11 @@ describe('PlanWindow', () => {
     expect(await screen.findByText(/^\d+ frames?$/)).toBeTruthy();
     expect(screen.queryByText(/· 0 B/)).toBeNull();
     cleanup();
+    // A metadata plan counts frames too, with its sizes.
+    await showThen(plan({ kind: 'metadata' }));
+    expect(await screen.findByText(/^\d+ frames? · /)).toBeTruthy();
+    expect(screen.queryByText(/files?/)).toBeNull();
+    cleanup();
     // A Black Hole plan keeps its "applied" chip.
     await showThen(
       plan({ state: { kind: 'applied' }, report: { applied: [{ ...line, reason: 'moved to the Black Hole' }], skipped: [], failed: [], runId: null } }),

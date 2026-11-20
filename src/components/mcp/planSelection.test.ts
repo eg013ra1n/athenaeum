@@ -99,4 +99,12 @@ describe('planSelection', () => {
     sel = toggleGroup(p, toggleGroup(p, sel, 'group:1'), 'group:2');
     expect(selectionProblems(p, sel)).toEqual(['tick at least one file']);
   });
+
+  it('problems_for_a_metadata_or_plate_solve_plan_name_frames', () => {
+    for (const kind of ['metadata', 'plate_solve'] as const) {
+      const p = plan({ kind });
+      const sel = toggleGroup(p, toggleGroup(p, initialSelection(p), 'group:1'), 'group:2');
+      expect(selectionProblems(p, sel)).toEqual(['tick at least one frame']);
+    }
+  });
 });

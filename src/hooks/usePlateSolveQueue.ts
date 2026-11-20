@@ -49,9 +49,11 @@ export type PlateSolvePrecheckError =
   | { kind: 'catalog_missing'; message: string }
   | { kind: 'unknown'; message: string };
 
-/** A plate solve the assistant started (a plan the user applied), as the panel and the sidebar show it. */
-export interface AssistantSolveRun {
+/** A plate solve this page did not start, as the panel and the sidebar show it: a run the assistant started (a plan
+ *  the user applied), a My Frames solve, a second tab's batch, or a run that survived a reload. */
+export interface ForeignSolveRun {
   runId: string | null;
+  origin: PlateSolveOrigin;
   done: number;
   total: number;
   currentFile: string | null;
@@ -69,9 +71,13 @@ function busyDetail(a: PlateSolveActivity): string {
     : `A plate solve batch is already running (${counts}). Wait for it or cancel it.`;
 }
 
-function assistantRunOf(a: PlateSolveActivity | null): AssistantSolveRun | null {
-  if (!a || !a.running || a.origin !== 'assistant') return null;
-  return { runId: a.runId, done: a.done, total: a.total, currentFile: a.currentFile, isCancelling: false };
+/** The slot's holder as a run this page did not start; `own` describes the queue's own batch (its run id, if known). */
+function foreignRunOf(a: PlateSolveActivity | null, own: { id: string | null; inFlight: boolean }): ForeignSolveRun | null {
+  if (!a || !a.running || a.origin === null) return null;
+  // The queue's own batch holds the slot: by its run id, or, before that id is known, a UI run while it is in flight.
+  if (a.runId !== null && a.runId === own.id) return null;
+  if (own.inFlight && own.id === null && a.origin === 'ui') return null;
+  return { runId: a.runId, origin: a.origin, done: a.done, total: a.total, currentFile: a.currentFile, isCancelling: false };
 }
 
 /** A batch cancelled before it started: it ends now, solved nothing, and nothing waits for it. */
@@ -84,7 +90,20 @@ function endedUnstarted(entry: ActivePlateSolveBatch): ActivePlateSolveBatch {
   };
 }
 
+/** Cancel a run by its id; without one (the queue's own run before its id is known) the backend cancels the run it holds. */
+function cancelBackend(runId: string | null): Promise<unknown> {
+  return runId ? api.invoke('cancel_plate_solve', { runId }) : api.invoke('cancel_plate_solve');
+}
+
 let nextBatchId = 1;
+
+/** Whether an event's run is the queue's own batch's: not a known foreign run, and not another than the own run once that is known.
+ *  An event without a run id, or from a run nothing is known about while no own id is known, goes to the queue's batch. */
+function isOwnRun(runId: string | undefined, foreign: Set<string>, ownId: string | null): boolean {
+  if (!runId) return true;
+  if (foreign.has(runId)) return false;
+  return ownId === null || runId === ownId;
+}
 
 export function usePlateSolveQueue() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
@@ -99,17 +118,23 @@ export function usePlateSolveQueue() {
   const notifyRef = useRef(notify);
   notifyRef.current = notify;
 
-  // The plate solve the assistant started, if one runs (get_plate_solve_activity, then the events).
-  const [assistantRun, setAssistantRunState] = useState<AssistantSolveRun | null>(null);
+  // The plate solve this page did not start, if one runs (get_plate_solve_activity, then the events).
+  const [foreignRun, setForeignRunState] = useState<ForeignSolveRun | null>(null);
   // The same value, written at once: the event listeners (registered once) and the activity reads decide on it.
-  const assistantRunRef = useRef<AssistantSolveRun | null>(null);
-  const setAssistantRun = useCallback((update: (prev: AssistantSolveRun | null) => AssistantSolveRun | null) => {
-    const next = update(assistantRunRef.current);
-    assistantRunRef.current = next;
-    setAssistantRunState(next);
+  const foreignRunRef = useRef<ForeignSolveRun | null>(null);
+  const setForeignRun = useCallback((update: (prev: ForeignSolveRun | null) => ForeignSolveRun | null) => {
+    const next = update(foreignRunRef.current);
+    foreignRunRef.current = next;
+    if (next?.runId) foreignIdsRef.current.add(next.runId);
+    setForeignRunState(next);
   }, []);
+  // Run ids known to be another run's (a holder the queue waited on, a line shown): their events never touch the queue's batch.
+  const foreignIdsRef = useRef<Set<string>>(new Set());
+  // The queue's own batch: its run id once `plate-solve-started` named it, and whether its start command was sent.
+  const ownRunIdRef = useRef<string | null>(null);
+  const invokedRef = useRef(false);
   // Bumped when a run starts, so a read that began earlier cannot hide it.
-  const assistantEpochRef = useRef(0);
+  const foreignEpochRef = useRef(0);
   // Runs whose end was already told (an end comes from the event and from a re-read, never twice).
   const toldRunsRef = useRef<Set<string>>(new Set());
   // The head batch waits because another run holds the one slot; it stays queued and starts when the slot is free.
@@ -151,12 +176,12 @@ export function usePlateSolveQueue() {
     });
   }, []);
 
-  /** The assistant's line ended: hide it and tell the outcome once (the event's counts, or the line's own when the event was lost). */
-  const endAssistantRun = useCallback(
+  /** The foreign line ended: hide it and tell the outcome once (the event's counts, or, when the event was lost, that its result was not received). */
+  const endForeignRun = useCallback(
     (payload?: PlateSolveCompleteEvent) => {
-      const run = assistantRunRef.current;
+      const run = foreignRunRef.current;
       if (!run) return;
-      setAssistantRun(() => null);
+      setForeignRun(() => null);
       const key = `plate-solve-done-${run.runId ?? 'unknown'}`;
       if (toldRunsRef.current.has(key)) return;
       toldRunsRef.current.add(key);
@@ -170,22 +195,32 @@ export function usePlateSolveQueue() {
           dedupeKey: key,
         });
       } else {
-        notifyRef.current({
-          title: 'Plate solve from the assistant ended',
-          detail: `${run.done} of ${run.total} frames were done when it ended`,
-          kind: 'platesolve',
-          tone: 'info',
-          dedupeKey: key,
-        });
+        notifyRef.current(
+          run.origin === 'assistant'
+            ? {
+                title: 'Plate solve from the assistant ended',
+                detail: 'Its result was not received here — ask the assistant for solve_status.',
+                kind: 'platesolve',
+                tone: 'info',
+                dedupeKey: key,
+              }
+            : {
+                title: 'Plate solve ended',
+                detail: 'Its result was not received here.',
+                kind: 'platesolve',
+                tone: 'info',
+                dedupeKey: key,
+              },
+        );
       }
     },
-    [setAssistantRun],
+    [setForeignRun],
   );
 
   /** The slot's holder, read from the backend; `null` when it could not be read (the backend then decides).
-   *  Every read also moves the assistant's line: it follows the activity, whatever events arrived. */
+   *  Every read also moves the foreign line: it follows the activity, whatever events arrived. */
   const readActivity = useCallback(async (): Promise<PlateSolveActivity | null> => {
-    const epoch = assistantEpochRef.current;
+    const epoch = foreignEpochRef.current;
     let a: PlateSolveActivity | null;
     try {
       a = await api.invoke<PlateSolveActivity | null>('get_plate_solve_activity');
@@ -193,11 +228,11 @@ export function usePlateSolveQueue() {
       console.error('[usePlateSolveQueue] get_plate_solve_activity failed:', err);
       return null;
     }
-    const run = assistantRunOf(a);
+    const run = foreignRunOf(a, { id: ownRunIdRef.current, inFlight: invokedRef.current });
     if (run) {
       // Another run than the one the line shows: the shown one ended (told), the new one takes the line.
-      if (assistantRunRef.current && assistantRunRef.current.runId !== run.runId) endAssistantRun();
-      setAssistantRun((prev) =>
+      if (foreignRunRef.current && foreignRunRef.current.runId !== run.runId) endForeignRun();
+      setForeignRun((prev) =>
         prev && prev.runId === run.runId
           ? {
               ...prev,
@@ -208,12 +243,12 @@ export function usePlateSolveQueue() {
             }
           : run,
       );
-    } else if (a && epoch === assistantEpochRef.current) {
-      // Nothing of the assistant's runs now (a run that started after this read began is newer than it).
-      endAssistantRun();
+    } else if (a && epoch === foreignEpochRef.current) {
+      // No run but the queue's own now (a run that started after this read began is newer than it).
+      endForeignRun();
     }
     return a;
-  }, [setAssistantRun, endAssistantRun]);
+  }, [setForeignRun, endForeignRun]);
 
   /** Another run holds the slot: say so once per wait, keep the batch queued, and let a re-read or the complete event retry. */
   const holdBatch = useCallback(
@@ -221,6 +256,9 @@ export function usePlateSolveQueue() {
       processingRef.current = false;
       currentBatchIdRef.current = null;
       completeResolveRef.current = null;
+      invokedRef.current = false;
+      ownRunIdRef.current = null;
+      if (activity.runId) foreignIdsRef.current.add(activity.runId);
       if (!heldRef.current) {
         setHeld(true);
         notifyRef.current({
@@ -246,8 +284,27 @@ export function usePlateSolveQueue() {
 
     processingRef.current = true;
 
+    // A batch cancelled while this function awaited never runs: it ends, and the next one is started.
+    const dropIfCancelled = (): boolean => {
+      if (queueRef.current[0]?.batchId === next.batchId) return false;
+      processingRef.current = false;
+      currentBatchIdRef.current = null;
+      invokedRef.current = false;
+      ownRunIdRef.current = null;
+      setActiveBatches(prev => {
+        const entry = prev.get(next.batchId);
+        if (!entry || entry.isComplete) return prev;
+        const updated = new Map(prev);
+        updated.set(next.batchId, endedUnstarted(entry));
+        return updated;
+      });
+      if (queueRef.current.length > 0) void runNextRef.current();
+      return true;
+    };
+
     // The slot decides, not an error text: while any run holds it, the batch stays queued.
     const activity = await readActivity();
+    if (dropIfCancelled()) return;
     if (activity?.running) {
       holdBatch(activity);
       return;
@@ -283,10 +340,11 @@ export function usePlateSolveQueue() {
           setPrecheckError({ kind: 'catalog_missing', message });
           processingRef.current = false;
           currentBatchIdRef.current = null;
-          setQueue(q => q.slice(1));
+          setQueue(q => q.filter(i => i.batchId !== next.batchId));
           return;
         }
         catalogVerifiedRef.current = true;
+        if (dropIfCancelled()) return;
       } catch (err) {
         // Status call itself failed — surface generically and skip the batch.
         const message = `Could not verify star catalog status: ${String(err)}`;
@@ -295,7 +353,7 @@ export function usePlateSolveQueue() {
         setPrecheckError({ kind: 'unknown', message });
         processingRef.current = false;
         currentBatchIdRef.current = null;
-        setQueue(q => q.slice(1));
+        setQueue(q => q.filter(i => i.batchId !== next.batchId));
         return;
       }
     }
@@ -308,11 +366,15 @@ export function usePlateSolveQueue() {
       completeResolveRef.current = resolve;
     });
     try {
+      invokedRef.current = true;
       await api.invoke<void>('plate_solve_batch', { frameIds: next.frameIds });
       await completed;
     } catch (err) {
       console.error(`Plate solve batch ${next.batchId} failed:`, err);
       // A rejection is read through the activity: a run that holds the slot is the reason, whatever the wording.
+      // The queue's own run does not exist (the command was refused), so nothing the slot holds is its own.
+      invokedRef.current = false;
+      ownRunIdRef.current = null;
       const after = await readActivity();
       if (after?.running) {
         holdBatch(after);
@@ -332,7 +394,9 @@ export function usePlateSolveQueue() {
     completeResolveRef.current = null;
     processingRef.current = false;
     currentBatchIdRef.current = null;
-    setQueue(q => q.slice(1));
+    invokedRef.current = false;
+    ownRunIdRef.current = null;
+    setQueue(q => q.filter(i => i.batchId !== next.batchId));
   }, [failBatch, readActivity, holdBatch, setHeld]);
   runNextRef.current = runNext;
 
@@ -343,18 +407,18 @@ export function usePlateSolveQueue() {
     return () => clearInterval(timer);
   }, [held]);
 
-  // The assistant's run, if one is already running when the app starts.
+  // A run this page did not start, if one is already running when the page opens.
   useEffect(() => {
     void readActivity();
   }, [readActivity]);
 
-  // While the assistant's line shows, the activity is read again now and then: the complete event can be lost (web).
-  const assistantShown = assistantRun !== null;
+  // While the foreign line shows, the activity is read again now and then: the complete event can be lost (web).
+  const foreignShown = foreignRun !== null;
   useEffect(() => {
-    if (!assistantShown) return;
+    if (!foreignShown) return;
     const timer = setInterval(() => void readActivity(), BUSY_REREAD_MS);
     return () => clearInterval(timer);
-  }, [assistantShown, readActivity]);
+  }, [foreignShown, readActivity]);
 
   // Kick the processor whenever the queue has pending items.
   useEffect(() => {
@@ -378,10 +442,10 @@ export function usePlateSolveQueue() {
         (payload) => {
           if (cancelled) return;
           const batchId = currentBatchIdRef.current;
-          if (batchId == null) {
-            // Not the queue's batch: the assistant's run, when one is on screen. The counter never steps back.
-            setAssistantRun(prev =>
-              prev
+          if (batchId == null || !isOwnRun(payload.run_id, foreignIdsRef.current, ownRunIdRef.current)) {
+            // Not the queue's batch: the run on the foreign line, when it is that run's. The counter never steps back.
+            setForeignRun(prev =>
+              prev && (!payload.run_id || !prev.runId || prev.runId === payload.run_id)
                 ? {
                     ...prev,
                     done: Math.max(prev.done, payload.current),
@@ -441,16 +505,20 @@ export function usePlateSolveQueue() {
         'plate-solve-started',
         (payload) => {
           if (cancelled) return;
-          if (payload.origin === 'assistant') {
-            assistantEpochRef.current += 1;
-            setAssistantRun(() => ({
-              runId: payload.runId,
-              done: 0,
-              total: payload.total,
-              currentFile: null,
-              isCancelling: false,
-            }));
+          // A run begun while the queue's own batch is in flight is that batch's: its id is remembered, no line.
+          if (currentBatchIdRef.current != null && invokedRef.current && payload.origin === 'ui') {
+            if (ownRunIdRef.current === null) ownRunIdRef.current = payload.runId;
+            return;
           }
+          foreignEpochRef.current += 1;
+          setForeignRun(() => ({
+            runId: payload.runId,
+            origin: payload.origin,
+            done: 0,
+            total: payload.total,
+            currentFile: null,
+            isCancelling: false,
+          }));
         },
       )
       .then((fn) => { if (cancelled) fn(); else unlistenStarted = fn; })
@@ -462,14 +530,15 @@ export function usePlateSolveQueue() {
         (payload) => {
           if (cancelled) return;
           const batchId = currentBatchIdRef.current;
-          if (batchId == null) {
-            // Not the queue's batch: the assistant's run ended (told once), and the slot is free, so a held batch starts.
-            endAssistantRun(payload);
-            if (heldRef.current) void runNextRef.current();
+          if (batchId == null || !isOwnRun(payload.run_id, foreignIdsRef.current, ownRunIdRef.current)) {
+            // Not the queue's batch's end: the run on the foreign line ended (told once, when the ids match), and a
+            // held batch starts. A foreign end never ends the queue's batch.
+            const line = foreignRunRef.current;
+            if (line && (!payload.run_id || !line.runId || line.runId === payload.run_id)) endForeignRun(payload);
+            if (batchId == null && heldRef.current) void runNextRef.current();
             return;
           }
-          // The queue's own batch ended. The event carries no run id, so a line the assistant's run still has
-          // is left to the next activity read.
+          // The queue's own batch ended.
           setActiveBatches(prev => {
             const entry = prev.get(batchId);
             if (!entry) return prev;
@@ -509,7 +578,7 @@ export function usePlateSolveQueue() {
       unlistenComplete?.();
       unlistenStarted?.();
     };
-  }, [setAssistantRun, endAssistantRun]);
+  }, [setForeignRun, endForeignRun]);
 
   const enqueuePlateSolve = useCallback(
     (frameIds: number[], label?: string): number => {
@@ -543,6 +612,8 @@ export function usePlateSolveQueue() {
 
   const cancelBatch = useCallback(async (batchId: number) => {
     const isCurrent = currentBatchIdRef.current === batchId;
+    // At once, not at the next render: a start that is awaiting reads the queue to see it was cancelled.
+    queueRef.current = queueRef.current.filter(item => item.batchId !== batchId);
     setQueue(q => q.filter(item => item.batchId !== batchId));
     setActiveBatches(prev => {
       const entry = prev.get(batchId);
@@ -552,19 +623,20 @@ export function usePlateSolveQueue() {
       updated.set(batchId, isCurrent ? { ...entry, isCancelling: true } : endedUnstarted(entry));
       return updated;
     });
-    if (isCurrent) {
+    // A batch whose start command was not sent has nothing to cancel in the backend (and a cancel there could stop another run).
+    if (isCurrent && invokedRef.current) {
       try {
-        await api.invoke('cancel_plate_solve');
+        await cancelBackend(ownRunIdRef.current);
       } catch {
         // May fail if the batch already finished — safe to ignore.
       }
     }
   }, []);
 
-  /** Cancel the assistant's run (the same command as the queue's own cancel: one slot, one cancel handle).
+  /** Cancel the run on the foreign line (the same command as the queue's own cancel, naming that run).
    *  The slot is read first: only the run the line shows is cancelled, never a batch that took the slot since. */
-  const cancelAssistantRun = useCallback(async () => {
-    const shown = assistantRunRef.current;
+  const cancelForeignRun = useCallback(async () => {
+    const shown = foreignRunRef.current;
     if (!shown) return;
     const a = await readActivity();
     if (a === null) {
@@ -578,13 +650,14 @@ export function usePlateSolveQueue() {
       });
       return;
     }
-    if (!(a.running && a.origin === 'assistant' && a.runId === shown.runId)) return;
-    setAssistantRun(prev => (prev ? { ...prev, isCancelling: true } : prev));
+    // No run id to name (the activity gave none): the cancel would stop whatever runs, so it is not sent.
+    if (!(a.running && a.runId !== null && a.runId === shown.runId)) return;
+    setForeignRun(prev => (prev ? { ...prev, isCancelling: true } : prev));
     try {
-      await api.invoke('cancel_plate_solve');
+      await cancelBackend(shown.runId);
     } catch (err) {
       console.error('[usePlateSolveQueue] cancel_plate_solve failed:', err);
-      setAssistantRun(prev => (prev ? { ...prev, isCancelling: false } : prev));
+      setForeignRun(prev => (prev ? { ...prev, isCancelling: false } : prev));
       notifyRef.current({
         title: 'Could not cancel the plate solve',
         detail: String(err),
@@ -593,15 +666,16 @@ export function usePlateSolveQueue() {
         kind: 'platesolve',
       });
     }
-  }, [readActivity, setAssistantRun]);
+  }, [readActivity, setForeignRun]);
 
   const cancelAll = useCallback(async () => {
+    queueRef.current = [];
     setQueue([]);
-    if (assistantRunRef.current) void cancelAssistantRun();
+    if (foreignRunRef.current) void cancelForeignRun();
     const currentId = currentBatchIdRef.current;
-    if (currentId != null) {
+    if (currentId != null && invokedRef.current) {
       try {
-        await api.invoke('cancel_plate_solve');
+        await cancelBackend(ownRunIdRef.current);
       } catch {
         // ignore
       }
@@ -616,7 +690,7 @@ export function usePlateSolveQueue() {
       }
       return updated;
     });
-  }, [cancelAssistantRun]);
+  }, [cancelForeignRun]);
 
   const dismissCompleted = useCallback((batchId: number) => {
     setActiveBatches(prev => {
@@ -648,12 +722,12 @@ export function usePlateSolveQueue() {
     enqueuePlateSolve,
     cancelBatch,
     cancelAll,
-    cancelAssistantRun,
+    cancelForeignRun,
     dismissCompleted,
     dismissPrecheckError,
     // state
     activeBatches,
-    assistantRun,
+    foreignRun,
     currentBatch,
     queueLength,
     hasActiveBatches,

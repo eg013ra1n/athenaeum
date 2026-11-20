@@ -77,7 +77,7 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
       <div className="mr-auto min-w-0 self-center">
         {(waiting || kind === 'applying') && (
           <p className="font-medium text-content-secondary">
-            {plan.kind === 'plate_solve' ? frames(sum.items) : files(sum.items)}
+            {plan.kind === 'black_hole' ? files(sum.items) : frames(sum.items)}
             {hasSizes ? ` · ${formatBytes(sum.bytes)}` : ''}
           </p>
         )}
