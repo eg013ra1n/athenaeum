@@ -306,6 +306,127 @@ describe('PlanWindow', () => {
     expect(answers()[0][1]).toEqual({ planId: 'plan-1', answer: { action: 'cancel' } });
   });
 
+  it('a_click_outside_does_not_cancel_an_applied_plan_either', async () => {
+    const line = { itemId: 'item:2', fileName: 'copy-2.fits', folder: '/data/night-2', reason: 'moved to the Black Hole' };
+    await showThen(plan({ state: { kind: 'applied' }, report: { applied: [line], skipped: [], failed: [], runId: null } }));
+    await screen.findByText('moved to the Black Hole');
+    fireEvent.mouseDown(screen.getByTestId('dialog-scrim'));
+    fireEvent.click(screen.getByTestId('dialog-scrim'));
+    // The report is the only place the user sees what moved: a stray click leaves it open.
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    expect(screen.getByText('moved to the Black Hole')).toBeTruthy();
+  });
+
+  it('an_applying_plan_can_be_closed', async () => {
+    const closers: Record<string, () => void> = {
+      escape: () => fireEvent.keyDown(document, { key: 'Escape' }),
+      cross: () => fireEvent.click(screen.getAllByRole('button', { name: 'Close' })[0]),
+      footer: () => {
+        const all = screen.getAllByRole('button', { name: 'Close' });
+        fireEvent.click(all[all.length - 1]);
+      },
+    };
+    for (const [how, close] of Object.entries(closers)) {
+      await showThen(plan({ state: { kind: 'applying' } }));
+      expect(screen.getByText('Applying… you can close this window; the report opens when it is done.'), how).toBeTruthy();
+      const buttons = screen.getAllByRole('button', { name: 'Close' });
+      expect(buttons.every((b) => !(b as HTMLButtonElement).disabled), how).toBe(true);
+      close();
+      await waitFor(() => expect(screen.queryByRole('dialog'), how).toBeNull());
+      // Closing hides the window; it never cancels the apply.
+      expect(answers(), how).toHaveLength(0);
+      cleanup();
+    }
+  });
+
+  it('the_report_opens_when_a_hidden_apply_ends', async () => {
+    await showThen(plan({ state: { kind: 'applying' } }));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    // Progress events for the hidden plan do not bring the window back.
+    await emit('plan-1');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    // A newer plan waits unseen behind it.
+    plans['plan-2'] = plan({ planId: 'plan-2', title: 'The newer plan' });
+    await emit('plan-2');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    // The end state opens the window again, with the report, and without a notification.
+    const line = { itemId: 'item:2', fileName: 'copy-2.fits', folder: '/data/night-2', reason: 'moved to the Black Hole' };
+    plans['plan-1'] = plan({ state: { kind: 'applied' }, report: { applied: [line], skipped: [], failed: [], runId: null } });
+    await emit('plan-1');
+    expect(await screen.findByRole('dialog', { name: /Move duplicate copies/ })).toBeTruthy();
+    expect(screen.getByText('moved to the Black Hole')).toBeTruthy();
+    expect(notifyMock).not.toHaveBeenCalled();
+    // Close on the report then opens the newer plan.
+    const closes = screen.getAllByRole('button', { name: 'Close' });
+    fireEvent.click(closes[closes.length - 1]);
+    expect(await screen.findByRole('dialog', { name: /The newer plan/ })).toBeTruthy();
+  });
+
+  it('a_lost_event_is_caught_up_by_the_re_read', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      newest = plans['plan-1'] = plan({ state: { kind: 'applying' } });
+      mount();
+      const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+      await tick(0);
+      expect(screen.getByRole('dialog')).toBeTruthy();
+      // The plan ends, but the event is lost: nothing tells the window.
+      const line = { itemId: 'item:2', fileName: 'copy-2.fits', folder: '/data/night-2', reason: 'moved to the Black Hole' };
+      plans['plan-1'] = plan({ state: { kind: 'applied' }, report: { applied: [line], skipped: [], failed: [], runId: null } });
+      expect(screen.queryByText('moved to the Black Hole')).toBeNull();
+      await tick(3100);
+      expect(screen.getByText('moved to the Black Hole')).toBeTruthy();
+      expect(api.invoke).toHaveBeenCalledWith('get_mcp_plan', { planId: 'plan-1' });
+      // The plan has ended: the timer is gone.
+      const reads = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_mcp_plan').length;
+      const before = reads();
+      await tick(9000);
+      expect(reads()).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a_visible_tab_re_reads_the_plan_and_unmount_stops_the_timer', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      newest = plans['plan-1'] = plan({ state: { kind: 'applying' } });
+      const view = mount();
+      const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+      await tick(0);
+      const reads = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_mcp_plan').length;
+      const before = reads();
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+      expect(reads()).toBe(before + 1);
+      view.unmount();
+      const after = reads();
+      await tick(9000);
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+      expect(reads()).toBe(after);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('outside_waiting_the_window_shows_the_plans_own_selection', async () => {
+    newest = plans['plan-1'] = plan();
+    mount();
+    await screen.findByRole('dialog');
+    // This window's own ticks: group 1 is unticked here, so only the group-2 copy counts.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M31 Light 300 s (3 copies)' }));
+    expect(screen.getByText('1 file · 3.9 KB')).toBeTruthy();
+    // Another page applied only copy-3 of the first group: the backend recorded exactly that.
+    const applied = plan({ state: { kind: 'applying' } });
+    applied.groups[0].items[1].selected = false;
+    applied.groups[1].items[1].selected = false;
+    plans['plan-1'] = applied;
+    await emit('plan-1');
+    await waitFor(() => expect(screen.getByText('1 file · 2.0 KB')).toBeTruthy());
+    expect((screen.getByRole('checkbox', { name: 'Include copy-3.fits' }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('checkbox', { name: 'Include copy-2.fits' }) as HTMLInputElement).checked).toBe(false);
+  });
+
   it('a_plan_that_failed_during_apply_shows_what_was_done', async () => {
     const line = (n: number, reason: string) => ({ itemId: `item:${n}`, fileName: `copy-${n}.fits`, folder: `/data/night-${n}`, reason });
     await showThen(plan({

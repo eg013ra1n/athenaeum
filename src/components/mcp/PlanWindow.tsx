@@ -35,6 +35,9 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
     setStore({ preparing, sel });
   }
   const update = (f: (s: typeof sel) => typeof sel) => setStore({ preparing, sel: f(sel) });
+  // Only a waiting plan is edited here. Any other state shows what the plan itself recorded (a second page may have
+  // applied it with other ticks than this window's local ones).
+  if (kind !== 'waiting') sel = initialSelection(plan);
 
   // The banner is for a replaced plan only; a newer plan waits unseen while this one applies.
   const superseded = kind === 'replaced';
@@ -74,6 +77,11 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
             {files(sum.items)} · {formatBytes(sum.bytes)}
           </p>
         )}
+        {kind === 'applying' && (
+          <p className="text-content-muted" role="status">
+            Applying… you can close this window; the report opens when it is done.
+          </p>
+        )}
         {problems.length > 0 && (
           <ul className="text-warning" role="status">
             {problems.map((p) => (
@@ -98,9 +106,12 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
         </>
       )}
       {mode === 'busy' && (
-        <Button variant="primary" disabled>
-          Apply
-        </Button>
+        <>
+          <Button onClick={dismiss}>Close</Button>
+          <Button variant="primary" disabled>
+            Apply
+          </Button>
+        </>
       )}
       {mode === 'close' && (
         <>
@@ -127,9 +138,10 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
           {plan.title}
         </span>
       }
-      closeOnScrim={mode === 'close'}
-      busy={busy || kind === 'applying'}
-      // Escape, the cross and a click outside decline a plan that still waits; a finished plan just closes.
+      // A click outside never ends or hides a plan: the report is the only place the user sees what moved.
+      closeOnScrim={false}
+      busy={busy}
+      // Escape and the cross decline a plan that still waits, hide one that applies, and close a finished one.
       onClose={mode === 'cancel' ? () => void cancel() : dismiss}
       footer={footer}
     >

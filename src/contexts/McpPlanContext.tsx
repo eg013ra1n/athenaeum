@@ -10,9 +10,14 @@ import type { McpPlanView, PlanAnswer } from '../types/mcp';
  * The plan on screen is never swapped under the cursor. An event for another plan only records that a newer one
  * waits (`newerPlanId`); the window offers it as "Open the new plan". A plan opened while no window is shown is
  * not a swap and opens at once.
+ *
+ * An applying plan never locks the app: Close hides the window and the apply carries on (the plan stays tracked
+ * here); the window opens again with the report when the plan reaches its end state. While a plan is
+ * `preparing`, `waiting` or `applying` it is also re-read every 3 s and when the tab becomes visible, because the
+ * web build can drop events (an EventSource reconnect, a lagged broadcast).
  */
 interface McpPlanContextValue {
-  /** The plan the window shows; `null` when the window is closed. */
+  /** The plan the window shows; `null` when the window is closed or hidden while the plan applies. */
   plan: McpPlanView | null;
   /** A plan newer than the shown one is waiting (the shown one is replaced, or finished). */
   newerPlanId: string | null;
@@ -20,7 +25,7 @@ interface McpPlanContextValue {
   busy: boolean;
   apply: (answer: Extract<PlanAnswer, { action: 'apply' }>) => Promise<void>;
   cancel: () => Promise<void>;
-  /** Close the window; a newer plan, if one waits, opens in its place. */
+  /** Close the window; a newer plan, if one waits, opens in its place. While a plan applies it only hides the window. */
   dismiss: () => void;
   openNewer: () => Promise<void>;
 }
@@ -33,6 +38,9 @@ function undecided(plan: McpPlanView): boolean {
   return k === 'preparing' || k === 'waiting' || k === 'applying';
 }
 
+/** How often a plan that is not finished is re-read, in case an event was lost. */
+const REREAD_MS = 3000;
+
 export function McpPlanProvider({ children }: { children: ReactNode }) {
   const { notify } = useNotifications();
   const notifyRef = useRef(notify);
@@ -41,6 +49,8 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
   const [plan, setPlanState] = useState<McpPlanView | null>(null);
   const [newerPlanId, setNewerState] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // The window is hidden while its plan applies; the plan is still tracked and shows its report when it ends.
+  const [hidden, setHidden] = useState(false);
   const planRef = useRef<McpPlanView | null>(null);
   const newerRef = useRef<string | null>(null);
   // Per plan id: the newest request whose answer was used, so a slow answer never overwrites a newer one.
@@ -64,6 +74,8 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
       const cur = planRef.current;
       if (cur && cur.planId === view.planId) {
         setPlan(view);
+        // A hidden plan that is no longer applying has ended: the window opens again with its report.
+        if (view.state.kind !== 'applying') setHidden(false);
         if (view.state.kind === 'replaced' && view.replacedBy) setNewer(view.replacedBy);
       } else if (cur) {
         if (undecided(view)) setNewer(view.planId);
@@ -111,6 +123,21 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
     };
   }, [read]);
 
+  // Never trust events alone: re-read the plan that is on screen (or hidden) while it is not finished.
+  const pollId = plan && undecided(plan) ? plan.planId : null;
+  useEffect(() => {
+    if (!pollId) return;
+    const timer = setInterval(() => void read(pollId), REREAD_MS);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void read(pollId);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [pollId, read]);
+
   const answer = useCallback(
     async (a: PlanAnswer, failTitle: string): Promise<McpPlanView | null> => {
       const cur = planRef.current;
@@ -142,6 +169,7 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
         return null;
       });
     setNewer(null);
+    setHidden(false);
     if (view) {
       usedRef.current.set(view.planId, ++seqRef.current);
       setPlan(view);
@@ -151,6 +179,12 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
   }, [setNewer, setPlan]);
 
   const dismiss = useCallback(() => {
+    // A plan that applies keeps going: Close only hides the window, and the report opens it again.
+    if (planRef.current?.state.kind === 'applying') {
+      setHidden(true);
+      return;
+    }
+    setHidden(false);
     if (newerRef.current) void openNewer();
     else setPlan(null);
   }, [openNewer, setPlan]);
@@ -168,8 +202,8 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
   }, [answer, dismiss]);
 
   const value = useMemo(
-    () => ({ plan, newerPlanId, busy, apply, cancel, dismiss, openNewer }),
-    [plan, newerPlanId, busy, apply, cancel, dismiss, openNewer],
+    () => ({ plan: hidden ? null : plan, newerPlanId, busy, apply, cancel, dismiss, openNewer }),
+    [plan, hidden, newerPlanId, busy, apply, cancel, dismiss, openNewer],
   );
   return <McpPlanContext.Provider value={value}>{children}</McpPlanContext.Provider>;
 }

@@ -309,15 +309,24 @@ The window is the one place a plan is looked over and decided: ticks, the copy t
   as it was. When the shown plan becomes `replaced` it shows the banner "The assistant prepared a newer plan" and **Open the new plan**
   (Apply disabled); while a plan applies, a newer one waits unseen. Close on a finished plan opens a waiting newer plan, if there is one.
 - **No keypress or stray click answers a plan.** No button has the initial focus (the title line does, `data-autofocus` + `tabIndex={-1}`):
-  the window opens by itself over any page. A scrim click never ends a plan (`DialogShell closeOnScrim={false}` while `preparing`,
-  `waiting` or `applying`); Escape and the cross send `cancel`. Apply arms one second after the window shows a waiting plan.
+  the window opens by itself over any page. A scrim click never dismisses the window in any state (`DialogShell closeOnScrim={false}`;
+  the report is the only place the user sees what moved); Escape and the cross send `cancel` while a plan is `preparing` or `waiting`.
+  Apply arms one second after the window shows a waiting plan.
+- **An applying plan never locks the app.** While it applies, Escape, the cross and a **Close** button hide the window and the apply carries
+  on; the footer says "Applying… you can close this window; the report opens when it is done." The hidden plan stays tracked, and when it
+  reaches its end state (`applied`, or `failed` with its report) the window opens again with the report. That report is the one outcome of
+  the user's own click, so there is no `notify()`. A newer plan waits unseen meanwhile and opens when the report is closed.
+- **Events are not trusted alone.** The web build drops events (an EventSource reconnect, a lagged broadcast). While the tracked plan is
+  `preparing`, `waiting` or `applying` (shown or hidden) the context re-reads it with `get_mcp_plan({ planId })` every 3 s and once when the
+  tab becomes visible; the timer ends with the plan and on unmount. The re-read never swaps the shown plan for another id.
 - **States.** `preparing`: `done of total` and Cancel; `waiting`: groups, totals ("N files · X GB"), Cancel, Apply (disabled while
-  `selectionProblems` is non-empty, the problems are listed beside the totals); `applying`: read-only, nothing to press; `applied`: the report
+  `selectionProblems` is non-empty, the problems are listed beside the totals); `applying`: read-only, only Close (it hides the window; above); `applied`: the report
   (applied / skipped / failed with each reason) until dismissed, also for a plan that `failed` while applying; `replaced`, `expired`, `failed`: state text and Close.
-- **Selection rules** (`planSelection.ts`, pure): the initial selection is the plan's `selected` items and `chosen` copies; a locked item can be
-  neither ticked nor chosen; the kept copy (the group's current `chosen`) is never included, and choosing a ticked copy unticks it; a group with
+- **Selection rules** (`planSelection.ts`, pure): the initial selection is the plan's `selected` items and `chosen` copies; a locked item can never be
+  ticked, but it may be the copy that stays (a lock forbids moving a copy, not keeping it; only a non-candidate cannot be chosen); the kept copy (the group's current `chosen`) is never included, and choosing a ticked copy unticks it; a group with
   ticked items and no `chosen` is "pick the copy that stays in <group title>". The selection starts over once, when a `preparing` plan turns
-  `waiting`. A group with some copies ticked shows half-ticked; one click unticks them all.
+  `waiting`. Outside `waiting` the window shows the plan's own selection (`initialSelection(plan)`, what the backend recorded), never its local
+  ticks, so a second page sees what another page applied. A group with some copies ticked shows half-ticked; one click unticks them all.
 - A failed command is logged (`console.error`) and raises one `notify()`; the window stays. No notification for progress.
 
 ## Logging

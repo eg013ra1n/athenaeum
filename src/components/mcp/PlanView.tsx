@@ -32,8 +32,7 @@ export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGrou
       {state.kind === 'preparing' && <Preparing done={state.done} total={state.total} />}
       {state.kind === 'applying' && (
         <p className="flex items-center gap-2 text-content-secondary" role="status">
-          <Loader2 size={14} className="animate-spin" aria-hidden /> Applying the plan. Files are being moved; this window shows the
-          report when it is done.
+          <Loader2 size={14} className="animate-spin" aria-hidden /> The plan is being applied. Files are being moved.
         </p>
       )}
       {state.kind === 'expired' && (
