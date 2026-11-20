@@ -98,7 +98,7 @@ plan size limits belong to the planning tools.
 ## Assistant access: the local channel
 
 The desktop serves the assistant over a local channel; an assistant starts the `athenaeum-mcp` bridge, which connects to it. The
-web build serves `/mcp` over HTTP instead (Task 8) and binds nothing here.
+web build serves `/mcp` over HTTP instead (below) and binds nothing here.
 
 **Setting.** `mcp.enabled` (`"false"` default, in `defaults::all()`). Only `set_mcp_enabled` writes it; the generic
 `set_setting` refuses the key with `Invalid("use set_mcp_enabled")`. No other path writes settings in bulk (the Settings page's
@@ -159,10 +159,16 @@ echoed. A later host still serves `/1`.
 carries the same sentence, and a stored `"true"` without a key at boot stays `off` with `lastError` = the sentence. With a key, on
 means `serving` (the key is in `McpStatus.token`; `check_token` and `is_serving` are what the `/mcp` route asks). Nothing binds.
 
+**Web `/mcp`.** The route (`athenaeum-web/src/routes/mcp.rs`, `require_mcp_access`) is gated in this order: access off answers 403
+`Assistant access (MCP) is off in Athenaeum's Settings.`; no catalog open yet answers 503; a missing or wrong `Authorization: Bearer
+<key>` answers 401 (the `X-API-Key` header is not this key). An SSE `GET` stream that is already open on `/mcp` outlives turning
+access off or regenerating the key, while every new request is refused at once. Accepted for v1: the questions are `POST`s, and
+the stream carries only server notices.
+
 **Client config.** `desktop_client_config(name, bridge, build, app_data_override)` returns
 `{"mcpServers":{"<name>":{"command":"<bridge>","args":["--build","<build>"(,"--app-data-dir","<dir>")]}}}` and
-`claude mcp add <name> -- "<bridge>" --build <build>` (plus ` --app-data-dir "<dir>"`). `McpStatus` fills them with the bridge expected
-next to the app's executable and the app-data dir always passed, so the bridge never guesses.
+`claude mcp add <name> -- "<bridge>" --build <build>` (plus ` --app-data-dir "<dir>"`). `McpStatus` fills them with the bridge's path
+(`bridge_path_for`, see "Packaging and the bridge copy") and the app-data dir always passed, so the bridge never guesses.
 
 ## The bridge (`athenaeum-mcp`)
 
@@ -194,8 +200,25 @@ never lost. While down, a request arriving two seconds or more after the last at
 replays, and writes `notifications/tools/list_changed` to the client. A stateless client (revision 2026-07-28) has nothing to replay.
 Client end of input: exit 0.
 
-**Not covered here.** Packaging the bridge next to the app and the Settings page's copy button are Task 8's; the web image has no
-bridge (the Dockerfile drops the crate from the workspace). The bridge is versioned with the app (`bump.sh`, `check_versions.sh`).
+**Packaging and the bridge copy.** The installers carry the bridge as a Tauri sidecar. `bundle.externalBin` is listed only in the
+overlay `crates/athenaeum-tauri/tauri.mcp-bridge.json`, which the release pipeline passes with `--config`: tauri-build fails every
+`cargo build` / `cargo test -p athenaeum-tauri` whose listed sidecar file is missing, so the committed `tauri.conf.json` does not
+list it. `scripts/release/build-mcp-bridge.mjs [--target <triple>] [--debug]` builds the bridge and copies it to
+`crates/athenaeum-tauri/binaries/athenaeum-mcp-<triple>[.exe]` (gitignored), the name Tauri wants; the pipeline runs it with each
+build's own target before each `npm run tauri build` (`docs/release/README.md`). The bridge lands at
+`Athenaeum.app/Contents/MacOS/athenaeum-mcp` (signed and notarized with the app), beside the exe in the MSI and setup exe, and
+`/usr/bin/athenaeum-mcp` in the `.deb`. In `tauri dev` it is `target/debug/athenaeum-mcp` (build it with
+`cargo build -p athenaeum-mcp`). The configuration names the file next to the app's executable, except on two platforms:
+
+- **Bridge copy.** An AppImage mounts at a new path at every start, and on Windows a client holding the installed
+  `athenaeum-mcp.exe` locks it against the installer, so both run a copy at `<app-data>/bin/athenaeum-mcp[.exe]` and the
+  configuration names the copy (`mcp_bridge.rs`: `bridge_path_for`, `copies_to_app_data`, `refresh_bridge_copy`). At a start with
+  assistant access on, once the catalog is open, the copy is refreshed when `<app-data>/bin/athenaeum-mcp.version` differs from the
+  app's version: copied to a temporary name, then renamed over the copy. A copy a client has locked stays as it is (and its version file
+  with it) and is refreshed at a later start; the handshake is versioned, so a bridge one version behind still works.
+
+The web image has no bridge (the Dockerfile drops the crate from the workspace). The bridge is versioned with the app (`bump.sh`,
+`check_versions.sh`).
 
 ## Logging
 

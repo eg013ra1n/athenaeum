@@ -92,7 +92,10 @@ build:windows:
     # vendored `./target/tools/windows/nasm/nasm`, never PATH.
     - if (Test-Path "target\release\bundle") { Remove-Item -Recurse -Force "target\release\bundle" }
     - npm install
-    - npm run tauri build
+    # The assistant bridge rides in the installers as a sidecar (docs/release/README.md):
+    # build it for the host triple, then list it with the --config overlay.
+    - node scripts/release/build-mcp-bridge.mjs
+    - npm run tauri build -- --config crates/athenaeum-tauri/tauri.mcp-bridge.json
   artifacts:
     name: "athenaeum-windows-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -129,7 +132,10 @@ build:linux:
     - export RUSTAFITS_PORTABLE=1
     - rm -rf target/release/bundle/
     - npm install
-    - npm run tauri build
+    # The assistant bridge rides in the .deb as a sidecar (docs/release/README.md);
+    # the AppImage copies it to <app-data>/bin at run time, nothing extra here.
+    - node scripts/release/build-mcp-bridge.mjs
+    - npm run tauri build -- --config crates/athenaeum-tauri/tauri.mcp-bridge.json
   artifacts:
     name: "athenaeum-linux-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -266,8 +272,12 @@ build:macos:
     # itself again, so the updater's .app.tar.gz carries a stapled bundle.
     # Ruling F5.1 (DMG-only notarization) is reversed by that spec; the DMG
     # loop below still notarizes the DMG a first-time user downloads.
-    - npm run tauri build -- --target aarch64-apple-darwin
-    - npm run tauri build -- --target x86_64-apple-darwin
+    # Each target gets its own bridge (docs/release/README.md); Tauri signs the
+    # sidecar with the app.
+    - node scripts/release/build-mcp-bridge.mjs --target aarch64-apple-darwin
+    - npm run tauri build -- --target aarch64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - node scripts/release/build-mcp-bridge.mjs --target x86_64-apple-darwin
+    - npm run tauri build -- --target x86_64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
     - |
       for DMG in target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
                  target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do

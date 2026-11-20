@@ -22,3 +22,20 @@ release" rule, which left `main` hundreds of commits stale — unworkable once
 `main` is the default branch outside contributors base their pull requests on.
 A release branch is cut only if a backport is ever actually needed.
 
+### The assistant bridge in the installers
+
+Every desktop installer carries the `athenaeum-mcp` bridge as a Tauri sidecar (MCP plan, decision D2; reference
+`docs/mcp/README.md`, "Packaging and the bridge copy"). The sidecar is listed only in the overlay
+`crates/athenaeum-tauri/tauri.mcp-bridge.json` (`bundle.externalBin`), because tauri-build fails every `cargo build` / `cargo test
+-p athenaeum-tauri` whose listed sidecar file is missing. So each `npm run tauri build` in `.gitlab-ci.yml` is preceded by
+`node scripts/release/build-mcp-bridge.mjs [--target <triple>]` (release profile; without `--target` it uses the host triple from
+`rustc -vV`) and carries `--config crates/athenaeum-tauri/tauri.mcp-bridge.json`. The script copies the bridge to
+`crates/athenaeum-tauri/binaries/athenaeum-mcp-<triple>[.exe]` (gitignored) and fails with a non-zero exit when the cargo build fails. On
+macOS the two targets each get their own bridge, built just before their `tauri build`; Tauri signs the sidecar with the app, so no
+signing line mentions it. The Linux job needs nothing extra for the AppImage: the app copies the bridge to `<app-data>/bin` itself.
+
+A local installer build that should carry the bridge does the same, with the debug profile if it is only a check:
+`node scripts/release/build-mcp-bridge.mjs --debug`, then `npm run tauri build -- --debug --bundles app --config
+crates/athenaeum-tauri/tauri.mcp-bridge.json`; the bridge is then at `Athenaeum.app/Contents/MacOS/athenaeum-mcp`. A plain
+`npm run tauri build` (no overlay) ships no bridge. The release procedure itself is unchanged: `bump.sh` already covers
+`athenaeum-mcp`'s version.

@@ -56,3 +56,6 @@ __pycache__/
 
 # Per-machine Claude Code permissions (paths bound to one machine)
 .claude/settings.local.json
+
+# The MCP bridge sidecar the release scripts copy here (scripts/release/build-mcp-bridge.mjs)
+/crates/athenaeum-tauri/binaries/
