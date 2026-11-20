@@ -151,24 +151,50 @@ fn plate_solve_started_nothing(_v: &McpPlanView, _report: &PlanReport) -> Option
     None
 }
 
+/// What a plan that failed before it did anything says, by what its kind does.
+fn nothing_done_words(kind: PlanKind) -> &'static str {
+    match kind {
+        PlanKind::BlackHole => "No file was recorded as moved before it stopped.",
+        PlanKind::Metadata => "No value was written before it stopped.",
+        PlanKind::PlateSolve => "Nothing was started before it stopped.",
+    }
+}
+
+/// What a plan that failed after it did something says may be left behind, by what its kind does.
+fn may_have_changed_words(kind: PlanKind) -> &'static str {
+    match kind {
+        PlanKind::BlackHole => "Some files may have changed before it stopped; check them before asking again.",
+        PlanKind::Metadata => "Some values may have been written before it stopped; check the frames before asking again.",
+        PlanKind::PlateSolve => "A run may have started before it stopped; ask solve_status before asking again.",
+    }
+}
+
 /// The answer for a plan that exists: the words of its state, its report when it has one, and the same in data.
 pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
     let mut text = format!("Plan {}, {}: {}.", v.plan_id, v.title, state_words(v));
     if let PlanState::Failed { error } = &v.state {
         // Never the word "applied": a failed plan was not applied, whatever it got done first.
-        text.push_str(&format!("\nFailed: {}.", error.trim_end_matches('.')));
-        if let Some(report) = &v.report {
-            if *report == PlanReport::default() {
-                // It failed while it was applying, before it wrote a line.
-                text.push_str("\nNo file was recorded as moved before it stopped.");
-            } else if let Some(reason) = plate_solve_started_nothing(v, report) {
-                // A plate-solve run that was refused its start: no frame was touched.
+        let nothing_started = v.report.as_ref().and_then(|r| plate_solve_started_nothing(v, r));
+        match (&v.report, nothing_started) {
+            // A plate-solve run that was refused its start: no frame was touched, and the reason is said once.
+            (Some(report), Some(reason)) => {
                 text.push_str(&format!("\nNothing was started: {}.", reason.trim_end_matches('.')));
                 #[cfg(all(feature = "render", feature = "solver"))]
                 text.push_str(&crate::mcp::plans::plate_solve::report_text(report));
-            } else {
-                text.push_str(&partial_text(report));
-                text.push_str("\nSome files may have changed before it stopped; check them before asking again.");
+                #[cfg(not(all(feature = "render", feature = "solver")))]
+                let _ = report;
+            }
+            (report, _) => {
+                text.push_str(&format!("\nFailed: {}.", error.trim_end_matches('.')));
+                if let Some(report) = report {
+                    if *report == PlanReport::default() {
+                        // It failed while it was applying, before it wrote a line.
+                        text.push_str(&format!("\n{}", nothing_done_words(v.kind)));
+                    } else {
+                        text.push_str(&partial_text(report));
+                        text.push_str(&format!("\n{}", may_have_changed_words(v.kind)));
+                    }
+                }
             }
         }
     } else if let Some(report) = &v.report {
@@ -751,6 +777,36 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         assert!(!a.text.contains("0 done"), "{}", a.text);
         assert!(!a.text.to_lowercase().contains("applied"), "{}", a.text);
         assert_eq!(a.data["report"]["applied"], json!([]));
+    }
+
+    #[test]
+    fn a_failed_plans_words_follow_its_kind() {
+        // Black Hole: files are moved.
+        let mut v = view(PlanState::Failed { error: "the catalog is busy".to_string() });
+        v.report = Some(PlanReport::default());
+        assert!(status_answer(&v).text.contains("No file was recorded as moved before it stopped."));
+        // Metadata: values are written, never files moved.
+        v.kind = PlanKind::Metadata;
+        let said = status_answer(&v).text;
+        assert!(said.contains("No value was written before it stopped."), "{said}");
+        assert!(!said.contains("moved"), "{said}");
+        // Plate solve: a run is started, and the reason is said once.
+        #[cfg(all(feature = "render", feature = "solver"))]
+        {
+            v.kind = PlanKind::PlateSolve;
+            let said = status_answer(&v).text;
+            assert!(said.contains("Nothing was started before it stopped."), "{said}");
+            assert!(!said.contains("moved") && !said.contains("value was written"), "{said}");
+            v.state = PlanState::Failed { error: "A plate solve batch started in Athenaeum is running".to_string() };
+            v.report = Some(PlanReport {
+                failed: vec![line("a.fits", "A plate solve batch started in Athenaeum is running")],
+                ..PlanReport::default()
+            });
+            let said = status_answer(&v).text;
+            assert!(said.contains("Nothing was started: A plate solve batch started in Athenaeum is running."), "{said}");
+            assert_eq!(said.matches("A plate solve batch started in Athenaeum is running").count(), 2, "once above the file line, once in it: {said}");
+            assert!(!said.contains("Failed: "), "{said}");
+        }
     }
 
     #[test]

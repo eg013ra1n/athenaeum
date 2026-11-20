@@ -25,6 +25,15 @@ pub struct BatchArgs {
     pub frame_ids: Vec<i64>,
 }
 
+/// Request body for `cancel_plate_solve`: `{ "runId"?: string }`. With a run id the cancel acts only while the slot
+/// holds that run; the body may be `{}`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelPlateSolveArgs {
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
 /// Request body for `set_plate_solve_config`. The frontend calls
 /// `api.invoke('set_plate_solve_config', { config })` per the Tauri
 /// named-arg convention used by every `api.invoke` call, so the HTTP body is
@@ -103,8 +112,9 @@ pub async fn plate_solve_batch(
 #[tracing::instrument(skip_all)]
 pub async fn cancel_plate_solve(
     State(state): State<WebAppState>,
+    Json(args): Json<CancelPlateSolveArgs>,
 ) -> Json<()> {
-    athenaeum_core::api::plate_solve::cancel_plate_solve(&state.ctx);
+    athenaeum_core::api::plate_solve::cancel_plate_solve_named(&state.ctx, args.run_id.as_deref());
     Json(())
 }
 

@@ -381,6 +381,15 @@ pub fn cancel_plate_solve_run(ctx: &ServiceContext, run_id: &str) -> bool {
     }
 }
 
+/// `cancel_plate_solve` as the hosts call it: with a run id it is [`cancel_plate_solve_run`] (the window cancels
+/// the run it is showing and nothing else), without one it is [`cancel_plate_solve`].
+pub fn cancel_plate_solve_named(ctx: &ServiceContext, run_id: Option<&str>) -> bool {
+    match run_id {
+        Some(run_id) => cancel_plate_solve_run(ctx, run_id),
+        None => cancel_plate_solve(ctx),
+    }
+}
+
 /// Wraps the run's emitter: copies each `plate-solve-progress` event into the
 /// handle's [`SolveProgress`], then forwards every event unchanged.
 struct RecordingEmitter {
@@ -402,11 +411,7 @@ impl ProgressEmitter for RecordingEmitter {
             }
             match payload["status"].as_str() {
                 Some("solving") => p.current_file = file,
-                Some("solved") => p.solved += 1,
                 Some("failed") => {
-                    if payload["failure_code"].as_str() == Some("REJECTED_LOW_CONFIDENCE") {
-                        p.solved = p.solved.saturating_sub(1);
-                    }
                     let name = file.unwrap_or_else(|| match payload["frame_id"].as_i64() {
                         Some(id) => format!("frame {id}"),
                         None => "frame".to_string(),
@@ -435,6 +440,9 @@ struct PlateSolveStartedEvent {
 // `matched_stars`, `total_time_ms`, ...
 #[derive(Clone, Serialize)]
 struct PlateSolveProgressEvent {
+    /// The run these events belong to (the `solve-<uuid>` of `plate-solve-started`), so a window can tell its own
+    /// run's events from another's.
+    run_id: String,
     frame_id: i64,
     current: usize,
     total: usize,
@@ -451,6 +459,8 @@ struct PlateSolveProgressEvent {
 
 #[derive(Clone, Serialize)]
 struct PlateSolveCompleteEvent {
+    /// The run that ended (see [`PlateSolveProgressEvent::run_id`]).
+    run_id: String,
     solved: usize,
     failed: usize,
     total: usize,
@@ -518,6 +528,12 @@ impl PreparedPlateSolveBatch {
     /// The id this run's handle carries (also in `plate-solve-started` and the activity).
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// The run's cancel flag, the one the slot's handle holds: a caller that ends the run later reads whether
+    /// anyone cancelled it.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel_flag)
     }
 }
 
@@ -662,6 +678,7 @@ pub fn run_plate_solve_batch(
     mut batch: PreparedPlateSolveBatch,
 ) -> Result<(), ApiError> {
     let total = batch.total;
+    let run_id = batch.run_id.clone();
     let start = std::time::Instant::now();
     // The run owns the slot from here; it is freed on every path, before the complete event.
     let slot = batch.slot.take();
@@ -698,6 +715,7 @@ pub fn run_plate_solve_batch(
         emitter.as_ref(),
         "plate-solve-complete",
         &PlateSolveCompleteEvent {
+            run_id,
             solved: end.solved,
             failed: end.failed,
             total,
@@ -723,7 +741,7 @@ fn solve_and_persist(
     let PreparedPlateSolveBatch {
         slot: _,
         origin: _,
-        run_id: _,
+        run_id,
         progress: _,
         ps_config,
         layer_caches,
@@ -768,6 +786,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id,
                                     current: done_so_far,
                                     total,
@@ -848,6 +867,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id: *frame_id,
                                     current: done,
                                     total,
@@ -865,6 +885,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id: *frame_id,
                                     current: done,
                                     total,
@@ -940,6 +961,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id: *frame_id,
                                     current: total,
                                     total,
@@ -1241,6 +1263,47 @@ mod tests {
         assert_eq!(failed_rows, 3);
     }
 
+    /// Every progress and the complete event of a batch name the run (`run_id`, the `solve-<uuid>` the started event
+    /// and the activity carry), so a window can tell its own run's events from another's.
+    #[test]
+    fn progress_and_complete_name_their_run() {
+        let _guard = crate::api::collab_autopublish::test_lock();
+        let (_tmp, ctx) = test_ctx();
+        let emitter = Arc::new(CapturingEmitter::default());
+        let prepared = prepare_plate_solve_batch(&ctx, &[9001, 9002], Vec::new(), Vec::new(), None, PlateSolveOrigin::Assistant)
+            .expect("prepare");
+        let run_id = prepared.run_id().to_string();
+        run_plate_solve_batch(ctx.clone(), emitter.clone(), prepared).expect("run");
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
+
+        let progress = emitter.named("plate-solve-progress");
+        assert_eq!(progress.len(), 2, "{progress:?}");
+        for p in &progress {
+            assert_eq!(p["run_id"], run_id.as_str(), "{p}");
+        }
+        let complete = emitter.named("plate-solve-complete");
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0]["run_id"], run_id.as_str(), "{}", complete[0]);
+    }
+
+    /// A cancel that names a run acts only while slot 0 holds that run; a cancel that names none cancels the slot.
+    #[test]
+    fn cancel_with_a_run_id_spares_another_run() {
+        let (_tmp, ctx) = test_ctx();
+        let batch = prepare_for(&ctx, &[9001], PlateSolveOrigin::Ui).expect("prepare");
+        let flag = ctx.active_plate_solves.lock().unwrap().get(&0).unwrap().cancel_flag.clone();
+
+        assert!(!cancel_plate_solve_named(&ctx, Some("solve-an-older-run")), "another run's id cancels nothing");
+        assert!(!flag.load(Ordering::Relaxed), "the running batch is spared");
+        assert!(cancel_plate_solve_named(&ctx, Some(batch.run_id())));
+        assert!(flag.load(Ordering::Relaxed));
+
+        // No id: as before, whatever holds the slot.
+        flag.store(false, Ordering::Relaxed);
+        assert!(cancel_plate_solve_named(&ctx, None));
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
     /// An autofind over frame ids that are not in the catalog counts them as
     /// per-frame errors, emits the complete event once and removes handle 1.
     #[test]
@@ -1483,16 +1546,16 @@ mod tests {
         rec.emit_json("other-event", serde_json::json!({}));
         {
             let p = progress.lock().unwrap();
-            assert_eq!((p.done, p.total, p.solved), (2, 3, 1));
+            assert_eq!((p.done, p.total), (2, 3));
             assert_eq!(p.failures, vec![("b.fits".to_string(), "no stars".to_string())]);
         }
-        // The low-confidence correction flips a counted solve to a failure.
+        // The low-confidence correction is a failure line like any other.
         rec.emit_json(
             "plate-solve-progress",
             ev(1, 3, "failed", "a.fits", Some("too few"), Some("REJECTED_LOW_CONFIDENCE")),
         );
         let p = progress.lock().unwrap();
-        assert_eq!((p.done, p.solved, p.failures.len()), (3, 0, 2));
+        assert_eq!((p.done, p.failures.len()), (3, 2));
         assert_eq!(inner.named("plate-solve-progress").len(), 4);
         assert_eq!(inner.named("other-event").len(), 1);
     }

@@ -153,13 +153,33 @@ fn kind_for(frame: &Frame, kind: &str) -> (String, bool) {
     if frame.is_master { (master_of(kind), true) } else { (kind.to_string(), false) }
 }
 
-/// The frame type of the nearest folder of `folder` (a catalog path, either separator) named for one, with that
-/// folder as the path spells it.
-fn frame_type_from_folder(folder: &str) -> Option<(&'static str, String)> {
-    folder
-        .rsplit(['/', '\\'])
-        .filter(|c| !c.is_empty())
-        .find_map(|c| kind_of_folder(c).map(|k| (k, c.to_string())))
+/// Words that mark a folder name as speaking of a frame type, however much else it says (`DARK_300s`, `Flats-old`).
+const KIND_WORDS: [&str; 5] = ["light", "dark", "flat", "bias", "offset"];
+
+/// What the nearest folder that speaks of a frame type says.
+enum FolderKind {
+    /// The folder is named for the type, exactly.
+    Named(&'static str, String),
+    /// The folder holds a kind word among others: it speaks of a type, but no type can be read from it.
+    Partial(String),
+    /// No folder of the path speaks of a type.
+    Silent,
+}
+
+/// Walks up `folder` (a catalog path, either separator) from the file. The nearest component that contains any
+/// kind word decides: an exact kind name gives that kind, an inexact one gives no type at all, however clearly a
+/// folder further up is named (`Lights/2024/DARK_300s` holds darks).
+fn frame_type_from_folder(folder: &str) -> FolderKind {
+    for c in folder.rsplit(['/', '\\']).filter(|c| !c.is_empty()) {
+        if let Some(kind) = kind_of_folder(c) {
+            return FolderKind::Named(kind, c.to_string());
+        }
+        let lower = c.to_ascii_lowercase();
+        if KIND_WORDS.iter().any(|w| lower.contains(w)) {
+            return FolderKind::Partial(c.to_string());
+        }
+    }
+    FolderKind::Silent
 }
 
 // ---- the date, from the file name ----
@@ -282,15 +302,17 @@ pub fn infer(
         for sf in missing.iter().filter(|sf| field.is_missing(sf)) {
             let Some(frame_id) = frame_id_of(sf) else { continue };
             let found: Result<(String, String), String> = match field {
-                FillField::FrameType => frame_type_from_folder(&sf.folder)
-                    .map(|(kind, folder)| {
+                FillField::FrameType => match frame_type_from_folder(&sf.folder) {
+                    FolderKind::Named(kind, folder) => {
                         let (value, master) = frame_of(sf).map_or((kind.to_string(), false), |f| kind_for(f, kind));
                         let evidence = format!("folder '{folder}' in its path");
-                        (value, if master { format!("{evidence}; {IS_A_MASTER}") } else { evidence })
-                    })
-                    .ok_or_else(|| {
-                        "no folder in its path is named for a frame type (Lights, Darks, Flats, Bias, DarkFlats)".to_string()
-                    }),
+                        Ok((value, if master { format!("{evidence}; {IS_A_MASTER}") } else { evidence }))
+                    }
+                    FolderKind::Partial(folder) => Err(format!("folder '{folder}' names a frame type only in part")),
+                    FolderKind::Silent => Err(
+                        "no folder in its path is named for a frame type (Lights, Darks, Flats, Bias, DarkFlats)".to_string(),
+                    ),
+                },
                 FillField::Date => {
                     let name = &sf.file.file.filename;
                     date_from_file_name(name)
@@ -494,7 +516,28 @@ mod tests {
         assert!(got.iter().all(|p| p.field == FillField::FrameType));
         assert_eq!(none.len(), 1, "{none:?}");
         assert_eq!(none[0].frame_id, 9);
-        assert!(none[0].why.contains("no folder in its path is named for a frame type"), "{}", none[0].why);
+        assert_eq!(none[0].why, "folder 'Flats-old' names a frame type only in part");
+    }
+
+    #[test]
+    fn the_nearest_folder_decides_the_frame_type() {
+        let missing = vec![
+            // A far ancestor does not outvote the nearest folder that names a kind, even in part.
+            frame(1, "Lights/2024/DARK_300s", "a.fits", |_| {}),
+            // An exact name nearer than another exact name wins.
+            frame(2, "Flats/M31/Lights/2024", "b.fits", |_| {}),
+            // No folder names a kind: the old sentence.
+            frame(3, "M31/2024-10-05", "c.fits", |_| {}),
+            // A partial name nearest, an exact one above it: still no proposal.
+            frame(4, "Darks/Dark_Library", "d.fits", |_| {}),
+        ];
+        let (got, none) = infer(&missing, &[], &[FillField::FrameType]);
+        let kinds: Vec<(i64, &str)> = got.iter().map(|p| (p.frame_id, p.value.as_str())).collect();
+        assert_eq!(kinds, vec![(2, "Light")]);
+        let why = |id: i64| none.iter().find(|n| n.frame_id == id).map(|n| n.why.as_str());
+        assert_eq!(why(1), Some("folder 'DARK_300s' names a frame type only in part"));
+        assert_eq!(why(4), Some("folder 'Dark_Library' names a frame type only in part"));
+        assert!(why(3).is_some_and(|w| w.contains("no folder in its path is named for a frame type")), "{:?}", why(3));
     }
 
     #[test]

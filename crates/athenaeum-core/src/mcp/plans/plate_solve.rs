@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rmcp::schemars::JsonSchema;
@@ -141,6 +142,9 @@ pub struct RunView {
     pub plan_id: String,
     pub total: usize,
     pub cancel_requested: bool,
+    /// The run's own cancel flag was set and the assistant never asked for it: the user cancelled it in Athenaeum's
+    /// window.
+    pub cancelled_in_app: bool,
     /// The frames that failed so far (while it runs) with file name and folder.
     pub failures: Vec<FailedFile>,
     pub outcome: Option<SolveOutcome>,
@@ -174,6 +178,7 @@ impl SolveRuns {
                 plan_id: plan_id.to_string(),
                 total,
                 cancel_requested: false,
+                cancelled_in_app: false,
                 failures: Vec::new(),
                 outcome: None,
             },
@@ -224,6 +229,16 @@ impl SolveRuns {
         }
     }
 
+    /// The run ended with its cancel flag set. When `cancel_solve` did not set it, someone cancelled it in
+    /// Athenaeum's window, and the snapshot says so.
+    fn note_cancel_seen(&self, run_id: &str) {
+        if let Some(r) = self.lock().iter_mut().find(|r| r.view.run_id == run_id) {
+            if !r.view.cancel_requested {
+                r.view.cancelled_in_app = true;
+            }
+        }
+    }
+
     /// The run ended: keep its snapshot. The counts are the complete event's; a run that returned an error kept no
     /// result (a failed COMMIT rolled the solves back), so nothing was solved whatever the events said.
     pub fn finish(&self, run_id: &str, result: Result<(), ApiError>) {
@@ -263,6 +278,15 @@ impl SolveRuns {
         );
         r.view.outcome = Some(outcome);
     }
+}
+
+/// A run's end, on the run's own thread: a cancel the window made (the flag is set, `cancel_solve` did not set it)
+/// is noted, then the snapshot is kept.
+fn end_run(runs: &SolveRuns, run_id: &str, cancel_flag: &AtomicBool, result: Result<(), ApiError>) {
+    if cancel_flag.load(Ordering::Relaxed) {
+        runs.note_cancel_seen(run_id);
+    }
+    runs.finish(run_id, result);
 }
 
 /// The run's emitter: tells the host what each frame did, then forwards every event unchanged.
@@ -356,8 +380,10 @@ fn read_plan(host: &McpHost, args: &PlanPlateSolveArgs) -> Result<Read, ApiError
     };
     let frames = fetch_scoped_frames(&conn, &prepared.filter).map_err(|e| read_failed("the frames in scope", format!("{e:#}")))?;
     let cfg = config::load_config(&conn);
+    // The lights the plan would hold are counted first, from the rows already read: a request over the cap is
+    // refused before any per-frame read (the input gate, the catalog values).
     let (mut not_lights, mut located) = (0usize, 0usize);
-    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut eligible = Vec::new();
     for sf in &frames {
         let Some(frame) = sf.file.frame.as_ref() else {
             not_lights += 1;
@@ -376,6 +402,16 @@ fn read_plan(host: &McpHost, args: &PlanPlateSolveArgs) -> Result<Read, ApiError
             located += 1;
             continue;
         }
+        eligible.push((sf, frame, frame_id, file_id, missing));
+    }
+    if eligible.len() > PLAN_ITEM_CAP {
+        return Err(ApiError::Invalid(format!(
+            "this plan would hold {} items, and a plan holds at most 2 000; narrow the scope (a folder, a night) and ask again",
+            eligible.len()
+        )));
+    }
+    let mut candidates: Vec<Candidate> = Vec::with_capacity(eligible.len());
+    for (sf, frame, frame_id, file_id, missing) in eligible {
         let coordinates = match (frame.ra, frame.dec) {
             (Some(ra), Some(dec)) if !missing => Some((ra, dec)),
             _ => None,
@@ -594,12 +630,6 @@ pub fn prepare(host: &Arc<McpHost>, args: PlanPlateSolveArgs, resolve: Resolvers
     let read = read_plan(host, &args)?;
     if read.candidates.is_empty() {
         return Err(ApiError::Invalid(nothing_to_solve(&read, args.only_unsolved)));
-    }
-    if read.candidates.len() > PLAN_ITEM_CAP {
-        return Err(ApiError::Invalid(format!(
-            "this plan would hold {} items, and a plan holds at most 2 000; narrow the scope (a folder, a night) and ask again",
-            read.candidates.len()
-        )));
     }
     // From here the plan exists: a failure ends it `failed` (a preparing plan is never swept).
     let (id, _cancel) = host.plans.begin(host, PlanKind::PlateSolve, TITLE);
@@ -834,6 +864,15 @@ impl PlanApplier for PlateSolveApplier {
         nothing_started_reason(report)
     }
 
+    /// A batch that holds the slot refuses the Apply in its own words, and the plan keeps waiting: the user presses
+    /// Apply again once the batch ends.
+    fn ready(&self, host: &McpHost) -> Result<(), String> {
+        match busy_refusal(host) {
+            Some(refusal) => Err(refusal.to_string()),
+            None => Ok(()),
+        }
+    }
+
     fn apply(&self, host: &McpHost, plan_id: &str, sel: &PlanSelection, fresh: &[String]) -> PlanReport {
         let report = PlanReport::default();
         let fresh: std::collections::HashSet<&str> = fresh.iter().map(String::as_str).collect();
@@ -865,6 +904,7 @@ impl PlanApplier for PlateSolveApplier {
             }
         };
         let run_id = prepared.run_id().to_string();
+        let cancel_flag = prepared.cancel_flag();
         let names: HashMap<i64, (String, String)> =
             self.items.values().map(|i| (i.frame_id, (i.file_name.clone(), i.folder.clone()))).collect();
         host.solves.start(&run_id, plan_id, frame_ids.len(), names);
@@ -887,7 +927,7 @@ impl PlanApplier for PlateSolveApplier {
                 if let Err(e) = &result {
                     tracing::error!(error = %e, run_id = %thread_run, "plate solve run failed");
                 }
-                runs.finish(&thread_run, result);
+                end_run(&runs, &thread_run, &cancel_flag, result);
             });
         });
         if let Err(e) = spawned {
@@ -974,7 +1014,7 @@ pub fn solve_status(host: &McpHost, run_id: &str) -> Result<Answer, ApiError> {
         return Ok(Answer::new(lines.join("\n"), data));
     }
     match record {
-        Some(RunView { outcome: Some(o), plan_id, total, cancel_requested, .. }) => {
+        Some(RunView { outcome: Some(o), plan_id, total, cancel_requested, cancelled_in_app, .. }) => {
             let mut lines = Vec::new();
             match &o.error {
                 Some(e) => lines.push(format!(
@@ -989,7 +1029,12 @@ pub fn solve_status(host: &McpHost, run_id: &str) -> Result<Answer, ApiError> {
                     count_of(total, "frame", "frames")
                 )),
             }
-            if o.not_attempted > 0 {
+            if cancelled_in_app {
+                lines.push(format!(
+                    "The run was cancelled in Athenaeum; {} not attempted.",
+                    if o.not_attempted == 1 { "1 frame was".to_string() } else { format!("{} frames were", o.not_attempted) }
+                ));
+            } else if o.not_attempted > 0 {
                 lines.push(format!(
                     "{} {} not attempted{}.",
                     o.not_attempted,
@@ -1014,6 +1059,7 @@ pub fn solve_status(host: &McpHost, run_id: &str) -> Result<Answer, ApiError> {
                 "notAttempted": o.not_attempted,
                 "failedWithoutFile": o.unlisted,
                 "cancelRequested": cancel_requested,
+                "cancelledInApp": cancelled_in_app,
                 "error": o.error,
                 "totalTimeMs": o.total_time_ms,
                 "failures": o.failures.iter().map(failure_json).collect::<Vec<_>>(),

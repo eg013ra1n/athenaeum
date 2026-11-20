@@ -259,6 +259,22 @@ fn frame_column(key: &str) -> Option<&'static str> {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread read a frame's catalog values (a test counts the per-frame reads a planner makes).
+    static CATALOG_VALUE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_catalog_value_reads() {
+    CATALOG_VALUE_READS.with(|n| n.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn catalog_value_reads() -> usize {
+    CATALOG_VALUE_READS.with(std::cell::Cell::get)
+}
+
 /// The stored text of the given header keys for one frame, `None` for an empty value. The planner records these in
 /// [`ItemSnapshot::catalog`] and the apply re-reads them with the same function, so the two always compare like for
 /// like. `Err` names a key this build does not track or a frame that is gone.
@@ -267,6 +283,8 @@ pub fn catalog_values(
     frame_id: i64,
     keys: &[&str],
 ) -> Result<BTreeMap<String, Option<String>>, String> {
+    #[cfg(test)]
+    CATALOG_VALUE_READS.with(|n| n.set(n.get() + 1));
     let mut out = BTreeMap::new();
     for key in keys {
         let column = frame_column(key).ok_or_else(|| format!("the catalog value {key} is not tracked by a plan"))?;

@@ -57,7 +57,6 @@ pub enum PlateSolveOrigin {
 pub struct SolveProgress {
     pub done: usize,
     pub total: usize,
-    pub solved: usize,
     pub current_file: Option<String>,
     /// `(file name, reason)` of each frame that failed.
     pub failures: Vec<(String, String)>,

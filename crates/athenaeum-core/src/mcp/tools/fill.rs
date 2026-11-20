@@ -50,7 +50,7 @@ impl AthenaeumMcp {
     }
 
     #[tool(
-        description = "How a plate-solve run stands, by the `runId` of the plan's report (`solve-...`): while it runs, how many frames are done of the total, how many solved and failed so far, the file being solved and each failure by file name and folder; after it, the result: solved, failed with every failed file and its error, and frames a cancel left unattempted. It changes nothing. Only runs this assistant started (since Athenaeum opened) are remembered; another id is answered in words.",
+        description = "How a plate-solve run stands, by the `runId` of the plan's report (`solve-...`): while it runs, how many frames are done of the total, how many failed so far, the file being solved and each failure by file name and folder (never a solved count: a frame counts as solved only when the run has saved its result); after it, the result: solved, failed with every failed file and its error, and frames a cancel left unattempted (a cancel from Athenaeum's window is named as such). It changes nothing. Only runs this assistant started (since Athenaeum opened) are remembered; another id is answered in words.",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn solve_status(&self, Parameters(args): Parameters<SolveRunArgs>) -> CallToolResult {

@@ -624,3 +624,31 @@ fn the_applier_rechecks_the_field_and_the_light() {
     assert_eq!(row(&rig, &lit).0, None);
     assert_eq!(row(&rig, &ok).1.as_deref(), Some("Cam X"));
 }
+
+#[test]
+fn a_frame_deleted_before_the_write_is_failed() {
+    let rig = rig();
+    let a = put(&rig, "vanish", "a.fits", |_| {});
+    let b = put(&rig, "vanish", "b.fits", |_| {});
+    let view = plan(&rig, args(&rig, "vanish", &[], Some((FillField::Camera, "Cam X"))));
+    assert_eq!(view.groups[0].items.iter().filter(|i| i.selected).count(), 2);
+    // b leaves the catalog after the re-check and before the write reaches it: writing a's row deletes b's.
+    {
+        let database = rig.ctx.db.get().expect("db");
+        let conn = database.conn();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER vanish_b BEFORE UPDATE ON frames WHEN OLD.id = {} BEGIN DELETE FROM frames WHERE id = {}; END;",
+            a.frame_id, b.frame_id
+        ))
+        .expect("trigger");
+    }
+    let ended = apply(&rig, &view.plan_id, proposal(&view));
+    assert_eq!(ended.state, PlanState::Applied, "{ended:?}");
+    let report = ended.report.expect("a report");
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(report.applied[0].item_id, item_id_of(&a, FillField::Camera));
+    assert_eq!(report.failed.len(), 1, "a write that did not reach a frame is not reported applied: {report:?}");
+    assert_eq!(report.failed[0].item_id, item_id_of(&b, FillField::Camera));
+    assert_eq!(report.failed[0].reason, "not in the catalog any more");
+    assert_eq!(row(&rig, &a).1.as_deref(), Some("Cam X"));
+}

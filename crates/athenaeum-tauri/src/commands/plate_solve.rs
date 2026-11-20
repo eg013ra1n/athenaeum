@@ -80,10 +80,12 @@ pub async fn plate_solve_batch(
     .map_err(|e| e.to_string())
 }
 
+/// Cancel the running batch. With `run_id` (Tauri arg `runId`) only when the slot holds that run; without, whatever
+/// batch holds it.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn cancel_plate_solve(state: State<'_, AppState>) -> Result<(), String> {
-    athenaeum_core::api::plate_solve::cancel_plate_solve(&state.ctx);
+pub async fn cancel_plate_solve(state: State<'_, AppState>, run_id: Option<String>) -> Result<(), String> {
+    athenaeum_core::api::plate_solve::cancel_plate_solve_named(&state.ctx, run_id.as_deref());
     Ok(())
 }
 

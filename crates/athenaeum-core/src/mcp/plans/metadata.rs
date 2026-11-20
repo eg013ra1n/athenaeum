@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use rmcp::schemars::JsonSchema;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -674,6 +674,44 @@ fn no_longer_missing(conn: &Connection, info: &ItemInfo) -> Option<String> {
     }
 }
 
+/// Why a frame the write did not reach is reported failed.
+const NOT_IN_CATALOG: &str = "not in the catalog any more";
+
+/// After a write that reached `updated` of `frame_ids`: the frames that are no longer in the catalog. A frame that
+/// cannot be looked up is counted as not written too (it is not claimed applied).
+fn frames_gone(host: &McpHost, plan_id: &str, frame_ids: &[i64], updated: usize) -> BTreeSet<i64> {
+    tracing::warn!(plan_id, count = updated, "plan wrote fewer rows than it named");
+    let all = || frame_ids.iter().copied().collect::<BTreeSet<i64>>();
+    let database = match crate::api::db(host.ctx()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, plan_id, "plan could not reopen the catalog to find the frames it missed");
+            return all();
+        }
+    };
+    let conn = match database.try_conn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, plan_id, "plan could not reach the catalog to find the frames it missed");
+            return all();
+        }
+    };
+    let mut gone = BTreeSet::new();
+    for id in frame_ids {
+        match conn.query_row("SELECT 1 FROM frames WHERE id = ?1", [id], |_| Ok(())).optional() {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                gone.insert(*id);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, plan_id, frame_id = *id, "plan could not look a frame up after a short write");
+                gone.insert(*id);
+            }
+        }
+    }
+    gone
+}
+
 impl PlanApplier for MetadataApplier {
     /// Every item is an independent include/exclude: the generic check is all a selection needs.
     fn validate(&self, _view: &McpPlanView, _sel: &PlanSelection) -> Result<(), String> {
@@ -727,13 +765,21 @@ impl PlanApplier for MetadataApplier {
             let frame_ids: Vec<i64> = ids.iter().filter_map(|id| self.items.get(*id).map(|i| i.frame_id)).collect();
             match crate::api::files::bulk_update_frame_metadata(host.ctx(), frame_ids.clone(), edits_of(field, value)) {
                 Ok(updated) => {
-                    if updated != frame_ids.len() {
-                        tracing::warn!(plan_id, count = updated, "plan wrote fewer rows than it named");
-                    }
-                    changed.extend(frame_ids);
+                    // A write that reached fewer rows than it named is not reported applied: the frames it did not
+                    // reach are found again in the catalog and reported failed.
+                    let missed: BTreeSet<i64> =
+                        if updated < frame_ids.len() { frames_gone(host, plan_id, &frame_ids, updated) } else { BTreeSet::new() };
                     for id in ids {
-                        report.applied.push(report_line(&self.items, id, format!("{} set to '{}'", field.header_key(), shown(field, value))));
+                        let line = match self.items.get(id) {
+                            Some(info) if missed.contains(&info.frame_id) => {
+                                report.failed.push(report_line(&self.items, id, NOT_IN_CATALOG));
+                                continue;
+                            }
+                            _ => report_line(&self.items, id, format!("{} set to '{}'", field.header_key(), shown(field, value))),
+                        };
+                        report.applied.push(line);
                     }
+                    changed.extend(frame_ids.iter().filter(|f| !missed.contains(f)));
                 }
                 Err(e) => {
                     tracing::error!(error = %e, plan_id, "plan metadata write failed");

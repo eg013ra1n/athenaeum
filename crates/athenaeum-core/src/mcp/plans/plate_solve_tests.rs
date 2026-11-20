@@ -351,26 +351,62 @@ fn apply_starts_a_run_and_says_started_not_solved() {
 }
 
 #[test]
-fn apply_refused_when_a_ui_batch_started_meanwhile() {
+fn apply_while_a_batch_runs_keeps_the_plan_waiting() {
+    let _lock = crate::api::collab_autopublish::test_lock();
     let rig = rig();
     light(&rig, "late", "lights-0001.fits");
     let view = plan(&rig, args(&rig, "late"));
-    // The user starts a batch in the window while the plan waits.
+    // The user starts a batch in the window while the plan waits, then presses Apply on the plan.
     let ui = prepare_plate_solve_batch(&rig.ctx, &[9001], Vec::new(), Vec::new(), None, PlateSolveOrigin::Ui)
         .expect("the UI batch");
-    let done = apply(&rig, &view.plan_id, proposal(&view));
-    let report = done.report.clone().expect("a report");
-    assert!(report.run_id.is_none(), "nothing started");
-    assert!(report.applied.is_empty());
-    assert_eq!(report.failed.len(), 1);
-    assert_eq!(report.failed[0].reason, BUSY_UI.replace("{done}", "0").replace("{total}", "1"));
-    let said = crate::mcp::tools::plans::status_answer(&done).text;
     let busy = BUSY_UI.replace("{done}", "0").replace("{total}", "1");
-    // A run that never started ends the plan failed, with the report kept, never applied.
-    assert_eq!(done.state, PlanState::Failed { error: busy.clone() });
-    assert!(said.contains(&format!("Nothing was started: {}", busy.trim_end_matches('.'))), "{said}");
-    assert!(!said.contains("Some files may have changed") && !said.contains("started a plate solve of"), "{said}");
-    assert!(rig.host.solves.get("solve-none").is_none());
+    let refused = rig
+        .host
+        .plans
+        .answer(&rig.host, &view.plan_id, PlanAnswer::Apply { selection: proposal(&view) })
+        .err()
+        .expect("an Apply the slot cannot take is refused");
+    match refused {
+        ApiError::Conflict(said) => assert_eq!(said, busy),
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    // The plan did not burn: it still waits, with its selection, and starts once the slot is free.
+    let waiting = rig.host.plans.view(Some(&view.plan_id)).expect("plan");
+    assert_eq!(waiting.state, PlanState::Waiting);
+    assert!(waiting.report.is_none(), "{:?}", waiting.report);
+    assert_eq!(proposal(&waiting), proposal(&view));
+    drop(ui);
+    let done = apply(&rig, &view.plan_id, proposal(&view));
+    assert_eq!(done.state, PlanState::Applied, "{:?}", done.state);
+    let run_id = done.report.expect("a report").run_id.expect("the run started");
+    finished(&rig, &run_id);
+    crate::api::collab_autopublish::reset_dirty_state_for_test();
+}
+
+#[test]
+fn a_batch_that_takes_the_slot_after_ready_ends_the_plan_failed() {
+    let rig = rig();
+    let a = light(&rig, "race", "lights-0001.fits");
+    let item_id = format!("item:{}", a.file_id);
+    let applier = PlateSolveApplier {
+        items: HashMap::from([(
+            item_id.clone(),
+            ItemInfo { frame_id: a.frame_id, file_name: a.name.clone(), folder: text(&dir_of(&rig, "race")) },
+        )]),
+        resolve: installed(),
+    };
+    assert!(applier.ready(&rig.host).is_ok(), "an idle slot is ready");
+    // A batch takes the slot between `ready` and the start: the start's own refusal stays the safety net.
+    let ui = prepare_plate_solve_batch(&rig.ctx, &[9001], Vec::new(), Vec::new(), None, PlateSolveOrigin::Ui).expect("ui");
+    let busy = BUSY_UI.replace("{done}", "0").replace("{total}", "1");
+    assert_eq!(applier.ready(&rig.host).err().as_deref(), Some(busy.as_str()));
+    let selection = PlanSelection {
+        groups: vec![GroupSelection { group_id: "group:1".to_string(), chosen: None, included: vec![item_id.clone()] }],
+    };
+    let report = applier.apply(&rig.host, "plan-race", &selection, std::slice::from_ref(&item_id));
+    assert!(report.run_id.is_none() && report.applied.is_empty(), "{report:?}");
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(applier.start_failure(&report).as_deref(), Some(busy.as_str()));
     drop(ui);
 }
 
@@ -416,7 +452,6 @@ fn status_reports_progress_and_result() {
         let solves = rig.ctx.active_plate_solves.lock().unwrap();
         let mut p = solves.get(&0).unwrap().progress.lock().unwrap();
         p.done = 2;
-        p.solved = 1;
         p.current_file = Some("lights-0003.fits".into());
     }
     let running = solve_status(&rig.host, &run_id).expect("status");
@@ -517,6 +552,79 @@ fn cancel_solve_stops_only_its_run() {
     let said = cancel_solve(&rig.host, &my_id).expect("an answer");
     assert_eq!(said.data["cancelled"], false);
     assert!(said.text.contains("already ended"), "{}", said.text);
+}
+
+#[test]
+fn an_unscoped_request_over_the_cap_reads_no_frame() {
+    let rig = rig();
+    {
+        let database = rig.ctx.db.get().expect("db");
+        let conn = database.conn();
+        let tx = conn.unchecked_transaction().expect("transaction");
+        for n in 0..=PLAN_ITEM_CAP {
+            let name = format!("lights-{n:05}.fits");
+            let path = rig.base.join("nas").join("many").join(&name);
+            let file_id = db::insert_file(
+                &tx,
+                &File {
+                    id: None,
+                    path: text(&path),
+                    filename: name,
+                    size: 4,
+                    modified_at: Utc::now(),
+                    format: FileFormat::FITS,
+                    created_at: Utc::now(),
+                    content_hash: None,
+                    archived_in_operation: None,
+                    archive_zip_path: None,
+                    archive_path_in_zip: None,
+                    uuid: None,
+                    updated_at: None,
+                },
+            )
+            .expect("file row");
+            db::insert_frame(&tx, &Frame { file_id, imagetyp: Some(ImageType::Light), ..Default::default() }).expect("frame row");
+        }
+        tx.commit().expect("commit");
+    }
+    super::super::reset_catalog_value_reads();
+    let said = prepare(&rig.host, PlanPlateSolveArgs { scope: Scope::default(), only_unsolved: true }, installed())
+        .err()
+        .expect("refused over the cap")
+        .to_string();
+    assert!(said.contains("at most 2 000"), "{said}");
+    assert_eq!(super::super::catalog_value_reads(), 0, "the cap is counted before any frame is read");
+    assert!(rig.host.plans.view(None).is_none(), "no plan began");
+}
+
+#[test]
+fn a_cancel_from_the_app_is_named_to_the_assistant() {
+    let rig = rig();
+    // A run the window cancelled: its handle's flag is set, and the assistant never asked for it.
+    rig.host.solves.start("solve-app", "plan-app", 5, Default::default());
+    rig.host.solves.note_complete("solve-app", 1, 1, 9);
+    let flag = std::sync::atomic::AtomicBool::new(true);
+    end_run(&rig.host.solves, "solve-app", &flag, Ok(()));
+    let said = solve_status(&rig.host, "solve-app").expect("status");
+    assert!(said.text.contains("cancelled in Athenaeum; 3 frames were not attempted"), "{}", said.text);
+    assert_eq!(said.data["cancelledInApp"], true);
+    assert_eq!(said.data["notAttempted"], 3);
+
+    // The assistant's own cancel is not "in Athenaeum".
+    rig.host.solves.start("solve-mine", "plan-mine", 5, Default::default());
+    rig.host.solves.note_cancel("solve-mine");
+    rig.host.solves.note_complete("solve-mine", 1, 1, 9);
+    end_run(&rig.host.solves, "solve-mine", &flag, Ok(()));
+    let said = solve_status(&rig.host, "solve-mine").expect("status");
+    assert!(!said.text.contains("in Athenaeum"), "{}", said.text);
+    assert_eq!(said.data["cancelledInApp"], false);
+
+    // A run nobody cancelled says nothing of it.
+    rig.host.solves.start("solve-calm", "plan-calm", 2, Default::default());
+    rig.host.solves.note_complete("solve-calm", 2, 0, 9);
+    end_run(&rig.host.solves, "solve-calm", &std::sync::atomic::AtomicBool::new(false), Ok(()));
+    let said = solve_status(&rig.host, "solve-calm").expect("status");
+    assert!(!said.text.contains("cancelled") && said.data["cancelledInApp"] == false, "{}", said.text);
 }
 
 #[test]

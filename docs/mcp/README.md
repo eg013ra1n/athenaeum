@@ -63,7 +63,7 @@ Every answer is two halves that each read on their own.
 | `plan_plate_solve { scope, onlyUnsolved? }` | Prepares a plate-solve plan over the lights of the scope (those that miss coordinates unless `onlyUnsolved` is false); see "Plate-solve plans" below. Refused in words, leaving the waiting plan alone, when the scope names nothing, no light is left to solve or the plan would hold more than 2 000 items, and refused while any plate-solve batch runs (the running run's own words). Solver builds only |
 | `solve_status { runId }` | A run's progress while it runs (frames done of total, failed so far, the file being solved, each failure by file name and folder; no solved count, the store can still reject a frame or roll the batch back) and its result after it (solved, failed with every failed file and its error, frames a cancel left unattempted). Changes nothing; knows the runs the assistant started since Athenaeum opened (the last 20). Solver builds only |
 | `cancel_solve { runId }` | Sets the cancel flag of the assistant's own run, and only while slot 0 holds that exact `runId`; a run started in Athenaeum's window, an ended run or an unknown id is answered in words and nothing is stopped. It stops a run, it never decides a plan (the one tool name that says "cancel"; `no_tool_applies_a_plan` allows it by name). Solver builds only |
-| `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied") |
+| `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied"); before a line was written the words follow the kind (Black Hole `No file was recorded as moved before it stopped.`, metadata `No value was written before it stopped.`, plate solve `Nothing was started before it stopped.`), and a plate-solve plan that was refused its start says the reason once, `Nothing was started: <reason>.`, with no `Failed:` line above it |
 
 Each tool is a core fn `mcp::tools::<name>(host, args) -> Result<Answer, ApiError>` wearing
 `#[tracing::instrument(skip_all, fields(tool = "<name>"), err)]`; `AthenaeumMcp::all_tools()` (`server.rs`) joins the tool routers (`catalog_tools() + plan_tools() + fill_tools()`, and `tools.json` is written from it); the `#[tool]` method is a two-line adapter that runs it with
@@ -246,13 +246,12 @@ MCP client can call applies or cancels a plan: `PlanStore::answer` is reached on
 - **One undecided plan.** `begin` makes the old `preparing` / `waiting` plan `replaced` (`replacedBy` = the new id, its cancel flag set). A
   replaced, cancelled, expired or applied plan stays readable by its id for 24 h (at most 100 finished plans). `view(None)` is the newest plan
   that is `preparing`, `waiting` or `applying` (a page that reloads during an apply finds it, even when a newer plan failed), else the newest plan.
-  A failed apply always carries a report (an empty one says nothing was recorded as moved; `plan_status` reads `No file was recorded as moved before
-  it stopped.`); only a plan that failed while it was being prepared has none. Turning assistant access off does not end a waiting or preparing
+  A failed apply always carries a report (an empty one says nothing was done; `plan_status` words it by the plan's kind, see the `plan_status` row); only a plan that failed while it was being prepared has none. Turning assistant access off does not end a waiting or preparing
   plan: the user still decides it in the window.
 - **Expiry is on tokio time.** `publish` stores a `tokio::time::Instant` deadline (`PLAN_TTL`, one hour); the sleeper and the apply check
   both read it, so a test pauses time. `expiresAt` is display text (local time, `YYYY-MM-DD HH:MM:SS`).
 - **Apply.** `Apply` only from `waiting`, unexpired. The generic check (known groups and items, no locked item included, `chosen` a
-  candidate, something selected) and the kind's `PlanApplier::validate` run first; then the plan is `applying` and a thread re-stamps every
+  candidate, something selected), the kind's `PlanApplier::validate` and its `PlanApplier::ready` run first (`ready` is the kind's resource: an `Err` refuses the Apply in words as a `Conflict` and the plan stays `waiting`, so it is never burnt; `apply_while_a_batch_runs_keeps_the_plan_waiting`); then the plan is `applying` and a thread re-stamps every
   included item and each group's kept copy (`disk_stamp`; a zip-resident row stamps its zip, `files.archive_zip_path`; paths are never
   `canonicalize`d) and re-reads the catalog values captured at planning (`catalog_values`). A changed item is skipped with its reason
   (`changed on disk since the plan (size A → B)`, `missing`, `catalog changed: OBJECT is now 'X'`); a changed or missing kept copy skips its
@@ -322,15 +321,18 @@ empty means all four, or only the statement's field when a statement is given; c
 the scope that misses the field is proposed for, by the Missing Metadata view's own test (`missing_flags`: the object only for lights);
 a frame whose stored value is not empty is left alone even where the parser could not read it.
 
-- **Evidence, each item says which.** Frame type: the nearest folder of the path named `light(s)`, `dark(s)`, `flat(s)`,
-  `bias`/`biases`/`offset(s)` or `darkflat(s)`/`flatdark(s)` (case-insensitive, the whole folder name), `folder 'Flats' in its path`.
+- **Evidence, each item says which.** Frame type: walk up from the file; the nearest folder whose name contains any kind word (`light`, `dark`,
+  `flat`, `bias`, `offset`) decides. A name that is exactly `light(s)`, `dark(s)`, `flat(s)`, `bias`/`biases`/`offset(s)` or
+  `darkflat(s)`/`flatdark(s)` (case-insensitive) gives that kind, `folder 'Flats' in its path`; an inexact one (`DARK_300s`) gives no proposal,
+  `folder 'DARK_300s' names a frame type only in part`, whatever a folder further up is named (`Lights/2024/DARK_300s`;
+  `the_nearest_folder_decides_the_frame_type`).
   Date: the file name holds `YYYY-MM-DD[_T ]HH[-_:]MM[-_:]SS` or `YYYYMMDD[-_]HHMMSS` (hand-parsed, year 1990-2100, a real date, not part of
   a longer run of digits), `from the file name '<name>'; the camera clock's time zone is unknown, taken as UTC`. Camera and object (D9):
   the other frames of the same folder (the folder itself, not below it; Black Hole files do not count) that have the field set: at
   least 3 and all equal gives `40 frames in this folder have INSTRUME = 'ZWO ASI2600MM Pro'`; disagreeing frames give no proposal,
   `frames in this folder disagree: 30 'A', 10 'B'`; fewer than 3 give `fewer than 3 frames in this folder have it`. Neighbours are read
   for the folders of the missing frames only, outside the scope too. The object is counted from lights only (a flat's `OBJECT` is not the
-  target; `flats_never_name_a_lights_object`). A frame that is a master (`is_master`, set by the parser from the file name) keeps its master
+  target; `flats_never_name_a_lights_object`); a neighbour with no frame type (`imagetyp` NULL) is not a light and does not count toward an object. A frame that is a master (`is_master`, set by the parser from the file name) keeps its master
   type: the proposal is `MasterDark` / `MasterFlat` / `MasterBias` / `MasterDarkFlat` / `MasterLight`, evidence `folder 'Darks' in its path; the
   file is a master`, because the catalog derives `is_master` from the type text and `Dark` would turn the master into a raw frame
   (`a_master_in_a_darks_folder_stays_a_master`).
@@ -360,7 +362,9 @@ a frame whose stored value is not empty is left alone even where the parser coul
   and writes each group with `api::files::bulk_update_frame_metadata` (the Missing Metadata page's own write: catalog only, `frames.override =
   1`, so the scanner's re-parse keeps the value - `fill_sets_override_and_survives_rescan` - and the links and session seats of the frame go).
   A date is stored `<value>Z`, as the Set Date modal stores it. One `frames-metadata-changed {"count": <frames>}` follows when anything
-  was written; the closing line is `info!(via = "mcp", plan_id, count, "mcp metadata fill applied")`.
+  was written; the closing line is `info!(via = "mcp", plan_id, count, "mcp metadata fill applied")`. A write that reached fewer rows than it
+  named (a frame deleted between the re-check and the write) is not reported applied: the applier looks the frames up again and reports those no
+  longer in the catalog `failed`, `not in the catalog any more` (`a_frame_deleted_before_the_write_is_failed`).
 
 ## Plate-solve plans (`plan_plate_solve`, `solve_status`, `cancel_solve`)
 
@@ -378,22 +382,29 @@ the module, the three tools and `McpHost::solves`, and its tool list simply lack
   `runs X frames at a time` (the configured `batch_concurrency`, else `(cores / 3).clamp(2, 8)`), and the left-out counts. The answer is the plan
   as data and words (`describe_plan`, also what `plan_status` says of a waiting plate-solve plan), at most 50 groups and 20 items per group.
 - **Refused in words before the plan begins** (the waiting plan is never replaced): a scope that names nothing, no light to solve, a plan of more
-  than 2 000 items, and a plate-solve batch already running: `BUSY_ASSISTANT` when the running run is the assistant's, `BUSY_UI` when the user
+  than 2 000 items (counted from the scope's rows before any frame is read, `an_unscoped_request_over_the_cap_reads_no_frame`), and a plate-solve batch already running: `BUSY_ASSISTANT` when the running run is the assistant's, `BUSY_UI` when the user
   started it in Athenaeum (`planning_refused_while_a_ui_batch_runs`).
 - **Applied means started.** Apply re-checks each file and the frame's type and coordinates (the store), resolves the catalogs again, claims the slot
   with `prepare_plate_solve_batch(.., Assistant)` and starts `run_plate_solve_batch` on a thread named `mcp-plate-solve` (never the store's apply
   thread). The plan ends `applied` with `report.runId = solve-<uuid>` and `plan_status` says `started a plate solve of N frames (run solve-...);
-  ask solve_status for its progress`, never that frames were solved; its report counts `started`, `skipped` and `could not start`. A batch the user
-  started in the window meanwhile (or a catalog removed) starts nothing: every selected item is a `failed` line with the busy text (`BUSY_UI`), and
-  the plan ends `failed` (`PlanApplier::start_failure`, the first failure's reason), so the window shows a failure and `plan_status` says
-  `Nothing was started: <reason>.`, never "Some files may have changed". Log: `info!(via = "mcp", plan_id, run_id, count, "plate solve run started from the assistant")`.
+  ask solve_status for its progress`, never that frames were solved; its report counts `started`, `skipped` and `could not start`. A batch already
+  running when Apply is pressed refuses the Apply itself (`PlateSolveApplier::ready`, a `Conflict` with the filled `BUSY_*` text) and the plan stays
+  `waiting`. A batch that takes the slot between `ready` and the start (or a catalog removed meanwhile) starts nothing: every selected item is a
+  `failed` line with the reason, and the plan ends `failed` (`PlanApplier::start_failure`, the first failure's reason), so the window shows a
+  failure and `plan_status` says `Nothing was started: <reason>.` once, never "Some files may have changed". Log: `info!(via = "mcp", plan_id, run_id, count, "plate solve run started from the assistant")`.
 - **`solve_status`** reads the handle's progress while the slot holds the run, and the snapshot the host keeps (`SolveRuns`, the last 20 runs) after.
   The snapshot counts from the run's own result: the solved and failed counts are the `plate-solve-complete` event's, never the progress events'
-  (a failed store or COMMIT sends no event, so `SolveProgress.solved` can overcount; a run that returns an error solved nothing). A failed frame is
+  (a failed store or COMMIT sends no event; a run that returns an error solved nothing; the handle's progress holds no solved count, so a running status never promises one). A failed frame is
   named with its file name and folder (the run's emitter records each failed frame), `failedWithoutFile` counts failures no event named, and
-  `notAttempted` is what a cancel left (`status_reports_progress_and_result`, `the_final_snapshot_counts_from_the_runs_own_result`).
+  `notAttempted` is what a cancel left (`status_reports_progress_and_result`, `the_final_snapshot_counts_from_the_runs_own_result`). A run whose
+  cancel flag was set when it ended, without `cancel_solve` having set it, was cancelled in Athenaeum's window: the status says `The run was cancelled
+  in Athenaeum; N frames were not attempted.` and carries `cancelledInApp` (`a_cancel_from_the_app_is_named_to_the_assistant`).
 - **`cancel_solve`** goes through `cancel_plate_solve_run` (check and set under the slot's lock) and only for a run in the host's own log, so
   the window's run is never touched whatever id is named (`cancel_solve_stops_only_its_run`).
+- **The window's events name their run.** `plate-solve-progress` and `plate-solve-complete` carry `run_id` (the `solve-<uuid>` that
+  `plate-solve-started` and the activity carry; snake_case like the rest of those payloads; `progress_and_complete_name_their_run`), and the
+  `cancel_plate_solve` command (both hosts) takes an optional `runId`: with one it is `cancel_plate_solve_run` (acts only while slot 0 holds that run,
+  `cancel_with_a_run_id_spares_another_run`), without it the old cancel of whatever holds the slot. The object autofind's events are unchanged.
 
 ## The plan window
 
