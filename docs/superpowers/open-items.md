@@ -364,9 +364,6 @@ copied into the MCP nor fixed by its plan; each is a small fix of its own. Delet
   exclusion. The MCP leaves Black Hole files out unless the scope asks for them.
 - **Its chips tag non-lights.** `computeMissingFlags` marks a dark, flat or bias "Coordinates" / "Object" when the
   file is listed for another gap. The MCP keeps the lights-only rule for those two.
-- **A frame set's integration may count Black Hole members.** The stored `total_exp_time` can include members that
-  `member_count` leaves out, so the page's figure can be too high. The MCP answers the stored figure and says when
-  Black Hole members are in it; fix the page's figure itself.
 - **The folder overview counts Black Hole rows.** `get_folder_overview` counts them per scan root; the MCP's storage
   figures report them apart.
 
