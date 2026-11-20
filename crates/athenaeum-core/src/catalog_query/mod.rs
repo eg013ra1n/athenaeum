@@ -18,7 +18,7 @@ mod summary_tests;
 mod tests;
 
 pub use calibration::{calibration_summary, CalibrationLine, FRAME_SETS_PAGE};
-pub use details::{file_details, FileDetails};
+pub use details::{file_details, CalibrationLink, FileDetails};
 pub use quality::{quality_summary, QualityMetric, QualitySummary, OUTLIERS_SHOWN};
 pub use storage::{storage_summary, StorageLine, StorageSummary};
 

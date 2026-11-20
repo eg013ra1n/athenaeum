@@ -45,12 +45,15 @@ fn sets_of_lights(ctx: &ServiceContext, frame_ids: &[i64]) -> Result<BTreeMap<i6
     let mut sets = BTreeMap::new();
     for chunk in frame_ids.chunks(ID_CHUNK) {
         let marks = vec!["?"; chunk.len()].join(", ");
+        // A copy the set does not use (a second copy of a frame it already holds) reaches no line below.
+        let used = crate::db::frame_is_used_copy_sql("fs.id");
         let sql = format!(
             "SELECT DISTINCT fs.id, fs.name FROM session_members sm \
              JOIN sessions ss ON ss.id = sm.session_id \
              JOIN imaging_nights n ON n.id = ss.imaging_night_id \
              JOIN frames_set fs ON fs.id = n.frames_set_id \
-             WHERE sm.frame_id IN ({marks})"
+             JOIN frames f ON f.id = sm.frame_id \
+             WHERE sm.frame_id IN ({marks}) AND {used}"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| {
             tracing::error!(error = %e, "calibration summary: frame set read failed");

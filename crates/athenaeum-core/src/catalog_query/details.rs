@@ -25,15 +25,33 @@ pub struct FileDetails {
     /// The stored header keywords and their values, by keyword.
     pub header: Vec<(String, String)>,
     pub analysis: Option<FrameAnalysis>,
+    /// The analysis row was written by the current measurement version; `false` when it is an older one (or when
+    /// there is no row).
+    pub analysis_current: bool,
     /// Transparency loss in magnitudes; `None` where it was not measured.
     pub transparency_loss: Option<f64>,
-    /// The linked calibration: (type, master file name, folder). A raw set that is not built into a master reads
-    /// `<n> raw frames, e.g. <file name>`.
-    pub calibration: Vec<(String, String, String)>,
+    /// Why there is no transparency loss, in the app's words (the action that cures it, or the app's own sentence);
+    /// `None` when there is a loss or the app states no reason.
+    pub transparency_reason: Option<String>,
+    /// The linked calibration, one file each.
+    pub calibration: Vec<CalibrationLink>,
     /// Other catalog files the duplicate groups name with this one.
     pub copies: Vec<FileLine>,
     /// A plate solve of Athenaeum's own is stored for the frame.
     pub solved: bool,
+}
+
+/// One calibration link of a file: the master file, or, for a raw set not built into a master, its first member (the
+/// file name then reads `<n> raw frames, e.g. <file name>`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationLink {
+    /// `Dark`, `Flat`, `Bias`, ...
+    pub kind: String,
+    /// `file:<id>`.
+    pub handle: String,
+    pub file_name: String,
+    pub folder: String,
 }
 
 fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
@@ -69,24 +87,24 @@ fn frames_of_files(conn: &Connection, file_ids: &[i64]) -> Result<Vec<ScopedFram
     fetch_scoped_frames(conn, &filter).map_err(|e| internal("the files", format!("{e:#}")))
 }
 
-/// Master file name and folder of a calibration set: its master file when it has one, else its first member.
-fn set_file(conn: &Connection, set_id: i64) -> Result<Option<(String, String)>, ApiError> {
+/// File id, file name and folder of a calibration set: its master file when it has one, else its first member.
+fn set_file(conn: &Connection, set_id: i64) -> Result<Option<(i64, String, String)>, ApiError> {
     let members: i64 = conn
         .query_row("SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1", [set_id], |r| r.get(0))
         .map_err(|e| internal("the calibration set", e))?;
-    let first: Option<(String, String, bool)> = conn
+    let first: Option<(i64, String, String, bool)> = conn
         .query_row(
-            "SELECT fi.filename, fi.path, fr.is_master FROM calibration_set_frames csf \
+            "SELECT fi.id, fi.filename, fi.path, fr.is_master FROM calibration_set_frames csf \
              JOIN frames fr ON fr.id = csf.frame_id JOIN files fi ON fi.id = fr.file_id \
              WHERE csf.set_id = ?1 ORDER BY fr.is_master DESC, fr.id LIMIT 1",
             [set_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)),
         )
         .optional()
         .map_err(|e| internal("the calibration set", e))?;
-    Ok(first.map(|(name, path, is_master)| {
+    Ok(first.map(|(id, name, path, is_master)| {
         let name = if is_master || members <= 1 { name } else { format!("{members} raw frames, e.g. {name}") };
-        (name, super::parent_of(&path))
+        (id, name, super::parent_of(&path))
     }))
 }
 
@@ -141,22 +159,33 @@ pub fn file_details(ctx: &ServiceContext, file: &str) -> Result<FileDetails, Api
         .map_err(|e| internal("the plate solve", e))?;
 
     #[cfg(all(feature = "render", feature = "solver"))]
-    let transparency_loss = {
+    let (transparency_loss, transparency_reason) = {
         let catalog = ctx.app_data_dir().and_then(|d| crate::analysis::transparency::installed_catalog_identity(&d));
-        crate::analysis::transparency::transparency_for_frames(&conn, catalog.as_deref(), &[frame_id])
-            .map_err(|e| internal("the transparency", e))?
-            .get(&frame_id)
-            .and_then(|t| t.loss_mag)
+        let found = crate::analysis::transparency::transparency_for_frames(&conn, catalog.as_deref(), &[frame_id])
+            .map_err(|e| internal("the transparency", e))?;
+        let t = found.get(&frame_id);
+        let loss = t.and_then(|t| t.loss_mag);
+        let reason = if loss.is_some() {
+            None
+        } else {
+            t.and_then(|t| t.reason.as_deref()).map(super::quality::transparency_reason_text)
+        };
+        (loss, reason)
     };
     #[cfg(not(all(feature = "render", feature = "solver")))]
-    let transparency_loss = None;
+    let (transparency_loss, transparency_reason) = (None, None);
+
+    #[cfg(feature = "render")]
+    let analysis_current = analysis.as_ref().is_some_and(|a| a.measure_version == Some(crate::star_measure::MEASURE_VERSION));
+    #[cfg(not(feature = "render"))]
+    let analysis_current = false;
 
     let mut calibration = Vec::new();
     for link in crate::db::calibration_links::get_links_for_frame(&conn, frame_id)
         .map_err(|e| internal("the calibration links", e))?
     {
-        if let Some((name, folder)) = set_file(&conn, link.calibration_set_id)? {
-            calibration.push((link.calibration_type, name, folder));
+        if let Some((id, file_name, folder)) = set_file(&conn, link.calibration_set_id)? {
+            calibration.push(CalibrationLink { kind: link.calibration_type, handle: format!("file:{id}"), file_name, folder });
         }
     }
 
@@ -169,7 +198,9 @@ pub fn file_details(ctx: &ServiceContext, file: &str) -> Result<FileDetails, Api
         modified_at: stored.modified_at.format("%Y-%m-%d %H:%M:%S").to_string(),
         header,
         analysis,
+        analysis_current,
         transparency_loss,
+        transparency_reason,
         calibration,
         copies,
         solved,

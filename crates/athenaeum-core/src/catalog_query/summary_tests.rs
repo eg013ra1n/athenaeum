@@ -26,11 +26,16 @@ fn dir_text() -> &'static str {
 
 fn file_in(conn: &Connection, dir: &str, name: &str, size: i64) -> i64 {
     let sep = std::path::MAIN_SEPARATOR;
+    file_at(conn, &format!("{dir}{sep}{name}"), name, size)
+}
+
+/// A file whose catalog path is the literal text `path` (a `/`-rooted spelling stays as written on every platform).
+fn file_at(conn: &Connection, path: &str, name: &str, size: i64) -> i64 {
     db::insert_file(
         conn,
         &crate::models::File {
             id: None,
-            path: format!("{dir}{sep}{name}"),
+            path: path.to_string(),
             filename: name.to_string(),
             size,
             modified_at: chrono::Utc::now(),
@@ -203,6 +208,22 @@ fn quality_outliers_named_by_file() {
 
 #[cfg(feature = "render")]
 #[test]
+fn quality_outliers_are_worst_first() {
+    let conn = catalog();
+    // Two high outliers, the larger one added after the smaller; two low ones, the smaller one first.
+    let values = [2.0, 2.1, 2.0, 2.2, 2.1, 2.0, 2.1, 6.0, 9.0, 2.0];
+    for (i, fwhm) in values.into_iter().enumerate() {
+        let (file, frame) = light(&conn, &format!("w{i}.fits"));
+        analyse(&conn, frame, file, Some(current()), fwhm, None);
+    }
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, None, &frames, QualityMetric::Fwhm).expect("summary");
+    let high: Vec<(&str, f64)> = q.high_outliers.iter().map(|(l, x)| (l.file_name.as_str(), *x)).collect();
+    assert_eq!(high, vec![("w8.fits", 9.0), ("w7.fits", 6.0)], "the furthest from the median comes first");
+}
+
+#[cfg(feature = "render")]
+#[test]
 fn quality_over_forty_thousand_frames_chunks_its_ids() {
     let conn = catalog();
     let tx = conn.unchecked_transaction().expect("tx");
@@ -235,7 +256,6 @@ fn not_measured_names_the_app_action() {
         QualityMetric::FrameSnr,
         QualityMetric::Background,
         QualityMetric::Noise,
-        QualityMetric::QualityScore,
         QualityMetric::TransparencyLoss,
     ] {
         let q = quality_summary(&conn, None, &frames, metric).expect("summary");
@@ -246,6 +266,55 @@ fn not_measured_names_the_app_action() {
             assert!(reason.contains("plate-solve these frames in Athenaeum, then run Analysis"), "{reason}");
         }
     }
+}
+
+/// Marks a stored analysis as plate-solved (a minimal solve row) and sets its zero-point columns.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn solved_with(conn: &Connection, frame: i64, zp_version: Option<i64>, zp_catalog: Option<&str>, zp_refusal: Option<&str>) {
+    conn.execute(
+        "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2, matched_stars, \
+         total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec, field_rotation_deg, solve_time_ms, \
+         catalog_used, algorithm_used, solved_at) \
+         VALUES (?1, 1, 1, 10, 10, 0.001, 0, 0, 0.001, 50, 60, 0.3, 0.5, 1.0, 0, 10, 'c', 'a', '2026-03-01T23:00:00Z')",
+        [frame],
+    )
+    .expect("solve");
+    conn.execute(
+        "UPDATE frame_analysis SET zp_version = ?2, zp_catalog = ?3, zp_refusal = ?4 WHERE frame_id = ?1",
+        params![frame, zp_version, zp_catalog, zp_refusal],
+    )
+    .expect("zero point columns");
+}
+
+#[cfg(all(feature = "render", feature = "solver"))]
+#[test]
+fn transparency_reason_is_the_apps_own() {
+    // One reason a solve and an Analysis cure, one the app words itself, and a failed measurement.
+    let conn = catalog();
+    let (file, unsolved) = light(&conn, "unsolved.fits");
+    analyse(&conn, unsolved, file, Some(current()), 2.0, None);
+    let (file, failed) = light(&conn, "failed.fits");
+    analyse(&conn, failed, file, Some(current()), 2.0, None);
+    solved_with(&conn, failed, Some(i64::from(crate::analysis::zero_point::ZP_VERSION)), Some("cat"), Some("internal"));
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, Some("cat"), &frames, QualityMetric::TransparencyLoss).expect("summary");
+    assert_eq!((q.measured, q.not_measured), (0, 1), "{q:#?}");
+    assert_eq!(q.refused, vec![("measurement failed".to_string(), 1)], "a failed measurement is a refusal");
+    let reason = q.not_measured_reason.expect("one frame is missing");
+    assert!(reason.contains("plate-solve these frames in Athenaeum, then run Analysis"), "{reason}");
+    assert!(!reason.contains("failed"), "{reason}");
+
+    // No catalogue installed: the app's own sentence, with no action the user cannot take.
+    let conn = catalog();
+    let (file, solved) = light(&conn, "solved.fits");
+    analyse(&conn, solved, file, Some(current()), 2.0, None);
+    solved_with(&conn, solved, None, None, None);
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, None, &frames, QualityMetric::TransparencyLoss).expect("summary");
+    assert_eq!((q.measured, q.not_measured), (0, 1), "{q:#?}");
+    let reason = q.not_measured_reason.expect("one frame is missing");
+    assert!(reason.contains("the star catalogue is not installed — install it to measure transparency"), "{reason}");
+    assert!(!reason.contains("plate-solve"), "{reason}");
 }
 
 #[test]
@@ -343,6 +412,41 @@ mod calibration_lines {
         }
     }
 
+    /// A set that holds two copies of one frame counts for the copy the set uses, never for the other.
+    #[test]
+    fn a_set_reached_only_through_an_unused_copy_is_not_counted() {
+        let (_tmp, ctx) = ctx();
+        let (first, second) = {
+            let db = ctx.db.get().expect("db");
+            let conn = db.conn();
+            let mut frames = Vec::new();
+            for folder in ["a", "b"] {
+                let file = file_in(&conn, &format!("{}{folder}", dir_text()), "dup.fits", 100);
+                conn.execute(
+                    "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'HDR', ?2)",
+                    params![file, crate::fingerprint::compute_header_fingerprint("HDR")],
+                )
+                .expect("header");
+                frames.push(frame_on(&conn, file, ImageType::Light, false));
+            }
+            frame_set(&conn, "Copies", &frames);
+            (frames[0], frames[1])
+        };
+        let frames = {
+            let db = ctx.db.get().expect("db");
+            let conn = db.conn();
+            scoped(&conn, &Scope::default())
+        };
+        let only = |frame: i64| -> Vec<ScopedFrame> {
+            frames.iter().filter(|f| f.file.frame.as_ref().and_then(|x| x.id) == Some(frame)).cloned().collect()
+        };
+        // The copy with the lower id is the one the set uses.
+        let (_, used_total) = calibration_summary(&ctx, &only(first), 0).expect("used copy");
+        assert_eq!(used_total, 1);
+        let (lines, unused_total) = calibration_summary(&ctx, &only(second), 0).expect("unused copy");
+        assert_eq!((lines.len(), unused_total), (0, 0), "a count with no line to show");
+    }
+
     #[test]
     fn calibration_reason_only_where_the_app_states_one() {
         let (tmp, ctx) = ctx();
@@ -432,6 +536,9 @@ mod details {
         assert_eq!(by_handle.line.state, FrameState::Catalog);
         assert_eq!(by_handle.modified_at.len(), "2024-10-05 22:00:00".len());
         assert!(by_handle.analysis.is_none() && !by_handle.solved && by_handle.transparency_loss.is_none());
+        assert!(!by_handle.analysis_current, "no analysis row is no current analysis");
+        #[cfg(all(feature = "render", feature = "solver"))]
+        assert_eq!(by_handle.transparency_reason.as_deref(), Some("not analysed yet"));
         assert!(by_handle.calibration.is_empty() && by_handle.copies.is_empty());
         let keys: Vec<&str> = by_handle.header.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"EXPTIME") && keys.contains(&"FILTER"), "{keys:?}");
@@ -469,7 +576,7 @@ mod details {
                 ids.push(id);
             }
             // A built master dark linked to the first frame.
-            let master_file = file_in(&conn, "/vol/masters", "master_dark.fits", 5);
+            let master_file = file_at(&conn, "/vol/masters/master_dark.fits", "master_dark.fits", 5);
             let master_frame = frame_on(&conn, master_file, ImageType::MasterDark, true);
             conn.execute(
                 "INSERT INTO calibration_set (imagetyp, date, is_master_library) VALUES ('MasterDark', '2024-10-05', 1)",
@@ -491,6 +598,17 @@ mod details {
         assert_eq!(d.copies[0].handle, format!("file:{b}"));
         assert_eq!(d.copies[0].file_name, "f.fits");
         assert_eq!(d.copies[0].folder, "/vol/b");
-        assert_eq!(d.calibration, vec![("Dark".to_string(), "master_dark.fits".to_string(), "/vol/masters".to_string())]);
+        assert_eq!(d.calibration.len(), 1, "{:#?}", d.calibration);
+        assert_eq!(d.calibration[0].kind, "Dark");
+        assert_eq!(d.calibration[0].file_name, "master_dark.fits");
+        assert_eq!(d.calibration[0].folder, "/vol/masters");
+        let master_id: i64 = {
+            let db = ctx.db.get().expect("db");
+            let conn = db.conn();
+            conn.query_row("SELECT id FROM files WHERE filename = 'master_dark.fits'", [], |r| r.get(0)).expect("id")
+        };
+        assert_eq!(d.calibration[0].handle, format!("file:{master_id}"));
+        let value = serde_json::to_value(&d.calibration[0]).expect("json");
+        assert!(value.get("fileName").is_some() && value.get("handle").is_some(), "{value}");
     }
 }

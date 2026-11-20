@@ -30,6 +30,24 @@ const OUTLIER_SIGMAS: f64 = 3.0;
 const RUN_ANALYSIS: &str = "run Analysis on these frames in Athenaeum";
 const SOLVE_THEN_ANALYSE: &str = "plate-solve these frames in Athenaeum, then run Analysis";
 
+/// What the app says to a user of a frame with no transparency loss. A reason a plate solve or an Analysis cures (not
+/// solved, not measured yet, the analysis differs from the solve) reads as that action; any other sentence (no star
+/// catalogue, no reference yet, a colour camera, a failed measurement, ...) is the app's own, unchanged.
+#[cfg(feature = "solver")]
+pub(super) fn transparency_reason_text(sentence: &str) -> String {
+    use crate::analysis::transparency::LossReason;
+    let cured = [LossReason::NotSolved, LossReason::NotMeasured, LossReason::AnalysisDiffers];
+    if cured.iter().any(|r| r.sentence() == sentence) {
+        SOLVE_THEN_ANALYSE.to_string()
+    } else {
+        sentence.to_string()
+    }
+}
+
+/// The label a failed transparency measurement is counted under in `refused`.
+#[cfg(feature = "solver")]
+const MEASUREMENT_FAILED: &str = "measurement failed";
+
 /// A stored measurement a question can ask about (a tool argument).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -43,7 +61,6 @@ pub enum QualityMetric {
     FrameSnr,
     Background,
     Noise,
-    QualityScore,
     TransparencyLoss,
 }
 
@@ -88,7 +105,6 @@ fn value_of(metric: QualityMetric, a: &FrameAnalysis) -> Option<f64> {
         QualityMetric::FrameSnr => Some(a.frame_snr),
         QualityMetric::Background => Some(a.background),
         QualityMetric::Noise => Some(a.noise),
-        QualityMetric::QualityScore => a.quality_score,
         // Read from the transparency table, not from the analysis row.
         QualityMetric::TransparencyLoss => None,
     };
@@ -206,7 +222,7 @@ fn summarise(
     let mut not_measured = 0usize;
     let mut older_version = 0usize;
     let mut refused: HashMap<&'static str, usize> = HashMap::new();
-    // The app's own sentence for a frame that has no transparency loss, counted.
+    // The app's own sentence for a frame whose missing transparency loss no action cures, counted.
     #[cfg_attr(not(feature = "solver"), allow(unused_mut))]
     let mut why: HashMap<String, usize> = HashMap::new();
 
@@ -229,7 +245,19 @@ fn summarise(
             let loss = t.and_then(|t| t.loss_mag).filter(|x| x.is_finite());
             if loss.is_none() {
                 if let Some(sentence) = t.and_then(|t| t.reason.clone()) {
-                    *why.entry(sentence).or_default() += 1;
+                    // A failed measurement is a refusal of the frame, not something an action updates.
+                    if sentence == crate::analysis::transparency::LossReason::Refused(
+                        crate::analysis::transparency::Refusal::MeasurementFailed,
+                    )
+                    .sentence()
+                    {
+                        *refused.entry(MEASUREMENT_FAILED).or_default() += 1;
+                        continue;
+                    }
+                    let text = transparency_reason_text(&sentence);
+                    if text != SOLVE_THEN_ANALYSE {
+                        *why.entry(text).or_default() += 1;
+                    }
                 }
             }
             loss
@@ -246,15 +274,20 @@ fn summarise(
 
     let mut parts: Vec<String> = Vec::new();
     if not_measured > 0 {
-        let action = if metric == QualityMetric::TransparencyLoss { SOLVE_THEN_ANALYSE } else { RUN_ANALYSIS };
-        let mut part = format!("{not_measured} not measured — {action}");
-        if !why.is_empty() {
+        if metric == QualityMetric::TransparencyLoss {
+            // The action only for the frames it cures; every other frame reads the app's own sentence.
+            let own: usize = why.values().sum();
+            let mut pieces: Vec<String> = Vec::new();
+            if not_measured > own {
+                pieces.push(format!("{} not measured — {SOLVE_THEN_ANALYSE}", not_measured - own));
+            }
             let mut reasons: Vec<(String, usize)> = why.into_iter().collect();
             reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let listed: Vec<String> = reasons.iter().map(|(s, n)| format!("{n} {s}")).collect();
-            part.push_str(&format!(" ({})", listed.join("; ")));
+            pieces.extend(reasons.iter().map(|(s, n)| format!("{n} not measured — {s}")));
+            parts.push(pieces.join("; "));
+        } else {
+            parts.push(format!("{not_measured} not measured — {RUN_ANALYSIS}"));
         }
-        parts.push(part);
     }
     if older_version > 0 {
         parts.push(format!("{older_version} measured by an earlier version — run Analysis again"));
