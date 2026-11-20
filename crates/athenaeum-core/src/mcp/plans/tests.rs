@@ -604,6 +604,14 @@ async fn events_and_front() {
     assert!(rig.events.0.lock().unwrap().iter().all(|(n, _)| n == "mcp-plan-updated"));
 }
 
+/// tracing-core shortcuts interest to the registering thread's default while only ONE dispatcher exists: a parallel
+/// test's thread (logging to none) could then reach a line first and mark it never logged, process-wide. Every test
+/// that installs its own subscriber calls this before `set_default`.
+fn second_dispatcher() {
+    static SECOND_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND_DISPATCH.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 /// A scoped log capture: the lines of everything logged on this thread (and the apply thread, which inherits the
 /// caller's dispatcher).
 fn capture() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
@@ -624,9 +632,7 @@ fn capture() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
             self.clone()
         }
     }
-    // tracing-core shortcuts interest to the registering thread's default while only ONE dispatcher exists.
-    static SECOND_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    SECOND_DISPATCH.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    second_dispatcher();
     let buf = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .with_writer(Buf(Arc::clone(&buf)))
@@ -798,6 +804,7 @@ async fn a_panic_outside_the_applier_still_ends_the_plan() {
     let fx = fixture(&rig);
     let applier = TestApplier::default();
     let id = waiting(&rig, &fx, &applier);
+    second_dispatcher();
     let guard = tracing::subscriber::set_default(
         tracing_subscriber::fmt().with_writer(Boom).with_max_level(tracing::Level::DEBUG).with_ansi(false).finish(),
     );
