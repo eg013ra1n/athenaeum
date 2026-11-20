@@ -55,7 +55,7 @@ value, a default or render code. Two consumers read it: the search index
 
 | Tab | Section ids (`SETTINGS_SECTIONS`) |
 | ---- | ---- |
-| General | `general.updates` `general.grouping` `general.sessions` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.compute` `general.dataLocations` `general.logging` |
+| General | `general.updates` `general.grouping` `general.sessions` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.compute` `general.dataLocations` `general.assistantAccess` `general.logging` |
 | Blink | `blink.viewer` `blink.flatContour` `blink.annotations` |
 | Analysis | `analysis.detection` `analysis.measurement` `analysis.batch` `analysis.rejection` |
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
@@ -77,6 +77,16 @@ the generic `get_setting` and written through its own command, `set_compute_max_
 live queue (`ComputeQueue::set_max_concurrent`), so a change applies at once; the generic `set_setting` would store
 the value and leave the running queue as it was. The range is the one `api::compute::validate_max_concurrent`
 enforces. Running jobs share the memory budgets (`integration.band_budget_mb` is divided by this value).
+
+`general.assistantAccess` (MCP v1, T9) is "Assistant access (MCP)", off by default (`AssistantAccessSection`). Its one
+field, `enabled`, is a `SettingToggle` on the KV key `mcp.enabled` with a `read` and a `write` override: the read is
+`get_mcp_status`, the write `set_mcp_enabled { enabled }` (both hosts), never `set_setting`, which refuses the key. Both
+return an `McpStatus` the section keeps and renders: on the desktop the bridge path (a path containing
+`/AppTranslocation/` gets the Move-to-Applications warning), the client configuration and the Claude Code command, each
+with a copy button; on the web the endpoint `${window.location.origin}/mcp`, the key and the config. A web server without
+`ATHENAEUM_API_KEY` reports `blockedReason`: the toggle is disabled and the section says why. `regenerate` is a button
+(`regenerate_mcp_token`), not a setting. A failed command raises one `notify()` warning with `dedupeKey: 'mcp-settings'`
+(the write handles it, so the toggle's own notification does not fire twice) and the toggle re-reads the real state.
 
 `stacking.compute` (Task 13c) is one KV number, `compute.memory_budget_mb` ("Frame memory budget (MB)",
 `StackingComputeSection`, `SettingNumber` with `intCodec(0, 1048576)`, generic `get_setting` / `set_setting`, default

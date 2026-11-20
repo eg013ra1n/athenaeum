@@ -22,6 +22,7 @@ import { ToolbarContainer, ToolbarButton, ToolbarDivider, ToolbarInfo } from '..
 import { useNotifications } from '../contexts/NotificationContext';
 import { useSessionState } from '../contexts/SessionStateContext';
 import { HistoryNav } from '../components/HistoryNav';
+import { frameSetTab } from './objectsTabs';
 
 export default function Objects() {
   const navigate = useNavigate();
@@ -738,9 +739,9 @@ export default function Objects() {
 
   // Tab counts for badges
   const tabCounts = useMemo(() => ({
-    stage: frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length,
-    wip: frameSets.filter(fs => fs.frames_set.is_custom && !fs.frames_set.is_archived).length,
-    archive: frameSets.filter(fs => fs.frames_set.is_archived).length,
+    stage: frameSets.filter(fs => frameSetTab(fs) === 'stage').length,
+    wip: frameSets.filter(fs => frameSetTab(fs) === 'wip').length,
+    archive: frameSets.filter(fs => frameSetTab(fs) === 'archive').length,
   }), [frameSets]);
 
   const activeFilterCount = countActiveFilters(filters);
