@@ -366,6 +366,12 @@ copied into the MCP nor fixed by its plan; each is a small fix of its own. Delet
   file is listed for another gap. The MCP keeps the lights-only rule for those two.
 - **The folder overview counts Black Hole rows.** `get_folder_overview` counts them per scan root; the MCP's storage
   figures report them apart.
+- **Set Frame Type may demote a master (found by the MCP v1 review, from the code, not run).** `SetFrameTypeModal.tsx`
+  sends MASTERDARK as `{imagetyp: 'DARK', isMaster: true}`, but `bulk_update_frame_metadata` derives `is_master` from
+  the type text (`db/operations.rs` ~1855), so the frame may be written `is_master = 0`. Send the `Master*` type text
+  (the MCP's metadata plan does), and test it.
+- **Autofind (slot key 1) has no guard against a second run.** A second object autofind replaces the first's handle;
+  the batch slot (key 0) refuses a second batch since MCP v1.
 
 ## Standing decisions — do not re-flag these
 
@@ -409,9 +415,9 @@ review; what is missing is a human running the flow on real data.
 ### Assistant access (MCP) M1 — catalog questions (2026-11-20)
 
 Branch `mcp/m1-host`, merged to local `main` (spec `docs/superpowers/specs/2026-10-27-athenaeum-mcp-design.md`, plan
-`docs/superpowers/plans/2026-11-19-athenaeum-mcp-v1-plan.md` Tasks 1-10). Reference: `docs/mcp/README.md`. Evidence:
-the ledger `.superpowers/sdd/2026-11-19-mcp-v1/` and the headless smoke on a copy of the dev catalog (40 535 frames,
-82 sets: 11 of 11 cases equal the app, nothing changed; `m1-smoke-report.md` there). Owed by hand, in Claude desktop and
+`docs/superpowers/plans/2026-11-19-athenaeum-mcp-v1-plan.md` Tasks 1-10). Reference: `docs/mcp/README.md` (its last section keeps the build's
+rulings and deferred items; the ledger was deleted at the plan's close). Evidence: the headless smoke on a copy of the
+dev catalog (40 535 frames, 82 sets: 11 of 11 cases equal the app, nothing changed). Owed by hand, in Claude desktop and
 Claude Code against `npm run tauri dev` (dev catalog) and the installed release:
 - **S1 off, and client before app.** Access off in both builds: every question answers the off sentence only. Then
   quit Athenaeum, start Claude desktop first: the real tools are listed, a call answers "not running"; start
@@ -439,9 +445,8 @@ page hides it).
 
 ### Assistant access (MCP) M2 — plans the user applies (2026-11-20)
 
-Branch `mcp/m2-plans`, merged to local `main` (plan Tasks 11-15). Reference: `docs/mcp/README.md`. Evidence: the ledger
-`.superpowers/sdd/2026-11-19-mcp-v1/` and the headless smoke on a copy of the dev catalog with real duplicates made on
-disk (`m2-smoke-report.md` there: a Black Hole plan answered at once, a damaged copy locked "differs in bytes", Apply
+Branch `mcp/m2-plans`, merged to local `main` (plan Tasks 11-15). Reference: `docs/mcp/README.md`. Evidence: the headless
+smoke on a copy of the dev catalog with real duplicates made on disk (a Black Hole plan answered at once, a damaged copy locked "differs in bytes", Apply
 moved exactly the ticked rows, every file's shasum unchanged). The window itself was never seen in a browser (the
 extension was not connected): owed by hand, in Claude desktop and Claude Code against `npm run tauri dev` and the
 installed release:
@@ -462,6 +467,30 @@ Told, not fixed: planning banks each verified pair's full-file hash (`files.stro
 Duplicates page's verify does; a master moved to the Black Hole leaves the master library (the app's own
 unregister; only unlinked masters reach a plan's ticks); a web server restarted during an apply leaves that tab
 showing "applying" until it is reloaded.
+
+### Assistant access (MCP) M3 — metadata and plate solving (2026-11-21)
+
+Branch `mcp/m3-fill-solve`, merged to local `main` (plan Tasks 16-19). Reference: `docs/mcp/README.md`. Evidence: the
+headless smoke on a copy of the dev catalog: a frame-type fill applied 5 of 6 frames, exactly those changed with
+`override = 1`; 5 real M 8 frames solved through the assistant, only they got coordinates; an Apply while a UI batch
+held the slot was refused and the plan kept waiting. The plan window and the plate-solve panel were never seen in a
+browser. Owed by hand, in Claude desktop and Claude Code against `npm run tauri dev` and the installed release:
+- **S9 fill by inference and by instruction.** Fill a frame type from a `Flats` folder and an object from agreeing
+  neighbours; then "these are M 31" on a few lights ("by your instruction" shown). Rescan: the values stay. A date
+  without a time is refused.
+- **S10 plate solve both ways.** The same frames solved from the assistant and from the UI agree. While the assistant's
+  run goes, the plate-solve panel shows it with Cancel, and the UI's own batch waits ("Plate solve not started" once
+  per wait). The assistant cannot plan or start while a UI batch runs, and Apply then keeps the plan waiting.
+- **S12 writes logged.** `list_operations(kind = "mcp_plan_apply")` lists the metadata and solve applies with their
+  `plan_id`.
+- **S13 fill side.** A metadata plan scoped to one camera and one year proposes only frames the Missing Metadata view
+  lists for that scope (non-Black-Hole rows).
+Told, not fixed:
+- A solve also names a frame's missing object from its field, as a UI solve does; the plan says so. On the smoke, M 8
+  frames became "RCW 145" while their folder says "M 8".
+- A metadata plan locks frames on an unmounted volume, although only the catalog changes.
+- In the sub-second window while the queue's start command is in flight, a Cancel can reach another run.
+- A batch cancelled during that window and then refused stays "Cancelling…" until reload.
 
 ### Forced-list zero point (2026-11-16)
 
