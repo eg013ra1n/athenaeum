@@ -414,7 +414,7 @@ the ledger `.superpowers/sdd/2026-11-19-mcp-v1/` and the headless smoke on a cop
 82 sets: 11 of 11 cases equal the app, nothing changed; `m1-smoke-report.md` there). Owed by hand, in Claude desktop and
 Claude Code against `npm run tauri dev` (dev catalog) and the installed release:
 - **S1 off, and client before app.** Access off in both builds: every question answers the off sentence only. Then
-  quit Athenaeum, start Claude desktop first: the real five tools are listed, a call answers "not running"; start
+  quit Athenaeum, start Claude desktop first: the real tools are listed, a call answers "not running"; start
   Athenaeum: the next call answers.
 - **S2 duplicates.** `find_duplicates` over the whole catalog equals the Duplicates page, with the content setting
   off and on.
@@ -436,6 +436,32 @@ Claude Code against `npm run tauri dev` (dev catalog) and the installed release:
 Told, not fixed: a whole-catalog calibration question takes ~40 s cold (~4 s warm) — the app's own per-set readiness
 for one page of 25 sets; the web `get_mcp_status` still returns the key after access is off (behind the API key; the
 page hides it).
+
+### Assistant access (MCP) M2 — plans the user applies (2026-11-20)
+
+Branch `mcp/m2-plans`, merged to local `main` (plan Tasks 11-15). Reference: `docs/mcp/README.md`. Evidence: the ledger
+`.superpowers/sdd/2026-11-19-mcp-v1/` and the headless smoke on a copy of the dev catalog with real duplicates made on
+disk (`m2-smoke-report.md` there: a Black Hole plan answered at once, a damaged copy locked "differs in bytes", Apply
+moved exactly the ticked rows, every file's shasum unchanged). The window itself was never seen in a browser (the
+extension was not connected): owed by hand, in Claude desktop and Claude Code against `npm run tauri dev` and the
+installed release:
+- **S3 Black Hole plan.** Ask for a plan over real duplicates with "keep the copies in <folder>": the window opens by
+  itself and the app comes to the front; no button has focus; Apply arms after a second; untick → the totals drop;
+  Cancel changes nothing; Apply moves exactly the ticked files (Black Hole tab), restore works, file views refresh. A
+  scrim click does nothing; Escape cancels; while applying the window can be hidden and the report reopens it.
+- **S4 the model cannot apply.** "Apply it yourself" fails in words; `plan_status` says waiting until the click.
+- **S5 web, no page.** Docker without `ATHENAEUM_API_KEY`: the toggle is off with the why. With it: no tab open → the
+  answer says "open Athenaeum"; a tab shows the waiting plan; a replaced plan stays on screen as replaced; an expired
+  plan offers no Apply.
+- **S6 another connection.** Claude desktop asks `plan_status` after a plan and gets it (it opens two connections).
+- **S7 changed on disk.** Touch a planned file between plan and Apply → that item skipped, with its reason.
+- **S8 rebuilt copies.** `/Volumes/bigbase3/Calibration` → 108 masters, 81 distinct, 27 extra (ATR2600M 12,
+  ZWO_ASI2600MC_Duo 9, ZWO_ASI6200MM_Pro 6); no linked copy is ever ticked.
+- **S12 writes logged.** `list_operations(kind = "mcp_plan_apply")` lists each apply with its `plan_id`.
+Told, not fixed: planning banks each verified pair's full-file hash (`files.strong_hash`, `updated_at`), as the
+Duplicates page's verify does; a master moved to the Black Hole leaves the master library (the app's own
+unregister; only unlinked masters reach a plan's ticks); a web server restarted during an apply leaves that tab
+showing "applying" until it is reloaded.
 
 ### Forced-list zero point (2026-11-16)
 
