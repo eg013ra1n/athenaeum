@@ -143,8 +143,11 @@ impl McpHost {
         (self.has_viewer)()
     }
 
-    /// The one read-only catalog connection (R11). Questions hold the guard for the length of one question; a
-    /// write through it fails, so no question can change the catalog.
+    /// The one read-only catalog connection (R11); a write through it fails, so no question can change the catalog.
+    ///
+    /// Hold the guard only for the reads that use it: do every reader read first, `drop` the guard, then call
+    /// anything that takes the context (`host.ctx()`), which checks out pool connections and can wait. A guard held
+    /// across such a call blocks every other question for as long as that call takes.
     pub fn reader(&self) -> Result<MutexGuard<'_, Connection>, ApiError> {
         let reader = self.reader.get().ok_or_else(starting)?;
         // A panic in an earlier question leaves a read-only connection as it was.

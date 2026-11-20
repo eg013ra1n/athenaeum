@@ -93,7 +93,9 @@ struct Rig {
     host: Arc<McpHost>,
     ctx: Arc<ServiceContext>,
     base: PathBuf,
-    // Fields drop in declaration order: the pool and the reader holding `catalog.db` open go before its folder.
+    // Fields drop in declaration order, so the host (the reader) and the context (the pool) holding `catalog.db` open go
+    // before its folder. That holds only once every served connection is closed: a spawned server keeps its own
+    // `Arc<McpHost>`, so each test ends with `Peer::close` on every connection before the rig drops.
     _tmp: tempfile::TempDir,
 }
 
@@ -154,17 +156,44 @@ fn rig(open: bool) -> Rig {
 
 type Client = RunningService<RoleClient, ()>;
 
-async fn connect(host: &Arc<McpHost>, mode: ClientLifecycleMode) -> Client {
+/// A client and the task that serves it. The task owns an `Arc<McpHost>` (reader and pool), so a test that lets the
+/// rig drop first leaves `catalog.db` open under its temp dir (a failed delete on Windows): close every peer first.
+struct Peer {
+    client: Client,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl std::ops::Deref for Peer {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+impl Peer {
+    /// Cancel the client, then wait until the server task has ended and dropped its host.
+    async fn close(self) {
+        let Peer { client, server } = self;
+        let _ = client.cancel().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the server ends once its client is gone")
+            .expect("the server task");
+    }
+}
+
+async fn connect(host: &Arc<McpHost>, mode: ClientLifecycleMode) -> Peer {
     let (server_end, client_end) = tokio::io::duplex(1 << 20);
     let server = host.server();
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         let running = rmcp::serve_server(server, server_end).await.expect("the server starts");
         let _ = running.waiting().await;
     });
-    rmcp::serve_client_with_lifecycle((), client_end, mode).await.expect("the client connects")
+    let client = rmcp::serve_client_with_lifecycle((), client_end, mode).await.expect("the client connects");
+    Peer { client, server }
 }
 
-async fn legacy(host: &Arc<McpHost>) -> Client {
+async fn legacy(host: &Arc<McpHost>) -> Peer {
     connect(host, ClientLifecycleMode::Initialize).await
 }
 
@@ -216,7 +245,7 @@ async fn both_revisions_list_the_same_tools() {
         let mut names: Vec<String> = client.list_all_tools().await.expect("tools").into_iter().map(|t| t.name.to_string()).collect();
         names.sort();
         seen.push(names);
-        let _ = client.cancel().await;
+        client.close().await;
     }
     assert_eq!(seen[0], TOOLS.map(String::from).to_vec());
     assert_eq!(seen[0], seen[1], "both protocol revisions list the same tools");
@@ -233,6 +262,7 @@ async fn the_server_introduces_itself() {
     assert_eq!(server.version, "9.9.9-test");
     assert_eq!(info.instructions.as_deref(), Some(INSTRUCTIONS));
     assert!(info.capabilities.tools.is_some());
+    client.close().await;
 }
 
 #[tokio::test]
@@ -253,6 +283,7 @@ async fn every_answer_names_its_build_and_catalog() {
         assert_eq!(data["source"]["build"], "athenaeum-dev");
         assert_eq!(data["source"]["version"], "9.9.9-test");
     }
+    client.close().await;
 }
 
 #[tokio::test]
@@ -267,6 +298,11 @@ async fn both_halves_read_on_their_own() {
         let folder = text(&rig.base.join("nas").join(dir));
         assert!(said.contains(&format!("flat1.fits in {folder}")), "{said}");
     }
+    // The scan root a copy sits under is in the text, not only in `scanRoot`.
+    let root = text(&rig.base.join("nas"));
+    assert_eq!(said.matches(&format!("under {root}")).count(), 2, "each copy names its scan root: {said}");
+    assert!(!said.contains("scan root kind"), "a normal root names no kind: {said}");
+    assert_eq!(data_of(&dups)["groups"][0]["copies"][0]["scanRoot"], root.as_str());
     let data = data_of(&dups);
     assert_eq!(data["groupsInScope"], 1);
     assert_eq!(data["groups"][0]["copies"].as_array().expect("copies").len(), 2);
@@ -289,6 +325,7 @@ async fn both_halves_read_on_their_own() {
     assert_eq!(details.is_error, Some(false), "{}", text_of(&details));
     assert_handles_are_named(&data_of(&details), "file_details");
     assert!(text_of(&details).contains("h0.fits in "), "{}", text_of(&details));
+    client.close().await;
 }
 
 fn digest(conn: &Connection) -> String {
@@ -345,6 +382,7 @@ async fn questions_change_nothing() {
             assert_eq!(digest_now(), before, "{tool} changed the catalog");
         }
     }
+    client.close().await;
 }
 
 #[tokio::test]
@@ -388,6 +426,7 @@ async fn path_arguments_are_looked_up_not_opened() {
     assert_eq!(data_of(&r)["totals"]["frames"], 0);
 
     assert!(!rig.base.join("outside").exists(), "a path the assistant gave was touched");
+    client.close().await;
 }
 
 #[tokio::test]
@@ -406,6 +445,7 @@ async fn scope_that_matches_nothing_names_nearest_values() {
 
     let r = ask(&client, "find_duplicates", json!({ "scope": { "filter": "Ha" } })).await;
     assert!(text_of(&r).contains("no filter 'Ha'") && text_of(&r).contains("'H'"), "{}", text_of(&r));
+    client.close().await;
 }
 
 #[tokio::test]
@@ -438,6 +478,7 @@ async fn a_failure_is_an_error_result_in_words() {
     let r = ask(&client, "file_details", json!({ "file": "file:9999999" })).await;
     assert_eq!(r.is_error, Some(true));
     assert!(text_of(&r).contains("no file file:9999999 in the catalog"), "{}", text_of(&r));
+    client.close().await;
 }
 
 #[tokio::test]
@@ -456,6 +497,8 @@ async fn two_connections_share_one_host() {
     // Reading never blocks the catalog's writers.
     let database = rig.ctx.db.get().expect("db");
     db::set_setting(&database.conn(), "test.while-open", "ok").expect("write beside the readers");
+    a.close().await;
+    b.close().await;
 }
 
 #[tokio::test]
@@ -509,6 +552,7 @@ async fn frame_set_question_equals_its_page() {
     let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": "IC 5146 set" } })).await;
     assert!(text_of(&r).contains("2 frames of this set are in the Black Hole and not counted (10 min)."), "{}", text_of(&r));
     assert!(text_of(&r).contains("5 frames, integration 25 min."), "{}", text_of(&r));
+    client.close().await;
 }
 
 #[tokio::test]
@@ -523,4 +567,65 @@ async fn the_default_state_says_what_it_leaves_out() {
     let r = ask(&client, "query_frames", json!({ "scope": { "object": "IC 5146", "state": ["black_hole"] } })).await;
     assert!(!text_of(&r).contains("left out"), "{}", text_of(&r));
     assert_eq!(data_of(&r)["totals"]["frames"], 1);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_slow_app_call_does_not_hold_the_reader() {
+    // Exhaust the catalog's pool: a question that reaches an app call (calibration, the duplicate scan) waits for a
+    // pooled connection. While it waits, a question on another connection that needs only the reader must answer.
+    // No production hook: the pool is the test's own lever, and `McpHost::reader` is the one lock in question.
+    let rig = rig(true);
+    let slow = legacy(&rig.host).await;
+    let other = connect(&rig.host, ClientLifecycleMode::Discover { preferred_versions: vec![ProtocolVersion::V_2026_07_28] }).await;
+    for (tool, args) in [
+        ("query_frames", json!({ "scope": { "filter": "H" }, "calibration": true })),
+        ("catalog_overview", json!({})),
+    ] {
+        let held: Vec<_> = {
+            let database = rig.ctx.db.get().expect("db");
+            (0..8).map(|_| database.try_conn().expect("a pooled connection")).collect()
+        };
+        let waiting = ask(&slow, tool, args);
+        tokio::pin!(waiting);
+        // Let the question reach its app call and block on the pool.
+        let pending = tokio::time::timeout(std::time::Duration::from_millis(500), &mut waiting).await;
+        assert!(pending.is_err(), "{tool}: the question should be waiting for a pooled connection");
+
+        let quick = tokio::time::timeout(std::time::Duration::from_secs(10), ask(&other, "find_missing_metadata", json!({ "categories": ["object"] })))
+            .await
+            .unwrap_or_else(|_| panic!("{tool}: a second question could not get the reader while the first waited on the pool"));
+        assert_eq!(quick.is_error, Some(false), "{}", text_of(&quick));
+
+        drop(held);
+        let done = tokio::time::timeout(std::time::Duration::from_secs(30), &mut waiting).await.expect("the first question answers once the pool frees");
+        assert_eq!(done.is_error, Some(false), "{tool}: {}", text_of(&done));
+    }
+    slow.close().await;
+    other.close().await;
+}
+
+#[tokio::test]
+async fn the_folder_list_is_capped_at_fifty() {
+    let rig = rig(true);
+    {
+        let database = rig.ctx.db.get().expect("db");
+        let conn = database.conn();
+        for i in 0..52 {
+            let dir = rig.base.join("nas").join("many").join(format!("d{i:02}"));
+            put(&conn, &dir, "m.fits", &Row { object: None, ..light("Z") });
+        }
+    }
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "find_missing_metadata", json!({ "scope": { "filter": "Z" }, "categories": ["object"] })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains("In 52 folders:"), "{said}");
+    assert_eq!(said.lines().filter(|l| l.contains(": 1 file, e.g. m.fits")).count(), 50, "fifty folders listed: {said}");
+    assert!(said.contains("and 2 more folders (2 files)"), "{said}");
+    let data = data_of(&r);
+    assert_eq!(data["byFolder"].as_array().expect("byFolder").len(), 50);
+    assert_eq!(data["otherFolders"], json!({ "folders": 2, "files": 2 }));
+    assert_eq!(data["filesMissing"], 52);
+    client.close().await;
 }

@@ -406,6 +406,8 @@ fn star_catalogue(host: &McpHost) -> Option<String> {
 
 #[tracing::instrument(skip_all, fields(tool = "query_frames"), err)]
 pub fn query_frames(host: &McpHost, args: QueryFramesArgs) -> Result<Answer, ApiError> {
+    // Asked of the app's context, so before the reader guard is taken (see `McpHost::reader`).
+    let catalogue = if args.quality.is_some() { star_catalogue(host) } else { None };
     let conn = host.reader()?;
     let prep = match prepare(&conn, &args.scope)? {
         Prep::Answered(answer) => return Ok(answer),
@@ -456,10 +458,18 @@ pub fn query_frames(host: &McpHost, args: QueryFramesArgs) -> Result<Answer, Api
     }
 
     if let Some(metric) = args.quality {
-        let q = cq::quality_summary(&conn, star_catalogue(host).as_deref(), &frames, metric)?;
+        let q = cq::quality_summary(&conn, catalogue.as_deref(), &frames, metric)?;
         lines.extend(quality_lines(&q));
         data.insert("quality".to_string(), quality_json(&q)?);
     }
+
+    // Every read the reader does comes first; the calibration summary takes `ctx` and checks out pool connections.
+    let storage = if args.storage {
+        Some(cq::storage_summary(&conn, &frames).map_err(|e| internal("the storage", format!("{e:#}")))?)
+    } else {
+        None
+    };
+    drop(conn);
 
     if args.calibration {
         let (found, sets_total) = cq::calibration_summary(host.ctx(), &frames, 0)?;
@@ -467,10 +477,9 @@ pub fn query_frames(host: &McpHost, args: QueryFramesArgs) -> Result<Answer, Api
         data.insert("calibration".to_string(), json!({ "lines": json(&found)?, "frameSetsTotal": sets_total }));
     }
 
-    if args.storage {
-        let s = cq::storage_summary(&conn, &frames).map_err(|e| internal("the storage", format!("{e:#}")))?;
-        lines.extend(storage_lines(&s));
-        data.insert("storage".to_string(), storage_json(&s)?);
+    if let Some(s) = &storage {
+        lines.extend(storage_lines(s));
+        data.insert("storage".to_string(), storage_json(s)?);
     }
 
     Ok(prep.answer(&lines.join("\n"), data))
@@ -501,9 +510,11 @@ pub fn catalog_overview(host: &McpHost) -> Result<Answer, ApiError> {
     let filters = distinct(|f| f.file.frame.as_ref().and_then(|x| x.filter.as_ref()));
 
     let storage = cq::storage_summary(&conn, &frames).map_err(|e| internal("the storage", format!("{e:#}")))?;
+    let missing = cq::find_missing_in_scope(&conn, &prep.resolved, &MissingCategory::ALL, 0)?;
+    // The reader is done: the duplicate scan takes `ctx` and checks out pool connections.
+    drop(conn);
     // Only the totals: a page far past the last one lists no group.
     let (_, dup_groups, dup_extra_bytes) = cq::find_duplicates_in_scope(host.ctx(), &prep.resolved, u32::MAX)?;
-    let missing = cq::find_missing_in_scope(&conn, &prep.resolved, &MissingCategory::ALL, 0)?;
 
     let mut lines = vec![format!("Catalog: {}.", totals_text(&by_type.totals))];
     if !by_type.groups.is_empty() {
@@ -706,6 +717,9 @@ pub fn find_duplicates(host: &McpHost, args: ScopeArgs) -> Result<Answer, ApiErr
         ));
         for c in &g.copies {
             let mut line = format!("  - {}", file_text(&c.line));
+            if let Some(root) = &c.scan_root {
+                line.push_str(&format!("; under {root}"));
+            }
             if let Some(kind) = c.root_kind.as_deref().filter(|k| *k != "normal") {
                 line.push_str(&format!("; scan root kind {}", kind.replace('_', " ")));
             }
@@ -752,8 +766,9 @@ pub fn find_missing_metadata(host: &McpHost, args: MissingArgs) -> Result<Answer
         let beyond: Vec<&(String, usize, Vec<FileLine>)> = found.by_folder.iter().skip(GROUPS_SHOWN).collect();
         if !beyond.is_empty() {
             lines.push(format!(
-                "  and {} more ({})",
-                count_of(beyond.len(), "folder", "folders"),
+                "  and {} more {} ({})",
+                beyond.len(),
+                if beyond.len() == 1 { "folder" } else { "folders" },
                 count_of(beyond.iter().map(|(_, n, _)| n).sum(), "file", "files")
             ));
         }

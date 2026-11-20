@@ -9,7 +9,8 @@ spike facts (what the real clients do): `docs/superpowers/research/2026-11-19-mc
 An assistant (Claude desktop, Claude Code, ...) asks Athenaeum about one astrophotography catalog. Three rules bind every tool:
 
 - **Questions change nothing.** They read through the host's one `SQLITE_OPEN_READ_ONLY` connection (`McpHost::reader`, plan R11),
-  never a PRAGMA on a pooled connection. `questions_change_nothing` digests the catalog before and after every tool.
+  never a PRAGMA on a pooled connection; the exceptions are `file_details`, the calibration summary and `find_duplicates_in_scope`, which reuse the app's
+  context-taking functions that only read (below). `questions_change_nothing` digests the catalog before and after every tool.
 - **No tool applies a plan.** Changes are plans that open in Athenaeum's window, where only the user can apply them; there is
   no `apply` tool, no in-chat card, no elicitation in v1.
 - **Off by default.** `mcp.enabled` is `"false"` (Task 6 adds the setting, the local channel and the on/off lifecycle).
@@ -80,8 +81,11 @@ separator-strict prefix) and never opened or `canonicalize`d.
   for them. The scanner never writes one of these into a frame's `date_obs`, so the twins agree on every catalog row.
 - **A content-key duplicate group whose copies have no catalog frame row is never in a scope.** A scope is a filter on frames;
   such a group is visible only in the Duplicates page.
-- **`find_duplicates` and `catalog_overview` read through the app's own duplicate query** (`get_duplicates`), a pooled connection
-  that only reads; the reader connection covers every other read.
+- **Three reads use the pool, not the reader:** `file_details`, the calibration summary (`query_frames` with `calibration`) and
+  `find_duplicates_in_scope` (`find_duplicates`, `catalog_overview`) reuse the app's own ctx-taking functions, which only read
+  (R11's named exceptions); the reader covers `query_frames`' frames, quality and storage, `find_missing_metadata` and the overview's counts.
+- **The reader guard is never held across a call that takes `ctx`:** do every reader read, `drop` the guard, then call the app
+  function (`McpHost::reader` says so; `a_slow_app_call_does_not_hold_the_reader` pins it).
 
 ## Sizes (D3)
 
