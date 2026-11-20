@@ -40,9 +40,14 @@ export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGrou
         <p className="text-warning">This plan expired before it was applied. Ask the assistant to prepare it again.</p>
       )}
       {state.kind === 'cancelled' && <p className="text-content-muted">This plan was cancelled. Nothing was changed.</p>}
-      {state.kind === 'failed' && <p className="text-error">Preparing the plan failed: {state.error}</p>}
-      {state.kind === 'applied' && plan.report && <Report report={plan.report} />}
-      {state.kind !== 'applied' &&
+      {state.kind === 'failed' && (
+        <p className="text-error">
+          {plan.report ? 'This plan failed' : 'Preparing the plan failed'}: {state.error}
+        </p>
+      )}
+      {plan.report && <Report report={plan.report} />}
+      {!plan.report &&
+        state.kind !== 'applied' &&
         plan.groups.map((g, i) => (
           <Group
             key={g.id}
@@ -116,6 +121,7 @@ function Group({
         <Checkbox
           size="sm"
           checked={tickable.length > 0 && ticked === tickable.length}
+          indeterminate={ticked > 0 && ticked < tickable.length}
           disabled={readOnly || tickable.length === 0}
           onChange={() => onToggleGroup(group.id)}
           ariaLabel={`Include all in ${group.title}`}
@@ -206,7 +212,7 @@ function Row({
               name={`keep-${group.id}`}
               className="accent-[theme(colors.accent.DEFAULT)]"
               checked={isChosen}
-              disabled={readOnly || locked || !item.candidate}
+              disabled={readOnly || !item.candidate}
               onChange={() => onChoose(group.id, item.id)}
               aria-label={`${group.chooseOne}: ${item.fileName}`}
             />

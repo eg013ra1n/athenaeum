@@ -9,11 +9,13 @@ const SIZE_CLASS = { sm: 'w-[440px]', md: 'w-[560px]', lg: 'flex max-h-[90vh] w-
 const FOCUSABLE = 'button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
 /** Spec §7 — the one modal shell: scrim, centred window, header, body, footer. `lg` is the 960 px plan window: it keeps within 92vw / 90vh and only its body scrolls. */
-export function DialogShell({ title, size = 'sm', onClose, busy = false, footer, children }: {
+export function DialogShell({ title, size = 'sm', onClose, busy = false, closeOnScrim = true, footer, children }: {
   title: ReactNode;
   size?: 'sm' | 'md' | 'lg';
   onClose: () => void;
   busy?: boolean;
+  /** A click on the scrim closes the dialog (default). A dialog whose close is a decision (a plan) turns it off; Esc and the cross stay. */
+  closeOnScrim?: boolean;
   footer?: ReactNode;
   children: ReactNode;
 }) {
@@ -64,7 +66,7 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
       onClick={(e) => {
         const fromScrim = pressOnScrim.current && e.target === e.currentTarget;
         pressOnScrim.current = false;
-        if (fromScrim && !busyRef.current) onClose();
+        if (fromScrim && closeOnScrim && !busyRef.current) onClose();
       }}
     >
       <div

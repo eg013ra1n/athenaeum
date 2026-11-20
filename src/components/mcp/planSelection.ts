@@ -37,22 +37,21 @@ export function toggleItem(plan: McpPlanView, sel: PlanSelection, groupId: strin
   }));
 }
 
-/** Every item of the group that may be ticked is ticked, or, when all are, none. */
+/** A group with any copy ticked is unticked; a group with none ticked gets every copy that may be ticked. */
 export function toggleGroup(plan: McpPlanView, sel: PlanSelection, groupId: string): PlanSelection {
   const group = plan.groups.find((g) => g.id === groupId);
   if (!group) return sel;
   const ids = group.items.filter((i) => ticks(chosenOf(sel, groupId), i)).map((i) => i.id);
   return mapGroup(sel, groupId, (included, chosen) => {
-    const all = ids.length > 0 && ids.every((id) => included.includes(id));
-    return { chosen, included: all ? [] : ids };
+    return { chosen, included: included.some((id) => ids.includes(id)) ? [] : ids };
   });
 }
 
-/** The user picks the copy that stays; a copy that was ticked is unticked, a locked or non-candidate copy cannot be picked. */
+/** The user picks the copy that stays; a copy that was ticked is unticked. A lock forbids moving a copy, not keeping it; only a non-candidate cannot be picked. */
 export function chooseOne(plan: McpPlanView, sel: PlanSelection, groupId: string, itemId: string): PlanSelection {
   const group = plan.groups.find((g) => g.id === groupId);
   const item = group?.items.find((i) => i.id === itemId);
-  if (!group || !item || group.chooseOne === null || !item.candidate || item.locked !== null) return sel;
+  if (!group || !item || group.chooseOne === null || !item.candidate) return sel;
   return mapGroup(sel, groupId, (included) => ({ chosen: itemId, included: included.filter((id) => id !== itemId) }));
 }
 

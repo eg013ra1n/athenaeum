@@ -52,7 +52,7 @@ export function plan(over: Partial<McpPlanView> = {}): McpPlanView {
         items: [
           item(4),
           item(5, { selected: true, sizeBytes: 4000 }),
-          item(6, { locked: 'calibration links point at it; it stays in v1', candidate: false, sizeBytes: 500 }),
+          item(6, { locked: 'calibration links point at it; it stays in v1', sizeBytes: 500 }),
         ],
       },
     ],

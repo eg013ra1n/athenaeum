@@ -17,10 +17,13 @@ export function PlanWindow() {
   return plan ? <PlanDialog key={plan.planId} plan={plan} /> : null;
 }
 
+/** Apply stays disabled this long after the window shows a waiting plan, so a click aimed elsewhere cannot apply it. */
+const APPLY_ARM_MS = 1000;
+
 const files = (n: number) => `${n} file${n === 1 ? '' : 's'}`;
 
 function PlanDialog({ plan }: { plan: McpPlanView }) {
-  const { newerPlanId, busy, apply, cancel, dismiss, openNewer } = useMcpPlan();
+  const { busy, apply, cancel, dismiss, openNewer } = useMcpPlan();
   const kind = plan.state.kind;
   const preparing = kind === 'preparing';
 
@@ -33,24 +36,35 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
   }
   const update = (f: (s: typeof sel) => typeof sel) => setStore({ preparing, sel: f(sel) });
 
-  const superseded = kind === 'replaced' || newerPlanId !== null;
+  // The banner is for a replaced plan only; a newer plan waits unseen while this one applies.
+  const superseded = kind === 'replaced';
   const waiting = kind === 'waiting';
   const canAnswer = (waiting || preparing) && !busy;
   const sum = totals(plan, sel);
   const problems = waiting ? selectionProblems(plan, sel) : [];
 
-  // Cancel has the initial focus (Close when there is no Cancel), never Apply: Enter on a plan that has just opened
-  // cannot apply it.
+  // Nothing pressable has the initial focus: the window opens by itself over any page, so a Space or Enter meant for
+  // something else must press nothing. The title line takes it (`data-autofocus`, not a tab stop of its own).
   const mode = waiting || preparing ? 'cancel' : kind === 'applying' ? 'busy' : 'close';
-  const focusRef = useRef<HTMLSpanElement>(null);
+  const titleRef = useRef<HTMLSpanElement>(null);
   const first = useRef(true);
   useEffect(() => {
     if (first.current) {
       first.current = false;
       return;
     }
-    focusRef.current?.querySelector<HTMLElement>('[data-autofocus]')?.focus();
+    // The button that was pressed is gone (Cancel/Apply -> Close): focus returns to the title, not to another button.
+    titleRef.current?.focus();
   }, [mode]);
+
+  // Apply arms one second after the window shows a waiting plan (on open, and when a preparing plan turns waiting).
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    setArmed(false);
+    if (!waiting) return;
+    const t = setTimeout(() => setArmed(true), APPLY_ARM_MS);
+    return () => clearTimeout(t);
+  }, [waiting]);
 
   const footer = (
     <>
@@ -68,15 +82,15 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
           </ul>
         )}
       </div>
-      <span ref={focusRef} className="contents">
+      <span className="contents">
       {mode === 'cancel' && (
         <>
-          <Button data-autofocus disabled={busy} onClick={() => void cancel()}>
+          <Button disabled={busy} onClick={() => void cancel()}>
             Cancel
           </Button>
           <Button
             variant="primary"
-            disabled={!waiting || !canAnswer || superseded || problems.length > 0}
+            disabled={!waiting || !armed || !canAnswer || superseded || problems.length > 0}
             onClick={() => void apply({ action: 'apply', selection: sel })}
           >
             Apply
@@ -90,7 +104,7 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
       )}
       {mode === 'close' && (
         <>
-          <Button data-autofocus onClick={dismiss}>
+          <Button onClick={dismiss}>
             Close
           </Button>
           {/* A replaced plan keeps a dead Apply, so it is plain that it cannot be applied. */}
@@ -108,7 +122,12 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
   return (
     <DialogShell
       size="lg"
-      title={plan.title}
+      title={
+        <span ref={titleRef} data-autofocus tabIndex={-1} className="outline-none">
+          {plan.title}
+        </span>
+      }
+      closeOnScrim={mode === 'close'}
       busy={busy || kind === 'applying'}
       // Escape, the cross and a click outside decline a plan that still waits; a finished plan just closes.
       onClose={mode === 'cancel' ? () => void cancel() : dismiss}
