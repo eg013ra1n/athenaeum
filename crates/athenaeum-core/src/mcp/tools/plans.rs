@@ -24,6 +24,7 @@ use crate::calibration_library::rebuilt_copies::{find_rebuilt_master_copies, Reb
 use crate::catalog_query::GROUPS_SHOWN;
 use crate::mcp::answer::count_of;
 use crate::mcp::plans::black_hole::{self, describe_plan, real_verify};
+use crate::mcp::plans::metadata;
 use crate::mcp::plans::{McpPlanView, PlanBlackHoleArgs, PlanKind, PlanReport, PlanState, ReportLine};
 use crate::mcp::{Answer, AthenaeumMcp, McpHost};
 
@@ -155,7 +156,12 @@ pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
         text.push_str(&report_text(report));
     }
     // A plan that waits for the user: every copy and what would happen to it, as the planning answer says it.
-    let described = (v.kind == PlanKind::BlackHole && v.state == PlanState::Waiting && !v.groups.is_empty()).then(|| describe_plan(v));
+    let waiting = v.state == PlanState::Waiting && !v.groups.is_empty();
+    let described = match v.kind {
+        PlanKind::BlackHole if waiting => Some(describe_plan(v)),
+        PlanKind::Metadata if waiting => Some(metadata::describe_plan(v)),
+        _ => None,
+    };
     if let Some(d) = &described {
         text.push_str(&format!("\n{}.", d.summary));
         for line in &d.lines {
@@ -442,7 +448,7 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         let client = connect(&rig.host, ClientLifecycleMode::Initialize).await;
         let tools = client.list_all_tools().await.expect("tools");
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
-        for want in ["plan_status", "plan_black_hole", "find_rebuilt_masters"] {
+        for want in ["plan_status", "plan_black_hole", "find_rebuilt_masters", "plan_metadata_fill"] {
             assert!(names.iter().any(|n| n == want), "{want} is not offered: {names:?}");
         }
         for n in &names {

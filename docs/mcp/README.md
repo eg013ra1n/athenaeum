@@ -59,10 +59,11 @@ Every answer is two halves that each read on their own.
 | `find_missing_metadata` | The Missing Metadata view's rows inside the scope: counts per category, folders, a page of files |
 | `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many calibration links point at each (`linkCount`: light frames, and master sets that use it as a dark or bias); not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); like `find_duplicates`, a group is in the scope when one of its copies is, and it is then listed whole (every copy, its handle the lowest file id of the whole group, so `plan_black_hole` finds it) |
 | `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window. A plan with copies to byte-check answers at once with state `preparing` (the checks run on a thread of their own); the answer of a published plan lists every copy and its fate |
+| `plan_metadata_fill { scope, fields?, statement? }` | Prepares a metadata plan: fills the object (lights only), camera, date or frame type that frames in the scope miss, from evidence or from `statement {field, value}` (the user's own word); see "Metadata plans" below. Refused in words, leaving the waiting plan alone, when the scope names nothing, nothing can be proposed or the plan would hold more than 2 000 items. The plan is published before the tool answers, and the answer lists every group and frame |
 | `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied") |
 
 Each tool is a core fn `mcp::tools::<name>(host, args) -> Result<Answer, ApiError>` wearing
-`#[tracing::instrument(skip_all, fields(tool = "<name>"), err)]`; `AthenaeumMcp::all_tools()` (`server.rs`) joins the tool routers (`catalog_tools() + plan_tools()`, and `tools.json` is written from it); the `#[tool]` method is a two-line adapter that runs it with
+`#[tracing::instrument(skip_all, fields(tool = "<name>"), err)]`; `AthenaeumMcp::all_tools()` (`server.rs`) joins the tool routers (`catalog_tools() + plan_tools() + fill_tools()`, and `tools.json` is written from it); the `#[tool]` method is a two-line adapter that runs it with
 `spawn_blocking` (it reads SQLite) and wraps it with `to_tool_result`. No test keeps a list of tool names: core's tests read `all_tools()`, the bridge's read `McpHost::tool_list_json()`, so a new tool cannot leave a stale list.
 
 **One frame set.** A `query_frames` scope that is exactly one frame set (`frameSet` and nothing else, default state) answers the
@@ -310,6 +311,45 @@ of the named groups and refuses more than `PLAN_ITEM_CAP` (2 000) in words befor
   `chosen` (`pick the copy that stays ...`) and `chosen` is never included, in its own group or any other.
 - Columns: IMAGETYP, OBJECT, FILTER, EXPTIME, DATE-OBS, INSTRUME, size, modified.
 
+## Metadata plans (`plan_metadata_fill`)
+
+`mcp/infer.rs` (pure: what the evidence says), `mcp/plans/metadata.rs` (the plan and its applier), `mcp/tools/fill.rs` (the tool). An
+assistant asks Athenaeum to fill the object, camera, date or frame type frames miss (`fields`: `object`, `camera`, `date`, `frame_type`;
+empty means all four, or only the statement's field when a statement is given; coordinates are the plate-solve plan's). Only a frame of
+the scope that misses the field is proposed for, by the Missing Metadata view's own test (`missing_flags`: the object only for lights);
+a frame whose stored value is not empty is left alone even where the parser could not read it.
+
+- **Evidence, each item says which.** Frame type: the nearest folder of the path named `light(s)`, `dark(s)`, `flat(s)`,
+  `bias`/`biases`/`offset(s)` or `darkflat(s)`/`flatdark(s)` (case-insensitive, the whole folder name), `folder 'Flats' in its path`.
+  Date: the file name holds `YYYY-MM-DD[_T ]HH[-_:]MM[-_:]SS` or `YYYYMMDD[-_]HHMMSS` (hand-parsed, year 1990-2100, a real date, not part of
+  a longer run of digits), `from the file name '<name>'; the camera clock's time zone is unknown, taken as UTC`. Camera and object (D9):
+  the other frames of the same folder (the folder itself, not below it; Black Hole files do not count) that have the field set: at
+  least 3 and all equal gives `40 frames in this folder have INSTRUME = 'ZWO ASI2600MM Pro'`; disagreeing frames give no proposal,
+  `frames in this folder disagree: 30 'A', 10 'B'`; fewer than 3 give `fewer than 3 frames in this folder have it`. Neighbours are read
+  for the folders of the missing frames only, outside the scope too.
+- **The user's word.** `statement {field, value}` covers the frames in the scope that miss that field; evidence `by your instruction`.
+  The value is normalized before any plan begins (a frame type to `Light` / `Dark` / `Flat` / `Bias` / `DarkFlat`, a date `YYYY-MM-DD` or
+  `YYYY-MM-DDTHH:MM:SS`, UTC) and a bad one is an `Invalid` in words. With a statement and no `fields`, only the statement's field is
+  planned; `fields` are inferred in addition, except the statement's own.
+- **The plan.** One group per (field, value), largest first within a field, its items selected (`item:<frame id>:<field>`; columns
+  Field / Now / Proposed). A frame that misses a field and has no evidence is a locked item in a group `<Field>: nothing proposed`, with the
+  reason. A file that cannot be stamped is locked `not reachable ...`. Notes: `these changes take N frames out of their sessions and M out
+  of calibration links` (`count_frame_metadata_relations`, as the metadata editor's confirm warns; only when a link goes) and that only
+  the catalog changes. A date group is per distinct time, so a folder of dated file names is one group per frame.
+- **Refused in words before the plan begins** (the waiting plan is never replaced): a scope that names nothing (the scope's own hints), a
+  request with nothing to propose (what was missing and why, and that the user's value goes in `statement`), a plan of more than
+  `PLAN_ITEM_CAP` (2 000) items, a bad statement.
+- **The answer is the plan** (`metadata::describe_plan`, also what `plan_status` says of a waiting metadata plan): `N values proposed in M
+  groups`, per group its title and how many frames, each frame by name and folder with its evidence or `locked: <why>`; the data carries the
+  same as `groups[].items[]` (`fileName`, `folder`, `values` current and proposed, `selected`, `locked`, `evidence`), at most 50 groups and 20
+  items per group, the rest summed (`otherGroups`, `itemsNotShown`).
+- **Apply** (after the store's stamp and catalog re-check: an item whose field was filled meanwhile is skipped `catalog changed: INSTRUME is now
+  'X'`): the applier re-checks the field is still empty (the object: still a light) on a pooled connection it releases, groups equal edits
+  and writes each group with `api::files::bulk_update_frame_metadata` (the Missing Metadata page's own write: catalog only, `frames.override =
+  1`, so the scanner's re-parse keeps the value - `fill_sets_override_and_survives_rescan` - and the links and session seats of the frame go).
+  A date is stored `<value>Z`, as the Set Date modal stores it. One `frames-metadata-changed {"count": <frames>}` follows when anything
+  was written; the closing line is `info!(via = "mcp", plan_id, count, "mcp metadata fill applied")`.
+
 ## The plan window
 
 `src/components/mcp/{PlanWindow,PlanView,planSelection}`, state in `src/contexts/McpPlanContext.tsx` (provider and window sit in `Layout.tsx`, once).
@@ -345,6 +385,6 @@ The window is the one place a plan is looked over and decided: ticks, the copy t
 ## Logging
 
 New log fields: `via`, `plan_id`, `kind`, `applied`, `skipped`, `failed` (plans, above) and `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,
-`find_missing_metadata`, `plan_status`, `find_rebuilt_masters`, `plan_black_hole`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
+`find_missing_metadata`, `plan_status`, `find_rebuilt_masters`, `plan_black_hole`, `plan_metadata_fill`). A failed tool is logged by its span's `err`, then returned to the assistant in words. The channel (`mcp::lifecycle`) adds no field
 name: it logs with `state` (`off`/`starting`/`serving`/`elsewhere`/`failed`), `addr` (the endpoint's text), `reason`
 (`timeout`, `too_long`, or a handshake refusal's word), `error` and `path`; never the key.

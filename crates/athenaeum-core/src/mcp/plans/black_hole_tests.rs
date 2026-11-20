@@ -29,7 +29,7 @@ impl ProgressEmitter for Capture {
 }
 
 impl Capture {
-    fn named(&self, name: &str) -> Vec<Value> {
+    pub(crate) fn named(&self, name: &str) -> Vec<Value> {
         self.0.lock().unwrap().iter().filter(|(n, _)| n == name).map(|(_, p)| p.clone()).collect()
     }
 }

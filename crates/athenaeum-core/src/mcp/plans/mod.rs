@@ -11,6 +11,7 @@
 
 mod apply;
 pub mod black_hole;
+pub mod metadata;
 mod model;
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -24,6 +25,7 @@ use serde_json::json;
 use tokio::time::Instant;
 
 pub use black_hole::{BlackHoleSource, PlanBlackHoleArgs};
+pub use metadata::PlanMetadataArgs;
 pub use model::{
     catalog_values, disk_stamp, stamp_for_plan, stamp_target, DiskStamp, GroupSelection, ItemSnapshot, McpPlanView,
     PlanAnswer, PlanColumn, PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState,

@@ -26,9 +26,9 @@ impl AthenaeumMcp {
 }
 
 impl AthenaeumMcp {
-    /// Every tool the server offers: the catalog questions and the plan tool. Each later planning tool joins here.
+    /// Every tool the server offers: the catalog questions, the plan tools and the metadata plan. Each later planning tool joins here.
     pub(crate) fn all_tools() -> ToolRouter<Self> {
-        Self::catalog_tools() + Self::plan_tools()
+        Self::catalog_tools() + Self::plan_tools() + Self::fill_tools()
     }
 }
 

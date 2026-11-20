@@ -10,6 +10,7 @@
 
 pub mod answer;
 pub mod channel;
+pub mod infer;
 pub mod lifecycle;
 pub mod plans;
 pub mod server;

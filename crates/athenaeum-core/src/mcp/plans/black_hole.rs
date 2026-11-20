@@ -713,7 +713,7 @@ pub fn prepare(host: &Arc<McpHost>, args: PlanBlackHoleArgs, verify: VerifyFn) -
 
 /// Runs one step of preparing a plan. An error or a panic ends the plan `failed` (a preparing plan is never swept,
 /// so nothing else would end it) and is returned to the caller as an error.
-fn guard<T>(host: &McpHost, id: &str, step: impl FnOnce() -> Result<T, ApiError>) -> Result<T, ApiError> {
+pub(super) fn guard<T>(host: &McpHost, id: &str, step: impl FnOnce() -> Result<T, ApiError>) -> Result<T, ApiError> {
     match std::panic::catch_unwind(AssertUnwindSafe(step)) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
