@@ -3,7 +3,7 @@
 //! frames of the same folder) or from the user's own word (`statement`). Athenaeum prepares a plan; only the user
 //! applies it, in Athenaeum's window.
 //!
-//! One group per (field, value), its items selected; a frame that misses a field and has no evidence for it is a
+//! One group per (field, value), its items selected (a date is per (field, folder): every frame has its own time); a frame that misses a field and has no evidence for it is a
 //! locked item in a group of its own, with the reason. The apply is the Missing Metadata page's own write
 //! (`api::files::bulk_update_frame_metadata`: catalog only, `frames.override = 1`, so a re-scan keeps the value, and
 //! the links the cascade severs are the ones the page's confirm warns about; the plan's notes say how many).
@@ -259,6 +259,11 @@ struct ItemInfo {
     folder: String,
 }
 
+/// A value as a person reads it: a date is `YYYY-MM-DD HH:MM:SS` (the proposal keeps its `T`).
+fn shown(field: FillField, value: &str) -> String {
+    if field == FillField::Date { value.replacen('T', " ", 1) } else { value.to_string() }
+}
+
 fn item_id(frame_id: i64, field: FillField) -> String {
     format!("item:{frame_id}:{}", field.as_str())
 }
@@ -312,16 +317,31 @@ fn build_and_publish(host: &McpHost, id: &str, read: Read) -> Result<Result<(), 
     let mut plan_snapshots: HashMap<String, ItemSnapshot> = HashMap::new();
     let mut infos: HashMap<String, ItemInfo> = HashMap::new();
 
-    // One group per (field, value): the largest first within a field.
-    let mut by_value: BTreeMap<(FillField, String), Vec<&Proposal>> = BTreeMap::new();
+    // One group per (field, value), the largest first within a field. A date is the exception: every frame has its
+    // own time, so its group is the folder, and each item keeps its own value.
+    let mut by_group: BTreeMap<(FillField, String), Vec<&Proposal>> = BTreeMap::new();
     for p in &proposals {
-        by_value.entry((p.field, p.value.clone())).or_default().push(p);
+        let key = if p.field == FillField::Date { frame_ref(p.frame_id)?.folder.clone() } else { p.value.clone() };
+        by_group.entry((p.field, key)).or_default().push(p);
     }
-    let mut ordered: Vec<((FillField, String), Vec<&Proposal>)> = by_value.into_iter().collect();
+    let mut ordered: Vec<((FillField, String), Vec<&Proposal>)> = by_group.into_iter().collect();
     ordered.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| b.1.len().cmp(&a.1.len())).then_with(|| a.0 .1.cmp(&b.0 .1)));
-    for ((field, value), members) in ordered {
+    for ((field, key), members) in ordered {
+        let title = if field == FillField::Date {
+            let first = members.iter().map(|p| p.value.as_str()).min().unwrap_or_default();
+            let last = members.iter().map(|p| p.value.as_str()).max().unwrap_or_default();
+            let span = if first == last {
+                shown(field, first)
+            } else {
+                format!("{} to {}", shown(field, first), shown(field, last))
+            };
+            format!("{}: {key} ({span})", field.label())
+        } else {
+            format!("{}: {key}", field.label())
+        };
         let mut items = Vec::with_capacity(members.len());
         for p in members {
+            let value = &p.value;
             let r = frame_ref(p.frame_id)?;
             let iid = item_id(p.frame_id, field);
             let lock = match stamps.get(&r.file_id) {
@@ -344,6 +364,7 @@ fn build_and_publish(host: &McpHost, id: &str, read: Read) -> Result<Result<(), 
                 iid.clone(),
                 ItemInfo { frame_id: p.frame_id, field, value: value.clone(), file_name: r.file_name.clone(), folder: r.folder.clone() },
             );
+            let value = shown(field, value);
             items.push(PlanItem {
                 id: iid,
                 file_name: r.file_name.clone(),
@@ -363,7 +384,7 @@ fn build_and_publish(host: &McpHost, id: &str, read: Read) -> Result<Result<(), 
         }
         groups.push(PlanGroup {
             id: format!("group:{}", groups.len() + 1),
-            title: format!("{}: {value}", field.label()),
+            title,
             note: None,
             choose_one: None,
             chosen: None,
@@ -532,10 +553,14 @@ pub fn describe_plan(view: &McpPlanView) -> PlanDescription {
             ));
         }
         let first = g.items.first();
+        // The one value of the group; a group of dates holds one per frame, which its items carry.
+        let common = first
+            .and_then(|f| f.values.get("proposed"))
+            .filter(|v| g.items.iter().all(|i| i.values.get("proposed") == Some(*v)));
         groups.push(json!({
             "title": g.title,
             "field": first.and_then(|i| i.values.get("field")),
-            "value": (!is_nothing_group(g)).then(|| first.and_then(|i| i.values.get("proposed"))).flatten(),
+            "value": if is_nothing_group(g) { None } else { common },
             "proposed": selected,
             "locked": locked_here,
             "note": g.note,
@@ -667,7 +692,10 @@ impl PlanApplier for MetadataApplier {
         {
             let database = match crate::api::db(host.ctx()) {
                 Ok(d) => d,
-                Err(e) => return self.skip_all(report, &included, &format!("the catalog is not available: {e}")),
+                Err(e) => {
+                    tracing::error!(error = %e, plan_id, "plan apply could not open the catalog");
+                    return self.skip_all(report, &included, &format!("the catalog is not available: {e}"));
+                }
             };
             let conn = match database.try_conn() {
                 Ok(c) => c,
@@ -704,7 +732,7 @@ impl PlanApplier for MetadataApplier {
                     }
                     changed.extend(frame_ids);
                     for id in ids {
-                        report.applied.push(report_line(&self.items, id, format!("{} set to '{value}'", field.header_key())));
+                        report.applied.push(report_line(&self.items, id, format!("{} set to '{}'", field.header_key(), shown(field, value))));
                     }
                 }
                 Err(e) => {

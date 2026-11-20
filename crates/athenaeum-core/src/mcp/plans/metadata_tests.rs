@@ -184,7 +184,10 @@ fn fill_sets_override_and_survives_rescan() {
 
     let view = plan(&rig, args(&rig, "rescan", &[FillField::Date], None));
     assert_eq!(view.groups.len(), 1);
-    assert_eq!(view.groups[0].title, "Date: 2024-10-05T22:15:03");
+    let title = &view.groups[0].title;
+    assert!(title.starts_with("Date: ") && title.contains("rescan") && title.ends_with("(2024-10-05 22:15:03)"), "{title}");
+    assert_eq!(view.groups[0].items[0].values["proposed"], "2024-10-05 22:15:03");
+    assert_eq!(view.groups[0].items[0].action, "Set DATE-OBS to '2024-10-05 22:15:03'");
     let ended = apply(&rig, &view.plan_id, proposal(&view));
     assert_eq!(ended.state, PlanState::Applied, "{ended:?}");
     assert_eq!(ended.report.as_ref().map(|r| r.applied.len()), Some(1), "{:?}", ended.report);
@@ -490,4 +493,134 @@ fn an_oversized_request_is_refused_before_any_plan_begins() {
     assert!(said.contains("2 000") && said.contains(&over.to_string()), "{said}");
     let now = rig.host.plans.view(None).expect("a plan");
     assert_eq!((now.plan_id.as_str(), &now.state), (first.plan_id.as_str(), &PlanState::Waiting));
+}
+
+#[test]
+fn a_master_in_a_darks_folder_stays_a_master() {
+    let rig = rig();
+    let m = put(&rig, "cal/Darks", "master_dark_300s.fits", |f| f.is_master = true);
+    let raw = put(&rig, "cal/Darks", "d1.fits", |_| {});
+    assert_eq!(row(&rig, &m).4, 1, "the fixture is a master");
+    let view = plan(&rig, args(&rig, "cal/Darks", &[FillField::FrameType], None));
+    let i = item(&view, &m, FillField::FrameType);
+    assert_eq!(i.values["proposed"], "MasterDark");
+    assert_eq!(i.evidence.as_deref(), Some("folder 'Darks' in its path; the file is a master"));
+    assert_eq!(item(&view, &raw, FillField::FrameType).values["proposed"], "Dark");
+    let ended = apply(&rig, &view.plan_id, proposal(&view));
+    assert_eq!(ended.state, PlanState::Applied, "{ended:?}");
+    let (_, _, _, imagetyp, is_master, flag) = row(&rig, &m);
+    assert_eq!((imagetyp.as_deref(), is_master, flag), (Some("MasterDark"), 1, 1));
+    let (_, _, _, imagetyp, is_master, _) = row(&rig, &raw);
+    assert_eq!((imagetyp.as_deref(), is_master), (Some("Dark"), 0));
+}
+
+#[test]
+fn a_date_without_a_time_is_refused() {
+    let rig = rig();
+    light(&rig, "date-wait", "w1.fits", None);
+    let first = plan(&rig, args(&rig, "date-wait", &[], Some((FillField::Object, "M 31"))));
+    let a = light(&rig, "date-none", "a.fits", Some("M 31"));
+    let said = match prepare(&rig.host, args(&rig, "date-none", &[], Some((FillField::Date, "2024-10-05")))) {
+        Err(ApiError::Invalid(m)) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        said.contains("give the time too (YYYY-MM-DD HH:MM:SS): the night a frame belongs to is decided by its time"),
+        "{said}"
+    );
+    let now = rig.host.plans.view(None).expect("a plan");
+    assert_eq!((now.plan_id.as_str(), &now.state), (first.plan_id.as_str(), &PlanState::Waiting));
+    assert_eq!(row(&rig, &a).2, None);
+    // With the time it is planned and shown as a date.
+    let view = plan(&rig, args(&rig, "date-none", &[], Some((FillField::Date, "2024-10-05 22:15:03"))));
+    assert_eq!(item(&view, &a, FillField::Date).values["proposed"], "2024-10-05 22:15:03");
+}
+
+#[test]
+fn dates_are_grouped_by_folder() {
+    let rig = rig();
+    let n = 6;
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for k in 0..n {
+        a.push(put(&rig, "nightA", &format!("L_2024-10-05_22-1{k}-03.fits"), |f| f.imagetyp = Some(ImageType::Light)));
+        b.push(put(&rig, "nightB", &format!("L_2024-10-06_23-0{k}-30.fits"), |f| f.imagetyp = Some(ImageType::Light)));
+    }
+    let scope = Scope { folder: Some(text(&rig.base.join("nas"))), ..Default::default() };
+    let view = plan(&rig, PlanMetadataArgs { scope, fields: vec![FillField::Date], statement: None });
+    assert_eq!(view.groups.len(), 2, "one group per folder, not per frame: {:?}", view.groups.iter().map(|g| &g.title).collect::<Vec<_>>());
+    let titles: Vec<&str> = view.groups.iter().map(|g| g.title.as_str()).collect();
+    assert!(titles[0].starts_with("Date: ") && titles[0].contains("nightA"), "{titles:?}");
+    assert!(titles[0].ends_with("(2024-10-05 22:10:03 to 2024-10-05 22:15:03)"), "{titles:?}");
+    assert!(titles[1].contains("nightB") && titles[1].ends_with("(2024-10-06 23:00:30 to 2024-10-06 23:05:30)"), "{titles:?}");
+    assert_eq!(view.groups[0].items.len(), n);
+    // Each item keeps its own value.
+    assert_eq!(item(&view, &a[2], FillField::Date).values["proposed"], "2024-10-05 22:12:03");
+    assert_eq!(item(&view, &b[5], FillField::Date).values["proposed"], "2024-10-06 23:05:30");
+    assert_eq!(item(&view, &a[2], FillField::Date).action, "Set DATE-OBS to '2024-10-05 22:12:03'");
+    let ended = apply(&rig, &view.plan_id, proposal(&view));
+    assert_eq!(ended.state, PlanState::Applied, "{ended:?}");
+    assert_eq!(row(&rig, &a[2]).2.as_deref(), Some("2024-10-05T22:12:03Z"));
+    assert_eq!(row(&rig, &b[5]).2.as_deref(), Some("2024-10-06T23:05:30Z"));
+}
+
+#[test]
+fn flats_never_name_a_lights_object() {
+    let rig = rig();
+    for n in 1..=3 {
+        put(&rig, "flatobj", &format!("f{n}.fits"), |f| {
+            f.imagetyp = Some(ImageType::Flat);
+            f.object = Some("FlatField".to_string());
+        });
+    }
+    light(&rig, "flatobj", "l1.fits", None);
+    let said = match prepare(&rig.host, args(&rig, "flatobj", &[FillField::Object], None)) {
+        Err(ApiError::Invalid(m)) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(said.contains("fewer than 3 frames in this folder have it") && !said.contains("FlatField"), "{said}");
+}
+
+#[test]
+fn the_applier_rechecks_the_field_and_the_light() {
+    let rig = rig();
+    let filled = put(&rig, "recheck", "a.fits", |_| {});
+    let lit = light(&rig, "recheck", "b.fits", None);
+    let ok = put(&rig, "recheck", "c.fits", |_| {});
+    let info = |fx: &Fx, field: FillField, value: &str| ItemInfo {
+        frame_id: fx.frame_id,
+        field,
+        value: value.to_string(),
+        file_name: fx.name.clone(),
+        folder: text(&dir_of(&rig, "recheck")),
+    };
+    let ids = [
+        item_id_of(&filled, FillField::Camera),
+        item_id_of(&lit, FillField::Object),
+        item_id_of(&ok, FillField::Camera),
+    ];
+    let items = HashMap::from([
+        (ids[0].clone(), info(&filled, FillField::Camera, "Cam X")),
+        (ids[1].clone(), info(&lit, FillField::Object, "M 31")),
+        (ids[2].clone(), info(&ok, FillField::Camera, "Cam X")),
+    ]);
+    // After planning: a's camera is filled, b stops being a light.
+    {
+        let database = rig.ctx.db.get().expect("db");
+        let conn = database.conn();
+        conn.execute("UPDATE frames SET instrume = 'Other' WHERE id = ?1", [filled.frame_id]).expect("fill a");
+        conn.execute("UPDATE frames SET imagetyp = 'Dark' WHERE id = ?1", [lit.frame_id]).expect("retype b");
+    }
+    let selection = PlanSelection {
+        groups: vec![GroupSelection { group_id: "group:1".to_string(), chosen: None, included: ids.to_vec() }],
+    };
+    let report = MetadataApplier { items }.apply(&rig.host, "plan-recheck", &selection, &ids);
+    let reason = |id: &str| report.skipped.iter().find(|l| l.item_id == id).map(|l| l.reason.clone());
+    assert_eq!(reason(&ids[0]).as_deref(), Some("it has INSTRUME now: 'Other'"), "{report:?}");
+    assert_eq!(reason(&ids[1]).as_deref(), Some("it is no longer a light frame"), "{report:?}");
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(report.applied[0].item_id, ids[2]);
+    assert_eq!(row(&rig, &filled).1.as_deref(), Some("Other"));
+    assert_eq!(row(&rig, &lit).0, None);
+    assert_eq!(row(&rig, &ok).1.as_deref(), Some("Cam X"));
 }

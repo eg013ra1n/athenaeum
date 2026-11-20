@@ -6,7 +6,7 @@
 //!
 //! Only a frame that misses the field is ever proposed for (the Missing Metadata view's own test, `missing_flags`;
 //! the object only for lights, as that view does). The camera and the object are taken from the other frames of the
-//! same folder (D9): at least three have the field set and all agree. A frame type comes from the nearest folder of
+//! same folder (D9): at least three have the field set and all agree; for the object only lights count. A frame type comes from the nearest folder of
 //! its path that is named for one; a date from the file name, read as UTC because the camera clock's zone is unknown.
 
 use std::collections::{BTreeMap, HashMap};
@@ -22,6 +22,8 @@ use crate::models::{Frame, ImageType};
 const NEIGHBOURS_NEEDED: usize = 3;
 /// The evidence of a value the user gave.
 pub const BY_INSTRUCTION: &str = "by your instruction";
+/// What a master's evidence says besides the folder or the user's word.
+const IS_A_MASTER: &str = "the file is a master";
 /// The widest a value the user gives may be (a FITS card holds 68 characters).
 const VALUE_MAX_CHARS: usize = 120;
 
@@ -92,8 +94,8 @@ impl FillField {
 pub struct Proposal {
     pub frame_id: i64,
     pub field: FillField,
-    /// The value as the plan shows it. A date is `YYYY-MM-DDTHH:MM:SS` (UTC); a frame type is `Light`, `Dark`,
-    /// `Flat`, `Bias` or `DarkFlat`.
+    /// The value as the plan keeps it. A date is `YYYY-MM-DDTHH:MM:SS` (UTC); a frame type is `Light`, `Dark`,
+    /// `Flat`, `Bias` or `DarkFlat`, or for a frame that is a master the same with `Master` before it.
     pub value: String,
     pub evidence: String,
 }
@@ -113,7 +115,8 @@ pub struct NoProposal {
 pub struct UserStatement {
     pub field: FillField,
     /// The value, as the user said it: a target name or camera name as it should be written, a frame type
-    /// (`light`, `dark`, `flat`, `bias`, `darkflat`), or a date (`YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM:SS` in UTC).
+    /// (`light`, `dark`, `flat`, `bias`, `darkflat`), or a date with its time (`YYYY-MM-DD HH:MM:SS` or
+    /// `YYYY-MM-DDTHH:MM:SS`, in UTC): the night a frame belongs to is decided by its time.
     pub value: String,
 }
 
@@ -137,6 +140,17 @@ fn kind_of_folder(name: &str) -> Option<&'static str> {
         "darkflat" | "darkflats" | "flatdark" | "flatdarks" => Some("DarkFlat"),
         _ => None,
     }
+}
+
+/// The frame type a frame of that kind is when the file is a master: its own master kind, so the type keeps
+/// `is_master` set (the catalog derives the flag from the type text).
+fn master_of(kind: &str) -> String {
+    format!("Master{kind}")
+}
+
+/// A frame type for `frame`: `kind`, or the master kind when the frame is a master.
+fn kind_for(frame: &Frame, kind: &str) -> (String, bool) {
+    if frame.is_master { (master_of(kind), true) } else { (kind.to_string(), false) }
 }
 
 /// The frame type of the nearest folder of `folder` (a catalog path, either separator) named for one, with that
@@ -222,7 +236,12 @@ fn value_of(f: &Frame, field: FillField) -> Option<&str> {
 fn tally<'a>(neighbours: &'a [ScopedFrame], field: FillField) -> HashMap<&'a str, BTreeMap<String, usize>> {
     let mut out: HashMap<&str, BTreeMap<String, usize>> = HashMap::new();
     for sf in neighbours {
-        let Some(value) = frame_of(sf).and_then(|f| value_of(f, field)) else { continue };
+        let Some(frame) = frame_of(sf) else { continue };
+        // A flat's OBJECT names the panel or the flat field, not the target: only lights speak for an object.
+        if field == FillField::Object && frame.imagetyp != Some(ImageType::Light) {
+            continue;
+        }
+        let Some(value) = value_of(frame, field) else { continue };
         *out.entry(sf.folder.as_str()).or_default().entry(value.to_string()).or_default() += 1;
     }
     out
@@ -264,7 +283,11 @@ pub fn infer(
             let Some(frame_id) = frame_id_of(sf) else { continue };
             let found: Result<(String, String), String> = match field {
                 FillField::FrameType => frame_type_from_folder(&sf.folder)
-                    .map(|(kind, folder)| (kind.to_string(), format!("folder '{folder}' in its path")))
+                    .map(|(kind, folder)| {
+                        let (value, master) = frame_of(sf).map_or((kind.to_string(), false), |f| kind_for(f, kind));
+                        let evidence = format!("folder '{folder}' in its path");
+                        (value, if master { format!("{evidence}; {IS_A_MASTER}") } else { evidence })
+                    })
                     .ok_or_else(|| {
                         "no folder in its path is named for a frame type (Lights, Darks, Flats, Bias, DarkFlats)".to_string()
                     }),
@@ -301,8 +324,17 @@ pub fn by_instruction(frames: &[ScopedFrame], field: FillField, value: &str) -> 
     frames
         .iter()
         .filter(|sf| field.is_missing(sf))
-        .filter_map(frame_id_of)
-        .map(|frame_id| Proposal { frame_id, field, value: value.to_string(), evidence: BY_INSTRUCTION.to_string() })
+        .filter_map(|sf| {
+            let frame_id = frame_id_of(sf)?;
+            // A frame type said for a master is the master kind of it (see `master_of`).
+            let master = field == FillField::FrameType && frame_of(sf).is_some_and(|f| f.is_master);
+            let (value, evidence) = if master {
+                (master_of(value), format!("{BY_INSTRUCTION}; {IS_A_MASTER}"))
+            } else {
+                (value.to_string(), BY_INSTRUCTION.to_string())
+            };
+            Some(Proposal { frame_id, field, value, evidence })
+        })
         .collect()
 }
 
@@ -339,17 +371,28 @@ pub fn normalize_statement(field: FillField, value: &str) -> Result<String, Stri
             kind.map(str::to_string)
                 .ok_or_else(|| format!("'{value}' is not a frame type to set; use light, dark, flat, bias or darkflat"))
         }
+        FillField::Date if is_date_only(value) => Err(format!(
+            "'{value}' has no time: give the time too (YYYY-MM-DD HH:MM:SS): the night a frame belongs to is decided by its time"
+        )),
         FillField::Date => normalize_date(value).ok_or_else(|| {
-            format!("'{value}' is not a date to set; use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS (UTC), from 1990 to 2100")
+            format!("'{value}' is not a date to set; use YYYY-MM-DD HH:MM:SS (UTC), from 1990 to 2100")
         }),
     }
 }
 
+/// `YYYY-MM-DD` and nothing after it.
+fn is_date_only(value: &str) -> bool {
+    let b = value.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && digits(&b[0..4]).is_some()
+        && digits(&b[5..7]).is_some()
+        && digits(&b[8..10]).is_some()
+}
+
 fn normalize_date(value: &str) -> Option<String> {
     let b = value.as_bytes();
-    if b.len() == 10 && b[4] == b'-' && b[7] == b'-' {
-        return valid((digits(&b[0..4])?, digits(&b[5..7])?, digits(&b[8..10])?, 0, 0, 0));
-    }
     let parts = dashed(b)?;
     if b.len() != 19 {
         return None;
@@ -530,6 +573,53 @@ mod tests {
     }
 
     #[test]
+    fn flats_never_name_a_lights_object() {
+        // Three flats of the folder say OBJECT = 'FlatField': that is not the light's target.
+        let flats: Vec<ScopedFrame> = (0..3)
+            .map(|k| {
+                frame(100 + k, "M31/L", &format!("f{k}.fits"), |f| {
+                    f.object = Some("FlatField".to_string());
+                    f.imagetyp = Some(ImageType::Flat);
+                })
+            })
+            .collect();
+        let (got, none) = infer(&[light(1, "M31/L", "m1.fits")], &flats, &[FillField::Object]);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(none[0].why, "fewer than 3 frames in this folder have it");
+        // Lights of the folder still speak for it, whatever else is there.
+        let mut beside = flats;
+        beside.extend(with_object(200, 3, "M31/L", "M 31"));
+        let (got, _) = infer(&[light(1, "M31/L", "m1.fits")], &beside, &[FillField::Object]);
+        assert_eq!(got[0].value, "M 31");
+        assert_eq!(got[0].evidence, "3 frames in this folder have OBJECT = 'M 31'");
+    }
+
+    #[test]
+    fn a_master_keeps_its_master_type() {
+        let master = |id: i64, folder: &str| frame(id, folder, "master.fits", |f| f.is_master = true);
+        let missing = vec![
+            master(1, "cal/Darks"),
+            master(2, "cal/Flats"),
+            master(3, "cal/Bias"),
+            master(4, "cal/DarkFlats"),
+            master(5, "cal/Lights"),
+            frame(6, "cal/Darks", "raw.fits", |_| {}),
+        ];
+        let (got, none) = infer(&missing, &[], &[FillField::FrameType]);
+        assert!(none.is_empty(), "{none:?}");
+        let kinds: Vec<(i64, &str)> = got.iter().map(|p| (p.frame_id, p.value.as_str())).collect();
+        assert_eq!(
+            kinds,
+            vec![(1, "MasterDark"), (2, "MasterFlat"), (3, "MasterBias"), (4, "MasterDarkFlat"), (5, "MasterLight"), (6, "Dark")]
+        );
+        assert_eq!(got[0].evidence, "folder 'Darks' in its path; the file is a master");
+        assert_eq!(got[5].evidence, "folder 'Darks' in its path");
+        // The user's word for a master is the master kind too.
+        let said = by_instruction(&missing[..1], FillField::FrameType, "Dark");
+        assert_eq!((said[0].value.as_str(), said[0].evidence.as_str()), ("MasterDark", "by your instruction; the file is a master"));
+    }
+
+    #[test]
     fn disagreeing_neighbours_make_no_proposal() {
         let mut neighbours = with_object(100, 30, "M31/L", "A");
         neighbours.extend(with_object(200, 10, "M31/L", "B"));
@@ -580,7 +670,9 @@ mod tests {
         assert_eq!(normalize_statement(FillField::FrameType, "Flats").as_deref(), Ok("Flat"));
         assert_eq!(normalize_statement(FillField::FrameType, "dark flat").as_deref(), Ok("DarkFlat"));
         assert!(normalize_statement(FillField::FrameType, "master dark").is_err());
-        assert_eq!(normalize_statement(FillField::Date, "2024-10-05").as_deref(), Ok("2024-10-05T00:00:00"));
+        let no_time = normalize_statement(FillField::Date, "2024-10-05").expect_err("a date needs a time");
+        assert!(no_time.contains("give the time too (YYYY-MM-DD HH:MM:SS)"), "{no_time}");
+        assert_eq!(normalize_statement(FillField::Date, "2024-10-05 22:15:03").as_deref(), Ok("2024-10-05T22:15:03"));
         assert_eq!(normalize_statement(FillField::Date, "2024-10-05T22:15:03").as_deref(), Ok("2024-10-05T22:15:03"));
         assert!(normalize_statement(FillField::Date, "last night").is_err());
         assert!(normalize_statement(FillField::Date, "2024-10-05T22:15:03Z").is_err());

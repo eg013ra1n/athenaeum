@@ -326,16 +326,25 @@ a frame whose stored value is not empty is left alone even where the parser coul
   the other frames of the same folder (the folder itself, not below it; Black Hole files do not count) that have the field set: at
   least 3 and all equal gives `40 frames in this folder have INSTRUME = 'ZWO ASI2600MM Pro'`; disagreeing frames give no proposal,
   `frames in this folder disagree: 30 'A', 10 'B'`; fewer than 3 give `fewer than 3 frames in this folder have it`. Neighbours are read
-  for the folders of the missing frames only, outside the scope too.
+  for the folders of the missing frames only, outside the scope too. The object is counted from lights only (a flat's `OBJECT` is not the
+  target; `flats_never_name_a_lights_object`). A frame that is a master (`is_master`, set by the parser from the file name) keeps its master
+  type: the proposal is `MasterDark` / `MasterFlat` / `MasterBias` / `MasterDarkFlat` / `MasterLight`, evidence `folder 'Darks' in its path; the
+  file is a master`, because the catalog derives `is_master` from the type text and `Dark` would turn the master into a raw frame
+  (`a_master_in_a_darks_folder_stays_a_master`).
 - **The user's word.** `statement {field, value}` covers the frames in the scope that miss that field; evidence `by your instruction`.
-  The value is normalized before any plan begins (a frame type to `Light` / `Dark` / `Flat` / `Bias` / `DarkFlat`, a date `YYYY-MM-DD` or
-  `YYYY-MM-DDTHH:MM:SS`, UTC) and a bad one is an `Invalid` in words. With a statement and no `fields`, only the statement's field is
+  The value is normalized before any plan begins (a frame type to `Light` / `Dark` / `Flat` / `Bias` / `DarkFlat`, or its master kind for a
+  master; a date `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DDTHH:MM:SS`, UTC) and a bad one is an `Invalid` in words. A date without a time is
+  refused (`give the time too (YYYY-MM-DD HH:MM:SS): the night a frame belongs to is decided by its time`, as the Set Date modal does: a
+  midnight UTC would land on the previous night; `a_date_without_a_time_is_refused`). **Reach:** with no `scope`, a statement (and each
+  inferred field) covers every frame of the whole catalog that misses the field, up to the 2 000-item cap; the tool's description says so. With a statement and no `fields`, only the statement's field is
   planned; `fields` are inferred in addition, except the statement's own.
 - **The plan.** One group per (field, value), largest first within a field, its items selected (`item:<frame id>:<field>`; columns
   Field / Now / Proposed). A frame that misses a field and has no evidence is a locked item in a group `<Field>: nothing proposed`, with the
   reason. A file that cannot be stamped is locked `not reachable ...`. Notes: `these changes take N frames out of their sessions and M out
   of calibration links` (`count_frame_metadata_relations`, as the metadata editor's confirm warns; only when a link goes) and that only
-  the catalog changes. A date group is per distinct time, so a folder of dated file names is one group per frame.
+  the catalog changes. A date is shown `YYYY-MM-DD HH:MM:SS` in the item, its action and the group title (`Proposal.value` keeps the `T` form), and its group is
+  per (field, folder), titled `Date: <folder> (<first> to <last>)`, each item with its own time (`dates_are_grouped_by_folder`); the apply
+  still writes equal values as one batch.
 - **Refused in words before the plan begins** (the waiting plan is never replaced): a scope that names nothing (the scope's own hints), a
   request with nothing to propose (what was missing and why, and that the user's value goes in `statement`), a plan of more than
   `PLAN_ITEM_CAP` (2 000) items, a bad statement.
