@@ -102,9 +102,8 @@ pub mod collab_live;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab_autopublish;
 // The Black Hole bulk move with its side effects (the auto-publish note, the `blackhole-changed` event): one
-// function for the Duplicates page and the assistant's applied plan (MCP plan, Task 11). Gated like
-// `collab_autopublish`, which it calls.
-#[cfg(all(feature = "render", feature = "solver"))]
+// function for the Duplicates page and the assistant's applied plan (MCP plan, Task 11). Not gated: only its
+// auto-publish note needs render+solver, and the assistant calls the move in every build.
 pub mod black_hole;
 // One tracker for every collab publish-family run (progress, one finished
 // event, last run, snapshot, cancel) and the prepared-frame bookkeeping.

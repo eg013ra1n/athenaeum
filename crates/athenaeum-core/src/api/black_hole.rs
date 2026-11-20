@@ -1,7 +1,7 @@
 //! The Black Hole bulk move with its side effects, in one place (MCP plan, Task 11).
 //!
 //! The Duplicates page's batch delete, and the assistant's applied Black Hole plan, both run this: the catalog move,
-//! then the collab auto-publish note, then the one `blackhole-changed` event the other views refresh on. The two
+//! then the collab auto-publish note (render+solver builds), then the one `blackhole-changed` event the other views refresh on. The two
 //! host wrappers (`commands/duplicates.rs`, `routes/duplicates.rs`) are one call each.
 
 use crate::api::{db, ApiError};
@@ -16,8 +16,8 @@ use crate::services::ServiceContext;
 /// assistant passes `None`, so only `blackhole-changed` reaches the pages. A file that cannot be moved is listed in
 /// `BulkMoveResult::failed`; it never aborts the batch.
 ///
-/// The emit cannot fail the move: a `ProgressEmitter` reports nothing back, and the host emitters log a failed send
-/// themselves.
+/// The emit cannot fail the move: a `ProgressEmitter` reports nothing back. Only the desktop emitter logs a failed
+/// send; the web's SSE emitter ignores a send with no browser connected, on purpose.
 pub fn bulk_move_to_black_hole(
     ctx: &ServiceContext,
     file_ids: &[i64],
@@ -35,6 +35,8 @@ pub fn bulk_move_to_black_hole(
         // `conn` drops here: the note below checks a connection out again (the pool has 8).
     };
 
+    // No auto-publish to note in a headless build (no render+solver).
+    #[cfg(all(feature = "render", feature = "solver"))]
     super::collab_autopublish::note_black_hole_change(ctx, file_ids);
 
     // One event, so the Black Hole tab, the file manager and missing-metadata views refresh. The payload has no
@@ -50,6 +52,7 @@ pub fn bulk_move_to_black_hole(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "render", feature = "solver"))]
     use crate::api::collab_autopublish::{is_set_dirty_for_test, reset_dirty_state_for_test, test_lock};
     use std::sync::Mutex;
 
@@ -107,11 +110,15 @@ mod tests {
 
     #[test]
     fn bulk_move_notes_and_emits_like_the_ui() {
+        #[cfg(all(feature = "render", feature = "solver"))]
         let _guard = test_lock();
+        #[cfg(all(feature = "render", feature = "solver"))]
         reset_dirty_state_for_test();
         let (_tmp, base) = crate::test_support::canonical_tempdir();
         let ctx = ServiceContext::new_for_tests(base.join("catalog.db"));
         let (set_id, files) = two_lights(&ctx);
+        #[cfg(not(all(feature = "render", feature = "solver")))]
+        let _ = set_id;
 
         let capture = Capture::default();
         let result = bulk_move_to_black_hole(&ctx, &files, "duplicates", Some(&capture), &capture).unwrap();
@@ -127,9 +134,11 @@ mod tests {
             events.iter().any(|(n, _)| n == "bulk-move-to-black-hole-progress"),
             "the UI's progress reaches its emitter: {events:?}"
         );
-        assert!(is_set_dirty_for_test(set_id), "the frame set is dirty for auto-publish");
-
-        reset_dirty_state_for_test();
+        #[cfg(all(feature = "render", feature = "solver"))]
+        {
+            assert!(is_set_dirty_for_test(set_id), "the frame set is dirty for auto-publish");
+            reset_dirty_state_for_test();
+        }
         let database = db(&ctx).unwrap();
         let rows: i64 = database.conn().query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 2);
@@ -138,7 +147,9 @@ mod tests {
 
     #[test]
     fn assistant_move_emits_no_progress_events() {
+        #[cfg(all(feature = "render", feature = "solver"))]
         let _guard = test_lock();
+        #[cfg(all(feature = "render", feature = "solver"))]
         reset_dirty_state_for_test();
         let (_tmp, base) = crate::test_support::canonical_tempdir();
         let ctx = ServiceContext::new_for_tests(base.join("catalog.db"));
@@ -158,6 +169,7 @@ mod tests {
             .query_row("SELECT from_where FROM black_hole LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(from, "assistant");
+        #[cfg(all(feature = "render", feature = "solver"))]
         reset_dirty_state_for_test();
         drop(ctx);
     }

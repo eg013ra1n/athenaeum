@@ -111,6 +111,21 @@ fn linked_frames(conn: &Connection, set_id: i64) -> Result<usize> {
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
+/// How many frames calibration links point from at the master in `file_id`: through the set that holds it, directly
+/// or through the sub-calibration chain (the rule `RebuiltCopy::linked_lights` reports). 0 when the file has no frame
+/// or its frame is in no calibration set. Any master file, a duplicate group's included.
+pub fn master_link_count(conn: &Connection, file_id: i64) -> Result<usize> {
+    let frame_id: Option<i64> = conn
+        .query_row("SELECT id FROM frames WHERE file_id = ?1 ORDER BY id LIMIT 1", params![file_id], |r| r.get(0))
+        .optional()
+        .with_context(|| format!("read the frame of file {file_id}"))?;
+    let Some(frame_id) = frame_id else { return Ok(0) };
+    match set_of_frame(conn, frame_id)? {
+        Some(set) => linked_frames(conn, set),
+        None => Ok(0),
+    }
+}
+
 /// The shared parameters of a group, in words (the first copy's, which equal the others' to the key's precision).
 fn params_label(line: &FileLine) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -197,10 +212,7 @@ pub fn find_rebuilt_master_copies(
         let mut copies = Vec::with_capacity(members.len());
         for (file_id, frame_id, line) in members {
             let calibration_set_id = set_of_frame(conn, frame_id)?;
-            let linked_lights = match calibration_set_id {
-                Some(set) => linked_frames(conn, set)?,
-                None => 0,
-            };
+            let linked_lights = master_link_count(conn, file_id)?;
             copies.push(RebuiltCopy { file_id, line, calibration_set_id, linked_lights });
         }
         out.push(RebuiltMasterGroup { handle, params_label: label, copies });
@@ -366,6 +378,65 @@ mod tests {
         assert_eq!(g.copies[2].linked_lights, 0);
         assert_eq!(g.copies[1].calibration_set_id, None);
         assert!(g.params_label.contains("300 s") && g.params_label.contains("-10.0"), "{}", g.params_label);
+    }
+
+    #[test]
+    fn a_copy_linked_through_a_flat_set_counts() {
+        let conn = catalog();
+        db::upsert_scan_root(&conn, &lib_root(), "calibration_library").expect("root");
+        let (first, first_frame) = add(&conn, &Master::dark("MasterDark_300s.xisf"));
+        let (second, _) = add(&conn, &Master::dark("MasterDark_300s_2.xisf"));
+        let dark_set = linked_set(&conn, first_frame, 0);
+        // A flat set uses the dark set as its sub-calibration; one light is linked to the flat set only.
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library, instrume) VALUES ('MasterFlat', '2024-10-05', 1, 'Cam')",
+            [],
+        )
+        .expect("flat set");
+        let flat_set = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+             VALUES (?1, 'calibration_set', ?2, 'Dark', '2024-10-05T00:00:00Z')",
+            [flat_set, dark_set],
+        )
+        .expect("flat uses dark");
+        let light_file = db::insert_file(
+            &conn,
+            &File {
+                id: None,
+                path: format!("{}{}light.fits", other_dir(), std::path::MAIN_SEPARATOR),
+                filename: "light.fits".to_string(),
+                size: 1,
+                modified_at: Utc::now(),
+                format: FileFormat::FITS,
+                created_at: Utc::now(),
+                content_hash: None,
+                archived_in_operation: None,
+                archive_zip_path: None,
+                archive_path_in_zip: None,
+                uuid: None,
+                updated_at: None,
+            },
+        )
+        .expect("light file");
+        let light = db::insert_frame(
+            &conn,
+            &Frame { file_id: light_file, imagetyp: Some(ImageType::Light), ..Default::default() },
+        )
+        .expect("light frame");
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+             VALUES (?1, 'frame', ?2, 'Flat', '2024-10-05T00:00:00Z')",
+            [light, flat_set],
+        )
+        .expect("light uses flat");
+
+        assert!(master_link_count(&conn, first).expect("count") > 0);
+        assert_eq!(master_link_count(&conn, second).expect("count"), 0);
+        let groups = find_rebuilt_master_copies(&conn, None).expect("find");
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert!(groups[0].copies[0].linked_lights > 0, "{groups:?}");
+        assert_eq!(groups[0].copies[0].linked_lights, master_link_count(&conn, first).expect("count"));
     }
 
     #[test]
