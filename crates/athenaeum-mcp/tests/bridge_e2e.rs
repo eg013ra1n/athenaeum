@@ -21,7 +21,7 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ProtocolVersion};
 use rmcp::service::{NotificationContext, RunningService};
 use rmcp::{ClientLifecycleMode, RoleClient};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
@@ -472,5 +472,181 @@ async fn two_bridges_one_host() {
     // The other conversation goes on.
     assert_from(&b.ask("query_frames").await, "athenaeum-dev", &rig);
     b.close().await;
+    rig.finish().await;
+}
+
+// ---- raw lines: one answer per request, bytes untouched ----
+
+const REPLAY_ID: &str = "athenaeum-bridge-replay";
+const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"raw","version":"0"}}}"#;
+const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+const CALL: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_frames","arguments":{}}}"#;
+
+/// A bridge driven by lines written by hand; every line it writes to the client is collected, whole.
+struct Raw {
+    input: tokio::io::DuplexStream,
+    seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    reader: JoinHandle<()>,
+    bridge: JoinHandle<io::Result<()>>,
+}
+
+impl Raw {
+    fn start(opts: BridgeOptions) -> Self {
+        let (bridge_in, input) = tokio::io::duplex(1 << 20);
+        let (client_in, bridge_out) = tokio::io::duplex(1 << 20);
+        let bridge = tokio::spawn(run_bridge(opts, bridge_in, bridge_out));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let reader = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(client_in);
+            loop {
+                let mut line = Vec::new();
+                match tokio::io::AsyncBufReadExt::read_until(&mut lines, b'\n', &mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        line.pop();
+                        sink.lock().expect("the sink").push(line);
+                    }
+                }
+            }
+        });
+        Self { input, seen, reader, bridge }
+    }
+
+    async fn send(&mut self, line: &[u8]) {
+        self.input.write_all(line).await.expect("the bridge reads");
+        self.input.write_all(b"\n").await.expect("the bridge reads");
+    }
+
+    fn responses_to(&self, id: &Value) -> usize {
+        self.seen.lock().expect("the sink").iter().filter_map(|l| serde_json::from_slice::<Value>(l).ok()).filter(|v| &v["id"] == id && v.get("method").is_none()).count()
+    }
+
+    async fn wait_for_response(&self, id: Value, within: Duration) {
+        let deadline = tokio::time::Instant::now() + within;
+        while self.responses_to(&id) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "no answer to {id} in {within:?}; got {} lines", self.seen.lock().expect("the sink").len());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Closes the client's input and returns every line the bridge wrote, parsed.
+    async fn finish(self) -> Vec<Value> {
+        let Self { input, seen, reader, bridge } = self;
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(8), bridge).await.expect("the bridge ends").expect("joins").expect("ends cleanly");
+        tokio::time::timeout(Duration::from_secs(5), reader).await.expect("the client side ends").expect("joins");
+        let lines = seen.lock().expect("the sink").clone();
+        lines.iter().map(|l| serde_json::from_slice(l).unwrap_or_else(|e| panic!("the bridge wrote a line that is not JSON ({e}): {}", String::from_utf8_lossy(l)))).collect()
+    }
+}
+
+/// A host that handshakes, answers the `initialize` it is sent, records every line, and closes at the first `tools/call`.
+async fn quitting_host(listener: athenaeum_core::mcp::channel::Listener) -> Vec<Vec<u8>> {
+    use tokio::io::AsyncBufReadExt;
+    let stream = listener.accept().await.expect("the bridge connects");
+    let (read, mut write) = tokio::io::split(stream);
+    let mut read = tokio::io::BufReader::new(read);
+    let mut hello = Vec::new();
+    read.read_until(b'\n', &mut hello).await.expect("the handshake");
+    assert_eq!(hello, format!("ATHENAEUM-MCP/1 {KEY_A}\n").into_bytes());
+    write.write_all(format!("OK athenaeum-dev {VERSION}\n").as_bytes()).await.expect("the reply");
+    let mut lines = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        if read.read_until(b'\n', &mut line).await.expect("a line") == 0 {
+            break;
+        }
+        line.pop();
+        let is_initialize = serde_json::from_slice::<Value>(&line).is_ok_and(|v| v["method"] == "initialize");
+        let is_call = serde_json::from_slice::<Value>(&line).is_ok_and(|v| v["method"] == "tools/call");
+        lines.push(line);
+        if is_initialize {
+            let result = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"athenaeum-dev","version":"9.9.9-test"}}}"#;
+            write.write_all(format!("{result}\n").as_bytes()).await.expect("the answer");
+        }
+        if is_call {
+            break; // the app quits without answering the call
+        }
+    }
+    lines
+}
+
+#[tokio::test]
+async fn a_call_the_app_never_answers_is_answered_once_and_bytes_pass_untouched() {
+    let rig = dev_rig();
+    write_marker_and_key(&rig);
+    let (endpoint, listener) = bind(&rig.dir()).expect("a channel to listen on");
+    std::fs::write(rig.dir().join("endpoint"), endpoint.to_text()).expect("the endpoint");
+    let host = tokio::spawn(quitting_host(listener));
+
+    let not_json: &[u8] = b"this is not json at all";
+    let not_utf8: &[u8] = b"\xff\xfe not utf-8 {\x80\x81}";
+    let mut long = vec![b'x'; 70 * 1024];
+    long[0] = b'#';
+
+    let mut raw = Raw::start(rig.options(Build::Dev));
+    raw.send(INITIALIZE.as_bytes()).await;
+    raw.wait_for_response(json!(1), Duration::from_secs(10)).await;
+    raw.send(INITIALIZED.as_bytes()).await;
+    raw.send(not_json).await;
+    raw.send(not_utf8).await;
+    raw.send(&long).await;
+    raw.send(CALL.as_bytes()).await;
+    raw.wait_for_response(json!(2), Duration::from_secs(10)).await;
+    // A second answer or a leaked reply would come after the first: give them time to show up.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let out = raw.finish().await;
+
+    let forwarded = tokio::time::timeout(Duration::from_secs(5), host).await.expect("the fake host ends").expect("joins");
+    let expected: Vec<&[u8]> = vec![INITIALIZE.as_bytes(), INITIALIZED.as_bytes(), not_json, not_utf8, &long, CALL.as_bytes()];
+    assert_eq!(forwarded.len(), expected.len(), "the host saw every line once");
+    for (got, want) in forwarded.iter().zip(&expected) {
+        assert!(got == want, "a line reached the host changed ({} bytes in, {} out)", want.len(), got.len());
+    }
+
+    let answers_to = |id: Value| out.iter().filter(|v| v["id"] == id && v.get("method").is_none()).count();
+    assert_eq!(answers_to(json!(1)), 1, "one answer to initialize: {out:?}");
+    assert_eq!(answers_to(json!(2)), 1, "one answer to the call: {out:?}");
+    assert_eq!(answers_to(json!(REPLAY_ID)), 0, "the replay's answer never reaches the client: {out:?}");
+    assert_eq!(out.len(), 2, "nothing else was written to the client: {out:?}");
+    let call = out.iter().find(|v| v["id"] == 2).expect("the call's answer");
+    let words = unavailable_text(&Unavailable::NotRunning, Build::Dev);
+    assert!(call.to_string().contains(&words), "the call is answered in words: {call}");
+
+    remove_endpoint(&endpoint);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn a_hung_app_costs_one_handshake_wait_not_one_per_request() {
+    let rig = dev_rig();
+    write_marker_and_key(&rig);
+    let (endpoint, listener) = bind(&rig.dir()).expect("a channel to listen on");
+    std::fs::write(rig.dir().join("endpoint"), endpoint.to_text()).expect("the endpoint");
+    // Accepts every connection and never says a word.
+    let host = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok(stream) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+
+    let started = tokio::time::Instant::now();
+    let mut raw = Raw::start(rig.options(Build::Dev));
+    raw.send(INITIALIZE.as_bytes()).await;
+    raw.wait_for_response(json!(1), Duration::from_secs(20)).await;
+    raw.send(INITIALIZED.as_bytes()).await;
+    raw.send(CALL.as_bytes()).await;
+    raw.wait_for_response(json!(2), Duration::from_secs(20)).await;
+    let took = started.elapsed();
+    // The bridge's first connect waits out the 5 s handshake once; the requests that follow it right away do not wait again.
+    assert!(took < Duration::from_secs(8), "two requests took {took:?}: each one waited for the hung app");
+    let out = raw.finish().await;
+    assert_eq!(out.len(), 2, "{out:?}");
+
+    host.abort();
+    let _ = host.await;
+    remove_endpoint(&endpoint);
     rig.finish().await;
 }

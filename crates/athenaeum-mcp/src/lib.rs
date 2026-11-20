@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -44,7 +44,7 @@ const FLAP_WINDOW: Duration = Duration::from_millis(500);
 const DRAIN_WINDOW: Duration = Duration::from_secs(2);
 /// The id of the `initialize` the bridge replays into a new session; its reply never reaches the client.
 const REPLAY_ID: &str = "athenaeum-bridge-replay";
-const LIST_CHANGED: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+const LIST_CHANGED: &[u8] = br#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 
 type BoxRead = Box<dyn AsyncRead + Send + Unpin>;
 type BoxWrite = Box<dyn AsyncWrite + Send + Unpin>;
@@ -204,34 +204,64 @@ async fn connect(opts: &BridgeOptions) -> Result<(BoxRead, BoxWrite), Unavailabl
 
 // ---- one side of the pipe: lines in, lines out ----
 
-/// Writes each queued line and a newline, flushing every one; ends when the queue closes or a write fails.
-async fn write_lines(mut out: BoxWrite, mut queue: mpsc::UnboundedReceiver<String>) {
+/// Writes each queued line and a newline, flushing every one; ends when the queue closes or a write fails (and says so).
+/// Lines are bytes: the bridge never needs a line to be text.
+async fn write_lines(mut out: BoxWrite, mut queue: mpsc::UnboundedReceiver<Vec<u8>>, to: &'static str) {
     while let Some(mut line) = queue.recv().await {
-        line.push('\n');
-        if out.write_all(line.as_bytes()).await.is_err() || out.flush().await.is_err() {
+        line.push(b'\n');
+        let written = match out.write_all(&line).await {
+            Ok(()) => out.flush().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            tracing::warn!(error = %e, to, "a write failed; this direction ends");
             break;
         }
     }
     let _ = out.shutdown().await;
 }
 
+/// Reads newline-ended lines as bytes (a client that sends something that is not UTF-8 is passed through, not refused).
+/// A line cut short by a cancelled `next_line` stays in `buf` and is continued by the next call.
+struct ByteLines {
+    reader: BufReader<BoxRead>,
+    buf: Vec<u8>,
+}
+
+impl ByteLines {
+    fn new(read: BoxRead) -> Self {
+        Self { reader: BufReader::new(read), buf: Vec::new() }
+    }
+
+    /// The next line without its `\n`, or `None` at the end of the stream.
+    async fn next_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.reader.read_until(b'\n', &mut self.buf).await?;
+        if self.buf.last() == Some(&b'\n') {
+            self.buf.pop();
+            return Ok(Some(std::mem::take(&mut self.buf)));
+        }
+        // The stream ended: a last line without its newline is still a line.
+        Ok((!self.buf.is_empty()).then(|| std::mem::take(&mut self.buf)))
+    }
+}
+
 /// A peer's two directions. Writes go through a queue to a task of their own, so a peer that is slow to read can never
 /// stop the bridge from reading the other side.
 struct Link {
-    lines: Lines<BufReader<BoxRead>>,
-    queue: mpsc::UnboundedSender<String>,
+    lines: ByteLines,
+    queue: mpsc::UnboundedSender<Vec<u8>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl Link {
     fn new(read: BoxRead, write: BoxWrite, mut tasks: Vec<JoinHandle<()>>) -> Self {
         let (queue, rx) = mpsc::unbounded_channel();
-        tasks.push(tokio::spawn(write_lines(write, rx)));
-        Self { lines: BufReader::new(read).lines(), queue, tasks }
+        tasks.push(tokio::spawn(write_lines(write, rx, "the app")));
+        Self { lines: ByteLines::new(read), queue, tasks }
     }
 
     /// Queues a line; `false` when the peer's writer has ended.
-    fn send(&self, line: String) -> bool {
+    fn send(&self, line: Vec<u8>) -> bool {
         self.queue.send(line).is_ok()
     }
 
@@ -266,20 +296,24 @@ struct Peer {
 
 struct Shape {
     id: Option<Value>,
+    /// `error.message` of a response that carries an `error` (`Some("")` when it has none).
+    error: Option<String>,
     method: Option<String>,
     /// `params.requestId` of a `notifications/cancelled`.
     cancelled: Option<Value>,
 }
 
 impl Shape {
-    fn of(line: &str) -> Option<Self> {
-        let value: Value = serde_json::from_str(line).ok()?;
+    /// What the bridge needs to know of a line; `None` when it is not a JSON object (it is passed on all the same).
+    fn of(line: &[u8]) -> Option<Self> {
+        let value: Value = serde_json::from_slice(line).ok()?;
         let object = value.as_object()?;
         let method = object.get("method").and_then(Value::as_str).map(str::to_string);
         let cancelled = (method.as_deref() == Some("notifications/cancelled"))
             .then(|| object.get("params").and_then(|p| p.get("requestId")).cloned())
             .flatten();
-        Some(Self { id: object.get("id").filter(|id| !id.is_null()).cloned(), method, cancelled })
+        let error = object.get("error").map(|e| e.get("message").and_then(Value::as_str).unwrap_or("").chars().take(200).collect());
+        Some(Self { id: object.get("id").filter(|id| !id.is_null()).cloned(), error, method, cancelled })
     }
 
     fn is_request(&self) -> bool {
@@ -293,27 +327,30 @@ impl Shape {
 
 /// A request the peer has not answered yet.
 struct Pending {
-    line: String,
+    line: Vec<u8>,
     is_initialize: bool,
 }
 
 struct Bridge {
     opts: BridgeOptions,
-    client: mpsc::UnboundedSender<String>,
+    client: mpsc::UnboundedSender<Vec<u8>>,
     peer: Peer,
     /// The client's `initialize` request and `notifications/initialized`, kept to replay into a new session.
-    initialize: Option<String>,
-    initialized: Option<String>,
+    initialize: Option<Vec<u8>>,
+    initialized: Option<Vec<u8>>,
     /// Requests sent and not answered, by id (as JSON text), in the order they were sent.
     inflight: BTreeMap<u64, (String, Pending)>,
     next_seq: u64,
+    /// When the last connect attempt ENDED (an attempt that hangs for the handshake window must not make the next
+    /// request look overdue for another one).
     last_try: Instant,
 }
 
 impl Bridge {
-    async fn start(opts: BridgeOptions, client: mpsc::UnboundedSender<String>) -> Self {
+    async fn start(opts: BridgeOptions, client: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        let attempt = connect(&opts).await;
         let last_try = Instant::now();
-        let peer = match connect(&opts).await {
+        let peer = match attempt {
             Ok((read, write)) => {
                 tracing::info!(build = opts.build.server_name(), "connected to the app");
                 Peer { side: Side::Live, link: Link::new(read, write, Vec::new()) }
@@ -326,12 +363,12 @@ impl Bridge {
         Self { opts, client, peer, initialize: None, initialized: None, inflight: BTreeMap::new(), next_seq: 0, last_try }
     }
 
-    fn to_client(&self, line: String) {
+    fn to_client(&self, line: Vec<u8>) {
         let _ = self.client.send(line);
     }
 
-    async fn on_client_line(&mut self, line: String) {
-        if line.trim().is_empty() {
+    async fn on_client_line(&mut self, line: Vec<u8>) {
+        if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
         let shape = Shape::of(&line);
@@ -362,13 +399,17 @@ impl Bridge {
         }
     }
 
-    async fn on_peer_line(&mut self, line: io::Result<Option<String>>) {
+    async fn on_peer_line(&mut self, line: io::Result<Option<Vec<u8>>>) {
         match line {
             Ok(Some(line)) => {
                 if let Some(shape) = Shape::of(&line) {
                     if shape.is_response() {
                         let id = shape.id.unwrap_or(Value::Null);
                         if id.as_str() == Some(REPLAY_ID) {
+                            // The replay's answer is the bridge's own business, but a refusal is worth a line.
+                            if let Some(message) = &shape.error {
+                                tracing::warn!(error = %message, "the app refused the replayed initialize");
+                            }
                             return;
                         }
                         let key = id.to_string();
@@ -387,8 +428,9 @@ impl Bridge {
 
     /// While the app does not answer: look again. A live app takes over; another reason replaces the words.
     async fn try_again(&mut self) {
+        let attempt = connect(&self.opts).await;
         self.last_try = Instant::now();
-        match connect(&self.opts).await {
+        match attempt {
             Ok((read, write)) => {
                 tracing::info!(build = self.opts.build.server_name(), "connected to the app");
                 self.install(Peer { side: Side::Live, link: Link::new(read, write, Vec::new()) }, true).await;
@@ -415,7 +457,7 @@ impl Bridge {
                 for (_, (id, _)) in std::mem::take(&mut self.inflight) {
                     let id: Value = serde_json::from_str(&id).unwrap_or(Value::Null);
                     let error = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": text } });
-                    self.to_client(error.to_string());
+                    self.to_client(error.to_string().into_bytes());
                 }
                 let peer = fallback_peer(&self.opts, reason);
                 self.install(peer, false).await;
@@ -423,8 +465,8 @@ impl Bridge {
             Side::Live => {
                 tracing::info!(build = self.opts.build.server_name(), "the app closed the connection");
                 let flapping = self.last_try.elapsed() < FLAP_WINDOW;
-                self.last_try = Instant::now();
                 let attempt = if flapping { Err(Unavailable::NotRunning) } else { connect(&self.opts).await };
+                self.last_try = Instant::now();
                 match attempt {
                     Ok((read, write)) => {
                         tracing::info!(build = self.opts.build.server_name(), "connected to the app");
@@ -448,10 +490,10 @@ impl Bridge {
         // An `initialize` still waiting for its reply is resent with the rest, under its own id.
         let waiting = self.inflight.values().any(|(_, pending)| pending.is_initialize);
         if let (Some(init), false) = (&self.initialize, waiting) {
-            match serde_json::from_str::<Value>(init) {
+            match serde_json::from_slice::<Value>(init) {
                 Ok(mut value) => {
                     value["id"] = json!(REPLAY_ID);
-                    self.peer.link.send(value.to_string());
+                    self.peer.link.send(value.to_string().into_bytes());
                     if let Some(done) = &self.initialized {
                         self.peer.link.send(done.clone());
                     }
@@ -462,8 +504,10 @@ impl Bridge {
         for (_, pending) in self.inflight.values() {
             self.peer.link.send(pending.line.clone());
         }
-        if announce {
-            self.to_client(LIST_CHANGED.to_string());
+        // A client whose `initialize` is still unanswered has not been told the server is up: the new session answers
+        // that `initialize`, and a list-changed before it would reach the client too early.
+        if announce && !waiting {
+            self.to_client(LIST_CHANGED.to_vec());
         }
     }
 
@@ -500,8 +544,8 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (to_client, queue) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(write_lines(Box::new(client_out), queue));
-    let mut from_client = BufReader::new(client_in).lines();
+    let writer = tokio::spawn(write_lines(Box::new(client_out), queue, "the client"));
+    let mut from_client = ByteLines::new(Box::new(client_in));
     let mut bridge = Bridge::start(opts, to_client).await;
     let outcome = loop {
         tokio::select! {
@@ -554,12 +598,27 @@ mod tests {
 
     #[test]
     fn shapes_tell_requests_from_responses() {
-        let request = Shape::of(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#).expect("parses");
+        let request = Shape::of(br#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#).expect("parses");
         assert!(request.is_request() && !request.is_response());
-        let response = Shape::of(r#"{"jsonrpc":"2.0","id":"x","result":{}}"#).expect("parses");
+        let response = Shape::of(br#"{"jsonrpc":"2.0","id":"x","result":{}}"#).expect("parses");
         assert!(response.is_response());
-        let note = Shape::of(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).expect("parses");
+        let note = Shape::of(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).expect("parses");
         assert!(!note.is_request() && !note.is_response());
-        assert!(Shape::of("not json").is_none());
+        assert!(Shape::of(b"not json").is_none());
+        assert!(Shape::of(b"\xff\xfe").is_none());
+        let refusal = Shape::of(br#"{"jsonrpc":"2.0","id":"x","error":{"code":-32600,"message":"no"}}"#).expect("parses");
+        assert!(refusal.is_response() && refusal.error.as_deref() == Some("no"));
+        assert!(response.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn lines_are_bytes() {
+        let input: &[u8] = b"{\"a\":1}\n\xff\xfe\x80\n\nlast without newline";
+        let mut lines = ByteLines::new(Box::new(input));
+        assert_eq!(lines.next_line().await.expect("a line"), Some(b"{\"a\":1}".to_vec()));
+        assert_eq!(lines.next_line().await.expect("a line"), Some(b"\xff\xfe\x80".to_vec()));
+        assert_eq!(lines.next_line().await.expect("a line"), Some(Vec::new()));
+        assert_eq!(lines.next_line().await.expect("a line"), Some(b"last without newline".to_vec()));
+        assert_eq!(lines.next_line().await.expect("the end"), None);
     }
 }

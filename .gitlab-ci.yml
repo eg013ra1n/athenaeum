@@ -39,7 +39,7 @@ variables:
   GIT_CLEAN_FLAGS: -ffdx -e target/ -e .cargo/ -e .npm/
 
 # --- Gate (tags only) ---
-# One refusal before a single build minute is spent: the six version files
+# One refusal before a single build minute is spent: the seven version files
 # must equal the tag (bump.sh's job to make them so). The other half of the
 # gate, gate:tests — the tagged commit's GitHub check-suite, the only place
 # tests actually run — lives down in the `build` stage, not here (see its

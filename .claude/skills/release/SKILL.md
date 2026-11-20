@@ -52,7 +52,7 @@ that can be released and to read its verdicts.
 3. **The release commit contains ONLY** `RELEASE_NOTES.md`, the seven version files
    and `Cargo.lock`. A code fix goes in its own commit BEFORE this one and gets
    its own green GitHub run first. `git status --short` must list exactly those
-   eight paths. Commit: `chore(release): vX.Y.Z — <tagline without the product name>`.
+   nine paths. Commit: `chore(release): vX.Y.Z — <tagline without the product name>`.
 4. **Push main, wait for green, tag.**
    `git push all main` → wait for the GitHub run of that commit
    (`gh run watch` or poll `gh run list --commit <sha>`) → `git tag vX.Y.Z && git push all vX.Y.Z`.
