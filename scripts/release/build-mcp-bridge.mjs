@@ -68,7 +68,7 @@ const cargoArgs = ['build', '-p', 'athenaeum-mcp', '--message-format=json-render
 if (!args.debug) cargoArgs.push('--release');
 if (args.target) cargoArgs.push('--target', args.target);
 
-console.error(`build-mcp-bridge: cargo ${cargoArgs.slice(0, -1).join(' ')} (${triple})`);
+console.error(`build-mcp-bridge: cargo ${cargoArgs.join(' ')} (${triple})`);
 const build = spawnSync('cargo', cargoArgs, {
   cwd: root,
   encoding: 'utf8',

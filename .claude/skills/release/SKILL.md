@@ -134,7 +134,9 @@ committed in `crates/athenaeum-tauri/tauri.conf.json`
 is the RELEASE key, not a throwaway one from a local rehearsal (§7.2 of the
 spec). Locally, `npm run tauri build` (`bundle.createUpdaterArtifacts:
 true`) refuses to bundle without both variables exported in the shell —
-`npm run tauri dev` does not need them.
+`npm run tauri dev` does not need them. A local bundle has no `athenaeum-mcp` bridge unless
+`node scripts/release/build-mcp-bridge.mjs` runs first and the build gets
+`--config crates/athenaeum-tauri/tauri.mcp-bridge.json` (use `npx tauri build`; see `docs/release/README.md`).
 
 ## Re-tagging
 

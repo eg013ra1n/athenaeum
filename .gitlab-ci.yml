@@ -94,8 +94,11 @@ build:windows:
     - npm install
     # The assistant bridge rides in the installers as a sidecar (docs/release/README.md):
     # build it for the host triple, then list it with the --config overlay.
+    # `npx tauri build`, never `npm run tauri build -- ...`: PowerShell can eat the bare `--`,
+    # so the overlay would be dropped and the installers would ship with no bridge. There is no
+    # cheap bundle check on this job; the npx form is the guard.
     - node scripts/release/build-mcp-bridge.mjs
-    - npm run tauri build -- --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - npx tauri build --config crates/athenaeum-tauri/tauri.mcp-bridge.json
   artifacts:
     name: "athenaeum-windows-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -135,7 +138,9 @@ build:linux:
     # The assistant bridge rides in the .deb as a sidecar (docs/release/README.md);
     # the AppImage copies it to <app-data>/bin at run time, nothing extra here.
     - node scripts/release/build-mcp-bridge.mjs
-    - npm run tauri build -- --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - npx tauri build --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    # A .deb without the bridge fails the job here, not on a user's machine.
+    - 'for DEB in target/release/bundle/deb/*.deb; do dpkg-deb -c "$DEB" | grep -q "usr/bin/athenaeum-mcp$" || { echo "FATAL: $DEB has no usr/bin/athenaeum-mcp"; exit 1; }; done'
   artifacts:
     name: "athenaeum-linux-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -275,9 +280,11 @@ build:macos:
     # Each target gets its own bridge (docs/release/README.md); Tauri signs the
     # sidecar with the app.
     - node scripts/release/build-mcp-bridge.mjs --target aarch64-apple-darwin
-    - npm run tauri build -- --target aarch64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - npx tauri build --target aarch64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - '[ -x "target/aarch64-apple-darwin/release/bundle/macos/Athenaeum.app/Contents/MacOS/athenaeum-mcp" ] || { echo "FATAL: aarch64-apple-darwin .app has no athenaeum-mcp"; exit 1; }'
     - node scripts/release/build-mcp-bridge.mjs --target x86_64-apple-darwin
-    - npm run tauri build -- --target x86_64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - npx tauri build --target x86_64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - '[ -x "target/x86_64-apple-darwin/release/bundle/macos/Athenaeum.app/Contents/MacOS/athenaeum-mcp" ] || { echo "FATAL: x86_64-apple-darwin .app has no athenaeum-mcp"; exit 1; }'
     - |
       for DMG in target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
                  target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do

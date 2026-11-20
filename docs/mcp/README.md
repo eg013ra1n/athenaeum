@@ -205,7 +205,7 @@ overlay `crates/athenaeum-tauri/tauri.mcp-bridge.json`, which the release pipeli
 `cargo build` / `cargo test -p athenaeum-tauri` whose listed sidecar file is missing, so the committed `tauri.conf.json` does not
 list it. `scripts/release/build-mcp-bridge.mjs [--target <triple>] [--debug]` builds the bridge and copies it to
 `crates/athenaeum-tauri/binaries/athenaeum-mcp-<triple>[.exe]` (gitignored), the name Tauri wants; the pipeline runs it with each
-build's own target before each `npm run tauri build` (`docs/release/README.md`). The bridge lands at
+build's own target before each `npx tauri build` (`docs/release/README.md`). The bridge lands at
 `Athenaeum.app/Contents/MacOS/athenaeum-mcp` (signed and notarized with the app), beside the exe in the MSI and setup exe, and
 `/usr/bin/athenaeum-mcp` in the `.deb`. In `tauri dev` it is `target/debug/athenaeum-mcp` (build it with
 `cargo build -p athenaeum-mcp`). The configuration names the file next to the app's executable, except on two platforms:
