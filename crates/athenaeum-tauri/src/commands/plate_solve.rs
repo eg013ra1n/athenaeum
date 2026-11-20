@@ -5,72 +5,12 @@ use serde::Serialize;
 use tauri::State;
 
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
-use athenaeum_core::plate_solve::dso_lookup::{DsoCatalog, ResolvedObject};
+use athenaeum_core::api::plate_solve::PlateSolveActivity;
+use athenaeum_core::plate_solve::dso_lookup::ResolvedObject;
 use athenaeum_core::plate_solve::storage;
-use athenaeum_core::plate_solve::CatalogOpenError;
+use athenaeum_core::services::PlateSolveOrigin;
 
 use super::AppState;
-
-/// Resolve and open the additive density-tier catalog stack under
-/// `<app-data>/catalogs/smac_gaia` (base → deepest), or a legacy single
-/// `stars.smac` there as a 1-layer fallback. Opens fresh each call (mmap is
-/// cheap); the batch path opens once and shares across workers. Errors if no
-/// catalog is installed.
-pub(super) fn resolve_layer_caches(
-    state: &AppState,
-) -> Result<Vec<Arc<solvemyastro::StarCache>>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let db_path = db.path().to_path_buf();
-    let parent = db_path
-        .parent()
-        .ok_or("Cannot determine app data directory")?;
-    athenaeum_core::plate_solve::open_catalog_layers(parent).map_err(|e| match e {
-        CatalogOpenError::NotInstalled { root } => format!(
-            "solvemyastro star catalog not found under {}. \
-             Please download the Gaia DR3 prebuilt catalog from Settings → Plate Solving.",
-            root.display()
-        ),
-        CatalogOpenError::Open { dir, error } => {
-            format!("Failed to open star cache at {}: {error}", dir.display())
-        }
-    })
-}
-
-/// Open the installed quad-index packs under `<app-data>/catalogs/smac_index`
-/// (empty when none are installed; a pack that does not open is skipped with a
-/// warning). Opened once per batch, like the catalog layers.
-pub(super) fn resolve_index_packs(state: &AppState) -> Vec<Arc<solvemyastro::QuadIndex>> {
-    let Some(db) = state.ctx.db.get() else {
-        return Vec::new();
-    };
-    let db_path = db.path().to_path_buf();
-    match db_path.parent() {
-        Some(parent) => athenaeum_core::plate_solve::open_index_packs(parent),
-        None => Vec::new(),
-    }
-}
-
-/// Lazy-load the DSO catalog once and cache it in the ServiceContext.
-fn get_dso_catalog(state: &AppState) -> Option<Arc<DsoCatalog>> {
-    {
-        let guard = state.ctx.dso_catalog.read().unwrap();
-        if let Some(ref cat) = *guard {
-            return Some(cat.clone());
-        }
-    }
-    match DsoCatalog::load() {
-        Ok(cat) => {
-            let arc = Arc::new(cat);
-            let mut guard = state.ctx.dso_catalog.write().unwrap();
-            *guard = Some(arc.clone());
-            Some(arc)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load DSO catalog");
-            None
-        }
-    }
-}
 
 // ========== Config Commands ==========
 
@@ -116,15 +56,17 @@ pub async fn plate_solve_batch(
     state: State<'_, AppState>,
     frame_ids: Vec<i64>,
 ) -> Result<(), String> {
-    let layer_caches = resolve_layer_caches(&state)?;
-    let index_packs = resolve_index_packs(&state);
-    let dso = get_dso_catalog(&state);
-    let prepared = athenaeum_core::api::plate_solve::prepare_plate_solve_batch(
+    use athenaeum_core::api::plate_solve as core;
+    let layer_caches = core::resolve_layer_caches(&state.ctx).map_err(|e| e.to_string())?;
+    let index_packs = core::resolve_index_packs(&state.ctx);
+    let dso = core::dso_catalog(&state.ctx);
+    let prepared = core::prepare_plate_solve_batch(
         &state.ctx,
         &frame_ids,
         layer_caches,
         index_packs,
         dso,
+        PlateSolveOrigin::Ui,
     )
     .map_err(|e| e.to_string())?;
 
@@ -141,15 +83,18 @@ pub async fn plate_solve_batch(
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn cancel_plate_solve(state: State<'_, AppState>) -> Result<(), String> {
-    let solves = state.ctx.active_plate_solves.lock().unwrap();
-    tracing::debug!(active_keys = ?solves.keys().collect::<Vec<_>>(), "cancel_plate_solve invoked");
-    if let Some(handle) = solves.get(&0) {
-        handle.cancel_flag.store(true, Ordering::Relaxed);
-        tracing::info!("plate solve cancel flag set");
-    } else {
-        tracing::warn!("no active plate solve handle, cancel had no effect");
-    }
+    athenaeum_core::api::plate_solve::cancel_plate_solve(&state.ctx);
     Ok(())
+}
+
+/// What the plate-solve slot is doing now: idle, or the running batch's origin,
+/// run id and progress.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_plate_solve_activity(
+    state: State<'_, AppState>,
+) -> Result<PlateSolveActivity, String> {
+    Ok(athenaeum_core::api::plate_solve::plate_solve_activity(&state.ctx))
 }
 
 // ========== Autofind Object Commands ==========
@@ -169,7 +114,7 @@ pub async fn autofind_objects_from_coordinates(
     state: State<'_, AppState>,
     frame_ids: Vec<i64>,
 ) -> Result<(), String> {
-    let dso = get_dso_catalog(&state);
+    let dso = athenaeum_core::api::plate_solve::dso_catalog(&state.ctx);
     let prepared = athenaeum_core::api::plate_solve::prepare_autofind_objects(&state.ctx, dso)
         .map_err(|e| e.to_string())?;
 

@@ -458,6 +458,7 @@ pub fn run() {
             commands::reset_plate_solve_config,
             commands::plate_solve_batch,
             commands::cancel_plate_solve,
+            commands::get_plate_solve_activity,
             commands::autofind_objects_from_coordinates,
             commands::cancel_autofind_objects,
             commands::resolve_object_name,

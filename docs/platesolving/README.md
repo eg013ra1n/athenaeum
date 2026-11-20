@@ -338,7 +338,9 @@ Takeaways:
   catalog; bright is a speed optimization on top of it.
 ## Per-Frame Pipeline
 
-The batch driver is `api::plate_solve::{prepare_plate_solve_batch, run_plate_solve_batch}` in core; the Tauri command and its Axum mirror resolve the star-catalog layers, index packs and DSO catalog, call prepare, then run (the desktop awaits the run, the web does not). A panic inside one frame fails that frame with code `PANIC`; the run always ends the batch (cancel handle 0 removed, `plate-solve-complete` emitted). Core exposes `service::solve_frame`, `solve_frame_tiered`, `solve_frame_layered` (single-frame conveniences, mostly for tests and tools) and `solve_frame_with_hints`, the hot path both hosts and the stacking solve call. There is no single-frame solve command.
+The batch driver is `api::plate_solve::{prepare_plate_solve_batch, run_plate_solve_batch}` in core; the resolvers (`resolve_layer_caches`, `resolve_index_packs`, `dso_catalog`), `cancel_plate_solve` and `plate_solve_activity` are core too, so the Tauri command, its Axum mirror and the assistant (MCP) call one set. The hosts resolve, call prepare with a `PlateSolveOrigin` (`Ui` or `Assistant`), then run (the desktop awaits the run, the web does not).
+
+**One batch slot, both ways.** Key 0 of `ServiceContext::active_plate_solves` is the one running batch; its handle carries the origin, a `run_id` and a `SolveProgress` the run copies from each `plate-solve-progress` event. `prepare` checks the slot and inserts the handle under one lock and refuses a second batch with `ApiError::Conflict` in words (`BUSY_ASSISTANT`, `BUSY_UI`, `BUSY_UI_SELF`; it used to replace the cancel handle silently). The slot is freed by a `Drop` guard the prepared batch owns and `run` takes over, so a batch dropped before `run` blocks nothing. The run emits `plate-solve-started` `{origin, runId, total}` once, before the first frame. The object autofind holds key 1 (origin `Ui`) and does not take part in the refusal. A panic inside one frame fails that frame with code `PANIC`; the run always ends the batch (cancel handle 0 removed, `plate-solve-complete` emitted). Core exposes `service::solve_frame`, `solve_frame_tiered`, `solve_frame_layered` (single-frame conveniences, mostly for tests and tools) and `solve_frame_with_hints`, the hot path both hosts and the stacking solve call. There is no single-frame solve command.
 
 ### 1. Load and gate (calling thread, holds the DB)
 
@@ -676,13 +678,14 @@ The `blind_*` fields and `camera_defaults` have no controls; they live only in t
 
 ## Tauri Commands
 
-All 15 are in `crates/athenaeum-tauri/src/commands/plate_solve.rs` and mirrored in `crates/athenaeum-web/src/routes/plate_solve.rs`.
+All 16 are in `crates/athenaeum-tauri/src/commands/plate_solve.rs` and mirrored in `crates/athenaeum-web/src/routes/plate_solve.rs`.
 
 | Command | Purpose |
 | ---- | ---- |
 | `get_plate_solve_config()` / `set_plate_solve_config(config)` / `reset_plate_solve_config()` | Settings CRUD for `PlateSolveConfig` |
 | `plate_solve_batch(frame_ids)` | Gate, solve and persist a list of frames; emits `plate-solve-progress` per frame and `plate-solve-complete` at the end |
 | `cancel_plate_solve()` | Set the cancel flag of the running batch |
+| `get_plate_solve_activity()` | `PlateSolveActivity`: `running`, `origin`, `runId`, `done`, `total`, `currentFile` of the batch slot |
 | `autofind_objects_from_coordinates(frame_ids)` | Label frames that have coordinates but no object from the DSO catalog; emits `autofind-objects-progress` and `autofind-objects-complete` |
 | `cancel_autofind_objects()` | Cancel that batch |
 | `resolve_object_name(name)` | Does the DSO catalog know this name (the metadata editor asks while typing) |

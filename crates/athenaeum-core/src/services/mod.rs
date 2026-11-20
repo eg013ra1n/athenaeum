@@ -43,9 +43,33 @@ pub struct AnalysisHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
-/// Handle to track an active plate solve batch operation.
+/// Who started a plate-solve run: the app's own window or the assistant (MCP).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PlateSolveOrigin {
+    Ui,
+    Assistant,
+}
+
+/// What a running plate-solve batch has done so far, copied from its
+/// `plate-solve-progress` events by the run's recorder.
+#[derive(Clone, Debug, Default)]
+pub struct SolveProgress {
+    pub done: usize,
+    pub total: usize,
+    pub solved: usize,
+    pub current_file: Option<String>,
+    /// `(file name, reason)` of each frame that failed.
+    pub failures: Vec<(String, String)>,
+}
+
+/// Handle to track an active plate solve batch operation (key 0 of
+/// `active_plate_solves` is the one batch slot, key 1 the object autofind).
 pub struct PlateSolveHandle {
     pub cancel_flag: Arc<AtomicBool>,
+    pub origin: PlateSolveOrigin,
+    pub run_id: String,
+    pub progress: Arc<Mutex<SolveProgress>>,
 }
 
 /// Handle to track an active archive operation (ZIP archive feature).

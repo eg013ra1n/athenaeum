@@ -5,80 +5,13 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
-use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
-use athenaeum_core::plate_solve::CatalogOpenError;
+use athenaeum_core::api::plate_solve::PlateSolveActivity;
+use athenaeum_core::services::PlateSolveOrigin;
 use athenaeum_core::plate_solve::storage;
 
 use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
-
-fn get_dso_catalog(state: &WebAppState) -> Option<Arc<DsoCatalog>> {
-    {
-        let guard = state.ctx.dso_catalog.read().unwrap();
-        if let Some(ref cat) = *guard {
-            return Some(cat.clone());
-        }
-    }
-    match DsoCatalog::load() {
-        Ok(cat) => {
-            let arc = Arc::new(cat);
-            let mut guard = state.ctx.dso_catalog.write().unwrap();
-            *guard = Some(arc.clone());
-            Some(arc)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load DSO catalog");
-            None
-        }
-    }
-}
-
-/// Resolve and open the additive density-tier catalog stack under
-/// `<app-data>/catalogs/smac_gaia` (base → deepest), or a legacy single
-/// `stars.smac` there as a 1-layer fallback. Opens fresh each call (mmap is
-/// cheap); the batch path opens once and shares across workers.
-fn resolve_layer_caches(
-    state: &WebAppState,
-) -> Result<Vec<Arc<solvemyastro::StarCache>>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "DB not initialized".into(),
-    ))?;
-    let db_path = db.path();
-    let parent = std::path::Path::new(&db_path).parent().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Cannot determine app data dir".into(),
-    ))?;
-    athenaeum_core::plate_solve::open_catalog_layers(parent).map_err(|e| match e {
-        CatalogOpenError::NotInstalled { root } => (
-            StatusCode::PRECONDITION_FAILED,
-            format!(
-                "solvemyastro star catalog not found under {}. \
-                 Please download the Gaia DR3 prebuilt catalog.",
-                root.display()
-            ),
-        ),
-        CatalogOpenError::Open { dir, error } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to open star cache at {}: {error}", dir.display()),
-        ),
-    })
-}
-
-/// Open the installed quad-index packs under `<app-data>/catalogs/smac_index`
-/// (empty when none are installed; a pack that does not open is skipped with a
-/// warning). Opened once per batch, like the catalog layers.
-fn resolve_index_packs(state: &WebAppState) -> Vec<Arc<solvemyastro::QuadIndex>> {
-    let Some(db) = state.ctx.db.get() else {
-        return Vec::new();
-    };
-    let db_path = db.path();
-    match std::path::Path::new(&db_path).parent() {
-        Some(parent) => athenaeum_core::plate_solve::open_index_packs(parent),
-        None => Vec::new(),
-    }
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,15 +72,17 @@ pub async fn plate_solve_batch(
     State(state): State<WebAppState>,
     Json(args): Json<BatchArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let layer_caches = resolve_layer_caches(&state)?;
-    let index_packs = resolve_index_packs(&state);
-    let dso = get_dso_catalog(&state);
-    let prepared = athenaeum_core::api::plate_solve::prepare_plate_solve_batch(
+    use athenaeum_core::api::plate_solve as core;
+    let layer_caches = core::resolve_layer_caches(&state.ctx).map_err(api_err)?;
+    let index_packs = core::resolve_index_packs(&state.ctx);
+    let dso = core::dso_catalog(&state.ctx);
+    let prepared = core::prepare_plate_solve_batch(
         &state.ctx,
         &args.frame_ids,
         layer_caches,
         index_packs,
         dso,
+        PlateSolveOrigin::Ui,
     )
     .map_err(api_err)?;
 
@@ -169,11 +104,18 @@ pub async fn plate_solve_batch(
 pub async fn cancel_plate_solve(
     State(state): State<WebAppState>,
 ) -> Json<()> {
-    let solves = state.ctx.active_plate_solves.lock().unwrap();
-    if let Some(handle) = solves.get(&0) {
-        handle.cancel_flag.store(true, Ordering::Relaxed);
-    }
+    athenaeum_core::api::plate_solve::cancel_plate_solve(&state.ctx);
     Json(())
+}
+
+/// POST /api/get_plate_solve_activity
+///
+/// Mirrors the Tauri command: what the plate-solve slot is doing now.
+#[tracing::instrument(skip_all, level = "debug")]
+pub async fn get_plate_solve_activity(
+    State(state): State<WebAppState>,
+) -> Json<PlateSolveActivity> {
+    Json(athenaeum_core::api::plate_solve::plate_solve_activity(&state.ctx))
 }
 
 // ========== Autofind Object Routes ==========
@@ -212,7 +154,7 @@ pub async fn autofind_objects_from_coordinates(
     State(state): State<WebAppState>,
     Json(args): Json<BatchArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let dso = get_dso_catalog(&state);
+    let dso = athenaeum_core::api::plate_solve::dso_catalog(&state.ctx);
     let prepared = athenaeum_core::api::plate_solve::prepare_autofind_objects(&state.ctx, dso)
         .map_err(api_err)?;
 

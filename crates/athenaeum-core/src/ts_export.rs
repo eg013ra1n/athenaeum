@@ -391,6 +391,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::plate_solve::storage::PlateSolveRecord,
             crate::plate_solve::hints::FovSummary,
             crate::plate_solve::object_fill::AutofindStatus,
+            crate::services::PlateSolveOrigin,
+            crate::api::plate_solve::PlateSolveActivity,
         ]))),
         ("analysis-config.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::analysis::config::AnalysisPsfModel,
