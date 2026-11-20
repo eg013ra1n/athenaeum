@@ -137,7 +137,7 @@ export function AssistantAccessSection() {
         {blocked && (
           <div className="flex items-start gap-2 text-sm text-warning">
             <AlertTriangle size={16} className="mt-0.5 shrink-0" />
-            <p>{blocked} Set the ATHENAEUM_API_KEY environment variable of the container, then restart it.</p>
+            <p>{blocked}</p>
           </div>
         )}
 

@@ -101,10 +101,12 @@ describe('AssistantAccessSection', () => {
 
   it('web_without_api_key_says_why_and_disables_the_toggle', async () => {
     platform.tauri = false;
-    const why = 'Assistant access on the web needs an API key; none is configured on this server.';
+    // The backend's NEEDS_API_KEY (crates/athenaeum-core/src/mcp/lifecycle.rs), verbatim: it already says how.
+    const why =
+      'Assistant access cannot be turned on here: this Athenaeum is not protected by an API key, so anyone who can reach it could read your catalog. Set the ATHENAEUM_API_KEY environment variable of the container, restart it, then turn this on.';
     await renderSection({ ...OFF, blockedReason: why });
-    expect(await screen.findByText(new RegExp(why.slice(0, 30)))).toBeTruthy();
-    expect(screen.getByText(/ATHENAEUM_API_KEY/)).toBeTruthy();
+    expect(await screen.findByText(why)).toBeTruthy();
+    expect(document.body.textContent?.match(/ATHENAEUM_API_KEY/g)?.length).toBe(1);
     expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(true);
     expect(screen.queryByText(/mcpServers/)).toBeNull();
   });
