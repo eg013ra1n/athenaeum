@@ -556,6 +556,71 @@ async fn frame_set_question_equals_its_page() {
 }
 
 #[tokio::test]
+async fn frame_sets_that_share_a_name_are_answered_set_by_set() {
+    let rig = rig(true);
+    // The later-created set holds the earlier nights: the answer goes by first night, not by id.
+    let (late_id, early_id) = {
+        let database = rig.ctx.db.get().expect("db");
+        let conn = database.conn();
+        let make = |name: &str, dir: &str, filter: &'static str, count: usize, night: &str, stored: f64| -> i64 {
+            let dir = rig.base.join("nas").join(dir);
+            let members: Vec<i64> = (0..count).map(|i| put(&conn, &dir, &format!("{dir_name}{i}.fits", dir_name = filter.to_lowercase()), &light(filter)).1).collect();
+            for m in &members {
+                conn.execute("UPDATE frames SET date_obs = ?1 WHERE id = ?2", rusqlite::params![format!("{night}T22:00:00+00:00"), m]).expect("date");
+            }
+            let set = db::create_frames_set(&conn, Some(name), false, None, None, None, None, Some(stored), None, None, None).expect("set");
+            let n = db::create_imaging_night(&conn, set, &format!("{night}T00:00:00Z"), &format!("{night}T12:00:00Z")).expect("night");
+            let session = db::create_session(&conn, n, "CamA", members.len() as i32, None).expect("session");
+            db::insert_session_members(&conn, session, &members).expect("members");
+            set
+        };
+        let late = make("LDN 1272", "ldn_late", "O", 3, "2024-11-02", 888.0);
+        let early = make("ldn  1272", "ldn_early", "H", 2, "2024-09-01", 999.0);
+        (late, early)
+    };
+    let (early_totals, late_totals) = {
+        let reader = rig.host.reader().expect("reader");
+        (
+            crate::catalog_query::frame_set_totals(&reader, early_id).expect("early"),
+            crate::catalog_query::frame_set_totals(&reader, late_id).expect("late"),
+        )
+    };
+    assert_eq!(early_totals.frames, 2);
+    assert_eq!(late_totals.frames, 3);
+
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": "LDN 1272" }, "groupBy": ["filter"] })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains("2 frame sets are named 'LDN 1272'; each is shown with its own page's figures."), "{said}");
+    let early_text = format!("2 frames, integration {}.", crate::catalog_query::format_duration(early_totals.integration_s));
+    let late_text = format!("3 frames, integration {}.", crate::catalog_query::format_duration(late_totals.integration_s));
+    let (e, l) = (said.find(&early_text).unwrap_or_else(|| panic!("{early_text}: {said}")), said.find(&late_text).unwrap_or_else(|| panic!("{late_text}: {said}")));
+    assert!(e < l, "ordered by the first night: {said}");
+    assert!(said.contains("2024-09-01 … 2024-09-01") && said.contains("2024-11-02 … 2024-11-02"), "{said}");
+    assert!(!said.contains("Totals:"), "no plain scope totals: {said}");
+
+    let data = data_of(&r);
+    assert!(data.get("frameSet").is_none(), "{data}");
+    let sets = data["frameSets"].as_array().expect("frameSets");
+    assert_eq!(sets.len(), 2);
+    for (entry, t) in sets.iter().zip([&early_totals, &late_totals]) {
+        assert_eq!(entry["frames"], t.frames);
+        assert_eq!(entry["integrationS"], t.integration_s);
+        assert_eq!(entry["blackHoleLeftOut"], json!(t.black_hole_left_out.map(|(n, s)| json!({ "frames": n, "integrationS": s }))));
+        let by_filter: Vec<Value> = t.by_filter.iter().map(|(f, n, s)| json!({ "filter": f, "frames": n, "integrationS": s })).collect();
+        assert_eq!(entry["byFilter"], Value::Array(by_filter));
+    }
+    assert_eq!(sets[0]["name"], "ldn  1272");
+    assert_eq!(sets[0]["nights"], json!({ "first": "2024-09-01", "last": "2024-09-01" }));
+    assert_eq!(sets[1]["nights"], json!({ "first": "2024-11-02", "last": "2024-11-02" }));
+    // The groups the caller asked for run over the union, after the sets.
+    assert_eq!(data["groupsTotal"], 2, "{data}");
+    assert_eq!(data["totals"]["frames"], 5);
+    client.close().await;
+}
+
+#[tokio::test]
 async fn the_default_state_says_what_it_leaves_out() {
     let rig = rig(true);
     let client = legacy(&rig.host).await;

@@ -583,6 +583,20 @@ const MEMBER_OF_SET: &str = "f.id IN (SELECT msm.frame_id FROM session_members m
      JOIN imaging_nights mn ON mn.id = ms.imaging_night_id \
      WHERE mn.frames_set_id = ?1)";
 
+/// The first and last night (the scope's night rule, `YYYY-MM-DD`) of the members a frame set's page counts; `None`
+/// when no counted member carries a usable `date_obs`.
+pub fn frame_set_nights(conn: &Connection, frames_set_id: i64) -> Result<Option<(String, String)>> {
+    let used = frame_is_used_copy_sql("?1");
+    let night = crate::scope::night::night_sql("f.date_obs");
+    let sql = format!(
+        "SELECT MIN({night}), MAX({night}) FROM frames f WHERE {MEMBER_OF_SET} AND {FRAME_NOT_IN_BLACK_HOLE_SQL} AND {used}"
+    );
+    let (first, last): (Option<String>, Option<String>) = conn
+        .query_row(&sql, [frames_set_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .with_context(|| format!("read set nights: {sql}"))?;
+    Ok(first.zip(last))
+}
+
 /// A frame set's figures from the catalog's own page query: `frames` is the member count and `integration_s` the
 /// total the page shows (`get_frames_sets_by_project`), so the two cannot differ from the page. `by_filter` reads
 /// the same members. `black_hole_left_out` counts the set's members now in the Black Hole (used copy, every member

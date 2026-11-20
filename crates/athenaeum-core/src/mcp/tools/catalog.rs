@@ -186,14 +186,19 @@ fn indented(lines: impl IntoIterator<Item = String>) -> Vec<String> {
 
 // ---- json pieces whose Rust shape is a tuple ----
 
-fn frame_set_json(name: &str, t: &FrameSetTotals) -> Value {
-    json!({
+fn frame_set_json(name: &str, nights: Option<&(String, String)>, t: &FrameSetTotals) -> Value {
+    let mut v = json!({
         "name": name,
         "frames": t.frames,
         "integrationS": t.integration_s,
         "blackHoleLeftOut": t.black_hole_left_out.map(|(n, s)| json!({ "frames": n, "integrationS": s })),
         "byFilter": t.by_filter.iter().map(|(f, n, s)| json!({ "filter": f, "frames": n, "integrationS": s })).collect::<Vec<_>>(),
-    })
+    });
+    // Only the several-sets answer names the nights, so the one-set shape is exactly what it was.
+    if let (Some((first, last)), Some(obj)) = (nights, v.as_object_mut()) {
+        obj.insert("nights".to_string(), json!({ "first": first, "last": last }));
+    }
+    v
 }
 
 fn storage_json(s: &StorageSummary) -> Result<Value, ApiError> {
@@ -341,11 +346,12 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 
 // ---- query_frames ----
 
-/// The frame set a scope names and nothing else: the id and the stored name of the one frame set the catalog holds
-/// under that name, `None` for any other scope (or a name two sets share).
-fn the_one_frame_set(conn: &Connection, scope: &Scope) -> Result<Option<(i64, String)>, ApiError> {
+/// The frame sets a scope names and nothing else: the id and stored name of every frame set the catalog holds under
+/// that name (the same normalized-name equality `resolve_scope` uses), in id order. Empty for any other scope, and
+/// for a name no set carries.
+fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, String)>, ApiError> {
     let blank = |v: &Option<String>| v.as_deref().map_or(true, |s| s.trim().is_empty());
-    let Some(name) = scope.frame_set.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { return Ok(None) };
+    let Some(name) = scope.frame_set.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { return Ok(Vec::new()) };
     let only_a_set = [&scope.object, &scope.folder, &scope.scan_root, &scope.camera, &scope.telescope, &scope.filter, &scope.frame_type, &scope.night, &scope.date_from, &scope.date_to]
         .into_iter()
         .all(blank)
@@ -353,10 +359,10 @@ fn the_one_frame_set(conn: &Connection, scope: &Scope) -> Result<Option<(i64, St
         && scope.year.is_none()
         && scope.state.as_deref().map_or(true, |s| s.is_empty() || (FrameState::DEFAULT.iter().all(|d| s.contains(d)) && !s.contains(&FrameState::BlackHole)));
     if !only_a_set {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut stmt = conn
-        .prepare("SELECT id, name FROM frames_set WHERE name IS NOT NULL AND name <> ''")
+        .prepare("SELECT id, name FROM frames_set WHERE name IS NOT NULL AND name <> '' ORDER BY id")
         .map_err(|e| internal("the frame sets", e))?;
     let sets = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
@@ -364,15 +370,14 @@ fn the_one_frame_set(conn: &Connection, scope: &Scope) -> Result<Option<(i64, St
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| internal("the frame sets", e))?;
     let wanted = normalize_value(name);
-    let mut hits: Vec<(i64, String)> = sets.into_iter().filter(|(_, n)| normalize_value(n) == wanted).collect();
-    Ok(if hits.len() == 1 { hits.pop() } else { None })
+    Ok(sets.into_iter().filter(|(_, n)| normalize_value(n) == wanted).collect())
 }
 
 /// The frame set's own figures as a sentence: the page's frame count and integration time, and the Black Hole
 /// members the page leaves out.
-fn frame_set_lines(name: &str, t: &FrameSetTotals) -> Vec<String> {
+fn frame_set_lines(heading: &str, t: &FrameSetTotals) -> Vec<String> {
     let mut out = vec![format!(
-        "Frame set '{name}', as its page shows it: {}, integration {}.",
+        "{heading}, as its page shows it: {}, integration {}.",
         count_of(t.frames, "frame", "frames"),
         cq::format_duration(t.integration_s)
     )];
@@ -419,14 +424,42 @@ pub fn query_frames(host: &McpHost, args: QueryFramesArgs) -> Result<Answer, Api
     let mut lines: Vec<String> = Vec::new();
     let mut data = Map::new();
 
-    // A scope that is exactly one frame set says what that set's own page says (integration time included).
-    match the_one_frame_set(&conn, &args.scope)? {
-        Some((set_id, name)) => {
-            let t = cq::frame_set_totals(&conn, set_id).map_err(|e| internal("the frame set", format!("{e:#}")))?;
-            lines.extend(frame_set_lines(&name, &t));
-            data.insert("frameSet".to_string(), frame_set_json(&name, &t));
+    // A scope that is exactly one frame set says what that set's own page says (integration time included). A name
+    // two or more sets share is answered set by set, each with its own page's figures, so no figure is one no page shows.
+    let named = frame_sets_named(&conn, &args.scope)?;
+    match named.as_slice() {
+        [] => lines.push(format!("Totals: {}.", totals_text(&result.totals))),
+        [(set_id, name)] => {
+            let t = cq::frame_set_totals(&conn, *set_id).map_err(|e| internal("the frame set", format!("{e:#}")))?;
+            lines.extend(frame_set_lines(&format!("Frame set '{name}'"), &t));
+            data.insert("frameSet".to_string(), frame_set_json(name, None, &t));
         }
-        None => lines.push(format!("Totals: {}.", totals_text(&result.totals))),
+        many => {
+            let mut read = Vec::with_capacity(many.len());
+            for (set_id, name) in many {
+                let t = cq::frame_set_totals(&conn, *set_id).map_err(|e| internal("the frame set", format!("{e:#}")))?;
+                let nights = cq::frame_set_nights(&conn, *set_id).map_err(|e| internal("the frame set's nights", format!("{e:#}")))?;
+                read.push((*set_id, name, nights, t));
+            }
+            // By first night (a set with no dated member last), the id breaking a tie.
+            read.sort_by(|a, b| {
+                let key = |x: &(i64, &String, Option<(String, String)>, FrameSetTotals)| (x.2.is_none(), x.2.as_ref().map(|n| n.0.clone()), x.0);
+                key(a).cmp(&key(b))
+            });
+            let wanted = args.scope.frame_set.as_deref().map(str::trim).unwrap_or_default();
+            lines.push(format!("{} frame sets are named '{wanted}'; each is shown with its own page's figures.", many.len()));
+            for (_, name, nights, t) in &read {
+                let heading = match nights {
+                    Some((first, last)) => format!("Frame set '{name}', nights {first} … {last}"),
+                    None => format!("Frame set '{name}'"),
+                };
+                lines.extend(frame_set_lines(&heading, t));
+            }
+            data.insert(
+                "frameSets".to_string(),
+                Value::Array(read.iter().map(|(_, name, nights, t)| frame_set_json(name, nights.as_ref(), t)).collect()),
+            );
+        }
     }
     data.insert("totals".to_string(), json(&result.totals)?);
 
