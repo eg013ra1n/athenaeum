@@ -47,9 +47,9 @@ that can be released and to read its verdicts.
    the Version History row and the chat teaser), then `## What's New` /
    `## Changes` / `## Bug Fixes` in user-facing English. This file IS the blog
    post: write it at that quality, there is no second text.
-2. **Bump.** `scripts/release/bump.sh X.Y.Z[-beta.N]` — rewrites the six version
+2. **Bump.** `scripts/release/bump.sh X.Y.Z[-beta.N]` — rewrites the seven version
    files, refreshes `Cargo.lock`, asserts they agree.
-3. **The release commit contains ONLY** `RELEASE_NOTES.md`, the six version files
+3. **The release commit contains ONLY** `RELEASE_NOTES.md`, the seven version files
    and `Cargo.lock`. A code fix goes in its own commit BEFORE this one and gets
    its own green GitHub run first. `git status --short` must list exactly those
    eight paths. Commit: `chore(release): vX.Y.Z — <tagline without the product name>`.

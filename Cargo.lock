@@ -439,6 +439,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "athenaeum-mcp"
+version = "0.7.1"
+dependencies = [
+ "athenaeum-core",
+ "dirs",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "athenaeum-tauri"
 version = "0.7.1"
 dependencies = [

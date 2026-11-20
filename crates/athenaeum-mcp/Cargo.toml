@@ -1,0 +1,34 @@
+[package]
+name = "athenaeum-mcp"
+version = "0.7.1"
+description = "athenaeum-mcp: the bridge an assistant (an MCP client) starts to reach the running Athenaeum"
+authors = ["you"]
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "athenaeum_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "athenaeum-mcp"
+path = "src/main.rs"
+
+# The bridge links no athenaeum-core: it pipes bytes to the app's local channel (the handshake and the channel files are
+# a wire contract, copied here and pinned by tests/bridge_e2e.rs against the real host), and answers in words itself,
+# with a tiny rmcp server, whenever the app cannot.
+[dependencies]
+# `sync` is rmcp's own need, named here because the bridge's writer tasks use channels directly.
+tokio = { version = "1", features = ["rt", "io-std", "io-util", "net", "macros", "time", "sync"] }
+serde_json = "1"
+# Platform data directory when the client's config names none (~/Library/Application Support, %APPDATA%, ~/.local/share).
+dirs = "6"
+rmcp = { version = "3.11", default-features = false, features = ["server"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Real hosts in temp app-data dirs; no render / solver, which the bridge's tests do not need.
+athenaeum-core = { path = "../athenaeum-core", default-features = false }
+rmcp = { version = "3.11", default-features = false, features = ["server", "client"] }
+tempfile = "3"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bump the release version in the six files that carry it, refresh Cargo.lock,
-# and prove the six agree. Usage: scripts/release/bump.sh X.Y.Z[-beta.N]
+# Bump the release version in the seven files that carry it, refresh Cargo.lock,
+# and prove the seven agree. Usage: scripts/release/bump.sh X.Y.Z[-beta.N]
 # Env: REPO_ROOT (optional), BUMP_SKIP_CARGO=1 (skip the Cargo.lock refresh; tests).
 set -euo pipefail
 
@@ -33,7 +33,7 @@ PY
 }
 
 rewrite_first "$REPO_ROOT/package.json"                              '^  "version": "([^"]+)"' "$NEW"
-for crate in athenaeum-core athenaeum-tauri athenaeum-web perseus; do
+for crate in athenaeum-core athenaeum-tauri athenaeum-web athenaeum-mcp perseus; do
   rewrite_first "$REPO_ROOT/crates/$crate/Cargo.toml"                '^version = "([^"]+)"'     "$NEW"
 done
 rewrite_first "$REPO_ROOT/crates/athenaeum-tauri/tauri.conf.json"    '^  "version": "([^"]+)"' "$TAURI_NEW"

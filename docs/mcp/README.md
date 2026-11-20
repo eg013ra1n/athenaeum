@@ -164,6 +164,39 @@ means `serving` (the key is in `McpStatus.token`; `check_token` and `is_serving`
 `claude mcp add <name> -- "<bridge>" --build <build>` (plus ` --app-data-dir "<dir>"`). `McpStatus` fills them with the bridge expected
 next to the app's executable and the app-data dir always passed, so the bridge never guesses.
 
+## The bridge (`athenaeum-mcp`)
+
+`crates/athenaeum-mcp` is a small program an assistant starts over stdio (`athenaeum-mcp --build release|dev [--app-data-dir <dir>]`, the
+arguments the app writes into the config it copies, ruling R8/P9). It links no `athenaeum-core` and opens no catalog: it pipes the
+client's newline-delimited JSON-RPC to the app's channel after the handshake above, and says why in words whenever the app cannot
+answer. The handshake and the channel files are a wire contract it copies (`Endpoint::parse`, the `ATHENAEUM-MCP/1` line); the tests in
+`crates/athenaeum-mcp/tests/bridge_e2e.rs` run it against real core hosts, so a change of either side fails there. Folder names:
+`Build::dir_name` copies core's `paths::APP_DATA_DIR_NAME_RELEASE` / `_DEV` (a test pins them). Without `--app-data-dir` it uses
+`dirs::data_dir()/<dir name>` and never guesses beyond that.
+
+**Every connect attempt re-reads the files** (`enabled`, `token`, `endpoint`): a Windows pipe name is new at every bind and the key can be
+regenerated. No `enabled` marker means `off`; no key or `endpoint`, or a connection that fails, means `not_running`; then the handshake:
+`ERR starting|off|token|version` are `starting`, `off`, `token_rejected`, `outdated`; `OK <name>` with a name other than the build's own
+is `wrong_build` (a dev bridge at the release folder says it reached `athenaeum`).
+
+**Words.** `Unavailable` (`not_running`, `off`, `starting`, `token_rejected`, `outdated`, `wrong_build`) has one sentence per state
+(`unavailable_text`, build-aware: ` (dev build)`), carried by `FallbackServer`, a tiny rmcp server over `tokio::io::duplex`: its
+instructions are the sentence, `tools/list` is the app's own list from `<app-data>/mcp/tools.json` when it parses (else one tool,
+`athenaeum_status`), and a `tools/call` of ANY name is an error result with the sentence as text and
+`structuredContent {state, build, message}`. A client that starts before the app (Claude desktop starts its bridges at its own launch)
+therefore sees the real tools at once and gets the reason when it calls one.
+
+**Loop.** Live: bytes both ways, requests tracked by id until answered. The bridge keeps the client's `initialize` and
+`notifications/initialized`. When the live stream ends it looks again at once (unless the connection lived under half a second) and
+otherwise starts a fresh fallback; either way it replays `initialize` (id `athenaeum-bridge-replay`, the reply dropped) and
+`initialized` into the new session and resends the unanswered requests, so a question asked while the app quits is answered in words,
+never lost. While down, a request arriving two seconds or more after the last attempt tries to connect again; on success it switches,
+replays, and writes `notifications/tools/list_changed` to the client. A stateless client (revision 2026-07-28) has nothing to replay.
+Client end of input: exit 0.
+
+**Not covered here.** Packaging the bridge next to the app and the Settings page's copy button are Task 8's; the web image has no
+bridge (the Dockerfile drops the crate from the workspace). The bridge is versioned with the app (`bump.sh`, `check_versions.sh`).
+
 ## Logging
 
 One new log field: `tool` (the tool's name on its span: `catalog_overview`, `query_frames`, `file_details`, `find_duplicates`,

@@ -7,7 +7,7 @@
 
 The procedure is the `release` skill (`.claude/skills/release/SKILL.md`): notes
 (`RELEASE_NOTES.md` is the blog post), `scripts/release/bump.sh`, a release
-commit that holds only notes + the six version files + `Cargo.lock`, push, green
+commit that holds only notes + the seven version files + `Cargo.lock`, push, green
 GitHub run, tag. The tag pipeline (`.gitlab-ci.yml`) runs
 `gate → build → deploy → publish → verify → announce`: it refuses a tag whose
 versions or GitHub checks are not green, uploads to `artfrom.space/builds/<tag>/`
