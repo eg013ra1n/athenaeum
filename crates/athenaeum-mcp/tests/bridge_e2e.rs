@@ -28,7 +28,6 @@ use tokio::task::JoinHandle;
 const VERSION: &str = "9.9.9-test";
 const KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const TOOLS: [&str; 5] = ["catalog_overview", "file_details", "find_duplicates", "find_missing_metadata", "query_frames"];
 
 // ---- the host side ----
 
@@ -40,6 +39,20 @@ struct Rig {
 }
 
 impl Rig {
+    /// The tools the app offers, by name, from the app's own list (`tools.json` is this same text): a new tool never
+    /// leaves a stale list here.
+    fn tools(&self) -> Vec<String> {
+        let listed: Value = serde_json::from_str(&self.host.tool_list_json()).expect("the tool list is JSON");
+        let mut names: Vec<String> = listed["tools"]
+            .as_array()
+            .expect("a tool list")
+            .iter()
+            .map(|t| t["name"].as_str().expect("a tool name").to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
     fn dir(&self) -> PathBuf {
         mcp_dir(&self.base)
     }
@@ -354,7 +367,7 @@ async fn client_started_before_the_app_lists_the_real_tools() {
     write_marker_and_key(&rig);
     std::fs::write(rig.dir().join("tools.json"), rig.host.tool_list_json()).expect("the tool list");
     let s = legacy(rig.options(Build::Dev)).await;
-    assert_eq!(s.tool_names().await, TOOLS.map(String::from).to_vec(), "the app's own list, before the app runs");
+    assert_eq!(s.tool_names().await, rig.tools(), "the app's own list, before the app runs");
     assert_says(&s.ask("query_frames").await, &Unavailable::NotRunning, Build::Dev);
     // The app starts: the next call (the bridge looks again two seconds after its last try) is the app's own answer.
     let before = s.changed.load(Ordering::SeqCst);
@@ -362,7 +375,7 @@ async fn client_started_before_the_app_lists_the_real_tools() {
     let answer = s.ask_until_the_app_answers().await;
     assert_from(&answer, "athenaeum-dev", &rig);
     assert!(s.changed.load(Ordering::SeqCst) > before, "the client was told its tool list may have changed");
-    assert_eq!(s.tool_names().await, TOOLS.map(String::from).to_vec());
+    assert_eq!(s.tool_names().await, rig.tools());
     s.close().await;
     rig.finish().await;
 }
@@ -374,7 +387,7 @@ async fn app_quits_mid_conversation() {
     let rig = dev_rig();
     rig.enable();
     let s = legacy(rig.options(Build::Dev)).await;
-    assert_eq!(s.tool_names().await, TOOLS.map(String::from).to_vec());
+    assert_eq!(s.tool_names().await, rig.tools());
     assert_from(&s.ask("query_frames").await, "athenaeum-dev", &rig);
     rig.host.shutdown();
     // The next question is answered in words, within five seconds, not left hanging.
@@ -398,7 +411,7 @@ async fn app_returns_and_the_bridge_reconnects() {
     assert!(text_of(&answer).starts_with("[athenaeum-dev"), "{}", text_of(&answer));
     assert_from(&answer, "athenaeum-dev", &rig);
     assert!(s.changed.load(Ordering::SeqCst) > before, "the client saw tools/list_changed");
-    assert_eq!(s.tool_names().await, TOOLS.map(String::from).to_vec());
+    assert_eq!(s.tool_names().await, rig.tools());
     s.close().await;
     rig.finish().await;
 }
@@ -408,7 +421,7 @@ async fn stateless_client_needs_no_replay() {
     let rig = dev_rig();
     rig.enable();
     let s = session(rig.options(Build::Dev), stateless()).await;
-    assert_eq!(s.tool_names().await, TOOLS.map(String::from).to_vec());
+    assert_eq!(s.tool_names().await, rig.tools());
     assert_from(&s.ask("query_frames").await, "athenaeum-dev", &rig);
     rig.host.shutdown();
     assert_says(&s.ask("query_frames").await, &Unavailable::NotRunning, Build::Dev);

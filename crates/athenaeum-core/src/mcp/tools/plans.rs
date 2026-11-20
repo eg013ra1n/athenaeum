@@ -143,8 +143,13 @@ pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
         // Never the word "applied": a failed plan was not applied, whatever it got done first.
         text.push_str(&format!("\nFailed: {}.", error.trim_end_matches('.')));
         if let Some(report) = &v.report {
-            text.push_str(&partial_text(report));
-            text.push_str("\nSome files may have changed before it stopped; check them before asking again.");
+            if *report == PlanReport::default() {
+                // It failed while it was applying, before it wrote a line.
+                text.push_str("\nNo file was recorded as moved before it stopped.");
+            } else {
+                text.push_str(&partial_text(report));
+                text.push_str("\nSome files may have changed before it stopped; check them before asking again.");
+            }
         }
     } else if let Some(report) = &v.report {
         text.push_str(&report_text(report));
@@ -688,6 +693,24 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         assert!(said.contains("applied"), "{said}");
         assert!(said.contains("1 applied, 1 skipped, 0 failed"), "{said}");
         assert!(said.contains("b.fits in /nas/a: changed on disk since the plan"), "{said}");
+    }
+
+    #[test]
+    fn a_failed_plan_says_what_it_moved_in_both_cases() {
+        // Failed while preparing: no report, and no word about files.
+        let a = status_answer(&view(PlanState::Failed { error: "could not read the catalog".to_string() }));
+        assert!(a.text.contains("Failed: could not read the catalog."), "{}", a.text);
+        assert!(!a.text.contains("before it stopped"), "{}", a.text);
+        assert_eq!(a.data["report"], serde_json::Value::Null);
+        // Failed during the apply before any line: an empty report says that nothing was moved.
+        let mut early = view(PlanState::Failed { error: "the catalog is busy".to_string() });
+        early.report = Some(PlanReport::default());
+        let a = status_answer(&early);
+        assert!(a.text.contains("Failed: the catalog is busy."), "{}", a.text);
+        assert!(a.text.contains("No file was recorded as moved before it stopped."), "{}", a.text);
+        assert!(!a.text.contains("0 done"), "{}", a.text);
+        assert!(!a.text.to_lowercase().contains("applied"), "{}", a.text);
+        assert_eq!(a.data["report"]["applied"], json!([]));
     }
 
     #[test]

@@ -339,11 +339,19 @@ impl PlanStore {
         });
     }
 
-    /// A plan by its id, `None` for the newest one. A replaced, cancelled or expired plan is still there.
+    /// A plan by its id, `None` for the newest live one (else the newest). A replaced, cancelled or expired plan is still there.
     pub fn view(&self, id: Option<&str>) -> Option<McpPlanView> {
         self.with(|inner| match id {
             Some(id) => inner.plans.iter().find(|p| p.id == id).map(Plan::view),
-            None => inner.plans.last().map(Plan::view),
+            // The page that reloads finds the plan that still needs it: the newest one that is being prepared, waits
+            // or is being applied, else the newest plan.
+            None => inner
+                .plans
+                .iter()
+                .rev()
+                .find(|p| !p.state.is_finished())
+                .or_else(|| inner.plans.last())
+                .map(Plan::view),
         })
     }
 
@@ -472,7 +480,9 @@ impl PlanStore {
                 }
                 Err(apply::Failure { error, report }) => {
                     tracing::error!(plan_id = %p.id, kind = p.kind.as_str(), error = %error, "mcp plan apply failed");
-                    p.report = report;
+                    // A plan that failed while it was applying always has a report (an empty one says nothing moved);
+                    // only a plan that failed while it was being prepared has none.
+                    p.report = report.or_else(|| Some(PlanReport::default()));
                     p.finish(PlanState::Failed { error });
                 }
             }

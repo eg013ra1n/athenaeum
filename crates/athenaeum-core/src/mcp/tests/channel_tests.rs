@@ -17,16 +17,13 @@ use crate::events::NullEmitter;
 use crate::services::ServiceContext;
 
 const VERSION: &str = "9.9.9-test";
-const TOOLS: [&str; 8] = [
-    "catalog_overview",
-    "file_details",
-    "find_duplicates",
-    "find_missing_metadata",
-    "find_rebuilt_masters",
-    "plan_black_hole",
-    "plan_status",
-    "query_frames",
-];
+/// The tools the server offers, by name, from the router itself: a new tool never leaves a stale list here.
+fn tools() -> Vec<String> {
+    let mut names: Vec<String> =
+        crate::mcp::AthenaeumMcp::all_tools().list_all().into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+    names
+}
 
 // ---- the rig ----
 
@@ -252,7 +249,7 @@ async fn tools_json_is_written_on_enable() {
     let served = serde_json::to_value(client.list_all_tools().await.expect("tools")).expect("to json");
     let _ = client.cancel().await;
     assert_eq!(on_disk["tools"], served, "tools.json is the server's own tools/list");
-    assert_eq!(on_disk["tools"].as_array().expect("tools").len(), TOOLS.len());
+    assert_eq!(on_disk["tools"].as_array().expect("tools").len(), tools().len());
     // No temp file is left beside it.
     let names: Vec<String> = std::fs::read_dir(rig.dir()).expect("dir").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).collect();
     assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
@@ -267,7 +264,7 @@ async fn frozen_v1_handshake_is_still_served() {
     let line = format!("ATHENAEUM-MCP/1 {}", rig.token());
     let (stream, reply) = shake(&rig.endpoint(), &line).await;
     assert_eq!(reply, format!("OK {} {VERSION}", mcp_server_name()));
-    assert_eq!(tool_names(stream).await, TOOLS.map(String::from).to_vec());
+    assert_eq!(tool_names(stream).await, tools());
     // A later channel protocol is refused in words, not served.
     let (_s, reply) = shake(&rig.endpoint(), &format!("ATHENAEUM-MCP/9 {}", rig.token())).await;
     assert!(reply.starts_with("ERR version "), "{reply}");
@@ -380,7 +377,7 @@ async fn enable_then_handshake_ok_then_mcp_flows() {
     }
     let (stream, reply) = shake(&rig.endpoint(), &format!("{HANDSHAKE_PREFIX} {}", rig.token())).await;
     assert_eq!(reply, format!("OK {} {VERSION}", mcp_server_name()));
-    assert_eq!(tool_names(stream).await, TOOLS.map(String::from).to_vec());
+    assert_eq!(tool_names(stream).await, tools());
     rig.finish().await;
 }
 

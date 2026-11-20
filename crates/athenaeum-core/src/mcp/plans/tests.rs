@@ -919,3 +919,76 @@ async fn a_cancel_racing_an_apply_has_one_winner() {
         }
     }
 }
+
+// ---- fix wave: a failed apply always has a report; a reload finds the applying plan ----
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_apply_always_has_a_report() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    let id = waiting(&rig, &fx, &TestApplier::default());
+    // An apply that failed before it wrote a line (the thread could not start, a panic around the applier).
+    rig.host.plans.finish_apply(&id, Err(apply::Failure { error: "the catalog is busy".to_string(), report: None }));
+    let v = rig.host.plans.view(Some(&id)).expect("plan");
+    assert_eq!(v.state, PlanState::Failed { error: "the catalog is busy".to_string() });
+    assert_eq!(v.report, Some(PlanReport::default()), "a failed apply says nothing moved");
+
+    // A plan that failed while it was being prepared never reached an apply: it has no report.
+    let (prep, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t");
+    rig.host.plans.fail(&prep, "could not read the catalog".to_string());
+    let v = rig.host.plans.view(Some(&prep)).expect("plan");
+    assert!(matches!(v.state, PlanState::Failed { .. }));
+    assert_eq!(v.report, None);
+}
+
+/// An applier that waits (bounded) until `gate` opens.
+#[derive(Clone)]
+struct Gated(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl PlanApplier for Gated {
+    fn validate(&self, _v: &McpPlanView, _s: &PlanSelection) -> Result<(), String> {
+        Ok(())
+    }
+    fn apply(&self, _h: &McpHost, _p: &str, _s: &PlanSelection, fresh: &[String]) -> PlanReport {
+        let (lock, cv) = &*self.0;
+        let open = lock.lock().unwrap();
+        let _ = cv.wait_timeout_while(open, Duration::from_secs(10), |open| !*open).unwrap();
+        PlanReport {
+            applied: fresh
+                .iter()
+                .map(|id| ReportLine { item_id: id.clone(), file_name: id.clone(), folder: String::new(), reason: "done".into() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reload_during_an_apply_finds_the_applying_plan() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (id, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t");
+    let mut c = content(&rig, &fx, &TestApplier::default());
+    c.applier = Box::new(Gated(Arc::clone(&gate)));
+    rig.host.plans.publish(&id, c).expect("publish");
+    rig.host.plans.answer(&rig.host, &id, apply_of(selection(Some(&fx.keeper), &[&fx.a]))).expect("apply");
+    // A newer plan that came to nothing is the newest, yet the page reloading must find the one being applied.
+    let (newer, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t2");
+    rig.host.plans.fail(&newer, "could not read the catalog".to_string());
+    let newest = rig.host.plans.view(None).expect("a plan");
+    assert_eq!((newest.plan_id.as_str(), &newest.state), (id.as_str(), &PlanState::Applying));
+    // A newer plan that waits or is prepared is itself preferred (the newest of the live ones).
+    let (live, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "t3");
+    assert_eq!(rig.host.plans.view(None).expect("a plan").plan_id, live);
+    // Open the gate (bounded wait below) and let the apply end.
+    {
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    assert_eq!(settled(&rig, &id).await.state, PlanState::Applied);
+    // Nothing live is left but the preparing plan; after it ends, the newest plan is the answer.
+    rig.host.plans.fail(&live, "x".to_string());
+    assert_eq!(rig.host.plans.view(None).expect("a plan").plan_id, live);
+}

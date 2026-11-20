@@ -63,7 +63,7 @@ Every answer is two halves that each read on their own.
 
 Each tool is a core fn `mcp::tools::<name>(host, args) -> Result<Answer, ApiError>` wearing
 `#[tracing::instrument(skip_all, fields(tool = "<name>"), err)]`; `AthenaeumMcp::all_tools()` (`server.rs`) joins the tool routers (`catalog_tools() + plan_tools()`, and `tools.json` is written from it); the `#[tool]` method is a two-line adapter that runs it with
-`spawn_blocking` (it reads SQLite) and wraps it with `to_tool_result`.
+`spawn_blocking` (it reads SQLite) and wraps it with `to_tool_result`. No test keeps a list of tool names: core's tests read `all_tools()`, the bridge's read `McpHost::tool_list_json()`, so a new tool cannot leave a stale list.
 
 **One frame set.** A `query_frames` scope that is exactly one frame set (`frameSet` and nothing else, default state) answers the
 frame set's own page figures (`catalog_query::frame_set_totals`): its frame count and integration time are the page's (the
@@ -240,7 +240,11 @@ MCP client can call applies or cancels a plan: `PlanStore::answer` is reached on
 | The generic selection check and the re-check at apply | `plans/apply.rs` |
 
 - **One undecided plan.** `begin` makes the old `preparing` / `waiting` plan `replaced` (`replacedBy` = the new id, its cancel flag set). A
-  replaced, cancelled, expired or applied plan stays readable by its id for 24 h (at most 100 finished plans); `view(None)` is the newest.
+  replaced, cancelled, expired or applied plan stays readable by its id for 24 h (at most 100 finished plans). `view(None)` is the newest plan
+  that is `preparing`, `waiting` or `applying` (a page that reloads during an apply finds it, even when a newer plan failed), else the newest plan.
+  A failed apply always carries a report (an empty one says nothing was recorded as moved; `plan_status` reads `No file was recorded as moved before
+  it stopped.`); only a plan that failed while it was being prepared has none. Turning assistant access off does not end a waiting or preparing
+  plan: the user still decides it in the window.
 - **Expiry is on tokio time.** `publish` stores a `tokio::time::Instant` deadline (`PLAN_TTL`, one hour); the sleeper and the apply check
   both read it, so a test pauses time. `expiresAt` is display text (local time, `YYYY-MM-DD HH:MM:SS`).
 - **Apply.** `Apply` only from `waiting`, unexpired. The generic check (known groups and items, no locked item included, `chosen` a
@@ -258,7 +262,8 @@ MCP client can call applies or cancels a plan: `PlanStore::answer` is reached on
 
 `mcp/plans/black_hole.rs`. An assistant names groups (`dup:<key>:<hash>` from `find_duplicates`, `rebuilt:<id>` from `find_rebuilt_masters`);
 only those groups enter the plan. The handles are read before the plan begins, so a mistyped or stale handle (or the other source's) is an
-`Invalid` in words and never replaces the plan the user is looking at.
+`Invalid` in words and never replaces the plan the user is looking at. So does a request that is too large: `resolve` sums the distinct copies
+of the named groups and refuses more than `PLAN_ITEM_CAP` (2 000) in words before `begin`, so no file is stamped and the waiting plan stays.
 
 - **One keeper per group** ("Copy that stays", `chooseOne`): `chosen` is the one copy under `keepInFolder` (separator-strict: the folder or
   anything below it, never a folder that merely starts like it) or among `keepFiles` (`file:<n>` or the stored path). None or several: `chosen`
@@ -271,15 +276,18 @@ only those groups enter the plan. The handles are read before the plan begins, s
   `rebuilt_copies::master_link_count`, the one link count: light frames plus master sets that use it, such as a master dark behind a master
   flat with no light yet); a copy whose master set superseded raw frames (`raw frames were superseded by it; it stays in v1`: moving it would
   un-supersede them, `master_unregister`); a zip-resident copy (`inside a zip; a zip moves to the Black Hole only as a whole`); a copy whose
-  file cannot be stamped (`not reachable ...`); a byte-checked copy whose bytes differ from the keeper's, whichever key matched it, header or content (`differs in bytes from the copy that
+  file cannot be stamped (`not reachable ...`); a byte-checked copy whose bytes differ from the keeper's, whichever key matched it (`differs in bytes from the copy that
   stays`, with a group note). A group whose every copy sits in an earlier group of the plan is titled `group whose copies are in another group of this plan`.
 - **The answer is the plan, as data and in words** (`describe_plan`, one function for the planning answer and for `plan_status` of a waiting
   plan): per group its title, the copy that stays (`chosen`: file name and folder), and `items` with `fileName`, `folder`, `values` (the
   columns), `selected`, `locked` (the reason or null) and `candidate`; the text lists, under each group, the copy that stays and every other
   copy as `moves`, `not selected` or `locked: <reason>`. At most 50 groups are shown with their items (the rest summed) and at most 20 items
   per group (the rest summed).
-- **Byte checks** (`Header` and `Content` groups; only the full-file `strong_hash` groups, `Master`, decide on bytes already, while
-  `files.content_hash` samples 3 x 512 KB and so does not): each unlocked copy is compared with the keeper by `verify_duplicate_pair`. The
+- **Byte checks** (`Header`, `Content` and `Master` groups; a rebuilt master is not a copy of its keeper's bytes and is not checked): a stored
+  full-file hash may predate an in-place overwrite, so the disk decides, and `files.content_hash` samples 3 x 512 KB. Each unlocked copy is
+  compared with the keeper by `verify_duplicate_pair`, which answers from the stored hashes when both files still match their rows (about a
+  stat) and reads the bytes otherwise. The evidence says which: `byte-identical to the copy that stays (compared just now)` for a byte compare,
+  `same full-file hash as the copy that stays, files unchanged since` for a stored-hash answer (`VerifyFn` returns the pair's method). The
   tool answers right after the plan begins, with the handle and state `preparing` (`Athenaeum is checking N copies byte for byte; ... Ask
   plan_status.`), because a client cancels a tool call after about a minute and a cancelled call gives the assistant no handle. The checks run
   on a thread of their own, progress per pair, the plan's cancel flag read between pairs (a plan the user cancels or a newer plan replaces

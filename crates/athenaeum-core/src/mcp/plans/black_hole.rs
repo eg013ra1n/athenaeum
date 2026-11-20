@@ -38,6 +38,7 @@ use super::{
 use crate::api::ApiError;
 use crate::calibration_library::rebuilt_copies::{find_rebuilt_master_copies, master_link_count};
 use crate::db::{file_not_in_black_hole_sql, native_separator_of};
+use crate::duplicates::{VerifyMethod, VerifyPairResult};
 use crate::mcp::answer::{bytes_text, count_of};
 use crate::mcp::tools::to_json;
 use crate::mcp::{Answer, McpHost};
@@ -87,13 +88,14 @@ pub struct PlanBlackHoleArgs {
     pub keep_files: Vec<String>,
 }
 
-/// Compares two catalog files byte for byte: `true` when identical. The planner and the applier take it as a value so
-/// a test can count and interrupt the comparisons.
-pub type VerifyFn = Arc<dyn Fn(&McpHost, i64, i64) -> Result<bool, ApiError> + Send + Sync>;
+/// Compares two catalog files: whether they are identical and how that was decided (a byte compare just now, or the
+/// stored full-file hashes of two files unchanged since). The planner and the applier take it as a value so a test can
+/// count and interrupt the comparisons.
+pub type VerifyFn = Arc<dyn Fn(&McpHost, i64, i64) -> Result<VerifyPairResult, ApiError> + Send + Sync>;
 
 /// The real comparison: the Duplicates page's own `verify_duplicate_pair`.
 pub fn real_verify() -> VerifyFn {
-    Arc::new(|host, a, b| crate::api::files::verify_duplicate_pair(host.ctx(), a, b).map(|r| r.identical))
+    Arc::new(|host, a, b| crate::api::files::verify_duplicate_pair(host.ctx(), a, b))
 }
 
 fn plan_columns() -> Vec<PlanColumn> {
@@ -123,8 +125,9 @@ struct GroupSpec {
     matched: String,
     /// The title when the group has its own words (a rebuilt master's parameters).
     title: Option<String>,
-    /// A group whose key does not decide on bytes (`Header`, and `Content`: `files.content_hash` samples 3 x 512 KB):
-    /// its copies are byte-checked against the keeper. Only the full-file hash key decides on bytes already.
+    /// A group whose copies are checked against the keeper's disk file: `Header`, `Content` (`files.content_hash`
+    /// samples 3 x 512 KB) and `Master` (a full-file hash that may predate an overwrite; the check is a stat when both
+    /// files still match their rows). A rebuilt master is no copy of its keeper's bytes and is not checked.
     byte_checked: bool,
     file_ids: Vec<i64>,
 }
@@ -354,7 +357,9 @@ fn resolve(host: &McpHost, args: &PlanBlackHoleArgs) -> Result<Vec<(String, Grou
                 };
                 let (matched, byte_checked) = match key {
                     crate::db::DuplicateKey::Header => ("same header, size and name", true),
-                    crate::db::DuplicateKey::Master => ("same full-file hash", false),
+                    // The stored hash may predate an in-place overwrite: the disk decides. `verify_duplicate_pair`
+                    // answers from the stored hashes when both files still match their rows, so this costs a stat.
+                    crate::db::DuplicateKey::Master => ("same full-file hash", true),
                     crate::db::DuplicateKey::Content => ("same content (a sampled hash)", true),
                 };
                 available.insert(
@@ -389,10 +394,17 @@ fn resolve(host: &McpHost, args: &PlanBlackHoleArgs) -> Result<Vec<(String, Grou
             "no {what} {list} in the catalog now (it may have changed, or it is not in a scan root that looks for duplicates); ask {tool} again"
         )));
     }
-    Ok(wanted
-        .into_iter()
-        .filter_map(|h| available.remove(&h).map(|spec| (h, spec)))
-        .collect())
+    let resolved: Vec<(String, GroupSpec)> =
+        wanted.into_iter().filter_map(|h| available.remove(&h).map(|spec| (h, spec))).collect();
+    // A request that is too large is refused here, before any plan begins: it must not replace the plan the user is
+    // looking at, and no file is stamped for it. A file in two groups is planned once.
+    let copies = resolved.iter().flat_map(|(_, g)| g.file_ids.iter().copied()).collect::<HashSet<i64>>().len();
+    if copies > PLAN_ITEM_CAP {
+        return Err(ApiError::Invalid(format!(
+            "these groups hold {copies} copies, and a plan holds at most 2 000; name fewer groups (or narrow the scope of {tool}) and ask again"
+        )));
+    }
+    Ok(resolved)
 }
 
 /// Every copy of every group, from the host's reader; the guard is dropped before the caller touches the disk.
@@ -588,18 +600,26 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
 }
 
 /// Records what the byte checks found: a differing pair is locked and the group says so.
-fn record_checks(out: &mut Assembled, results: &[(usize, Result<bool, ApiError>)]) {
+fn record_checks(out: &mut Assembled, results: &[(usize, Result<VerifyPairResult, ApiError>)]) {
     let mut differing: HashMap<usize, usize> = HashMap::new();
     let mut unreadable: HashMap<usize, usize> = HashMap::new();
     for (p, result) in results {
         let pair = &out.pairs[*p];
         let item = &mut out.groups[pair.group].items[pair.item];
         match result {
-            Ok(true) => item.evidence = Some("byte-identical to the copy that stays (compared just now)".to_string()),
-            Ok(false) => {
+            Ok(r) if r.identical => {
+                item.evidence = Some(match r.method {
+                    VerifyMethod::Bytes => "byte-identical to the copy that stays (compared just now)".to_string(),
+                    VerifyMethod::StoredHash => "same full-file hash as the copy that stays, files unchanged since".to_string(),
+                });
+            }
+            Ok(r) => {
                 item.locked = Some(DIFFERS.to_string());
                 item.selected = false;
-                item.evidence = Some("compared byte by byte with the copy that stays: the files are not the same".to_string());
+                item.evidence = Some(match r.method {
+                    VerifyMethod::Bytes => "compared byte by byte with the copy that stays: the files are not the same".to_string(),
+                    VerifyMethod::StoredHash => "its full-file hash differs from the copy that stays".to_string(),
+                });
                 *differing.entry(pair.group).or_default() += 1;
             }
             Err(e) => {
@@ -616,7 +636,7 @@ fn record_checks(out: &mut Assembled, results: &[(usize, Result<bool, ApiError>)
     for g in groups {
         if let Some(n) = differing.get(&g) {
             out.group_notes[g].push(format!(
-                "{} the same header but different bytes from the copy that stays; left out",
+                "{} the group's key but different bytes from the copy that stays; left out",
                 plural(*n, "copy has", "copies have")
             ));
         }
@@ -719,7 +739,7 @@ fn check_and_publish(
     verify: &VerifyFn,
     pairs: usize,
 ) -> Result<Result<(), Stopped>, ApiError> {
-    let mut results: Vec<(usize, Result<bool, ApiError>)> = Vec::with_capacity(pairs);
+    let mut results: Vec<(usize, Result<VerifyPairResult, ApiError>)> = Vec::with_capacity(pairs);
     for p in 0..pairs {
         if cancel.load(Ordering::SeqCst) {
             return Ok(Err(Stopped::Ended));
@@ -1052,7 +1072,7 @@ impl PlanApplier for BlackHoleApplier {
             }
             for id in &w.ids {
                 let Some(item) = self.items.get(*id) else { continue };
-                let verdict = (self.verify)(host, item.file_id, w.keeper_file).map_err(|e| {
+                let verdict = (self.verify)(host, item.file_id, w.keeper_file).map(|r| r.identical).map_err(|e| {
                     tracing::warn!(error = %e, plan_id, "plan pair could not be compared");
                     e.to_string()
                 });

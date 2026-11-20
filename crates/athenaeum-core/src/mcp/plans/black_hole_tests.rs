@@ -656,7 +656,7 @@ fn verification_is_cancellable() {
                 let id = host.plans.view(None).expect("the plan being prepared").plan_id;
                 host.plans.answer(&host, &id, PlanAnswer::Cancel).expect("cancel");
             }
-            Ok(true)
+            Ok(same_bytes())
         })
     };
     let answer = prepare(
@@ -832,7 +832,7 @@ fn gated(gate: &Arc<(Mutex<bool>, Condvar)>, started: &Arc<AtomicUsize>) -> Veri
         let (lock, cv) = &*gate;
         let open = lock.lock().expect("gate");
         let _ = cv.wait_timeout_while(open, Duration::from_secs(10), |open| !*open).expect("gate wait");
-        Ok(true)
+        Ok(same_bytes())
     })
 }
 
@@ -1093,9 +1093,14 @@ fn master_used_by_another_master_is_locked() {
 
 // ---- fix round 2 ----
 
+/// What a byte compare of two identical files answers.
+fn same_bytes() -> VerifyPairResult {
+    VerifyPairResult { identical: true, method: VerifyMethod::Bytes }
+}
+
 /// An instant comparison: every pair is identical.
 fn identical() -> VerifyFn {
-    Arc::new(|_h: &McpHost, _a: i64, _b: i64| Ok(true))
+    Arc::new(|_h: &McpHost, _a: i64, _b: i64| Ok(same_bytes()))
 }
 
 #[tokio::test(start_paused = true)]
@@ -1113,7 +1118,19 @@ async fn a_byte_checked_plan_gets_its_timer() {
     let id = answer.data["planId"].as_str().expect("a plan id").to_string();
     // The worker publishes the plan; no read of the plan runs between here and the clock moving on.
     settle(&rig, &id);
-    assert_eq!(rig.host.plans.view(Some(&id)).expect("the plan").state, PlanState::Waiting);
+    // The store emits its event after it releases the lock, so the state can be `waiting` a moment before the publish
+    // event lands. One pair: `begin`, the first and the last progress (`done == total`), then the publish: four
+    // events. Wait (bounded, real time) for all four before counting, or a late one would pass for the expiry.
+    let started = Instant::now();
+    while rig.events.named("mcp-plan-updated").len() < 4 {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the publish event never came: {:?}",
+            rig.events.named("mcp-plan-updated")
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(rig.events.named("mcp-plan-updated").len(), 4, "begin, progress twice, publish");
     let before = rig.events.named("mcp-plan-updated").len();
     tokio::time::advance(crate::mcp::plans::PLAN_TTL + Duration::from_secs(1)).await;
     for _ in 0..5 {
@@ -1133,7 +1150,7 @@ fn a_panic_while_preparing_fails_the_plan() {
     let rig = rig();
     let a = header_copy(&rig, "x-a", "t21.fits", b"AAAA");
     header_copy(&rig, "x-b", "t21.fits", b"AAAA");
-    let verify: VerifyFn = Arc::new(|_h: &McpHost, _a: i64, _b: i64| -> Result<bool, ApiError> { panic!("a comparison went wrong") });
+    let verify: VerifyFn = Arc::new(|_h: &McpHost, _a: i64, _b: i64| -> Result<VerifyPairResult, ApiError> { panic!("a comparison went wrong") });
     let answer = prepare(
         &rig.host,
         args(BlackHoleSource::Duplicates, &[header_handle("t21.fits")], Some(&a.dir()), &[]),
@@ -1200,4 +1217,72 @@ fn a_group_emptied_by_an_earlier_group_says_so() {
     assert!(out.groups[1].items.is_empty());
     assert_eq!(out.groups[1].title, "group whose copies are in another group of this plan");
     assert_eq!(out.groups[2].title, "group with no copy left in the catalog");
+}
+
+// ---- fix wave: the disk is checked, a bad request leaves the waiting plan alone, true evidence ----
+
+#[test]
+fn a_full_hash_group_is_checked_against_the_disk() {
+    let rig = rig();
+    let a = header_copy(&rig, "f-a", "t30.xisf", b"AAAA");
+    let b = header_copy(&rig, "f-b", "t30.xisf", b"AAAA");
+    {
+        // Two masters whose stored full-file hashes agree.
+        let database = rig.ctx.db.get().expect("db");
+        let conn = database.conn();
+        conn.execute("UPDATE frames SET imagetyp = 'MasterDark', is_master = 1", []).expect("masters");
+        conn.execute("UPDATE files SET strong_hash = 'FULLHASH1' WHERE filename = 't30.xisf'", []).expect("hash");
+    }
+    // One copy is overwritten in place after its hash was stored (same size).
+    std::fs::write(&b.path, b"BBBB").expect("overwrite");
+    let groups = crate::api::files::get_duplicates(&rig.ctx).expect("groups");
+    let handles: Vec<String> =
+        groups.iter().filter_map(|g| g.key.map(|k| format!("dup:{}:{}", k.hash_type(), g.content_hash))).collect();
+    assert_eq!(handles, vec!["dup:master:FULLHASH1".to_string()]);
+    let (verify, calls) = counting();
+    let view = plan_with(&rig, BlackHoleSource::Duplicates, &handles, Some(&a.dir()), &[], verify);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the pair is checked against the disk");
+    let dropped = item(&view, &b);
+    assert_eq!(dropped.locked.as_deref(), Some("differs in bytes from the copy that stays"), "{dropped:?}");
+    assert!(!dropped.selected);
+}
+
+#[test]
+fn the_evidence_names_the_method_that_decided() {
+    let rig = rig();
+    let a = header_copy(&rig, "v-a", "t31.fits", b"AAAA");
+    let b = header_copy(&rig, "v-b", "t31.fits", b"AAAA");
+    let handle = [header_handle("t31.fits")];
+    let by = |method: VerifyMethod| -> VerifyFn {
+        Arc::new(move |_h: &McpHost, _a: i64, _b: i64| Ok(VerifyPairResult { identical: true, method }))
+    };
+    let view = plan_with(&rig, BlackHoleSource::Duplicates, &handle, Some(&a.dir()), &[], by(VerifyMethod::Bytes));
+    let said = item(&view, &b).evidence.clone().unwrap_or_default();
+    assert_eq!(said, "byte-identical to the copy that stays (compared just now)");
+    let view = plan_with(&rig, BlackHoleSource::Duplicates, &handle, Some(&a.dir()), &[], by(VerifyMethod::StoredHash));
+    let said = item(&view, &b).evidence.clone().unwrap_or_default();
+    assert_eq!(said, "same full-file hash as the copy that stays, files unchanged since");
+    assert!(!said.contains("compared just now") && !said.contains("byte-identical"), "{said}");
+}
+
+#[test]
+fn an_oversized_request_leaves_the_waiting_plan_alone() {
+    let rig = rig();
+    let a = header_copy(&rig, "w-a", "t32.fits", b"AAAA");
+    header_copy(&rig, "w-b", "t32.fits", b"AAAA");
+    let first = plan(&rig, BlackHoleSource::Duplicates, &[header_handle("t32.fits")], Some(&a.dir()), &[]);
+    // One group of more copies than a plan holds.
+    let name = "t33.fits";
+    let over = crate::mcp::plans::PLAN_ITEM_CAP + 1;
+    for n in 0..over {
+        header_copy(&rig, &format!("big-{n}"), name, b"AAAA");
+    }
+    let refused = match prepare(&rig.host, args(BlackHoleSource::Duplicates, &[header_handle(name)], None, &[]), real_verify()) {
+        Err(ApiError::Invalid(m)) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(refused.contains("2 000") && refused.contains(&over.to_string()), "{refused}");
+    // The user's waiting plan is untouched, and no plan began.
+    let still = rig.host.plans.view(None).expect("a plan");
+    assert_eq!((still.plan_id.as_str(), &still.state), (first.plan_id.as_str(), &PlanState::Waiting));
 }

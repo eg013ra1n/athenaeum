@@ -229,16 +229,13 @@ fn assert_handles_are_named(v: &Value, whence: &str) {
     }
 }
 
-const TOOLS: [&str; 8] = [
-    "catalog_overview",
-    "file_details",
-    "find_duplicates",
-    "find_missing_metadata",
-    "find_rebuilt_masters",
-    "plan_black_hole",
-    "plan_status",
-    "query_frames",
-];
+/// The tools the server offers, by name, from the router itself: a new tool never leaves a stale list here.
+fn tools() -> Vec<String> {
+    let mut names: Vec<String> =
+        crate::mcp::AthenaeumMcp::all_tools().list_all().into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+    names
+}
 
 // ---- tests ----
 
@@ -256,7 +253,7 @@ async fn both_revisions_list_the_same_tools() {
         seen.push(names);
         client.close().await;
     }
-    assert_eq!(seen[0], TOOLS.map(String::from).to_vec());
+    assert_eq!(seen[0], tools());
     assert_eq!(seen[0], seen[1], "both protocol revisions list the same tools");
     assert!(seen[0].iter().all(|n| !n.contains("apply")), "no tool applies a plan: {:?}", seen[0]);
 }
