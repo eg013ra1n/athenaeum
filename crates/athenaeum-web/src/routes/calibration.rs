@@ -520,6 +520,7 @@ mod calibration_config_tests {
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {
+            mcp: Default::default(),
             ctx,
             event_tx,
             allowed_paths: Vec::new(),

@@ -471,6 +471,7 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-opener",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -484,6 +485,7 @@ dependencies = [
  "chrono",
  "percent-encoding",
  "rayon",
+ "rmcp",
  "rusqlite",
  "serde",
  "serde_json",
@@ -5887,22 +5889,31 @@ version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "391f153431ab68664d946513ea0cb3edbca78eaf99c5a983036cacab6220d85b"
 dependencies = [
+ "async-trait",
+ "base64 0.23.0",
+ "bytes",
  "chrono",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "indexmap 2.14.0",
  "libc",
  "pastey",
  "percent-encoding",
  "pin-project-lite",
+ "rand",
  "rmcp-macros",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sse-stream",
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
@@ -6792,6 +6803,19 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

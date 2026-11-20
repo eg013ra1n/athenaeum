@@ -15,6 +15,10 @@ const TAURI_LIB: &str = include_str!("../../../athenaeum-tauri/src/lib.rs");
 const WEB_ROUTES: &str = include_str!("mod.rs");
 
 /// Routes the web host has and the desktop does not need.
+///
+/// `/mcp` (assistant access) is not here on purpose: it is a `nest_service` outside `/api/`, not a
+/// `.route("/api/…")`, so this parser never sees it. The desktop's counterpart is the local channel the three
+/// `*_mcp_*` commands switch; only those commands are mirrored one for one.
 const WEB_ONLY: &[&str] = &[
     // The SSE stream itself; the desktop delivers events through Tauri.
     "events",

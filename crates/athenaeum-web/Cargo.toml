@@ -29,6 +29,9 @@ solvemyastro = { path = "../../solvemyastro" }
 # version.
 percent-encoding = "2.1"
 tracing = "0.1"
+# Assistant access (MCP) at `/mcp`: rmcp's Streamable HTTP service, mounted with `nest_service` (rmcp has no axum
+# dependency). One rmcp version with athenaeum-core's; the feature adds only its own http/sse pieces.
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]
 # ServiceExt::oneshot for router-level middleware tests (see routes/auth.rs).

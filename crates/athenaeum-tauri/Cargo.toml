@@ -33,3 +33,7 @@ base64 = "0.23"
 tauri-plugin-updater = "2"
 solvemyastro = { path = "../../solvemyastro" }
 tracing = "0.1"
+
+[dev-dependencies]
+# Temp folders for the bridge-copy tests (src/mcp_bridge.rs); same version as athenaeum-core and athenaeum-web.
+tempfile = "3"
