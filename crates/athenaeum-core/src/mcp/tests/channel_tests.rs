@@ -9,7 +9,7 @@ use rmcp::ClientLifecycleMode;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::channel::{bind, connect, mcp_dir, Endpoint, Stream, HANDSHAKE_PREFIX};
+use super::channel::{bind, connect, mcp_dir, spawn_closable, Endpoint, Stream, HANDSHAKE_PREFIX};
 use super::{desktop_client_config, mcp_server_name, HostKind, McpHost, McpIdentity, NEEDS_API_KEY};
 use crate::api::ApiError;
 use crate::db;
@@ -350,6 +350,13 @@ async fn enable_then_handshake_ok_then_mcp_flows() {
     assert_eq!(rig.kv().as_deref(), Some("true"));
     assert!(rig.file("enabled").exists());
     assert_eq!(status.endpoint.as_deref(), Some(rig.endpoint().to_text().as_str()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: PathBuf| std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(rig.dir()), 0o700, "the channel folder is private to its owner");
+        assert_eq!(mode(rig.file("token")), 0o600, "the key is readable by its owner only");
+    }
     let (stream, reply) = shake(&rig.endpoint(), &format!("{HANDSHAKE_PREFIX} {}", rig.token())).await;
     assert_eq!(reply, format!("OK {} {VERSION}", mcp_server_name()));
     assert_eq!(tool_names(stream).await, TOOLS.map(String::from).to_vec());
@@ -453,7 +460,101 @@ async fn second_instance_of_one_build_does_not_steal_the_endpoint() {
     assert!(first.file("endpoint").exists() && first.file("enabled").exists() && first.file("tools.json").exists());
     let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
     assert!(reply.starts_with("OK "), "the first one is untouched: {reply}");
+    // The second host goes before the first one's temp dir does.
+    second.shutdown();
+    drop(second);
     first.finish().await;
+}
+
+/// Sets a flag when it is dropped.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn closing_a_task_drops_what_it_owns_before_close_returns() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dropped = Arc::new(AtomicBool::new(false));
+    let owned = DropFlag(Arc::clone(&dropped));
+    let closer = spawn_closable(&tokio::runtime::Handle::current(), async move {
+        let _owned = owned;
+        std::future::pending::<()>().await;
+    });
+    // Let the task start and park on its pending future.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!dropped.load(Ordering::SeqCst) && !closer.is_finished());
+    closer.close();
+    assert!(dropped.load(Ordering::SeqCst), "the future is dropped by close itself, not at the next poll");
+    assert!(closer.is_finished());
+    closer.close();
+    // A task that ends by itself is finished, too.
+    let done = spawn_closable(&tokio::runtime::Handle::current(), async {});
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(done.is_finished());
+}
+
+#[tokio::test]
+async fn regenerate_is_refused_while_another_instance_serves() {
+    let first = desktop();
+    first.host.set_enabled(true).expect("on");
+    let endpoint = first.endpoint();
+    let token = first.token();
+    let second = host_over(&first.ctx, HostKind::Desktop, false);
+    second.on_catalog_open().expect("open");
+    std::fs::write(first.file("enabled"), "owned-by-the-first").expect("the first one's marker");
+    assert_eq!(second.set_enabled(true).expect("on").state, "elsewhere");
+    assert_eq!(std::fs::read_to_string(first.file("enabled")).expect("marker"), "owned-by-the-first", "the marker is written only after a bind");
+    let err = second.regenerate_token().expect_err("another instance owns the key");
+    assert!(matches!(&err, ApiError::Conflict(m) if m == "another Athenaeum of this build serves the assistant"), "{err:?}");
+    assert_eq!(first.token(), token, "the shared key file is not rewritten");
+    assert_eq!(second.status().state, "elsewhere");
+    // The serving instance still takes the key it hands out.
+    let (_s, reply) = shake(&endpoint, &format!("{HANDSHAKE_PREFIX} {token}")).await;
+    assert!(reply.starts_with("OK "), "{reply}");
+    second.shutdown();
+    drop(second);
+    first.finish().await;
+}
+
+#[tokio::test]
+async fn the_channel_folder_is_private_when_the_socket_lives_elsewhere() {
+    let rig = desktop();
+    // A deep app-data dir puts the Unix socket in the temp dir, so only `ensure_token` makes `<app-data>/mcp`.
+    let app_data = rig.base.join("a-deliberately-long-application-support-folder-name").join("and-another-long-folder-name-below-it");
+    rig.host.set_app_data_dir(app_data.clone());
+    let status = rig.host.set_enabled(true).expect("on");
+    assert_eq!(status.state, "serving", "{:?}", status.last_error);
+    let dir = mcp_dir(&app_data);
+    assert!(dir.join("token").is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the channel folder is private to its owner: {mode:o}");
+    }
+    rig.host.set_enabled(false).expect("off");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn a_failed_bind_leaves_no_endpoint_file() {
+    let rig = desktop();
+    // A folder where the tool list goes: the write fails after the channel is bound and `endpoint` is written.
+    std::fs::create_dir_all(rig.file("tools.json")).expect("a folder in the tool list's place");
+    let status = rig.host.set_enabled(true).expect("a channel that cannot start is a status, not an error");
+    assert_eq!(status.state, "failed");
+    assert!(status.last_error.as_deref().is_some_and(|m| m.contains("tool list")), "{:?}", status.last_error);
+    assert!(status.endpoint.is_none());
+    assert!(!rig.file("endpoint").exists(), "no stale endpoint file");
+    assert!(rig.file("tools.json").is_dir());
+    assert!(rig.file("token").exists(), "the key stays");
+    assert_eq!(rig.kv().as_deref(), Some("true"), "the setting is what the owner chose");
+    assert!(!rig.host.is_serving());
+    rig.finish().await;
 }
 
 #[tokio::test]

@@ -15,7 +15,7 @@
 //!   never removes or rewrites the first one's files.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -23,8 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use super::channel::{
-    self, endpoint_present, mcp_dir, new_token, parse_hello, read_token, remove_endpoint, tokens_match, write_atomic, Endpoint,
-    Hello, HandshakeError, Listener, Stream, HANDSHAKE_MAX_BYTES,
+    self, endpoint_present, ensure_private_dir, mcp_dir, new_token, parse_hello, read_token, remove_endpoint, spawn_acceptor,
+    spawn_closable, tokens_match, write_atomic, Closer, Endpoint, Hello, HandshakeError, Stream, HANDSHAKE_MAX_BYTES,
 };
 use super::{AthenaeumMcp, HostKind, McpHost};
 use crate::api::ApiError;
@@ -110,21 +110,72 @@ impl State {
     }
 }
 
-/// What a bind started: stopping it cancels the listener and every connection.
+/// The connections handed to clients, so that closing the channel drops every one of them at once (on Windows a pipe
+/// instance that outlives the close keeps the pipe name taken).
+#[derive(Clone, Default)]
+struct Sessions(Arc<Mutex<SessionList>>);
+
+#[derive(Default)]
+struct SessionList {
+    open: Vec<Closer>,
+    closed: bool,
+}
+
+impl Sessions {
+    fn lock(&self) -> MutexGuard<'_, SessionList> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, session: Closer) {
+        let mut list = self.lock();
+        if list.closed {
+            drop(list);
+            session.close();
+            return;
+        }
+        list.open.retain(|s| !s.is_finished());
+        list.open.push(session);
+    }
+
+    fn close_all(&self) {
+        let open = {
+            let mut list = self.lock();
+            list.closed = true;
+            std::mem::take(&mut list.open)
+        };
+        for session in open {
+            session.close();
+        }
+    }
+}
+
+/// What a bind started: stopping it cancels the listener and every connection, and drops them.
 struct Run {
     /// Parent of everything below; cancelled to close the channel.
     cancel: CancellationToken,
     /// Parent of every connection's token; cancelled and replaced when the key changes.
     conns: CancellationToken,
-    /// The accept loop's token; replaced when the socket is rebound.
+    /// The accept handler's token; replaced when the socket is rebound.
     listener: CancellationToken,
+    /// The task that owns the listener (and on Windows the waiting pipe instance); closing it drops them.
+    acceptor: Closer,
+    sessions: Sessions,
     handle: tokio::runtime::Handle,
+}
+
+impl Run {
+    /// Cancels everything and drops the listener and every connection before it returns.
+    fn close(&self) {
+        self.cancel.cancel();
+        self.acceptor.close();
+        self.sessions.close_all();
+    }
 }
 
 impl Drop for Run {
     /// A host that goes away closes its channel: the accept loop and every connection end.
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.close();
     }
 }
 
@@ -300,8 +351,13 @@ impl McpHost {
     /// this is the key an assistant presents to `/mcp`.
     pub fn regenerate_token(self: &Arc<Self>) -> Result<McpStatus, ApiError> {
         let mut ch = self.lock_channel();
+        if ch.state == State::Elsewhere {
+            // The shared key file belongs to the instance that serves; changing it would leave that one on the old key.
+            tracing::warn!("mcp key not regenerated: another instance serves the assistant");
+            return Err(ApiError::Conflict(ELSEWHERE.to_string()));
+        }
         let dir = self.channel_dir()?;
-        std::fs::create_dir_all(&dir).map_err(|e| {
+        ensure_private_dir(&dir).map_err(|e| {
             tracing::error!(error = %e, path = %dir.display(), "mcp channel folder could not be created");
             ApiError::Internal(format!("could not create the assistant folder: {e}"))
         })?;
@@ -372,6 +428,7 @@ impl McpHost {
         let Ok(dir) = self.channel_dir() else { return };
         let Some(run) = ch.run.as_mut() else { return };
         run.listener.cancel();
+        run.acceptor.close();
         let handle = run.handle.clone();
         let rebound = {
             let _enter = handle.enter();
@@ -381,7 +438,9 @@ impl McpHost {
             Ok((endpoint, listener)) => {
                 let listener_ct = run.cancel.child_token();
                 run.listener = listener_ct.clone();
-                handle.spawn(accept_loop(Arc::downgrade(self), listener, listener_ct));
+                let (acceptor, incoming) = spawn_acceptor(&handle, listener);
+                run.acceptor = acceptor;
+                handle.spawn(accept_loop(Arc::downgrade(self), incoming, listener_ct, run.sessions.clone()));
                 if let Err(e) = write_atomic(&dir.join("endpoint"), endpoint.to_text().as_bytes(), false) {
                     tracing::warn!(error = %e, "mcp endpoint file could not be rewritten");
                 }
@@ -420,11 +479,16 @@ impl McpHost {
 
     fn fail(&self, ch: &mut Channel, message: String) {
         tracing::error!(error = %message, "mcp channel could not start");
-        if let Some(run) = ch.run.take() {
-            run.cancel.cancel();
-        }
+        // Dropping the run closes the listener and every connection.
+        drop(ch.run.take());
         if let Some(endpoint) = ch.endpoint.take() {
             remove_endpoint(&endpoint);
+        }
+        // What this instance wrote is stale now; another instance's `endpoint` file is not ours to remove.
+        if ch.state != State::Elsewhere {
+            if let Ok(dir) = self.channel_dir() {
+                remove_file_quiet(&dir.join("endpoint"));
+            }
         }
         ch.state = State::Failed;
         ch.last_error = Some(message);
@@ -433,7 +497,7 @@ impl McpHost {
     /// Reads the key file, or makes the key and writes it.
     fn ensure_token(&self, ch: &mut Channel, dir: &Path) -> Result<(), ()> {
         let made = (|| -> std::io::Result<String> {
-            std::fs::create_dir_all(dir)?;
+            ensure_private_dir(dir)?;
             if let Some(token) = read_token(dir)? {
                 return Ok(token);
             }
@@ -471,10 +535,6 @@ impl McpHost {
             ch.state = State::Serving;
             return;
         }
-        if let Err(e) = write_atomic(&dir.join("enabled"), b"1", false) {
-            self.fail(ch, format!("could not write the assistant marker: {e}"));
-            return;
-        }
         if ch.run.is_some() && matches!(ch.state, State::Starting | State::Serving) {
             // Bound already (the early start, or a repeated call): only the state and the tool list move on.
             if self.catalog_open() {
@@ -484,6 +544,11 @@ impl McpHost {
             self.open_channel(ch, &dir, false);
         }
         if ch.run.is_some() {
+            // The marker is the owner's, written only once this instance holds the endpoint.
+            if let Err(e) = write_atomic(&dir.join("enabled"), b"1", false) {
+                self.fail(ch, format!("could not write the assistant marker: {e}"));
+                return;
+            }
             if let Err(e) = write_atomic(&dir.join("tools.json"), self.tool_list_json().as_bytes(), false) {
                 self.fail(ch, format!("could not write the assistant tool list: {e}"));
             }
@@ -518,11 +583,20 @@ impl McpHost {
             }
         };
         let cancel = CancellationToken::new();
-        let run = Run { conns: cancel.child_token(), listener: cancel.child_token(), cancel, handle: handle.clone() };
-        handle.spawn(accept_loop(Arc::downgrade(self), listener, run.listener.clone()));
+        let sessions = Sessions::default();
+        let (acceptor, incoming) = spawn_acceptor(&handle, listener);
+        let run = Run {
+            conns: cancel.child_token(),
+            listener: cancel.child_token(),
+            cancel,
+            acceptor,
+            sessions: sessions.clone(),
+            handle: handle.clone(),
+        };
+        handle.spawn(accept_loop(Arc::downgrade(self), incoming, run.listener.clone(), sessions));
         handle.spawn(watch_endpoint(Arc::downgrade(self), run.cancel.clone()));
         if let Err(e) = write_atomic(&dir.join("endpoint"), endpoint.to_text().as_bytes(), false) {
-            run.cancel.cancel();
+            drop(run);
             remove_endpoint(&endpoint);
             self.fail(ch, format!("could not write the assistant endpoint: {e}"));
             return;
@@ -545,9 +619,8 @@ impl McpHost {
     /// (`elsewhere`) files are not ours and stay. `forget` also removes the marker and the tool list.
     fn close_channel(&self, ch: &mut Channel, forget: bool) {
         let owned = ch.state != State::Elsewhere;
-        if let Some(run) = ch.run.take() {
-            run.cancel.cancel();
-        }
+        // Dropping the run closes the listener and every connection before this returns.
+        drop(ch.run.take());
         if let Some(endpoint) = ch.endpoint.take() {
             if owned {
                 remove_endpoint(&endpoint);
@@ -597,24 +670,29 @@ impl McpHost {
     }
 }
 
-/// Accepts connections until cancelled; each gets its own task. Holds the host weakly, so a dropped host ends it.
-async fn accept_loop(host: Weak<McpHost>, listener: Listener, ct: CancellationToken) {
+/// Takes the connections the acceptor task hands over until cancelled; each gets its own closable task, which the run's
+/// sessions list can drop at once. Holds the host weakly, so a dropped host ends it.
+async fn accept_loop(
+    host: Weak<McpHost>,
+    mut incoming: tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Stream>>,
+    ct: CancellationToken,
+    sessions: Sessions,
+) {
     loop {
         let accepted = tokio::select! {
             biased;
             () = ct.cancelled() => return,
-            accepted = listener.accept() => accepted,
+            accepted = incoming.recv() => accepted,
         };
         match accepted {
-            Ok(stream) => {
+            None => return,
+            Some(Ok(stream)) => {
                 let Some(host) = host.upgrade() else { return };
                 let Some(conn_ct) = host.connection_token() else { continue };
-                tokio::spawn(serve_connection(host, stream, conn_ct));
+                let session = spawn_closable(&tokio::runtime::Handle::current(), serve_connection(host, stream, conn_ct));
+                sessions.add(session);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "mcp channel accept failed");
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+            Some(Err(e)) => tracing::warn!(error = %e, "mcp channel accept failed"),
         }
     }
 }

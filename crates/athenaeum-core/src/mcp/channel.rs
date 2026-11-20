@@ -14,10 +14,12 @@
 //!
 //! The Windows half is a thin mirror of the Unix half; it is compiled only by the Windows build.
 
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -264,17 +266,45 @@ impl Listener {
     }
 }
 
-/// See the Unix `bind`: a second first instance of the pipe is refused by Windows as access denied.
+/// See the Unix `bind`. Windows refuses a second first instance of the pipe as access denied. That refusal means
+/// "another instance of this build serves it" only when a client finds something answering on the pipe; otherwise
+/// (a leftover instance still closing) it is retried a few times and then reported as the OS error.
 #[cfg(windows)]
 pub fn bind(dir: &Path) -> io::Result<(Endpoint, Listener)> {
     use tokio::net::windows::named_pipe::ServerOptions;
+    const BIND_TRIES: u32 = 5;
     let name = pipe_name(dir);
-    let first = ServerOptions::new()
-        .first_pipe_instance(true)
-        .reject_remote_clients(true)
-        .create(&name)
-        .map_err(|e| if e.kind() == io::ErrorKind::PermissionDenied { in_use_error() } else { e })?;
+    let mut tries = 0;
+    let first = loop {
+        match ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name) {
+            Ok(first) => break first,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                if pipe_answers(&name) {
+                    return Err(in_use_error());
+                }
+                tries += 1;
+                if tries >= BIND_TRIES {
+                    tracing::warn!(error = %e, tries, "mcp pipe is refused and nothing answers on it");
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     Ok((Endpoint::Pipe(name.clone()), Listener { name, next: tokio::sync::Mutex::new(first) }))
+}
+
+/// The Windows counterpart of the Unix connect probe: a client that opens the pipe (or finds every instance busy)
+/// shows that a live server owns it. Writes nothing and is dropped at once.
+#[cfg(windows)]
+fn pipe_answers(name: &str) -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    match ClientOptions::new().open(name) {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
+    }
 }
 
 #[cfg(windows)]
@@ -307,6 +337,129 @@ pub fn remove_endpoint(_endpoint: &Endpoint) {}
 #[cfg(windows)]
 pub fn endpoint_present(_endpoint: &Endpoint) -> bool {
     true
+}
+
+// ---- tasks whose futures can be dropped from outside ----
+
+/// What the driver of a closable task shares with its [`Closer`].
+struct CloseState {
+    fut: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    waker: Option<Waker>,
+    closed: bool,
+    finished: bool,
+}
+
+fn lock_state(state: &Mutex<CloseState>) -> MutexGuard<'_, CloseState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Closes a task made by [`spawn_closable`]: [`Closer::close`] drops the task's future (and what it owns: a listener,
+/// a connection, a Windows pipe instance) on the calling thread, at once, rather than when the runtime next polls it.
+#[derive(Clone)]
+pub struct Closer {
+    state: Arc<Mutex<CloseState>>,
+}
+
+impl Closer {
+    /// Drops the future now. A future being polled at this very moment on another thread is dropped by that poll's end.
+    /// Calling it again does nothing.
+    pub fn close(&self) {
+        let (fut, waker) = {
+            let mut state = lock_state(&self.state);
+            state.closed = true;
+            (state.fut.take(), state.waker.take())
+        };
+        // Dropped outside the lock: what the future owns may run its own `Drop`.
+        drop(fut);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// The future ended, by itself or by [`Closer::close`].
+    pub fn is_finished(&self) -> bool {
+        let state = lock_state(&self.state);
+        state.finished || state.closed
+    }
+}
+
+/// Runs `fut` on `handle` like a spawned task, but the returned [`Closer`] can drop it synchronously. The future is
+/// held in a slot and taken out only while it is polled, so `close` never waits on a poll (a poll may take the
+/// caller's own locks).
+pub fn spawn_closable<F>(handle: &tokio::runtime::Handle, fut: F) -> Closer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let state = Arc::new(Mutex::new(CloseState { fut: Some(Box::pin(fut)), waker: None, closed: false, finished: false }));
+    let shared = Arc::clone(&state);
+    handle.spawn(std::future::poll_fn(move |cx| {
+        let mut fut = {
+            let mut state = lock_state(&shared);
+            if state.closed {
+                state.finished = true;
+                return Poll::Ready(());
+            }
+            state.waker = Some(cx.waker().clone());
+            match state.fut.take() {
+                Some(fut) => fut,
+                None => {
+                    state.finished = true;
+                    return Poll::Ready(());
+                }
+            }
+        };
+        let polled = fut.as_mut().poll(cx);
+        let mut state = lock_state(&shared);
+        match polled {
+            Poll::Pending if !state.closed => {
+                state.fut = Some(fut);
+                Poll::Pending
+            }
+            _ => {
+                state.finished = true;
+                // `state` (declared last) is released before `fut` drops.
+                Poll::Ready(())
+            }
+        }
+    }));
+    Closer { state }
+}
+
+/// Accepts connections on `listener` in a closable task and sends each to the returned receiver. Dropping the task (the
+/// [`Closer`]) drops the listener, and with it the waiting pipe instance on Windows.
+pub fn spawn_acceptor(
+    handle: &tokio::runtime::Handle,
+    listener: Listener,
+) -> (Closer, tokio::sync::mpsc::UnboundedReceiver<io::Result<Stream>>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let closer = spawn_closable(handle, async move {
+        loop {
+            let accepted = listener.accept().await;
+            let failed = accepted.is_err();
+            if tx.send(accepted).is_err() {
+                return;
+            }
+            if failed {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    });
+    (closer, rx)
+}
+
+/// Creates the channel folder, private to the owner on Unix. A folder that already exists and is not ours cannot be made
+/// private: that is an error rather than a channel in someone else's place.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 // ---- the channel files ----
