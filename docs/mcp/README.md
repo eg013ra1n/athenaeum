@@ -295,7 +295,12 @@ of the named groups and refuses more than `PLAN_ITEM_CAP` (2 000) in words befor
   worker enters the caller's tokio runtime, so the published plan gets its expiry timer; an error or a panic while preparing (on the tool's thread or
   the worker) ends the plan `failed` with a sentence, because `sweep` never expires a preparing plan. Both halves of the answer report the state taken
   before the worker starts (`preparing`, 0 of N). No
-  reader guard and no pooled connection is held across a comparison.
+  reader guard and no pooled connection is held across a comparison. A byte compare that finds a pair identical banks the pair's
+  full-file hash (`files.strong_hash`, `updated_at`), as the Duplicates page's verify does, so planning writes that cache and nothing else
+  (M2 smoke, 2026-11-20: 11 rows).
+- **A master moved to the Black Hole leaves the master library.** The move is the app's own (`bulk_move_to_black_hole`), which unregisters
+  the master's calibration set first (`master_unregister`), as the Black Hole flow does from the file browser. Only a master that no
+  calibration link points at reaches a plan's ticks, so no light or master loses its calibration (M2 smoke: 2 sets and their frame rows went).
 - **Apply** (after the store's stamp re-check of the included items and the kept copy): a byte-checked group whose `chosen` is not the copy the
   plan compared against is compared again first (a differing pair is skipped); then, immediately before the move, a group whose keeper is in
   the Black Hole now is skipped as a whole, every master item is re-checked for links and for superseding (skipped with the lock's reason) and
