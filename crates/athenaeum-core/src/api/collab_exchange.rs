@@ -22,6 +22,7 @@ use crate::collab::hub_client::CollabClient;
 use crate::collab::snapshot::{member_of_device, own_display_name, SnapshotMember};
 use crate::db::collab_frames::{FrameOrigin, LocalFrameRow};
 use crate::events::ProgressEmitter;
+use crate::scope::night::night_of_date_obs;
 use crate::services::ServiceContext;
 
 /// Map an [`AccountClientError`](crate::account::AccountClientError) onto the api
@@ -744,23 +745,6 @@ pub(crate) fn parse_manifest_wire(
             None
         }
     }
-}
-
-/// The night a frame belongs to when all we have is its `DATE-OBS` (another
-/// member's frame): the UTC date of `dateObs − 12 h` (spec 2026-09-29 §5.2).
-pub(crate) fn night_of_date_obs(date_obs: &str) -> Option<String> {
-    use chrono::{DateTime, NaiveDateTime, Utc};
-    let t: DateTime<Utc> = DateTime::parse_from_rfc3339(date_obs)
-        .map(|d| d.with_timezone(&Utc))
-        .or_else(|_| {
-            NaiveDateTime::parse_from_str(date_obs, "%Y-%m-%dT%H:%M:%S%.f").map(|n| n.and_utc())
-        })
-        .ok()?;
-    Some(
-        (t - chrono::Duration::hours(12))
-            .format("%Y-%m-%d")
-            .to_string(),
-    )
 }
 
 /// One cached per-frame manifest row of a project (mine or a peer's),
@@ -2808,29 +2792,6 @@ mod tests {
         assert_eq!(own.received_at, None);
         assert_eq!(own.received_from_device, None);
         assert_eq!(own.received_from_member, None);
-    }
-
-    /// The UTC date of `dateObs − 12 h` — the night boundary for a frame we
-    /// only know through its cached manifest (Task 6, spec 2026-09-29 §5.2).
-    #[test]
-    fn night_of_date_obs_shifts_twelve_hours_in_utc() {
-        assert_eq!(
-            night_of_date_obs("2026-09-27T11:59:59Z").as_deref(),
-            Some("2026-09-26")
-        );
-        assert_eq!(
-            night_of_date_obs("2026-09-27T12:00:00Z").as_deref(),
-            Some("2026-09-27")
-        );
-        assert_eq!(
-            night_of_date_obs("2026-09-27T03:10:00").as_deref(),
-            Some("2026-09-26")
-        );
-        assert_eq!(
-            night_of_date_obs("2026-09-27T03:10:00.250").as_deref(),
-            Some("2026-09-26")
-        );
-        assert_eq!(night_of_date_obs("garbage"), None);
     }
 
     /// This device's node id for `ctx`'s sync dir — the identity a member's

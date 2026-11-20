@@ -1,0 +1,520 @@
+//! Scope tests: the night rule against SQLite itself, and every condition against a small real catalog.
+
+use super::night::{night_of_date_obs, night_sql};
+use super::*;
+use crate::db::{self, Database};
+use crate::models::{File, FileFormat, Frame, ImageType};
+use crate::test_support::canonical_tempdir;
+use chrono::{DateTime, Utc};
+use std::path::{Path, PathBuf};
+
+struct Cat {
+    _tmp: tempfile::TempDir,
+    base: PathBuf,
+    db: Database,
+}
+
+fn cat() -> Cat {
+    let (tmp, base) = canonical_tempdir();
+    let db = Database::new(base.join("catalog.db")).expect("open catalog");
+    Cat { _tmp: tmp, base, db }
+}
+
+/// One frame to put in the catalog; `path` is relative to the catalog's folder.
+#[derive(Default, Clone)]
+struct Fx {
+    path: &'static str,
+    object: Option<&'static str>,
+    camera: Option<&'static str>,
+    telescope: Option<&'static str>,
+    filter: Option<&'static str>,
+    imagetyp: Option<ImageType>,
+    exptime: Option<f64>,
+    date_obs: Option<&'static str>,
+}
+
+impl Cat {
+    fn path(&self, rel: &str) -> String {
+        rel.split('/').fold(self.base.clone(), |p, part| p.join(part)).to_string_lossy().into_owned()
+    }
+
+    /// Returns `(file id, frame id)`.
+    fn add(&self, fx: &Fx) -> (i64, i64) {
+        let conn = self.db.conn();
+        let path = self.path(fx.path);
+        let filename = Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+        let file_id = db::insert_file(
+            &conn,
+            &File {
+                id: None,
+                path,
+                filename,
+                size: 10,
+                modified_at: Utc::now(),
+                format: FileFormat::FITS,
+                created_at: Utc::now(),
+                content_hash: None,
+                archived_in_operation: None,
+                archive_zip_path: None,
+                archive_path_in_zip: None,
+                uuid: None,
+                updated_at: None,
+            },
+        )
+        .expect("insert file");
+        let frame_id = db::insert_frame(
+            &conn,
+            &Frame {
+                file_id,
+                object: fx.object.map(str::to_string),
+                instrume: fx.camera.map(str::to_string),
+                telescop: fx.telescope.map(str::to_string),
+                filter: fx.filter.map(str::to_string),
+                imagetyp: fx.imagetyp.clone(),
+                exptime: fx.exptime,
+                date_obs: fx
+                    .date_obs
+                    .map(|d| DateTime::parse_from_rfc3339(d).expect("test date").with_timezone(&Utc)),
+                ..Default::default()
+            },
+        )
+        .expect("insert frame");
+        (file_id, frame_id)
+    }
+
+    /// A frame set holding `frame_ids`, one night and session.
+    fn set_of(&self, name: Option<&str>, archived: bool, frame_ids: &[i64]) -> i64 {
+        let conn = self.db.conn();
+        let set = db::create_frames_set(&conn, name, false, None, None, None, None, None, None, None, None)
+            .expect("set");
+        if archived {
+            conn.execute("UPDATE frames_set SET is_archived = 1 WHERE id = ?1", [set]).expect("archive set");
+        }
+        let night = db::create_imaging_night(&conn, set, "2024-01-01T00:00:00Z", "2024-01-01T12:00:00Z")
+            .expect("night");
+        let session = db::create_session(&conn, night, "cam", frame_ids.len() as i32, None).expect("session");
+        db::insert_session_members(&conn, session, frame_ids).expect("members");
+        set
+    }
+
+    fn black_hole(&self, file_id: i64) {
+        self.db
+            .conn()
+            .execute(
+                "INSERT INTO black_hole (file_id, from_where, moved_at, original_path) VALUES (?1, 'test', 'now', 'x')",
+                [file_id],
+            )
+            .expect("black hole");
+    }
+
+    fn in_zip(&self, file_id: i64) {
+        self.db
+            .conn()
+            .execute("UPDATE files SET archive_zip_path = ?2 WHERE id = ?1", rusqlite::params![file_id, self.path("a.zip")])
+            .expect("zip");
+    }
+
+    fn scan_root(&self, rel: &str) -> String {
+        let path = self.path(rel);
+        db::upsert_scan_root(&self.db.conn(), &path, "normal").expect("scan root");
+        path
+    }
+
+    /// File names the filter lets through, sorted.
+    fn names(&self, filter: &ScopeFilter) -> Vec<String> {
+        let conn = self.db.conn();
+        let sql = format!(
+            "SELECT ff.filename FROM frames fr JOIN files ff ON ff.id = fr.file_id WHERE {} ORDER BY ff.filename",
+            filter.sql
+        );
+        let mut stmt = conn.prepare(&sql).unwrap_or_else(|e| panic!("prepare {sql}: {e}"));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(filter.params.iter()), |r| r.get::<_, String>(0))
+            .unwrap_or_else(|e| panic!("run {sql}: {e}"));
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn resolve(&self, scope: &Scope) -> ResolvedScope {
+        resolve_scope(&self.db.conn(), scope).expect("resolve")
+    }
+
+    fn scoped_names(&self, scope: &Scope) -> Vec<String> {
+        let r = self.resolve(scope);
+        let f = r.filter.unwrap_or_else(|| panic!("no filter: {}", hints_text(&r.hints)));
+        self.names(&f)
+    }
+}
+
+fn light(path: &'static str) -> Fx {
+    Fx { path, imagetyp: Some(ImageType::Light), ..Default::default() }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The night rule
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Scope (SQL) and grouping (Rust) must put every frame on the same night: one row per form, against SQLite.
+#[test]
+fn night_sql_equals_night_of_date_obs() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let sql = format!("SELECT {}", night_sql("?1"));
+    let forms = [
+        // The forms the scanner and the collab manifests write.
+        "2026-09-27T11:59:59Z",
+        "2026-09-27T12:00:00Z",
+        "2026-09-27T03:10:00",
+        "2026-09-27T03:10:00.250",
+        "2026-09-27T23:30:00+02:00",
+        "2026-09-27T03:10:00+00:00",
+        "2024-10-05 22:15:03",
+        "2024-10-05",
+        "garbage",
+        // Shapes around them.
+        "2024-10-05T22:15",
+        "2024-10-05T22:15Z",
+        "2024-10-05T22:15:03z",
+        "2024-10-05 22:15:03 +05:30",
+        "2024-10-05T22:15:03-08:00",
+        "2024-10-05T03:10:00-08:00",
+        "2024-10-05T11:59:59.9996Z",
+        "2024-10-05T23:59:59.9996Z",
+        "2024-10-05T22:15:03.",
+        "2024-10-05T22:15:03.123456789012",
+        "2024-10-05T",
+        "2024-10-05 ",
+        "2024-10-05  T 22:15:03",
+        "2024-02-31T20:00:00",
+        "2024-02-30",
+        "2023-03-01T01:00:00Z",
+        "2024-01-01T05:00:00Z",
+        "0000-01-01T05:00:00Z",
+        "9999-12-31T23:59:59Z",
+        "-0001-06-01T20:00:00Z",
+        // Rejected by SQLite.
+        "",
+        "2024-13-01",
+        "2024-00-10",
+        "2024-10-00",
+        "2024-10-32",
+        "2024-10-05T24:00:00",
+        "2024-10-05T22:60:00",
+        "2024-10-05T22:15:60",
+        "2024-10-05T22:15:03+15:00",
+        "2024-10-05T22:15:03+0200",
+        "2024-10-05T22:15:03+02",
+        "2024-10-05T22:15:03Zjunk",
+        "2024-10-05T22:15:03 junk",
+        "2024-10-05Tgarbage",
+        "2024-1-5",
+        "20241005",
+        "2024-10-05T22",
+        "2024-10-05T22:1",
+        " 2024-10-05",
+        "2024/10/05",
+        "2024-10-05T22:15:03.5Z",
+        "2024-10-05T22:15:03Z ",
+    ];
+    for form in forms {
+        let sqlite: Option<String> = conn.query_row(&sql, [form], |r| r.get(0)).unwrap();
+        assert_eq!(night_of_date_obs(form), sqlite, "night of {form:?}");
+    }
+}
+
+#[test]
+fn night_of_date_obs_shifts_twelve_hours_in_utc() {
+    assert_eq!(night_of_date_obs("2026-09-27T11:59:59Z").as_deref(), Some("2026-09-26"));
+    assert_eq!(night_of_date_obs("2026-09-27T12:00:00Z").as_deref(), Some("2026-09-27"));
+    assert_eq!(night_of_date_obs("2026-09-27T03:10:00").as_deref(), Some("2026-09-26"));
+    assert_eq!(night_of_date_obs("2026-09-27T03:10:00.250").as_deref(), Some("2026-09-26"));
+    assert_eq!(night_of_date_obs("garbage"), None);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------------------------------------------
+
+fn everything_scope(c: &Cat, scan_root: &str) -> Scope {
+    Scope {
+        object: Some("m 31".into()),
+        frame_set: Some("andromeda".into()),
+        folder: Some(c.path("M31")),
+        scan_root: Some(scan_root.to_string()),
+        camera: Some("ZWO ASI2600MM Pro".into()),
+        telescope: Some("RC8".into()),
+        filter: Some("Ha".into()),
+        frame_type: Some("lights".into()),
+        exposure_s: Some(300.0),
+        night: Some("2024-10-04".into()),
+        date_from: Some("2024-01-01".into()),
+        date_to: Some("2024-12-31".into()),
+        year: Some(2024),
+        state: Some(vec![FrameState::Catalog, FrameState::SoftArchived, FrameState::Zipped, FrameState::BlackHole]),
+    }
+}
+
+/// Every statement the resolver builds prepares and runs under the `f` = frames alias, on an empty and on a
+/// populated catalog (a wrong alias shows as "no such column").
+#[test]
+fn every_scope_statement_prepares_and_runs() {
+    // Empty catalog: the conditions that need no catalog value.
+    let c = cat();
+    let scope = Scope {
+        folder: Some(c.path("M31")),
+        frame_type: Some("lights".into()),
+        exposure_s: Some(300.0),
+        night: Some("2024-10-04".into()),
+        date_from: Some("2024-01-01".into()),
+        date_to: Some("2024-12-31".into()),
+        year: Some(2024),
+        ..Default::default()
+    };
+    assert_eq!(c.scoped_names(&scope), Vec::<String>::new());
+    for state in FrameState::ALL {
+        let f = ScopeFilter { sql: format!("fr.id IN (SELECT f.id FROM frames f JOIN files fl ON fl.id = f.file_id WHERE {})", frame_state_sql(state)), params: vec![] };
+        assert_eq!(c.names(&f), Vec::<String>::new());
+    }
+    // An empty catalog names nothing: every text value is a hint, none an error.
+    let r = c.resolve(&Scope { camera: Some("x".into()), object: Some("x".into()), frame_set: Some("x".into()), ..Default::default() });
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints.len(), 3);
+
+    // Populated: all conditions at once.
+    let root = c.scan_root("M31");
+    let (f1, fr1) = c.add(&Fx {
+        path: "M31/H/a.fits",
+        object: Some("M 31"),
+        camera: Some("ZWO ASI2600MM Pro"),
+        telescope: Some("RC8"),
+        filter: Some("Ha"),
+        imagetyp: Some(ImageType::Light),
+        exptime: Some(300.0),
+        date_obs: Some("2024-10-05T02:00:00+00:00"),
+    });
+    let _ = f1;
+    c.set_of(Some("Andromeda"), false, &[fr1]);
+    let s = everything_scope(&c, &root);
+    assert_eq!(c.scoped_names(&s), vec!["a.fits".to_string()]);
+    // And the same scope with the default states.
+    let s = Scope { state: None, ..s };
+    assert_eq!(c.scoped_names(&s), vec!["a.fits".to_string()]);
+}
+
+#[test]
+fn camera_matches_normalized_not_substring() {
+    let c = cat();
+    c.add(&Fx { path: "a.fits", camera: Some("ZWO ASI2600MM Pro"), ..light("a.fits") });
+    c.add(&Fx { path: "b.fits", camera: Some("ZWO ASI2600MC Duo"), ..light("b.fits") });
+    let r = c.resolve(&Scope { camera: Some("zwo  asi2600mm pro".into()), ..Default::default() });
+    assert_eq!(c.names(r.filter.as_ref().expect("resolves")), vec!["a.fits".to_string()]);
+    let r = c.resolve(&Scope { camera: Some("ASI2600".into()), ..Default::default() });
+    assert!(r.filter.is_none());
+    assert_eq!(
+        hints_text(&r.hints),
+        "no camera 'ASI2600'; the catalog has 'ZWO ASI2600MC Duo' and 'ZWO ASI2600MM Pro'"
+    );
+}
+
+#[test]
+fn describe_reads_like_the_spec() {
+    let s = Scope {
+        camera: Some("ZWO ASI2600MM Pro".into()),
+        year: Some(2024),
+        frame_type: Some("lights".into()),
+        ..Default::default()
+    };
+    assert_eq!(describe_scope(&s), "ZWO ASI2600MM Pro, nights 2024-01-01 … 2024-12-31, lights");
+    assert_eq!(describe_scope(&Scope::default()), "the whole catalog");
+    let s = Scope {
+        object: Some("IC 5146".into()),
+        exposure_s: Some(300.0),
+        frame_type: Some("flat".into()),
+        folder: Some("/data/IC5146".into()),
+        state: Some(vec![FrameState::Catalog, FrameState::SoftArchived, FrameState::Zipped, FrameState::BlackHole]),
+        ..Default::default()
+    };
+    assert_eq!(describe_scope(&s), "IC 5146, 300 s, flats, in /data/IC5146, including the Black Hole");
+}
+
+#[test]
+fn black_hole_left_out_unless_asked() {
+    let c = cat();
+    c.add(&light("keep.fits"));
+    let (bh, _) = c.add(&light("rejected.fits"));
+    c.black_hole(bh);
+    let r = c.resolve(&Scope::default());
+    assert!(r.black_hole_left_out);
+    assert_eq!(c.names(r.filter.as_ref().unwrap()), vec!["keep.fits".to_string()]);
+
+    let ask = Scope { state: Some(vec![FrameState::Catalog, FrameState::BlackHole]), ..Default::default() };
+    let r = c.resolve(&ask);
+    assert!(!r.black_hole_left_out);
+    assert_eq!(c.names(r.filter.as_ref().unwrap()), vec!["keep.fits".to_string(), "rejected.fits".to_string()]);
+
+    let only = Scope { state: Some(vec![FrameState::BlackHole]), ..Default::default() };
+    assert_eq!(c.scoped_names(&only), vec!["rejected.fits".to_string()]);
+}
+
+#[test]
+fn folder_includes_subfolders_separator_strict() {
+    let c = cat();
+    c.add(&light("M31/H/a.fits"));
+    c.add(&light("M31b/a.fits"));
+    let r = c.scoped_names(&Scope { folder: Some(c.path("M31")), ..Default::default() });
+    assert_eq!(r, vec!["a.fits".to_string()]);
+    // The second `a.fits` is the sibling: counting rows says which one came back.
+    let both = c.scoped_names(&Scope { folder: Some(c.path("M31b")), ..Default::default() });
+    assert_eq!(both, vec!["a.fits".to_string()]);
+    let all = c.scoped_names(&Scope::default());
+    assert_eq!(all.len(), 2);
+    // A trailing separator names the same folder.
+    let slash = format!("{}{}", c.path("M31"), std::path::MAIN_SEPARATOR);
+    assert_eq!(c.scoped_names(&Scope { folder: Some(slash), ..Default::default() }), vec!["a.fits".to_string()]);
+}
+
+#[test]
+fn scan_root_is_matched_by_its_path_or_hinted() {
+    let c = cat();
+    let root = c.scan_root("M31");
+    c.scan_root("Other");
+    c.add(&light("M31/H/a.fits"));
+    c.add(&light("Other/b.fits"));
+    assert_eq!(
+        c.scoped_names(&Scope { scan_root: Some(root.clone()), ..Default::default() }),
+        vec!["a.fits".to_string()]
+    );
+    let r = c.resolve(&Scope { scan_root: Some(c.path("M3")), ..Default::default() });
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints[0].condition, "scan root");
+    assert_eq!(r.hints[0].existing.len(), 1);
+}
+
+#[test]
+fn object_matches_frame_set_name() {
+    let c = cat();
+    let (_, in_set) = c.add(&Fx { path: "in_set.fits", object: None, ..light("in_set.fits") });
+    let (_, by_object) = c.add(&Fx { path: "by_object.fits", object: Some("IC 5146"), ..light("by_object.fits") });
+    let (_, elsewhere) = c.add(&Fx { path: "elsewhere.fits", object: Some("M 31"), ..light("elsewhere.fits") });
+    c.set_of(Some("IC 5146"), false, &[in_set]);
+    c.set_of(Some("Andromeda"), false, &[elsewhere]);
+    let _ = by_object;
+    let names = c.scoped_names(&Scope { object: Some("ic 5146".into()), ..Default::default() });
+    assert_eq!(names, vec!["by_object.fits".to_string(), "in_set.fits".to_string()]);
+    // `frame_set` is the set only: the frame whose own OBJECT says the same is not in it.
+    let names = c.scoped_names(&Scope { frame_set: Some("IC 5146".into()), ..Default::default() });
+    assert_eq!(names, vec!["in_set.fits".to_string()]);
+    // A name that is neither is a hint over both spellings.
+    let r = c.resolve(&Scope { object: Some("IC 514".into()), ..Default::default() });
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints[0].existing, vec!["IC 5146".to_string()]);
+}
+
+#[test]
+fn year_is_the_night_range() {
+    let c = cat();
+    c.add(&Fx { path: "in2024.fits", date_obs: Some("2025-01-01T05:00:00+00:00"), ..light("in2024.fits") });
+    c.add(&Fx { path: "in2025.fits", date_obs: Some("2025-01-01T12:00:00+00:00"), ..light("in2025.fits") });
+    c.add(&Fx { path: "nodate.fits", ..light("nodate.fits") });
+    let y2024 = c.scoped_names(&Scope { year: Some(2024), ..Default::default() });
+    assert_eq!(y2024, vec!["in2024.fits".to_string()]);
+    let y2025 = c.scoped_names(&Scope { year: Some(2025), ..Default::default() });
+    assert_eq!(y2025, vec!["in2025.fits".to_string()]);
+    let night = c.scoped_names(&Scope { night: Some("2024-12-31".into()), ..Default::default() });
+    assert_eq!(night, vec!["in2024.fits".to_string()]);
+    // Open-ended ranges.
+    let from = c.scoped_names(&Scope { date_from: Some("2025-01-01".into()), ..Default::default() });
+    assert_eq!(from, vec!["in2025.fits".to_string()]);
+    let to = c.scoped_names(&Scope { date_to: Some("2024-12-31".into()), ..Default::default() });
+    assert_eq!(to, vec!["in2024.fits".to_string()]);
+}
+
+#[test]
+fn frame_type_and_exposure() {
+    let c = cat();
+    c.add(&Fx { path: "l.fits", exptime: Some(300.0), ..light("l.fits") });
+    c.add(&Fx { path: "d.fits", exptime: Some(300.002), imagetyp: Some(ImageType::Dark), ..Default::default() });
+    c.add(&Fx { path: "df.fits", exptime: Some(5.0), imagetyp: Some(ImageType::DarkFlat), ..Default::default() });
+    let names = |s: Scope| c.scoped_names(&s);
+    assert_eq!(names(Scope { frame_type: Some("lights".into()), ..Default::default() }), vec!["l.fits".to_string()]);
+    assert_eq!(names(Scope { frame_type: Some("Dark".into()), ..Default::default() }), vec!["d.fits".to_string()]);
+    assert_eq!(names(Scope { frame_type: Some("darkflats".into()), ..Default::default() }), vec!["df.fits".to_string()]);
+    assert_eq!(
+        names(Scope { exposure_s: Some(300.0), ..Default::default() }),
+        vec!["d.fits".to_string(), "l.fits".to_string()]
+    );
+    let r = c.resolve(&Scope { frame_type: Some("ligths".into()), ..Default::default() });
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints[0].condition, "frame type");
+    assert_eq!(r.hints[0].existing, vec!["Light".to_string()]);
+}
+
+/// Each fixture frame is in exactly one state.
+#[test]
+fn states_partition_the_catalog() {
+    let c = cat();
+    let (_, plain) = c.add(&light("plain.fits"));
+    let (_, in_live_set) = c.add(&light("live.fits"));
+    let (_, in_archived_set) = c.add(&light("archived.fits"));
+    let (zip_file, _) = c.add(&light("zipped.fits"));
+    let (bh_file, _) = c.add(&light("blackholed.fits"));
+    let (bh_zip_file, _) = c.add(&light("blackholed_zip.fits"));
+    let _ = plain;
+    c.set_of(Some("Live"), false, &[in_live_set]);
+    c.set_of(Some("Archived"), true, &[in_archived_set]);
+    c.in_zip(zip_file);
+    c.black_hole(bh_file);
+    c.in_zip(bh_zip_file);
+    c.black_hole(bh_zip_file);
+
+    let all = {
+        let sql = format!("{}", "fr.id IN (SELECT f.id FROM frames f JOIN files fl ON fl.id = f.file_id WHERE 1)");
+        c.names(&ScopeFilter { sql, params: vec![] })
+    };
+    assert_eq!(all.len(), 6);
+    let by = |s: FrameState| {
+        let sql = format!(
+            "fr.id IN (SELECT f.id FROM frames f JOIN files fl ON fl.id = f.file_id WHERE {})",
+            frame_state_sql(s)
+        );
+        c.names(&ScopeFilter { sql, params: vec![] })
+    };
+    assert_eq!(by(FrameState::Catalog), vec!["live.fits".to_string(), "plain.fits".to_string()]);
+    assert_eq!(by(FrameState::SoftArchived), vec!["archived.fits".to_string()]);
+    assert_eq!(by(FrameState::Zipped), vec!["zipped.fits".to_string()]);
+    assert_eq!(by(FrameState::BlackHole), vec!["blackholed.fits".to_string(), "blackholed_zip.fits".to_string()]);
+    let mut union: Vec<String> = FrameState::ALL.into_iter().flat_map(by).collect();
+    union.sort();
+    assert_eq!(union, all, "disjoint and exhaustive");
+}
+
+#[test]
+fn hint_formats_and_nearest() {
+    let h = |existing: &[&str]| NearestHint {
+        condition: "filter",
+        given: "Hb".into(),
+        existing: existing.iter().map(|s| s.to_string()).collect(),
+    };
+    assert_eq!(hints_text(&[h(&[])]), "no filter 'Hb'; nothing like it in the catalog");
+    assert_eq!(hints_text(&[h(&["Ha"])]), "no filter 'Hb'; the catalog has 'Ha'");
+    assert_eq!(hints_text(&[h(&["Ha", "Oiii", "Sii"])]), "no filter 'Hb'; the catalog has 'Ha', 'Oiii' and 'Sii'");
+    let existing: Vec<String> = ["Ha", "OIII", "SII", "Luminance", "Red"].iter().map(|s| s.to_string()).collect();
+    // Within three edits, by distance then value; never more than five.
+    assert_eq!(nearest::nearest(&existing, "Hb"), vec!["Ha".to_string(), "Red".to_string(), "SII".to_string()]);
+    let many: Vec<String> = (0..9).map(|i| format!("Filter {i}")).collect();
+    assert_eq!(nearest::nearest(&many, "filter").len(), 5);
+    assert_eq!(normalize_value("  ZWO   Asi \t2600 "), "zwo asi 2600");
+}
+
+/// Scope reaches the tool layer as JSON: camelCase fields, snake_case states.
+#[test]
+fn scope_json_shape() {
+    let s: Scope = serde_json::from_str(
+        r#"{"frameSet":"IC 5146","exposureS":300,"dateFrom":"2024-01-01","state":["soft_archived","black_hole"]}"#,
+    )
+    .unwrap();
+    assert_eq!(s.frame_set.as_deref(), Some("IC 5146"));
+    assert_eq!(s.exposure_s, Some(300.0));
+    assert_eq!(s.state, Some(vec![FrameState::SoftArchived, FrameState::BlackHole]));
+    assert_eq!(serde_json::to_string(&FrameState::BlackHole).unwrap(), "\"black_hole\"");
+    let schema = serde_json::to_value(rmcp::schemars::schema_for!(Scope)).unwrap();
+    assert!(schema["properties"]["frameSet"].is_object(), "{schema}");
+}

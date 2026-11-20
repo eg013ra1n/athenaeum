@@ -103,6 +103,8 @@ fd-lock = "4"
 ed25519-dalek = "3.0.0"
 # postcard wire encoding for the announce/ack control protocol (bidirectional QUIC stream).
 postcard = { version = "1", features = ["use-std"] }
+# MCP server (the `mcp` module, plan 2026-11-19): `Scope` derives rmcp's re-exported schemars so its JSON schema is a tool's input schema.
+rmcp = { version = "3.11", default-features = false, features = ["server", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
