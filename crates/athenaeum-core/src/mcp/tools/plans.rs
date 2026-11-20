@@ -140,6 +140,17 @@ fn run_text(out: &mut String, r: &PlanReport) {
     }
 }
 
+/// For a plate-solve plan that failed without a run: the reason nothing started.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn plate_solve_started_nothing(v: &McpPlanView, report: &PlanReport) -> Option<String> {
+    if v.kind == PlanKind::PlateSolve { crate::mcp::plans::plate_solve::nothing_started_reason(report) } else { None }
+}
+
+#[cfg(not(all(feature = "render", feature = "solver")))]
+fn plate_solve_started_nothing(_v: &McpPlanView, _report: &PlanReport) -> Option<String> {
+    None
+}
+
 /// The answer for a plan that exists: the words of its state, its report when it has one, and the same in data.
 pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
     let mut text = format!("Plan {}, {}: {}.", v.plan_id, v.title, state_words(v));
@@ -150,6 +161,11 @@ pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
             if *report == PlanReport::default() {
                 // It failed while it was applying, before it wrote a line.
                 text.push_str("\nNo file was recorded as moved before it stopped.");
+            } else if let Some(reason) = plate_solve_started_nothing(v, report) {
+                // A plate-solve run that was refused its start: no frame was touched.
+                text.push_str(&format!("\nNothing was started: {}.", reason.trim_end_matches('.')));
+                #[cfg(all(feature = "render", feature = "solver"))]
+                text.push_str(&crate::mcp::plans::plate_solve::report_text(report));
             } else {
                 text.push_str(&partial_text(report));
                 text.push_str("\nSome files may have changed before it stopped; check them before asking again.");

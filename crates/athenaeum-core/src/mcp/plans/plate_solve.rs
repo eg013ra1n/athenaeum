@@ -767,6 +767,14 @@ pub fn started_words(v: &McpPlanView) -> String {
     }
 }
 
+/// Why a plate-solve plan started nothing: no run, and at least one failed line (the first one's reason).
+pub fn nothing_started_reason(report: &PlanReport) -> Option<String> {
+    if report.run_id.is_some() {
+        return None;
+    }
+    report.failed.first().map(|l| l.reason.clone())
+}
+
 /// The report of a plate-solve plan: frames started, skipped by the re-check, failed to start.
 pub fn report_text(r: &PlanReport) -> String {
     let mut out = format!(
@@ -820,6 +828,10 @@ impl PlanApplier for PlateSolveApplier {
     /// Every item is an independent include/exclude: the generic check is all a selection needs.
     fn validate(&self, _view: &McpPlanView, _sel: &PlanSelection) -> Result<(), String> {
         Ok(())
+    }
+
+    fn start_failure(&self, report: &PlanReport) -> Option<String> {
+        nothing_started_reason(report)
     }
 
     fn apply(&self, host: &McpHost, plan_id: &str, sel: &PlanSelection, fresh: &[String]) -> PlanReport {
@@ -930,10 +942,9 @@ pub fn solve_status(host: &McpHost, run_id: &str) -> Result<Answer, ApiError> {
             failures = p.failures.iter().map(|(n, e)| FailedFile { file_name: n.clone(), folder: String::new(), error: e.clone() }).collect();
         }
         let mut lines = vec![format!(
-            "Run {run_id} is running: {} of {} frames done, {} solved so far, {} failed so far.",
+            "Run {run_id} is running: {} of {} frames done, {} failed so far.",
             p.done,
             p.total,
-            p.solved,
             failures.len()
         )];
         if origin == PlateSolveOrigin::Ui {
@@ -955,7 +966,6 @@ pub fn solve_status(host: &McpHost, run_id: &str) -> Result<Answer, ApiError> {
             "origin": origin,
             "done": p.done,
             "total": p.total,
-            "solved": p.solved,
             "failed": failures.len(),
             "currentFile": p.current_file,
             "cancelRequested": record.as_ref().is_some_and(|r| r.cancel_requested),

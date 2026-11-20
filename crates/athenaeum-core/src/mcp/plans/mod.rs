@@ -61,6 +61,11 @@ pub trait PlanApplier: Send + Sync {
     /// does). `sel` is the whole selection. The report holds the applier's own skips and failures; the store adds
     /// the items it skipped itself.
     fn apply(&self, host: &McpHost, plan_id: &str, sel: &PlanSelection, fresh: &[String]) -> PlanReport;
+    /// Whether the report says the applier never began its work. `Some(reason)` ends the plan `failed` with the
+    /// report kept, instead of `applied`. Only a kind whose Apply starts something that may refuse to start overrides it.
+    fn start_failure(&self, _report: &PlanReport) -> Option<String> {
+        None
+    }
 }
 
 pub(super) struct Content {

@@ -365,9 +365,41 @@ fn apply_refused_when_a_ui_batch_started_meanwhile() {
     assert_eq!(report.failed.len(), 1);
     assert_eq!(report.failed[0].reason, BUSY_UI.replace("{done}", "0").replace("{total}", "1"));
     let said = crate::mcp::tools::plans::status_answer(&done).text;
-    assert!(said.contains("did not start a plate solve") && !said.contains("started a plate solve of"), "{said}");
+    let busy = BUSY_UI.replace("{done}", "0").replace("{total}", "1");
+    // A run that never started ends the plan failed, with the report kept, never applied.
+    assert_eq!(done.state, PlanState::Failed { error: busy.clone() });
+    assert!(said.contains(&format!("Nothing was started: {}", busy.trim_end_matches('.'))), "{said}");
+    assert!(!said.contains("Some files may have changed") && !said.contains("started a plate solve of"), "{said}");
     assert!(rig.host.solves.get("solve-none").is_none());
     drop(ui);
+}
+
+#[test]
+fn apply_fails_the_plan_when_the_catalog_went_missing_after_the_plan() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // The catalog is installed when the plan is made and removed before Apply resolves it again.
+    static REMOVED: AtomicBool = AtomicBool::new(false);
+    let rig = rig();
+    let a = light(&rig, "gone", "lights-0001.fits");
+    let resolve = Resolvers {
+        layers: |_| if REMOVED.load(Ordering::SeqCst) { Err(ApiError::Invalid("no catalog".into())) } else { Ok(Vec::new()) },
+        packs: |_| Vec::new(),
+        dso: |_| None,
+    };
+    let answer = prepare(&rig.host, args(&rig, "gone"), resolve).expect("the plan is prepared");
+    let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+    let view = rig.host.plans.view(Some(&id)).expect("the plan");
+    assert_eq!(view.state, PlanState::Waiting, "{}", answer.text);
+    REMOVED.store(true, Ordering::SeqCst);
+    let done = apply(&rig, &id, proposal(&view));
+    REMOVED.store(false, Ordering::SeqCst);
+    assert_eq!(done.state, PlanState::Failed { error: NO_CATALOG.to_string() }, "{:?}", done.state);
+    let report = done.report.clone().expect("the report is kept");
+    assert!(report.run_id.is_none() && report.applied.is_empty(), "{report:?}");
+    assert_eq!((report.failed.len(), report.failed[0].file_name.as_str()), (1, a.name.as_str()));
+    let said = crate::mcp::tools::plans::status_answer(&done).text;
+    assert!(said.contains(&format!("Nothing was started: {}", NO_CATALOG.trim_end_matches('.'))), "{said}");
+    assert!(!said.contains("Some files may have changed") && !said.contains("applied"), "{said}");
 }
 
 #[test]
@@ -389,6 +421,9 @@ fn status_reports_progress_and_result() {
     }
     let running = solve_status(&rig.host, &run_id).expect("status");
     assert!(running.text.contains("2 of 3 frames"), "{}", running.text);
+    // The store can still reject a frame or roll the batch back: no "solved so far" until the run ends.
+    assert!(!running.text.contains("solved"), "{}", running.text);
+    assert!(running.data.get("solved").is_none(), "{}", running.data);
     assert!(running.text.contains("lights-0003.fits"), "{}", running.text);
     assert!(running.text.contains("lights-0002.fits in somewhere: no stars found"), "{}", running.text);
     assert_eq!(running.data["state"], "running");
