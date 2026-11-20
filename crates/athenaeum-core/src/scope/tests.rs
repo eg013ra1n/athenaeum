@@ -9,15 +9,16 @@ use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 struct Cat {
-    _tmp: tempfile::TempDir,
-    base: PathBuf,
+    // Fields drop in declaration order: the pool holding `catalog.db` open goes before its folder is removed.
     db: Database,
+    base: PathBuf,
+    _tmp: tempfile::TempDir,
 }
 
 fn cat() -> Cat {
     let (tmp, base) = canonical_tempdir();
     let db = Database::new(base.join("catalog.db")).expect("open catalog");
-    Cat { _tmp: tmp, base, db }
+    Cat { db, base, _tmp: tmp }
 }
 
 /// One frame to put in the catalog; `path` is relative to the catalog's folder.
@@ -31,6 +32,7 @@ struct Fx {
     imagetyp: Option<ImageType>,
     exptime: Option<f64>,
     date_obs: Option<&'static str>,
+    is_master: bool,
 }
 
 impl Cat {
@@ -72,6 +74,7 @@ impl Cat {
                 filter: fx.filter.map(str::to_string),
                 imagetyp: fx.imagetyp.clone(),
                 exptime: fx.exptime,
+                is_master: fx.is_master,
                 date_obs: fx
                     .date_obs
                     .map(|d| DateTime::parse_from_rfc3339(d).expect("test date").with_timezone(&Utc)),
@@ -190,7 +193,8 @@ fn night_sql_equals_night_of_date_obs() {
         "0000-01-01T05:00:00Z",
         "9999-12-31T23:59:59Z",
         "-0001-06-01T20:00:00Z",
-        // Rejected by SQLite.
+        // Malformed: SQLite answers NULL for most of these and a date for a few (`T24:00:00`, a fraction before
+        // `Z`, a trailing space); the Rust twin must answer the same either way.
         "",
         "2024-13-01",
         "2024-00-10",
@@ -280,7 +284,7 @@ fn every_scope_statement_prepares_and_runs() {
 
     // Populated: all conditions at once.
     let root = c.scan_root("M31");
-    let (f1, fr1) = c.add(&Fx {
+    let (_, fr1) = c.add(&Fx {
         path: "M31/H/a.fits",
         object: Some("M 31"),
         camera: Some("ZWO ASI2600MM Pro"),
@@ -289,8 +293,8 @@ fn every_scope_statement_prepares_and_runs() {
         imagetyp: Some(ImageType::Light),
         exptime: Some(300.0),
         date_obs: Some("2024-10-05T02:00:00+00:00"),
+        ..Default::default()
     });
-    let _ = f1;
     c.set_of(Some("Andromeda"), false, &[fr1]);
     let s = everything_scope(&c, &root);
     assert_eq!(c.scoped_names(&s), vec!["a.fits".to_string()]);
@@ -333,6 +337,16 @@ fn describe_reads_like_the_spec() {
         ..Default::default()
     };
     assert_eq!(describe_scope(&s), "IC 5146, 300 s, flats, in /data/IC5146, including the Black Hole");
+    for (given, said) in [
+        ("bias", "biases"),
+        ("biases", "biases"),
+        ("master bias", "master biases"),
+        ("master darks", "master darks"),
+        ("darkflat", "darkflats"),
+    ] {
+        let s = Scope { frame_type: Some(given.into()), ..Default::default() };
+        assert_eq!(describe_scope(&s), said, "frame type {given:?}");
+    }
 }
 
 #[test]
@@ -466,7 +480,7 @@ fn states_partition_the_catalog() {
     c.black_hole(bh_zip_file);
 
     let all = {
-        let sql = format!("{}", "fr.id IN (SELECT f.id FROM frames f JOIN files fl ON fl.id = f.file_id WHERE 1)");
+        let sql = "fr.id IN (SELECT f.id FROM frames f JOIN files fl ON fl.id = f.file_id WHERE 1)".to_string();
         c.names(&ScopeFilter { sql, params: vec![] })
     };
     assert_eq!(all.len(), 6);
@@ -517,4 +531,101 @@ fn scope_json_shape() {
     assert_eq!(serde_json::to_string(&FrameState::BlackHole).unwrap(), "\"black_hole\"");
     let schema = serde_json::to_value(rmcp::schemars::schema_for!(Scope)).unwrap();
     assert!(schema["properties"]["frameSet"].is_object(), "{schema}");
+}
+
+/// The catalog's own flag decides raw or master: the scanner stores a master found by its file name as
+/// `imagetyp = Dark`, `is_master = 1`.
+#[test]
+fn master_flag_decides_raw_or_master() {
+    let c = cat();
+    c.add(&Fx { path: "master_dark_300s.fits", imagetyp: Some(ImageType::Dark), is_master: true, ..Default::default() });
+    c.add(&Fx { path: "plain_dark.fits", imagetyp: Some(ImageType::Dark), ..Default::default() });
+    c.add(&Fx { path: "typed_master.fits", imagetyp: Some(ImageType::MasterDark), is_master: true, ..Default::default() });
+    c.add(&light("light.fits"));
+    let names = |t: &str| c.scoped_names(&Scope { frame_type: Some(t.into()), ..Default::default() });
+    assert_eq!(names("darks"), vec!["plain_dark.fits".to_string()]);
+    assert_eq!(names("dark"), vec!["plain_dark.fits".to_string()]);
+    assert_eq!(names("master darks"), vec!["master_dark_300s.fits".to_string(), "typed_master.fits".to_string()]);
+    assert_eq!(names("master dark"), vec!["master_dark_300s.fits".to_string(), "typed_master.fits".to_string()]);
+    assert_eq!(names("lights"), vec!["light.fits".to_string()]);
+}
+
+/// A frame set's page counts its used copy only; a second copy of the same raw frame is `catalog` even when the
+/// set is archived, and the four states still partition the catalog.
+#[test]
+fn soft_archived_counts_the_used_copy_only() {
+    let c = cat();
+    let (file_a, frame_a) = c.add(&light("A/dup.fits"));
+    let (file_b, frame_b) = c.add(&light("B/dup.fits"));
+    for file in [file_a, file_b] {
+        c.db
+            .conn()
+            .execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'SIMPLE = T', 'fp-dup')",
+                [file],
+            )
+            .expect("header");
+    }
+    c.set_of(Some("Archived"), true, &[frame_a, frame_b]);
+    let in_state = |folder: &str, state: FrameState| {
+        c.scoped_names(&Scope { folder: Some(c.path(folder)), state: Some(vec![state]), ..Default::default() }).len()
+    };
+    // The lowest file id is the used copy.
+    assert_eq!(in_state("A", FrameState::SoftArchived), 1);
+    assert_eq!(in_state("A", FrameState::Catalog), 0);
+    assert_eq!(in_state("B", FrameState::SoftArchived), 0);
+    assert_eq!(in_state("B", FrameState::Catalog), 1);
+    for folder in ["A", "B"] {
+        let total: usize = FrameState::ALL.into_iter().map(|s| in_state(folder, s)).sum();
+        assert_eq!(total, 1, "{folder} is in exactly one state");
+    }
+}
+
+/// A scan root is matched by equality after separator normalisation: a spelling that differs in case is a miss
+/// with the nearest roots as the hint.
+#[test]
+fn scan_root_case_difference_is_a_miss_with_a_hint() {
+    let c = cat();
+    let root = c.scan_root("Lights");
+    c.add(&light("Lights/a.fits"));
+    let wrong_case = c.path("lights");
+    assert_ne!(wrong_case, root);
+    let r = c.resolve(&Scope { scan_root: Some(wrong_case), ..Default::default() });
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints[0].condition, "scan root");
+    assert_eq!(r.hints[0].existing, vec![root.clone()]);
+    // A trailing separator is still the same root.
+    let slash = format!("{root}{}", std::path::MAIN_SEPARATOR);
+    assert_eq!(c.scoped_names(&Scope { scan_root: Some(slash), ..Default::default() }), vec!["a.fits".to_string()]);
+}
+
+#[test]
+fn malformed_night_is_an_error_in_words() {
+    let c = cat();
+    let err = |s: Scope| resolve_scope(&c.db.conn(), &s).expect_err("refused").to_string();
+    assert_eq!(
+        err(Scope { night: Some("last tuesday".into()), ..Default::default() }),
+        "night must be a date YYYY-MM-DD, got 'last tuesday'"
+    );
+    assert_eq!(
+        err(Scope { night: Some("2024-02-30".into()), ..Default::default() }),
+        "night must be a date YYYY-MM-DD, got '2024-02-30'"
+    );
+    assert_eq!(
+        err(Scope { date_from: Some("2024-1-5".into()), ..Default::default() }),
+        "date from must be a date YYYY-MM-DD, got '2024-1-5'"
+    );
+    assert_eq!(
+        err(Scope { date_to: Some("20241005".into()), ..Default::default() }),
+        "date to must be a date YYYY-MM-DD, got '20241005'"
+    );
+    // A valid calendar date resolves, leap day included.
+    assert!(resolve_scope(&c.db.conn(), &Scope { night: Some("2024-02-29".into()), ..Default::default() }).is_ok());
+}
+
+/// A misspelled field never quietly widens a scope.
+#[test]
+fn unknown_scope_field_is_refused() {
+    let err = serde_json::from_str::<Scope>(r#"{"exposure": 300}"#).expect_err("refused").to_string();
+    assert!(err.contains("exposure"), "{err}");
 }

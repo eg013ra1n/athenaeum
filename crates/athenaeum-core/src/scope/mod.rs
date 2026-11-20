@@ -58,7 +58,7 @@ impl FrameState {
 /// The common filter of every question and plan. Every field narrows; an absent field does not. Text values
 /// match a value the catalog holds, ignoring case and runs of spaces, never a part of one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, rmcp::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct Scope {
     /// Object name: the OBJECT header value, or the name of a frame set the frame belongs to.
@@ -144,7 +144,8 @@ fn member_of_set_sql(used_copy: bool, extra: &str) -> String {
 /// partition the catalog: every frame is in exactly one.
 pub fn frame_state_sql(state: FrameState) -> String {
     let not_bh = FRAME_NOT_IN_BLACK_HOLE_SQL;
-    let in_archived_set = member_of_set_sql(false, "fs.is_archived = 1");
+    // The set's page counts its used copy of a raw frame only, so the state does too.
+    let in_archived_set = member_of_set_sql(true, "fs.is_archived = 1");
     match state {
         FrameState::BlackHole => format!("(NOT {not_bh})"),
         FrameState::Zipped => format!("(fl.archive_zip_path IS NOT NULL AND {not_bh})"),
@@ -225,7 +226,13 @@ pub fn describe_scope(scope: &Scope) -> String {
     }
     if let Some(t) = given(&scope.frame_type) {
         let t = t.to_lowercase();
-        parts.push(if t.ends_with('s') { t } else { format!("{t}s") });
+        parts.push(if t.ends_with("biases") || (t.ends_with('s') && !t.ends_with("bias")) {
+            t
+        } else if t.ends_with("bias") {
+            format!("{t}es")
+        } else {
+            format!("{t}s")
+        });
     }
     if let Some(f) = given(&scope.folder) {
         parts.push(format!("in {f}"));
@@ -271,9 +278,51 @@ fn in_list(column: &str, values: &[String]) -> (String, Vec<Value>) {
 /// What one condition adds: SQL with its parameters, or nothing (a hint was pushed instead).
 type Cond = (String, Vec<Value>);
 
+/// The raw kind a master kind is made from (`MasterDark` -> `Dark`); a raw kind is its own.
+fn raw_kind(kind: &ImageType) -> ImageType {
+    match kind {
+        ImageType::MasterLight => ImageType::Light,
+        ImageType::MasterDark => ImageType::Dark,
+        ImageType::MasterFlat => ImageType::Flat,
+        ImageType::MasterBias => ImageType::Bias,
+        ImageType::MasterDarkFlat => ImageType::DarkFlat,
+        raw => raw.clone(),
+    }
+}
+
+/// A frame type, decided by the catalog's own signals. The scanner stores a master it found by file name as the
+/// raw `imagetyp` with `is_master = 1`, so a raw kind excludes the flagged rows and a master kind takes both the
+/// master `imagetyp` and the flagged raw one. The spellings are the ones `insert_frame` writes (`{:?}`).
+fn frame_type_cond(kind: &ImageType) -> Cond {
+    if kind.is_master() {
+        (
+            "(f.imagetyp = ? OR (f.imagetyp = ? AND f.is_master = 1))".to_string(),
+            vec![Value::Text(format!("{kind:?}")), Value::Text(format!("{:?}", raw_kind(kind)))],
+        )
+    } else {
+        ("f.imagetyp = ? AND COALESCE(f.is_master, 0) = 0".to_string(), vec![Value::Text(format!("{kind:?}"))])
+    }
+}
+
+/// `label` must be a date `YYYY-MM-DD` that exists on the calendar.
+fn check_date(label: &str, value: Option<&str>) -> Result<()> {
+    let Some(v) = value else { return Ok(()) };
+    let shaped = v.len() == 10
+        && v.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
+    if shaped && chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok() {
+        return Ok(());
+    }
+    // The refusal is the answer; the command boundary that asked logs it.
+    Err(anyhow::anyhow!("{label} must be a date YYYY-MM-DD, got '{v}'"))
+}
+
 /// Resolve a [`Scope`] against the catalog `conn` reads. Reads the distinct values of the text columns a scope
 /// names; the filter it returns reads nothing else.
 pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> {
+    check_date("night", given(&scope.night))?;
+    check_date("date from", given(&scope.date_from))?;
+    check_date("date to", given(&scope.date_to))?;
+
     let mut conds: Vec<Cond> = Vec::new();
     let mut hints: Vec<NearestHint> = Vec::new();
 
@@ -346,7 +395,7 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
             .flatten()
             .find_map(ImageType::from_str);
         match kind {
-            Some(k) => conds.push(("f.imagetyp = ?".to_string(), vec![Value::Text(format!("{k:?}"))])),
+            Some(k) => conds.push(frame_type_cond(&k)),
             None => {
                 let distinct = distinct_values(
                     conn,
@@ -385,8 +434,10 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
     if let Some(g) = given(&scope.scan_root) {
         let roots = distinct_values(conn, "SELECT path FROM scan_roots")?;
         let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
-        let wanted = normalize_value(&trim(&normalize_separators(g)));
-        let hits: Vec<String> = roots.iter().filter(|r| normalize_value(&trim(r)) == wanted).cloned().collect();
+        // Equal as stored, after separators only: a path is never case-folded.
+        let wanted = trim(&normalize_separators(g));
+        let hits: Vec<String> =
+            roots.iter().filter(|r| trim(&normalize_separators(r)) == wanted).cloned().collect();
         if hits.is_empty() {
             hints.push(NearestHint { condition: "scan root", given: g.to_string(), existing: nearest::nearest(&roots, g) });
         } else {
