@@ -101,6 +101,11 @@ pub mod collab_live;
 // `api::collab` (render+solver) — it drives `publish_collab_frames`.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab_autopublish;
+// The Black Hole bulk move with its side effects (the auto-publish note, the `blackhole-changed` event): one
+// function for the Duplicates page and the assistant's applied plan (MCP plan, Task 11). Gated like
+// `collab_autopublish`, which it calls.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod black_hole;
 // One tracker for every collab publish-family run (progress, one finished
 // event, last run, snapshot, cancel) and the prepared-frame bookkeeping.
 #[cfg(all(feature = "render", feature = "solver"))]

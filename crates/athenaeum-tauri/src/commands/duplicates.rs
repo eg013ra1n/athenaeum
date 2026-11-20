@@ -32,26 +32,17 @@ pub async fn bulk_move_to_black_hole(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<crate::models::BulkMoveResult, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
-    let result = db::bulk_move_to_black_hole(&conn, &file_ids, &from_where, Some(&emitter))
-        .map_err(|e| e.to_string())?;
-
-    // The note re-locks the catalog: release this handler's guard first.
-    drop(conn);
-    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &file_ids);
-
-    // Fire a single `blackhole-changed` event so other views (Black Hole
-    // tab, file manager, missing-metadata) invalidate their caches. The
-    // payload intentionally has no file_id — consumers should just refresh.
-    let _ = app_handle.emit("blackhole-changed", serde_json::json!({
-        "action": "bulk-blackholed",
-        "count": result.moved,
-    }));
-
-    Ok(result)
+    // The move, the auto-publish note and the one `blackhole-changed` event (the Black Hole tab, file manager and
+    // missing-metadata views refresh on it) are `api::black_hole`'s, shared with the assistant's applied plan.
+    let emitter = crate::tauri_events::TauriProgressEmitter(app_handle);
+    athenaeum_core::api::black_hole::bulk_move_to_black_hole(
+        &state.ctx,
+        &file_ids,
+        &from_where,
+        Some(&emitter),
+        &emitter,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Move a file to the black hole (soft delete)

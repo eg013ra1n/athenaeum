@@ -124,26 +124,17 @@ pub async fn bulk_move_to_black_hole(
     State(state): State<WebAppState>,
     Json(args): Json<BulkMoveToBlackHoleArgs>,
 ) -> Result<Json<athenaeum_core::models::BulkMoveResult>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
+    // The move, the auto-publish note and the one `blackhole-changed` event are `api::black_hole`'s, shared with the
+    // assistant's applied plan.
     let emitter = SseProgressEmitter::new(state.event_tx.clone());
-    let result = athenaeum_core::db::bulk_move_to_black_hole(
-        &conn,
+    let result = athenaeum_core::api::black_hole::bulk_move_to_black_hole(
+        &state.ctx,
         &args.file_ids,
         &args.from_where,
         Some(&emitter),
+        &emitter,
     )
-    .map_err(db_err)?;
-
-    drop(conn);
-    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &args.file_ids);
-
-    let _ = state.event_tx.send(SseEvent {
-        event_name: "blackhole-changed".to_string(),
-        data: serde_json::json!({ "action": "bulk-blackholed", "count": result.moved }),
-    });
-
+    .map_err(crate::routes::api_err)?;
     Ok(Json(result))
 }
 
