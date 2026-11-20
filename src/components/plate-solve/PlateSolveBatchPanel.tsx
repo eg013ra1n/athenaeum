@@ -31,7 +31,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
   onSolveComplete,
   hideTriggerButtons = false,
 }, ref) {
-  const { enqueuePlateSolve, cancelBatch, dismissCompleted, activeBatches } =
+  const { enqueuePlateSolve, cancelBatch, dismissCompleted, activeBatches, assistantRun, cancelAssistantRun } =
     usePlateSolveProgressContext();
 
   const [myBatchId, setMyBatchId] = useState<number | null>(null);
@@ -113,6 +113,36 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
 
   return (
     <div className="space-y-3">
+      {/* A plate solve the assistant started (a plan the user applied): shown here, with its own Cancel. */}
+      {assistantRun && (
+        <div className="rounded-lg border border-border bg-surface p-3 space-y-2" role="status">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <div className="flex items-center gap-2 text-content-secondary min-w-0 flex-1">
+              <Loader2 size={14} className="animate-spin flex-shrink-0 text-violet-400" />
+              <span className="truncate" title={assistantRun.currentFile ?? undefined}>
+                Plate solve started from the assistant — {assistantRun.done} of {assistantRun.total}
+                {assistantRun.currentFile ? `, ${assistantRun.currentFile}` : ''}
+              </span>
+            </div>
+            <button
+              onClick={() => void cancelAssistantRun()}
+              disabled={assistantRun.isCancelling}
+              className="flex items-center gap-2 px-3 py-1 rounded-lg text-sm font-medium transition-colors
+                border border-border hover:bg-surface-hover disabled:opacity-50"
+            >
+              <XCircle size={15} />
+              {assistantRun.isCancelling ? 'Cancelling...' : 'Cancel'}
+            </button>
+          </div>
+          <div className="h-1.5 w-full rounded-full bg-surface-hover overflow-hidden">
+            <div
+              className="h-full rounded-full bg-violet-500 transition-[width] duration-300 ease-out"
+              style={{ width: `${assistantRun.total > 0 ? (assistantRun.done / assistantRun.total) * 100 : 0}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* What the batch would extract from zips first: the selection if there is one, else the whole list. */}
       {!hideTriggerButtons && !isActive && (
         <ZipExtractionLine scope={{ frameIds: selectedFrameIds.length > 0 ? selectedFrameIds : frameIds }} />

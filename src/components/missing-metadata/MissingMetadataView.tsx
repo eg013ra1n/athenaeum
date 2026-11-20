@@ -158,6 +158,22 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
     void loadMissing();
   }, [loadMissing]);
 
+  // A metadata plan the assistant applied wrote to the catalog: reload what the view lists.
+  const loadMissingRef = useRef(loadMissing);
+  loadMissingRef.current = loadMissing;
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<{ count: number }>('frames-metadata-changed', () => {
+        if (cancelled) return;
+        void loadMissingRef.current();
+      })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch((err) => console.error('[MissingMetadataView] listen failed:', err));
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
   // External refresh trigger — bumping refreshNonce reloads the table even
   // when nothing in the local effect deps changed.
   useEffect(() => {

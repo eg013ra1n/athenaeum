@@ -7,17 +7,18 @@ interface PlateSolveQueueIndicatorProps {
 }
 
 export function PlateSolveQueueIndicator({ collapsed }: PlateSolveQueueIndicatorProps) {
-  const { currentBatch, queueLength, hasActiveBatches, cancelAll } = usePlateSolveProgressContext();
+  const { currentBatch, queueLength, hasActiveBatches, cancelAll, assistantRun } = usePlateSolveProgressContext();
 
-  const progress = currentBatch?.progress;
+  // The assistant's run holds the one slot, so it is the only run to show while it goes.
+  const progress = assistantRun ? { current: assistantRun.done, total: assistantRun.total } : currentBatch?.progress;
   const percent = progress && progress.total > 0 ? (progress.current / progress.total) * 100 : 0;
-  const label = currentBatch?.label || 'Plate solve';
+  const label = assistantRun ? 'Plate solve (assistant)' : currentBatch?.label || 'Plate solve';
 
   return (
     <QueueIndicator
       collapsed={collapsed}
       icon={Crosshair}
-      active={hasActiveBatches}
+      active={hasActiveBatches || assistantRun != null}
       label={label}
       percent={percent}
       current={progress?.current}

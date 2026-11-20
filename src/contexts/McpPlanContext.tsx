@@ -87,19 +87,47 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
     [setPlan, setNewer],
   );
 
+  const openNewer = useCallback(async () => {
+    const cur = planRef.current;
+    const target = newerRef.current ?? cur?.replacedBy ?? null;
+    const view = await api
+      .invoke<McpPlanView | null>('get_mcp_plan', { planId: target })
+      .catch((err) => {
+        console.error('[mcp-plan] get_mcp_plan failed:', err);
+        return null;
+      });
+    setNewer(null);
+    setHidden(false);
+    if (view) {
+      usedRef.current.set(view.planId, ++seqRef.current);
+      setPlan(view);
+    } else {
+      setPlan(null);
+    }
+  }, [setNewer, setPlan]);
+
   const read = useCallback(
     async (planId: string | null) => {
       const seq = ++seqRef.current;
       try {
         const view = await api.invoke<McpPlanView | null>('get_mcp_plan', { planId });
-        if (view) take(view, seq);
+        if (view) {
+          take(view, seq);
+        } else if (planId && planRef.current?.planId === planId && (usedRef.current.get(planId) ?? 0) <= seq) {
+          // The plan on screen is gone (the web server restarted mid-apply): the poll ends, the window opens
+          // again, and a waiting newer plan takes its place, else the window closes.
+          console.warn('[mcp-plan] the plan on screen is gone:', planId);
+          setHidden(false);
+          if (newerRef.current) await openNewer();
+          else setPlan(null);
+        }
         return view;
       } catch (err) {
         console.error('[mcp-plan] get_mcp_plan failed:', err);
         return null;
       }
     },
-    [take],
+    [take, openNewer, setPlan],
   );
 
   useEffect(() => {
@@ -158,25 +186,6 @@ export function McpPlanProvider({ children }: { children: ReactNode }) {
     },
     [take],
   );
-
-  const openNewer = useCallback(async () => {
-    const cur = planRef.current;
-    const target = newerRef.current ?? cur?.replacedBy ?? null;
-    const view = await api
-      .invoke<McpPlanView | null>('get_mcp_plan', { planId: target })
-      .catch((err) => {
-        console.error('[mcp-plan] get_mcp_plan failed:', err);
-        return null;
-      });
-    setNewer(null);
-    setHidden(false);
-    if (view) {
-      usedRef.current.set(view.planId, ++seqRef.current);
-      setPlan(view);
-    } else {
-      setPlan(null);
-    }
-  }, [setNewer, setPlan]);
 
   const dismiss = useCallback(() => {
     // A plan that applies keeps going: Close only hides the window, and the report opens it again.

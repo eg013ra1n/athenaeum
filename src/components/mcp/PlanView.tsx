@@ -32,7 +32,12 @@ export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGrou
       {state.kind === 'preparing' && <Preparing done={state.done} total={state.total} />}
       {state.kind === 'applying' && (
         <p className="flex items-center gap-2 text-content-secondary" role="status">
-          <Loader2 size={14} className="animate-spin" aria-hidden /> The plan is being applied. Files are being moved.
+          <Loader2 size={14} className="animate-spin" aria-hidden /> {applyingWords(plan.kind)}
+        </p>
+      )}
+      {state.kind === 'applied' && plan.kind === 'plate_solve' && (
+        <p className="text-content-secondary" role="status">
+          {startedWords(plan.report)}
         </p>
       )}
       {state.kind === 'expired' && (
@@ -41,10 +46,18 @@ export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGrou
       {state.kind === 'cancelled' && <p className="text-content-muted">This plan was cancelled. Nothing was changed.</p>}
       {state.kind === 'failed' && (
         <p className="text-error">
-          {plan.report ? 'This plan failed' : 'Preparing the plan failed'}: {state.error}
+          {plan.kind === 'plate_solve' && plan.report
+            ? 'Nothing was started'
+            : plan.report
+              ? 'This plan failed'
+              : 'Preparing the plan failed'}
+          : {state.error}
         </p>
       )}
-      {plan.report && <Report report={plan.report} />}
+      {state.kind === 'failed' && plan.report && isEmptyReport(plan.report) && plan.kind !== 'plate_solve' && (
+        <p className="text-content-muted">{plan.kind === 'metadata' ? 'Nothing was written.' : 'No file was recorded as moved.'}</p>
+      )}
+      {plan.report && <Report report={plan.report} kind={plan.kind} />}
       {!plan.report &&
         state.kind !== 'applied' &&
         plan.groups.map((g, i) => (
@@ -64,6 +77,23 @@ export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGrou
     </div>
   );
 }
+
+/** What the window says while a plan is applied: each kind of plan does something else. */
+function applyingWords(kind: McpPlanView['kind']): string {
+  if (kind === 'metadata') return 'Writing the values to the catalog…';
+  if (kind === 'plate_solve') return 'Starting the plate solve…';
+  return 'The plan is being applied. Files are being moved.';
+}
+
+/** A plate-solve plan that was applied started a run; it solved nothing yet. */
+function startedWords(report: PlanReport | null): string {
+  const runId = report?.runId ?? null;
+  if (!report || !runId) return 'No plate solve was started.';
+  const n = report.applied.length;
+  return `Started a plate solve of ${n} frame${n === 1 ? '' : 's'} (run ${runId}). Its progress shows in the plate-solve panel.`;
+}
+
+const isEmptyReport = (r: PlanReport) => r.applied.length + r.skipped.length + r.failed.length === 0;
 
 function Preparing({ done, total }: { done: number; total: number }) {
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
@@ -247,10 +277,11 @@ function Row({
   );
 }
 
-function Report({ report }: { report: PlanReport }) {
+function Report({ report, kind }: { report: PlanReport; kind: McpPlanView['kind'] }) {
   return (
     <div className="space-y-3">
-      <ReportList lines={report.applied} tone="ok" word="applied" />
+      {/* A plate-solve plan only started a run: its lines are in the sentence above, not an "applied" count. */}
+      {kind !== 'plate_solve' && <ReportList lines={report.applied} tone="ok" word="applied" />}
       <ReportList lines={report.skipped} tone="warn" word="skipped" />
       <ReportList lines={report.failed} tone="err" word="failed" />
     </div>

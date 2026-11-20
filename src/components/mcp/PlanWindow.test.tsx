@@ -496,4 +496,117 @@ describe('PlanWindow', () => {
     expect(screen.getByRole('dialog')).toBeTruthy();
     err.mockRestore();
   });
+
+  it('each_plan_kind_has_its_own_words', async () => {
+    const line = { itemId: 'item:2', fileName: 'copy-2.fits', folder: '/data/night-2', reason: 'started in run solve-abc' };
+    // Applying: one sentence per kind.
+    const applying: Array<[McpPlanView['kind'], RegExp]> = [
+      ['black_hole', /Files are being moved/],
+      ['metadata', /Writing the values to the catalog…/],
+      ['plate_solve', /Starting the plate solve…/],
+    ];
+    for (const [kind, words] of applying) {
+      await showThen(plan({ kind, state: { kind: 'applying' } }));
+      expect(await screen.findByText(words), kind).toBeTruthy();
+      if (kind !== 'black_hole') expect(screen.queryByText(/Files are being moved/), kind).toBeNull();
+      cleanup();
+    }
+    // Applied: a plate-solve plan started a run (it solved nothing yet) and has no "applied" chip.
+    await showThen(
+      plan({
+        kind: 'plate_solve',
+        state: { kind: 'applied' },
+        report: { applied: [line, { ...line, itemId: 'item:3' }], skipped: [], failed: [], runId: 'solve-abc' },
+      }),
+    );
+    expect(
+      await screen.findByText('Started a plate solve of 2 frames (run solve-abc). Its progress shows in the plate-solve panel.'),
+    ).toBeTruthy();
+    expect(screen.queryByText(/\d+ applied/)).toBeNull();
+    cleanup();
+    // Failed: the error, in "Nothing was started" words.
+    await showThen(
+      plan({
+        kind: 'plate_solve',
+        state: { kind: 'failed', error: 'A plate solve batch started in Athenaeum is running (1 of 4 frames).' },
+        report: { applied: [], skipped: [], failed: [{ ...line, reason: 'busy' }], runId: null },
+      }),
+    );
+    expect(await screen.findByText(/Nothing was started: A plate solve batch started in Athenaeum is running/)).toBeTruthy();
+    cleanup();
+    // A Black Hole plan keeps its "applied" chip.
+    await showThen(
+      plan({ state: { kind: 'applied' }, report: { applied: [{ ...line, reason: 'moved to the Black Hole' }], skipped: [], failed: [], runId: null } }),
+    );
+    expect(await screen.findByText(/1 applied/)).toBeTruthy();
+  });
+
+  it('an_empty_failed_report_says_nothing_happened', async () => {
+    const empty = { applied: [], skipped: [], failed: [], runId: null };
+    const cases: Array<[McpPlanView['kind'], string]> = [
+      ['black_hole', 'No file was recorded as moved.'],
+      ['metadata', 'Nothing was written.'],
+    ];
+    for (const [kind, words] of cases) {
+      await showThen(plan({ kind, state: { kind: 'failed', error: 'the catalog went away' }, report: empty }));
+      expect(await screen.findByText(words), kind).toBeTruthy();
+      cleanup();
+    }
+    // A plate-solve plan uses its own words; a plan that failed while preparing has no report and says no more.
+    await showThen(plan({ kind: 'plate_solve', state: { kind: 'failed', error: 'no catalog' }, report: empty }));
+    expect(await screen.findByText(/Nothing was started: no catalog/)).toBeTruthy();
+    expect(screen.queryByText('No file was recorded as moved.')).toBeNull();
+    cleanup();
+    await showThen(plan({ state: { kind: 'failed', error: 'the catalog went away' }, groups: [] }));
+    expect(await screen.findByText(/Preparing the plan failed/)).toBeTruthy();
+    expect(screen.queryByText('No file was recorded as moved.')).toBeNull();
+  });
+
+  it('a_plan_that_vanished_stops_the_poll', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+      const reads = (id: string) =>
+        vi.mocked(api.invoke).mock.calls.filter(([c, a]) => c === 'get_mcp_plan' && (a as { planId: string | null }).planId === id).length;
+
+      // The server restarted while plan-1 applied and the window was hidden; a newer plan waits.
+      newest = plans['plan-1'] = plan({ state: { kind: 'applying' } });
+      mount();
+      await tick(0);
+      fireEvent.keyDown(document, { key: 'Escape' });
+      await tick(0);
+      expect(screen.queryByRole('dialog')).toBeNull();
+      plans['plan-2'] = plan({ planId: 'plan-2', title: 'The newer plan' });
+      await emit('plan-2');
+      expect(screen.queryByRole('dialog')).toBeNull();
+      delete plans['plan-1'];
+      await tick(3100);
+      // The window is back, on the newer plan, and plan-1 is not read again.
+      expect(screen.getByRole('dialog', { name: /The newer plan/ })).toBeTruthy();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('gone'), 'plan-1');
+      const before = reads('plan-1');
+      await tick(9000);
+      expect(reads('plan-1')).toBe(before);
+      cleanup();
+
+      // No newer plan: the plan is cleared and nothing is polled.
+      vi.mocked(api.invoke).mockClear();
+      plans = {};
+      newest = plans['plan-3'] = plan({ planId: 'plan-3', state: { kind: 'applying' } });
+      mount();
+      await tick(0);
+      expect(screen.getByRole('dialog')).toBeTruthy();
+      delete plans['plan-3'];
+      newest = null;
+      await tick(3100);
+      expect(screen.queryByRole('dialog')).toBeNull();
+      const after = reads('plan-3');
+      await tick(9000);
+      expect(reads('plan-3')).toBe(after);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });
