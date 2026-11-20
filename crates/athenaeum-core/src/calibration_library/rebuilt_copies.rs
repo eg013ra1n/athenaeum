@@ -33,8 +33,9 @@ pub struct RebuiltCopy {
     pub line: FileLine,
     /// The calibration set that holds this copy (its master set when it has one).
     pub calibration_set_id: Option<i64>,
-    /// How many frames calibration links point from at this copy's set, directly or through the sub-calibration
-    /// chain (a master dark behind a master flat counts the lights the flat serves). 0: nothing uses this copy.
+    /// How many calibration links point at this copy's set, directly or through the sub-calibration chain: light
+    /// frames (a master dark behind a master flat counts the lights the flat serves) and the master sets built from
+    /// it. 0: nothing uses this copy.
     pub linked_lights: usize,
 }
 
@@ -89,9 +90,11 @@ fn set_of_frame(conn: &Connection, frame_id: i64) -> Result<Option<i64>> {
     .with_context(|| format!("read the calibration set of frame {frame_id}"))
 }
 
-/// The distinct frames that calibration links point from at `set_id`, or at a set that uses it as a sub-calibration
-/// (the chain `get_calibration_set_consumers` walks).
-fn linked_frames(conn: &Connection, set_id: i64) -> Result<usize> {
+/// The links that point at `set_id`, or at a set that uses it as a sub-calibration (the chain
+/// `get_calibration_set_consumers` walks): the distinct light frames linked to any set of the chain, plus the distinct
+/// sets of the chain that use `set_id` (or a set that does) as their own dark or bias. A master dark behind a master
+/// flat counts the flat's set even when no light is linked to the flat yet: the flat is built from it.
+fn links_to_set(conn: &Connection, set_id: i64) -> Result<usize> {
     let n: i64 = conn
         .query_row(
             "WITH RECURSIVE consumer_chain(set_id) AS ( \
@@ -101,19 +104,20 @@ fn linked_frames(conn: &Connection, set_id: i64) -> Result<usize> {
                    JOIN consumer_chain cc ON cstf.calibration_set_id = cc.set_id \
                   WHERE cstf.source_type = 'calibration_set' \
              ) \
-             SELECT COUNT(DISTINCT cstf.source_id) FROM calibration_set_to_frames cstf \
+             SELECT COUNT(DISTINCT cstf.source_type || ':' || cstf.source_id) FROM calibration_set_to_frames cstf \
                JOIN consumer_chain cc ON cstf.calibration_set_id = cc.set_id \
-              WHERE cstf.source_type = 'frame'",
+              WHERE cstf.source_type = 'frame' OR (cstf.source_type = 'calibration_set' AND cstf.source_id <> ?1)",
             params![set_id],
             |r| r.get(0),
         )
-        .with_context(|| format!("count the frames linked to calibration set {set_id}"))?;
+        .with_context(|| format!("count the links to calibration set {set_id}"))?;
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
-/// How many frames calibration links point from at the master in `file_id`: through the set that holds it, directly
-/// or through the sub-calibration chain (the rule `RebuiltCopy::linked_lights` reports). 0 when the file has no frame
-/// or its frame is in no calibration set. Any master file, a duplicate group's included.
+/// How many calibration links point at the master in `file_id`: through the set that holds it, directly or through the
+/// sub-calibration chain (the rule `RebuiltCopy::linked_lights` reports). Light frames count, and so do master sets
+/// built from it (a master dark behind a master flat with no light yet). 0 when the file has no frame or its frame is
+/// in no calibration set. Any master file, a duplicate group's included.
 pub fn master_link_count(conn: &Connection, file_id: i64) -> Result<usize> {
     let frame_id: Option<i64> = conn
         .query_row("SELECT id FROM frames WHERE file_id = ?1 ORDER BY id LIMIT 1", params![file_id], |r| r.get(0))
@@ -121,7 +125,7 @@ pub fn master_link_count(conn: &Connection, file_id: i64) -> Result<usize> {
         .with_context(|| format!("read the frame of file {file_id}"))?;
     let Some(frame_id) = frame_id else { return Ok(0) };
     match set_of_frame(conn, frame_id)? {
-        Some(set) => linked_frames(conn, set),
+        Some(set) => links_to_set(conn, set),
         None => Ok(0),
     }
 }
@@ -437,6 +441,31 @@ mod tests {
         assert_eq!(groups.len(), 1, "{groups:?}");
         assert!(groups[0].copies[0].linked_lights > 0, "{groups:?}");
         assert_eq!(groups[0].copies[0].linked_lights, master_link_count(&conn, first).expect("count"));
+    }
+
+    #[test]
+    fn a_master_used_by_another_master_counts() {
+        let conn = catalog();
+        db::upsert_scan_root(&conn, &lib_root(), "calibration_library").expect("root");
+        let (first, first_frame) = add(&conn, &Master::dark("MasterDark_300s.xisf"));
+        let (second, _) = add(&conn, &Master::dark("MasterDark_300s_2.xisf"));
+        let dark_set = linked_set(&conn, first_frame, 0);
+        assert_eq!(master_link_count(&conn, first).expect("count"), 0, "nothing uses it yet");
+        // A master flat is built from the dark; no light is linked to the flat.
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library, instrume) VALUES ('MasterFlat', '2024-10-05', 1, 'Cam')",
+            [],
+        )
+        .expect("flat set");
+        let flat_set = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+             VALUES (?1, 'calibration_set', ?2, 'Dark', '2024-10-05T00:00:00Z')",
+            [flat_set, dark_set],
+        )
+        .expect("flat uses dark");
+        assert_eq!(master_link_count(&conn, first).expect("count"), 1);
+        assert_eq!(master_link_count(&conn, second).expect("count"), 0);
     }
 
     #[test]

@@ -92,7 +92,7 @@ pub struct FileArgs {
 /// Run a tool body on a blocking thread (it reads SQLite) and wrap what it answers.
 pub(crate) async fn run<F>(host: &Arc<McpHost>, body: F) -> CallToolResult
 where
-    F: FnOnce(&McpHost) -> Result<Answer, ApiError> + Send + 'static,
+    F: FnOnce(&Arc<McpHost>) -> Result<Answer, ApiError> + Send + 'static,
 {
     let worker = Arc::clone(host);
     let answer = match tokio::task::spawn_blocking(move || body(&worker)).await {

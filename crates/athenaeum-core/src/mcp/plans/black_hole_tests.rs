@@ -4,11 +4,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::*;
 use crate::mcp::plans::{GroupSelection, PlanAnswer, NOT_REACHABLE};
@@ -167,7 +167,14 @@ pub(crate) fn header_handle(name: &str) -> String {
 
 /// A master of the calibration library. Masters of one `exptime` are copies of one master.
 pub(crate) fn master_copy(rig: &Rig, name: &str, exptime: f64, bytes: &[u8]) -> Fx {
-    let path = rig.base.join("lib").join(name);
+    master_copy_in(rig, "", name, exptime, bytes)
+}
+
+/// [`master_copy`] in the folder `sub` of the library (empty: the library itself).
+pub(crate) fn master_copy_in(rig: &Rig, sub: &str, name: &str, exptime: f64, bytes: &[u8]) -> Fx {
+    let dir = if sub.is_empty() { rig.base.join("lib") } else { rig.base.join("lib").join(sub) };
+    std::fs::create_dir_all(&dir).expect("library folder");
+    let path = dir.join(name);
     std::fs::write(&path, bytes).expect("write master");
     let database = rig.ctx.db.get().expect("db");
     let conn = database.conn();
@@ -243,6 +250,25 @@ pub(crate) fn link_master(rig: &Rig, fx: &Fx, lights: usize) {
     }
 }
 
+/// A master flat's set uses `fx`'s master set as its dark, and no light frame is linked to either.
+pub(crate) fn use_in_master_flat(rig: &Rig, fx: &Fx) {
+    let set = master_set(rig, fx);
+    let database = rig.ctx.db.get().expect("db");
+    let conn = database.conn();
+    conn.execute(
+        "INSERT INTO calibration_set (imagetyp, date, is_master_library, instrume) VALUES ('MasterFlat', '2024-10-05', 1, 'Cam')",
+        [],
+    )
+    .expect("flat set");
+    let flat = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+         VALUES (?1, 'calibration_set', ?2, 'Dark', '2024-10-05T00:00:00Z')",
+        [flat, set],
+    )
+    .expect("flat uses the dark");
+}
+
 /// A raw set was superseded by `fx`'s master set.
 fn supersede(rig: &Rig, fx: &Fx) {
     let set = master_set(rig, fx);
@@ -282,9 +308,22 @@ fn plan_with(
 ) -> McpPlanView {
     let answer = prepare(&rig.host, args(source, groups, folder, files), verify).expect("the plan is prepared");
     let id = answer.data["planId"].as_str().expect("a plan id").to_string();
-    let view = rig.host.plans.view(Some(&id)).expect("the plan");
+    let view = settle(rig, &id);
     assert_eq!(view.state, PlanState::Waiting, "{}", answer.text);
     view
+}
+
+/// Waits (bounded) until a plan is no longer being prepared: its byte checks run on a thread of their own.
+pub(crate) fn settle(rig: &Rig, id: &str) -> McpPlanView {
+    let started = Instant::now();
+    loop {
+        let v = rig.host.plans.view(Some(id)).expect("the plan");
+        if !matches!(v.state, PlanState::Preparing { .. }) {
+            return v;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "the plan is still preparing: {:?}", v.state);
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// The selection a user gets by pressing Apply on the proposal as it stands.
@@ -366,9 +405,9 @@ fn keep_in_folder_picks_the_keeper_and_selects_the_rest() {
     let g = &view.groups[0];
     assert_eq!(g.choose_one.as_deref(), Some("Copy that stays"));
     assert_eq!(g.chosen.as_deref(), Some(a.item().as_str()));
+    // The kept copy is shown by `chosen` alone: an ordinary candidate, neither selected nor locked.
     let keeper = item(&view, &a);
-    assert_eq!(keeper.locked.as_deref(), Some("stays"));
-    assert!(!keeper.selected && keeper.candidate);
+    assert!(keeper.locked.is_none() && !keeper.selected && keeper.candidate, "{keeper:?}");
     for other in [&b, &c, &d] {
         let i = item(&view, other);
         assert!(i.selected && i.locked.is_none(), "{}: {i:?}", other.name);
@@ -400,8 +439,8 @@ fn no_instruction_selects_nothing() {
     }
 
     // Two copies under the named folder: no single copy is picked.
-    let a = header_copy(&rig, "two/inside", "t3.fits", b"AAAA");
-    header_copy(&rig, "two/inside/deeper", "t3.fits", b"AAAA");
+    let a = header_copy(&rig, &Path::new("two").join("inside").to_string_lossy(), "t3.fits", b"AAAA");
+    header_copy(&rig, &Path::new("two").join("inside").join("deeper").to_string_lossy(), "t3.fits", b"AAAA");
     header_copy(&rig, "elsewhere", "t3.fits", b"AAAA");
     let folder = a.dir();
     let view = plan(&rig, BlackHoleSource::Duplicates, &[header_handle("t3.fits")], Some(&folder), &[]);
@@ -458,9 +497,9 @@ fn linked_master_is_locked_with_reason() {
     assert_eq!(linked.locked.as_deref(), Some("calibration links point at it; it stays in v1"));
     assert!(!linked.selected);
     assert!(item(&view, &m3).selected && item(&view, &m3).locked.is_none());
-    assert_eq!(item(&view, &m2).locked.as_deref(), Some("stays"));
+    assert!(item(&view, &m2).locked.is_none() && !item(&view, &m2).selected);
     let note = view.groups[0].note.clone().unwrap_or_default();
-    assert!(note.contains("MasterDark-300s.xisf") && note.contains("2 frames linked"), "{note}");
+    assert!(note.contains("MasterDark-300s.xisf") && note.contains("2 calibration links point at it"), "{note}");
 
     // A locked copy is refused by the window's apply, whatever the selection says.
     let sel = PlanSelection {
@@ -626,8 +665,10 @@ fn verification_is_cancellable() {
         verify,
     )
     .expect("an answer in words");
+    let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+    // The checks run on their own thread: the plan ends cancelled, after the first comparison.
+    settle(&rig, &id);
     assert_eq!(calls.load(Ordering::SeqCst), 1, "no comparison after the cancel: three were due");
-    assert!(answer.text.contains("cancelled") && answer.text.contains("nothing changed"), "{}", answer.text);
     let view = rig.host.plans.view(None).expect("the plan");
     assert_eq!(view.state, PlanState::Cancelled);
     assert!(view.groups.is_empty(), "a cancelled plan publishes nothing");
@@ -778,4 +819,274 @@ fn the_handle_is_the_one_the_duplicates_page_gives() {
         .filter_map(|g| g.key.map(|k| format!("dup:{}:{}", k.hash_type(), g.content_hash)))
         .collect();
     assert_eq!(handles, vec![header_handle("t12.fits")]);
+}
+
+// ---- fix round 1 ----
+
+/// A comparison that waits for `gate` to open (bounded) before it answers `identical`.
+fn gated(gate: &Arc<(Mutex<bool>, Condvar)>, started: &Arc<AtomicUsize>) -> VerifyFn {
+    let gate = Arc::clone(gate);
+    let started = Arc::clone(started);
+    Arc::new(move |_h: &McpHost, _a: i64, _b: i64| {
+        started.fetch_add(1, Ordering::SeqCst);
+        let (lock, cv) = &*gate;
+        let open = lock.lock().expect("gate");
+        let _ = cv.wait_timeout_while(open, Duration::from_secs(10), |open| !*open).expect("gate wait");
+        Ok(true)
+    })
+}
+
+fn open_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+    let (lock, cv) = &**gate;
+    *lock.lock().expect("gate") = true;
+    cv.notify_all();
+}
+
+#[test]
+fn planning_answers_before_the_byte_checks_end() {
+    let rig = rig();
+    let a = header_copy(&rig, "p-a", "t13.fits", b"AAAA");
+    header_copy(&rig, "p-b", "t13.fits", b"AAAA");
+    header_copy(&rig, "p-c", "t13.fits", b"AAAA");
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let started = Arc::new(AtomicUsize::new(0));
+    let answer = prepare(
+        &rig.host,
+        args(BlackHoleSource::Duplicates, &[header_handle("t13.fits")], Some(&a.dir()), &[]),
+        gated(&gate, &started),
+    );
+    // Whatever happens next, the checks are let go: a failed assertion must not leave a thread waiting.
+    let answer = match answer {
+        Ok(a) => a,
+        Err(e) => {
+            open_gate(&gate);
+            panic!("no answer: {e:?}");
+        }
+    };
+    let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+    let now = rig.host.plans.view(Some(&id)).expect("the plan");
+    let held = matches!(now.state, PlanState::Preparing { done: 0, total: 2 });
+    let said = answer.text.clone();
+    let kind = answer.data["state"]["kind"].clone();
+    open_gate(&gate);
+    assert!(held, "the answer came while the checks were still to run: {:?}", now.state);
+    assert_eq!(kind, "preparing", "{said}");
+    assert!(
+        said.contains("Athenaeum is checking 2 copies byte for byte; the plan opens in Athenaeum's window when it is ready. Ask plan_status."),
+        "{said}"
+    );
+    assert!(now.groups.is_empty(), "nothing is published before the checks end");
+
+    let done = settle(&rig, &id);
+    assert_eq!(done.state, PlanState::Waiting);
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert_eq!(done.groups[0].items.iter().filter(|i| i.selected).count(), 2);
+}
+
+#[test]
+fn the_answer_lists_each_copy_and_its_fate() {
+    let rig = rig();
+    let a = header_copy(&rig, "f-a", "t14.fits", b"AAAA");
+    let b = header_copy(&rig, "f-b", "t14.fits", b"AAAA");
+    let c = header_copy(&rig, "f-c", "t14.fits", b"AABA");
+    let d = header_copy(&rig, "f-d", "t15.fits", b"BBBB");
+    let e = header_copy(&rig, "f-e", "t15.fits", b"BBBB");
+    let answer = prepare(
+        &rig.host,
+        args(
+            BlackHoleSource::Duplicates,
+            &[header_handle("t14.fits"), header_handle("t15.fits")],
+            Some(&a.dir()),
+            &[],
+        ),
+        real_verify(),
+    )
+    .expect("the plan is prepared");
+    let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+    assert_eq!(settle(&rig, &id).state, PlanState::Waiting);
+    let ready = crate::mcp::tools::plan_status(&rig.host, crate::mcp::tools::PlanStatusArgs { plan_id: id.clone() })
+        .expect("the status");
+
+    // The same words and data come from the planning answer once it is ready and from plan_status.
+    for (what, said, data) in [("status", &ready.text, &ready.data)] {
+        let at = |n: &Fx| format!("{} in {}", n.name, text(&n.dir()));
+        assert!(said.contains(&format!("the copy that stays is {}", at(&a))), "{what}: {said}");
+        assert!(said.contains(&format!("{}: moves", at(&b))), "{what}: {said}");
+        assert!(said.contains(&format!("{}: locked: differs in bytes from the copy that stays", at(&c))), "{what}: {said}");
+        assert!(said.contains(&format!("{}: not selected", at(&d))), "{what}: {said}");
+        assert!(said.contains(&format!("{}: not selected", at(&e))), "{what}: {said}");
+        let g = &data["groups"][0];
+        assert_eq!(g["chosen"]["fileName"], "t14.fits");
+        assert_eq!(g["chosen"]["folder"], json!(text(&a.dir())));
+        let items = g["items"].as_array().expect("items");
+        assert_eq!(items.len(), 3, "{what}: {items:?}");
+        let by_folder = |f: &Fx| items.iter().find(|i| i["folder"] == json!(text(&f.dir()))).unwrap_or_else(|| panic!("{what}: {items:?}"));
+        assert_eq!(by_folder(&b)["selected"], true);
+        assert_eq!(by_folder(&b)["locked"], Value::Null);
+        assert_eq!(by_folder(&b)["candidate"], true);
+        assert_eq!(by_folder(&b)["fileName"], "t14.fits");
+        assert_eq!(by_folder(&b)["values"]["IMAGETYP"], "Light");
+        assert_eq!(by_folder(&c)["locked"], "differs in bytes from the copy that stays");
+        assert_eq!(by_folder(&a)["selected"], false);
+        assert_eq!(by_folder(&a)["locked"], Value::Null);
+        assert_eq!(data["groups"][1]["chosen"], Value::Null);
+    }
+    // A plan with nothing to byte-check is published before the tool answers: the answer itself carries the plan.
+    let m1 = master_copy(&rig, "MasterDark-fate-1.xisf", 300.0, b"M1");
+    let m2 = master_copy(&rig, "MasterDark-fate-2.xisf", 300.0, b"M2");
+    let m3 = master_copy(&rig, "MasterDark-fate-3.xisf", 300.0, b"M3");
+    link_master(&rig, &m1, 2);
+    let direct = prepare(
+        &rig.host,
+        args(BlackHoleSource::RebuiltMasters, &[rebuilt_handle(&m1)], None, &[&m2]),
+        real_verify(),
+    )
+    .expect("the plan is prepared");
+    assert_eq!(direct.data["state"]["kind"], "waiting", "{}", direct.text);
+    let said = &direct.text;
+    let at = |n: &Fx| format!("{} in {}", n.name, text(&n.dir()));
+    assert!(said.contains(&format!("the copy that stays is {}", at(&m2))), "{said}");
+    assert!(said.contains(&format!("{}: locked: {LINKED}", at(&m1))), "{said}");
+    assert!(said.contains(&format!("{}: moves", at(&m3))), "{said}");
+    let items = direct.data["groups"][0]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 3);
+    assert_eq!(direct.data["groups"][0]["chosen"]["fileName"], "MasterDark-fate-2.xisf");
+}
+
+#[test]
+fn the_window_can_swap_the_copy_that_stays() {
+    let rig = rig();
+    let a = header_copy(&rig, "w-a", "t16.fits", b"AAAA");
+    let b = header_copy(&rig, "w-b", "t16.fits", b"AAAA");
+    let (verify, calls) = counting();
+    let view = plan_with(&rig, BlackHoleSource::Duplicates, &[header_handle("t16.fits")], Some(&a.dir()), &[], verify);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let planned = item(&view, &a);
+    assert!(!planned.selected && planned.locked.is_none() && planned.candidate, "{planned:?}");
+    assert_eq!(view.groups[0].chosen.as_deref(), Some(a.item().as_str()));
+
+    // The user keeps the other copy and sends the planned keeper away.
+    let sel = PlanSelection {
+        groups: vec![GroupSelection { group_id: view.groups[0].id.clone(), chosen: Some(b.item()), included: vec![a.item()] }],
+    };
+    let done = apply(&rig, &view.plan_id, sel);
+    assert_eq!(done.state, PlanState::Applied);
+    let report = done.report.expect("report");
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(report.applied[0].item_id, a.item());
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "the planned keeper is compared with the new keeper first");
+    let moved: Vec<i64> = black_hole_rows(&rig).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(moved, vec![a.file_id], "the planned keeper only");
+}
+
+#[test]
+fn content_key_pair_is_byte_checked() {
+    let rig = rig();
+    let a = header_copy(&rig, "k-a", "t17.fits", b"AAAA");
+    let b = header_copy(&rig, "k-b", "t17.fits", b"AAAA");
+    // Same sampled hash, different bytes: the sample does not decide.
+    let c = header_copy(&rig, "k-c", "t17.fits", b"AABA");
+    {
+        let database = rig.ctx.db.get().expect("db");
+        let conn = database.conn();
+        db::set_setting(&conn, "duplicates.use_content_hash", "true").expect("setting");
+        conn.execute("UPDATE files SET content_hash = 'SAMPLED1' WHERE filename = 't17.fits'", []).expect("hash");
+    }
+    let groups = crate::api::files::get_duplicates(&rig.ctx).expect("groups");
+    let handles: Vec<String> =
+        groups.iter().filter_map(|g| g.key.map(|k| format!("dup:{}:{}", k.hash_type(), g.content_hash))).collect();
+    assert_eq!(handles.len(), 1, "{handles:?}");
+    assert!(handles[0].starts_with("dup:content:"), "{handles:?}");
+    let (verify, calls) = counting();
+    let view = plan_with(&rig, BlackHoleSource::Duplicates, &handles, Some(&a.dir()), &[], verify);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one comparison per copy that is not the keeper");
+    assert!(item(&view, &b).selected);
+    assert_eq!(item(&view, &c).locked.as_deref(), Some("differs in bytes from the copy that stays"));
+}
+
+#[test]
+fn a_file_in_two_groups_is_planned_once() {
+    let rig = rig();
+    let a = header_copy(&rig, "o-a", "t18.fits", b"AAAA");
+    let b = header_copy(&rig, "o-b", "t18.fits", b"AAAA");
+    let c = header_copy(&rig, "o-c", "t18.fits", b"AAAA");
+    let spec = |ids: &[i64]| GroupSpec {
+        matched: "same header, size and name".to_string(),
+        title: None,
+        byte_checked: true,
+        file_ids: ids.to_vec(),
+    };
+    // The header cache and the master cache are built apart: `a` sits in both groups.
+    let specs = vec![
+        ("dup:header:one".to_string(), spec(&[a.file_id, b.file_id])),
+        ("dup:master:two".to_string(), spec(&[a.file_id, c.file_id])),
+    ];
+    let loaded = load_groups(&rig.host, &specs).expect("loaded");
+    let a_args = args(BlackHoleSource::Duplicates, &[], Some(&a.dir()), &[]);
+    let out = assemble(&specs, loaded, &a_args);
+    let holding: Vec<usize> = out
+        .groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.items.iter().any(|i| i.id == a.item()))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(holding, vec![0], "the file is in the first group only");
+    assert_eq!(out.groups[1].items.len(), 1);
+    let note = out.group_notes[1].join("; ");
+    assert!(note.contains("t18.fits") && note.contains("already in another group of this plan"), "{note}");
+
+    // A selection that moves a group's kept copy anywhere in the plan is refused.
+    let (id, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "x");
+    rig.host
+        .plans
+        .publish(
+            &id,
+            PlanContent {
+                title: "x".to_string(),
+                columns: plan_columns(),
+                groups: out.groups.clone(),
+                notes: vec![],
+                snapshots: out.snapshots.clone(),
+                applier: Box::new(BlackHoleApplier { items: out.items, groups: out.group_infos, verify: real_verify() }),
+            },
+        )
+        .expect("publish");
+    let view = rig.host.plans.view(Some(&id)).expect("plan");
+    let content_applier = BlackHoleApplier { items: HashMap::new(), groups: HashMap::new(), verify: real_verify() };
+    let sel = PlanSelection {
+        groups: vec![
+            GroupSelection { group_id: view.groups[0].id.clone(), chosen: Some(a.item()), included: vec![b.item()] },
+            GroupSelection { group_id: view.groups[1].id.clone(), chosen: Some(c.item()), included: vec![a.item()] },
+        ],
+    };
+    match content_applier.validate(&view, &sel) {
+        Err(m) => assert!(m.contains("cannot also be moved"), "{m}"),
+        Ok(()) => panic!("a copy that stays in one group was included in another"),
+    }
+}
+
+#[test]
+fn master_used_by_another_master_is_locked() {
+    let rig = rig();
+    let m1 = master_copy(&rig, "MasterDark-um-1.xisf", 300.0, b"M1");
+    let m2 = master_copy(&rig, "MasterDark-um-2.xisf", 300.0, b"M2");
+    let m3 = master_copy(&rig, "MasterDark-um-3.xisf", 300.0, b"M3");
+    use_in_master_flat(&rig, &m1);
+    let view = plan(&rig, BlackHoleSource::RebuiltMasters, &[rebuilt_handle(&m1)], None, &[&m2]);
+    assert_eq!(item(&view, &m1).locked.as_deref(), Some(LINKED), "no light is behind the flat, a master is");
+    assert!(item(&view, &m3).selected);
+
+    // Used by another master only after the plan: the apply re-check sees it too.
+    let rig2 = self::rig();
+    let n1 = master_copy(&rig2, "MasterDark-un-1.xisf", 300.0, b"M1");
+    let n2 = master_copy(&rig2, "MasterDark-un-2.xisf", 300.0, b"M2");
+    let n3 = master_copy(&rig2, "MasterDark-un-3.xisf", 300.0, b"M3");
+    let view = plan(&rig2, BlackHoleSource::RebuiltMasters, &[rebuilt_handle(&n1)], None, &[&n1]);
+    assert!(item(&view, &n2).selected && item(&view, &n3).selected);
+    use_in_master_flat(&rig2, &n2);
+    let done = apply(&rig2, &view.plan_id, proposal(&view));
+    assert_eq!(reasons(&done.report.expect("report").skipped)[&n2.item()], LINKED);
+    let moved: Vec<i64> = black_hole_rows(&rig2).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(moved, vec![n3.file_id]);
 }

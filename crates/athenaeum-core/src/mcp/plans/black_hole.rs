@@ -5,9 +5,15 @@
 //! Only the named groups enter. Each group is a choose-one, "Copy that stays": `chosen` is the one copy under
 //! `keepInFolder` (separator-strict) or among `keepFiles`; with none or several there is no keeper, nothing is
 //! selected and the group's note says why. The other copies are include/exclude items, selected iff a keeper is set.
-//! A copy that cannot be moved is locked with its reason: the keeper itself, a master with calibration links, a copy
-//! whose registration superseded raw frames, a zip-resident copy, a copy whose file cannot be reached, a header-key
-//! copy whose bytes differ from the keeper's.
+//! The kept copy is the user's choice, not a lock: the window may keep another copy, so the planned keeper is an
+//! ordinary candidate item. A copy that cannot be moved is locked with its reason: a master with calibration links
+//! (or one that another master is built from), a copy whose registration superseded raw frames, a zip-resident copy,
+//! a copy whose file cannot be reached, a byte-checked copy whose bytes differ from the keeper's. A file is planned in
+//! one group only.
+//!
+//! The byte checks run on a thread of their own: the tool answers right after the plan begins (a client cancels a
+//! call after about a minute, and a cancelled call would give the assistant no handle), and the plan is published
+//! when the checks end.
 //!
 //! The plan holds no catalog connection and no reader guard across a call that takes the context
 //! (`verify_duplicate_pair`, `bulk_move_to_black_hole`): the planner reads on the host's reader, drops the guard, and
@@ -15,6 +21,7 @@
 //! releases it before the move.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -22,7 +29,7 @@ use chrono::{DateTime, Utc};
 use rmcp::schemars::JsonSchema;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::{
     plan_opened_text, stamp_for_plan, stamp_target, DiskStamp, ItemSnapshot, McpPlanView, PlanApplier, PlanColumn,
@@ -32,12 +39,11 @@ use crate::api::ApiError;
 use crate::calibration_library::rebuilt_copies::{find_rebuilt_master_copies, master_link_count};
 use crate::db::{file_not_in_black_hole_sql, native_separator_of};
 use crate::mcp::answer::{bytes_text, count_of};
+use crate::mcp::tools::to_json;
 use crate::mcp::{Answer, McpHost};
 
 /// The choose-one label of every group.
 pub const KEEP_LABEL: &str = "Copy that stays";
-/// The lock reason of the chosen copy.
-pub const STAYS: &str = "stays";
 /// A master that calibration links point at stays.
 pub const LINKED: &str = "calibration links point at it; it stays in v1";
 /// A copy whose registration superseded raw frames stays: moving it would make those frames matchable again.
@@ -45,6 +51,10 @@ pub const SUPERSEDING: &str = "raw frames were superseded by it; it stays in v1"
 pub const IN_ZIP: &str = "inside a zip; a zip moves to the Black Hole only as a whole";
 pub const DIFFERS: &str = "differs in bytes from the copy that stays";
 const MOVE_ACTION: &str = "Move to the Black Hole";
+/// A plan answer lists at most this many groups with their items (the rest is summed) ...
+const GROUPS_LISTED: usize = crate::catalog_query::GROUPS_SHOWN;
+/// ... and at most this many items of a group.
+const ITEMS_LISTED: usize = 20;
 /// Where the Black Hole row says the move came from.
 const FROM_WHERE: &str = "assistant";
 
@@ -113,8 +123,9 @@ struct GroupSpec {
     matched: String,
     /// The title when the group has its own words (a rebuilt master's parameters).
     title: Option<String>,
-    /// A header-key duplicate group: its copies are byte-checked against the keeper.
-    header_key: bool,
+    /// A group whose key does not decide on bytes (`Header`, and `Content`: `files.content_hash` samples 3 x 512 KB):
+    /// its copies are byte-checked against the keeper. Only the full-file hash key decides on bytes already.
+    byte_checked: bool,
     file_ids: Vec<i64>,
 }
 
@@ -337,15 +348,18 @@ fn resolve(host: &McpHost, args: &PlanBlackHoleArgs) -> Result<Vec<(String, Grou
         BlackHoleSource::Duplicates => {
             // `get_duplicates` takes the context: no guard is held here.
             for g in crate::api::files::get_duplicates(host.ctx())? {
-                let Some(key) = g.key else { continue };
-                let (matched, header_key) = match key {
+                let Some(key) = g.key else {
+                    tracing::warn!(count = g.file_ids.len(), "duplicate group has no key and cannot be planned");
+                    continue;
+                };
+                let (matched, byte_checked) = match key {
                     crate::db::DuplicateKey::Header => ("same header, size and name", true),
                     crate::db::DuplicateKey::Master => ("same full-file hash", false),
-                    crate::db::DuplicateKey::Content => ("same content", false),
+                    crate::db::DuplicateKey::Content => ("same content (a sampled hash)", true),
                 };
                 available.insert(
                     format!("dup:{}:{}", key.hash_type(), g.content_hash),
-                    GroupSpec { matched: matched.to_string(), title: None, header_key, file_ids: g.file_ids.clone() },
+                    GroupSpec { matched: matched.to_string(), title: None, byte_checked, file_ids: g.file_ids.clone() },
                 );
             }
         }
@@ -361,7 +375,7 @@ fn resolve(host: &McpHost, args: &PlanBlackHoleArgs) -> Result<Vec<(String, Grou
                     GroupSpec {
                         matched: "the same master built again".to_string(),
                         title: Some(g.params_label.clone()),
-                        header_key: false,
+                        byte_checked: false,
                         file_ids: g.copies.iter().map(|c| c.file_id).collect(),
                     },
                 );
@@ -407,7 +421,7 @@ struct ItemInfo {
 }
 
 struct GroupInfo {
-    header_key: bool,
+    byte_checked: bool,
     planned_chosen: Option<String>,
 }
 
@@ -446,8 +460,22 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
         notes: Vec::new(),
     };
     let mut matched_entries: HashSet<String> = HashSet::new();
-    for (gi, ((_, spec), copies)) in specs.iter().zip(loaded).enumerate() {
+    // The header cache and the master cache are built apart, so one file can sit in two groups: it is planned once.
+    let mut placed: HashSet<i64> = HashSet::new();
+    for (gi, ((_, spec), mut copies)) in specs.iter().zip(loaded).enumerate() {
         let gid = format!("group:{}", gi + 1);
+        let mut notes: Vec<String> = Vec::new();
+        let before = copies.len();
+        copies.retain(|c| {
+            let first = placed.insert(c.file_id);
+            if !first {
+                notes.push(format!("{} in {} is already in another group of this plan and is left out here", c.name, c.folder));
+            }
+            first
+        });
+        if copies.len() < before {
+            tracing::warn!(count = before - copies.len(), "plan left a file out of a later group");
+        }
         let stamps: Vec<Result<DiskStamp, String>> =
             copies.iter().map(|c| stamp_for_plan(&stamp_target(&c.path, c.zip.as_deref()))).collect();
         for c in &copies {
@@ -458,7 +486,6 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
                 matched_entries.insert(c.path.clone());
             }
         }
-        let mut notes: Vec<String> = Vec::new();
         let chosen_idx = match rules.pick(&copies) {
             Ok(i) if stamps[i].is_ok() => Some(i),
             Ok(i) => {
@@ -474,12 +501,8 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
             }
         };
         let chosen_id = chosen_idx.map(|i| format!("item:{}", copies[i].file_id));
-        let evidence = if spec.header_key {
-            if chosen_idx.is_some() {
-                format!("{}; bytes are compared with the copy that stays", spec.matched)
-            } else {
-                spec.matched.clone()
-            }
+        let evidence = if spec.byte_checked && chosen_idx.is_some() {
+            format!("{}; bytes are compared with the copy that stays", spec.matched)
         } else {
             spec.matched.clone()
         };
@@ -488,9 +511,8 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
         for (i, c) in copies.iter().enumerate() {
             let id = format!("item:{}", c.file_id);
             let keeper = chosen_idx == Some(i);
-            let locked = if keeper {
-                Some(STAYS.to_string())
-            } else if let Err(reason) = &stamps[i] {
+            // The kept copy is shown by `chosen` alone: the window may keep another one, so it is not locked.
+            let locked = if let Err(reason) = &stamps[i] {
                 Some(reason.clone())
             } else if c.zip.is_some() {
                 Some(IN_ZIP.to_string())
@@ -507,17 +529,17 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
                     ItemSnapshot { file_id: c.file_id, frame_id: c.frame_id, stamp: stamp.clone(), catalog: BTreeMap::new() },
                 );
             }
-            if spec.header_key && !keeper && locked.is_none() {
+            if spec.byte_checked && !keeper && locked.is_none() {
                 if let Some(k) = chosen_idx {
                     out.pairs.push(Pair { group: gi, item: items.len(), item_file: c.file_id, keeper_file: copies[k].file_id });
                 }
             }
             if c.master && c.linked > 0 {
                 notes.push(format!(
-                    "{} in {} has {} linked and stays",
+                    "{} in {}: {} at it, so it stays",
                     c.name,
                     c.folder,
-                    plural(c.linked, "frame", "frames")
+                    plural(c.linked, "calibration link points", "calibration links point")
                 ));
             } else if c.master && c.superseding {
                 notes.push(format!("{} in {} superseded raw frames and stays", c.name, c.folder));
@@ -533,7 +555,7 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
                 values: c.values.clone(),
                 action: MOVE_ACTION.to_string(),
                 evidence: Some(evidence.clone()),
-                selected: chosen_idx.is_some() && locked.is_none(),
+                selected: chosen_idx.is_some() && !keeper && locked.is_none(),
                 locked,
                 candidate: stamps[i].is_ok(),
                 size_bytes: Some(c.size),
@@ -544,7 +566,7 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
             (None, Some(first)) => format!("{}: {}", first.name, plural(copies.len(), "copy", "copies")),
             (None, None) => "group with no copy left in the catalog".to_string(),
         };
-        out.group_infos.insert(gid.clone(), GroupInfo { header_key: spec.header_key, planned_chosen: chosen_id.clone() });
+        out.group_infos.insert(gid.clone(), GroupInfo { byte_checked: spec.byte_checked, planned_chosen: chosen_id.clone() });
         out.groups.push(PlanGroup {
             id: gid,
             title,
@@ -619,43 +641,75 @@ fn title_of(source: BlackHoleSource) -> &'static str {
     }
 }
 
-/// `plan_black_hole`: reads the named groups, begins the plan, byte-checks the header-key copies against their
-/// keepers (progress per pair, the plan's cancel flag between pairs), and publishes it for the user. Runs on the
-/// tool's blocking thread. Returns once the plan is waiting (or was cancelled or replaced while it was prepared).
-pub fn prepare(host: &McpHost, args: PlanBlackHoleArgs, verify: VerifyFn) -> Result<Answer, ApiError> {
+/// `plan_black_hole`: reads the named groups, begins the plan and works out the keepers and locks. A plan with
+/// copies to byte-check answers at once, `preparing`: the checks (progress per pair, the plan's cancel flag between
+/// pairs) run on a thread of their own and publish the plan when they end. A plan with nothing to check is published
+/// before the answer. Runs on the tool's blocking thread.
+pub fn prepare(host: &Arc<McpHost>, args: PlanBlackHoleArgs, verify: VerifyFn) -> Result<Answer, ApiError> {
     let specs = resolve(host, &args)?;
-    let (id, cancel) = host.plans.begin(host, PlanKind::BlackHole, title_of(args.source));
-    match build_and_publish(host, &id, &cancel, &specs, &args, &verify) {
-        Ok(Ok(())) => {}
-        Ok(Err(Stopped::Ended)) => return Ok(ended_answer(host, &id)),
+    let title = title_of(args.source);
+    let (id, cancel) = host.plans.begin(host, PlanKind::BlackHole, title);
+    let out = match load_groups(host, &specs) {
+        Ok(loaded) => assemble(&specs, loaded, &args),
         Err(e) => {
             host.plans.fail(&id, e.to_string());
             return Err(e);
         }
-    }
-    let Some(view) = host.plans.view(Some(&id)) else {
-        return Err(ApiError::Internal("the plan is gone".to_string()));
     };
-    Ok(answer_of(host, &view))
-}
-
-fn build_and_publish(
-    host: &McpHost,
-    id: &str,
-    cancel: &AtomicBool,
-    specs: &[(String, GroupSpec)],
-    args: &PlanBlackHoleArgs,
-    verify: &VerifyFn,
-) -> Result<Result<(), Stopped>, ApiError> {
-    let loaded = load_groups(host, specs)?;
-    let mut out = assemble(specs, loaded, args);
     let item_count: usize = out.groups.iter().map(|g| g.items.len()).sum();
     // A plan that is too large fails at its publish: do not byte-check what will not be shown.
     let pairs = if item_count > PLAN_ITEM_CAP { 0 } else { out.pairs.len() };
-    let mut results: Vec<(usize, Result<bool, ApiError>)> = Vec::with_capacity(pairs);
-    if pairs > 0 {
-        host.plans.progress(id, 0, pairs);
+    if pairs == 0 {
+        return match check_and_publish(host, &id, &cancel, out, title, &verify, 0) {
+            Ok(Ok(())) => ready_answer(host, &id),
+            Ok(Err(Stopped::Ended)) => Ok(ended_answer(host, &id)),
+            Err(e) => {
+                host.plans.fail(&id, e.to_string());
+                Err(e)
+            }
+        };
     }
+
+    host.plans.progress(&id, 0, pairs);
+    let worker_host = Arc::clone(host);
+    let worker_id = id.clone();
+    // A tracing dispatcher is per thread: carry the caller's so the checks' lines land with it.
+    let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+    let spawned = std::thread::Builder::new().name("mcp-plan-prepare".to_string()).spawn(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                check_and_publish(&worker_host, &worker_id, &cancel, out, title, &verify, pairs)
+            }));
+            match outcome {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => worker_host.plans.fail(&worker_id, e.to_string()),
+                Err(_) => {
+                    tracing::error!(plan_id = %worker_id, "plan preparation panicked");
+                    worker_host.plans.fail(&worker_id, "preparing the plan stopped unexpectedly; ask for it again".to_string());
+                }
+            }
+        });
+    });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, plan_id = %id, "plan preparation thread could not start");
+        let error = format!("the plan could not be prepared: {e}");
+        host.plans.fail(&id, error.clone());
+        return Err(ApiError::Internal(error));
+    }
+    Ok(preparing_answer(host, &id, pairs))
+}
+
+/// Byte-checks the pairs (when there are any) and publishes the plan.
+fn check_and_publish(
+    host: &McpHost,
+    id: &str,
+    cancel: &AtomicBool,
+    mut out: Assembled,
+    title: &str,
+    verify: &VerifyFn,
+    pairs: usize,
+) -> Result<Result<(), Stopped>, ApiError> {
+    let mut results: Vec<(usize, Result<bool, ApiError>)> = Vec::with_capacity(pairs);
     for p in 0..pairs {
         if cancel.load(Ordering::SeqCst) {
             return Ok(Err(Stopped::Ended));
@@ -677,7 +731,7 @@ fn build_and_publish(
     }
     let applier = BlackHoleApplier { items: out.items, groups: out.group_infos, verify: Arc::clone(verify) };
     let content = PlanContent {
-        title: title_of(args.source).to_string(),
+        title: title.to_string(),
         columns: plan_columns(),
         groups: out.groups,
         notes: out.notes,
@@ -693,6 +747,10 @@ fn build_and_publish(
     }
 }
 
+fn state_json(state: &PlanState) -> Value {
+    to_json(state).unwrap_or(Value::Null)
+}
+
 fn ended_answer(host: &McpHost, id: &str) -> Answer {
     let state = host.plans.view(Some(id)).map(|v| v.state);
     let words = match &state {
@@ -701,26 +759,96 @@ fn ended_answer(host: &McpHost, id: &str) -> Answer {
     };
     Answer::new(
         format!("The plan was {words} while it was being prepared; nothing changed. Ask again if it is still wanted."),
-        json!({ "planId": id, "state": state.as_ref().and_then(|s| serde_json::to_value(s).ok()).unwrap_or(Value::Null) }),
+        json!({ "planId": id, "state": state.as_ref().map_or(Value::Null, state_json) }),
     )
+}
+
+/// The answer while the byte checks run: the handle, `preparing`, and where to ask.
+fn preparing_answer(host: &McpHost, id: &str, pairs: usize) -> Answer {
+    let state = host.plans.view(Some(id)).map_or(PlanState::Preparing { done: 0, total: pairs }, |v| v.state);
+    Answer::new(
+        format!(
+            "Plan {id} is being prepared. Athenaeum is checking {} byte for byte; the plan opens in Athenaeum's window when it is ready. Ask plan_status.",
+            plural(pairs, "copy", "copies")
+        ),
+        json!({ "planId": id, "kind": PlanKind::BlackHole.as_str(), "state": state_json(&state) }),
+    )
+}
+
+fn ready_answer(host: &McpHost, id: &str) -> Result<Answer, ApiError> {
+    let Some(view) = host.plans.view(Some(id)) else {
+        return Err(ApiError::Internal("the plan is gone".to_string()));
+    };
+    Ok(answer_of(host, &view))
+}
+
+// ---- what the answer says about the plan ----
+
+/// A plan that waits for the user, in words and as data. One function for the planning answer and for `plan_status`.
+pub struct PlanDescription {
+    /// `N files proposed for the Black Hole (size) from M groups`.
+    pub summary: String,
+    /// What follows the summary: counts that need attention, each group with its copies, the plan's notes.
+    pub lines: Vec<String>,
+    /// `proposedFiles`, `proposedBytes`, `lockedFiles`, `groupsWithoutKeeper`, `groups`, `otherGroups`, `notes`.
+    pub data: Map<String, Value>,
 }
 
 fn count_where(view: &McpPlanView, f: impl Fn(&PlanItem) -> bool) -> usize {
     view.groups.iter().flat_map(|g| g.items.iter()).filter(|i| f(i)).count()
 }
 
-fn answer_of(host: &McpHost, view: &McpPlanView) -> Answer {
+/// What happens to a copy, in words.
+fn fate_of(item: &PlanItem) -> String {
+    match (&item.locked, item.selected) {
+        (Some(reason), _) => format!("locked: {reason}"),
+        (None, true) => "moves".to_string(),
+        (None, false) => "not selected".to_string(),
+    }
+}
+
+fn item_json(item: &PlanItem) -> Value {
+    json!({
+        "fileName": item.file_name,
+        "folder": item.folder,
+        "values": item.values,
+        "selected": item.selected,
+        "locked": item.locked,
+        "candidate": item.candidate,
+        "evidence": item.evidence,
+    })
+}
+
+struct Sums {
+    files: usize,
+    proposed: usize,
+    locked: usize,
+}
+
+fn sums_of<'a>(items: impl Iterator<Item = &'a PlanItem>) -> Sums {
+    items.fold(Sums { files: 0, proposed: 0, locked: 0 }, |a, i| Sums {
+        files: a.files + 1,
+        proposed: a.proposed + usize::from(i.selected),
+        locked: a.locked + usize::from(i.locked.is_some()),
+    })
+}
+
+fn sums_json(s: &Sums) -> Value {
+    json!({ "files": s.files, "proposed": s.proposed, "locked": s.locked })
+}
+
+pub fn describe_plan(view: &McpPlanView) -> PlanDescription {
     let proposed = count_where(view, |i| i.selected);
     let bytes: i64 = view.groups.iter().flat_map(|g| g.items.iter()).filter(|i| i.selected).filter_map(|i| i.size_bytes).sum();
-    let locked = count_where(view, |i| i.locked.is_some() && i.locked.as_deref() != Some(STAYS));
+    let locked = count_where(view, |i| i.locked.is_some());
     let waiting = view.groups.iter().filter(|g| g.chosen.is_none()).count();
-    let mut lines = vec![format!(
-        "Plan {} is ready: {} proposed for the Black Hole ({}) from {}.",
-        view.plan_id,
+    let summary = format!(
+        "{} proposed for the Black Hole ({}) from {}",
         plural(proposed, "file", "files"),
         bytes_text(bytes),
         plural(view.groups.len(), "group", "groups")
-    )];
+    );
+    let mut lines: Vec<String> = Vec::new();
     if waiting > 0 {
         lines.push(format!(
             "{} no copy that stays picked yet: nothing is proposed there until the user picks one in the window.",
@@ -730,62 +858,97 @@ fn answer_of(host: &McpHost, view: &McpPlanView) -> Answer {
     if locked > 0 {
         lines.push(format!("{} locked and will not move.", plural(locked, "file is", "files are")));
     }
-    for g in view.groups.iter().take(10) {
-        let keeps = g
-            .chosen
-            .as_ref()
-            .and_then(|c| g.items.iter().find(|i| &i.id == c))
-            .map(|i| format!("keeps {} in {}", i.file_name, i.folder))
-            .unwrap_or_else(|| "no copy stays yet".to_string());
-        let moves = g.items.iter().filter(|i| i.selected).count();
-        let mut line = format!("- {}: {keeps}; {} proposed", g.title, moves);
+
+    let mut groups: Vec<Value> = Vec::new();
+    for g in view.groups.iter().take(GROUPS_LISTED) {
+        let keeper = g.chosen.as_ref().and_then(|c| g.items.iter().find(|i| &i.id == c));
+        let keeps = match keeper {
+            Some(i) => format!("the copy that stays is {} in {}", i.file_name, i.folder),
+            None => "no copy stays yet".to_string(),
+        };
+        let sums = sums_of(g.items.iter());
+        let mut line = format!("- {}: {keeps}; {} proposed", g.title, sums.proposed);
         if let Some(note) = &g.note {
             line.push_str(&format!(" ({note})"));
         }
         lines.push(line);
+        let others: Vec<&PlanItem> = g.items.iter().filter(|i| keeper.is_none_or(|k| k.id != i.id)).collect();
+        for i in others.iter().take(ITEMS_LISTED) {
+            lines.push(format!("    {} in {}: {}", i.file_name, i.folder, fate_of(i)));
+        }
+        if others.len() > ITEMS_LISTED {
+            let rest = sums_of(others.iter().skip(ITEMS_LISTED).copied());
+            lines.push(format!(
+                "    and {} more ({} proposed, {} locked)",
+                plural(rest.files, "copy", "copies"),
+                rest.proposed,
+                rest.locked
+            ));
+        }
+        // The copy that stays leads the data list; then the others in plan order.
+        let listed: Vec<&PlanItem> = keeper.into_iter().chain(others.iter().copied()).collect();
+        let shown: Vec<Value> = listed.iter().take(ITEMS_LISTED + usize::from(keeper.is_some())).map(|i| item_json(i)).collect();
+        let hidden = sums_of(listed.iter().skip(ITEMS_LISTED + usize::from(keeper.is_some())).copied());
+        groups.push(json!({
+            "title": g.title,
+            "chosen": keeper.map(|i| json!({ "fileName": i.file_name, "folder": i.folder })),
+            "proposed": sums.proposed,
+            "locked": sums.locked,
+            "note": g.note,
+            "items": shown,
+            "itemsNotShown": (hidden.files > 0).then(|| sums_json(&hidden)),
+        }));
     }
-    if view.groups.len() > 10 {
-        lines.push(format!("- and {} more groups (the structured half lists them all)", view.groups.len() - 10));
+    let beyond = sums_of(view.groups.iter().skip(GROUPS_LISTED).flat_map(|g| g.items.iter()));
+    let other_groups = view.groups.len().saturating_sub(GROUPS_LISTED);
+    if other_groups > 0 {
+        lines.push(format!(
+            "- and {} more ({}, {} proposed, {} locked)",
+            plural(other_groups, "group", "groups"),
+            plural(beyond.files, "copy", "copies"),
+            beyond.proposed,
+            beyond.locked
+        ));
     }
     for n in &view.notes {
         lines.push(n.clone());
     }
+
+    let mut data = Map::new();
+    data.insert("proposedFiles".to_string(), json!(proposed));
+    data.insert("proposedBytes".to_string(), json!(bytes));
+    data.insert("lockedFiles".to_string(), json!(locked));
+    data.insert("groupsWithoutKeeper".to_string(), json!(waiting));
+    data.insert("groups".to_string(), Value::Array(groups));
+    data.insert(
+        "otherGroups".to_string(),
+        if other_groups > 0 {
+            json!({ "groups": other_groups, "files": beyond.files, "proposed": beyond.proposed, "locked": beyond.locked })
+        } else {
+            Value::Null
+        },
+    );
+    data.insert("notes".to_string(), json!(view.notes));
+    PlanDescription { summary, lines, data }
+}
+
+fn answer_of(host: &McpHost, view: &McpPlanView) -> Answer {
+    let described = describe_plan(view);
+    let mut lines = vec![format!("Plan {} is ready: {}.", view.plan_id, described.summary)];
+    lines.extend(described.lines);
     lines.push(format!("{}.", plan_opened_text(host)));
     match &view.expires_at {
         Some(t) => lines.push(format!("It waits for the user until {t}. Nothing moves until they press Apply there.")),
         None => lines.push("Nothing moves until the user presses Apply there.".to_string()),
     }
     lines.push("Ask plan_status for the outcome.".to_string());
-    let groups: Vec<Value> = view
-        .groups
-        .iter()
-        .map(|g| {
-            let keeps = g.chosen.as_ref().and_then(|c| g.items.iter().find(|i| &i.id == c));
-            json!({
-                "title": g.title,
-                "keepsFileName": keeps.map(|i| i.file_name.clone()),
-                "keepsFolder": keeps.map(|i| i.folder.clone()),
-                "proposed": g.items.iter().filter(|i| i.selected).count(),
-                "locked": g.items.iter().filter(|i| i.locked.is_some() && i.locked.as_deref() != Some(STAYS)).count(),
-                "note": g.note,
-            })
-        })
-        .collect();
-    Answer::new(
-        lines.join("\n"),
-        json!({
-            "planId": view.plan_id,
-            "kind": view.kind.as_str(),
-            "state": serde_json::to_value(&view.state).unwrap_or(Value::Null),
-            "expiresAt": view.expires_at,
-            "proposedFiles": proposed,
-            "proposedBytes": bytes,
-            "lockedFiles": locked,
-            "groupsWithoutKeeper": waiting,
-            "groups": groups,
-            "notes": view.notes,
-        }),
-    )
+    let mut data = Map::new();
+    data.insert("planId".to_string(), json!(view.plan_id));
+    data.insert("kind".to_string(), json!(view.kind.as_str()));
+    data.insert("state".to_string(), state_json(&view.state));
+    data.insert("expiresAt".to_string(), json!(view.expires_at));
+    data.extend(described.data);
+    Answer::new(lines.join("\n"), Value::Object(data))
 }
 
 // ---- the applier ----
@@ -820,6 +983,8 @@ struct Work<'a> {
 
 impl PlanApplier for BlackHoleApplier {
     fn validate(&self, view: &McpPlanView, sel: &PlanSelection) -> Result<(), String> {
+        // Every group's kept copy, whatever group the selection names it in: none of them is ever moved.
+        let kept: HashSet<&str> = sel.groups.iter().filter_map(|g| g.chosen.as_deref()).collect();
         for g in &sel.groups {
             if g.included.is_empty() {
                 continue;
@@ -833,6 +998,15 @@ impl PlanApplier for BlackHoleApplier {
                     return Err(format!("the copy that stays in \"{title}\" cannot also be moved"));
                 }
                 Some(_) => {}
+            }
+            if let Some(id) = g.included.iter().find(|id| kept.contains(id.as_str())) {
+                let name = view
+                    .groups
+                    .iter()
+                    .flat_map(|x| x.items.iter())
+                    .find(|i| &i.id == id)
+                    .map_or_else(|| id.clone(), |i| format!("{} in {}", i.file_name, i.folder));
+                return Err(format!("{name} is the copy that stays in another group and cannot also be moved"));
             }
         }
         Ok(())
@@ -858,8 +1032,27 @@ impl PlanApplier for BlackHoleApplier {
             }
         }
 
-        // Re-check on a pooled connection of its own, released before anything that takes the context.
-        let mut movable: Vec<Work> = Vec::new();
+        // The slow step first, on no catalog connection: a byte-checked group whose keeper is not the one the plan
+        // checked against compares each copy with it now. It can take minutes.
+        let mut verdicts: HashMap<&str, Result<bool, String>> = HashMap::new();
+        for w in &work {
+            let info = self.groups.get(w.group_id);
+            if !info.is_some_and(|g| g.byte_checked && g.planned_chosen.as_deref() != Some(w.chosen)) {
+                continue;
+            }
+            for id in &w.ids {
+                let Some(item) = self.items.get(*id) else { continue };
+                let verdict = (self.verify)(host, item.file_id, w.keeper_file).map_err(|e| {
+                    tracing::warn!(error = %e, plan_id, "plan pair could not be compared");
+                    e.to_string()
+                });
+                verdicts.insert(id, verdict);
+            }
+        }
+
+        // Then the re-checks, immediately before the move, on a pooled connection of its own that is released before
+        // anything that takes the context.
+        let mut to_move: Vec<&str> = Vec::new();
         {
             let database = match crate::api::db(host.ctx()) {
                 Ok(d) => d,
@@ -872,7 +1065,7 @@ impl PlanApplier for BlackHoleApplier {
                     return self.skip_all(report, &work, &format!("the catalog is busy: {e}"));
                 }
             };
-            for w in work {
+            for w in &work {
                 match in_black_hole(&conn, w.keeper_file) {
                     Ok(true) => {
                         for id in &w.ids {
@@ -886,45 +1079,26 @@ impl PlanApplier for BlackHoleApplier {
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        tracing::error!(error = %e, plan_id, "plan could not re-check the copy that stays");
+                        tracing::warn!(error = %e, plan_id, "plan could not re-check the copy that stays");
                         for id in &w.ids {
                             report.skipped.push(report_line(&self.items, id, format!("the copy that stays could not be re-checked: {e}")));
                         }
                         continue;
                     }
                 }
-                let mut ids = Vec::new();
                 for id in &w.ids {
-                    match self.recheck_item(&conn, plan_id, id) {
-                        Some(reason) => report.skipped.push(report_line(&self.items, id, reason)),
-                        None => ids.push(*id),
+                    if let Some(reason) = self.recheck_item(&conn, plan_id, id) {
+                        report.skipped.push(report_line(&self.items, id, reason));
+                        continue;
                     }
-                }
-                movable.push(Work { ids, ..w });
-            }
-        }
-
-        // A header-key group whose keeper is not the one the plan checked against: check each copy against it now.
-        let mut to_move: Vec<&str> = Vec::new();
-        for w in &movable {
-            let info = self.groups.get(w.group_id);
-            let recheck = info.is_some_and(|g| g.header_key && g.planned_chosen.as_deref() != Some(w.chosen));
-            for id in &w.ids {
-                if !recheck {
-                    to_move.push(id);
-                    continue;
-                }
-                let Some(item) = self.items.get(*id) else { continue };
-                match (self.verify)(host, item.file_id, w.keeper_file) {
-                    Ok(true) => to_move.push(id),
-                    Ok(false) => report.skipped.push(report_line(&self.items, id, DIFFERS)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, plan_id, "plan pair could not be compared");
-                        report.skipped.push(report_line(
+                    match verdicts.get(id) {
+                        None | Some(Ok(true)) => to_move.push(id),
+                        Some(Ok(false)) => report.skipped.push(report_line(&self.items, id, DIFFERS)),
+                        Some(Err(e)) => report.skipped.push(report_line(
                             &self.items,
                             id,
                             format!("could not be compared with the copy that stays: {e}"),
-                        ));
+                        )),
                     }
                 }
             }
@@ -974,7 +1148,7 @@ impl BlackHoleApplier {
             Ok(true) => return Some("already in the Black Hole".to_string()),
             Ok(false) => {}
             Err(e) => {
-                tracing::error!(error = %e, plan_id, "plan could not re-check an item");
+                tracing::warn!(error = %e, plan_id, "plan could not re-check an item");
                 return Some(format!("could not be re-checked: {e}"));
             }
         }
@@ -985,7 +1159,7 @@ impl BlackHoleApplier {
             Ok(0) => {}
             Ok(_) => return Some(LINKED.to_string()),
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), plan_id, "plan could not re-read a master's links");
+                tracing::warn!(error = %format!("{e:#}"), plan_id, "plan could not re-read a master's links");
                 return Some(format!("its calibration links could not be re-read: {e:#}"));
             }
         }
@@ -993,7 +1167,7 @@ impl BlackHoleApplier {
             Ok(false) => None,
             Ok(true) => Some(SUPERSEDING.to_string()),
             Err(e) => {
-                tracing::error!(error = %e, plan_id, "plan could not re-read a master's set");
+                tracing::warn!(error = %e, plan_id, "plan could not re-read a master's set");
                 Some(format!("its calibration set could not be re-read: {e}"))
             }
         }

@@ -57,8 +57,8 @@ Every answer is two halves that each read on their own.
 | `file_details` | One file: header values, stored measurements and whether they are current, transparency, calibration links, copies, plate solve |
 | `find_duplicates` | Duplicate groups with a copy in the scope, each copy with file name, folder, scan root kind and a processing-folder note |
 | `find_missing_metadata` | The Missing Metadata view's rows inside the scope: counts per category, folders, a page of files |
-| `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many frames calibration links point at each; not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); the scope narrows which masters are considered |
-| `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window |
+| `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many calibration links point at each (light frames, and master sets that use it as a dark or bias); not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); like `find_duplicates`, a group is in the scope when one of its copies is, and it is then listed whole (every copy, its handle the lowest file id of the whole group, so `plan_black_hole` finds it) |
+| `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window. A plan with copies to byte-check answers at once with state `preparing` (the checks run on a thread of their own); the answer of a published plan lists every copy and its fate |
 | `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied") |
 
 Each tool is a core fn `mcp::tools::<name>(host, args) -> Result<Answer, ApiError>` wearing
@@ -263,23 +263,35 @@ only those groups enter the plan. The handles are read before the plan begins, s
 - **One keeper per group** ("Copy that stays", `chooseOne`): `chosen` is the one copy under `keepInFolder` (separator-strict: the folder or
   anything below it, never a folder that merely starts like it) or among `keepFiles` (`file:<n>` or the stored path). None or several: `chosen`
   is null, nothing is selected and the group's note says `no instruction picks the copy that stays here (2 copies under <folder>)`. The other
-  copies are include/exclude items, selected iff a keeper is set.
-- **Locked, with the reason:** the keeper (`stays`); a master with calibration links (`calibration links point at it; it stays in v1`, counted by
-  `rebuilt_copies::master_link_count`, the one link count); a copy whose master set superseded raw frames (`raw frames were superseded by it; it
-  stays in v1`: moving it would un-supersede them, `master_unregister`); a zip-resident copy (`inside a zip; a zip moves to the Black Hole only as
-  a whole`); a copy whose file cannot be stamped (`not reachable ...`); a header-key copy whose bytes differ from the keeper's (`differs in bytes
-  from the copy that stays`, with a group note).
-- **Byte checks** (header-key groups only; the other keys decide on bytes already): while the plan is `preparing`, each unlocked copy is compared
-  with the keeper by `verify_duplicate_pair` on the tool's blocking thread, progress per pair, the plan's cancel flag read between pairs (a plan the
-  user cancels or a newer plan replaces stops there and answers in words). No reader guard and no pooled connection is held across a comparison.
-- **Apply** (after the store's stamp re-check of the included items and the kept copy): a group whose keeper is in the Black Hole now is skipped as a
-  whole; every master item is re-checked for links and for superseding (skipped with the lock's reason); an item already in the Black Hole is
-  skipped; a header-key group whose `chosen` is not the copy the plan compared against is compared again (a differing pair is skipped). The rest
-  goes through `api::black_hole::bulk_move_to_black_hole(ctx, ids, "assistant", None, emitter)`: one `blackhole-changed` with `count` = moved, no
-  per-file progress events; `BulkMoveResult.failed` fills the report's `failed`.
+  copies are include/exclude items, selected iff a keeper is set. The kept copy is a choice, not a lock: it is shown by `chosen` alone, the
+  planned keeper is an ordinary candidate item (not selected, not locked), and the window may keep another copy and include the planned one
+  (the apply byte-checks that pair first). A file sits in one group only: a file already placed in an earlier group is left out of later ones,
+  with a note; `validate` refuses a selection that includes any group's `chosen`.
+- **Locked, with the reason (only real reasons):** a master with calibration links (`calibration links point at it; it stays in v1`, counted by
+  `rebuilt_copies::master_link_count`, the one link count: light frames plus master sets that use it, such as a master dark behind a master
+  flat with no light yet); a copy whose master set superseded raw frames (`raw frames were superseded by it; it stays in v1`: moving it would
+  un-supersede them, `master_unregister`); a zip-resident copy (`inside a zip; a zip moves to the Black Hole only as a whole`); a copy whose
+  file cannot be stamped (`not reachable ...`); a byte-checked copy whose bytes differ from the keeper's (`differs in bytes from the copy that
+  stays`, with a group note).
+- **The answer is the plan, as data and in words** (`describe_plan`, one function for the planning answer and for `plan_status` of a waiting
+  plan): per group its title, the copy that stays (`chosen`: file name and folder), and `items` with `fileName`, `folder`, `values` (the
+  columns), `selected`, `locked` (the reason or null) and `candidate`; the text lists, under each group, the copy that stays and every other
+  copy as `moves`, `not selected` or `locked: <reason>`. At most 50 groups are shown with their items (the rest summed) and at most 20 items
+  per group (the rest summed).
+- **Byte checks** (`Header` and `Content` groups; only the full-file `strong_hash` groups, `Master`, decide on bytes already, while
+  `files.content_hash` samples 3 x 512 KB and so does not): each unlocked copy is compared with the keeper by `verify_duplicate_pair`. The
+  tool answers right after the plan begins, with the handle and state `preparing` (`Athenaeum is checking N copies byte for byte; ... Ask
+  plan_status.`), because a client cancels a tool call after about a minute and a cancelled call gives the assistant no handle. The checks run
+  on a thread of their own, progress per pair, the plan's cancel flag read between pairs (a plan the user cancels or a newer plan replaces
+  stops there); when they end the plan is published (`waiting`). A plan with nothing to byte-check is published before the tool answers. No
+  reader guard and no pooled connection is held across a comparison.
+- **Apply** (after the store's stamp re-check of the included items and the kept copy): a byte-checked group whose `chosen` is not the copy the
+  plan compared against is compared again first (a differing pair is skipped); then, immediately before the move, a group whose keeper is in
+  the Black Hole now is skipped as a whole, every master item is re-checked for links and for superseding (skipped with the lock's reason) and
+  an item already in the Black Hole is skipped. The rest goes through `api::black_hole::bulk_move_to_black_hole(ctx, ids, "assistant", None,
+  emitter)`: one `blackhole-changed` with `count` = moved, no per-file progress events; `BulkMoveResult.failed` fills the report's `failed`.
 - **`validate`** is in memory (no SQLite, so the hosts' `answer_mcp_plan` wrappers need no `spawn_blocking` for it): an included item needs a
-  `chosen` (`pick the copy that stays ...`) and `chosen` is never included. The window shows what it asked for: a locked keeper cannot be swapped
-  inside one plan; ask for a new plan with another `keepFiles`.
+  `chosen` (`pick the copy that stays ...`) and `chosen` is never included, in its own group or any other.
 - Columns: IMAGETYP, OBJECT, FILTER, EXPTIME, DATE-OBS, INSTRUME, size, modified.
 
 ## Logging

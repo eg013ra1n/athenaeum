@@ -3,9 +3,13 @@
 //! which prepares a plan of copies to move to the Black Hole.
 //!
 //! The plans are the host's (`mcp::plans`), app-wide by handle, so a status question answers for a plan made on any
-//! connection. A planning tool only prepares: no tool applies, cancels or replaces a plan the user has seen; the
-//! user's own click in Athenaeum's window is the only way (`api::mcp::answer_mcp_plan`). The words are written so that
+//! connection. A planning tool only prepares: no tool applies or cancels a plan; a new plan replaces one the user has
+//! not decided; the user's own click in Athenaeum's window is the only way to decide one
+//! (`api::mcp::answer_mcp_plan`). The words are written so that
 //! only a plan that really ended `applied` ever says "applied".
+
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -19,8 +23,8 @@ use crate::api::ApiError;
 use crate::calibration_library::rebuilt_copies::{find_rebuilt_master_copies, RebuiltMasterGroup};
 use crate::catalog_query::GROUPS_SHOWN;
 use crate::mcp::answer::count_of;
-use crate::mcp::plans::black_hole::{self, real_verify};
-use crate::mcp::plans::{McpPlanView, PlanBlackHoleArgs, PlanReport, PlanState, ReportLine};
+use crate::mcp::plans::black_hole::{self, describe_plan, real_verify};
+use crate::mcp::plans::{McpPlanView, PlanBlackHoleArgs, PlanKind, PlanReport, PlanState, ReportLine};
 use crate::mcp::{Answer, AthenaeumMcp, McpHost};
 
 /// Report lines the text half lists per kind (applied, skipped, failed); the structured half carries them all.
@@ -54,7 +58,7 @@ impl AthenaeumMcp {
     }
 
     #[tool(
-        description = "Prepare a plan that moves copies to the Black Hole (a soft delete the user can restore from the Black Hole page). Name the groups in `groups` by the handles find_duplicates (source duplicates) or find_rebuilt_masters (source rebuilt_masters) gave; only those groups enter. In each group one copy stays: say which with keepInFolder (the one copy under that folder, the folder itself or below) or keepFiles (file handles or full paths). A group where the instructions pick no single copy gets nothing selected and the user picks the copy that stays in the window. The other copies are proposed; a copy a calibration link points at, a copy inside a zip and a header-duplicate whose bytes differ from the kept copy are locked and never move. The plan opens in Athenaeum's window and nothing moves until the user presses Apply there; you cannot apply it. Ask plan_status for the outcome. A new plan replaces a plan the user has not decided yet. Byte checks of header duplicates can take a while.",
+        description = "Prepare a plan that moves copies to the Black Hole (a soft delete the user can restore from the Black Hole page). Name the groups in `groups` by the handles find_duplicates (source duplicates) or find_rebuilt_masters (source rebuilt_masters) gave; only those groups enter. In each group one copy stays: say which with keepInFolder (the one copy under that folder, the folder itself or below) or keepFiles (file handles or full paths). A group where the instructions pick no single copy gets nothing selected and the user picks the copy that stays in the window. The other copies are proposed; a copy a calibration link points at, a copy inside a zip and a header-duplicate whose bytes differ from the kept copy are locked and never move. The plan opens in Athenaeum's window and nothing moves until the user presses Apply there; you cannot apply it. Ask plan_status for the outcome. A new plan replaces a plan the user has not decided yet. Header and content duplicates are byte-checked against the kept copy, which can take a while: the answer then comes at once with the plan's handle and the state preparing, and the plan opens in Athenaeum's window when the checks end; ask plan_status. A plan that waits for the user is listed in full (each copy and what happens to it) by this answer or by plan_status.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn plan_black_hole(&self, Parameters(args): Parameters<PlanBlackHoleArgs>) -> CallToolResult {
@@ -145,6 +149,14 @@ pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
     } else if let Some(report) = &v.report {
         text.push_str(&report_text(report));
     }
+    // A plan that waits for the user: every copy and what would happen to it, as the planning answer says it.
+    let described = (v.kind == PlanKind::BlackHole && v.state == PlanState::Waiting && !v.groups.is_empty()).then(|| describe_plan(v));
+    if let Some(d) = &described {
+        text.push_str(&format!("\n{}.", d.summary));
+        for line in &d.lines {
+            text.push_str(&format!("\n{line}"));
+        }
+    }
     let mut data = Map::new();
     data.insert("planId".to_string(), json!(v.plan_id));
     data.insert("kind".to_string(), json!(v.kind.as_str()));
@@ -160,6 +172,9 @@ pub(crate) fn status_answer(v: &McpPlanView) -> Answer {
         if let Ok(value) = to_json(report) {
             data.insert("report".to_string(), value);
         }
+    }
+    if let Some(d) = described {
+        data.extend(d.data);
     }
     Answer::new(text, Value::Object(data))
 }
@@ -187,7 +202,7 @@ fn copy_words(c: &crate::calibration_library::rebuilt_copies::RebuiltCopy) -> St
     let linked = if c.linked_lights == 0 {
         "nothing is linked to it".to_string()
     } else {
-        format!("{} linked to it, so it stays", count_of(c.linked_lights, "frame is", "frames are"))
+        format!("{} at it, so it stays", count_of(c.linked_lights, "calibration link points", "calibration links point"))
     };
     format!("{} in {}; {linked}", c.line.file_name, c.line.folder)
 }
@@ -201,6 +216,18 @@ fn rebuilt_json(g: &RebuiltMasterGroup) -> Result<Value, ApiError> {
     Ok(v)
 }
 
+/// The files of the frames a scope covers.
+fn files_in_scope(conn: &rusqlite::Connection, filter: &crate::scope::ScopeFilter) -> Result<HashSet<i64>, ApiError> {
+    let failed = |e: rusqlite::Error| {
+        tracing::error!(error = %e, "mcp could not read the files in scope");
+        ApiError::Internal(format!("could not read the files in scope: {e}"))
+    };
+    let sql = format!("SELECT fr.file_id FROM frames fr WHERE {}", filter.sql);
+    let mut stmt = conn.prepare(&sql).map_err(failed)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(filter.params.iter()), |r| r.get::<_, i64>(0)).map_err(failed)?;
+    rows.collect::<rusqlite::Result<HashSet<i64>>>().map_err(failed)
+}
+
 #[tracing::instrument(skip_all, fields(tool = "find_rebuilt_masters"), err)]
 pub fn find_rebuilt_masters(host: &McpHost, args: ScopeArgs) -> Result<Answer, ApiError> {
     let conn = host.reader()?;
@@ -208,11 +235,16 @@ pub fn find_rebuilt_masters(host: &McpHost, args: ScopeArgs) -> Result<Answer, A
         Prep::Answered(answer) => return Ok(answer),
         Prep::Ready(prep) => prep,
     };
-    let found = find_rebuilt_master_copies(&conn, Some(&prep.filter)).map_err(|e| {
+    // Whole groups, as `find_duplicates` gives them: a group is in the scope when one of its copies is, it is listed
+    // with every copy, and its handle (the lowest file id of the whole group) is the one `plan_black_hole` finds.
+    let all = find_rebuilt_master_copies(&conn, None).map_err(|e| {
         tracing::error!(error = %format!("{e:#}"), "mcp could not read the rebuilt masters");
         ApiError::Internal(format!("could not read the rebuilt masters: {e:#}"))
     })?;
+    let in_scope = files_in_scope(&conn, &prep.filter)?;
     drop(conn);
+    let found: Vec<RebuiltMasterGroup> =
+        all.into_iter().filter(|g| g.copies.iter().any(|c| in_scope.contains(&c.file_id))).collect();
     let total = found.len();
     let page = args.page.unwrap_or(0);
     let pages = total.div_ceil(GROUPS_SHOWN);
@@ -255,8 +287,8 @@ pub fn find_rebuilt_masters(host: &McpHost, args: ScopeArgs) -> Result<Answer, A
 // ---- plan_black_hole ----
 
 #[tracing::instrument(skip_all, fields(tool = "plan_black_hole"), err)]
-pub fn plan_black_hole(host: &McpHost, args: PlanBlackHoleArgs) -> Result<Answer, ApiError> {
-    // The tool runs on a blocking thread (`run`), where the byte checks belong.
+pub fn plan_black_hole(host: &Arc<McpHost>, args: PlanBlackHoleArgs) -> Result<Answer, ApiError> {
+    // The tool runs on a blocking thread (`run`); the byte checks run on a thread of their own, after the answer.
     black_hole::prepare(host, args, real_verify())
 }
 
@@ -459,16 +491,26 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         )
         .await;
         assert_eq!(made.is_error, Some(false), "{}", text_of(&made));
+        // The copy is byte-checked, so the tool answers at once: preparing, with the handle.
         let said = text_of(&made);
-        assert!(said.contains("1 file proposed for the Black Hole"), "{said}");
-        assert!(said.contains("keeps other-conn.fits in "), "{said}");
+        assert!(said.contains("Athenaeum is checking 1 copy byte for byte") && said.contains("Ask plan_status."), "{said}");
         assert!(!said.contains("dup:") && !said.to_lowercase().contains("applied"), "{said}");
         let id = data_of(&made)["planId"].as_str().expect("a plan id").to_string();
 
+        // B is asked until the checks end (bounded), then both connections are asked about the waiting plan.
+        let mut on_b = ask(&b, "plan_status", json!({ "planId": id })).await;
+        for _ in 0..2000 {
+            if data_of(&on_b)["state"]["kind"] != "preparing" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            on_b = ask(&b, "plan_status", json!({ "planId": id })).await;
+        }
         let on_a = ask(&a, "plan_status", json!({ "planId": id })).await;
-        let on_b = ask(&b, "plan_status", json!({ "planId": id })).await;
         assert_eq!(on_b.is_error, Some(false), "{}", text_of(&on_b));
         assert!(text_of(&on_b).contains("waiting for you in Athenaeum's window"), "{}", text_of(&on_b));
+        assert!(text_of(&on_b).contains("1 file proposed for the Black Hole"), "{}", text_of(&on_b));
+        assert!(text_of(&on_b).contains("the copy that stays is other-conn.fits in "), "{}", text_of(&on_b));
         assert_eq!(text_of(&on_a), text_of(&on_b));
         assert_eq!(data_of(&on_a), data_of(&on_b));
         assert_eq!(data_of(&on_b)["kind"], "black_hole");
@@ -487,7 +529,7 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
         let said = text_of(&r);
         assert!(said.contains("1 master built more than once"), "{said}");
-        assert!(said.contains("MasterDark-tool-1.xisf in ") && said.contains("3 frames are linked to it, so it stays"), "{said}");
+        assert!(said.contains("MasterDark-tool-1.xisf in ") && said.contains("3 calibration links point at it, so it stays"), "{said}");
         assert!(!said.contains("rebuilt:") && !said.contains("file:"), "no handle in the words: {said}");
         let data = data_of(&r);
         let g = &data["groups"][0];
@@ -497,6 +539,34 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
         assert_eq!(g["copies"][0]["linkedLights"], 3);
         assert_eq!(g["copies"][1]["linkedLights"], 0);
         client.close().await;
+    }
+
+    #[tokio::test]
+    async fn scoped_rebuilt_group_handle_resolves() {
+        let rig = bh::rig();
+        // The group's lowest copy is outside the folder the scope names.
+        let m1 = bh::master_copy_in(&rig, "scope-one", "MasterDark-sc-1.xisf", 300.0, b"M1");
+        let m2 = bh::master_copy_in(&rig, "scope-two", "MasterDark-sc-2.xisf", 300.0, b"M2");
+        let m3 = bh::master_copy_in(&rig, "scope-two", "MasterDark-sc-3.xisf", 300.0, b"M3");
+        bh::link_master(&rig, &m1, 2);
+        let client = connect(&rig.host, ClientLifecycleMode::Initialize).await;
+        let r = ask(&client, "find_rebuilt_masters", json!({ "scope": { "folder": m2.dir().to_string_lossy() } })).await;
+        assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+        let data = data_of(&r);
+        assert_eq!(data["groupsInScope"], 1);
+        let g = &data["groups"][0];
+        assert_eq!(g["handle"], json!(bh::rebuilt_handle(&m1)), "the handle is the whole group's lowest file id");
+        assert_eq!(g["copies"].as_array().map(Vec::len), Some(3), "every copy of the group is listed: {g}");
+        assert_eq!(g["copies"][0]["linkedLights"], 2);
+        let said = text_of(&r);
+        assert!(said.contains("MasterDark-sc-1.xisf in ") && said.contains("2 calibration links point at it, so it stays"), "{said}");
+        client.close().await;
+
+        // The handle the answer gave plans.
+        let handle = g["handle"].as_str().expect("a handle").to_string();
+        let view = bh::plan(&rig, crate::mcp::plans::BlackHoleSource::RebuiltMasters, &[handle], None, &[&m2]);
+        assert_eq!(view.groups[0].items.len(), 3);
+        assert!(view.groups[0].items.iter().any(|i| i.id == m3.item() && i.selected));
     }
 
     #[tokio::test]
