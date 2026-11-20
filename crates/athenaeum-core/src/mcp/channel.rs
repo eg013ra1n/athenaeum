@@ -12,6 +12,10 @@
 //!                  ERR <starting|off|token|version> <message>\n  then the host closes
 //! ```
 //!
+//! One instance of a build serves at a time, decided by a lock on `<mcp dir>/serve.lock` ([`acquire_serve_lock`]), on
+//! every OS: whoever holds it owns the endpoint, and the OS releases it when a process dies, so a crash never leaves a
+//! false "another instance serves". [`bind`] assumes the caller holds the lock.
+//!
 //! The Windows half is a thin mirror of the Unix half; it is compiled only by the Windows build.
 
 use std::future::Future;
@@ -119,10 +123,52 @@ fn socket_path(dir: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("athenaeum-mcp-{}", short_id(app_data))).join("mcp.sock")
 }
 
-/// The Windows pipe name for the channel files in `dir`.
+/// A fresh Windows pipe name for the channel files in `dir`: `\\.\pipe\athenaeum-mcp-<app-data dir name>-<8 hex of its
+/// path>-<8 random hex>`. The random part is new at every bind (the same source as the key), so a pipe instance left
+/// over from an earlier bind never blocks this one and the name cannot be derived from the path.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn pipe_name(dir: &Path) -> String {
-    format!(r"\\.\pipe\athenaeum-mcp-{}", short_id(dir.parent().unwrap_or(dir)))
+    let app_data = dir.parent().unwrap_or(dir);
+    let name: String = app_data
+        .file_name()
+        .map(|n| n.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).take(40).collect())
+        .unwrap_or_default();
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    format!(r"\\.\pipe\athenaeum-mcp-{name}-{}-{}", short_id(app_data), &random[..8])
+}
+
+/// Why the serve lock was not taken.
+#[derive(Debug)]
+pub enum LockError {
+    /// Another instance of this build holds it: it serves the assistant.
+    Elsewhere,
+    /// The lock file could not be opened or locked.
+    Io(io::Error),
+}
+
+/// The exclusive lock on `<mcp dir>/serve.lock` that one instance of a build holds while it serves. Dropping it (closing
+/// the file) releases it; so does the end of the process.
+#[derive(Debug)]
+pub struct ServeLock {
+    _file: std::fs::File,
+}
+
+/// Takes the serve lock for the channel files in `dir` (`<app-data>/mcp`, made if missing). Two handles in one process
+/// conflict, like two processes. The lock file is never removed: a lock is judged by the OS, not by the file's presence.
+pub fn acquire_serve_lock(dir: &Path) -> Result<ServeLock, LockError> {
+    ensure_private_dir(dir).map_err(LockError::Io)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("serve.lock"))
+        .map_err(LockError::Io)?;
+    match file.try_lock() {
+        Ok(()) => Ok(ServeLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Elsewhere),
+        Err(std::fs::TryLockError::Error(e)) => Err(LockError::Io(e)),
+    }
 }
 
 /// One duplex connection, either end, on either OS.
@@ -163,11 +209,6 @@ impl AsyncWrite for Stream {
     }
 }
 
-/// The error a second listener on one endpoint gets: another instance of this build serves it.
-pub fn in_use_error() -> io::Error {
-    io::Error::new(io::ErrorKind::AddrInUse, "another Athenaeum of this build serves the assistant")
-}
-
 // ---- Unix ----
 
 #[cfg(unix)]
@@ -185,9 +226,9 @@ impl Listener {
 
 /// Binds the channel for the files in `dir` (`<app-data>/mcp`) and says where it is.
 ///
-/// Call it inside a tokio runtime context (it registers the socket with that runtime). A socket file nobody listens
-/// on (a crash left it) is removed first; one that accepts a connection belongs to another instance of this build and
-/// is an [`io::ErrorKind::AddrInUse`] error ([`in_use_error`]).
+/// Call it inside a tokio runtime context (it registers the socket with that runtime), holding the [`ServeLock`]: the
+/// lock proves no live instance of this build owns the socket path, so whatever file is there is a leftover and is
+/// removed first.
 #[cfg(unix)]
 pub fn bind(dir: &Path) -> io::Result<(Endpoint, Listener)> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -198,9 +239,6 @@ pub fn bind(dir: &Path) -> io::Result<(Endpoint, Listener)> {
     // A directory that is not ours cannot be made private: refuse it rather than listen in someone else's place.
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     if std::fs::symlink_metadata(&path).is_ok() {
-        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            return Err(in_use_error());
-        }
         std::fs::remove_file(&path)?;
     }
     let std_listener = std::os::unix::net::UnixListener::bind(&path)?;
@@ -266,45 +304,14 @@ impl Listener {
     }
 }
 
-/// See the Unix `bind`. Windows refuses a second first instance of the pipe as access denied. That refusal means
-/// "another instance of this build serves it" only when a client finds something answering on the pipe; otherwise
-/// (a leftover instance still closing) it is retried a few times and then reported as the OS error.
+/// See the Unix `bind`. The pipe name is fresh ([`pipe_name`]) and opened as the first instance: that can fail only if
+/// someone took a name they could not have predicted, which is an error like any other.
 #[cfg(windows)]
 pub fn bind(dir: &Path) -> io::Result<(Endpoint, Listener)> {
     use tokio::net::windows::named_pipe::ServerOptions;
-    const BIND_TRIES: u32 = 5;
     let name = pipe_name(dir);
-    let mut tries = 0;
-    let first = loop {
-        match ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name) {
-            Ok(first) => break first,
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                if pipe_answers(&name) {
-                    return Err(in_use_error());
-                }
-                tries += 1;
-                if tries >= BIND_TRIES {
-                    tracing::warn!(error = %e, tries, "mcp pipe is refused and nothing answers on it");
-                    return Err(e);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => return Err(e),
-        }
-    };
+    let first = ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name)?;
     Ok((Endpoint::Pipe(name.clone()), Listener { name, next: tokio::sync::Mutex::new(first) }))
-}
-
-/// The Windows counterpart of the Unix connect probe: a client that opens the pipe (or finds every instance busy)
-/// shows that a live server owns it. Writes nothing and is dropped at once.
-#[cfg(windows)]
-fn pipe_answers(name: &str) -> bool {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    const ERROR_PIPE_BUSY: i32 = 231;
-    match ClientOptions::new().open(name) {
-        Ok(_) => true,
-        Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
-    }
 }
 
 #[cfg(windows)]
@@ -355,6 +362,10 @@ fn lock_state(state: &Mutex<CloseState>) -> MutexGuard<'_, CloseState> {
 
 /// Closes a task made by [`spawn_closable`]: [`Closer::close`] drops the task's future (and what it owns: a listener,
 /// a connection, a Windows pipe instance) on the calling thread, at once, rather than when the runtime next polls it.
+///
+/// What that covers: the listener and a connection still in its handshake phase close inside `close`. A session that has
+/// completed `initialize` is different: rmcp moves its transport into a task of its own, and cancelling the session only
+/// asks that task to stop, so the stream closes when rmcp's task next runs after the cancellation, not inside `close`.
 #[derive(Clone)]
 pub struct Closer {
     state: Arc<Mutex<CloseState>>,
@@ -555,6 +566,18 @@ mod tests {
         assert_eq!(parse_hello("ATHENAEUM-MCP/x abc"), Hello::Malformed);
         assert_eq!(parse_hello("hello"), Hello::Malformed);
         assert_eq!(parse_hello(""), Hello::Malformed);
+    }
+
+    #[test]
+    fn the_serve_lock_is_exclusive_until_dropped() {
+        let (_tmp, base) = crate::test_support::canonical_tempdir();
+        let dir = mcp_dir(&base);
+        let first = acquire_serve_lock(&dir).expect("the first lock");
+        assert!(matches!(acquire_serve_lock(&dir), Err(LockError::Elsewhere)), "a second handle conflicts, in-process too");
+        drop(first);
+        let again = acquire_serve_lock(&dir).expect("the lock is free once dropped");
+        drop(again);
+        assert!(dir.join("serve.lock").is_file(), "the file stays; only the lock matters");
     }
 
     #[test]

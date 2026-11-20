@@ -117,7 +117,14 @@ web build serves `/mcp` over HTTP instead (Task 8) and binds nothing here.
 **Endpoint.** Unix socket `<app-data>/mcp/mcp.sock` when that path is at most 100 bytes, else
 `<temp dir>/athenaeum-mcp-<8 hex>/mcp.sock` (the directory is made mode 0700; the 8 hex are the first 4 bytes of the SHA-256 of
 the app-data dir's path). On a dev Mac the first path is 102 bytes, so the temp-dir one is the normal one there. Windows: the pipe
-`\\.\pipe\athenaeum-mcp-<8 hex>` (same 8 hex), opened as the first instance, so a second instance of the build is refused.
+`\\.\pipe\athenaeum-mcp-<app-data dir name>-<8 hex>-<8 random hex>` (the 8 hex as above; the random part is new at every bind, from the
+same source as the key, so a pipe instance left over from an earlier bind never blocks a new one and the name cannot be derived from the
+path), opened as the first instance. The `endpoint` file is how a bridge learns the name.
+
+**One instance per build.** Whoever holds an exclusive lock on `<app-data>/mcp/serve.lock` (`File::try_lock`, every OS) owns the
+endpoint. The lock lives in the channel's state and is released when the channel closes (off, failure, quit); the OS also releases it
+when a process dies, so a crash never leaves a false `elsewhere`. The file itself is never removed. Holding the lock proves nobody else
+serves, so on Unix a leftover socket file is removed before bind without a probe.
 
 **Handshake (frozen, append-only).** The bridge writes `ATHENAEUM-MCP/1 <token>\n` (one line, at most 256 bytes, within 5 s); the
 host answers `OK <server name> <version>\n` and the same stream then carries MCP (newline-delimited JSON-RPC, rmcp's
@@ -135,10 +142,16 @@ echoed. A later host still serves `/1`.
   iff the `enabled` marker exists; a connection gets `ERR starting`. *`on_catalog_open`* then reconciles to the stored setting, which
   wins over the marker (`starting` becomes `serving`, or the channel is closed and its files removed).
 - *`shutdown`* (app exit): closes everything and removes the socket and `endpoint`; the marker, `tools.json` and the key stay.
-- A leftover socket file with nobody listening (a crash) is removed before bind. A 30 s check (`recheck_endpoint`) rebinds when the
+- A leftover socket file (a crash) is removed before bind, under the lock. A 30 s check (`recheck_endpoint`) rebinds when the
   socket file has vanished (`$TMPDIR` cleaners); live connections are untouched.
-- An endpoint that accepts a connection belongs to another instance of this build: `elsewhere`, `lastError` "another Athenaeum of
-  this build serves the assistant". That instance's files are never removed or rewritten by this one, including by its off switch.
+- The serve lock held by another instance of this build: `elsewhere`, `lastError` "another Athenaeum of this build serves the
+  assistant". That instance's files are never removed or rewritten by this one, including by its off switch. Any other lock error is
+  `failed` with the OS error. The same 30 s check runs while `elsewhere` with the setting on: it retries the lock and, once it has it,
+  binds and becomes `serving` (`elsewhere_becomes_serving_when_the_other_instance_stops`).
+- *How a connection closes.* `Run::close` drops the listener, the handshake-phase tasks and every session task inside the call. A
+  session that has completed `initialize` has been handed to rmcp's own task, which is only cancelled: its stream closes when that
+  task next runs (`regenerate_cuts_off_connected_clients`: end of stream within 2 s). A Windows pipe name is fresh per bind, so a
+  late-closing instance never blocks the next bind.
 - Channel tasks run on the caller's tokio runtime, or on a small fallback runtime (`mcp-channel`, 2 workers) when the caller is not
   inside one (a window's setup closure).
 

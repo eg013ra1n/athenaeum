@@ -11,8 +11,9 @@
 //!   setting.
 //! - **Only the desktop binds.** The web build serves `/mcp` itself (Task 8); here it has the key, the on/off state and
 //!   the refusal to turn on without `ATHENAEUM_API_KEY`.
-//! - **One instance owns the endpoint.** A second instance of one build finds it answering and is `elsewhere`; it
-//!   never removes or rewrites the first one's files.
+//! - **One instance per build, by a lock.** The instance that holds the exclusive lock on `<mcp dir>/serve.lock` owns
+//!   the endpoint (the OS drops the lock when a process dies). A second instance cannot take it and is `elsewhere`; it
+//!   never removes or rewrites the first one's files, and its 30 s check takes the channel over once the lock is free.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -23,8 +24,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use super::channel::{
-    self, endpoint_present, ensure_private_dir, mcp_dir, new_token, parse_hello, read_token, remove_endpoint, spawn_acceptor,
-    spawn_closable, tokens_match, write_atomic, Closer, Endpoint, Hello, HandshakeError, Stream, HANDSHAKE_MAX_BYTES,
+    self, acquire_serve_lock, endpoint_present, ensure_private_dir, mcp_dir, new_token, parse_hello, read_token, remove_endpoint,
+    spawn_acceptor, spawn_closable, tokens_match, write_atomic, Closer, Endpoint, Hello, HandshakeError, LockError, ServeLock,
+    Stream, HANDSHAKE_MAX_BYTES,
 };
 use super::{AthenaeumMcp, HostKind, McpHost};
 use crate::api::ApiError;
@@ -38,7 +40,8 @@ const ELSEWHERE: &str = "another Athenaeum of this build serves the assistant";
 /// How long a connection has to write its handshake line.
 const HANDSHAKE_WINDOW: Duration = Duration::from_secs(5);
 
-/// How often a serving host checks that its socket file is still there (`$TMPDIR` cleaners remove stale ones).
+/// How often a serving host checks that its socket file is still there (`$TMPDIR` cleaners remove stale ones), and an
+/// `elsewhere` one tries the serve lock again.
 const ENDPOINT_RECHECK: Duration = Duration::from_secs(30);
 
 /// The bridge binary's file name, next to the app's executable.
@@ -110,8 +113,10 @@ impl State {
     }
 }
 
-/// The connections handed to clients, so that closing the channel drops every one of them at once (on Windows a pipe
-/// instance that outlives the close keeps the pipe name taken).
+/// The connections handed to clients, so that closing the channel drops them. A connection in its handshake phase (and
+/// the listener) is dropped inside [`Run::close`]. A session that has completed `initialize` has been moved by rmcp
+/// into its own task; cancelling it ends that task, so its stream closes when rmcp's task next runs after the
+/// cancellation, not inside `close` (`regenerate_cuts_off_connected_clients` is the proof: end of stream within 2 s).
 #[derive(Clone, Default)]
 struct Sessions(Arc<Mutex<SessionList>>);
 
@@ -181,6 +186,15 @@ impl Drop for Run {
 
 /// The mutable half of the lifecycle, behind one mutex. Connection tasks take it for a moment and never across an
 /// await; `set_enabled` and friends hold it across the setting's write so two switches cannot interleave.
+/// Cancels a token when dropped: the `elsewhere` retry timer lives as long as its guard.
+struct WatchGuard(CancellationToken);
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Channel {
     state: State,
@@ -191,6 +205,10 @@ pub(super) struct Channel {
     /// The key (also in the `token` file).
     token: Option<String>,
     run: Option<Run>,
+    /// The exclusive lock on `serve.lock` while this instance owns the channel; released when the channel closes.
+    lock: Option<ServeLock>,
+    /// The 30 s retry while `elsewhere`.
+    watch: Option<WatchGuard>,
 }
 
 /// The runtime the channel's tasks run on when the caller is not inside one (a window's setup closure).
@@ -414,10 +432,20 @@ impl McpHost {
         }
     }
 
-    /// The 30-second check, callable on its own: when the socket file has vanished (a `$TMPDIR` cleaner), bind it again.
-    /// Connections already made are not touched.
+    /// The 30-second check, callable on its own. Serving: when the socket file has vanished (a `$TMPDIR` cleaner), bind it
+    /// again; connections already made are not touched. `elsewhere` with the setting on: try the serve lock again and,
+    /// once it is free, bind and serve.
     pub fn recheck_endpoint(self: &Arc<Self>) {
         let mut ch = self.lock_channel();
+        if ch.state == State::Elsewhere {
+            if ch.enabled && self.is_desktop() && !self.web_blocked() {
+                self.engage(&mut ch);
+                if ch.state != State::Elsewhere {
+                    tracing::info!(state = ch.state.word(), "mcp channel taken over from another instance");
+                }
+            }
+            return;
+        }
         if !matches!(ch.state, State::Starting | State::Serving) {
             return;
         }
@@ -490,6 +518,9 @@ impl McpHost {
                 remove_file_quiet(&dir.join("endpoint"));
             }
         }
+        // Last: the lock goes after the files this instance made are gone.
+        ch.lock = None;
+        ch.watch = None;
         ch.state = State::Failed;
         ch.last_error = Some(message);
     }
@@ -564,19 +595,37 @@ impl McpHost {
                 return;
             }
         };
+        if ch.lock.is_none() {
+            match acquire_serve_lock(dir) {
+                Ok(lock) => ch.lock = Some(lock),
+                Err(LockError::Elsewhere) => {
+                    if ch.state == State::Elsewhere {
+                        tracing::debug!("mcp channel is still served by another instance of this build");
+                    } else {
+                        tracing::warn!("mcp channel is served by another instance of this build");
+                    }
+                    ch.state = State::Elsewhere;
+                    ch.last_error = Some(ELSEWHERE.to_string());
+                    ch.endpoint = None;
+                    if ch.watch.is_none() {
+                        let token = CancellationToken::new();
+                        handle.spawn(watch_endpoint(Arc::downgrade(self), token.clone()));
+                        ch.watch = Some(WatchGuard(token));
+                    }
+                    return;
+                }
+                Err(LockError::Io(e)) => {
+                    self.fail(ch, format!("the assistant channel could not take its lock: {e}"));
+                    return;
+                }
+            }
+        }
         let bound = {
             let _enter = handle.enter();
             channel::bind(dir)
         };
         let (endpoint, listener) = match bound {
             Ok(bound) => bound,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                tracing::warn!("mcp channel is served by another instance of this build");
-                ch.state = State::Elsewhere;
-                ch.last_error = Some(ELSEWHERE.to_string());
-                ch.endpoint = None;
-                return;
-            }
             Err(e) => {
                 self.fail(ch, format!("the assistant channel could not be opened: {e}"));
                 return;
@@ -604,6 +653,7 @@ impl McpHost {
         tracing::info!(addr = %endpoint.to_text(), "mcp channel bound");
         ch.endpoint = Some(endpoint);
         ch.run = Some(run);
+        ch.watch = None;
         ch.last_error = None;
         ch.state = if early || !self.catalog_open() { State::Starting } else { State::Serving };
     }
@@ -626,16 +676,18 @@ impl McpHost {
                 remove_endpoint(&endpoint);
             }
         }
-        if !owned {
-            return;
-        }
-        if let Ok(dir) = self.channel_dir() {
-            remove_file_quiet(&dir.join("endpoint"));
-            if forget {
-                remove_file_quiet(&dir.join("enabled"));
-                remove_file_quiet(&dir.join("tools.json"));
+        if owned {
+            if let Ok(dir) = self.channel_dir() {
+                remove_file_quiet(&dir.join("endpoint"));
+                if forget {
+                    remove_file_quiet(&dir.join("enabled"));
+                    remove_file_quiet(&dir.join("tools.json"));
+                }
             }
         }
+        // Last: another instance may take the lock the moment it is released, so this instance's files go first.
+        ch.lock = None;
+        ch.watch = None;
     }
 
     // ---- what a connection asks ----
@@ -697,7 +749,7 @@ async fn accept_loop(
     }
 }
 
-/// The 30 s check that the socket file is still there.
+/// The 30 s check: that the socket file is still there, or (while `elsewhere`) that the serve lock is still taken.
 async fn watch_endpoint(host: Weak<McpHost>, cancel: CancellationToken) {
     loop {
         tokio::select! {

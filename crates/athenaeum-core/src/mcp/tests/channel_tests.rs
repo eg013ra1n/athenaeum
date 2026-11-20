@@ -267,7 +267,12 @@ async fn stale_socket_is_removed_after_a_crash() {
     let (first, listener) = bind(&dir).expect("first bind");
     drop(listener);
     let (second, _listener) = bind(&dir).expect("bind works over what the crash left");
-    assert_eq!(first.to_text(), second.to_text());
+    match (&first, &second) {
+        // The Unix socket keeps its path; a Windows pipe gets a fresh name at every bind.
+        (Endpoint::Unix(_), Endpoint::Unix(_)) => assert_eq!(first.to_text(), second.to_text()),
+        (Endpoint::Pipe(a), Endpoint::Pipe(b)) => assert_ne!(a, b, "a pipe name is new at each bind"),
+        _ => panic!("one OS, one kind of endpoint: {first:?} {second:?}"),
+    }
     let stream = connect(&second).await;
     assert!(stream.is_ok(), "the new listener accepts: {stream:?}");
 }
@@ -464,6 +469,71 @@ async fn second_instance_of_one_build_does_not_steal_the_endpoint() {
     second.shutdown();
     drop(second);
     first.finish().await;
+}
+
+#[tokio::test]
+async fn elsewhere_becomes_serving_when_the_other_instance_stops() {
+    let first = desktop();
+    first.host.set_enabled(true).expect("on");
+    let second = host_over(&first.ctx, HostKind::Desktop, false);
+    second.on_catalog_open().expect("open");
+    assert_eq!(second.set_enabled(true).expect("on").state, "elsewhere");
+    // The 30 s check, driven directly: while the first one holds the channel nothing changes.
+    second.recheck_endpoint();
+    assert_eq!(second.status().state, "elsewhere");
+    assert!(second.status().endpoint.is_none());
+    // The first one quits (its lock goes with it); the next check takes the channel over.
+    first.host.shutdown();
+    second.recheck_endpoint();
+    let status = second.status();
+    assert_eq!(status.state, "serving", "{:?}", status.last_error);
+    assert!(status.last_error.is_none() && status.endpoint.is_some());
+    assert!(first.file("endpoint").exists() && first.file("enabled").exists() && first.file("tools.json").exists());
+    let (_s, reply) = shake(&first.endpoint(), &format!("{HANDSHAKE_PREFIX} {}", first.token())).await;
+    assert!(reply.starts_with("OK "), "the new owner serves: {reply}");
+    // And a third instance is now the one that is `elsewhere`.
+    let third = host_over(&first.ctx, HostKind::Desktop, false);
+    third.on_catalog_open().expect("open");
+    assert_eq!(third.set_enabled(true).expect("on").state, "elsewhere");
+    third.shutdown();
+    drop(third);
+    second.shutdown();
+    drop(second);
+    first.finish().await;
+}
+
+#[tokio::test]
+async fn files_left_by_a_dead_instance_do_not_make_elsewhere() {
+    let rig = desktop();
+    // What a crash leaves: the lock file (nobody holds its lock), a socket file nobody listens on, an old endpoint.
+    std::fs::create_dir_all(rig.dir()).expect("dir");
+    std::fs::write(rig.file("serve.lock"), "").expect("a lock file with no holder");
+    let (_old, listener) = bind(&rig.dir()).expect("an earlier bind");
+    drop(listener);
+    std::fs::write(rig.file("endpoint"), "stale text").expect("an old endpoint file");
+    let status = rig.host.set_enabled(true).expect("on");
+    assert_eq!(status.state, "serving", "{:?}", status.last_error);
+    let (_s, reply) = shake(&rig.endpoint(), &format!("{HANDSHAKE_PREFIX} {}", rig.token())).await;
+    assert!(reply.starts_with("OK "), "{reply}");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn the_lock_follows_the_channel_off_and_on() {
+    let rig = desktop();
+    rig.host.set_enabled(true).expect("on");
+    let other = host_over(&rig.ctx, HostKind::Desktop, false);
+    other.on_catalog_open().expect("open");
+    assert_eq!(other.set_enabled(true).expect("on").state, "elsewhere");
+    // Off releases the lock at once: the other one gets the channel on its next check.
+    rig.host.set_enabled(false).expect("off");
+    other.recheck_endpoint();
+    assert_eq!(other.status().state, "serving");
+    // And the first one, turned on again, finds it is the one that is elsewhere.
+    assert_eq!(rig.host.set_enabled(true).expect("on").state, "elsewhere");
+    other.shutdown();
+    drop(other);
+    rig.finish().await;
 }
 
 /// Sets a flag when it is dropped.
