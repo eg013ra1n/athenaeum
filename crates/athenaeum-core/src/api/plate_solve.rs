@@ -252,6 +252,44 @@ fn busy_text(holder: PlateSolveOrigin, requester: PlateSolveOrigin, p: &SolvePro
     template.replace("{done}", &p.done.to_string()).replace("{total}", &p.total.to_string())
 }
 
+/// The id of a plate-solve batch run: `solve-<uuid>`.
+fn new_solve_run_id() -> String {
+    format!("solve-{}", uuid::Uuid::new_v4())
+}
+
+/// Check and register under one lock (key 0 = plate-solve batch): a held slot
+/// refuses, it is never replaced. The handle starts with `total` set to the
+/// batch's size, so a refusal while the batch is still preparing names it right.
+fn claim_batch_slot(
+    ctx: &ServiceContext,
+    origin: PlateSolveOrigin,
+    total: usize,
+) -> Result<(Arc<AtomicBool>, String, Arc<Mutex<SolveProgress>>), ApiError> {
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let run_id = new_solve_run_id();
+    let progress = Arc::new(Mutex::new(SolveProgress { total, ..Default::default() }));
+    let mut solves = ctx.active_plate_solves.lock().unwrap();
+    if let Some(held) = solves.get(&0) {
+        let text = busy_text(
+            held.origin,
+            origin,
+            &held.progress.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        tracing::info!(origin = ?origin, run_id = %held.run_id, "plate solve refused, a batch is running");
+        return Err(ApiError::Conflict(text));
+    }
+    solves.insert(
+        0,
+        PlateSolveHandle {
+            cancel_flag: cancel_flag.clone(),
+            origin,
+            run_id: run_id.clone(),
+            progress: progress.clone(),
+        },
+    );
+    Ok((cancel_flag, run_id, progress))
+}
+
 /// Frees the batch slot (key 0) when dropped, if it still holds this run.
 /// A [`PreparedPlateSolveBatch`] owns one and [`run_plate_solve_batch`] takes
 /// it over, so a batch dropped before `run` never blocks a later solve.
@@ -468,8 +506,8 @@ impl PreparedPlateSolveBatch {
 /// Phase 1 of a plate-solve batch, synchronous: claim the batch slot (key 0;
 /// `Conflict` in words when it is held), load the config, pre-load frame metadata and hints so workers never
 /// touch the DB, run the input gate, and choose the concurrency. The star
-/// catalog layers, index packs and DSO catalog are what the host resolved from
-/// its own state. Frames that fail to load or are refused by the gate become
+/// catalog layers, index packs and DSO catalog are what the caller resolved with
+/// the core resolvers. Frames that fail to load or are refused by the gate become
 /// per-frame failures in the run, not errors here.
 pub fn prepare_plate_solve_batch(
     ctx: &ServiceContext,
@@ -480,33 +518,7 @@ pub fn prepare_plate_solve_batch(
     origin: PlateSolveOrigin,
 ) -> Result<PreparedPlateSolveBatch, ApiError> {
     let database = db(ctx)?;
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let progress = Arc::new(Mutex::new(SolveProgress::default()));
-
-    // Check and register under one lock (key 0 = plate-solve batch): a held
-    // slot refuses, it is never replaced.
-    {
-        let mut solves = ctx.active_plate_solves.lock().unwrap();
-        if let Some(held) = solves.get(&0) {
-            let text = busy_text(
-                held.origin,
-                origin,
-                &held.progress.lock().unwrap_or_else(|e| e.into_inner()),
-            );
-            tracing::info!(origin = ?origin, run_id = %held.run_id, "plate solve refused, a batch is running");
-            return Err(ApiError::Conflict(text));
-        }
-        solves.insert(
-            0,
-            PlateSolveHandle {
-                cancel_flag: cancel_flag.clone(),
-                origin,
-                run_id: run_id.clone(),
-                progress: progress.clone(),
-            },
-        );
-    }
+    let (cancel_flag, run_id, progress) = claim_batch_slot(ctx, origin, frame_ids.len())?;
     // From here the guard frees the slot on any early return.
     let slot = SlotGuard { slots: ctx.active_plate_solves.clone(), run_id: run_id.clone() };
 
@@ -1015,7 +1027,7 @@ pub fn prepare_autofind_objects(
             PlateSolveHandle {
                 cancel_flag: cancel_flag.clone(),
                 origin: PlateSolveOrigin::Ui,
-                run_id: uuid::Uuid::new_v4().to_string(),
+                run_id: new_solve_run_id(),
                 progress: Arc::new(Mutex::new(SolveProgress::default())),
             },
         );
@@ -1362,7 +1374,38 @@ mod tests {
         assert_eq!(started.len(), 1);
         assert_eq!(started[0]["origin"], "assistant");
         assert_eq!(started[0]["runId"], run_id.as_str());
+        assert!(run_id.starts_with("solve-"), "run id: {run_id}");
         assert_eq!(started[0]["total"], 2);
+    }
+
+    /// The slot's handle knows the batch's size from the moment it is claimed,
+    /// before any frame is loaded, so a refusal then is not "(0 of 0 frames)".
+    #[test]
+    fn a_refusal_while_preparing_names_the_batch_size() {
+        let (_tmp, ctx) = test_ctx();
+        let (_flag, run_id, _progress) =
+            claim_batch_slot(&ctx, PlateSolveOrigin::Assistant, 5).expect("claim");
+        assert!(run_id.starts_with("solve-"), "run id: {run_id}");
+        let err = claim_batch_slot(&ctx, PlateSolveOrigin::Ui, 1).err().expect("refused");
+        match err {
+            ApiError::Conflict(m) => assert!(m.contains("(0 of 5 frames)"), "refusal text: {m}"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// A second Athenaeum run is refused with its own words (the Ui + Ui branch).
+    #[test]
+    fn ui_refused_while_ui_runs() {
+        let (_tmp, ctx) = test_ctx();
+        let _first = prepare_for(&ctx, &[9001, 9002], PlateSolveOrigin::Ui).expect("first");
+        let err = prepare_for(&ctx, &[9003], PlateSolveOrigin::Ui).err().expect("refused");
+        match err {
+            ApiError::Conflict(m) => assert_eq!(
+                m,
+                "A plate solve batch is already running (0 of 2 frames). Wait for it or cancel it."
+            ),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 
     /// A batch dropped before `run` (an error between the two, a cancelled

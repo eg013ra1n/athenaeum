@@ -144,7 +144,7 @@ pub struct ServiceContext {
 
 impl ServiceContext {
     /// The app-data directory: the folder the catalog database lives in, where the star catalogue
-    /// (`catalogs/smac_gaia`) is installed. The same resolution as both hosts' `resolve_layer_caches`.
+    /// (`catalogs/smac_gaia`) is installed. The same resolution as `api::plate_solve::resolve_layer_caches` (one resolver in core now, for both hosts and the assistant).
     /// `None` before the database is opened, or for a database path with no parent.
     pub fn app_data_dir(&self) -> Option<std::path::PathBuf> {
         self.db.get()?.path().parent().map(std::path::Path::to_path_buf)
