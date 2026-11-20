@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assert that the six version files agree with a release tag.
+# Assert that the seven version files agree with a release tag.
 # Env: TAG (required, e.g. v0.6.4 or v0.6.4-beta.1); REPO_ROOT (optional).
 # tauri.conf.json carries X.Y.Z-N for a beta (its bundler rejects the dotted
 # form), so the tag's -beta.N maps to -N there and nowhere else.
@@ -29,7 +29,7 @@ check() { # $1 = relative file, $2 = actual, $3 = expected
 }
 
 check "package.json" "$(read_json_version "$REPO_ROOT/package.json")" "$VERSION"
-for crate in athenaeum-core athenaeum-tauri athenaeum-web perseus; do
+for crate in athenaeum-core athenaeum-tauri athenaeum-web athenaeum-mcp perseus; do
   check "crates/$crate/Cargo.toml" "$(read_cargo_version "$REPO_ROOT/crates/$crate/Cargo.toml")" "$VERSION"
 done
 check "crates/athenaeum-tauri/tauri.conf.json" "$(read_json_version "$REPO_ROOT/crates/athenaeum-tauri/tauri.conf.json")" "$TAURI_VERSION"
@@ -54,4 +54,4 @@ fi
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
-echo "ok: all six versions match $VERSION"
+echo "ok: all seven versions match $VERSION"

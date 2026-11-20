@@ -47,12 +47,12 @@ that can be released and to read its verdicts.
    the Version History row and the chat teaser), then `## What's New` /
    `## Changes` / `## Bug Fixes` in user-facing English. This file IS the blog
    post: write it at that quality, there is no second text.
-2. **Bump.** `scripts/release/bump.sh X.Y.Z[-beta.N]` — rewrites the six version
+2. **Bump.** `scripts/release/bump.sh X.Y.Z[-beta.N]` — rewrites the seven version
    files, refreshes `Cargo.lock`, asserts they agree.
-3. **The release commit contains ONLY** `RELEASE_NOTES.md`, the six version files
+3. **The release commit contains ONLY** `RELEASE_NOTES.md`, the seven version files
    and `Cargo.lock`. A code fix goes in its own commit BEFORE this one and gets
    its own green GitHub run first. `git status --short` must list exactly those
-   eight paths. Commit: `chore(release): vX.Y.Z — <tagline without the product name>`.
+   nine paths. Commit: `chore(release): vX.Y.Z — <tagline without the product name>`.
 4. **Push main, wait for green, tag.**
    `git push all main` → wait for the GitHub run of that commit
    (`gh run watch` or poll `gh run list --commit <sha>`) → `git tag vX.Y.Z && git push all vX.Y.Z`.
@@ -134,7 +134,9 @@ committed in `crates/athenaeum-tauri/tauri.conf.json`
 is the RELEASE key, not a throwaway one from a local rehearsal (§7.2 of the
 spec). Locally, `npm run tauri build` (`bundle.createUpdaterArtifacts:
 true`) refuses to bundle without both variables exported in the shell —
-`npm run tauri dev` does not need them.
+`npm run tauri dev` does not need them. A local bundle has no `athenaeum-mcp` bridge unless
+`node scripts/release/build-mcp-bridge.mjs` runs first and the build gets
+`--config crates/athenaeum-tauri/tauri.mcp-bridge.json` (use `npx tauri build`; see `docs/release/README.md`).
 
 ## Re-tagging
 

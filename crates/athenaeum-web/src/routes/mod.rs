@@ -44,9 +44,11 @@ mod stacking;
 pub(crate) mod sync;
 mod account;
 mod collab;
+mod mcp;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
+    let mcp_slot = state.mcp.clone();
     let api = Router::new()
         // SSE events
         .route("/api/events", get(sse_handler))
@@ -411,6 +413,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_collab_max_receive_streams", post(collab::set_collab_max_receive_streams))
         // Core
         .route("/api/initialize_database", post(initialize_database))
+        .route("/api/get_mcp_status", post(mcp::get_mcp_status))
+        .route("/api/set_mcp_enabled", post(mcp::set_mcp_enabled))
+        .route("/api/regenerate_mcp_token", post(mcp::regenerate_mcp_token))
         .route("/api/get_log_path", post(get_log_path))
         .route("/api/get_database_path", post(get_database_path))
         // Category A — Desktop-only stubs
@@ -427,6 +432,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
             auth::require_api_key,
         ))
         .with_state(state);
+
+    // Assistant access: `/mcp` is a `nest_service` outside `/api/`, merged AFTER the API-key layer so that layer never
+    // wraps it; it has its own gate (`mcp::require_mcp_access`).
+    let api = api.merge(mcp::mcp_router(mcp_slot));
 
     // Optionally serve static frontend files
     if let Some(dir) = static_dir {
@@ -574,6 +583,7 @@ pub(crate) mod tests {
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {
+            mcp: Default::default(),
             ctx,
             event_tx,
             allowed_paths: Vec::new(),
@@ -585,6 +595,33 @@ pub(crate) mod tests {
             sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
             sync_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
         }
+    }
+
+    /// `test_state` plus what assistant access needs: a real catalog in a temp dir, the MCP host built over it and
+    /// opened on that catalog. The caller drops every handle (router, state), then the dir, in that order.
+    pub(crate) fn test_state_with_catalog(api_key: Option<&str>) -> (WebAppState, tempfile::TempDir) {
+        use athenaeum_core::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = test_state(api_key);
+        let db = athenaeum_core::db::Database::new(dir.path().join("catalog.db")).expect("catalog");
+        assert!(state.ctx.db.set(db).is_ok(), "a fresh test state has no catalog");
+        let tx = state.event_tx.clone();
+        let host = McpHost::new(
+            Arc::clone(&state.ctx),
+            McpIdentity {
+                server_name: mcp_server_name(),
+                version: env!("CARGO_PKG_VERSION"),
+                kind: HostKind::Web,
+                web_api_key_set: api_key.is_some(),
+            },
+            Arc::new(crate::events::SseProgressEmitter::new(tx.clone())),
+            Arc::new(|| {}),
+            Arc::new(move || tx.receiver_count() > 0),
+        );
+        host.set_app_data_dir(dir.path().to_path_buf());
+        host.on_catalog_open().expect("the host opens on the test catalog");
+        state.mcp.set(host);
+        (state, dir)
     }
 
     #[tokio::test]

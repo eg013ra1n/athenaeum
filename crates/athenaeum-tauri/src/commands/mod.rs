@@ -63,6 +63,7 @@ pub mod collab;
 pub mod stacking;
 pub mod updates;
 pub mod zip;
+pub mod mcp;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -90,3 +91,4 @@ pub use collab::*;
 pub use stacking::*;
 pub use updates::*;
 pub use zip::*;
+pub use mcp::*;

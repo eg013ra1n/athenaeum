@@ -1,0 +1,81 @@
+{
+  "_about": "What the frontend computes today, row by row. missingFlags: computeMissingFlags (src/components/missing-metadata/MissingMetadataTable.tsx) on the frame's header values, `flags.type` is the frame-type flag. frameSetTab: the tab rule of src/pages/Objects.tsx (stage = not custom and not archived, wip = custom and not archived, archive = archived). Read by catalog_query::frontend_truth in Rust and by the vitest truth tests; change a row only when the TS code changes.",
+  "missingFlags": [
+    {
+      "name": "a complete light",
+      "frame": { "ra": 10.68, "dec": 41.27, "objctra": "00 42 44", "objctdec": "+41 16 09", "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "nothing at all",
+      "frame": { "ra": null, "dec": null, "objctra": null, "objctdec": null, "object": null, "date_obs": null, "instrume": null, "imagetyp": null },
+      "flags": { "coordinates": true, "object": true, "date": true, "camera": true, "type": true }
+    },
+    {
+      "name": "numeric zero pair and no sexagesimal text",
+      "frame": { "ra": 0, "dec": 0, "objctra": null, "objctdec": null, "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": true, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "no numeric pair and an all-zero sexagesimal placeholder",
+      "frame": { "ra": null, "dec": null, "objctra": "00:00:00", "objctdec": "+00:00:00", "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": true, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "no numeric pair but real sexagesimal text",
+      "frame": { "ra": null, "dec": null, "objctra": "00 42 44", "objctdec": "+41 16 09", "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "a real numeric pair and no sexagesimal text",
+      "frame": { "ra": 10.68, "dec": 41.27, "objctra": null, "objctdec": null, "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "zero right ascension alone is not a missing pair",
+      "frame": { "ra": 0, "dec": 5.5, "objctra": null, "objctdec": null, "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "zero pair with empty sexagesimal strings: empty text is not a placeholder",
+      "frame": { "ra": 0, "dec": 0, "objctra": "", "objctdec": "", "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "a dark with an empty OBJECT: the flag does not look at the frame type",
+      "frame": { "ra": 10.68, "dec": 41.27, "objctra": "00 42 44", "objctdec": "+41 16 09", "object": "", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Dark" },
+      "flags": { "coordinates": false, "object": true, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "a dark with nothing but a date, a camera and a type",
+      "frame": { "ra": null, "dec": null, "objctra": null, "objctdec": null, "object": null, "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Dark" },
+      "flags": { "coordinates": true, "object": true, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "an empty camera name",
+      "frame": { "ra": 10.68, "dec": 41.27, "objctra": null, "objctdec": null, "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "", "imagetyp": "Light" },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": true, "type": false }
+    },
+    {
+      "name": "a blank but not empty object name",
+      "frame": { "ra": 10.68, "dec": 41.27, "objctra": null, "objctdec": null, "object": " ", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": "Light" },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": false, "type": false }
+    },
+    {
+      "name": "no frame type",
+      "frame": { "ra": 10.68, "dec": 41.27, "objctra": null, "objctdec": null, "object": "M31", "date_obs": "2024-10-05T22:00:00Z", "instrume": "ASI2600MM", "imagetyp": null },
+      "flags": { "coordinates": false, "object": false, "date": false, "camera": false, "type": true }
+    },
+    {
+      "name": "no date",
+      "frame": { "ra": 10.68, "dec": 41.27, "objctra": null, "objctdec": null, "object": "M31", "date_obs": null, "instrume": "ASI2600MM", "imagetyp": "Flat" },
+      "flags": { "coordinates": false, "object": false, "date": true, "camera": false, "type": false }
+    }
+  ],
+  "frameSetTab": [
+    { "isCustom": false, "isArchived": false, "tab": "stage" },
+    { "isCustom": true, "isArchived": false, "tab": "wip" },
+    { "isCustom": false, "isArchived": true, "tab": "archive" },
+    { "isCustom": true, "isArchived": true, "tab": "archive" }
+  ]
+}

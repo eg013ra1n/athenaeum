@@ -47,12 +47,19 @@ pub fn get_settings_defaults(_ctx: &ServiceContext) -> Result<SettingsDefaults, 
 /// resize the cache now, and the monitoring keys wake the monitor loop.
 /// `monitor` is passed explicitly because `MonitorService` lives beside (not
 /// inside) `ServiceContext` on both hosts' state.
+///
+/// `mcp.enabled` is refused: turning assistant access on or off binds or closes the local channel, which only
+/// `api::mcp::set_mcp_enabled` does; a plain write would store a value nothing acts on.
 pub fn set_setting(
     ctx: &ServiceContext,
     key: &str,
     value: &str,
     monitor: &MonitorService,
 ) -> Result<(), ApiError> {
+    if key == crate::settings::keys::MCP_ENABLED {
+        tracing::warn!(key, "generic setting write refused: the assistant switch has its own command");
+        return Err(ApiError::Invalid("use set_mcp_enabled".to_string()));
+    }
     let db = crate::api::db(ctx)?;
     let conn = db.conn();
 

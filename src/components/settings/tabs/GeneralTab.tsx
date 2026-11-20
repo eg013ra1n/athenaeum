@@ -1,6 +1,6 @@
 // Settings redesign (spec 2026-09-18 §2) — General tab: Updates · Frame set
 // grouping · Session detection · Monitoring · Auto-merge · Content index ·
-// Archive · Data file locations · Logging. (Sky background moved to the
+// Archive · Data file locations · Assistant access (MCP) · Logging. (Sky background moved to the
 // Sky Chart tab.)
 //
 // Task E1: this file now exports its ordered `GENERAL_SECTIONS` list
@@ -18,6 +18,7 @@ import { ContentIndexSection } from '../sections/ContentIndexSection';
 import { ArchiveSection } from '../sections/ArchiveSection';
 import { ComputeQueueSection } from '../sections/ComputeQueueSection';
 import { DataLocationsSection } from '../sections/DataLocationsSection';
+import { AssistantAccessSection } from '../sections/AssistantAccessSection';
 import LoggingSettings from '../LoggingSettings';
 import { renderTabSections, type TabSectionEntry } from './tabSectionEntry';
 
@@ -31,6 +32,7 @@ export const GENERAL_SECTIONS: TabSectionEntry[] = [
   { sectionId: 'general.archive', element: <ArchiveSection /> },
   { sectionId: 'general.compute', element: <ComputeQueueSection /> },
   { sectionId: 'general.dataLocations', element: <DataLocationsSection /> },
+  { sectionId: 'general.assistantAccess', element: <AssistantAccessSection /> },
   { sectionId: 'general.logging', element: <LoggingSettings /> },
 ];
 

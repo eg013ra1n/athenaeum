@@ -113,6 +113,9 @@ pub mod defaults {
     // together, GB (see hips::cache). Offline-pack tiles are kept whatever it is.
     pub const SKYCHART_HIPS_CACHE_LIMIT_GB: &str = "10";
 
+    /// Assistant access (the MCP local channel, plan 2026-11-19): off until the owner turns it on. Written only by
+    /// `api::mcp::set_mcp_enabled`; the generic `set_setting` refuses the key.
+    pub const MCP_ENABLED: &str = "false";
 
     // Device-wide sync UPLOAD throttle (W1). Bytes/sec across every peer and
     // every concurrent GET. `0` = unlimited, and that is the default — a fresh
@@ -272,12 +275,16 @@ pub mod defaults {
             ),
             (super::keys::UI_TREE_VIEW_MODE, UI_TREE_VIEW_MODE),
             (super::keys::UI_BLINK_SIDEBAR_PX, UI_BLINK_SIDEBAR_PX),
+            (super::keys::MCP_ENABLED, MCP_ENABLED),
         ]
     }
 }
 
 /// Setting keys used throughout the application
 pub mod keys {
+    /// Assistant access on/off (`"true"` / `"false"`); only `api::mcp::set_mcp_enabled` writes it.
+    pub const MCP_ENABLED: &str = "mcp.enabled";
+
     // Frame set clustering
     pub const GROUPING_THRESHOLD_VALUE: &str = "grouping.threshold.value";
     pub const GROUPING_THRESHOLD_UNIT: &str = "grouping.threshold.unit";
@@ -926,6 +933,7 @@ mod tests {
             keys::COLLAB_MAX_RECEIVE_STREAMS,
             keys::SKYCHART_HIPS_ONLINE,
             keys::SKYCHART_HIPS_CACHE_LIMIT_GB,
+            keys::MCP_ENABLED,
         ] {
             assert!(
                 listed.contains(key),

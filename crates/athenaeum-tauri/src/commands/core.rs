@@ -12,6 +12,7 @@ use super::AppState;
 pub async fn initialize_database(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
+    mcp: State<'_, super::McpHostState>,
 ) -> Result<String, String> {
     let app_dir = crate::paths::resolve_app_data_dir(&app_handle)?;
 
@@ -81,6 +82,14 @@ pub async fn initialize_database(
             handle.apply_config(&cfg);
         }
     }
+
+    // Assistant access (MCP): the catalog is open, so the host opens its read-only reader and reconciles to the stored
+    // `mcp.enabled` (the database wins over the `enabled` marker the early start went by). A failure is logged and
+    // leaves the app running without assistant access; the Settings page shows the state.
+    if let Err(e) = mcp.0.on_catalog_open() {
+        tracing::error!(error = %e, "assistant access could not open on the catalog");
+    }
+    super::mcp::refresh_copy_if_enabled(&app_handle, &mcp.0);
 
     // Apply persisted compute.max_concurrent to the global compute queue.
     // Same DB-availability reasoning as blink.threads above: the desktop

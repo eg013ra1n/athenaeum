@@ -28,6 +28,7 @@ pub mod tauri_events;
 // Commands (Tauri API endpoints)
 mod commands;
 mod commands_rustafits;
+mod mcp_bridge;
 mod paths;
 
 use cache::MemoryImageCache;
@@ -107,6 +108,33 @@ pub fn run() {
 
             let app_handle = app.handle();
             let state: State<AppState> = app.state();
+
+            // Assistant access (MCP): the host exists from the start; `start_early` binds the channel when the
+            // `enabled` marker is there (answering "starting" until `initialize_database` has opened the catalog,
+            // which then reconciles to the stored setting). The app-data dir is told now: the catalog is not open yet.
+            {
+                use athenaeum_core::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity};
+                let app_for_front = app_handle.clone();
+                let host = McpHost::new(
+                    Arc::clone(&state.ctx),
+                    McpIdentity {
+                        server_name: mcp_server_name(),
+                        version: env!("CARGO_PKG_VERSION"),
+                        kind: HostKind::Desktop,
+                        web_api_key_set: false,
+                    },
+                    Arc::new(tauri_events::TauriProgressEmitter(app_handle.clone())),
+                    Arc::new(move || commands::bring_to_front(&app_for_front)),
+                    // The desktop always has a window to show a plan in.
+                    Arc::new(|| true),
+                );
+                match paths::resolve_app_data_dir(app_handle) {
+                    Ok(dir) => host.set_app_data_dir(dir),
+                    Err(e) => tracing::warn!(error = %e, "assistant access starts late: the data folder is not known"),
+                }
+                host.start_early();
+                app.manage(commands::McpHostState(host));
+            }
 
             // Auto-reconcile abandoned cross-volume moves — enqueue this as
             // the FIRST job on the operation queue so it serializes ahead of
@@ -577,6 +605,9 @@ pub fn run() {
             commands::take_over_collab_folder,
             commands::set_collab_max_upload_streams,
             commands::set_collab_max_receive_streams,
+            commands::get_mcp_status,
+            commands::set_mcp_enabled,
+            commands::regenerate_mcp_token,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -586,6 +617,12 @@ pub fn run() {
             // `block_on` so a stuck relay/close never hangs process exit;
             // `SharedIrohNode::shutdown` is idempotent, so handling both
             // ExitRequested and Exit (either may fire) never double-shuts.
+            // Assistant access: close the channel and every connection, remove the socket and `endpoint`.
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(mcp) = app_handle.try_state::<commands::McpHostState>() {
+                    mcp.0.shutdown();
+                }
+            }
             if matches!(
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit

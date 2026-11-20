@@ -137,6 +137,8 @@ mod stacking_project_e2e;
 // already inside the same feature combo here.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod settings;
+// Assistant access (MCP, plan 2026-11-19): the status / on-off / regenerate-key commands over the `McpHost`. Ungated.
+pub mod mcp;
 
 // Task 9: the C1 relay-eviction regression canary — one `#[ignore]`d test binding
 // two endpoints with the SAME device secret against a real relay (from

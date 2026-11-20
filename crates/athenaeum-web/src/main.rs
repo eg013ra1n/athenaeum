@@ -1,6 +1,7 @@
 use athenaeum_core::cache::MemoryImageCache;
 use athenaeum_core::db::{self, Database};
 use athenaeum_core::logging;
+use athenaeum_core::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity};
 use athenaeum_core::services::ServiceContext;
 use athenaeum_core::settings::{self, SettingsManager};
 use std::collections::HashMap;
@@ -53,6 +54,24 @@ impl Config {
     }
 }
 
+/// The assistant-access host (MCP) once `main` has built it; shared by every clone of the state. Empty in the
+/// router-level tests that never start one: `/mcp` and the three MCP routes then answer "starting".
+#[derive(Clone, Default)]
+pub struct McpSlot(Arc<OnceLock<Arc<McpHost>>>);
+
+impl McpSlot {
+    pub fn get(&self) -> Option<&Arc<McpHost>> {
+        self.0.get()
+    }
+
+    /// The first host wins; a second one is a bug in the caller and is logged, not silently dropped.
+    pub fn set(&self, host: Arc<McpHost>) {
+        if self.0.set(host).is_err() {
+            tracing::warn!("mcp host was already set; keeping the first");
+        }
+    }
+}
+
 /// Web-specific app state wrapping the shared ServiceContext.
 #[derive(Clone)]
 pub struct WebAppState {
@@ -77,6 +96,8 @@ pub struct WebAppState {
     /// Personal-sync send-side runtime (task M2). Lazily builds the sender engine
     /// on the first enqueue (manual send / auto mode).
     pub sync_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
+    /// Assistant access (MCP): the host behind `/mcp` and the three `/api/…mcp…` routes.
+    pub mcp: McpSlot,
 }
 
 #[tokio::main]
@@ -174,6 +195,9 @@ async fn main() {
         .unwrap_or(30);
     tracing::info!(cache_size, cache_max_mb, retention_minutes, "memory cache initialized");
 
+    // Where the catalog lives is where assistant access keeps its key (`<data dir>/mcp/`).
+    let mcp_data_dir = db.path().parent().map(std::path::Path::to_path_buf);
+
     // Build ServiceContext
     let settings_mgr = Arc::new(SettingsManager::new());
     // The zip extraction cache sits beside the catalog (`/data/zip-cache` in Docker).
@@ -238,6 +262,7 @@ async fn main() {
     }
 
     let state = WebAppState {
+        mcp: Default::default(),
         ctx,
         event_tx,
         allowed_paths: config.allowed_paths,
@@ -249,6 +274,33 @@ async fn main() {
         sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
         sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
     };
+
+    // Assistant access (MCP): the host behind `/mcp`. The web build never binds a socket; `on_catalog_open` opens the
+    // read-only reader (the catalog is open already) and reconciles to the stored `mcp.enabled`. Turning it off or
+    // regenerating the key takes effect per request, in `routes::mcp::require_mcp_access`.
+    {
+        let tx_for_viewer = state.event_tx.clone();
+        let host = McpHost::new(
+            Arc::clone(&state.ctx),
+            McpIdentity {
+                server_name: mcp_server_name(),
+                version: env!("CARGO_PKG_VERSION"),
+                kind: HostKind::Web,
+                web_api_key_set: state.api_key.is_some(),
+            },
+            Arc::new(events::SseProgressEmitter::new(state.event_tx.clone())),
+            // No window to raise: a plan waits in whichever browser tab shows the app.
+            Arc::new(|| {}),
+            Arc::new(move || tx_for_viewer.receiver_count() > 0),
+        );
+        if let Some(dir) = mcp_data_dir {
+            host.set_app_data_dir(dir);
+        }
+        if let Err(e) = host.on_catalog_open() {
+            tracing::error!(error = %e, "assistant access could not open on the catalog");
+        }
+        state.mcp.set(host);
+    }
 
     // Personal sync (Stage I, task A7): start the receiver + iroh transport at
     // boot when the dev flag is on. The web backend's DB is already initialised

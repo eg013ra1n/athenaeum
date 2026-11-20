@@ -45,13 +45,15 @@ RUN mkdir -p crates/athenaeum-core/examples \
        | sed -n 's/^name = "\(.*\)"$/\1/p' \
        | while read -r e; do echo "fn main() {}" > "crates/athenaeum-core/examples/$e.rs"; done
 
-# Exclude athenaeum-tauri (desktop shell), catalog-builder (offline dev
-# tooling), log-mcp (dev-time log query server), and perseus (headless capture
-# agent — its own binary crate, not part of the web build) from the workspace
+# Exclude athenaeum-tauri (desktop shell), athenaeum-mcp (the assistant bridge a
+# desktop client starts; the web image serves /mcp itself), catalog-builder
+# (offline dev tooling), log-mcp (dev-time log query server), and perseus
+# (headless capture agent — its own binary crate, not part of the web build) from the workspace
 # during the Docker build. Their sources are not copied into the image, so
 # leaving them as members would fail workspace manifest resolution for
 # `cargo build --package athenaeum-web`.
 RUN sed -i '/"crates\/athenaeum-tauri",/d' Cargo.toml \
+    && sed -i '/"crates\/athenaeum-mcp",/d' Cargo.toml \
     && sed -i '/"crates\/catalog-builder",/d' Cargo.toml \
     && sed -i '/"crates\/log-mcp",/d' Cargo.toml \
     && sed -i '/"crates\/perseus",/d' Cargo.toml

@@ -39,7 +39,7 @@ variables:
   GIT_CLEAN_FLAGS: -ffdx -e target/ -e .cargo/ -e .npm/
 
 # --- Gate (tags only) ---
-# One refusal before a single build minute is spent: the six version files
+# One refusal before a single build minute is spent: the seven version files
 # must equal the tag (bump.sh's job to make them so). The other half of the
 # gate, gate:tests — the tagged commit's GitHub check-suite, the only place
 # tests actually run — lives down in the `build` stage, not here (see its
@@ -92,7 +92,13 @@ build:windows:
     # vendored `./target/tools/windows/nasm/nasm`, never PATH.
     - if (Test-Path "target\release\bundle") { Remove-Item -Recurse -Force "target\release\bundle" }
     - npm install
-    - npm run tauri build
+    # The assistant bridge rides in the installers as a sidecar (docs/release/README.md):
+    # build it for the host triple, then list it with the --config overlay.
+    # `npx tauri build`, never `npm run tauri build -- ...`: PowerShell can eat the bare `--`,
+    # so the overlay would be dropped and the installers would ship with no bridge. There is no
+    # cheap bundle check on this job; the npx form is the guard.
+    - node scripts/release/build-mcp-bridge.mjs
+    - npx tauri build --config crates/athenaeum-tauri/tauri.mcp-bridge.json
   artifacts:
     name: "athenaeum-windows-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -129,7 +135,12 @@ build:linux:
     - export RUSTAFITS_PORTABLE=1
     - rm -rf target/release/bundle/
     - npm install
-    - npm run tauri build
+    # The assistant bridge rides in the .deb as a sidecar (docs/release/README.md);
+    # the AppImage copies it to <app-data>/bin at run time, nothing extra here.
+    - node scripts/release/build-mcp-bridge.mjs
+    - npx tauri build --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    # A .deb without the bridge fails the job here, not on a user's machine.
+    - 'for DEB in target/release/bundle/deb/*.deb; do dpkg-deb -c "$DEB" | grep -q "usr/bin/athenaeum-mcp$" || { echo "FATAL: $DEB has no usr/bin/athenaeum-mcp"; exit 1; }; done'
   artifacts:
     name: "athenaeum-linux-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -266,8 +277,14 @@ build:macos:
     # itself again, so the updater's .app.tar.gz carries a stapled bundle.
     # Ruling F5.1 (DMG-only notarization) is reversed by that spec; the DMG
     # loop below still notarizes the DMG a first-time user downloads.
-    - npm run tauri build -- --target aarch64-apple-darwin
-    - npm run tauri build -- --target x86_64-apple-darwin
+    # Each target gets its own bridge (docs/release/README.md); Tauri signs the
+    # sidecar with the app.
+    - node scripts/release/build-mcp-bridge.mjs --target aarch64-apple-darwin
+    - npx tauri build --target aarch64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - '[ -x "target/aarch64-apple-darwin/release/bundle/macos/Athenaeum.app/Contents/MacOS/athenaeum-mcp" ] || { echo "FATAL: aarch64-apple-darwin .app has no athenaeum-mcp"; exit 1; }'
+    - node scripts/release/build-mcp-bridge.mjs --target x86_64-apple-darwin
+    - npx tauri build --target x86_64-apple-darwin --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - '[ -x "target/x86_64-apple-darwin/release/bundle/macos/Athenaeum.app/Contents/MacOS/athenaeum-mcp" ] || { echo "FATAL: x86_64-apple-darwin .app has no athenaeum-mcp"; exit 1; }'
     - |
       for DMG in target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
                  target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do

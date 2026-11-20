@@ -50,6 +50,9 @@ pub mod orientation;
 // catalog/gaia builds on both astroimage (proper-motion) and solvemyastro (cache).
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod catalog;
+pub mod scope;
+pub mod catalog_query;
+pub mod mcp;
 // plate_solve + registration consume both astroimage and solvemyastro.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod plate_solve;

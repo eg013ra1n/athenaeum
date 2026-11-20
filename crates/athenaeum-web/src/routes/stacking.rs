@@ -950,6 +950,7 @@ mod tests {
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<crate::events::SseEvent>(16);
         WebAppState {
+            mcp: Default::default(),
             ctx,
             event_tx,
             allowed_paths: Vec::new(),
