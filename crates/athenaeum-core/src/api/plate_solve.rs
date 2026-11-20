@@ -1,10 +1,11 @@
 //! Plate-solve commands both hosts call: the batch solve (`prepare_plate_solve_batch`
 //! + `run_plate_solve_batch`), the object autofind (`prepare_autofind_objects` +
 //! `run_autofind_objects`), the catalog and index-pack downloads, and the trigger the auto-publish
-//! worker gets after a batch (collab v3 wave 2, Task 10). The hosts keep what they
-//! resolve from their own state (star-catalog layers, index packs, the DSO catalog)
-//! and keep their own waiting: the desktop awaits a run, the web starts it and
-//! returns.
+//! worker gets after a batch (collab v3 wave 2, Task 10). Core resolves the star-catalog
+//! layers, index packs and DSO catalog (`resolve_layer_caches`, `resolve_index_packs`,
+//! `dso_catalog`) and holds the one batch slot (`claim_batch_slot`, `cancel_plate_solve`,
+//! `plate_solve_activity`); the hosts keep only their own waiting: the desktop awaits a
+//! run, the web starts it and returns.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,8 +19,8 @@ use crate::plate_solve::dso_lookup::DsoCatalog;
 use crate::plate_solve::hints::extract_hints;
 use crate::plate_solve::object_fill::{self, AutofindProgress, AutofindStatus};
 use crate::plate_solve::service::{self, SolveResult};
-use crate::plate_solve::{describe_solve_failure, SolveHints, StoreOutcome};
-use crate::services::PlateSolveHandle;
+use crate::plate_solve::{describe_solve_failure, CatalogOpenError, SolveHints, StoreOutcome};
+use crate::services::{PlateSolveHandle, PlateSolveOrigin, SolveProgress};
 
 use crate::api::{db, ApiError};
 use crate::events::{emit_event, ProgressEmitter};
@@ -169,12 +170,279 @@ pub async fn download_index_packs(
     }
 }
 
+// ========== Resolvers, cancel, the one slot ==========
+
+/// Resolve and open the additive density-tier catalog stack under
+/// `<app-data>/catalogs/smac_gaia` (base to deepest), or a legacy single
+/// `stars.smac` there as a 1-layer fallback. Opens fresh each call (mmap is
+/// cheap); the batch path opens once and shares across workers. Errors when no
+/// catalog is installed, in the words both hosts show.
+pub fn resolve_layer_caches(
+    ctx: &ServiceContext,
+) -> Result<Vec<Arc<solvemyastro::StarCache>>, ApiError> {
+    let parent = resolve_app_data(ctx)?;
+    crate::plate_solve::open_catalog_layers(&parent).map_err(|e| match e {
+        CatalogOpenError::NotInstalled { root } => ApiError::Invalid(format!(
+            "solvemyastro star catalog not found under {}. \
+             Please download the Gaia DR3 prebuilt catalog from Settings \u{2192} Plate Solving.",
+            root.display()
+        )),
+        CatalogOpenError::Open { dir, error } => ApiError::Internal(format!(
+            "Failed to open star cache at {}: {error}",
+            dir.display()
+        )),
+    })
+}
+
+fn resolve_app_data(ctx: &ServiceContext) -> Result<std::path::PathBuf, ApiError> {
+    let database = db(ctx)?;
+    database
+        .path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| ApiError::Internal("Cannot determine app data directory".into()))
+}
+
+/// Open the installed quad-index packs under `<app-data>/catalogs/smac_index`
+/// (empty when none are installed or the database is not open; a pack that
+/// does not open is skipped with a warning). Opened once per batch, like the
+/// catalog layers.
+pub fn resolve_index_packs(ctx: &ServiceContext) -> Vec<Arc<solvemyastro::QuadIndex>> {
+    match ctx.app_data_dir() {
+        Some(parent) => crate::plate_solve::open_index_packs(&parent),
+        None => Vec::new(),
+    }
+}
+
+/// The DSO catalog, loaded once and cached in the `ServiceContext`. `None`
+/// (logged) when the bundled catalog cannot be loaded.
+pub fn dso_catalog(ctx: &ServiceContext) -> Option<Arc<DsoCatalog>> {
+    {
+        let guard = ctx.dso_catalog.read().unwrap();
+        if let Some(ref cat) = *guard {
+            return Some(cat.clone());
+        }
+    }
+    match DsoCatalog::load() {
+        Ok(cat) => {
+            let arc = Arc::new(cat);
+            let mut guard = ctx.dso_catalog.write().unwrap();
+            *guard = Some(arc.clone());
+            Some(arc)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load DSO catalog");
+            None
+        }
+    }
+}
+
+/// Refusal while an assistant run holds the batch slot; `{done}` and `{total}` are filled in.
+pub const BUSY_ASSISTANT: &str = "A plate solve started from the assistant is running ({done} of {total} frames). Wait for it or cancel it.";
+/// Refusal for the assistant while a run started in Athenaeum holds the slot.
+pub const BUSY_UI: &str = "A plate solve batch started in Athenaeum is running ({done} of {total} frames); the assistant's run can start when it ends.";
+/// Refusal for a second run started in Athenaeum while one started there runs.
+pub const BUSY_UI_SELF: &str = "A plate solve batch is already running ({done} of {total} frames). Wait for it or cancel it.";
+
+fn busy_text(holder: PlateSolveOrigin, requester: PlateSolveOrigin, p: &SolveProgress) -> String {
+    let template = match (holder, requester) {
+        (PlateSolveOrigin::Assistant, _) => BUSY_ASSISTANT,
+        (PlateSolveOrigin::Ui, PlateSolveOrigin::Assistant) => BUSY_UI,
+        (PlateSolveOrigin::Ui, PlateSolveOrigin::Ui) => BUSY_UI_SELF,
+    };
+    template.replace("{done}", &p.done.to_string()).replace("{total}", &p.total.to_string())
+}
+
+/// The id of a plate-solve batch run: `solve-<uuid>`.
+fn new_solve_run_id() -> String {
+    format!("solve-{}", uuid::Uuid::new_v4())
+}
+
+/// Check and register under one lock (key 0 = plate-solve batch): a held slot
+/// refuses, it is never replaced. The handle starts with `total` set to the
+/// batch's size, so a refusal while the batch is still preparing names it right.
+fn claim_batch_slot(
+    ctx: &ServiceContext,
+    origin: PlateSolveOrigin,
+    total: usize,
+) -> Result<(Arc<AtomicBool>, String, Arc<Mutex<SolveProgress>>), ApiError> {
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let run_id = new_solve_run_id();
+    let progress = Arc::new(Mutex::new(SolveProgress { total, ..Default::default() }));
+    let mut solves = ctx.active_plate_solves.lock().unwrap();
+    if let Some(held) = solves.get(&0) {
+        let text = busy_text(
+            held.origin,
+            origin,
+            &held.progress.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        tracing::info!(origin = ?origin, run_id = %held.run_id, "plate solve refused, a batch is running");
+        return Err(ApiError::Conflict(text));
+    }
+    solves.insert(
+        0,
+        PlateSolveHandle {
+            cancel_flag: cancel_flag.clone(),
+            origin,
+            run_id: run_id.clone(),
+            progress: progress.clone(),
+        },
+    );
+    Ok((cancel_flag, run_id, progress))
+}
+
+/// Frees the batch slot (key 0) when dropped, if it still holds this run.
+/// A [`PreparedPlateSolveBatch`] owns one and [`run_plate_solve_batch`] takes
+/// it over, so a batch dropped before `run` never blocks a later solve.
+struct SlotGuard {
+    slots: Arc<Mutex<std::collections::HashMap<i64, PlateSolveHandle>>>,
+    run_id: String,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let mut solves = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if solves.get(&0).is_some_and(|h| h.run_id == self.run_id) {
+            solves.remove(&0);
+        }
+    }
+}
+
+/// What a plate solve is doing right now, for the app and the assistant.
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlateSolveActivity {
+    pub running: bool,
+    pub origin: Option<PlateSolveOrigin>,
+    pub run_id: Option<String>,
+    pub done: usize,
+    pub total: usize,
+    pub current_file: Option<String>,
+}
+
+/// The batch slot's state: the run holding key 0 and its progress, or idle.
+pub fn plate_solve_activity(ctx: &ServiceContext) -> PlateSolveActivity {
+    let solves = ctx.active_plate_solves.lock().unwrap();
+    match solves.get(&0) {
+        Some(h) => {
+            let p = h.progress.lock().unwrap_or_else(|e| e.into_inner());
+            PlateSolveActivity {
+                running: true,
+                origin: Some(h.origin),
+                run_id: Some(h.run_id.clone()),
+                done: p.done,
+                total: p.total,
+                current_file: p.current_file.clone(),
+            }
+        }
+        None => PlateSolveActivity {
+            running: false,
+            origin: None,
+            run_id: None,
+            done: 0,
+            total: 0,
+            current_file: None,
+        },
+    }
+}
+
+/// Set the cancel flag of the running batch (slot 0). Returns whether there
+/// was one; a cancel with nothing running is logged and has no effect.
+pub fn cancel_plate_solve(ctx: &ServiceContext) -> bool {
+    let solves = ctx.active_plate_solves.lock().unwrap();
+    tracing::debug!(active_keys = ?solves.keys().collect::<Vec<_>>(), "cancel_plate_solve invoked");
+    match solves.get(&0) {
+        Some(handle) => {
+            handle.cancel_flag.store(true, Ordering::Relaxed);
+            tracing::info!(run_id = %handle.run_id, "plate solve cancel flag set");
+            true
+        }
+        None => {
+            tracing::warn!("no active plate solve handle, cancel had no effect");
+            false
+        }
+    }
+}
+
+/// Set the cancel flag of the running batch only when slot 0 holds `run_id`, checked and set under the slot's one
+/// lock (the assistant cancels its own run and nothing else). Returns whether it did.
+pub fn cancel_plate_solve_run(ctx: &ServiceContext, run_id: &str) -> bool {
+    let solves = ctx.active_plate_solves.lock().unwrap();
+    match solves.get(&0) {
+        Some(handle) if handle.run_id == run_id => {
+            handle.cancel_flag.store(true, Ordering::Relaxed);
+            tracing::info!(run_id = %handle.run_id, "plate solve cancel flag set");
+            true
+        }
+        _ => {
+            tracing::info!(run_id, "plate solve cancel left alone, the slot does not hold that run");
+            false
+        }
+    }
+}
+
+/// `cancel_plate_solve` as the hosts call it: with a run id it is [`cancel_plate_solve_run`] (the window cancels
+/// the run it is showing and nothing else), without one it is [`cancel_plate_solve`].
+pub fn cancel_plate_solve_named(ctx: &ServiceContext, run_id: Option<&str>) -> bool {
+    match run_id {
+        Some(run_id) => cancel_plate_solve_run(ctx, run_id),
+        None => cancel_plate_solve(ctx),
+    }
+}
+
+/// Wraps the run's emitter: copies each `plate-solve-progress` event into the
+/// handle's [`SolveProgress`], then forwards every event unchanged.
+struct RecordingEmitter {
+    inner: Arc<dyn ProgressEmitter>,
+    progress: Arc<Mutex<SolveProgress>>,
+}
+
+impl ProgressEmitter for RecordingEmitter {
+    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+        if event_name == "plate-solve-progress" {
+            let mut p = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+            let current = payload["current"].as_u64().unwrap_or(0) as usize;
+            let file = payload["filename"].as_str().map(str::to_string);
+            // The correction for a low-confidence rejection reports `current == total`
+            // for a frame already counted as solved; `done` only moves forward.
+            p.done = p.done.max(current);
+            if let Some(total) = payload["total"].as_u64() {
+                p.total = total as usize;
+            }
+            match payload["status"].as_str() {
+                Some("solving") => p.current_file = file,
+                Some("failed") => {
+                    let name = file.unwrap_or_else(|| match payload["frame_id"].as_i64() {
+                        Some(id) => format!("frame {id}"),
+                        None => "frame".to_string(),
+                    });
+                    let reason = payload["error"].as_str().unwrap_or("failed").to_string();
+                    p.failures.push((name, reason));
+                }
+                _ => {}
+            }
+        }
+        self.inner.emit_json(event_name, payload);
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlateSolveStartedEvent {
+    origin: PlateSolveOrigin,
+    run_id: String,
+    total: usize,
+}
+
 // ========== Batch solve ==========
 
 // snake_case on the wire (no `rename_all`): the UI reads `frame_id`,
 // `matched_stars`, `total_time_ms`, ...
 #[derive(Clone, Serialize)]
 struct PlateSolveProgressEvent {
+    /// The run these events belong to (the `solve-<uuid>` of `plate-solve-started`), so a window can tell its own
+    /// run's events from another's.
+    run_id: String,
     frame_id: i64,
     current: usize,
     total: usize,
@@ -191,6 +459,8 @@ struct PlateSolveProgressEvent {
 
 #[derive(Clone, Serialize)]
 struct PlateSolveCompleteEvent {
+    /// The run that ended (see [`PlateSolveProgressEvent::run_id`]).
+    run_id: String,
     solved: usize,
     failed: usize,
     total: usize,
@@ -237,9 +507,13 @@ enum WorkResult {
 }
 
 /// A plate-solve batch after phase 1: config, frames and hints loaded, the
-/// cancel handle (key 0) registered. Hand it to [`run_plate_solve_batch`],
-/// which always ends the batch.
+/// batch slot (key 0) held. Hand it to [`run_plate_solve_batch`], which always
+/// ends the batch; dropping it unrun frees the slot.
 pub struct PreparedPlateSolveBatch {
+    slot: Option<SlotGuard>,
+    origin: PlateSolveOrigin,
+    run_id: String,
+    progress: Arc<Mutex<SolveProgress>>,
     ps_config: Arc<PlateSolveConfig>,
     layer_caches: Vec<Arc<solvemyastro::StarCache>>,
     index_packs: Vec<Arc<solvemyastro::QuadIndex>>,
@@ -250,11 +524,24 @@ pub struct PreparedPlateSolveBatch {
     total: usize,
 }
 
-/// Phase 1 of a plate-solve batch, synchronous: load the config, register the
-/// cancel handle (key 0), pre-load frame metadata and hints so workers never
+impl PreparedPlateSolveBatch {
+    /// The id this run's handle carries (also in `plate-solve-started` and the activity).
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// The run's cancel flag, the one the slot's handle holds: a caller that ends the run later reads whether
+    /// anyone cancelled it.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel_flag)
+    }
+}
+
+/// Phase 1 of a plate-solve batch, synchronous: claim the batch slot (key 0;
+/// `Conflict` in words when it is held), load the config, pre-load frame metadata and hints so workers never
 /// touch the DB, run the input gate, and choose the concurrency. The star
-/// catalog layers, index packs and DSO catalog are what the host resolved from
-/// its own state. Frames that fail to load or are refused by the gate become
+/// catalog layers, index packs and DSO catalog are what the caller resolved with
+/// the core resolvers. Frames that fail to load or are refused by the gate become
 /// per-frame failures in the run, not errors here.
 pub fn prepare_plate_solve_batch(
     ctx: &ServiceContext,
@@ -262,17 +549,15 @@ pub fn prepare_plate_solve_batch(
     layer_caches: Vec<Arc<solvemyastro::StarCache>>,
     index_packs: Vec<Arc<solvemyastro::QuadIndex>>,
     dso: Option<Arc<DsoCatalog>>,
+    origin: PlateSolveOrigin,
 ) -> Result<PreparedPlateSolveBatch, ApiError> {
     let database = db(ctx)?;
+    let (cancel_flag, run_id, progress) = claim_batch_slot(ctx, origin, frame_ids.len())?;
+    // From here the guard frees the slot on any early return.
+    let slot = SlotGuard { slots: ctx.active_plate_solves.clone(), run_id: run_id.clone() };
+
     let conn = database.conn();
     let ps_config = Arc::new(config::load_config(&conn));
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-
-    // Register the cancel handle (key 0 = plate-solve batch).
-    {
-        let mut solves = ctx.active_plate_solves.lock().unwrap();
-        solves.insert(0, PlateSolveHandle { cancel_flag: cancel_flag.clone() });
-    }
 
     // Frames that fail to load become `LoadFailed` placeholders so their
     // status is reported alongside successful/failed solves.
@@ -343,6 +628,7 @@ pub fn prepare_plate_solve_batch(
     }
 
     let total = work_items.len();
+    progress.lock().unwrap_or_else(|e| e.into_inner()).total = total;
 
     // Choose concurrency: config override, else auto (~1 worker per 3 cores).
     // Lower cap than analysis (8 vs 16) because each solve already uses the
@@ -353,9 +639,13 @@ pub fn prepare_plate_solve_batch(
     } else {
         (ps_config.batch_concurrency as usize).clamp(1, 16)
     };
-    tracing::info!(total, workers = concurrency, "plate solve batch starting");
+    tracing::info!(total, workers = concurrency, origin = ?origin, run_id = %run_id, "plate solve batch starting");
 
     Ok(PreparedPlateSolveBatch {
+        slot: Some(slot),
+        origin,
+        run_id,
+        progress,
         ps_config,
         layer_caches,
         index_packs,
@@ -385,10 +675,21 @@ struct BatchEnd {
 pub fn run_plate_solve_batch(
     ctx: Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
-    batch: PreparedPlateSolveBatch,
+    mut batch: PreparedPlateSolveBatch,
 ) -> Result<(), ApiError> {
     let total = batch.total;
+    let run_id = batch.run_id.clone();
     let start = std::time::Instant::now();
+    // The run owns the slot from here; it is freed on every path, before the complete event.
+    let slot = batch.slot.take();
+    // Every progress event is copied into the handle's progress on its way out.
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(RecordingEmitter { inner: emitter, progress: batch.progress.clone() });
+    emit_event(
+        emitter.as_ref(),
+        "plate-solve-started",
+        &PlateSolveStartedEvent { origin: batch.origin, run_id: batch.run_id.clone(), total },
+    );
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         solve_and_persist(&ctx, emitter.as_ref(), &emitter, batch, start)
@@ -409,14 +710,12 @@ pub fn run_plate_solve_batch(
         }
     };
 
-    {
-        let mut solves = ctx.active_plate_solves.lock().unwrap();
-        solves.remove(&0);
-    }
+    drop(slot);
     emit_event(
         emitter.as_ref(),
         "plate-solve-complete",
         &PlateSolveCompleteEvent {
+            run_id,
             solved: end.solved,
             failed: end.failed,
             total,
@@ -440,6 +739,10 @@ fn solve_and_persist(
     start: std::time::Instant,
 ) -> BatchEnd {
     let PreparedPlateSolveBatch {
+        slot: _,
+        origin: _,
+        run_id,
+        progress: _,
         ps_config,
         layer_caches,
         index_packs,
@@ -483,6 +786,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id,
                                     current: done_so_far,
                                     total,
@@ -563,6 +867,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id: *frame_id,
                                     current: done,
                                     total,
@@ -580,6 +885,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id: *frame_id,
                                     current: done,
                                     total,
@@ -655,6 +961,7 @@ fn solve_and_persist(
                                 emitter,
                                 "plate-solve-progress",
                                 &PlateSolveProgressEvent {
+                                    run_id: run_id.clone(),
                                     frame_id: *frame_id,
                                     current: total,
                                     total,
@@ -755,7 +1062,15 @@ pub fn prepare_autofind_objects(
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
         let mut handles = ctx.active_plate_solves.lock().unwrap();
-        handles.insert(1, PlateSolveHandle { cancel_flag: cancel_flag.clone() });
+        handles.insert(
+            1,
+            PlateSolveHandle {
+                cancel_flag: cancel_flag.clone(),
+                origin: PlateSolveOrigin::Ui,
+                run_id: new_solve_run_id(),
+                progress: Arc::new(Mutex::new(SolveProgress::default())),
+            },
+        );
     }
     Ok(PreparedAutofind { dso, tolerance_deg, cancel_flag })
 }
@@ -920,8 +1235,15 @@ mod tests {
         let emitter = Arc::new(CapturingEmitter::default());
 
         let prepared =
-            prepare_plate_solve_batch(&ctx, &[9001, 9002, 9003], Vec::new(), Vec::new(), None)
-                .expect("prepare");
+            prepare_plate_solve_batch(
+                &ctx,
+                &[9001, 9002, 9003],
+                Vec::new(),
+                Vec::new(),
+                None,
+                PlateSolveOrigin::Ui,
+            )
+            .expect("prepare");
         assert!(ctx.active_plate_solves.lock().unwrap().contains_key(&0));
 
         run_plate_solve_batch(ctx.clone(), emitter.clone(), prepared).expect("run");
@@ -941,6 +1263,47 @@ mod tests {
         assert_eq!(failed_rows, 3);
     }
 
+    /// Every progress and the complete event of a batch name the run (`run_id`, the `solve-<uuid>` the started event
+    /// and the activity carry), so a window can tell its own run's events from another's.
+    #[test]
+    fn progress_and_complete_name_their_run() {
+        let _guard = crate::api::collab_autopublish::test_lock();
+        let (_tmp, ctx) = test_ctx();
+        let emitter = Arc::new(CapturingEmitter::default());
+        let prepared = prepare_plate_solve_batch(&ctx, &[9001, 9002], Vec::new(), Vec::new(), None, PlateSolveOrigin::Assistant)
+            .expect("prepare");
+        let run_id = prepared.run_id().to_string();
+        run_plate_solve_batch(ctx.clone(), emitter.clone(), prepared).expect("run");
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
+
+        let progress = emitter.named("plate-solve-progress");
+        assert_eq!(progress.len(), 2, "{progress:?}");
+        for p in &progress {
+            assert_eq!(p["run_id"], run_id.as_str(), "{p}");
+        }
+        let complete = emitter.named("plate-solve-complete");
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0]["run_id"], run_id.as_str(), "{}", complete[0]);
+    }
+
+    /// A cancel that names a run acts only while slot 0 holds that run; a cancel that names none cancels the slot.
+    #[test]
+    fn cancel_with_a_run_id_spares_another_run() {
+        let (_tmp, ctx) = test_ctx();
+        let batch = prepare_for(&ctx, &[9001], PlateSolveOrigin::Ui).expect("prepare");
+        let flag = ctx.active_plate_solves.lock().unwrap().get(&0).unwrap().cancel_flag.clone();
+
+        assert!(!cancel_plate_solve_named(&ctx, Some("solve-an-older-run")), "another run's id cancels nothing");
+        assert!(!flag.load(Ordering::Relaxed), "the running batch is spared");
+        assert!(cancel_plate_solve_named(&ctx, Some(batch.run_id())));
+        assert!(flag.load(Ordering::Relaxed));
+
+        // No id: as before, whatever holds the slot.
+        flag.store(false, Ordering::Relaxed);
+        assert!(cancel_plate_solve_named(&ctx, None));
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
     /// An autofind over frame ids that are not in the catalog counts them as
     /// per-frame errors, emits the complete event once and removes handle 1.
     #[test]
@@ -950,7 +1313,12 @@ mod tests {
         let dso = Arc::new(DsoCatalog::load().expect("bundled DSO catalog"));
 
         let prepared = prepare_autofind_objects(&ctx, Some(dso)).expect("prepare");
-        assert!(ctx.active_plate_solves.lock().unwrap().contains_key(&1));
+        {
+            let solves = ctx.active_plate_solves.lock().unwrap();
+            let handle = solves.get(&1).expect("autofind holds key 1");
+            assert_eq!(handle.origin, PlateSolveOrigin::Ui);
+            assert!(!handle.run_id.is_empty());
+        }
 
         run_autofind_objects(ctx.clone(), emitter.clone(), prepared, vec![9001, 9002])
             .expect("run");
@@ -962,5 +1330,233 @@ mod tests {
         assert_eq!(complete[0]["errors"], 2);
         assert_eq!(complete[0]["labeled"], 0);
         assert!(!ctx.active_plate_solves.lock().unwrap().contains_key(&1));
+    }
+
+    fn prepare_for(
+        ctx: &ServiceContext,
+        frame_ids: &[i64],
+        origin: PlateSolveOrigin,
+    ) -> Result<PreparedPlateSolveBatch, ApiError> {
+        prepare_plate_solve_batch(ctx, frame_ids, Vec::new(), Vec::new(), None, origin)
+    }
+
+    fn slot_run_id(ctx: &ServiceContext) -> Option<String> {
+        ctx.active_plate_solves.lock().unwrap().get(&0).map(|h| h.run_id.clone())
+    }
+
+    /// A second batch is refused in words while slot 0 is held; the first run
+    /// keeps its handle (same run id) and its text names who holds the slot.
+    #[test]
+    fn second_batch_is_refused_not_replaced() {
+        let (_tmp, ctx) = test_ctx();
+        let first = prepare_for(&ctx, &[9001, 9002], PlateSolveOrigin::Assistant).expect("first");
+        let held = slot_run_id(&ctx).expect("slot held");
+        assert_eq!(held, first.run_id());
+
+        let err = prepare_for(&ctx, &[9003], PlateSolveOrigin::Ui).err().expect("refused");
+        match err {
+            ApiError::Conflict(m) => {
+                assert!(
+                    m.starts_with("A plate solve started from the assistant is running"),
+                    "refusal text: {m}"
+                );
+                assert!(m.contains("(0 of 2 frames)"), "refusal text: {m}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        assert_eq!(slot_run_id(&ctx).as_deref(), Some(held.as_str()));
+    }
+
+    #[test]
+    fn assistant_refused_while_ui_runs() {
+        let (_tmp, ctx) = test_ctx();
+        let _ui = prepare_for(&ctx, &[9001], PlateSolveOrigin::Ui).expect("ui");
+        let err = prepare_for(&ctx, &[9002], PlateSolveOrigin::Assistant).err().expect("refused");
+        match err {
+            ApiError::Conflict(m) => {
+                assert!(
+                    m.starts_with("A plate solve batch started in Athenaeum is running"),
+                    "refusal text: {m}"
+                );
+                assert!(m.contains("(0 of 1 frames)"), "refusal text: {m}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_activity() {
+        let (_tmp, ctx) = test_ctx();
+        let a = plate_solve_activity(&ctx);
+        assert!(!a.running);
+        assert!(a.origin.is_none() && a.run_id.is_none() && a.current_file.is_none());
+        assert_eq!((a.done, a.total), (0, 0));
+    }
+
+    #[test]
+    fn activity_reports_the_running_run() {
+        let (_tmp, ctx) = test_ctx();
+        let batch = prepare_for(&ctx, &[9001, 9002, 9003], PlateSolveOrigin::Assistant).expect("prepare");
+        {
+            let solves = ctx.active_plate_solves.lock().unwrap();
+            let mut p = solves.get(&0).unwrap().progress.lock().unwrap();
+            p.done = 1;
+            p.current_file = Some("light_0002.fits".into());
+        }
+        let a = plate_solve_activity(&ctx);
+        assert!(a.running);
+        assert_eq!(a.origin, Some(PlateSolveOrigin::Assistant));
+        assert_eq!(a.run_id.as_deref(), Some(batch.run_id()));
+        assert_eq!((a.done, a.total), (1, 3));
+        assert_eq!(a.current_file.as_deref(), Some("light_0002.fits"));
+        let wire = serde_json::to_value(&a).unwrap();
+        assert_eq!(wire["origin"], "assistant");
+        assert_eq!(wire["runId"], batch.run_id());
+        assert_eq!(wire["currentFile"], "light_0002.fits");
+    }
+
+    #[test]
+    fn cancel_sets_the_flag_of_slot_zero() {
+        let (_tmp, ctx) = test_ctx();
+        assert!(!cancel_plate_solve(&ctx), "nothing to cancel");
+        let _batch = prepare_for(&ctx, &[9001], PlateSolveOrigin::Ui).expect("prepare");
+        let flag = ctx.active_plate_solves.lock().unwrap().get(&0).unwrap().cancel_flag.clone();
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(cancel_plate_solve(&ctx));
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn resolvers_report_a_missing_catalog_in_the_same_words() {
+        let (tmp, ctx) = test_ctx();
+        let err = resolve_layer_caches(&ctx).err().expect("no catalog installed");
+        let root = tmp.path().join("catalogs").join("smac_gaia");
+        let expected = format!(
+            "solvemyastro star catalog not found under {}. \
+             Please download the Gaia DR3 prebuilt catalog from Settings \u{2192} Plate Solving.",
+            root.display()
+        );
+        assert_eq!(err.to_string(), expected);
+        assert!(matches!(err, ApiError::Invalid(_)));
+        assert!(resolve_index_packs(&ctx).is_empty());
+    }
+
+    #[test]
+    fn started_event_names_its_origin() {
+        let _guard = crate::api::collab_autopublish::test_lock();
+        let (_tmp, ctx) = test_ctx();
+        let emitter = Arc::new(CapturingEmitter::default());
+        let prepared = prepare_for(&ctx, &[9001, 9002], PlateSolveOrigin::Assistant).expect("prepare");
+        let run_id = prepared.run_id().to_string();
+        run_plate_solve_batch(ctx.clone(), emitter.clone(), prepared).expect("run");
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
+
+        let started = emitter.named("plate-solve-started");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["origin"], "assistant");
+        assert_eq!(started[0]["runId"], run_id.as_str());
+        assert!(run_id.starts_with("solve-"), "run id: {run_id}");
+        assert_eq!(started[0]["total"], 2);
+    }
+
+    /// The slot's handle knows the batch's size from the moment it is claimed,
+    /// before any frame is loaded, so a refusal then is not "(0 of 0 frames)".
+    #[test]
+    fn a_refusal_while_preparing_names_the_batch_size() {
+        let (_tmp, ctx) = test_ctx();
+        let (_flag, run_id, _progress) =
+            claim_batch_slot(&ctx, PlateSolveOrigin::Assistant, 5).expect("claim");
+        assert!(run_id.starts_with("solve-"), "run id: {run_id}");
+        let err = claim_batch_slot(&ctx, PlateSolveOrigin::Ui, 1).err().expect("refused");
+        match err {
+            ApiError::Conflict(m) => assert!(m.contains("(0 of 5 frames)"), "refusal text: {m}"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// A second Athenaeum run is refused with its own words (the Ui + Ui branch).
+    #[test]
+    fn ui_refused_while_ui_runs() {
+        let (_tmp, ctx) = test_ctx();
+        let _first = prepare_for(&ctx, &[9001, 9002], PlateSolveOrigin::Ui).expect("first");
+        let err = prepare_for(&ctx, &[9003], PlateSolveOrigin::Ui).err().expect("refused");
+        match err {
+            ApiError::Conflict(m) => assert_eq!(
+                m,
+                "A plate solve batch is already running (0 of 2 frames). Wait for it or cancel it."
+            ),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// A batch dropped before `run` (an error between the two, a cancelled
+    /// plan) frees the slot: the next prepare is `Ok`.
+    #[test]
+    fn dropped_batch_frees_the_slot() {
+        let (_tmp, ctx) = test_ctx();
+        let first = prepare_for(&ctx, &[9001], PlateSolveOrigin::Assistant).expect("first");
+        assert!(slot_run_id(&ctx).is_some());
+        drop(first);
+        assert!(slot_run_id(&ctx).is_none());
+        let second = prepare_for(&ctx, &[9002], PlateSolveOrigin::Ui).expect("slot is free again");
+        assert_eq!(slot_run_id(&ctx).as_deref(), Some(second.run_id()));
+    }
+
+    /// Two prepares at once: exactly one gets the slot.
+    #[test]
+    fn check_and_insert_are_atomic() {
+        let (_tmp, ctx) = test_ctx();
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<PreparedPlateSolveBatch, ApiError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = [PlateSolveOrigin::Ui, PlateSolveOrigin::Assistant]
+                .into_iter()
+                .map(|origin| {
+                    let (ctx, barrier) = (&ctx, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        prepare_for(ctx, &[], origin)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        let conflicts =
+            results.iter().filter(|r| matches!(r, Err(ApiError::Conflict(_)))).count();
+        assert_eq!((ok, conflicts), (1, 1));
+    }
+
+    /// The recorder copies each `plate-solve-progress` event into the handle's
+    /// progress and forwards every event unchanged.
+    #[test]
+    fn recorder_copies_progress_events() {
+        let progress = Arc::new(Mutex::new(SolveProgress { total: 3, ..Default::default() }));
+        let inner = Arc::new(CapturingEmitter::default());
+        let rec = RecordingEmitter { inner: inner.clone(), progress: progress.clone() };
+        let ev = |frame_id: i64, current: usize, status: &str, file: &str, error: Option<&str>, code: Option<&str>| {
+            serde_json::json!({
+                "frame_id": frame_id, "current": current, "total": 3, "status": status,
+                "filename": file, "error": error, "failure_code": code,
+            })
+        };
+        rec.emit_json("plate-solve-progress", ev(1, 0, "solving", "a.fits", None, None));
+        assert_eq!(progress.lock().unwrap().current_file.as_deref(), Some("a.fits"));
+        rec.emit_json("plate-solve-progress", ev(1, 1, "solved", "a.fits", None, None));
+        rec.emit_json("plate-solve-progress", ev(2, 2, "failed", "b.fits", Some("no stars"), Some("X")));
+        rec.emit_json("other-event", serde_json::json!({}));
+        {
+            let p = progress.lock().unwrap();
+            assert_eq!((p.done, p.total), (2, 3));
+            assert_eq!(p.failures, vec![("b.fits".to_string(), "no stars".to_string())]);
+        }
+        // The low-confidence correction is a failure line like any other.
+        rec.emit_json(
+            "plate-solve-progress",
+            ev(1, 3, "failed", "a.fits", Some("too few"), Some("REJECTED_LOW_CONFIDENCE")),
+        );
+        let p = progress.lock().unwrap();
+        assert_eq!((p.done, p.failures.len()), (3, 2));
+        assert_eq!(inner.named("plate-solve-progress").len(), 4);
+        assert_eq!(inner.named("other-event").len(), 1);
     }
 }

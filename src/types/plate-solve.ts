@@ -118,3 +118,7 @@ export type FovSummary = { light_count: number, computable_count: number, min_fo
 
 export type AutofindStatus = "processing" | "labeled" | "no_match" | "already_labeled" | "missing_coords" | "error";
 
+export type PlateSolveOrigin = "ui" | "assistant";
+
+export type PlateSolveActivity = { running: boolean, origin: PlateSolveOrigin | null, runId: string | null, done: number, total: number, currentFile: string | null, };
+

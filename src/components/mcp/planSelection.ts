@@ -80,6 +80,6 @@ export function selectionProblems(plan: McpPlanView, sel: PlanSelection): string
     any = true;
     if (group.chooseOne !== null && g.chosen === null) problems.push(`pick the copy that stays in ${group.title}`);
   }
-  if (!any) problems.push('tick at least one file');
+  if (!any) problems.push(plan.kind === 'black_hole' ? 'tick at least one file' : 'tick at least one frame');
   return problems;
 }

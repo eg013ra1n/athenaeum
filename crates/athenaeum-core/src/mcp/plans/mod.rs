@@ -11,7 +11,10 @@
 
 mod apply;
 pub mod black_hole;
+pub mod metadata;
 mod model;
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod plate_solve;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
@@ -24,11 +27,17 @@ use serde_json::json;
 use tokio::time::Instant;
 
 pub use black_hole::{BlackHoleSource, PlanBlackHoleArgs};
+pub use metadata::PlanMetadataArgs;
+#[cfg(all(feature = "render", feature = "solver"))]
+pub use plate_solve::{PlanPlateSolveArgs, SolveRunArgs};
 pub use model::{
     catalog_values, disk_stamp, stamp_for_plan, stamp_target, DiskStamp, GroupSelection, ItemSnapshot, McpPlanView,
     PlanAnswer, PlanColumn, PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState,
     ReportLine, NOT_REACHABLE,
 };
+
+#[cfg(test)]
+pub(crate) use model::{catalog_value_reads, reset_catalog_value_reads};
 
 use super::{McpHost, McpSource};
 use crate::api::ApiError;
@@ -55,6 +64,18 @@ pub trait PlanApplier: Send + Sync {
     /// does). `sel` is the whole selection. The report holds the applier's own skips and failures; the store adds
     /// the items it skipped itself.
     fn apply(&self, host: &McpHost, plan_id: &str, sel: &PlanSelection, fresh: &[String]) -> PlanReport;
+    /// Whether the report says the applier never began its work. `Some(reason)` ends the plan `failed` with the
+    /// report kept, instead of `applied`. Only a kind whose Apply starts something that may refuse to start overrides it.
+    fn start_failure(&self, _report: &PlanReport) -> Option<String> {
+        None
+    }
+    /// Whether the kind can begin its work now. The store asks before the plan turns `applying`: an `Err` refuses the
+    /// Apply in those words and the plan stays `waiting`, so a plan the user may press again is never burnt by a
+    /// resource that is busy for a while. A resource taken after this answer still ends the plan through
+    /// [`Self::start_failure`].
+    fn ready(&self, _host: &McpHost) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub(super) struct Content {
@@ -401,6 +422,8 @@ impl PlanStore {
         })?;
         apply::check_selection(&view, &selection).map_err(invalid)?;
         content.applier.validate(&view, &selection).map_err(invalid)?;
+        // A kind whose resource is busy refuses in words, and the plan keeps waiting (no state changes here).
+        content.applier.ready(host).map_err(ApiError::Conflict)?;
 
         let span = tracing::info_span!("mcp_plan_apply", plan_id = %id, kind = view.kind.as_str());
         // The plan may have been cancelled or replaced meanwhile: decide under the lock.

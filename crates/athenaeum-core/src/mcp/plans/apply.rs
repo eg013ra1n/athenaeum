@@ -191,6 +191,11 @@ pub(super) fn run(
     };
     skipped.append(&mut report.skipped);
     report.skipped = skipped;
+    // An applier that never began (a plate-solve run refused its slot) ends the plan failed, with what it said kept.
+    if let Some(error) = content.applier.start_failure(&report) {
+        tracing::warn!(plan_id, kind, error = %error, "mcp plan applier did not start its work");
+        return Err(Failure { error, report: Some(report) });
+    }
     tracing::info!(
         via = "mcp",
         plan_id,

@@ -158,6 +158,54 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
     void loadMissing();
   }, [loadMissing]);
 
+  // A metadata plan the assistant applied wrote to the catalog: reload what the view lists.
+  const loadMissingRef = useRef(loadMissing);
+  loadMissingRef.current = loadMissing;
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<{ count: number }>('frames-metadata-changed', () => {
+        if (cancelled) return;
+        void loadMissingRef.current();
+      })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch((err) => console.error('[MissingMetadataView] listen failed:', err));
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
+  // A plate solve the assistant started wrote coordinates when it ends: reload what the view lists. A solve started in
+  // Athenaeum is refreshed by its own panel, so only an assistant's run counts (the complete event carries no origin:
+  // the started event and the activity say which run is the assistant's).
+  const assistantSolveRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+    const on = <T,>(name: string, cb: (p: T) => void) =>
+      api
+        .listen<T>(name, (p) => {
+          if (!cancelled) cb(p);
+        })
+        .then((fn) => { if (cancelled) fn(); else unlisteners.push(fn); })
+        .catch((err) => console.error('[MissingMetadataView] listen failed:', err));
+    void on<{ origin: string }>('plate-solve-started', (p) => {
+      assistantSolveRef.current = p.origin === 'assistant';
+    });
+    void on<unknown>('plate-solve-complete', () => {
+      if (!assistantSolveRef.current) return;
+      assistantSolveRef.current = false;
+      void loadMissingRef.current();
+    });
+    // A run that started before this view opened.
+    api
+      .invoke<{ running: boolean; origin: string | null } | null>('get_plate_solve_activity')
+      .then((a) => {
+        if (!cancelled && a?.running && a.origin === 'assistant') assistantSolveRef.current = true;
+      })
+      .catch((err) => console.error('[MissingMetadataView] get_plate_solve_activity failed:', err));
+    return () => { cancelled = true; unlisteners.forEach((fn) => fn()); };
+  }, []);
+
   // External refresh trigger — bumping refreshNonce reloads the table even
   // when nothing in the local effect deps changed.
   useEffect(() => {

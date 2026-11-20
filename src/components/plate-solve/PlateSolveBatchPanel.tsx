@@ -31,7 +31,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
   onSolveComplete,
   hideTriggerButtons = false,
 }, ref) {
-  const { enqueuePlateSolve, cancelBatch, dismissCompleted, activeBatches } =
+  const { enqueuePlateSolve, cancelBatch, dismissCompleted, activeBatches, foreignRun, cancelForeignRun } =
     usePlateSolveProgressContext();
 
   const [myBatchId, setMyBatchId] = useState<number | null>(null);
@@ -113,6 +113,35 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
 
   return (
     <div className="space-y-3">
+      {/* A plate solve this page did not start (the assistant's, a My Frames solve, another tab's): shown here, with its own Cancel. */}
+      {foreignRun && (
+        <div className="rounded-lg border border-border bg-surface p-3 space-y-2" role="status">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <div className="flex items-center gap-2 text-content-secondary min-w-0 flex-1">
+              <Loader2 size={14} className="animate-spin flex-shrink-0 text-accent" />
+              <span className="truncate" title={foreignRun.currentFile ?? undefined}>
+                {`${foreignRun.origin === 'assistant' ? 'Plate solve started from the assistant' : 'A plate solve batch is running'} — ${foreignRun.done} of ${foreignRun.total}${foreignRun.currentFile ? `, ${foreignRun.currentFile}` : ''}`}
+              </span>
+            </div>
+            <button
+              onClick={() => void cancelForeignRun()}
+              disabled={foreignRun.isCancelling}
+              className="flex items-center gap-2 px-3 py-1 rounded-lg text-sm font-medium transition-colors
+                border border-border hover:bg-surface-hover disabled:opacity-50"
+            >
+              <XCircle size={15} />
+              {foreignRun.isCancelling ? 'Cancelling...' : 'Cancel'}
+            </button>
+          </div>
+          <div className="h-1.5 w-full rounded-full bg-surface-hover overflow-hidden">
+            <div
+              className="h-full rounded-full bg-accent transition-[width] duration-300 ease-out"
+              style={{ width: `${foreignRun.total > 0 ? (foreignRun.done / foreignRun.total) * 100 : 0}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* What the batch would extract from zips first: the selection if there is one, else the whole list. */}
       {!hideTriggerButtons && !isActive && (
         <ZipExtractionLine scope={{ frameIds: selectedFrameIds.length > 0 ? selectedFrameIds : frameIds }} />

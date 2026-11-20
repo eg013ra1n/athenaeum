@@ -408,6 +408,8 @@ export function supportsWarningMode(
 // ============================================================================
 
 export interface PlateSolveProgressEvent {
+  /** The run these events belong to (the `solve-<uuid>` of `plate-solve-started`). */
+  run_id: string;
   frame_id: number;
   current: number;
   total: number;
@@ -423,6 +425,8 @@ export interface PlateSolveProgressEvent {
 }
 
 export interface PlateSolveCompleteEvent {
+  /** The run that ended (the `solve-<uuid>` of `plate-solve-started`). */
+  run_id: string;
   solved: number;
   failed: number;
   total: number;
