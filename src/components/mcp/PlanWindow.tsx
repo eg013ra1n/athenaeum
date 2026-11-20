@@ -21,6 +21,7 @@ export function PlanWindow() {
 const APPLY_ARM_MS = 1000;
 
 const files = (n: number) => `${n} file${n === 1 ? '' : 's'}`;
+const frames = (n: number) => `${n} frame${n === 1 ? '' : 's'}`;
 
 function PlanDialog({ plan }: { plan: McpPlanView }) {
   const { busy, apply, cancel, dismiss, openNewer } = useMcpPlan();
@@ -44,6 +45,8 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
   const waiting = kind === 'waiting';
   const canAnswer = (waiting || preparing) && !busy;
   const sum = totals(plan, sel);
+  // A plan that carries no sizes (a plate solve) shows a count only, never "0 B".
+  const hasSizes = plan.groups.some((g) => g.items.some((i) => i.sizeBytes != null));
   const problems = waiting ? selectionProblems(plan, sel) : [];
 
   // Nothing pressable has the initial focus: the window opens by itself over any page, so a Space or Enter meant for
@@ -74,7 +77,8 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
       <div className="mr-auto min-w-0 self-center">
         {(waiting || kind === 'applying') && (
           <p className="font-medium text-content-secondary">
-            {files(sum.items)} · {formatBytes(sum.bytes)}
+            {plan.kind === 'plate_solve' ? frames(sum.items) : files(sum.items)}
+            {hasSizes ? ` · ${formatBytes(sum.bytes)}` : ''}
           </p>
         )}
         {kind === 'applying' && (

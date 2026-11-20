@@ -50,4 +50,31 @@ describe('MissingMetadataView', () => {
     view.unmount();
     expect(handlers.get('frames-metadata-changed')!.size).toBe(0);
   });
+
+  it('missing_metadata_reloads_after_an_assistant_solve', async () => {
+    render(
+      <MemoryRouter>
+        <MissingMetadataView />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(loads()).toBe(1));
+    await waitFor(() => expect(handlers.get('plate-solve-complete')?.size).toBe(1));
+    await waitFor(() => expect(handlers.get('plate-solve-started')?.size).toBe(1));
+
+    // A solve started in Athenaeum is refreshed by its own panel: no second reload here.
+    await act(async () => {
+      handlers.get('plate-solve-started')!.forEach((h) => h({ origin: 'ui', runId: 'solve-u', total: 2 }));
+      handlers.get('plate-solve-complete')!.forEach((h) => h({ solved: 2, failed: 0, total: 2, total_time_ms: 1 }));
+    });
+    expect(loads()).toBe(1);
+
+    // An assistant's solve wrote coordinates: the list asks the catalog again.
+    await act(async () => {
+      handlers.get('plate-solve-started')!.forEach((h) => h({ origin: 'assistant', runId: 'solve-a', total: 2 }));
+    });
+    await act(async () => {
+      handlers.get('plate-solve-complete')!.forEach((h) => h({ solved: 2, failed: 0, total: 2, total_time_ms: 1 }));
+    });
+    await waitFor(() => expect(loads()).toBe(2));
+  });
 });

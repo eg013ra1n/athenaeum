@@ -74,6 +74,16 @@ function assistantRunOf(a: PlateSolveActivity | null): AssistantSolveRun | null 
   return { runId: a.runId, done: a.done, total: a.total, currentFile: a.currentFile, isCancelling: false };
 }
 
+/** A batch cancelled before it started: it ends now, solved nothing, and nothing waits for it. */
+function endedUnstarted(entry: ActivePlateSolveBatch): ActivePlateSolveBatch {
+  return {
+    ...entry,
+    isComplete: true,
+    isCancelling: false,
+    summary: { solved: 0, failed: 0, total: entry.frameIds.length, total_time_ms: 0 },
+  };
+}
+
 let nextBatchId = 1;
 
 export function usePlateSolveQueue() {
@@ -90,7 +100,18 @@ export function usePlateSolveQueue() {
   notifyRef.current = notify;
 
   // The plate solve the assistant started, if one runs (get_plate_solve_activity, then the events).
-  const [assistantRun, setAssistantRun] = useState<AssistantSolveRun | null>(null);
+  const [assistantRun, setAssistantRunState] = useState<AssistantSolveRun | null>(null);
+  // The same value, written at once: the event listeners (registered once) and the activity reads decide on it.
+  const assistantRunRef = useRef<AssistantSolveRun | null>(null);
+  const setAssistantRun = useCallback((update: (prev: AssistantSolveRun | null) => AssistantSolveRun | null) => {
+    const next = update(assistantRunRef.current);
+    assistantRunRef.current = next;
+    setAssistantRunState(next);
+  }, []);
+  // Bumped when a run starts, so a read that began earlier cannot hide it.
+  const assistantEpochRef = useRef(0);
+  // Runs whose end was already told (an end comes from the event and from a re-read, never twice).
+  const toldRunsRef = useRef<Set<string>>(new Set());
   // The head batch waits because another run holds the one slot; it stays queued and starts when the slot is free.
   const [held, setHeldState] = useState(false);
   const heldRef = useRef(false);
@@ -130,15 +151,69 @@ export function usePlateSolveQueue() {
     });
   }, []);
 
-  /** The slot's holder, read from the backend; `null` when it could not be read (the backend then decides). */
+  /** The assistant's line ended: hide it and tell the outcome once (the event's counts, or the line's own when the event was lost). */
+  const endAssistantRun = useCallback(
+    (payload?: PlateSolveCompleteEvent) => {
+      const run = assistantRunRef.current;
+      if (!run) return;
+      setAssistantRun(() => null);
+      const key = `plate-solve-done-${run.runId ?? 'unknown'}`;
+      if (toldRunsRef.current.has(key)) return;
+      toldRunsRef.current.add(key);
+      if (payload) {
+        notifyRef.current({
+          title: `Plate-solve finished — ${payload.solved}/${payload.total} solved`,
+          detail: payload.failed ? `${payload.failed} failed` : 'All frames solved',
+          kind: 'platesolve',
+          hasErrors: payload.failed > 0,
+          tone: payload.failed > 0 ? 'warning' : 'success',
+          dedupeKey: key,
+        });
+      } else {
+        notifyRef.current({
+          title: 'Plate solve from the assistant ended',
+          detail: `${run.done} of ${run.total} frames were done when it ended`,
+          kind: 'platesolve',
+          tone: 'info',
+          dedupeKey: key,
+        });
+      }
+    },
+    [setAssistantRun],
+  );
+
+  /** The slot's holder, read from the backend; `null` when it could not be read (the backend then decides).
+   *  Every read also moves the assistant's line: it follows the activity, whatever events arrived. */
   const readActivity = useCallback(async (): Promise<PlateSolveActivity | null> => {
+    const epoch = assistantEpochRef.current;
+    let a: PlateSolveActivity | null;
     try {
-      return await api.invoke<PlateSolveActivity | null>('get_plate_solve_activity');
+      a = await api.invoke<PlateSolveActivity | null>('get_plate_solve_activity');
     } catch (err) {
       console.error('[usePlateSolveQueue] get_plate_solve_activity failed:', err);
       return null;
     }
-  }, []);
+    const run = assistantRunOf(a);
+    if (run) {
+      // Another run than the one the line shows: the shown one ended (told), the new one takes the line.
+      if (assistantRunRef.current && assistantRunRef.current.runId !== run.runId) endAssistantRun();
+      setAssistantRun((prev) =>
+        prev && prev.runId === run.runId
+          ? {
+              ...prev,
+              // The counter never steps back; the file goes with the newer count.
+              done: Math.max(prev.done, run.done),
+              total: run.total,
+              currentFile: run.done >= prev.done ? run.currentFile ?? prev.currentFile : prev.currentFile,
+            }
+          : run,
+      );
+    } else if (a && epoch === assistantEpochRef.current) {
+      // Nothing of the assistant's runs now (a run that started after this read began is newer than it).
+      endAssistantRun();
+    }
+    return a;
+  }, [setAssistantRun, endAssistantRun]);
 
   /** Another run holds the slot: say so once per wait, keep the batch queued, and let a re-read or the complete event retry. */
   const holdBatch = useCallback(
@@ -153,7 +228,8 @@ export function usePlateSolveQueue() {
           detail: busyDetail(activity),
           tone: 'warning',
           kind: 'platesolve',
-          dedupeKey: 'plate-solve-busy',
+          // One refusal per holder run: the notification centre keeps a seen key for good.
+          dedupeKey: `plate-solve-busy-${activity.runId ?? 'unknown'}`,
         });
       }
     },
@@ -269,24 +345,26 @@ export function usePlateSolveQueue() {
 
   // The assistant's run, if one is already running when the app starts.
   useEffect(() => {
-    let cancelled = false;
-    void readActivity().then((a) => {
-      if (cancelled) return;
-      const run = assistantRunOf(a);
-      // An event that came first is newer than this read.
-      if (run) setAssistantRun((prev) => prev ?? run);
-    });
-    return () => {
-      cancelled = true;
-    };
+    void readActivity();
   }, [readActivity]);
+
+  // While the assistant's line shows, the activity is read again now and then: the complete event can be lost (web).
+  const assistantShown = assistantRun !== null;
+  useEffect(() => {
+    if (!assistantShown) return;
+    const timer = setInterval(() => void readActivity(), BUSY_REREAD_MS);
+    return () => clearInterval(timer);
+  }, [assistantShown, readActivity]);
 
   // Kick the processor whenever the queue has pending items.
   useEffect(() => {
     if (queue.length > 0 && !processingRef.current) {
       runNext();
+    } else if (queue.length === 0 && heldRef.current) {
+      // The held batch was cancelled: nothing waits for the slot any more.
+      setHeld(false);
     }
-  }, [queue, runNext]);
+  }, [queue, runNext, setHeld]);
 
   // Listen for backend progress + complete events once on mount.
   useEffect(() => {
@@ -364,7 +442,14 @@ export function usePlateSolveQueue() {
         (payload) => {
           if (cancelled) return;
           if (payload.origin === 'assistant') {
-            setAssistantRun({ runId: payload.runId, done: 0, total: payload.total, currentFile: null, isCancelling: false });
+            assistantEpochRef.current += 1;
+            setAssistantRun(() => ({
+              runId: payload.runId,
+              done: 0,
+              total: payload.total,
+              currentFile: null,
+              isCancelling: false,
+            }));
           }
         },
       )
@@ -376,13 +461,15 @@ export function usePlateSolveQueue() {
         'plate-solve-complete',
         (payload) => {
           if (cancelled) return;
-          setAssistantRun(null);
           const batchId = currentBatchIdRef.current;
           if (batchId == null) {
-            // Not the queue's batch: the slot is free now, so a held batch starts.
+            // Not the queue's batch: the assistant's run ended (told once), and the slot is free, so a held batch starts.
+            endAssistantRun(payload);
             if (heldRef.current) void runNextRef.current();
             return;
           }
+          // The queue's own batch ended. The event carries no run id, so a line the assistant's run still has
+          // is left to the next activity read.
           setActiveBatches(prev => {
             const entry = prev.get(batchId);
             if (!entry) return prev;
@@ -401,7 +488,7 @@ export function usePlateSolveQueue() {
             return updated;
           });
 
-          notify({
+          notifyRef.current({
             title: `Plate-solve finished — ${payload.solved}/${payload.total} solved`,
             detail: payload.failed
               ? `${payload.failed} failed`
@@ -422,7 +509,7 @@ export function usePlateSolveQueue() {
       unlistenComplete?.();
       unlistenStarted?.();
     };
-  }, []);
+  }, [setAssistantRun, endAssistantRun]);
 
   const enqueuePlateSolve = useCallback(
     (frameIds: number[], label?: string): number => {
@@ -455,15 +542,17 @@ export function usePlateSolveQueue() {
   );
 
   const cancelBatch = useCallback(async (batchId: number) => {
+    const isCurrent = currentBatchIdRef.current === batchId;
     setQueue(q => q.filter(item => item.batchId !== batchId));
     setActiveBatches(prev => {
       const entry = prev.get(batchId);
       if (!entry || entry.isComplete) return prev;
       const updated = new Map(prev);
-      updated.set(batchId, { ...entry, isCancelling: true });
+      // The running batch ends with its complete event; a held or queued one never started, so it ends now.
+      updated.set(batchId, isCurrent ? { ...entry, isCancelling: true } : endedUnstarted(entry));
       return updated;
     });
-    if (currentBatchIdRef.current === batchId) {
+    if (isCurrent) {
       try {
         await api.invoke('cancel_plate_solve');
       } catch {
@@ -472,8 +561,24 @@ export function usePlateSolveQueue() {
     }
   }, []);
 
-  /** Cancel the assistant's run (the same command as the queue's own cancel: one slot, one cancel handle). */
+  /** Cancel the assistant's run (the same command as the queue's own cancel: one slot, one cancel handle).
+   *  The slot is read first: only the run the line shows is cancelled, never a batch that took the slot since. */
   const cancelAssistantRun = useCallback(async () => {
+    const shown = assistantRunRef.current;
+    if (!shown) return;
+    const a = await readActivity();
+    if (a === null) {
+      // Unreadable (already logged): cancelling blind could stop another run.
+      notifyRef.current({
+        title: 'Could not cancel the plate solve',
+        detail: 'Athenaeum could not tell which plate solve is running.',
+        tone: 'warning',
+        hasErrors: true,
+        kind: 'platesolve',
+      });
+      return;
+    }
+    if (!(a.running && a.origin === 'assistant' && a.runId === shown.runId)) return;
     setAssistantRun(prev => (prev ? { ...prev, isCancelling: true } : prev));
     try {
       await api.invoke('cancel_plate_solve');
@@ -488,12 +593,13 @@ export function usePlateSolveQueue() {
         kind: 'platesolve',
       });
     }
-  }, []);
+  }, [readActivity, setAssistantRun]);
 
   const cancelAll = useCallback(async () => {
     setQueue([]);
-    if (assistantRun) void cancelAssistantRun();
-    if (currentBatchIdRef.current != null) {
+    if (assistantRunRef.current) void cancelAssistantRun();
+    const currentId = currentBatchIdRef.current;
+    if (currentId != null) {
       try {
         await api.invoke('cancel_plate_solve');
       } catch {
@@ -504,12 +610,13 @@ export function usePlateSolveQueue() {
       const updated = new Map(prev);
       for (const [, entry] of updated) {
         if (!entry.isComplete) {
-          updated.set(entry.batchId, { ...entry, isCancelling: true });
+          // The running batch ends with its complete event; a held or queued one never started.
+          updated.set(entry.batchId, entry.batchId === currentId ? { ...entry, isCancelling: true } : endedUnstarted(entry));
         }
       }
       return updated;
     });
-  }, [assistantRun, cancelAssistantRun]);
+  }, [cancelAssistantRun]);
 
   const dismissCompleted = useCallback((batchId: number) => {
     setActiveBatches(prev => {

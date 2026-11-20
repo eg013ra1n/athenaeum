@@ -46,7 +46,7 @@ export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGrou
       {state.kind === 'cancelled' && <p className="text-content-muted">This plan was cancelled. Nothing was changed.</p>}
       {state.kind === 'failed' && (
         <p className="text-error">
-          {plan.kind === 'plate_solve' && plan.report
+          {plan.kind === 'plate_solve'
             ? 'Nothing was started'
             : plan.report
               ? 'This plan failed'

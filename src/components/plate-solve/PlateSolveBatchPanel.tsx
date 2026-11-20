@@ -118,7 +118,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
         <div className="rounded-lg border border-border bg-surface p-3 space-y-2" role="status">
           <div className="flex items-center justify-between gap-3 text-sm">
             <div className="flex items-center gap-2 text-content-secondary min-w-0 flex-1">
-              <Loader2 size={14} className="animate-spin flex-shrink-0 text-violet-400" />
+              <Loader2 size={14} className="animate-spin flex-shrink-0 text-accent" />
               <span className="truncate" title={assistantRun.currentFile ?? undefined}>
                 Plate solve started from the assistant — {assistantRun.done} of {assistantRun.total}
                 {assistantRun.currentFile ? `, ${assistantRun.currentFile}` : ''}
@@ -136,7 +136,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
           </div>
           <div className="h-1.5 w-full rounded-full bg-surface-hover overflow-hidden">
             <div
-              className="h-full rounded-full bg-violet-500 transition-[width] duration-300 ease-out"
+              className="h-full rounded-full bg-accent transition-[width] duration-300 ease-out"
               style={{ width: `${assistantRun.total > 0 ? (assistantRun.done / assistantRun.total) * 100 : 0}%` }}
             />
           </div>

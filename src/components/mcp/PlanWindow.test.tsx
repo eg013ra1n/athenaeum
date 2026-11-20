@@ -534,6 +534,22 @@ describe('PlanWindow', () => {
     );
     expect(await screen.findByText(/Nothing was started: A plate solve batch started in Athenaeum is running/)).toBeTruthy();
     cleanup();
+    // A plate-solve plan that failed before any report: the same words, never "Preparing the plan failed".
+    await showThen(
+      plan({ kind: 'plate_solve', state: { kind: 'failed', error: 'no catalog' }, report: null, groups: [] }),
+    );
+    expect(await screen.findByText(/Nothing was started: no catalog/)).toBeTruthy();
+    expect(screen.queryByText(/Preparing the plan failed/)).toBeNull();
+    cleanup();
+    // The footer of a plate-solve plan without sizes counts frames and shows no byte total.
+    const unsized = plan({ kind: 'plate_solve' });
+    await showThen({
+      ...unsized,
+      groups: unsized.groups.map((g) => ({ ...g, chooseOne: null, items: g.items.map((i) => ({ ...i, sizeBytes: null })) })),
+    });
+    expect(await screen.findByText(/^\d+ frames?$/)).toBeTruthy();
+    expect(screen.queryByText(/· 0 B/)).toBeNull();
+    cleanup();
     // A Black Hole plan keeps its "applied" chip.
     await showThen(
       plan({ state: { kind: 'applied' }, report: { applied: [{ ...line, reason: 'moved to the Black Hole' }], skipped: [], failed: [], runId: null } }),
