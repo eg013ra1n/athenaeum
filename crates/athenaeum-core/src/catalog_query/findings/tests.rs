@@ -112,11 +112,12 @@ fn catalog() -> Connection {
 
 /// A catalog with two header groups under the `nas` scan root and a master group under the `lib` root.
 struct Dups {
-    _tmp: tempfile::TempDir,
     base: std::path::PathBuf,
+    // Fields drop in declaration order: the pool holding `catalog.db` open goes before its folder is removed.
     ctx: ServiceContext,
     /// The file id of pair B's copy under `nas/c`.
     c_copy: i64,
+    _tmp: tempfile::TempDir,
 }
 
 fn dups() -> Dups {
@@ -150,7 +151,7 @@ fn dups() -> Dups {
         put(&conn, &base.join("lib").join("one"), "master.xisf", &m);
         put(&conn, &base.join("lib").join("two"), "master.xisf", &m);
     }
-    Dups { _tmp: tmp, base, ctx, c_copy }
+    Dups { base, ctx, c_copy, _tmp: tmp }
 }
 
 fn resolved(ctx: &ServiceContext, scope: &Scope) -> crate::scope::ResolvedScope {
@@ -383,10 +384,13 @@ fn processing_folder_is_said_as_an_inference() {
         Some("this folder holds 2 masters or processed files and no raw lights; it looks like a processing folder")
     );
 
-    // A processed light (flagged as a master) is a processed file, never a raw light (P6).
+    // A processed light (flagged as a master) is a processed file, never a raw light (P6). One file reads singular.
     let lone = base.join("lone");
     put(&conn, &lone, "stack.xisf", &Spec { kind: Some(ImageType::Light), is_master: true, ..spec() });
-    assert!(processing_folder_note(&conn, &text(&lone)).expect("note").is_some());
+    assert_eq!(
+        processing_folder_note(&conn, &text(&lone)).expect("note").as_deref(),
+        Some("this folder holds 1 master or processed file and no raw lights; it looks like a processing folder")
+    );
 
     // A raw light next to them: no inference.
     put(&conn, &proc, "l1.fits", &Spec { kind: Some(ImageType::Light), ..spec() });
@@ -400,4 +404,26 @@ fn processing_folder_is_said_as_an_inference() {
     let sibling = base.join("lone2");
     put(&conn, &sibling, "l1.fits", &Spec { kind: Some(ImageType::Light), ..spec() });
     assert!(processing_folder_note(&conn, &text(&lone)).expect("note").is_some(), "lone2 is not lone");
+}
+
+#[test]
+fn processing_folder_note_leaves_the_black_hole_out() {
+    let conn = catalog();
+    let base = std::path::PathBuf::from(if cfg!(windows) { "C:\\stack" } else { "/stack" });
+
+    // The only raw light is in the Black Hole: the master stands alone, the note is given.
+    let gone_light = base.join("gone-light");
+    put(&conn, &gone_light, "m1.xisf", &Spec { kind: Some(ImageType::MasterDark), is_master: true, ..spec() });
+    let (light_file, _) = put(&conn, &gone_light, "l1.fits", &Spec { kind: Some(ImageType::Light), ..spec() });
+    assert_eq!(processing_folder_note(&conn, &text(&gone_light)).expect("note"), None, "the light still counts");
+    black_hole(&conn, light_file);
+    assert!(processing_folder_note(&conn, &text(&gone_light)).expect("note").is_some());
+
+    // The only master is in the Black Hole and no raw light is left: no note.
+    let gone_master = base.join("gone-master");
+    let (master_file, _) =
+        put(&conn, &gone_master, "m1.xisf", &Spec { kind: Some(ImageType::MasterDark), is_master: true, ..spec() });
+    assert!(processing_folder_note(&conn, &text(&gone_master)).expect("note").is_some());
+    black_hole(&conn, master_file);
+    assert_eq!(processing_folder_note(&conn, &text(&gone_master)).expect("note"), None);
 }

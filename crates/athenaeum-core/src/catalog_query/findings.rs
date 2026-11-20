@@ -209,9 +209,8 @@ pub fn processing_folder_note(conn: &Connection, folder: &str) -> Result<Option<
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok((masters >= 1 && raw_lights == 0).then(|| {
-        format!(
-            "this folder holds {masters} masters or processed files and no raw lights; it looks like a processing folder"
-        )
+        let held = if masters == 1 { "1 master or processed file".to_string() } else { format!("{masters} masters or processed files") };
+        format!("this folder holds {held} and no raw lights; it looks like a processing folder")
     }))
 }
 
