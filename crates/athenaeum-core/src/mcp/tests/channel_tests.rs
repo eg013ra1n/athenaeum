@@ -118,6 +118,24 @@ async fn shake(endpoint: &Endpoint, line: &str) -> (Stream, String) {
     (stream, reply)
 }
 
+/// Nothing accepts a connection at `endpoint`. On Unix the first attempt must be refused. On Windows the pipe instance
+/// that was waiting for a client closes only when the runtime next processes I/O: dropping it cancels its pending
+/// connect, and mio keeps the handle until that cancellation completes. So there the check gives the runtime up to 2 s,
+/// dropping any connection the closing instance still took.
+async fn refused_soon(endpoint: &Endpoint) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match connect(endpoint).await {
+            Err(_) => return true,
+            Ok(stream) => drop(stream),
+        }
+        if !cfg!(windows) || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn tool_names(stream: Stream) -> Vec<String> {
     let client = rmcp::serve_client_with_lifecycle((), stream, ClientLifecycleMode::Initialize).await.expect("the client connects");
     let mut names: Vec<String> = client.list_all_tools().await.expect("tools").into_iter().map(|t| t.name.to_string()).collect();
@@ -297,7 +315,7 @@ async fn vanished_socket_is_rebound() {
     let endpoint = rig.endpoint();
     if let Endpoint::Unix(path) = &endpoint {
         std::fs::remove_file(path).expect("a $TMPDIR cleaner takes the socket file");
-        assert!(connect(&endpoint).await.is_err(), "nothing answers at a vanished socket");
+        assert!(refused_soon(&endpoint).await, "nothing answers at a vanished socket");
     }
     rig.host.recheck_endpoint();
     let (_s, reply) = shake(&rig.endpoint(), &format!("{HANDSHAKE_PREFIX} {}", rig.token())).await;
@@ -343,7 +361,7 @@ async fn stored_off_beats_the_marker_when_the_catalog_opens() {
     assert_eq!((status.enabled, status.state.as_str()), (false, "off"));
     assert!(!rig.file("enabled").exists() && !rig.file("endpoint").exists());
     assert!(rig.file("token").exists(), "the token stays");
-    assert!(connect(&endpoint).await.is_err(), "the early listener is closed");
+    assert!(refused_soon(&endpoint).await, "the early listener is closed");
     // Idempotent: a second open changes nothing.
     rig.host.on_catalog_open().expect("open again");
     assert_eq!(rig.host.status().state, "off");
@@ -442,7 +460,7 @@ async fn disable_removes_endpoint_marker_and_tool_list_keeps_the_token() {
     }
     assert_eq!(rig.token(), token, "the token stays");
     assert_cut_off(&mut stream).await;
-    assert!(connect(&endpoint).await.is_err(), "nobody listens any more");
+    assert!(refused_soon(&endpoint).await, "nobody listens any more");
     rig.finish().await;
 }
 
@@ -452,7 +470,7 @@ async fn shutdown_keeps_the_marker_and_the_tool_list_for_the_next_start() {
     rig.host.set_enabled(true).expect("on");
     let endpoint = rig.endpoint();
     rig.host.shutdown();
-    assert!(connect(&endpoint).await.is_err());
+    assert!(refused_soon(&endpoint).await);
     assert!(rig.file("enabled").exists() && rig.file("tools.json").exists() && rig.file("token").exists());
     assert_eq!(rig.kv().as_deref(), Some("true"), "quitting does not turn it off");
     rig.finish().await;
@@ -594,7 +612,7 @@ async fn off_in_the_other_instance_reaches_the_server() {
     assert_eq!(status.state, "off", "{:?}", status.last_error);
     assert!(!status.enabled && !first.host.is_serving());
     assert!(!first.file("endpoint").exists() && !first.file("enabled").exists());
-    assert!(connect(&endpoint).await.is_err(), "the socket is closed");
+    assert!(refused_soon(&endpoint).await, "the socket is closed");
     second.shutdown();
     drop(second);
     first.finish().await;

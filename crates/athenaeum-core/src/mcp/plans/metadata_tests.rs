@@ -21,7 +21,7 @@ fn text(p: &Path) -> String {
 
 /// A catalog file with a real file behind it, in `nas/<dir>`; `set` fills the frame.
 fn put(rig: &Rig, dir: &str, name: &str, set: impl FnOnce(&mut Frame)) -> Fx {
-    let path = rig.base.join("nas").join(dir).join(name);
+    let path = dir_of(rig, dir).join(name);
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("dir");
     std::fs::write(&path, b"FITS").expect("write file");
     let database = rig.ctx.db.get().expect("db");
@@ -59,8 +59,10 @@ fn light(rig: &Rig, dir: &str, name: &str, object: Option<&str>) -> Fx {
     })
 }
 
+/// `nas/<dir>`, with `dir` written `a/b` and joined part by part: `Path::join("a/b")` keeps the `/` on Windows, and a
+/// stored path spelt `…\nas\a/b\…` is one no scanner writes and no scope folder (separators made native) matches.
 fn dir_of(rig: &Rig, dir: &str) -> PathBuf {
-    rig.base.join("nas").join(dir)
+    dir.split('/').fold(rig.base.join("nas"), |path, part| path.join(part))
 }
 
 fn item_id_of(fx: &Fx, field: FillField) -> String {

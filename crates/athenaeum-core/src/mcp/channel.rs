@@ -366,6 +366,11 @@ fn lock_state(state: &Mutex<CloseState>) -> MutexGuard<'_, CloseState> {
 /// What that covers: the listener and a connection still in its handshake phase close inside `close`. A session that has
 /// completed `initialize` is different: rmcp moves its transport into a task of its own, and cancelling the session only
 /// asks that task to stop, so the stream closes when rmcp's task next runs after the cancellation, not inside `close`.
+///
+/// On Windows a pipe instance that is waiting for a client outlives `close` by a moment: dropping it cancels its pending
+/// connect, and mio keeps the handle until the runtime processes that cancellation. A client that opens the pipe in
+/// between reaches an instance nobody serves and gets no handshake reply (the bridge then says the app is not running
+/// and tries again at the next request).
 #[derive(Clone)]
 pub struct Closer {
     state: Arc<Mutex<CloseState>>,
@@ -437,7 +442,8 @@ where
 }
 
 /// Accepts connections on `listener` in a closable task and sends each to the returned receiver. Dropping the task (the
-/// [`Closer`]) drops the listener, and with it the waiting pipe instance on Windows.
+/// [`Closer`]) drops the listener, and with it the waiting pipe instance on Windows (whose handle goes a moment later:
+/// see [`Closer`]).
 pub fn spawn_acceptor(
     handle: &tokio::runtime::Handle,
     listener: Listener,

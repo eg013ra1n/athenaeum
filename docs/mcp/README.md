@@ -163,7 +163,11 @@ echoed. A later host still serves `/1`.
 - *How a connection closes.* `Run::close` drops the listener, the handshake-phase tasks and every session task inside the call. A
   session that has completed `initialize` has been handed to rmcp's own task, which is only cancelled: its stream closes when that
   task next runs (`regenerate_cuts_off_connected_clients`: end of stream within 2 s). A Windows pipe name is fresh per bind, so a
-  late-closing instance never blocks the next bind.
+  late-closing instance never blocks the next bind. The Windows instance that waits for the next client also outlives the call
+  by a moment: dropping it cancels its pending connect, and mio keeps the handle until the runtime processes the cancellation.
+  A client that opens the pipe in that window gets no handshake reply, and the bridge says "not running" and tries again at
+  the next request. The channel tests therefore give the runtime up to 2 s on Windows before a closed endpoint must refuse
+  (`refused_soon`); the first CI run of these tests on Windows (2026-11-21) failed without it.
 - Channel tasks run on the caller's tokio runtime, or on a small fallback runtime (`mcp-channel`, 2 workers) when the caller is not
   inside one (a window's setup closure).
 
