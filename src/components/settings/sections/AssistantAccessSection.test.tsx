@@ -206,4 +206,76 @@ describe('AssistantAccessSection', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Regenerate access key' }));
     await waitFor(() => expect(callsOf('regenerate_mcp_token')).toHaveLength(1));
   });
+
+  describe('Add to Claude desktop', () => {
+    const CFG = '/Users/me/Library/Application Support/Claude/claude_desktop_config.json';
+    const WITH_CFG: McpStatus = { ...DESKTOP_ON, claudeDesktopConfig: CFG };
+
+    it('shows_add_button_when_config_path_known', async () => {
+      await renderSection(WITH_CFG);
+      expect(await screen.findByRole('button', { name: 'Add to Claude desktop' })).toBeTruthy();
+      expect(screen.getByText(/keeps a copy of the old file/)).toBeTruthy();
+    });
+
+    it('hides_add_button_on_web_and_when_path_unknown', async () => {
+      const { unmount } = await renderSection(DESKTOP_ON);
+      await screen.findByText('Client configuration');
+      expect(screen.queryByRole('button', { name: 'Add to Claude desktop' })).toBeNull();
+      unmount();
+      platform.tauri = false;
+      const web = await renderSection({ ...WITH_CFG, token: 'KEY123' });
+      await screen.findByText('Client configuration');
+      expect(screen.queryByRole('button', { name: 'Add to Claude desktop' })).toBeNull();
+      web.unmount();
+      platform.tauri = true;
+      const path = '/private/var/folders/x/AppTranslocation/ABC/d/Athenaeum.app/Contents/MacOS/athenaeum-mcp';
+      await renderSection({ ...WITH_CFG, bridgePath: path });
+      await screen.findByText(/App Translocation/);
+      expect(screen.queryByRole('button', { name: 'Add to Claude desktop' })).toBeNull();
+    });
+
+    it('add_success_shows_restart_line', async () => {
+      let resolve: (v: unknown) => void = () => {};
+      route({
+        add_mcp_to_claude_desktop: () => new Promise((r) => (resolve = r)),
+      });
+      await renderSection(WITH_CFG);
+      const button = (await screen.findByRole('button', { name: 'Add to Claude desktop' })) as HTMLButtonElement;
+      fireEvent.click(button);
+      fireEvent.click(button);
+      await waitFor(() => expect(button.disabled).toBe(true));
+      resolve({ path: CFG, replaced: true, backup: `${CFG}.bak` });
+      expect(await screen.findByText(`Added to ${CFG}. Restart Claude desktop to load it. Replaced the earlier entry.`)).toBeTruthy();
+      expect(callsOf('add_mcp_to_claude_desktop')).toHaveLength(1);
+      expect(callsOf('add_mcp_to_claude_desktop')[0]!.length).toBe(1); // no args
+      await waitFor(() => expect(button.disabled).toBe(false));
+      expect(notifyMock).not.toHaveBeenCalled();
+    });
+
+    it('add_success_without_replace_has_no_replaced_sentence', async () => {
+      route({ add_mcp_to_claude_desktop: () => ({ path: CFG, replaced: false, backup: null }) });
+      await renderSection(WITH_CFG);
+      fireEvent.click(await screen.findByRole('button', { name: 'Add to Claude desktop' }));
+      expect(await screen.findByText(`Added to ${CFG}. Restart Claude desktop to load it.`)).toBeTruthy();
+    });
+
+    it('add_failure_notifies', async () => {
+      const why = 'claude_desktop_config.json is not valid JSON (line 3, column 5); it was left as it is.';
+      route({ add_mcp_to_claude_desktop: () => Promise.reject(why) });
+      await renderSection(WITH_CFG);
+      fireEvent.click(await screen.findByRole('button', { name: 'Add to Claude desktop' }));
+      await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(1));
+      expect(notifyMock.mock.calls[0]![0]).toMatchObject({ tone: 'warning', detail: why, dedupeKey: 'mcp-settings' });
+      expect(screen.queryByText(/Restart Claude desktop to load it/)).toBeNull();
+    });
+  });
+
+  it('copy_block_does_not_break_words', async () => {
+    await renderSection(DESKTOP_ON);
+    const block = await screen.findByText(/mcpServers/, { selector: 'pre' });
+    expect(block.className).toContain('whitespace-pre');
+    expect(block.className).toContain('overflow-x-auto');
+    expect(block.className).not.toContain('whitespace-pre-wrap');
+    expect(block.className).not.toContain('break-all');
+  });
 });
