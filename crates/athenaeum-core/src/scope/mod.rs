@@ -149,6 +149,9 @@ fn member_of_set_sql(used_copy: bool, extra: &str) -> String {
 /// The most files one scope names.
 const MAX_FILES: usize = 2000;
 
+/// How many unknown entries of `files` get a lookup of similar file names for their hint.
+const MAX_FILE_HINT_LOOKUPS: usize = 5;
+
 /// The handle an answer gives a frame set: `set:<id>`.
 pub fn frame_set_handle(id: i64) -> String {
     format!("set:{id}")
@@ -317,7 +320,10 @@ pub fn describe_scope(scope: &Scope) -> String {
     if let Some(t) = scope.tab {
         parts.push(format!("in {}", tab_label(t)));
     }
-    if let Some(files) = file_entries(scope) {
+    if let Some(mut files) = file_entries(scope) {
+        // A file listed twice is one file.
+        files.sort_unstable();
+        files.dedup();
         parts.push(if files.len() == 1 { "1 named file".to_string() } else { format!("{} named files", files.len()) });
     }
     if let Some(e) = scope.exposure_s {
@@ -515,14 +521,17 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
             return Err(anyhow::anyhow!("at most {MAX_FILES} files; narrow the scope"));
         }
         let mut ids: Vec<i64> = Vec::new();
+        let mut unknown = 0usize;
         for entry in entries {
             match file_id_for_entry(conn, entry)? {
                 Some(id) => ids.push(id),
-                None => hints.push(NearestHint {
-                    condition: "file",
-                    given: entry.to_string(),
-                    existing: files_named_like(conn, entry)?,
-                }),
+                None => {
+                    // The lookup by file name scans the catalog: only the first few unknown entries get it.
+                    let existing =
+                        if unknown < MAX_FILE_HINT_LOOKUPS { files_named_like(conn, entry)? } else { Vec::new() };
+                    unknown += 1;
+                    hints.push(NearestHint { condition: "file", given: entry.to_string(), existing });
+                }
             }
         }
         ids.sort_unstable();

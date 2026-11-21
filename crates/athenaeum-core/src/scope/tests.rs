@@ -696,6 +696,40 @@ fn files_named_as_an_answer_prints_them() {
 }
 
 #[test]
+fn files_named_by_printed_name_when_it_differs_from_the_path() {
+    let c = cat();
+    let (id, _) = c.add(&light("M31/stored_as.fits"));
+    c.add(&light("M31/other.fits"));
+    c.db.conn()
+        .execute("UPDATE files SET filename = 'Shown.fits' WHERE id = ?1", [id])
+        .expect("rename display name");
+    let line = c.printed(id);
+    assert_eq!(line.file_name, "Shown.fits");
+    let entry = format!("{}{}{}", line.folder, std::path::MAIN_SEPARATOR, line.file_name);
+    assert_ne!(entry, c.path("M31/stored_as.fits"), "only the printed-name lookup can find it");
+    assert_eq!(c.scoped_names(&files_scope(&[entry])), vec!["Shown.fits".to_string()]);
+}
+
+#[test]
+fn files_hint_lookups_are_capped() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    let entries: Vec<String> = (0..7).map(|i| c.path(&format!("gone{i}/a.fits"))).collect();
+    let r = c.resolve(&files_scope(&entries));
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints.len(), 7);
+    for (i, h) in r.hints.iter().enumerate() {
+        assert_eq!(h.condition, "file");
+        assert_eq!(h.given, entries[i]);
+        if i < 5 {
+            assert_eq!(h.existing, vec![c.path("M31/a.fits")], "hint {i} looks the name up");
+        } else {
+            assert!(h.existing.is_empty(), "hint {i} is past the lookup cap");
+        }
+    }
+}
+
+#[test]
 fn files_narrow_with_other_fields() {
     let c = cat();
     c.add(&light("M31/a.fits"));
@@ -804,4 +838,12 @@ fn describe_scope_names_files_and_handle() {
     };
     assert_eq!(describe_scope(&s), "frame set set:231, in WIP, 2 named files");
     assert_eq!(describe_scope(&Scope { files: Some(vec!["a".into()]), ..Default::default() }), "1 named file");
+}
+
+#[test]
+fn describe_scope_counts_a_file_listed_twice_once() {
+    let twice = Scope { files: Some(vec!["a".into(), " a ".into(), "a".into()]), ..Default::default() };
+    assert_eq!(describe_scope(&twice), "1 named file");
+    let two = Scope { files: Some(vec!["a".into(), "b".into(), "a".into()]), ..Default::default() };
+    assert_eq!(describe_scope(&two), "2 named files");
 }
