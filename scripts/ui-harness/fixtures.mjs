@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mcpPlanHandlers } from './mcpPlan.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const MOCKUP = path.join(ROOT, 'docs/superpowers/research/2026-09-29-collab-project-layout-mockup.html');
@@ -415,6 +416,7 @@ export function buildFixtures(scenario = 'default') {
     get_setting: (args) => args.defaultValue ?? null,
   };
   if (scenario === 'stacking') Object.assign(handlers, stackingHandlers({ projectId: PID, card, nameOf: (id) => MBY[id].name, acc }));
+  if (scenario === 'mcp-plan') Object.assign(handlers, mcpPlanHandlers(process.env.HARNESS_PLAN || 'black_hole'));
   return { handlers, counts: { frames: FRAMES.length, members: MEMBERS.length } };
 }
 
