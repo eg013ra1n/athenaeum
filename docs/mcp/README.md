@@ -22,6 +22,7 @@ An assistant (Claude desktop, Claude Code, ...) asks Athenaeum about one astroph
 | `McpHost` (context, identity, the reader, `on_catalog_open`, `source`) | `mcp/mod.rs` |
 | The local channel: endpoint, handshake, the channel files | `mcp/channel.rs` |
 | On/off lifecycle, the key, `McpStatus`, the client config text | `mcp/lifecycle.rs`; commands' logic in `api/mcp.rs` |
+| Merging the entry into Claude desktop's configuration file | `mcp/claude_desktop.rs`; `api::mcp::add_to_claude_desktop` |
 | `Answer`, `to_tool_result` (line 1 + both halves) | `mcp/answer.rs` |
 | `AthenaeumMcp` (the rmcp handler, `INSTRUCTIONS`) | `mcp/server.rs` |
 | Tool bodies, argument types, the scope step | `mcp/tools/{mod,catalog,plans}.rs` |
@@ -38,9 +39,12 @@ Every answer is two halves that each read on their own.
 - **Text, line 1:** `[<server name> <version> · catalog <db path>]`. The server name is `athenaeum` (release) or `athenaeum-dev`
   (debug build, `mcp_server_name()`), so one assistant can hold both.
 - **Structured half:** `{"source": {"build", "version", "catalog"}, ...}` then the tool's own fields, camelCase.
-- **Files are named by file name and folder.** The text never shows a handle (`file:<id>`). Every structured object with a
+- **Files are named by file name and folder.** The text never shows a file handle (`file:<id>`). Every structured object with a
   `handle` also has `fileName` and `folder`; a duplicate group's `handle` (`dup:<key>:<hash>`) sits beside the file name and
-  folder of its first copy for that reason. No table or column name, hash or set id appears in a description.
+  folder of its first copy for that reason. No table or column name or hash appears in a description. **One exception, a frame
+  set's handle `set:<id>`** (owner, 2026-11-21): it is shown in both halves, because two sets can share a name (set 109 in WIP and
+  set 231 in Stage are both `LDN 1272`) and Claude desktop's model reads only the text, so a name alone cannot tell them apart
+  and the handle is the only way to ask for one (`frameSet: "set:231"`).
 - **A failure is an error result in words** (`isError`, same line 1, `{"source", "error"}`), never a protocol error: a client
   shows a protocol error's message to nobody. A protocol error is only for an unknown tool or a malformed request.
 - **A scope that names nothing the catalog holds is an answer**, not an error: it says `no camera 'CamB'; the catalog has 'CamA'`
@@ -53,14 +57,14 @@ Every answer is two halves that each read on their own.
 | Tool | Answers |
 | ---- | ------- |
 | `catalog_overview` | The default scope: totals by frame type, how many objects, cameras, telescopes and filters, first and last night, storage, duplicate groups, missing-metadata counts per category |
-| `query_frames` | Totals and integration time over a scope, optional `groupBy`, a page of files (`filesPage`), a stored-measurement summary (`quality`), calibration (`calibration`), storage (`storage`) |
+| `query_frames` | Totals and integration time over a scope, optional `groupBy`, a page of files (`filesPage`), a stored-measurement summary (`quality`), calibration (`calibration`), storage (`storage`). Frame sets are told apart by handle: every set entry (`frameSet`, `frameSets[]`) carries `handle` (`set:<id>`), `tab` (`stage` / `wip` / `archive`), `cameras`, `telescopes`, `centre` (`objctra` / `objctdec` as stored, or null) and `nights`; the text heading reads `Frame set 'LDN 1272' (Stage, set:231), nights ..., camera ATR2600M`. `groupBy frameSet` groups by set, not by name (label `'<name>' (<Tab>, set:<id>)`, `frameSetHandles` in the group's data). When the scope names `object`, `frameSet` or `tab` and the set-by-set answer did not run, `frameSetsInScope` (`handle`, `name` or null for an unnamed set, `tab`, `frames`; largest first, 50 shown, `frameSetsInScopeMore` counts the rest) and one text line list every set the scope's frames belong to (a frame in two sets is listed under both). `calibration.lines[]` carry `frameSetHandle` and `tab`. `quality` keeps the current figures apart from `earlier`, one entry per measure version (newest first, legacy rows last): `version` (null = measured before versions were recorded), `legacy`, `frames`, `min` / `median` / `max`, `lowOutliers` / `highOutliers`, `refused` (a legacy trailed row is refused as `stars trailed (legacy flag)`, as the app judges it) and `action`; `olderVersion` stays the count of all such rows, and the old one-line sentence stays only when `earlier` is empty (`transparency_loss`, whose currency is `ZP_VERSION`, has none) |
 | `file_details` | One file: header values, stored measurements and whether they are current, transparency, calibration links, copies, plate solve |
 | `find_duplicates` | Duplicate groups with a copy in the scope, each copy with file name, folder, scan root kind and a processing-folder note |
 | `find_missing_metadata` | The Missing Metadata view's rows inside the scope: counts per category, folders, a page of files |
 | `find_rebuilt_masters { scope, page }` | Masters of the calibration library built more than once (the `_2` / `_3` copy a rebuild wrote beside the first): groups of copies with how many calibration links point at each (`linkCount`: light frames, and master sets that use it as a dark or bias); not duplicates by any hash, so `find_duplicates` does not list them (`rebuilt:<lowest file id>` handles). Reads through the reader (`catalog_query` helpers only); like `find_duplicates`, a group is in the scope when one of its copies is, and it is then listed whole (every copy, its handle the lowest file id of the whole group, so `plan_black_hole` finds it) |
 | `plan_black_hole { source, groups, keepInFolder?, keepFiles? }` | Prepares a Black Hole plan from named groups (`source` `duplicates` or `rebuilt_masters`); see "Black Hole plans" below. Changes nothing until the user applies the plan in Athenaeum's window. A plan with copies to byte-check answers at once with state `preparing` (the checks run on a thread of their own); the answer of a published plan lists every copy and its fate |
 | `plan_metadata_fill { scope, fields?, statement? }` | Prepares a metadata plan: fills the object (lights only), camera, date or frame type that frames in the scope miss, from evidence or from `statement {field, value}` (the user's own word); see "Metadata plans" below. Refused in words, leaving the waiting plan alone, when the scope names nothing, nothing can be proposed or the plan would hold more than 2 000 items. The plan is published before the tool answers, and the answer lists every group and frame |
-| `plan_plate_solve { scope, onlyUnsolved? }` | Prepares a plate-solve plan over the lights of the scope (those that miss coordinates unless `onlyUnsolved` is false); see "Plate-solve plans" below. Refused in words, leaving the waiting plan alone, when the scope names nothing, no light is left to solve or the plan would hold more than 2 000 items, and refused while any plate-solve batch runs (the running run's own words). Solver builds only |
+| `plan_plate_solve { scope, onlyUnsolved? }` | Prepares a plate-solve plan over the lights of the scope: by default only those with no stored plate solve (`onlyUnsolved` true; a light whose header holds mount coordinates but was never solved is planned); `onlyUnsolved` false is a re-solve plan, every light of the scope, solved or not. A plan holds at most 2 000 frames: narrow by folder, night, frame set or `files`. See "Plate-solve plans" below. Refused in words, leaving the waiting plan alone, when the scope names nothing, no light is left to solve or the plan would hold more than 2 000 items, and refused while any plate-solve batch runs (the running run's own words). Apply skips a frame solved since an `onlyUnsolved` plan was made (`solved since the plan was made`); a re-solve plan solves again. Solver builds only |
 | `solve_status { runId }` | A run's progress while it runs (frames done of total, failed so far, the file being solved, each failure by file name and folder; no solved count, the store can still reject a frame or roll the batch back) and its result after it (solved, failed with every failed file and its error, frames a cancel left unattempted). Changes nothing; knows the runs the assistant started since Athenaeum opened (the last 20). Solver builds only |
 | `cancel_solve { runId }` | Sets the cancel flag of the assistant's own run, and only while slot 0 holds that exact `runId`; a run started in Athenaeum's window, an ended run or an unknown id is answered in words and nothing is stopped. It stops a run, it never decides a plan (the one tool name that says "cancel"; `no_tool_applies_a_plan` allows it by name). Solver builds only |
 | `plan_status {planId}` | Where a plan stands, for a plan made on any connection (`mcp/tools/plans.rs`): `waiting for you in Athenaeum's window (expires <time>)`, `applied` with the report (applied, skipped, failed, each by file name and folder), cancelled, replaced, expired, failed; an unknown id says `No plan <id>: Athenaeum restarted since, or the plan is older than a day.` (an answer, not an error). Only an `applied` plan's text says "applied" (`only_an_applied_plan_says_applied`): a plan that ended `failed` reads `Failed: <reason>.` and, when it got something done, `Done before it stopped: N done, N skipped, N failed.` (and never "applied"); before a line was written the words follow the kind (Black Hole `No file was recorded as moved before it stopped.`, metadata `No value was written before it stopped.`, plate solve `Nothing was started before it stopped.`), and a plate-solve plan that was refused its start says the reason once, `Nothing was started: <reason>.`, with no `Failed:` line above it |
@@ -77,9 +81,24 @@ are in the Black Hole the text adds `N frames of this set are in the Black Hole 
 ## The scope
 
 One `Scope` (`scope::Scope`) filters every question and plan; every field narrows, an absent one does not. Text values match a
-value the catalog holds, ignoring case and runs of spaces, never a part of one. User-supplied paths enter in two places only,
-`file_details.file` and `Scope.folder` / `scanRoot`; both are matched against the catalog's stored paths (equality,
+value the catalog holds, ignoring case and runs of spaces, never a part of one. User-supplied paths enter in three places only,
+`file_details.file`, `Scope.folder` / `scanRoot` and `Scope.files`; all are matched against the catalog's stored paths (equality,
 separator-strict prefix) and never opened or `canonicalize`d.
+
+Three fields added by the 2026-11-21 smoke fixes (`scope/mod.rs`):
+
+- **`files`** names exact files. Each entry is the folder and file name joined as an answer prints them (a loose file's path, or a
+  zip-resident row's printed folder + `/` + name; `\` also splits), a full path as the catalog stores it, or a `file:<n>` handle
+  an earlier structured answer gave. At most 2 000 entries (`at most 2 000 files; narrow the scope`). Narrows like every other
+  field. An entry that names no file adds a hint `{condition: "file", given, existing}` (`existing` = up to 3 catalog files of the
+  same name, case-insensitive) and, as for every unknown value, **one unknown entry empties the whole scope**: nothing runs, the
+  text says which entry. Only the first 5 unknown entries are looked up; the rest say `(not compared with the catalog: only the first 5
+  unknown files are)` (`hints[].lookedUp` false). A file listed twice counts once.
+- **`tab`** (`stage` / `wip` / `archive`): frames that belong to at least one frame set listed under that Objects page tab, by the
+  page's own rule (`frame_set_tab`: an archived set is Archive, whatever its custom flag; otherwise a custom set is WIP, else Stage),
+  so **archive wins over custom**. It joins `frameSet` / `files` among the fields that still allow the set-by-set answer.
+- **`frameSet`** takes a name or a handle `set:<id>`; a handle is exactly that set (several sets may share a name). No set of that id
+  is a hint `{condition: "frame set", existing: []}` and nothing matches.
 
 ### Limits worth knowing
 
@@ -111,7 +130,22 @@ web build serves `/mcp` over HTTP instead (below) and binds nothing here.
 **Setting.** `mcp.enabled` (`"false"` default, in `defaults::all()`). Only `set_mcp_enabled` writes it; the generic
 `set_setting` refuses the key with `Invalid("use set_mcp_enabled")`. No other path writes settings in bulk (the Settings page's
 "reset" is `set_setting` per key), so nothing else needed the same refusal. `get_mcp_status` / `set_mcp_enabled` /
-`regenerate_mcp_token` are the three commands (`api/mcp.rs`); `McpStatus` is in `src/types/mcp.ts`.
+`regenerate_mcp_token` are the three channel commands and `add_mcp_to_claude_desktop` the fourth (`api/mcp.rs`; the plan window's two, `get_mcp_plan` and `answer_mcp_plan`, are counted apart); `McpStatus` is in `src/types/mcp.ts`.
+
+**Add to Claude desktop** (Settings → Assistant access; desktop only, the web route `POST /api/add_mcp_to_claude_desktop` answers 501
+`add_mcp_to_claude_desktop is not available in web mode`; `mcp/claude_desktop.rs`, the button in `AssistantAccessSection.tsx`). The
+copy block is a whole `{"mcpServers": ...}` document that the user cannot paste into a file that already holds `mcpServers` and
+`preferences`, so the button merges Athenaeum's entry into `claude_desktop_config.json` itself: every other key and server is kept,
+`mcpServers.<name>` is set, keys are written sorted (never enable serde_json `preserve_order`). The old file, when it holds anything, is
+first copied to `claude_desktop_config.json.bak` (an older `.bak` is replaced), the new text goes to a temp file in the same folder
+that has the old file's mode and is renamed over the original. A blank file (empty, white space or a BOM only) counts as absent and is
+never copied over a good `.bak`. Refused in words, the file left as it is: no Claude desktop folder for this user; the bridge not
+found or under App Translocation; the file changed while the merge ran (`Claude desktop changed claude_desktop_config.json just now; it was
+left as it is. Try again.`); not valid JSON (`line L, column C`); the top level or `mcpServers` not an object. A leading BOM is accepted.
+The folder is macOS `~/Library/Application Support/Claude`; on Windows the Store/MSIX package folder
+`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude` (the most recently modified when several) is preferred over
+`%APPDATA%\Claude`, because the Store build reads only the first; other systems have none. `McpStatus.claudeDesktopConfig` is the
+file's path when that folder exists (the button is shown only then), the answer is `ClaudeDesktopAdded {path, replaced, backup}`.
 
 **Channel files**, in `<app-data>/mcp/`:
 
@@ -377,8 +411,13 @@ slot, the run, the cancel). `cfg(all(feature = "render", feature = "solver"))`, 
 the module, the three tools and `McpHost::solves`, and its tool list simply lacks them.
 
 - **Items** are the raw lights of the scope (a master or another type is left out and counted: `N frames are not a light frame and are left out`);
-  with `onlyUnsolved` (the default) only lights that miss coordinates by the Missing Metadata view's own test (`missing_flags`), the others counted
-  (`N light frames already have coordinates and are left out (onlyUnsolved)`). One group per folder, each item with Object / Filter / Exposure /
+  with `onlyUnsolved` (the default) only lights with no stored plate solve (no `plate_solves` row, the app's own "solved",
+  `plate_solve::storage::frames_with_solve`, one call over the scope's light ids), the others counted (`N light frames already have a plate solve
+  and are left out (onlyUnsolved)`). Owner ruling 2026-11-21: this replaces the Missing Metadata view's coordinates test, which read a header's mount
+  RA/DEC as "solved" and planned nothing for a set whose lights had mount coordinates and no solve. A header's coordinates still go to the solver as
+  its position hint. `onlyUnsolved` false plans every light of the scope, solved or not (a re-solve plan). All lights solved already is refused:
+  `every light frame in the scope (N) already has a plate solve (N); pass onlyUnsolved false to solve them again; nothing was planned`; the item's
+  evidence reads `no plate solve is stored for this frame`. One group per folder, each item with Object / Filter / Exposure /
   Coordinates. An item is locked (never ticked) with the reason: no star catalog (`the star catalog is not installed (Settings → Plate Solving)`,
   every item), the input gate (`service::input_gate_reason`, the stored `trailed` verdict at the current `MEASURE_VERSION` while
   `input_gate_enabled`), or a file that cannot be stamped (`not reachable ...`).
@@ -390,7 +429,7 @@ the module, the three tools and `McpHost::solves`, and its tool list simply lack
 - **Refused in words before the plan begins** (the waiting plan is never replaced): a scope that names nothing, no light to solve, a plan of more
   than 2 000 items (counted from the scope's rows before any frame is read, `an_unscoped_request_over_the_cap_reads_no_frame`), and a plate-solve batch already running: `BUSY_ASSISTANT` when the running run is the assistant's, `BUSY_UI` when the user
   started it in Athenaeum (`planning_refused_while_a_ui_batch_runs`).
-- **Applied means started.** Apply re-checks each file and the frame's type and coordinates (the store), resolves the catalogs again, claims the slot
+- **Applied means started.** Apply re-checks each file and the frame's type (the store; the stamp keeps `IMAGETYP` only) and, for an `onlyUnsolved` plan, once for the plan's selected frames whether a plate solve was stored meanwhile: such a frame is skipped, `solved since the plan was made`; a re-solve plan solves every selected light again. A failed read of that re-check warns and the Apply goes on. It then resolves the catalogs again, claims the slot
   with `prepare_plate_solve_batch(.., Assistant)` and starts `run_plate_solve_batch` on a thread named `mcp-plate-solve` (never the store's apply
   thread). The plan ends `applied` with `report.runId = solve-<uuid>` and `plan_status` says `started a plate solve of N frames (run solve-...);
   ask solve_status for its progress`, never that frames were solved; its report counts `started`, `skipped` and `could not start`. A batch already
@@ -540,6 +579,29 @@ the owner's behalf during the build, and the findings left for later, are kept h
 - Ruling: the smoke's two untruths are fixed before the merge by one small core round (`m3-smoke-fix-handoff.md`): the solve plan says it may name the object (the app's own `update_frame_object_if_missing` wrote "RCW 145" on 5 M8 frames), and a metadata group title counts what can be filled — the smoke's bar is "what a plan says is true" — cost if wrong: one more short round.
 - M3: parked — a metadata plan locks an item "not reachable" when its volume is unmounted although only the catalog is written (the M2 stamp rule; the UI's Set Object works offline) — Ruling: LATER, open-items (relax the stamp to catalog values for catalog-only plans).
 - M3: parked — `note_named_frames` / `frames_without_object` use `Database::conn()` (panics on pool exhaustion) outside `catch_unwind`, which would leave `solve_status` "saving its results" for good; the named count also counts an object set by the user during the run — Ruling: LATER (try_conn; word it "have an object name now").
+
+### 2026-11-21 — owner smoke fixes
+
+The owner's smoke of v1 (2026-11-21, checks П2, S10, S12, S14) found five gaps; they are closed by plan
+`docs/superpowers/plans/2026-11-21-mcp-smoke-fixes-plan.md` (branch `mcp/smoke-fixes`, merged to local `main`, not pushed). Two rulings of the owner
+changed what this reference said before:
+
+- **Ruling: a frame set's handle `set:<id>` is shown in the text half too** (it said the text never shows a handle). Claude desktop's
+  model reads only the text, and two sets named `LDN 1272` (109 in WIP, 368 frames; 231 in Stage, 4 frames) could not be told apart or
+  asked for. `file:<n>` stays out of the text. Cost if wrong: one handle per set line.
+- **Ruling: `onlyUnsolved` means "no stored plate solve"**, not the Missing Metadata view's coordinates test. Set 231's lights had mount RA/DEC and no solve,
+  so the default planned nothing ("already has coordinates (372)") and the assistant re-asked with `onlyUnsolved: false` over the folder. Cost if wrong:
+  a light with mount coordinates and no solve is planned (it is solved with its header position as the hint).
+- **Added: a scope names exact files and one set.** `files`, `tab` and `frameSet: "set:<id>"` (see "The scope"); a two-file solve is a scope of two files. `tab` was
+  the owner's addition in the same session.
+- **Added: earlier figures per version.** Set 109's 368 rows all predate `MEASURE_VERSION` (legacy), so the quality summary skipped them and the assistant
+  had nothing to show. They are now shown apart from the current figures, one entry per version, with their own outliers; a legacy row the app
+  judges trailed is refused as the app does. Current figures are never mixed with them (the v1 rule stands).
+- **Added: Add to Claude desktop** (above). The file is merged, not copied by hand.
+- **Not a gap: S12.** `list_operations` belongs to the `athenaeum-logs` tool of Claude Code in the repo; `mcp_plan_apply` was already keyed by `plan_id`, and
+  `log-mcp`'s two descriptions now name the kind.
+- **Deferred (owner, 2026-11-21): starting Analysis from the assistant** (a new plan kind). Until then, "run Analysis again for current figures" is the
+  user's own step.
 
 ### Deferred (LATER, parked, or minor)
 
