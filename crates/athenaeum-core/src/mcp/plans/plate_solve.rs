@@ -4,10 +4,11 @@
 //! `solve_status` and may cancel only its own run with `cancel_solve`.
 //!
 //! The items are the lights of the scope (those with no stored plate solve when `onlyUnsolved`, the default; a header's
-//! coordinates do not count as solved), one group per folder. An item the solver must not be handed is locked with the reason: the star catalog is not installed, the
-//! input gate refuses it (`service::input_gate_reason`) or its file cannot be reached. Everything the planner needs is
-//! read before the plan begins, so a request that cannot be planned (a scope that names nothing, no light to solve, too
-//! many items, a batch already running) is refused in words and never replaces the plan the user is looking at.
+//! coordinates do not count as solved), one group per folder. An item the solver must not be handed is locked with the
+//! reason: the star catalog is not installed, the input gate refuses it (`service::input_gate_reason`) or its file
+//! cannot be reached. Everything the planner needs is read before the plan begins, so a request that cannot be planned
+//! (a scope that names nothing, no light to solve, too many items, a batch already running) is refused in words and
+//! never replaces the plan the user is looking at.
 //!
 //! The run is core's (`run_plate_solve_batch`, the one slot, the handle's progress); this module only starts it on a
 //! thread of its own (`mcp-plate-solve`, never the store's apply thread), records what the run said about each failed
@@ -488,7 +489,7 @@ fn read_plan(host: &McpHost, args: &PlanPlateSolveArgs) -> Result<Read, ApiError
     }
     if eligible.len() > PLAN_ITEM_CAP {
         return Err(ApiError::Invalid(format!(
-            "this plan would hold {} items, and a plan holds at most 2 000; narrow the scope (a folder, a night) and ask again",
+            "this plan would hold {} items, and a plan holds at most 2 000; narrow the scope (a folder, a night or a frame set) and ask again",
             eligible.len()
         )));
     }
@@ -658,7 +659,7 @@ fn build_and_publish(
         groups,
         notes,
         snapshots,
-        applier: Box::new(PlateSolveApplier { items: infos, resolve }),
+        applier: Box::new(PlateSolveApplier { items: infos, resolve, only_unsolved }),
     };
     match host.plans.publish(id, content) {
         Ok(()) => Ok(Ok(())),
@@ -871,6 +872,9 @@ pub fn started_words(v: &McpPlanView) -> String {
             count_of(report.applied.len(), "frame", "frames")
         ),
         None => {
+            if report.failed.is_empty() && !report.skipped.is_empty() {
+                return "did not start a plate solve: every selected frame was solved since the plan was made".to_string();
+            }
             let why = report
                 .failed
                 .first()
@@ -921,6 +925,9 @@ pub fn report_text(r: &PlanReport) -> String {
 pub struct PlateSolveApplier {
     items: HashMap<String, ItemInfo>,
     resolve: Resolvers,
+    /// The plan was made with `onlyUnsolved`: a frame solved since is left out at Apply. A plan that re-solves
+    /// (`onlyUnsolved` false) solves every selected light again, stored solve or not.
+    only_unsolved: bool,
 }
 
 /// Why the apply leaves a frame out when a solve was stored for it after the plan was made.
@@ -974,16 +981,15 @@ impl PlanApplier for PlateSolveApplier {
     }
 
     fn apply(&self, host: &McpHost, plan_id: &str, sel: &PlanSelection, fresh: &[String]) -> PlanReport {
-        let report = PlanReport::default();
+        let mut report = PlanReport::default();
         let fresh: std::collections::HashSet<&str> = fresh.iter().map(String::as_str).collect();
-        let included: Vec<&str> =
+        let mut included: Vec<&str> =
             sel.groups.iter().flat_map(|g| g.included.iter().map(String::as_str)).filter(|id| fresh.contains(id)).collect();
-        // A frame solved since the plan was made is left alone (one read over the selected frames; the guard is
-        // released before anything takes the context).
-        let selected_ids: Vec<i64> = included.iter().filter_map(|id| self.items.get(*id).map(|i| i.frame_id)).collect();
-        let solved_since = solved_among(host, &selected_ids);
-        let (mut report, included): (PlanReport, Vec<&str>) = {
-            let mut report = report;
+        if self.only_unsolved {
+            // A frame solved since the plan was made is left alone (one read over the selected frames; the guard is
+            // released before anything takes the context).
+            let selected_ids: Vec<i64> = included.iter().filter_map(|id| self.items.get(*id).map(|i| i.frame_id)).collect();
+            let solved_since = solved_among(host, &selected_ids);
             let mut kept = Vec::with_capacity(included.len());
             for id in included {
                 match self.items.get(id) {
@@ -993,8 +999,8 @@ impl PlanApplier for PlateSolveApplier {
                     _ => kept.push(id),
                 }
             }
-            (report, kept)
-        };
+            included = kept;
+        }
         let frame_ids: Vec<i64> = included.iter().filter_map(|id| self.items.get(*id).map(|i| i.frame_id)).collect();
         if frame_ids.is_empty() {
             return report;
