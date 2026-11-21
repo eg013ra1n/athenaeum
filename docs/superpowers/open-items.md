@@ -360,8 +360,6 @@ contain forward slashes.
 Found by the reuse audit for `plans/2026-11-19-athenaeum-mcp-v1-plan.md` (its "Owner-visible items"). Neither
 copied into the MCP nor fixed by its plan; each is a small fix of its own. Delete an entry when its fix lands.
 
-- **The Missing Metadata view lists Black Hole files.** `get_frames_with_missing_metadata` has no Black Hole
-  exclusion. The MCP leaves Black Hole files out unless the scope asks for them.
 - **Its chips tag non-lights.** `computeMissingFlags` marks a dark, flat or bias "Coordinates" / "Object" when the
   file is listed for another gap. The MCP keeps the lights-only rule for those two.
 - **The folder overview counts Black Hole rows.** `get_folder_overview` counts them per scan root; the MCP's storage
