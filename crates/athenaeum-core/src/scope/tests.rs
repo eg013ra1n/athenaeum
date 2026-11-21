@@ -667,8 +667,35 @@ fn files_by_path_and_handle_select_exactly_those() {
     assert_eq!(c.resolve(&both).description, "2 named files");
     let one = files_scope(&[format!("file:{f2}")]);
     assert_eq!(c.resolve(&one).description, "1 named file");
-    // An empty list is absent.
-    assert_eq!(c.scoped_names(&files_scope(&[])).len(), 3);
+}
+
+#[test]
+fn empty_files_list_matches_nothing() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    let r = c.resolve(&files_scope(&[]));
+    assert!(r.filter.is_none(), "an empty files list is never the whole catalog");
+    assert_eq!(r.hints.len(), 1);
+    assert_eq!(r.hints[0].condition, "file");
+    assert!(r.hints[0].looked_up);
+    assert!(hints_text(&r.hints).contains("files names no file"), "{}", hints_text(&r.hints));
+    // Absent `files` is still no filter.
+    assert_eq!(c.scoped_names(&Scope::default()).len(), 1);
+}
+
+#[test]
+fn blank_files_entries_match_nothing() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    for entries in [vec![String::new()], vec!["   ".to_string(), "\t".to_string()]] {
+        let r = c.resolve(&files_scope(&entries));
+        assert!(r.filter.is_none(), "{entries:?}");
+        assert_eq!(r.hints.len(), 1, "{entries:?}");
+        assert!(hints_text(&r.hints).contains("files names no file"), "{entries:?}");
+    }
+    // A blank entry beside a real one is dropped; the real one still narrows.
+    let mixed = files_scope(&[String::new(), c.path("M31/a.fits")]);
+    assert_eq!(c.scoped_names(&mixed), vec!["a.fits".to_string()]);
 }
 
 #[test]
@@ -838,6 +865,24 @@ fn tab_stage_selects_frames_of_non_custom_unarchived_sets() {
     assert_eq!(c.scoped_names(&tab(FrameSetTab::Wip)), vec!["wip.fits".to_string()]);
     assert_eq!(c.scoped_names(&tab(FrameSetTab::Archive)), vec!["archived.fits".to_string()]);
     assert_eq!(c.resolve(&tab(FrameSetTab::Stage)).description, "in Stage");
+}
+
+#[test]
+fn frame_set_and_tab_are_one_set() {
+    let c = cat();
+    let (_, f) = c.add(&light("x/both.fits"));
+    c.set_of(Some("X"), false, &[f]);
+    let wip = c.set_of(Some("Y"), false, &[f]);
+    c.mark_custom(wip);
+    let scope = |name: &str| Scope { frame_set: Some(name.into()), tab: Some(FrameSetTab::Wip), ..Default::default() };
+    // X is a Stage set; the frame also sits in WIP set Y, but no one set is both X and WIP.
+    assert_eq!(c.scoped_names(&scope("X")), Vec::<String>::new());
+    assert_eq!(c.scoped_names(&scope("Y")), vec!["both.fits".to_string()]);
+    // By handle the same.
+    assert_eq!(c.scoped_names(&scope(&frame_set_handle(wip))), vec!["both.fits".to_string()]);
+    // `tab` alone still finds the frame.
+    let alone = Scope { tab: Some(FrameSetTab::Wip), ..Default::default() };
+    assert_eq!(c.scoped_names(&alone), vec!["both.fits".to_string()]);
 }
 
 #[test]

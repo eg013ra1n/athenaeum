@@ -93,10 +93,10 @@ Three fields added by the 2026-11-21 smoke fixes (`scope/mod.rs`):
   field. An entry that names no file adds a hint `{condition: "file", given, existing}` (`existing` = up to 3 catalog files of the
   same name, case-insensitive) and, as for every unknown value, **one unknown entry empties the whole scope**: nothing runs, the
   text says which entry. Only the first 5 unknown entries are looked up; the rest say `(not compared with the catalog: only the first 5
-  unknown files are)` (`hints[].lookedUp` false). A file listed twice counts once.
+  unknown files are)` (`hints[].lookedUp` false). A file listed twice counts once. An empty `files` (`[]`, or only blank entries) names no file: it is a hint `{condition: "file", given: ""}` (`files names no file`) and nothing matches, it never widens the scope to the whole catalog.
 - **`tab`** (`stage` / `wip` / `archive`): frames that belong to at least one frame set listed under that Objects page tab, by the
   page's own rule (`frame_set_tab`: an archived set is Archive, whatever its custom flag; otherwise a custom set is WIP, else Stage),
-  so **archive wins over custom**. It joins `frameSet` / `files` among the fields that still allow the set-by-set answer.
+  so **archive wins over custom**. With `frameSet` given, one set must satisfy both (a frame in a Stage set named X and in some other WIP set is not in `{frameSet: X, tab: wip}`). Read in any case (`WIP`, `Stage`). `tab` and `files` switch the set-by-set answer off; the answer is then the totals plus `frameSetsInScope`.
 - **`frameSet`** takes a name or a handle `set:<id>`; a handle is exactly that set (several sets may share a name). No set of that id
   is a hint `{condition: "frame set", existing: []}` and nothing matches.
 

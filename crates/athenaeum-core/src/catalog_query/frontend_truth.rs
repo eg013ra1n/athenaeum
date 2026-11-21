@@ -45,14 +45,27 @@ pub fn missing_flags(frame: &Frame) -> MissingFlags {
     }
 }
 
-/// The Objects page's three tabs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, rmcp::schemars::JsonSchema)]
+/// The Objects page's three tabs. Written lowercase (`stage` / `wip` / `archive`); read in any case, because the
+/// text answers print `Stage` / `WIP` / `Archive` and a caller copies what it saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[schemars(crate = "rmcp::schemars")]
 pub enum FrameSetTab {
     Stage,
     Wip,
     Archive,
+}
+
+impl<'de> Deserialize<'de> for FrameSetTab {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim().to_lowercase().as_str() {
+            "stage" => Ok(Self::Stage),
+            "wip" => Ok(Self::Wip),
+            "archive" => Ok(Self::Archive),
+            _ => Err(serde::de::Error::unknown_variant(&raw, &["stage", "wip", "archive"])),
+        }
+    }
 }
 
 /// The tab a frame set is listed under (`Objects.tsx`): archived sets are in Archive whatever else they are, the rest
@@ -122,6 +135,33 @@ mod tests {
         // The row the assistant must not "fix": a dark with an empty OBJECT is flagged, as the view flags it.
         let dark = rows.iter().find(|r| r["frame"]["imagetyp"] == "Dark" && r["frame"]["object"] == "").expect("the dark row");
         assert!(missing_flags(&frame_of(dark)).object);
+    }
+
+    #[test]
+    fn tab_parses_any_case() {
+        for (text, want) in [
+            ("stage", FrameSetTab::Stage),
+            ("Stage", FrameSetTab::Stage),
+            ("WIP", FrameSetTab::Wip),
+            ("Wip", FrameSetTab::Wip),
+            ("ARCHIVE", FrameSetTab::Archive),
+            ("archive", FrameSetTab::Archive),
+        ] {
+            let got: FrameSetTab = serde_json::from_value(serde_json::json!(text)).expect(text);
+            assert_eq!(got, want, "{text}");
+            // Written lowercase, always.
+            assert_eq!(serde_json::to_value(got).unwrap(), serde_json::json!(want_lower(want)));
+        }
+        let err = serde_json::from_value::<FrameSetTab>(serde_json::json!("done")).expect_err("unknown tab");
+        assert!(err.to_string().contains("stage"), "{err}");
+    }
+
+    fn want_lower(tab: FrameSetTab) -> &'static str {
+        match tab {
+            FrameSetTab::Stage => "stage",
+            FrameSetTab::Wip => "wip",
+            FrameSetTab::Archive => "archive",
+        }
     }
 
     #[test]

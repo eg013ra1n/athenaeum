@@ -165,11 +165,11 @@ pub fn parse_frame_set_handle(s: &str) -> Option<i64> {
     s.trim().strip_prefix("set:")?.trim().parse::<i64>().ok()
 }
 
-/// The entries of `files`, trimmed, empty ones dropped; `None` when none is left.
+/// The entries of `files`, trimmed, empty ones dropped; `None` when `files` is absent. `files` present with no
+/// usable entry is `Some` of an empty list: it names no file, it never means "no file filter".
 fn file_entries(scope: &Scope) -> Option<Vec<&str>> {
-    let v: Vec<&str> =
-        scope.files.as_deref()?.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    (!v.is_empty()).then_some(v)
+    let v: Vec<&str> = scope.files.as_deref()?.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    Some(v)
 }
 
 /// SQL on `fs` for the frame sets an Objects tab lists (`catalog_query::frame_set_tab` as a predicate).
@@ -296,7 +296,9 @@ pub fn hints_text(hints: &[NearestHint]) -> String {
     hints
         .iter()
         .map(|h| {
-            if !h.looked_up {
+            if h.condition == "file" && h.given.is_empty() {
+                "files names no file".to_string()
+            } else if !h.looked_up {
                 format!(
                     "no {} '{}' (not compared with the catalog: only the first {MAX_FILE_HINT_LOOKUPS} unknown files are)",
                     h.condition, h.given
@@ -499,13 +501,19 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
             conds.push((format!("({})", branches.join(" OR ")), params));
         }
     }
-    if let Some(g) = given(&scope.frame_set) {
+    // With `frameSet` given, `tab` is a condition on that same set (one set must satisfy both); alone it is its own.
+    let tab_and = |sql: String| match scope.tab {
+        Some(tab) => format!("({sql}) AND ({})", tab_sql(tab)),
+        None => sql,
+    };
+    let frame_set_given = given(&scope.frame_set);
+    if let Some(g) = frame_set_given {
         if let Some(id) = parse_frame_set_handle(g) {
             let exists: bool = conn
                 .query_row("SELECT EXISTS (SELECT 1 FROM frames_set WHERE id = ?1)", [id], |r| r.get(0))
                 .context("read frame set by handle")?;
             if exists {
-                conds.push((member_of_set_sql(true, "fs.id = ?"), vec![Value::Integer(id)]));
+                conds.push((member_of_set_sql(true, &tab_and("fs.id = ?".to_string())), vec![Value::Integer(id)]));
             } else {
                 hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: Vec::new(), looked_up: true });
             }
@@ -516,15 +524,21 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
                 hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: nearest::nearest(&sets, g), looked_up: true });
             } else {
                 let (sql, p) = in_list("fs.name", &hits);
-                conds.push((member_of_set_sql(true, &sql), p));
+                conds.push((member_of_set_sql(true, &tab_and(sql)), p));
             }
         }
     }
-    if let Some(tab) = scope.tab {
-        conds.push((member_of_set_sql(true, tab_sql(tab)), Vec::new()));
+    if frame_set_given.is_none() {
+        if let Some(tab) = scope.tab {
+            conds.push((member_of_set_sql(true, tab_sql(tab)), Vec::new()));
+        }
     }
 
     if let Some(entries) = file_entries(scope) {
+        if entries.is_empty() {
+            // `files` is there but names nothing: an empty scope, never the whole catalog.
+            hints.push(NearestHint { condition: "file", given: String::new(), existing: Vec::new(), looked_up: true });
+        }
         if entries.len() > MAX_FILES {
             return Err(anyhow::anyhow!("at most {MAX_FILES} files; narrow the scope"));
         }
