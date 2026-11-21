@@ -366,10 +366,6 @@ copied into the MCP nor fixed by its plan; each is a small fix of its own. Delet
   file is listed for another gap. The MCP keeps the lights-only rule for those two.
 - **The folder overview counts Black Hole rows.** `get_folder_overview` counts them per scan root; the MCP's storage
   figures report them apart.
-- **Set Frame Type may demote a master (found by the MCP v1 review, from the code, not run).** `SetFrameTypeModal.tsx`
-  sends MASTERDARK as `{imagetyp: 'DARK', isMaster: true}`, but `bulk_update_frame_metadata` derives `is_master` from
-  the type text (`db/operations.rs` ~1855), so the frame may be written `is_master = 0`. Send the `Master*` type text
-  (the MCP's metadata plan does), and test it.
 - **Autofind (slot key 1) has no guard against a second run.** A second object autofind replaces the first's handle;
   the batch slot (key 0) refuses a second batch since MCP v1.
 

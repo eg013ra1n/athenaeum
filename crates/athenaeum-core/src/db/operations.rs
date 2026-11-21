@@ -5426,6 +5426,35 @@ mod bulk_metadata_tests {
     }
 
     #[test]
+    fn plain_type_text_wins_over_an_explicit_master_flag() {
+        // The Set Frame Type dialog once sent `{imagetyp: "DARK", is_master: true}` for a master dark; the type
+        // text's derived flag wins, so the row came out a raw dark. Pinned: a caller names a master by its
+        // `Master*` type text, never by the flag next to a plain type.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/d.fits", Some("MasterDark"));
+        conn.execute("UPDATE frames SET is_master = 1 WHERE id = ?1", [frame_id])
+            .unwrap();
+
+        let edits = FrameMetadataEdits {
+            imagetyp: Some(Some("DARK".into())),
+            is_master: Some(true),
+            ..Default::default()
+        };
+        bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
+
+        let (typ, is_master): (String, i64) = conn
+            .query_row(
+                "SELECT imagetyp, is_master FROM frames WHERE id = ?1",
+                [frame_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(typ, "Dark");
+        assert_eq!(is_master, 0, "the plain type text decides, not the explicit flag");
+    }
+
+    #[test]
     fn imagetyp_derived_master_flag_overrides_explicit_edit() {
         // If a caller passes both imagetyp=MASTERDARK and is_master=false,
         // the imagetyp-derived flag wins so the row stays consistent.

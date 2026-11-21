@@ -31,12 +31,14 @@ const FRAME_TYPES: { value: FrameTypeChoice; label: string }[] = [
   { value: 'MASTERFLAT', label: 'MASTERFLAT' },
 ];
 
+// The core derives `is_master` from the type text and that derived value wins over `isMaster`, so a master is
+// named by its `Master*` type text (the spelling the catalog stores), never by a plain type plus the flag.
 function toEdits(choice: FrameTypeChoice): FrameMetadataEdits {
   switch (choice) {
     case 'MASTERDARK':
-      return { imagetyp: 'DARK', isMaster: true };
+      return { imagetyp: 'MasterDark', isMaster: true };
     case 'MASTERFLAT':
-      return { imagetyp: 'FLAT', isMaster: true };
+      return { imagetyp: 'MasterFlat', isMaster: true };
     default:
       return { imagetyp: choice, isMaster: false };
   }
