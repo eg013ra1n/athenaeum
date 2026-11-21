@@ -3,8 +3,10 @@ import { Info } from 'lucide-react';
 import { Button, DialogShell } from '../ui';
 import { formatBytes } from '../duplicates/presentation';
 import { useMcpPlan } from '../../contexts/McpPlanContext';
-import { PlanView } from './PlanView';
-import { chooseOne, initialSelection, selectionProblems, toggleGroup, toggleItem, totals } from './planSelection';
+import { PlanHeader } from './PlanHeader';
+import { defaultOpen, PlanView, showsList } from './PlanView';
+import { fmt } from './planLabels';
+import { chooseOne, initialSelection, offered, selectionProblems, toggleAll, toggleGroup, toggleItem, totals } from './planSelection';
 import type { McpPlanView } from '../../types/mcp';
 
 /**
@@ -19,19 +21,6 @@ export function PlanWindow() {
 
 /** Apply stays disabled this long after the window shows a waiting plan, so a click aimed elsewhere cannot apply it. */
 const APPLY_ARM_MS = 1000;
-
-const files = (n: number) => `${n} file${n === 1 ? '' : 's'}`;
-const frames = (n: number) => `${n} frame${n === 1 ? '' : 's'}`;
-
-/** The line under the title: what Apply would do, in the units of the plan's kind, and when the plan expires. */
-function summaryLine(plan: McpPlanView, sum: { items: number; bytes: number }, hasSizes: boolean, waiting: boolean): string {
-  const n = sum.items;
-  let what: string;
-  if (plan.kind === 'black_hole') what = `${files(n)}${hasSizes ? ` · ${formatBytes(sum.bytes)}` : ''} to the Black Hole`;
-  else if (plan.kind === 'metadata') what = `${n} value${n === 1 ? '' : 's'} to write`;
-  else what = `${frames(n)} to solve`;
-  return plan.expiresAt && waiting ? `${what} · expires ${plan.expiresAt}` : what;
-}
 
 function PlanDialog({ plan }: { plan: McpPlanView }) {
   const { busy, apply, cancel, dismiss, openNewer } = useMcpPlan();
@@ -58,7 +47,17 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
   // A plan that carries no sizes (a plate solve) shows a count only, never "0 B".
   const hasSizes = plan.groups.some((g) => g.items.some((i) => i.sizeBytes != null));
   const problems = waiting ? selectionProblems(plan, sel) : [];
-  const summary = (waiting || kind === 'applying') ? summaryLine(plan, sum, hasSizes, waiting) : null;
+  const copies = plan.groups.reduce((n, g) => n + g.items.length, 0);
+  const showStats = waiting || kind === 'applying' || superseded;
+
+  // A group is open by the plan's own default until the user opens or closes it, or presses Collapse all / Expand all.
+  const [openBy, setOpenBy] = useState<Record<string, boolean>>({});
+  const isOpen = (id: string) => openBy[id] ?? defaultOpen(plan, plan.groups.findIndex((g) => g.id === id));
+  const anyOpen = plan.groups.some((g) => isOpen(g.id));
+  const setAllOpen = (open: boolean) => setOpenBy(Object.fromEntries(plan.groups.map((g) => [g.id, open])));
+  const needKeeper = plan.kind === 'black_hole' && waiting
+    ? plan.groups.filter((g) => g.chooseOne !== null && sel.groups.find((x) => x.groupId === g.id)?.chosen == null).length
+    : 0;
 
   // Nothing pressable has the initial focus: the window opens by itself over any page, so a Space or Enter meant for
   // something else must press nothing. The title line takes it (`data-autofocus`, not a tab stop of its own).
@@ -87,9 +86,15 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
     <>
       <div className="mr-auto min-w-0 self-center">
         {(waiting || kind === 'applying') && (
-          <p className="font-medium text-content-secondary">
-            {plan.kind === 'black_hole' ? files(sum.items) : frames(sum.items)}
-            {hasSizes ? ` · ${formatBytes(sum.bytes)}` : ''}
+          <p data-testid="plan-selection" className="text-content-muted">
+            <b className="font-semibold text-content">{fmt(sum.items)}</b> of {fmt(plan.kind === 'black_hole' ? copies : offered(plan, sel))}{' '}
+            {plan.kind === 'black_hole' ? `${copies === 1 ? 'file' : 'files'} marked` : `${plan.kind === 'metadata' ? 'values' : 'frames'} selected`}
+            {plan.kind === 'black_hole' && hasSizes && (
+              <>
+                {' · '}
+                <b className="font-semibold text-content">{formatBytes(sum.bytes)}</b> will free
+              </>
+            )}
           </p>
         )}
         {kind === 'applying' && (
@@ -155,25 +160,23 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
       }
       // A click outside never ends or hides a plan: the report is the only place the user sees what moved.
       closeOnScrim={false}
+      bodyLayout="column"
       busy={busy}
       // Escape and the cross decline a plan that still waits, hide one that applies, and close a finished one.
       onClose={mode === 'cancel' ? () => void cancel() : dismiss}
       footer={footer}
     >
-      <div className="mb-3 flex items-center gap-1.5 text-[12px] text-content-muted">
-        {summary && <span className="min-w-0">{summary}</span>}
-        {/* The build and catalog the plan came from: the assistant's own answer already says them. */}
-        <span
-          title={`${plan.source.build} ${plan.source.version} · catalog ${plan.source.catalog}`}
-          aria-label={`${plan.source.build} ${plan.source.version} · catalog ${plan.source.catalog}`}
-          role="note"
-          className="inline-flex shrink-0 text-content-faint"
-        >
-          <Info size={13} aria-hidden />
-        </span>
-      </div>
+      <PlanHeader
+        plan={plan}
+        live={sum}
+        hasSizes={hasSizes}
+        showStats={showStats}
+        showExpiry={waiting}
+        needKeeper={needKeeper}
+        toggleAll={showsList(plan) ? { anyOpen, onClick: () => setAllOpen(!anyOpen) } : null}
+      />
       {superseded && (
-        <div role="status" className="mb-3 flex items-center gap-2 rounded-md border border-warning/50 bg-warning-muted px-2.5 py-2 text-content">
+        <div role="status" className="mb-3 flex shrink-0 items-center gap-2 rounded-md border border-warning/50 bg-warning-muted px-2.5 py-2 text-content">
           <Info size={14} className="shrink-0 text-warning" aria-hidden />
           <span className="min-w-0 flex-1">The assistant prepared a newer plan</span>
           <Button size="sm" variant="primary" onClick={() => void openNewer()}>
@@ -185,6 +188,9 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
         plan={plan}
         selection={sel}
         readOnly={!waiting || superseded || busy}
+        isOpen={isOpen}
+        onToggleOpen={(id) => setOpenBy({ ...openBy, [id]: !isOpen(id) })}
+        onToggleAll={() => update((s) => toggleAll(plan, s))}
         onToggleItem={(g, i) => update((s) => toggleItem(plan, s, g, i))}
         onToggleGroup={(g) => update((s) => toggleGroup(plan, s, g))}
         onChoose={(g, i) => update((s) => chooseOne(plan, s, g, i))}

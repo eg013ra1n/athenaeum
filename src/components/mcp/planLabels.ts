@@ -76,3 +76,34 @@ export function splitFacts(
     own: (item) => keys.filter((k) => !sharedKeys.has(k.key)).map((k) => fact(k, item)).filter((f): f is Fact => f !== null),
   };
 }
+
+/** A count with thousands separators (1,829), the way the mockup and the rest of the app write numbers. */
+export const fmt = (n: number): string => n.toLocaleString('en-US');
+
+/** `1 frame`, `1,829 frames`. */
+export const counted = (n: number, one: string, many: string): string => `${fmt(n)} ${n === 1 ? one : many}`;
+
+/** A service fact as the chip reads it: "Star catalog installed", "Index packs 0", "3 at a time". */
+export function factText(f: { label: string; value: string }): string {
+  return f.label === 'At a time' ? `${f.value} at a time` : `${f.label} ${f.value}`;
+}
+
+/** The hover text of a service fact, where the label alone is not clear. */
+export function factTitle(f: { label: string }): string | undefined {
+  if (f.label === 'Index packs') return 'Quad index packs installed';
+  if (f.label === 'At a time') return 'How many frames are solved at the same time';
+  return undefined;
+}
+
+/** The reason every item of a group is locked for, when all are locked for the same one; the group then collapses to one row. */
+export function groupLock(group: PlanGroup): string | null {
+  const first = group.items[0]?.locked ?? null;
+  if (first === null) return null;
+  return group.items.every((i) => i.locked === first) ? first : null;
+}
+
+/** The chip on a copy that cannot move: "Stays · 3 links" when the reason names the calibration links, else "Stays". */
+export function stayLabel(reason: string): string {
+  const links = /^(\d+) calibration links?\b/.exec(reason);
+  return links ? `Stays · ${links[1]} ${links[1] === '1' ? 'link' : 'links'}` : 'Stays';
+}

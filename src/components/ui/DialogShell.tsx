@@ -8,14 +8,20 @@ const SIZE_CLASS = { sm: 'w-[440px]', md: 'w-[560px]', lg: 'flex max-h-[90vh] w-
 
 const FOCUSABLE = 'button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
-/** Spec §7 — the one modal shell: scrim, centred window, header, body, footer. `lg` is the 960 px plan window: it keeps within 92vw / 90vh and only its body scrolls. */
-export function DialogShell({ title, size = 'sm', onClose, busy = false, closeOnScrim = true, footer, children }: {
+/**
+ * Spec §7 — the one modal shell: scrim, centred window, header, body, footer. `lg` is the 960 px plan window: it keeps
+ * within 92vw / 90vh and only its body scrolls — unless `bodyLayout="column"`, where the body is a flex column that
+ * does not scroll itself: its children pin what must stay (stats, chips) and one child scrolls (`min-h-0 flex-1 overflow-y-auto`).
+ */
+export function DialogShell({ title, size = 'sm', onClose, busy = false, closeOnScrim = true, bodyLayout = 'scroll', footer, children }: {
   title: ReactNode;
   size?: 'sm' | 'md' | 'lg';
   onClose: () => void;
   busy?: boolean;
   /** A click on the scrim closes the dialog (default). A dialog whose close is a decision (a plan) turns it off; Esc and the cross stay. */
   closeOnScrim?: boolean;
+  /** `lg` only. `scroll` (default): the body scrolls as one. `column`: the body is a flex column and its children decide what scrolls. */
+  bodyLayout?: 'scroll' | 'column';
   footer?: ReactNode;
   children: ReactNode;
 }) {
@@ -82,7 +88,13 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, closeOn
           <h2 id={titleId} className="min-w-0 flex-1 text-[13px] font-semibold text-content">{title}</h2>
           <Button size="sm" aria-label="Close" onClick={onClose} disabled={busy}><X size={12} /></Button>
         </div>
-        <div className={size === 'lg' ? 'min-h-0 flex-1 overflow-y-auto' : undefined}>{children}</div>
+        <div
+          className={
+            size !== 'lg' ? undefined : bodyLayout === 'column' ? 'flex min-h-0 flex-1 flex-col' : 'min-h-0 flex-1 overflow-y-auto'
+          }
+        >
+          {children}
+        </div>
         {footer !== undefined && <div className="mt-3.5 flex shrink-0 justify-end gap-2">{footer}</div>}
       </div>
     </div>,

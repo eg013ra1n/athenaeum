@@ -1,53 +1,55 @@
-import { useState, type ElementType, type ReactNode } from 'react';
-import { ArrowRight, Check, ChevronDown, ChevronRight, Crosshair, Lock, Pencil, Trash2 } from 'lucide-react';
+import type { ReactNode } from 'react';
+import { AlertTriangle, ChevronDown, ChevronRight, Lock, Trash2 } from 'lucide-react';
 import { Checkbox } from '../settings/Checkbox';
+import { Chip } from '../ui';
 import { formatBytes, imagetypClass } from '../duplicates/presentation';
-import { humanLabel, humanValue, splitFacts, type Fact } from './planLabels';
-import type { McpPlanView, PlanGroup, PlanItem } from '../../types/mcp';
+import { splitFacts, stayLabel, type Fact } from './planLabels';
+import type { PlanGroup, PlanItem } from '../../types/mcp';
 
 /**
- * One group of a plan, drawn like a group of the Duplicates page (`DuplicateGroupCard`): a header row that opens the
- * group, then one row per file with the marker that says what happens to THAT file from the current selection.
+ * One group of a Black Hole plan, drawn like a group of the Duplicates page (`DuplicateGroupCard`): a header row that
+ * opens the group, then one row per copy with the marker that says what happens to THAT copy from the current
+ * selection. What the copies share is said once for the group.
  */
 export interface PlanGroupCardProps {
-  kind: McpPlanView['kind'];
   group: PlanGroup;
   /** The columns the plan names, for the facts on a row. */
   facts: { key: string; label: string }[];
   chosen: string | null;
   included: string[];
   readOnly: boolean;
-  defaultOpen: boolean;
+  open: boolean;
+  onToggleOpen: (groupId: string) => void;
   onToggleItem: (groupId: string, itemId: string) => void;
   onToggleGroup: (groupId: string) => void;
   onChoose: (groupId: string, itemId: string) => void;
 }
 
-/** What a ticked row does, per kind: the pill of the header and the marker of the row use these words. */
-const KIND_WORDS: Record<McpPlanView['kind'], { pill: string; marker: string; left: string; icon: ElementType }> = {
-  black_hole: { pill: 'Move', marker: 'To the Black Hole', left: 'Stays', icon: Trash2 },
-  metadata: { pill: 'Fill', marker: 'Will be filled', left: 'Left empty', icon: Pencil },
-  plate_solve: { pill: 'Solve', marker: 'Will be solved', left: 'Not solved', icon: Crosshair },
-};
-
 const isDay = (v: string) => /^\d{4}-\d{2}-\d{2}/.test(v);
+const dim = 'flex-shrink-0 text-border';
 
-export function PlanGroupCard({ kind, group, facts, chosen, included, readOnly, defaultOpen, onToggleItem, onToggleGroup, onChoose }: PlanGroupCardProps) {
-  const [open, setOpen] = useState(defaultOpen);
-  const words = KIND_WORDS[kind];
+/** The evidence the copies that may move all share; said once on the group. */
+function sharedEvidence(group: PlanGroup, chosen: string | null): string | null {
+  const moving = group.items.filter((i) => i.id !== chosen && i.evidence !== null);
+  const first = moving[0]?.evidence ?? null;
+  return first !== null && moving.every((i) => i.evidence === first) ? first : null;
+}
+
+export function PlanGroupCard({ group, facts, chosen, included, readOnly, open, onToggleOpen, onToggleItem, onToggleGroup, onChoose }: PlanGroupCardProps) {
   const tickable = group.items.filter((i) => i.locked === null && i.id !== chosen);
   const ticked = tickable.filter((i) => included.includes(i.id)).length;
   const bodyId = `plan-${group.id}`;
   const { shared, own } = splitFacts(facts, group);
-  // The header says the frame type and the night once (as the Duplicates header does); the rest is said in the body.
-  const headerKeys = kind === 'black_hole' ? ['IMAGETYP', 'DATE-OBS'] : [];
-  const type = kind === 'black_hole' ? shared.find((f) => f.key === 'IMAGETYP') : undefined;
-  const date = kind === 'black_hole' ? shared.find((f) => f.key === 'DATE-OBS') : undefined;
-  const bodyShared = shared.filter((f) => !headerKeys.includes(f.key));
+  // The header says the frame type and the night once, as the Duplicates header does; the rest is said in the body.
+  const type = shared.find((f) => f.key === 'IMAGETYP');
+  const date = shared.find((f) => f.key === 'DATE-OBS');
+  const bodyShared = shared.filter((f) => f.key !== 'IMAGETYP' && f.key !== 'DATE-OBS');
   const sized = group.items.some((i) => i.sizeBytes != null);
   const movedBytes = group.items.filter((i) => included.includes(i.id)).reduce((n, i) => n + (i.sizeBytes ?? 0), 0);
   const unitBytes = group.items.find((i) => i.id === chosen)?.sizeBytes ?? group.items[0]?.sizeBytes ?? null;
-  const PillIcon = words.icon;
+  const needsKeeper = group.chooseOne !== null && chosen === null;
+  const evidence = sharedEvidence(group, chosen);
+  const unreachable = group.note !== null && /reach/i.test(group.note);
 
   return (
     <div className={open ? 'bg-surface-hover/40' : ''}>
@@ -65,7 +67,7 @@ export function PlanGroupCard({ kind, group, facts, chosen, included, readOnly, 
           aria-expanded={open}
           aria-controls={bodyId}
           aria-label={`${open ? 'Collapse' : 'Expand'} ${group.title}`}
-          onClick={() => setOpen((o) => !o)}
+          onClick={() => onToggleOpen(group.id)}
           className="flex min-w-0 flex-1 items-center gap-2 rounded text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
         >
           {open ? <ChevronDown size={16} className="flex-shrink-0" /> : <ChevronRight size={16} className="flex-shrink-0" />}
@@ -74,58 +76,53 @@ export function PlanGroupCard({ kind, group, facts, chosen, included, readOnly, 
               {type.value}
             </span>
           )}
-          <span
-            className={`min-w-0 truncate text-xs text-content ${kind === 'black_hole' ? 'font-mono' : 'font-semibold'}`}
-            title={group.title}
-          >
+          <span className="min-w-0 truncate font-mono text-xs text-content" title={group.title}>
             {group.title}
           </span>
-          {date && (
-            <span className="flex-shrink-0 font-mono text-[11px] text-content-muted">{isDay(date.value) ? date.value.slice(0, 10) : date.value}</span>
-          )}
-          {kind === 'black_hole' && sized && unitBytes !== null && (
+          {date && <span className="flex-shrink-0 font-mono text-[11px] text-content-muted">{isDay(date.value) ? date.value.slice(0, 10) : date.value}</span>}
+          {sized && unitBytes !== null && (
             <>
-              <span className="flex-shrink-0 text-border">·</span>
-              <span className="flex-shrink-0 text-xs font-semibold">{group.items.length}</span>
+              <span className={dim}>·</span>
+              <span className="flex-shrink-0 text-xs font-semibold text-content">{group.items.length}</span>
               <span className="flex-shrink-0 text-[11px] text-content-muted">×</span>
               <span className="flex-shrink-0 text-[11px] text-content-muted">{formatBytes(unitBytes)}</span>
               {movedBytes > 0 && (
                 <>
-                  <span className="flex-shrink-0 text-border">·</span>
-                  <span className="flex-shrink-0 text-[11px] text-error/80">{formatBytes(movedBytes)} to move</span>
+                  <span className={dim}>·</span>
+                  <span className="flex-shrink-0 whitespace-nowrap text-[11px] text-error/80">{formatBytes(movedBytes)} to move</span>
                 </>
               )}
             </>
           )}
         </button>
-        {/* Like the Duplicates header, a Black Hole group says nothing while nothing is marked; the others always say how many. */}
-        {(ticked > 0 || kind !== 'black_hole') && (
-          <span
-            className={`inline-flex h-6 flex-shrink-0 items-center gap-1 rounded-full border px-2 text-[11px] ${
-              ticked === 0
-                ? 'border-border bg-surface-hover text-content-muted'
-                : kind === 'black_hole'
-                  ? 'border-error/50 bg-error-muted text-error'
-                  : 'border-accent/40 bg-accent/15 text-accent'
-            }`}
-          >
-            <PillIcon size={12} />
-            {words.pill} {ticked} of {tickable.length}
+        {/* Like the Duplicates header, a group says nothing while nothing is marked, unless it still needs its copy that stays. */}
+        {needsKeeper ? (
+          <span className="inline-flex h-6 flex-shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-warning/50 bg-warning-muted px-2 text-[11px] text-warning">
+            <AlertTriangle size={12} aria-hidden />
+            Pick the copy that stays
           </span>
+        ) : (
+          ticked > 0 && (
+            <span className="inline-flex h-6 flex-shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-error/50 bg-error-muted px-2 text-[11px] text-error">
+              <Trash2 size={12} aria-hidden />
+              Move {ticked} of {group.items.length}
+            </span>
+          )
         )}
       </div>
 
       {open && (
-        <div id={bodyId} className="space-y-1 px-3 pb-3 pt-1">
-          {group.note && <p className="text-[11px] text-content-muted">{group.note}</p>}
+        <div id={bodyId} className="px-3 pb-2.5 pt-0.5">
+          {group.note && <p className={`mb-1 ml-1 text-[11px] ${unreachable ? 'text-warning' : 'text-content-faint'}`}>{group.note}</p>}
+          {evidence && <p className="mb-1 ml-1 text-[11px] text-content-faint">{evidence}</p>}
           {bodyShared.length > 0 && <FactLine facts={bodyShared} />}
           {group.items.map((item) => (
             <Row
               key={item.id}
-              kind={kind}
               group={group}
               item={item}
-              facts={own(item)}
+              extra={own(item)}
+              sharedEvidence={evidence}
               isChosen={item.id === chosen}
               isIncluded={included.includes(item.id)}
               readOnly={readOnly}
@@ -140,81 +137,62 @@ export function PlanGroupCard({ kind, group, facts, chosen, included, readOnly, 
 }
 
 /** `Label value` pairs on one muted line: the label faint, the value a step brighter. */
-function FactLine({ facts, children }: { facts: Fact[]; children?: ReactNode }) {
+function FactLine({ facts }: { facts: Fact[] }) {
   return (
-    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
+    <div className="mb-1 ml-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
       {facts.map((f) => (
         <span key={f.key}>
           <span className="text-content-faint">{f.label}</span> <span className="text-content-secondary">{f.value}</span>
         </span>
       ))}
-      {children}
     </div>
   );
 }
 
 function Row({
-  kind,
-  group,
-  item,
-  facts,
-  isChosen,
-  isIncluded,
-  readOnly,
-  onToggleItem,
-  onChoose,
+  group, item, extra, sharedEvidence: groupEvidence, isChosen, isIncluded, readOnly, onToggleItem, onChoose,
 }: {
-  kind: McpPlanView['kind'];
   group: PlanGroup;
   item: PlanItem;
-  facts: Fact[];
+  /** Facts of this copy that differ from its group's. */
+  extra: Fact[];
+  sharedEvidence: string | null;
   isChosen: boolean;
   isIncluded: boolean;
   readOnly: boolean;
   onToggleItem: (groupId: string, itemId: string) => void;
   onChoose: (groupId: string, itemId: string) => void;
 }) {
-  const words = KIND_WORDS[kind];
   const locked = item.locked !== null;
   const acts = isIncluded && !isChosen && !locked;
-  const destructive = kind === 'black_hole';
-
-  // The marker says what happens to THIS row from the current selection.
-  let marker: ReactNode;
-  if (acts) {
-    marker = (
-      <span className={`inline-flex items-center gap-1 ${destructive ? 'text-error' : 'text-accent'}`}>
-        {destructive ? <Trash2 size={13} /> : <Check size={13} />}
-        {words.marker}
-      </span>
-    );
-  } else if (isChosen) {
-    marker = (
-      <span className="inline-flex items-center gap-1 text-success">
-        <Check size={13} />
-        Stays
-      </span>
-    );
-  } else if (locked) {
-    marker = (
-      <span className="inline-flex items-center gap-1 text-content-muted">
-        <Lock size={12} />
-        Locked
-      </span>
-    );
-  } else {
-    marker = <span className={destructive ? 'text-content-secondary' : 'text-content-muted'}>{words.left}</span>;
-  }
-
-  const size = item.sizeBytes != null ? formatBytes(item.sizeBytes) : null;
-  const modified = item.values.modified ?? null;
   const canKeep = group.chooseOne !== null && !isChosen && item.candidate;
+  const modified = item.values.modified ?? null;
+  // The copy's own words, only where they differ from what the group says.
+  const own = [...extra.map((f) => `${f.label} ${f.value}`), ...(!locked && item.evidence && item.evidence !== groupEvidence ? [item.evidence] : [])];
+
+  let lab: ReactNode = null;
+  // A copy that cannot move shows the lock, even when it is the one that stays (a master with calibration links).
+  if (locked)
+    lab = (
+      <>
+        <Lock size={13} className="text-content-faint" aria-hidden />
+        <span className="sr-only">Locked</span>
+      </>
+    );
+  else if (isChosen) lab = <span className="text-success">Keep</span>;
+  else if (acts)
+    lab = (
+      <>
+        <Trash2 size={13} aria-hidden />
+        <span className="sr-only">To the Black Hole</span>
+      </>
+    );
 
   return (
     <div
       data-testid="plan-row"
-      className={`flex items-start gap-2 rounded border px-2 py-1.5 transition-colors ${
-        acts ? (destructive ? 'border-error/40 bg-error-muted/40' : 'border-accent/40 bg-accent/10') : 'border-transparent hover:bg-surface-hover'
+      className={`flex items-center gap-2 rounded border px-2 py-[5px] transition-colors ${
+        acts ? 'border-error/50 bg-error-muted/40' : 'border-transparent hover:bg-surface-hover'
       }`}
     >
       <Checkbox
@@ -224,78 +202,39 @@ function Row({
         onChange={() => onToggleItem(group.id, item.id)}
         ariaLabel={`Include ${item.fileName}`}
       />
-      <span className="w-36 flex-shrink-0 text-xs font-medium leading-4">{marker}</span>
-      <div className="min-w-0 flex-1 space-y-0.5">
-        <div
-          className={`truncate font-mono text-xs ${acts && destructive ? 'text-content-muted line-through' : 'text-content'}`}
-          title={item.fileName}
+      <span className={`inline-flex w-12 flex-none items-center text-xs font-medium ${acts ? 'text-error' : ''}`}>{lab}</span>
+      <div className="min-w-0 flex-1">
+        <span
+          title={`${item.folder}/${item.fileName}`}
+          className={`block overflow-hidden text-ellipsis whitespace-nowrap text-left font-mono text-xs [direction:rtl] ${acts ? 'text-content-muted line-through' : 'text-content'}`}
         >
-          {item.fileName}
-        </div>
-        <div className="truncate font-mono text-[11px] text-content-muted" title={item.folder}>
-          {item.folder}
-        </div>
-        {kind === 'metadata' && <Change item={item} />}
-        {kind === 'plate_solve' && <SolveLines item={item} />}
-        {facts.length > 0 && <FactLine facts={facts} />}
-        {locked && (
-          <div className="flex items-start gap-1 text-[11px] text-content-muted">
-            <Lock size={11} className="mt-[2px] shrink-0" aria-hidden />
-            <span>{item.locked}</span>
-          </div>
-        )}
-        {!locked && item.evidence && <div className="text-[11px] text-content-muted">{item.evidence}</div>}
-      </div>
-      {(size || modified) && (
-        <div className="flex-shrink-0 text-right text-[11px] text-content-muted">
-          {size && <div>{size}</div>}
-          {modified && <div>{modified}</div>}
-        </div>
-      )}
-      {canKeep && (
-        <button
-          type="button"
-          disabled={readOnly}
-          aria-label={`${group.chooseOne}: ${item.fileName}`}
-          onClick={() => onChoose(group.id, item.id)}
-          className="flex-shrink-0 rounded border border-border px-2 py-0.5 text-[11px] text-content-secondary hover:border-accent/50 hover:text-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          Keep this one
-        </button>
-      )}
-    </div>
-  );
-}
-
-/** A metadata change: the field, what the frame holds now, and the value the plan would write. */
-function Change({ item }: { item: PlanItem }) {
-  const field = item.values.field ?? '';
-  const current = item.values.current ?? '';
-  const proposed = item.values.proposed ?? '';
-  return (
-    <div className="flex flex-wrap items-center gap-x-1.5 text-[11px]">
-      <span className="text-content-faint">{humanLabel(field)}</span>
-      <span className="text-content-muted">{humanValue(field, current)}</span>
-      <ArrowRight size={11} className="text-content-faint" aria-hidden />
-      <span className="font-medium text-content">{humanValue(field, proposed)}</span>
-    </div>
-  );
-}
-
-/** A plate-solve row: the position the frame holds now, and what a solve would write to it. */
-function SolveLines({ item }: { item: PlanItem }) {
-  const hint = item.values.coordinates;
-  const noName = item.values.object === '(none)';
-  return (
-    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
-      {hint && (
-        <span>
-          <span className="text-content-faint">Position hint</span> <span className="text-content-secondary">{hint}</span>
+          <bdi>
+            <span className="text-content-faint">{item.folder}/</span>
+            <span>{item.fileName}</span>
+          </bdi>
         </span>
-      )}
-      <span>
-        <span className="text-content-faint">A solve writes</span>{' '}
-        <span className="text-content-secondary">{noName ? 'its coordinates and the name of the object in its field' : 'its coordinates'}</span>
+        {own.length > 0 && <div className="truncate text-[11px] text-content-faint">{own.join(' · ')}</div>}
+      </div>
+      {modified && <span className="flex-none whitespace-nowrap text-[11px] text-content-muted">{modified}</span>}
+      <span className="flex min-w-24 flex-none items-center justify-end gap-1.5">
+        {isChosen && !locked && <Chip tone="ok">Stays</Chip>}
+        {locked && item.locked && (
+          <Chip tone="info" title={item.locked}>
+            <span aria-hidden>{stayLabel(item.locked)}</span>
+            <span className="sr-only">{item.locked}</span>
+          </Chip>
+        )}
+        {canKeep && (
+          <button
+            type="button"
+            disabled={readOnly}
+            aria-label={`${group.chooseOne}: ${item.fileName}`}
+            onClick={() => onChoose(group.id, item.id)}
+            className="flex-shrink-0 px-1.5 py-px text-[11px] leading-[1.4] text-accent hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-45 disabled:no-underline"
+          >
+            Keep this one
+          </button>
+        )}
       </span>
     </div>
   );

@@ -83,3 +83,23 @@ export function selectionProblems(plan: McpPlanView, sel: PlanSelection): string
   if (!any) problems.push(plan.kind === 'black_hole' ? 'tick at least one file' : 'tick at least one frame');
   return problems;
 }
+
+/** The items the user may tick now: not locked and not the copy that stays. The footer's "of M". */
+export function offered(plan: McpPlanView, sel: PlanSelection): number {
+  return plan.groups.reduce((n, g) => n + g.items.filter((i) => ticks(chosenOf(sel, g.id), i)).length, 0);
+}
+
+/** The table's "select all": every tickable item ticked → none; otherwise every tickable item (a half-ticked plan fills up). */
+export function toggleAll(plan: McpPlanView, sel: PlanSelection): PlanSelection {
+  const ids = (g: McpPlanView['groups'][number]) => g.items.filter((i) => ticks(chosenOf(sel, g.id), i)).map((i) => i.id);
+  const everyTicked = sel.groups.every((s) => {
+    const group = plan.groups.find((g) => g.id === s.groupId);
+    return !group || ids(group).every((id) => s.included.includes(id));
+  });
+  return {
+    groups: sel.groups.map((s) => {
+      const group = plan.groups.find((g) => g.id === s.groupId);
+      return group ? { ...s, included: everyTicked ? [] : ids(group) } : s;
+    }),
+  };
+}

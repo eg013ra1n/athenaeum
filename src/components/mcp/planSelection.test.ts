@@ -3,6 +3,7 @@ import {
   chooseOne,
   initialSelection,
   selectionProblems,
+  toggleAll,
   toggleGroup,
   toggleItem,
   totals,
@@ -106,5 +107,20 @@ describe('planSelection', () => {
       const sel = toggleGroup(p, toggleGroup(p, initialSelection(p), 'group:1'), 'group:2');
       expect(selectionProblems(p, sel)).toEqual(['tick at least one frame']);
     }
+  });
+
+  it('select_all_ticks_every_tickable_item_or_clears_them_all', () => {
+    const p = plan();
+    const sel = initialSelection(p);
+    // Some are ticked, not all: one click ticks every item that may be ticked (never the kept copy or a locked one).
+    const partly = toggleItem(p, sel, 'group:1', 'item:3');
+    const full = toggleAll(p, partly);
+    expect(included(full, 'group:1')).toEqual(['item:2', 'item:3']);
+    expect(included(full, 'group:2')).toEqual(['item:5']);
+    // Everything ticked: one click clears.
+    const none = toggleAll(p, full);
+    expect(included(none, 'group:1')).toEqual([]);
+    expect(included(none, 'group:2')).toEqual([]);
+    expect(none.groups.map((g) => g.chosen)).toEqual(['item:1', 'item:4']);
   });
 });
