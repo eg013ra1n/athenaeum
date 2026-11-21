@@ -27,7 +27,7 @@ pub use findings::{
     MissingCategory, MissingFinding,
 };
 pub use frontend_truth::{frame_set_tab, missing_flags, FrameSetTab, MissingFlags};
-pub use quality::{quality_summary, QualityMetric, QualitySummary, OUTLIERS_SHOWN};
+pub use quality::{quality_summary, EarlierFigures, QualityMetric, QualitySummary, OUTLIERS_SHOWN};
 pub use storage::{storage_summary, StorageLine, StorageSummary};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

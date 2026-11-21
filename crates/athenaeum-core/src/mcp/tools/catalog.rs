@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use super::{prepare, run, to_json as json, FileArgs, MissingArgs, Prep, QueryFramesArgs, ScopeArgs};
 use crate::api::ApiError;
 use crate::catalog_query::{
-    self as cq, CalibrationLine, FileLine, FrameGroup, FrameSetTotals, MissingCategory, QualityMetric, QualitySummary,
+    self as cq, CalibrationLine, EarlierFigures, FileLine, FrameGroup, FrameSetTotals, MissingCategory, QualityMetric, QualitySummary,
     ScopedFrame, StorageSummary, Totals, FRAME_SETS_PAGE, GROUPS_SHOWN,
 };
 use crate::mcp::answer::{bytes_text, count_of};
@@ -227,6 +227,22 @@ fn storage_json(s: &StorageSummary) -> Result<Value, ApiError> {
     }))
 }
 
+fn earlier_json(e: &EarlierFigures) -> Result<Value, ApiError> {
+    let outliers = |v: &[(FileLine, f64)]| -> Result<Vec<Value>, ApiError> {
+        v.iter().map(|(l, x)| Ok(json!({ "file": json(l)?, "value": x }))).collect()
+    };
+    Ok(json!({
+        "version": e.version,
+        "frames": e.frames,
+        "min": e.min,
+        "median": e.median,
+        "max": e.max,
+        "lowOutliers": outliers(&e.low_outliers)?,
+        "highOutliers": outliers(&e.high_outliers)?,
+        "refused": e.refused.iter().map(|(why, n)| json!({ "reason": why, "frames": n })).collect::<Vec<_>>(),
+    }))
+}
+
 fn quality_json(q: &QualitySummary) -> Result<Value, ApiError> {
     let outliers = |v: &[(FileLine, f64)]| -> Result<Vec<Value>, ApiError> {
         v.iter().map(|(l, x)| Ok(json!({ "file": json(l)?, "value": x }))).collect()
@@ -236,6 +252,7 @@ fn quality_json(q: &QualitySummary) -> Result<Value, ApiError> {
         "measured": q.measured,
         "notMeasured": q.not_measured,
         "olderVersion": q.older_version,
+        "earlier": q.earlier.iter().map(earlier_json).collect::<Result<Vec<_>, ApiError>>()?,
         "refused": q.refused.iter().map(|(why, n)| json!({ "reason": why, "frames": n })).collect::<Vec<_>>(),
         "min": q.min,
         "median": q.median,
@@ -313,6 +330,30 @@ fn storage_lines(s: &StorageSummary) -> Vec<String> {
     out
 }
 
+/// One earlier measurement version in words: its own figures, apart from the current ones, named once.
+fn earlier_line(e: &EarlierFigures) -> String {
+    let who = match e.version {
+        Some(v) => format!("measured by version {v}"),
+        None => "measured before versions were recorded (legacy)".to_string(),
+    };
+    let mut line = format!("  {} {who} — their figures, apart from the current ones", e.frames);
+    if let (Some(a), Some(m), Some(b)) = (e.min, e.median, e.max) {
+        line.push_str(&format!(": median {m:.3}, range {a:.3} … {b:.3}"));
+    }
+    for (title, list) in [("low outliers", &e.low_outliers), ("high outliers", &e.high_outliers)] {
+        if !list.is_empty() {
+            let named: Vec<String> = list.iter().map(|(l, v)| format!("{v:.3}: {}", file_text(l))).collect();
+            line.push_str(&format!("; {title} {}", named.join(" | ")));
+        }
+    }
+    if !e.refused.is_empty() {
+        let refused: Vec<String> = e.refused.iter().map(|(why, n)| format!("{} {why}", count_of(*n, "frame", "frames"))).collect();
+        line.push_str(&format!("; refused: {}", refused.join(", ")));
+    }
+    line.push_str("; run Analysis again for current figures");
+    line
+}
+
 fn quality_lines(q: &QualitySummary) -> Vec<String> {
     let label = metric_label(q.metric);
     let mut out = Vec::new();
@@ -324,11 +365,14 @@ fn quality_lines(q: &QualitySummary) -> Vec<String> {
     if q.not_measured > 0 {
         out.push(format!("  {} not measured", count_of(q.not_measured, "raw light is", "raw lights are")));
     }
-    if q.older_version > 0 {
+    if q.earlier.is_empty() && q.older_version > 0 {
         out.push(format!(
-            "  {} measured by an older version of Athenaeum's measurement",
+            "  {} measured by an earlier version of Athenaeum's measurement",
             count_of(q.older_version, "raw light was", "raw lights were")
         ));
+    }
+    for e in &q.earlier {
+        out.push(earlier_line(e));
     }
     for (why, n) in &q.refused {
         out.push(format!("  {}: {why}", count_of(*n, "frame", "frames")));
@@ -925,4 +969,84 @@ pub fn find_missing_metadata(host: &McpHost, args: MissingArgs) -> Result<Answer
     data.insert("otherFolders".to_string(), json!({ "folders": more_folders, "files": more_files }));
     data.insert("page".to_string(), json(&found.page)?);
     Ok(prep.answer(&lines.join("\n"), data))
+}
+
+#[cfg(test)]
+mod quality_text_tests {
+    use super::*;
+    use crate::catalog_query::QualityMetric;
+    use crate::scope::FrameState;
+
+    fn line(name: &str) -> FileLine {
+        FileLine {
+            handle: "file:1".to_string(),
+            file_name: name.to_string(),
+            folder: "/data/night".to_string(),
+            imagetyp: Some("Light".to_string()),
+            object: None,
+            filter: None,
+            exptime_s: None,
+            gain: None,
+            offset: None,
+            ccd_temp: None,
+            binning: None,
+            width: None,
+            height: None,
+            date_obs: None,
+            night: None,
+            instrume: None,
+            telescop: None,
+            state: FrameState::Catalog,
+        }
+    }
+
+    fn earlier(version: Option<u32>) -> EarlierFigures {
+        EarlierFigures {
+            version,
+            frames: 368,
+            min: Some(2.41),
+            median: Some(3.12),
+            max: Some(5.9),
+            low_outliers: Vec::new(),
+            high_outliers: vec![(line("far.fits"), 5.9)],
+            refused: vec![("stars trailed".to_string(), 2)],
+        }
+    }
+
+    fn summary(earlier: Vec<EarlierFigures>, older_version: usize) -> QualitySummary {
+        QualitySummary {
+            metric: QualityMetric::Fwhm,
+            measured: 2,
+            not_measured: 0,
+            older_version,
+            earlier,
+            refused: Vec::new(),
+            min: Some(2.0),
+            median: Some(2.1),
+            max: Some(2.2),
+            low_outliers: Vec::new(),
+            high_outliers: Vec::new(),
+            not_measured_reason: None,
+        }
+    }
+
+    #[test]
+    fn earlier_text_names_each_version_once() {
+        let text = quality_lines(&summary(vec![earlier(Some(7)), earlier(None)], 736)).join("\n");
+        assert_eq!(text.matches("measured by version 7").count(), 1, "{text}");
+        assert_eq!(text.matches("measured before versions were recorded (legacy)").count(), 1, "{text}");
+        assert_eq!(text.matches("run Analysis again for current figures").count(), 2, "{text}");
+        assert!(text.contains("368 measured by version 7 — their figures, apart from the current ones: median 3.120, range 2.410 … 5.900"), "{text}");
+        assert!(text.contains("high outliers 5.900: "), "{text}");
+        assert!(text.contains("far.fits"), "{text}");
+        assert!(text.contains("refused: 2 frames stars trailed"), "{text}");
+        assert!(!text.contains("older version"), "the old sentence is replaced: {text}");
+        assert!(!text.contains("earlier version"), "{text}");
+    }
+
+    #[test]
+    fn older_rows_with_no_figures_keep_the_plain_sentence() {
+        let text = quality_lines(&summary(Vec::new(), 3)).join("\n");
+        assert_eq!(text.matches("earlier version").count(), 1, "{text}");
+    }
 }
