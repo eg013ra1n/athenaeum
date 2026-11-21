@@ -175,7 +175,7 @@ fn tab_sql(tab: FrameSetTab) -> &'static str {
     }
 }
 
-fn tab_label(tab: FrameSetTab) -> &'static str {
+pub fn tab_label(tab: FrameSetTab) -> &'static str {
     match tab {
         FrameSetTab::Stage => "Stage",
         FrameSetTab::Wip => "WIP",
