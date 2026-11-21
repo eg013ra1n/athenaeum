@@ -424,19 +424,8 @@ Branch `mcp/m1-host`, merged to local `main` (spec `docs/superpowers/specs/2026-
 rulings and deferred items; the ledger was deleted at the plan's close). Evidence: the headless smoke on a copy of the
 dev catalog (40 535 frames, 82 sets: 11 of 11 cases equal the app, nothing changed). Owed by hand, in Claude desktop and
 Claude Code against `npm run tauri dev` (dev catalog) and the installed release:
-- **S1 off, and client before app.** Access off in both builds: every question answers the off sentence only. Then
-  quit Athenaeum, start Claude desktop first: the real tools are listed, a call answers "not running"; start
-  Athenaeum: the next call answers.
-- **S2 duplicates.** `find_duplicates` over the whole catalog equals the Duplicates page, with the content setting
-  off and on.
 - **S11 dev and release at once.** Both on: each answer names its own build (`athenaeum` / `athenaeum-dev`) and its
   own catalog path; a dev config pointed at the release says it reached the other build.
-- **S13 scope.** One camera + one year: the missing-metadata answer equals the Missing Metadata view on non-Black-Hole
-  rows (the view lists Black Hole files — see "App gaps found while planning the MCP"); a misspelled camera names the
-  nearest values.
-- **S14 questions** (replaced by S14' below, 2026-11-21). A frame set's counts and integration per filter equal its page (try LDN 1272: two sets share the
-  name, each answered with its own page's figures); an outlier named by file; a never-measured value said so (the dev
-  catalog's analyses predate MEASURE_VERSION 8, so expect "measured by an earlier version").
 - **Windows session.** The named pipe; the client config points at `<app-data>\bin\athenaeum-mcp.exe`; update the app
   while Claude holds the bridge: the copy is kept, refreshed at the next start, the old bridge still answers. The
   Windows channel code is compile-checked here (`x86_64-pc-windows-gnu`), never run; the tag pipeline's Windows job is
@@ -459,15 +448,11 @@ installed release:
   itself and the app comes to the front; no button has focus; Apply arms after a second; untick → the totals drop;
   Cancel changes nothing; Apply moves exactly the ticked files (Black Hole tab), restore works, file views refresh. A
   scrim click does nothing; Escape cancels; while applying the window can be hidden and the report reopens it.
-- **S4 the model cannot apply.** "Apply it yourself" fails in words; `plan_status` says waiting until the click.
 - **S5 web, no page.** Docker without `ATHENAEUM_API_KEY`: the toggle is off with the why. With it: no tab open → the
   answer says "open Athenaeum"; a tab shows the waiting plan; a replaced plan stays on screen as replaced; an expired
   plan offers no Apply.
 - **S6 another connection.** Claude desktop asks `plan_status` after a plan and gets it (it opens two connections).
 - **S7 changed on disk.** Touch a planned file between plan and Apply → that item skipped, with its reason.
-- **S8 rebuilt copies.** `/Volumes/bigbase3/Calibration` → 108 masters, 81 distinct, 27 extra (ATR2600M 12,
-  ZWO_ASI2600MC_Duo 9, ZWO_ASI6200MM_Pro 6); no linked copy is ever ticked.
-- **S12 writes logged** (replaced by S12' below, 2026-11-21). `list_operations(kind = "mcp_plan_apply")` lists each apply with its `plan_id`.
 Told, not fixed: planning banks each verified pair's full-file hash (`files.strong_hash`, `updated_at`), as the
 Duplicates page's verify does; a master moved to the Black Hole leaves the master library (the app's own
 unregister; only unlinked masters reach a plan's ticks); a web server restarted during an apply leaves that tab
@@ -480,16 +465,10 @@ headless smoke on a copy of the dev catalog: a frame-type fill applied 5 of 6 fr
 `override = 1`; 5 real M 8 frames solved through the assistant, only they got coordinates; an Apply while a UI batch
 held the slot was refused and the plan kept waiting. The plan window and the plate-solve panel were never seen in a
 browser. Owed by hand, in Claude desktop and Claude Code against `npm run tauri dev` and the installed release:
-- **S9 fill by inference and by instruction.** Fill a frame type from a `Flats` folder and an object from agreeing
-  neighbours; then "these are M 31" on a few lights ("by your instruction" shown). Rescan: the values stay. A date
-  without a time is refused.
-- **S10 plate solve both ways** (S10' below covers the two-file ask, 2026-11-21). The same frames solved from the assistant and from the UI agree. While the assistant's
-  run goes, the plate-solve panel shows it with Cancel, and the UI's own batch waits ("Plate solve not started" once
-  per wait). The assistant cannot plan or start while a UI batch runs, and Apply then keeps the plan waiting.
-- **S12 writes logged** (replaced by S12' below, 2026-11-21). `list_operations(kind = "mcp_plan_apply")` lists the metadata and solve applies with their
-  `plan_id`.
-- **S13 fill side.** A metadata plan scoped to one camera and one year proposes only frames the Missing Metadata view
-  lists for that scope (non-Black-Hole rows).
+- **S9 Apply and rescan.** Apply a frame-type fill and an object fill: the values land; rescan: the values stay.
+  (The proposals themselves passed 2026-11-21 on a catalog copy.)
+- **S10 the panel.** While the assistant's run goes, the plate-solve panel shows it with Cancel, and the UI's own batch
+  waits ("Plate solve not started" once per wait).
 Told, not fixed:
 - A solve also names a frame's missing object from its field, as a UI solve does; the plan says so. On the smoke, M 8
   frames became "RCW 145" while their folder says "M 8".
@@ -501,11 +480,10 @@ Told, not fixed:
 
 Branch `mcp/smoke-fixes`, merged to local `main`, not pushed (plan `docs/superpowers/plans/2026-11-21-mcp-smoke-fixes-plan.md`).
 Reference: `docs/mcp/README.md` ("The scope", "Add to Claude desktop", the 2026-11-21 entry). They replace П2, S10, S12 and S14 of the owner's
-checklist; the old S10 / S12 / S14 entries above are marked replaced. Owed by hand, against `npm run tauri dev` and Claude desktop / Claude Code:
+checklist. Owed by hand, against `npm run tauri dev` and Claude desktop / Claude Code:
 - **П2'.** Settings → Assistant access → Add to Claude desktop; restart Claude desktop → Athenaeum (dev) in its tools, the file's old keys kept, a `.bak` beside it. On OBS-PC1 (Windows): the same, and say whether Claude is the Store build.
-- **S10'.** Ask the assistant to solve two named files → the plan window holds exactly those two.
-- **S14'.** Ask about LDN 1272 → both sets named, the Stage one with its 4 frames, camera and `set:231`; ask for FWHM outliers → legacy figures shown apart, outliers by file name.
-- **S12'.** Ask Claude Code in the repo for `list_operations(kind = "mcp_plan_apply")` → each applied plan with its id.
+- **S12'.** Ask Claude Code in the repo for `list_operations(kind = "mcp_plan_apply")` → each applied plan with its id
+  (the two solve applies of 2026-11-21 are listed; owed: a Black Hole apply and a metadata apply).
 Deferred (owner): starting Analysis from the assistant (a new plan kind).
 
 ### Forced-list zero point (2026-11-16)
