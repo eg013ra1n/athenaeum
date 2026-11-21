@@ -9,36 +9,54 @@ const GB = 1024 ** 3;
 const MB = 1024 ** 2;
 const ROOT = { id: 1, path: '/Volumes/Astro' };
 
-// The files of the scenario: two groups of byte-identical copies. One copy of the master is linked by calibration
-// links, so the plan locks it.
+// The files of the scenario, the mockup's three groups of byte-identical copies: a light with two extra copies; a master
+// flat whose first copy is linked by calibration links (so the plan locks it and it stays); a dark whose copy that would
+// stay is on a drive that cannot be reached (no copy is picked, the user must pick one).
+const LIGHT = '2025-09-14_01-25-40__-9.90_180.00s_0006.fits';
+const DARK = '2025-09-12_22-41-07__-10.00_300.00s_0001.fits';
 const GROUPS = [
   {
     id: 1,
-    name: 'masterDark_300s_-10C.xisf',
-    type: 'DARK',
-    object: null,
-    filter: null,
-    exptime: '300',
-    date: '2026-10-02T21:14:05Z',
-    size: Math.round(1.08 * GB),
+    name: LIGHT,
+    type: 'LIGHT',
+    object: 'M 78',
+    filter: 'L',
+    exptime: '180',
+    date: '2025-09-14T01:25:40Z',
+    size: Math.round(42.3 * MB),
     copies: [
-      { fileId: 101, folder: '/Volumes/Astro/Masters', modified: '2026-10-03 08:00:00' },
-      { fileId: 102, folder: '/Volumes/Astro/Backup/Masters', modified: '2026-10-03 08:00:00' },
-      { fileId: 103, folder: '/Volumes/Astro/Old/Masters', modified: '2026-10-03 08:00:00', lock: 'calibration links point at it; it stays in v1' },
+      { fileId: 101, folder: '/Volumes/Universe/Astrophotography/MBPMAX/Astro/Unsorted/2025-09-13/LIGHT', modified: '2025-09-14 01:28:47' },
+      { fileId: 102, folder: '/Volumes/BigMac/Pictures/Import/2025-09-13', modified: '2025-09-14 09:02:11' },
+      { fileId: 103, folder: '/Volumes/Universe/Astrophotography/Backup/2025-09-13/LIGHT', modified: '2025-09-15 18:44:30' },
     ],
   },
   {
     id: 2,
-    name: 'M31_L_300s_0012.fits',
-    type: 'LIGHT',
-    object: 'M31',
+    name: 'masterFlat_L_2025-09-14.xisf',
+    type: 'FLAT',
+    object: null,
     filter: 'L',
-    exptime: '300',
-    date: '2026-10-02T22:41:09Z',
-    size: 62 * MB,
+    exptime: '2',
+    date: '2025-09-14T20:15:03Z',
+    size: Math.round(118.4 * MB),
     copies: [
-      { fileId: 201, folder: '/Volumes/Astro/M31/2026-10-02', modified: '2026-10-03 07:12:44' },
-      { fileId: 202, folder: '/Volumes/Astro/Import/M31', modified: '2026-10-03 07:12:44' },
+      { fileId: 201, folder: '/Volumes/Universe/Astrophotography/Masters/Flat', modified: '2025-09-14 20:15:03', lock: '3 calibration links point at this copy, so it stays' },
+      { fileId: 202, folder: '/Volumes/BigMac/Pictures/Import', modified: '2025-09-14 20:15:03' },
+    ],
+  },
+  {
+    id: 3,
+    name: DARK,
+    type: 'DARK',
+    object: null,
+    filter: null,
+    exptime: '300',
+    date: '2025-09-12T22:41:07Z',
+    size: Math.round(54.9 * MB),
+    noKeeper: 'No copy is picked here: the copy that would stay, in /Volumes/Archive, cannot be reached.',
+    copies: [
+      { fileId: 301, folder: '/Volumes/Universe/Astrophotography/MBPMAX/Astro/Unsorted/2025-09-12/DARK', modified: '2025-09-12 22:46:12' },
+      { fileId: 302, folder: '/Volumes/BigMac/Pictures/Import/2025-09-12', modified: '2025-09-13 07:30:55' },
     ],
   },
 ];
@@ -69,6 +87,9 @@ function duplicateGroups() {
   }));
 }
 
+const count = (n, labelOne, label) => ({ count: n, labelOne, label });
+const EXPLAIN_BH = 'Only the marked copies move. The copy that stays is never touched. Pick another copy with Keep this one.';
+
 function blackHolePlan() {
   const values = (g, c) => {
     const v = { IMAGETYP: g.type, EXPTIME: g.exptime, 'DATE-OBS': shown(g.date), INSTRUME: 'ASI2600MM Pro', modified: c.modified };
@@ -78,23 +99,30 @@ function blackHolePlan() {
   };
   return {
     columns: ['IMAGETYP', 'OBJECT', 'FILTER', 'EXPTIME', 'DATE-OBS', 'INSTRUME', 'size', 'modified'].map((k) => ({ key: k, label: k === 'size' ? 'Size' : k === 'modified' ? 'Modified' : k })),
-    title: 'Move duplicate copies to the Black Hole',
-    summary: { counts: [], leftOut: [], warnings: [], facts: [], explain: null },
-    notes: ['2 groups of byte-identical copies; the copy in the first folder of each stays'],
+    title: 'Move extra copies to the Black Hole',
+    summary: {
+      counts: [count(GROUPS.length, 'group', 'groups')],
+      leftOut: [],
+      warnings: [count(1, 'group needs a copy that stays', 'groups need a copy that stays')],
+      facts: [],
+      explain: EXPLAIN_BH,
+    },
+    // The assistant's text answer keeps these; the window prints none of them.
+    notes: ['3 groups of byte-identical copies; the copy in the first folder of each stays'],
     groups: GROUPS.map((g, i) => ({
       id: `group:${i + 1}`,
-      title: `${g.name}: ${g.copies.length} copies`,
-      note: null,
+      title: g.name,
+      note: g.noKeeper ?? null,
       chooseOne: 'Copy that stays',
-      chosen: `item:${g.copies[0].fileId}`,
+      chosen: g.noKeeper ? null : `item:${g.copies[0].fileId}`,
       items: g.copies.map((c, k) => ({
         id: `item:${c.fileId}`,
         fileName: g.name,
         folder: c.folder,
         values: { ...values(g, c), size: `${g.size} B` },
         action: 'Move to the Black Hole',
-        evidence: k === 0 ? null : 'identical bytes to the copy that stays',
-        selected: k > 0 && !c.lock,
+        evidence: k === 0 && !g.noKeeper ? null : 'Same content; bytes are compared with the copy that stays.',
+        selected: k > 0 && !c.lock && !g.noKeeper,
         locked: c.lock ?? null,
         candidate: true,
         sizeBytes: g.size,
@@ -103,13 +131,21 @@ function blackHolePlan() {
   };
 }
 
+const ROOT_DIR = '/Volumes/Universe/Astrophotography/MBPMAX/Astro/Unsorted/';
+const frameName = (start, i, exp, temp) => {
+  const d = new Date(start + i * (exp + 7) * 1000);
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}_${p2(d.getUTCHours())}-${p2(d.getUTCMinutes())}-${p2(d.getUTCSeconds())}__${temp}_${exp.toFixed(2)}s_${String(i + 1).padStart(4, '0')}.fits`;
+};
+
+// One value proposed (1 frame) and a locked group of 1,829 frames with no value found: the window collapses the second to one row.
 function metadataPlan() {
-  const change = (n, name, folder, field, proposed, evidence, over = {}) => ({
-    id: `item:${n}:${field}`,
+  const change = (n, name, folder, proposed, evidence, over = {}) => ({
+    id: `item:${n}:OBJECT`,
     fileName: name,
     folder,
-    values: { field, current: '(empty)', proposed },
-    action: `Set ${field} to '${proposed}'`,
+    values: { field: 'OBJECT', current: '(empty)', proposed },
+    action: `Set OBJECT to '${proposed}'`,
     evidence,
     selected: true,
     locked: null,
@@ -117,99 +153,99 @@ function metadataPlan() {
     sizeBytes: null,
     ...over,
   });
-  const f = (n) => `M31_L_300s_00${n}.fits`;
+  const start = Date.UTC(2025, 8, 20, 20, 31, 12);
   return {
     columns: [{ key: 'field', label: 'Field' }, { key: 'current', label: 'Now' }, { key: 'proposed', label: 'Proposed' }],
-    title: 'Fill in missing metadata',
-    summary: { counts: [], leftOut: [], warnings: [], facts: [], explain: null },
+    title: 'Fill missing metadata',
+    summary: {
+      counts: [],
+      leftOut: [count(1829, 'frame with no value found', 'frames with no value found')],
+      warnings: [count(1, 'frame leaves its session', 'frames leave their sessions'), count(2, 'calibration link removed', 'calibration links removed')],
+      facts: [],
+      explain: 'Only the catalog changes. Files on disk are not rewritten, and a later scan keeps these values.',
+    },
     notes: ['Only the catalog changes: the files on disk are not rewritten, and a frame keeps the value when Athenaeum scans its file again.'],
     groups: [
       {
         id: 'group:1',
-        title: 'Object: M31',
+        title: 'Object: Filter test',
         note: null,
         chooseOne: null,
         chosen: null,
-        items: [
-          change(1, f(11), '/Volumes/Astro/M31/2026-10-02', 'OBJECT', 'M31', 'the other 41 frames in this folder are M31'),
-          change(2, f(12), '/Volumes/Astro/M31/2026-10-02', 'OBJECT', 'M31', 'the other 41 frames in this folder are M31'),
-          change(3, f(13), '/Volumes/Astro/Import/M31', 'OBJECT', 'M31', 'the file name starts with M31'),
-        ],
+        items: [change(1, frameName(Date.UTC(2025, 8, 13, 21, 40, 12), 5, 30, '-9.90'), `${ROOT_DIR}2025-09-13/LIGHT`, 'Filter test', 'the other frames of that night carry the same object name')],
       },
       {
         id: 'group:2',
-        title: 'Camera: ASI2600MM Pro',
-        note: null,
-        chooseOne: null,
-        chosen: null,
-        items: [change(4, f(14), '/Volumes/Astro/M31/2026-10-02', 'INSTRUME', 'ASI2600MM Pro', 'every other frame of this night names this camera')],
-      },
-      {
-        id: 'group:3',
         title: 'Object: nothing proposed',
         note: 'no value could be found for these frames',
         chooseOne: null,
         chosen: null,
-        items: [
-          {
-            ...change(5, 'Light_0001.fits', '/Volumes/Astro/Unsorted', 'OBJECT', '(none)', null, {
-              selected: false,
-              locked: 'nothing in the file name, the folder or the other frames names an object',
-            }),
-          },
-        ],
+        items: Array.from({ length: 1829 }, (_, i) =>
+          change(i + 2, frameName(start, i, 300, '-10.00'), `${ROOT_DIR}2025-09-20/LIGHT`, '(none)', null, {
+            selected: false,
+            locked: 'No value found',
+          }),
+        ),
       },
     ],
   };
 }
 
+// 552 frames in 6 folders, with 650 not light frames and 339 already solved left out; folder 2 has hints on 9 frames.
 function plateSolvePlan() {
-  const frame = (n, name, folder, object, coordinates, over = {}) => ({
-    id: `item:${n}`,
-    fileName: name,
-    folder,
-    values: { object, filter: 'Ha', exposure: '300 s', coordinates },
-    action: 'Solve for its coordinates',
-    evidence: 'no plate solve is stored for this frame',
-    selected: true,
-    locked: null,
-    candidate: false,
-    sizeBytes: null,
-    ...over,
-  });
+  const spec = [
+    ['2025-09-13', 118, 'M 78', 'L', '180 s', []],
+    ['2025-09-14', 143, 'M 78', 'L', '180 s', [2, 6, 9, 31, 48, 77, 90, 101, 120]],
+    ['2025-09-20', 96, 'NGC 2024', 'Ha', '300 s', []],
+    ['2025-10-02', 87, 'NGC 2024', 'Ha', '300 s', []],
+    ['2025-10-11', 74, 'IC 434', 'Ha', '300 s', []],
+    ['2025-10-18', 34, '(none)', 'OIII', '300 s', []],
+  ];
+  const hints = ['05h 46m 45s  +00° 03′', '05h 46m 44s  +00° 04′', '05h 46m 46s  +00° 03′'];
+  let n = 0;
   return {
     columns: [{ key: 'object', label: 'Object' }, { key: 'filter', label: 'Filter' }, { key: 'exposure', label: 'Exposure' }, { key: 'coordinates', label: 'Coordinates' }],
-    title: 'Plate solve',
-    summary: { counts: [], leftOut: [], warnings: [], facts: [], explain: null },
-    notes: [
-      '3 of 4 frames can be solved',
-      '1 frame refused: the file is on a drive that is not connected',
-      'A solved frame gets its coordinates; a frame with no object name also gets the name of the catalogued object the solve finds in its field, as a solve started in Athenaeum does.',
-    ],
-    groups: [
-      {
-        id: 'group:1',
-        title: '/Volumes/Astro/M31/2026-10-02',
+    title: 'Plate solve frames',
+    summary: {
+      counts: [count(6, 'folder', 'folders')],
+      leftOut: [count(650, 'not a light frame', 'not light frames'), count(339, 'already solved', 'already solved')],
+      warnings: [],
+      facts: [
+        { label: 'Star catalog', value: 'installed', tone: 'ok' },
+        { label: 'Index packs', value: '0', tone: 'neutral' },
+        { label: 'At a time', value: '3', tone: 'neutral' },
+      ],
+      explain: "A solve writes the frame's coordinates and, when the frame has no object name, the name of the object found in its field.",
+    },
+    notes: ['552 of 552 frames can be solved', 'A solved frame gets its coordinates; a frame with no object name also gets the name of the catalogued object the solve finds in its field.'],
+    groups: spec.map(([day, size, object, filter, exposure, hinted], g) => {
+      const [y, m, d] = day.split('-').map(Number);
+      const start = Date.UTC(y, m - 1, d, 20, 31, 12);
+      const exp = Number.parseInt(exposure, 10);
+      const folder = `${ROOT_DIR}${day}/LIGHT`;
+      return {
+        id: `group:${g + 1}`,
+        title: folder,
         note: null,
         chooseOne: null,
         chosen: null,
-        items: [
-          frame(1, 'M31_Ha_300s_0001.fits', '/Volumes/Astro/M31/2026-10-02', 'M31', 'RA 10.6847, Dec 41.2690'),
-          frame(2, 'M31_Ha_300s_0002.fits', '/Volumes/Astro/M31/2026-10-02', 'M31', 'RA 10.6851, Dec 41.2688'),
-        ],
-      },
-      {
-        id: 'group:2',
-        title: '/Volumes/Astro/Unsorted',
-        note: null,
-        chooseOne: null,
-        chosen: null,
-        items: [
-          frame(3, 'Light_0003.fits', '/Volumes/Astro/Unsorted', '(none)', 'none'),
-          frame(4, 'Light_0004.fits', '/Volumes/Astro/Unsorted', '(none)', 'none', { selected: false, locked: 'the file is on a drive that is not connected' }),
-        ],
-      },
-    ],
+        items: Array.from({ length: size }, (_, i) => {
+          n += 1;
+          return {
+            id: `item:${n}`,
+            fileName: frameName(start, i, exp, exp === 180 ? '-9.90' : '-10.00'),
+            folder,
+            values: { object, filter, exposure, coordinates: hinted.includes(i) ? hints[hinted.indexOf(i) % 3] : 'none' },
+            action: 'Solve for its coordinates',
+            evidence: 'no plate solve is stored for this frame',
+            selected: true,
+            locked: null,
+            candidate: false,
+            sizeBytes: null,
+          };
+        }),
+      };
+    }),
   };
 }
 
