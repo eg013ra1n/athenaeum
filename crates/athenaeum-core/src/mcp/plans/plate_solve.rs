@@ -1,10 +1,10 @@
 //! The plate-solve plan (MCP plan Task 18, §6.3 and §6.5): an assistant asks Athenaeum to plate-solve frames, for example
-//! the lights that miss coordinates. Athenaeum prepares a plan; only the user applies it, in Athenaeum's window, and
+//! the lights that have no stored plate solve. Athenaeum prepares a plan; only the user applies it, in Athenaeum's window, and
 //! applying STARTS one solve run (`api::plate_solve`, origin `assistant`). The assistant then follows the run with
 //! `solve_status` and may cancel only its own run with `cancel_solve`.
 //!
-//! The items are the lights of the scope (those that miss coordinates when `onlyUnsolved`, the default), one group per
-//! folder. An item the solver must not be handed is locked with the reason: the star catalog is not installed, the
+//! The items are the lights of the scope (those with no stored plate solve when `onlyUnsolved`, the default; a header's
+//! coordinates do not count as solved), one group per folder. An item the solver must not be handed is locked with the reason: the star catalog is not installed, the
 //! input gate refuses it (`service::input_gate_reason`) or its file cannot be reached. Everything the planner needs is
 //! read before the plan begins, so a request that cannot be planned (a scope that names nothing, no light to solve, too
 //! many items, a batch already running) is refused in words and never replaces the plan the user is looking at.
@@ -68,7 +68,7 @@ pub struct PlanPlateSolveArgs {
     /// Which frames. Only the light frames of the scope are planned. Empty: the whole catalog.
     #[serde(default)]
     pub scope: Scope,
-    /// Plan only the lights that miss coordinates (the default). False plans every light of the scope, solved or not.
+    /// Plan only the lights with no plate solve stored (the default). False plans every light of the scope, solved or not.
     #[serde(default = "yes")]
     pub only_unsolved: bool,
 }
@@ -421,14 +421,14 @@ struct Read {
     candidates: Vec<Candidate>,
     /// Frames of the scope that are not raw lights.
     not_lights: usize,
-    /// Lights that already have coordinates and are left out (`onlyUnsolved`).
-    located: usize,
+    /// Lights that already have a stored plate solve and are left out (`onlyUnsolved`).
+    solved: usize,
     concurrency: usize,
 }
 
-fn keys_of(only_unsolved: bool) -> &'static [&'static str] {
-    if only_unsolved { &["IMAGETYP", "RA", "DEC"] } else { &["IMAGETYP"] }
-}
+/// What the plan stamps of a frame's catalog values: its type only. Whether it is solved is read from `plate_solves`
+/// (at the plan and again at the apply), never from the header.
+const STAMPED_KEYS: &[&str] = &["IMAGETYP"];
 
 /// The frames the solver is handed at a time, as `prepare_plate_solve_batch` chooses.
 fn workers_for(cfg: &PlateSolveConfig) -> usize {
@@ -453,8 +453,8 @@ fn read_plan(host: &McpHost, args: &PlanPlateSolveArgs) -> Result<Read, ApiError
     let cfg = config::load_config(&conn);
     // The lights the plan would hold are counted first, from the rows already read: a request over the cap is
     // refused before any per-frame read (the input gate, the catalog values).
-    let (mut not_lights, mut located) = (0usize, 0usize);
-    let mut eligible = Vec::new();
+    let mut not_lights = 0usize;
+    let mut lights = Vec::new();
     for sf in &frames {
         let Some(frame) = sf.file.frame.as_ref() else {
             not_lights += 1;
@@ -468,12 +468,23 @@ fn read_plan(host: &McpHost, args: &PlanPlateSolveArgs) -> Result<Read, ApiError
             not_lights += 1;
             continue;
         }
-        let missing = missing_flags(frame).coordinates;
-        if args.only_unsolved && !missing {
-            located += 1;
-            continue;
+        lights.push((sf, frame, frame_id, file_id));
+    }
+    // "Unsolved" is the app's own: no `plate_solves` row, whatever the header says. One read over the scope's lights.
+    let solved_ids = if args.only_unsolved {
+        let ids: Vec<i64> = lights.iter().map(|l| l.2).collect();
+        crate::plate_solve::storage::frames_with_solve(&conn, &ids).map_err(|e| read_failed("the stored plate solves", format!("{e:#}")))?
+    } else {
+        std::collections::HashSet::new()
+    };
+    let mut solved = 0usize;
+    let mut eligible = Vec::with_capacity(lights.len());
+    for light in lights {
+        if solved_ids.contains(&light.2) {
+            solved += 1;
+        } else {
+            eligible.push(light);
         }
-        eligible.push((sf, frame, frame_id, file_id, missing));
     }
     if eligible.len() > PLAN_ITEM_CAP {
         return Err(ApiError::Invalid(format!(
@@ -482,9 +493,10 @@ fn read_plan(host: &McpHost, args: &PlanPlateSolveArgs) -> Result<Read, ApiError
         )));
     }
     let mut candidates: Vec<Candidate> = Vec::with_capacity(eligible.len());
-    for (sf, frame, frame_id, file_id, missing) in eligible {
+    for (sf, frame, frame_id, file_id) in eligible {
+        // The header's position is only the solver's hint.
         let coordinates = match (frame.ra, frame.dec) {
-            (Some(ra), Some(dec)) if !missing => Some((ra, dec)),
+            (Some(ra), Some(dec)) if !missing_flags(frame).coordinates => Some((ra, dec)),
             _ => None,
         };
         candidates.push(Candidate {
@@ -499,19 +511,19 @@ fn read_plan(host: &McpHost, args: &PlanPlateSolveArgs) -> Result<Read, ApiError
             exposure: frame.exptime,
             coordinates,
             gate: input_gate_reason(&conn, frame_id, &cfg),
-            catalog: catalog_values(&conn, frame_id, keys_of(args.only_unsolved)).map_err(|e| read_failed("a frame", e))?,
+            catalog: catalog_values(&conn, frame_id, STAMPED_KEYS).map_err(|e| read_failed("a frame", e))?,
         });
     }
-    Ok(Read { description: prepared.resolved.description.clone(), candidates, not_lights, located, concurrency: workers_for(&cfg) })
+    Ok(Read { description: prepared.resolved.description.clone(), candidates, not_lights, solved, concurrency: workers_for(&cfg) })
 }
 
 /// Why there is nothing to plan, so the assistant knows what to tell the user.
 fn nothing_to_solve(read: &Read, only_unsolved: bool) -> String {
     let d = &read.description;
-    if read.located > 0 && only_unsolved {
+    if read.solved > 0 && only_unsolved {
         return format!(
-            "every light frame in the scope ({d}) already has coordinates ({}); pass onlyUnsolved false to solve them again; nothing was planned",
-            read.located
+            "every light frame in the scope ({d}) already has a plate solve ({}); pass onlyUnsolved false to solve them again; nothing was planned",
+            read.solved
         );
     }
     if read.not_lights > 0 {
@@ -552,7 +564,7 @@ fn build_and_publish(
     only_unsolved: bool,
     resolve: Resolvers,
 ) -> Result<Result<(), Stopped>, ApiError> {
-    let Read { candidates, not_lights, located, concurrency, .. } = read;
+    let Read { candidates, not_lights, solved, concurrency, .. } = read;
     let mut by_folder: BTreeMap<String, Vec<&Candidate>> = BTreeMap::new();
     for c in &candidates {
         by_folder.entry(c.folder.clone()).or_default().push(c);
@@ -598,7 +610,7 @@ fn build_and_publish(
                     ("coordinates".to_string(), coordinates_text(c.coordinates)),
                 ]),
                 action: "Solve for its coordinates".to_string(),
-                evidence: only_unsolved.then(|| "the catalog holds no coordinates for this frame".to_string()),
+                evidence: only_unsolved.then(|| "no plate solve is stored for this frame".to_string()),
                 selected: lock.is_none(),
                 locked: lock,
                 candidate: false,
@@ -632,12 +644,12 @@ fn build_and_publish(
             if not_lights == 1 { "frame is" } else { "frames are" }
         ));
     }
-    if located > 0 {
+    if solved > 0 {
         notes.push(format!(
-            "{} already {} coordinates and {} left out (onlyUnsolved)",
-            count_of(located, "light frame", "light frames"),
-            if located == 1 { "has" } else { "have" },
-            if located == 1 { "is" } else { "are" }
+            "{} already {} a plate solve and {} left out (onlyUnsolved)",
+            count_of(solved, "light frame", "light frames"),
+            if solved == 1 { "has" } else { "have" },
+            if solved == 1 { "is" } else { "are" }
         ));
     }
     let content = PlanContent {
@@ -911,6 +923,22 @@ pub struct PlateSolveApplier {
     resolve: Resolvers,
 }
 
+/// Why the apply leaves a frame out when a solve was stored for it after the plan was made.
+const SOLVED_SINCE: &str = "solved since the plan was made";
+
+/// The frames among `frame_ids` that have a stored plate solve now. A catalog that cannot say is logged and treated as
+/// "none": the run then solves them again, which changes nothing the user would not have asked for.
+fn solved_among(host: &McpHost, frame_ids: &[i64]) -> std::collections::HashSet<i64> {
+    let read = host
+        .reader()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| crate::plate_solve::storage::frames_with_solve(&conn, frame_ids).map_err(|e| format!("{e:#}")));
+    read.unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "plate-solve plan could not re-check which frames are solved");
+        std::collections::HashSet::new()
+    })
+}
+
 fn report_line(items: &HashMap<String, ItemInfo>, item_id: &str, reason: impl Into<String>) -> ReportLine {
     let (file_name, folder) = items.get(item_id).map(|i| (i.file_name.clone(), i.folder.clone())).unwrap_or_default();
     ReportLine { item_id: item_id.to_string(), file_name, folder, reason: reason.into() }
@@ -950,7 +978,27 @@ impl PlanApplier for PlateSolveApplier {
         let fresh: std::collections::HashSet<&str> = fresh.iter().map(String::as_str).collect();
         let included: Vec<&str> =
             sel.groups.iter().flat_map(|g| g.included.iter().map(String::as_str)).filter(|id| fresh.contains(id)).collect();
+        // A frame solved since the plan was made is left alone (one read over the selected frames; the guard is
+        // released before anything takes the context).
+        let selected_ids: Vec<i64> = included.iter().filter_map(|id| self.items.get(*id).map(|i| i.frame_id)).collect();
+        let solved_since = solved_among(host, &selected_ids);
+        let (mut report, included): (PlanReport, Vec<&str>) = {
+            let mut report = report;
+            let mut kept = Vec::with_capacity(included.len());
+            for id in included {
+                match self.items.get(id) {
+                    Some(info) if solved_since.contains(&info.frame_id) => {
+                        report.skipped.push(report_line(&self.items, id, SOLVED_SINCE));
+                    }
+                    _ => kept.push(id),
+                }
+            }
+            (report, kept)
+        };
         let frame_ids: Vec<i64> = included.iter().filter_map(|id| self.items.get(*id).map(|i| i.frame_id)).collect();
+        if frame_ids.is_empty() {
+            return report;
+        }
         let ctx = host.ctx();
 
         // The catalogs, resolved now (an install or a removal since the plan counts), with no guard held.
@@ -1012,10 +1060,10 @@ impl PlanApplier for PlateSolveApplier {
             tracing::error!(error = %e, plan_id, "plate solve thread could not start");
             // The closure went with the error: the prepared batch is dropped, which frees the slot.
             host.solves.finish(&run_id, Err(ApiError::Internal(format!("the run could not start: {e}"))));
-            return self.none_started(PlanReport::default(), &included, &format!("the run could not start: {e}"));
+            return self.none_started(report, &included, &format!("the run could not start: {e}"));
         }
         tracing::info!(via = "mcp", plan_id, run_id = %run_id, count = frame_ids.len(), "plate solve run started from the assistant");
-        let mut report = PlanReport { run_id: Some(run_id.clone()), ..PlanReport::default() };
+        report.run_id = Some(run_id.clone());
         for id in &included {
             report.applied.push(report_line(&self.items, id, format!("started in run {run_id}")));
         }
