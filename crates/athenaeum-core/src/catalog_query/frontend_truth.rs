@@ -3,7 +3,7 @@
 //! `tests/fixtures/frontend_truth_tables.json` are what the TypeScript code returns; a Rust test and a vitest test
 //! read the same file.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::models::Frame;
 
@@ -46,8 +46,9 @@ pub fn missing_flags(frame: &Frame) -> MissingFlags {
 }
 
 /// The Objects page's three tabs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[schemars(crate = "rmcp::schemars")]
 pub enum FrameSetTab {
     Stage,
     Wip,

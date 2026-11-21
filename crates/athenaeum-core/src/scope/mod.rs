@@ -22,6 +22,7 @@ use crate::db::{
     frame_is_used_copy_sql, normalize_separators, scan_root_prefix_predicate,
     FRAME_NOT_IN_BLACK_HOLE_SQL,
 };
+use crate::catalog_query::{file_id_of, FrameSetTab};
 use crate::models::ImageType;
 
 /// Where a frame's file is, from the catalog's point of view.
@@ -63,8 +64,13 @@ impl FrameState {
 pub struct Scope {
     /// Object name: the OBJECT header value, or the name of a frame set the frame belongs to.
     pub object: Option<String>,
-    /// Frame set name.
+    /// Frame set name, or its handle `set:<number>` (one set, when several share a name).
     pub frame_set: Option<String>,
+    /// The Objects page tab of the frame set the frames belong to: stage, wip or archive.
+    pub tab: Option<FrameSetTab>,
+    /// Exact files: each the folder and file name joined, as an answer names them (a full path), or a
+    /// `file:<number>` handle an earlier answer gave. Narrows like every other field.
+    pub files: Option<Vec<String>>,
     /// A folder; includes its subfolders. A full path as the catalog spells it.
     pub folder: Option<String>,
     /// A scan root (a folder Athenaeum watches), by its full path.
@@ -101,7 +107,7 @@ pub struct ScopeFilter {
 /// A value that named nothing the catalog holds, and what it holds that is near.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NearestHint {
-    /// `camera`, `telescope`, `filter`, `object`, `frame set`, `frame type` or `scan root`.
+    /// `camera`, `telescope`, `filter`, `object`, `frame set`, `frame type`, `scan root` or `file`.
     pub condition: &'static str,
     pub given: String,
     pub existing: Vec<String>,
@@ -138,6 +144,96 @@ fn member_of_set_sql(used_copy: bool, extra: &str) -> String {
              JOIN frames_set fs ON fs.id = sn.frames_set_id \
              WHERE sm.frame_id = f.id{used} AND {extra})"
     )
+}
+
+/// The most files one scope names.
+const MAX_FILES: usize = 2000;
+
+/// The handle an answer gives a frame set: `set:<id>`.
+pub fn frame_set_handle(id: i64) -> String {
+    format!("set:{id}")
+}
+
+/// The id a frame-set handle `set:<id>` names; `None` for anything else (a name is not a handle).
+pub fn parse_frame_set_handle(s: &str) -> Option<i64> {
+    s.trim().strip_prefix("set:")?.trim().parse::<i64>().ok()
+}
+
+/// The entries of `files`, trimmed, empty ones dropped; `None` when none is left.
+fn file_entries(scope: &Scope) -> Option<Vec<&str>> {
+    let v: Vec<&str> =
+        scope.files.as_deref()?.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// SQL on `fs` for the frame sets an Objects tab lists (`catalog_query::frame_set_tab` as a predicate).
+fn tab_sql(tab: FrameSetTab) -> &'static str {
+    match tab {
+        FrameSetTab::Archive => "COALESCE(fs.is_archived, 0) = 1",
+        FrameSetTab::Wip => "COALESCE(fs.is_archived, 0) = 0 AND COALESCE(fs.is_custom, 0) = 1",
+        FrameSetTab::Stage => "COALESCE(fs.is_archived, 0) = 0 AND COALESCE(fs.is_custom, 0) = 0",
+    }
+}
+
+fn tab_label(tab: FrameSetTab) -> &'static str {
+    match tab {
+        FrameSetTab::Stage => "Stage",
+        FrameSetTab::Wip => "WIP",
+        FrameSetTab::Archive => "Archive",
+    }
+}
+
+/// A file's folder and file name joined the way an answer prints them (`FileLine.folder` + separator + name).
+fn printed_path(path: &str, filename: &str) -> String {
+    let folder = crate::catalog_query::parent_of(path);
+    if folder.ends_with(['/', '\\']) {
+        format!("{folder}{filename}")
+    } else {
+        format!("{folder}{}{filename}", crate::db::native_separator_of(path))
+    }
+}
+
+/// The id of the file an entry of `files` names: a handle or a full path, else the folder and file name an
+/// answer prints (separators folded as a path is).
+fn file_id_for_entry(conn: &Connection, entry: &str) -> Result<Option<i64>> {
+    if let Some(id) = file_id_of(conn, entry)? {
+        return Ok(Some(id));
+    }
+    if entry.starts_with("file:") {
+        return Ok(None);
+    }
+    let Some(cut) = entry.rfind(['/', '\\']) else { return Ok(None) };
+    let (wanted, name) = (normalize_separators(entry), &entry[cut + 1..]);
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT id, path FROM files WHERE filename = ?1").context("prepare file by name")?;
+    let rows = stmt
+        .query_map([name], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .context("run file by name")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("read file by name")?;
+    Ok(rows.into_iter().find(|(_, path)| normalize_separators(&printed_path(path, name)) == wanted).map(|(id, _)| id))
+}
+
+/// Up to three catalog files with the file name of `entry`, case-insensitive, printed as folder and name.
+fn files_named_like(conn: &Connection, entry: &str) -> Result<Vec<String>> {
+    let name = match entry.rfind(['/', '\\']) {
+        Some(cut) => &entry[cut + 1..],
+        None => entry,
+    };
+    if name.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT path, filename FROM files WHERE lower(filename) = lower(?1) ORDER BY path LIMIT 3")
+        .context("prepare files like")?;
+    let rows = stmt
+        .query_map([name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .context("run files like")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("read files like")?;
+    Ok(rows.into_iter().map(|(path, filename)| printed_path(&path, &filename)).collect())
 }
 
 /// The SQL test for one [`FrameState`], inside the filter's `f` (frames) / `fl` (files) aliases. The four
@@ -207,10 +303,22 @@ pub fn hints_text(hints: &[NearestHint]) -> String {
 /// A scope in words, for the first line of an answer.
 pub fn describe_scope(scope: &Scope) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for v in [&scope.object, &scope.frame_set, &scope.camera, &scope.telescope, &scope.filter] {
+    if let Some(v) = given(&scope.object) {
+        parts.push(v.to_string());
+    }
+    if let Some(v) = given(&scope.frame_set) {
+        parts.push(if parse_frame_set_handle(v).is_some() { format!("frame set {v}") } else { v.to_string() });
+    }
+    for v in [&scope.camera, &scope.telescope, &scope.filter] {
         if let Some(v) = given(v) {
             parts.push(v.to_string());
         }
+    }
+    if let Some(t) = scope.tab {
+        parts.push(format!("in {}", tab_label(t)));
+    }
+    if let Some(files) = file_entries(scope) {
+        parts.push(if files.len() == 1 { "1 named file".to_string() } else { format!("{} named files", files.len()) });
     }
     if let Some(e) = scope.exposure_s {
         parts.push(format!("{e} s"));
@@ -378,13 +486,50 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
         }
     }
     if let Some(g) = given(&scope.frame_set) {
-        let sets = set_names()?;
-        let hits = equal_values(&sets, g);
-        if hits.is_empty() {
-            hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: nearest::nearest(&sets, g) });
+        if let Some(id) = parse_frame_set_handle(g) {
+            let exists: bool = conn
+                .query_row("SELECT EXISTS (SELECT 1 FROM frames_set WHERE id = ?1)", [id], |r| r.get(0))
+                .context("read frame set by handle")?;
+            if exists {
+                conds.push((member_of_set_sql(true, "fs.id = ?"), vec![Value::Integer(id)]));
+            } else {
+                hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: Vec::new() });
+            }
         } else {
-            let (sql, p) = in_list("fs.name", &hits);
-            conds.push((member_of_set_sql(true, &sql), p));
+            let sets = set_names()?;
+            let hits = equal_values(&sets, g);
+            if hits.is_empty() {
+                hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: nearest::nearest(&sets, g) });
+            } else {
+                let (sql, p) = in_list("fs.name", &hits);
+                conds.push((member_of_set_sql(true, &sql), p));
+            }
+        }
+    }
+    if let Some(tab) = scope.tab {
+        conds.push((member_of_set_sql(true, tab_sql(tab)), Vec::new()));
+    }
+
+    if let Some(entries) = file_entries(scope) {
+        if entries.len() > MAX_FILES {
+            return Err(anyhow::anyhow!("at most {MAX_FILES} files; narrow the scope"));
+        }
+        let mut ids: Vec<i64> = Vec::new();
+        for entry in entries {
+            match file_id_for_entry(conn, entry)? {
+                Some(id) => ids.push(id),
+                None => hints.push(NearestHint {
+                    condition: "file",
+                    given: entry.to_string(),
+                    existing: files_named_like(conn, entry)?,
+                }),
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        if !ids.is_empty() {
+            let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+            conds.push((format!("fl.id IN ({})", list.join(",")), Vec::new()));
         }
     }
 

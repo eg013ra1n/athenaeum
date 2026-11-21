@@ -20,6 +20,7 @@ mod summary_tests;
 mod tests;
 
 pub use calibration::{calibration_summary, CalibrationLine, FRAME_SETS_PAGE};
+pub(crate) use details::file_id_of;
 pub use details::{file_details, CalibrationLink, FileDetails};
 pub use findings::{
     find_duplicates_in_scope, find_missing_in_scope, processing_folder_note, CopyLine, DuplicateFinding,
