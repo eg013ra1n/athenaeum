@@ -332,7 +332,7 @@ fn fetch_count(rows: usize) -> usize {
     let n = STATEMENTS.load(Ordering::SeqCst);
     conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     assert_eq!(got.len(), rows);
-    assert!(got.iter().all(|f| f.frame_sets.len() == 1 && f.frame_sets[0].name == "IC 5146" && f.frame_sets[0].tab == FrameSetTab::Stage));
+    assert!(got.iter().all(|f| f.frame_sets.len() == 1 && f.frame_sets[0].name.as_deref() == Some("IC 5146") && f.frame_sets[0].tab == FrameSetTab::Stage));
     n
 }
 
@@ -373,7 +373,7 @@ fn fetch_gives_folder_night_state_sets_and_root() {
     assert_eq!(by_name["c.fits"].state, FrameState::Zipped);
     assert_eq!(by_name["d.fits"].state, FrameState::BlackHole);
     let a_sets = &by_name["a.fits"].frame_sets;
-    assert_eq!((a_sets.len(), a_sets[0].name.as_str(), a_sets[0].tab), (1, "Set A", FrameSetTab::Stage));
+    assert_eq!((a_sets.len(), a_sets[0].name.as_deref(), a_sets[0].tab), (1, Some("Set A"), FrameSetTab::Stage));
     assert!(by_name["d.fits"].frame_sets.is_empty());
     assert_eq!(by_name["a.fits"].folder, dir);
     assert_eq!(by_name["a.fits"].night.as_deref(), Some("2024-10-05"));

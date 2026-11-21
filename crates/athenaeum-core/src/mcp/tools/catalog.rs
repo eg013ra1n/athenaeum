@@ -23,7 +23,7 @@ use crate::scope::{normalize_value, parse_frame_set_handle, FrameState, Scope};
 
 /// Frame sets the text half lists for a scope that names an object, a frame set or a tab (the structured half
 /// carries the same).
-const SETS_IN_SCOPE_SHOWN: usize = 10;
+const SETS_IN_SCOPE_SHOWN: usize = 50;
 /// Folders the text half lists in a storage summary (the structured half carries up to 50).
 const STORAGE_FOLDERS_IN_TEXT: usize = 10;
 /// Groups listed with their example files when the answer has this few groups.
@@ -272,7 +272,7 @@ fn calibration_lines(lines: &[CalibrationLine], sets_total: usize) -> Vec<String
     for l in lines {
         let mut line = format!(
             "- {}, night {}, {}, filter {}: {} — darks {}, flats {}, bias {}",
-            l.frame_set,
+            l.set.describe(),
             l.night,
             l.camera,
             l.filter,
@@ -459,7 +459,7 @@ fn read_set(conn: &Connection, id: i64, name: &str) -> Result<SetEntry, ApiError
 
 /// `Frame set 'LDN 1272' (Stage, set:231), nights 2025-09-13 … 2025-09-13, camera ATR2600M, telescope Esprit, centre RA 05 40 00, Dec -02 27 00`.
 fn set_heading(e: &SetEntry) -> String {
-    let who = cq::SetRef { id: e.id, name: e.name.clone(), tab: e.facts.tab }.describe();
+    let who = cq::SetRef { id: e.id, name: Some(e.name.clone()), tab: e.facts.tab }.describe();
     let mut out = format!("Frame set {who}");
     if let Some((first, last)) = &e.nights {
         out.push_str(&format!(", nights {first} … {last}"));
@@ -589,7 +589,10 @@ pub fn query_frames(host: &McpHost, args: QueryFramesArgs) -> Result<Answer, Api
             );
             let rest = sets.len().saturating_sub(SETS_IN_SCOPE_SHOWN);
             if rest > 0 {
-                text.push_str(&format!("; and {}", count_of(rest, "more frame set", "more frame sets")));
+                text.push_str(&format!(
+                    "; and {}; narrow by object, night or camera to list them",
+                    count_of(rest, "more frame set", "more frame sets")
+                ));
             }
             text.push('.');
             lines.push(text);

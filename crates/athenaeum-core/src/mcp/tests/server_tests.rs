@@ -855,3 +855,68 @@ async fn frame_set_name_plus_tab_lists_only_that_tab() {
     assert_eq!(listed[0]["handle"], format!("set:{stage}"));
     client.close().await;
 }
+
+#[tokio::test]
+async fn calibration_lines_tell_same_named_sets_apart() {
+    let rig = rig(true);
+    let wip = add_set(&rig, "LDN 1272", "ldn_wip", 3, true);
+    let stage = add_set(&rig, "LDN 1272", "ldn_stage", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "filter": "H" }, "calibration": true })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    let lines: Vec<&str> = said.lines().filter(|l| l.contains("LDN 1272")).collect();
+    assert_eq!(lines.len(), 2, "one line per set of the name: {said}");
+    assert!(lines.iter().any(|l| l.contains(&format!("'LDN 1272' (WIP, set:{wip})"))), "{said}");
+    assert!(lines.iter().any(|l| l.contains(&format!("'LDN 1272' (Stage, set:{stage})"))), "{said}");
+    let structured: Vec<Value> =
+        data_of(&r)["calibration"]["lines"].as_array().expect("lines").iter().filter(|l| l["frameSet"] == "LDN 1272").cloned().collect();
+    let handles: Vec<&str> = structured.iter().filter_map(|l| l["frameSetHandle"].as_str()).collect();
+    assert_eq!(handles.len(), 2, "{structured:?}");
+    assert_ne!(handles[0], handles[1]);
+    assert!(handles.contains(&format!("set:{wip}").as_str()) && handles.contains(&format!("set:{stage}").as_str()), "{handles:?}");
+    let tab_of = |h: String| structured.iter().find(|l| l["frameSetHandle"] == h).and_then(|l| l["tab"].as_str().map(str::to_string));
+    assert_eq!(tab_of(format!("set:{wip}")).as_deref(), Some("wip"));
+    assert_eq!(tab_of(format!("set:{stage}")).as_deref(), Some("stage"));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn frame_sets_in_scope_lists_up_to_fifty_and_says_how_to_narrow() {
+    let rig = rig(true);
+    let small = add_set(&rig, "Small", "small", 1, false);
+    // The rig holds one set of its own, so 52 sets in all.
+    for i in 0..50 {
+        add_set(&rig, &format!("Filler {i:02}"), &format!("filler_{i:02}"), 2, false);
+    }
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "tab": "stage" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    let listed = data_of(&r)["frameSetsInScope"].as_array().expect("frameSetsInScope").clone();
+    assert_eq!(listed.len(), 50, "the cap is the number of groups groupBy shows");
+    assert_eq!(data_of(&r)["frameSetsInScopeMore"], 2);
+    assert!(said.contains("; and 2 more frame sets; narrow by object, night or camera to list them."), "{said}");
+    assert!(!listed.iter().any(|e| e["handle"] == format!("set:{small}")), "the one-frame set is the smallest, past the cap");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn unnamed_set_is_listed_by_handle() {
+    let rig = rig(true);
+    let set = add_set(&rig, "Placeholder", "unnamed_dir", 2, false);
+    {
+        let database = rig.ctx.db.get().expect("db");
+        database.conn().execute("UPDATE frames_set SET name = NULL WHERE id = ?1", [set]).expect("clear name");
+    }
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "tab": "stage" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains(&format!("'(unnamed)' (Stage, set:{set}): 2 frames")), "{said}");
+    let listed = data_of(&r)["frameSetsInScope"].as_array().expect("frameSetsInScope").clone();
+    let entry = listed.iter().find(|e| e["handle"] == format!("set:{set}")).expect("the unnamed set is listed");
+    assert!(entry["name"].is_null(), "{entry}");
+    assert_eq!(entry["frames"], 2);
+    client.close().await;
+}

@@ -51,11 +51,15 @@ pub const EXAMPLES_PER_GROUP: usize = 3;
 /// Files on one page of the file list.
 pub const FILES_PAGE: u32 = 50;
 
+/// What the text calls a frame set that has no name.
+pub const UNNAMED_SET: &str = "(unnamed)";
+
 /// A frame set a frame belongs to: two sets may share a name, so the id and the Objects tab come with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetRef {
     pub id: i64,
-    pub name: String,
+    /// `None` for a set with no name (the page shows it unnamed).
+    pub name: Option<String>,
     pub tab: FrameSetTab,
 }
 
@@ -67,7 +71,7 @@ impl SetRef {
 
     /// `'LDN 1272' (Stage, set:231)`: what tells two sets of one name apart.
     pub fn describe(&self) -> String {
-        format!("'{}' ({}, {})", self.name, crate::scope::tab_label(self.tab), self.handle())
+        format!("'{}' ({}, {})", self.name.as_deref().unwrap_or(UNNAMED_SET), crate::scope::tab_label(self.tab), self.handle())
     }
 }
 
@@ -501,8 +505,8 @@ pub fn format_duration(seconds: f64) -> String {
 // ---- fetching ----
 
 /// The frames `filter` lets through, in three statements however many there are: the rows (with their night text
-/// and their state, the state decided by the scope's own [`frame_state_sql`]), the names of the frame sets that
-/// use them (one grouped read), and the scan roots (read once, matched in Rust). Ordered by observation time,
+/// and their state, the state decided by the scope's own [`frame_state_sql`]), the [`SetRef`]s of the frame sets
+/// that use them (one grouped read; a set with no name is kept, unnamed), and the scan roots (read once, matched in Rust). Ordered by observation time,
 /// then path.
 pub fn fetch_scoped_frames(conn: &Connection, filter: &ScopeFilter) -> Result<Vec<ScopedFrame>> {
     // The state test is written for `f` = frames / `fl` = files; this scalar subquery names them so, and the row's
@@ -567,7 +571,7 @@ fn fetch_set_refs(conn: &Connection, filter: &ScopeFilter) -> Result<HashMap<i64
          JOIN frames_set fs ON fs.id = sn.frames_set_id \
          JOIN frames f ON f.id = sm.frame_id \
          WHERE sm.frame_id IN (SELECT fr.id FROM frames fr WHERE {filter}) \
-           AND fs.name IS NOT NULL AND fs.name <> '' AND {used} \
+           AND {used} \
          ORDER BY sm.frame_id, fs.id",
         filter = filter.sql,
         used = frame_is_used_copy_sql("fs.id"),
@@ -575,7 +579,7 @@ fn fetch_set_refs(conn: &Connection, filter: &ScopeFilter) -> Result<HashMap<i64
     let mut stmt = conn.prepare(&sql).with_context(|| format!("prepare set names: {sql}"))?;
     let rows = stmt
         .query_map(params_from_iter(filter.params.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?, r.get::<_, bool>(4)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, bool>(3)?, r.get::<_, bool>(4)?))
         })
         .context("run set names")?;
     let mut out: HashMap<i64, Vec<SetRef>> = HashMap::new();
@@ -584,6 +588,7 @@ fn fetch_set_refs(conn: &Connection, filter: &ScopeFilter) -> Result<HashMap<i64
         let entry = out.entry(frame_id).or_default();
         // A frame in one set through two sessions is listed once.
         if entry.iter().all(|s| s.id != id) {
+            let name = name.filter(|n| !n.trim().is_empty());
             entry.push(SetRef { id, name, tab: frame_set_tab(is_custom, is_archived) });
         }
     }
