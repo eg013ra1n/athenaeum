@@ -1,7 +1,9 @@
 import { Loader2 } from 'lucide-react';
 import { Chip } from '../ui';
 import { PlanGroupCard } from './PlanGroupCard';
-import { factKeys } from './planLabels';
+import { PlanTableGroup, PlanTableHead } from './PlanTable';
+import { factKeys, groupLock } from './planLabels';
+import { offered, totals } from './planSelection';
 import type { McpPlanView, PlanReport, PlanSelection, ReportLine } from '../../types/mcp';
 
 /** The body of the plan window: state text, groups of items with their ticks, or the report. Presentational. */
@@ -10,26 +12,44 @@ export interface PlanViewProps {
   selection: PlanSelection;
   /** Ticks and the keeper cannot be changed (the plan is not waiting, or is superseded). */
   readOnly: boolean;
+  isOpen: (groupId: string) => boolean;
+  onToggleOpen: (groupId: string) => void;
   onToggleItem: (groupId: string, itemId: string) => void;
   onToggleGroup: (groupId: string) => void;
+  onToggleAll: () => void;
   onChoose: (groupId: string, itemId: string) => void;
 }
 
-/** More groups than this start collapsed, so a long plan opens as a list of titles. */
+/** More groups than this start collapsed (the first stays open), so a long plan opens as a list of titles. */
 const OPEN_ALL_UP_TO = 6;
 
-export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGroup, onChoose }: PlanViewProps) {
+/** Whether a group starts open: a group locked for one reason is one row; a long plan opens its first group only. */
+export function defaultOpen(plan: McpPlanView, index: number): boolean {
+  const group = plan.groups[index];
+  if (!group || groupLock(group) !== null) return false;
+  return plan.groups.length <= OPEN_ALL_UP_TO || index === 0;
+}
+
+/** Does this plan show a list of groups (not a state text or a report)? */
+export const showsList = (plan: McpPlanView) => !plan.report && plan.state.kind !== 'applied' && plan.groups.length > 0;
+
+/**
+ * The one part of the plan window that scrolls (`data-testid="plan-list"`): the stats, chips and sentence above it and
+ * the footer below it stay put. The table header of a metadata or plate-solve plan sticks to its top.
+ */
+export function PlanView({ plan, selection, readOnly, isOpen, onToggleOpen, onToggleItem, onToggleGroup, onToggleAll, onChoose }: PlanViewProps) {
   const state = plan.state;
   const facts = factKeys(plan);
+  const list = showsList(plan);
+  const table = plan.kind !== 'black_hole';
+  const ticked = totals(plan, selection).items;
+  const offeredNow = offered(plan, selection);
   return (
-    <div className="space-y-3">
-      {plan.notes.length > 0 && (
-        <ul className="space-y-0.5 text-content-muted">
-          {plan.notes.map((n, i) => (
-            <li key={i}>{n}</li>
-          ))}
-        </ul>
-      )}
+    <div
+      data-testid="plan-list"
+      className={`min-h-0 flex-1 overflow-y-auto ${list ? 'rounded-md border border-border/55 bg-surface' : ''}`}
+    >
+      <div className={`empty:hidden ${list ? 'space-y-2 px-3 py-2' : 'space-y-3'}`}>
       {state.kind === 'preparing' && <Preparing done={state.done} total={state.total} />}
       {state.kind === 'applying' && (
         <p className="flex items-center gap-2 text-content-secondary" role="status">
@@ -59,21 +79,43 @@ export function PlanView({ plan, selection, readOnly, onToggleItem, onToggleGrou
         <p className="text-content-muted">{plan.kind === 'metadata' ? 'Nothing was written.' : 'No file was recorded as moved.'}</p>
       )}
       {plan.report && <Report report={plan.report} kind={plan.kind} />}
-      {!plan.report && state.kind !== 'applied' && plan.groups.length > 0 && (
-        // The same list the Duplicates page puts its group cards in.
-        <div className="divide-y divide-border/40 overflow-hidden rounded-lg border border-border bg-surface">
-          {plan.groups.map((g, i) => {
+      </div>
+      {list && table && (
+        <PlanTableHead
+          kind={plan.kind as 'metadata' | 'plate_solve'}
+          checked={offeredNow > 0 && ticked === offeredNow}
+          mixed={ticked > 0 && ticked < offeredNow}
+          disabled={readOnly || offeredNow === 0}
+          onToggle={onToggleAll}
+        />
+      )}
+      {list && (
+        <div className={table ? '' : 'divide-y divide-border/55'}>
+          {plan.groups.map((g) => {
             const sel = selection.groups.find((x) => x.groupId === g.id);
-            return (
+            return table ? (
+              <PlanTableGroup
+                key={g.id}
+                kind={plan.kind as 'metadata' | 'plate_solve'}
+                group={g}
+                facts={facts}
+                included={sel?.included ?? []}
+                readOnly={readOnly}
+                open={isOpen(g.id)}
+                onToggleOpen={onToggleOpen}
+                onToggleItem={onToggleItem}
+                onToggleGroup={onToggleGroup}
+              />
+            ) : (
               <PlanGroupCard
                 key={g.id}
-                kind={plan.kind}
                 group={g}
                 facts={facts}
                 chosen={sel?.chosen ?? null}
                 included={sel?.included ?? []}
                 readOnly={readOnly}
-                defaultOpen={plan.groups.length <= OPEN_ALL_UP_TO || i === 0}
+                open={isOpen(g.id)}
+                onToggleOpen={onToggleOpen}
                 onToggleItem={onToggleItem}
                 onToggleGroup={onToggleGroup}
                 onChoose={onChoose}

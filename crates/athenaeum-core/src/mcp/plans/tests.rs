@@ -228,6 +228,7 @@ fn content(rig: &Rig, fx: &Fx, applier: &TestApplier) -> PlanContent {
             ],
         }],
         notes: vec![],
+        summary: PlanSummary::default(),
         snapshots,
         applier: Box::new(applier.clone()),
     }
@@ -501,6 +502,7 @@ async fn plan_item_cap_asks_for_a_narrower_scope() {
         columns: vec![],
         groups: vec![PlanGroup { id: "group:1".into(), title: "g".into(), note: None, choose_one: None, chosen: None, items }],
         notes: vec![],
+        summary: PlanSummary::default(),
         snapshots: HashMap::new(),
         applier: Box::new(TestApplier::default()),
     };
@@ -991,4 +993,52 @@ async fn a_reload_during_an_apply_finds_the_applying_plan() {
     // Nothing live is left but the preparing plan; after it ends, the newest plan is the answer.
     rig.host.plans.fail(&live, "x".to_string());
     assert_eq!(rig.host.plans.view(None).expect("a plan").plan_id, live);
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_view_state_carries_a_summary() {
+    let rig = rig();
+    let fx = fixture(&rig);
+    let applier = TestApplier::default();
+
+    // Preparing: nothing built yet, and the field is there.
+    let (preparing, _) = rig.host.plans.begin(&rig.host, PlanKind::BlackHole, "x");
+    let view = rig.host.plans.view(Some(&preparing)).expect("view");
+    assert!(matches!(view.state, PlanState::Preparing { .. }));
+    assert_eq!(view.summary, PlanSummary::default());
+
+    // Waiting carries what the planner published, and the wire names are the window's.
+    let mut c = content(&rig, &fx, &applier);
+    c.summary = PlanSummary {
+        counts: vec![SummaryCount::new(1, "group", "groups")],
+        facts: vec![SummaryFact::new("At a time", "3", FactTone::Neutral)],
+        explain: Some("one sentence".to_string()),
+        ..PlanSummary::default()
+    };
+    let expected = c.summary.clone();
+    rig.host.plans.publish(&preparing, c).expect("publish");
+    let view = rig.host.plans.view(Some(&preparing)).expect("view");
+    assert_eq!(view.state, PlanState::Waiting);
+    assert_eq!(view.summary, expected);
+    let json = serde_json::to_value(&view).expect("json");
+    assert_eq!(json["summary"]["counts"][0], serde_json::json!({ "count": 1, "label": "groups", "labelOne": "group" }));
+    assert_eq!(json["summary"]["facts"][0]["tone"], "neutral");
+    assert_eq!(json["summary"]["leftOut"], serde_json::json!([]));
+    assert_eq!(json["summary"]["explain"], "one sentence");
+
+    // A newer plan replaces it: the replaced and the cancelled views still carry the field.
+    let (newer, _) = rig.host.plans.begin(&rig.host, PlanKind::Metadata, "y");
+    let replaced = rig.host.plans.view(Some(&preparing)).expect("view");
+    assert_eq!(replaced.state, PlanState::Replaced);
+    assert_eq!(replaced.summary, expected);
+    rig.host.plans.answer(&rig.host, &newer, PlanAnswer::Cancel).expect("cancel");
+    let cancelled = rig.host.plans.view(Some(&newer)).expect("view");
+    assert_eq!(cancelled.state, PlanState::Cancelled);
+    assert_eq!(cancelled.summary, PlanSummary::default());
+
+    let (failed, _) = rig.host.plans.begin(&rig.host, PlanKind::Metadata, "z");
+    rig.host.plans.fail(&failed, "boom".to_string());
+    let view = rig.host.plans.view(Some(&failed)).expect("view");
+    assert!(matches!(view.state, PlanState::Failed { .. }));
+    assert_eq!(view.summary, PlanSummary::default());
 }

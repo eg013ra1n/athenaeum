@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Plan Window</title>
+<style>
+/* Tokens: tailwind.config.js (Nord). Dark is the app's theme. The app has no light overrides in src/, so the light set is a proposal (Snow Storm). */
+:root,:root[data-theme="dark"]{
+  color-scheme: dark;
+  --stage:#272c36; --surface:#2e3440; --elev:#3b4252; --hover:#434c5e; --border:#4c566a;
+  --line:rgba(76,86,106,.55); --line-soft:rgba(76,86,106,.28);
+  --text:#eceff4; --text2:#e5e9f0; --muted:#d8dee9; --faint:rgba(216,222,233,.62); --ghost:rgba(216,222,233,.38);
+  --accent:#88c0d0; --accent-h:#81a1c1; --on-accent:#2e3440; --accent-15:rgba(136,192,208,.15); --accent-40:rgba(136,192,208,.40);
+  --success:#a3be8c; --success-m:rgba(163,190,140,.22);
+  --warning:#ebcb8b; --warning-m:rgba(235,203,139,.22); --warning-50:rgba(235,203,139,.5);
+  --error:#bf616a; --error-m:rgba(191,97,106,.22); --error-50:rgba(191,97,106,.5); --error-80:rgba(191,97,106,.8);
+  --info:#81a1c1; --info-m:rgba(129,161,193,.22);
+  --scrim:rgba(46,52,64,.6); --shadow:0 8px 24px rgba(0,0,0,.35);
+  --note:#ebcb8b;
+  --mono: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+:root[data-theme="light"]{
+  color-scheme: light;
+  --stage:#d8dee9; --surface:#e5e9f0; --elev:#f6f8fb; --hover:#dbe1ea; --border:#b4bdcc;
+  --line:rgba(76,86,106,.30); --line-soft:rgba(76,86,106,.16);
+  --text:#2e3440; --text2:#3b4252; --muted:#434c5e; --faint:rgba(46,52,64,.64); --ghost:rgba(46,52,64,.40);
+  --accent:#5e81ac; --accent-h:#4c6f99; --on-accent:#eceff4; --accent-15:rgba(94,129,172,.14); --accent-40:rgba(94,129,172,.42);
+  --success:#5b7f43; --success-m:rgba(91,127,67,.16);
+  --warning:#94700f; --warning-m:rgba(184,140,28,.18); --warning-50:rgba(148,112,15,.5);
+  --error:#b0434e; --error-m:rgba(176,67,78,.14); --error-50:rgba(176,67,78,.5); --error-80:rgba(176,67,78,.85);
+  --info:#4f729c; --info-m:rgba(79,114,156,.16);
+  --scrim:rgba(46,52,64,.25); --shadow:0 8px 24px rgba(46,52,64,.22);
+  --note:#94700f;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--stage);color:var(--text);font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;font-variant-numeric:inherit}
+button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+/* ---- mockup chrome (not part of the app) ---- */
+.mockbar{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:8px 20px;background:var(--stage);border-bottom:1px dashed var(--warning-50);color:var(--faint);font-size:12px}
+.mockbar b{color:var(--note);font-weight:600;font-size:12px}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:5px;overflow:hidden}
+.seg button{padding:3px 10px;color:var(--faint);border-right:1px solid var(--border)}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--elev);color:var(--text)}
+.mockbar a{color:var(--accent);text-decoration:none}.mockbar a:hover{text-decoration:underline}
+main{padding:16px 20px 60px}
+.intro{max-width:980px}
+.intro h1{font-size:17px;font-weight:600;margin:4px 0 6px}
+.intro p{margin:4px 0;color:var(--muted)}
+.note{border-left:2px solid var(--note);background:color-mix(in srgb,var(--note) 8%,transparent);color:var(--muted);padding:8px 12px;font-size:12px;margin:10px 0;border-radius:0 4px 4px 0;max-width:980px}
+.note b{color:var(--note);font-weight:600}
+.note table{border-collapse:collapse;margin-top:6px;width:100%;font-size:11.5px}
+.note th{text-align:left;color:var(--faint);font-weight:600;padding:3px 10px 3px 0;border-bottom:1px solid var(--line)}
+.note td{padding:3px 10px 3px 0;vertical-align:top;border-bottom:1px solid var(--line-soft)}
+.note td:first-child{color:var(--text2)}
+.note code{font-family:var(--mono);font-size:11px;color:var(--text2)}
+.note ul{margin:4px 0 0;padding-left:18px}
+body.nonotes .note{display:none}
+.stagehead{display:flex;align-items:baseline;gap:10px;margin:30px 0 8px}
+.stagehead h2{font-size:15px;font-weight:600;margin:0}
+.stagehead span{color:var(--faint);font-size:12px}
+.stage{overflow-x:auto;padding:24px 12px;border-radius:8px;background:var(--scrim);display:flex;justify-content:center}
+
+/* ---- the dialog (DialogShell size lg: w-[960px] max-w-[92vw] max-h-[90vh], px-4 py-3.5, 12.5px, rounded-lg) ---- */
+.win{flex:none;width:960px;max-width:92vw;max-height:720px;display:flex;flex-direction:column;border:1px solid var(--border);border-radius:8px;background:var(--elev);padding:14px 16px;font-size:12.5px;line-height:1.4;color:var(--muted);box-shadow:var(--shadow)}
+.win .hd{display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;flex:none}
+.win h3{margin:0;flex:1;min-width:0;font-size:13px;font-weight:600;color:var(--text)}
+.btn{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;border:1px solid var(--border);border-radius:4px;padding:4px 10px;font-size:12px;line-height:1.4;color:var(--text2)}
+.btn:hover{background:var(--hover)}
+.btn.sm{padding:1px 7px;font-size:11px}
+.btn.pri{border-color:var(--accent);background:var(--accent);color:var(--on-accent);font-weight:600}
+.btn.pri:hover{background:var(--accent-h);border-color:var(--accent-h)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.linkbtn{color:var(--accent);padding:1px 6px;font-size:11px;line-height:1.4}.linkbtn:hover{text-decoration:underline}
+/* Duplicates toolbar stats row: text-xs, number in content / status colour, label muted, "·" in border colour */
+.top{display:flex;align-items:center;gap:10px;flex:none}
+.stats{flex:1;min-width:0;font-size:12px;color:var(--text2)}
+.stats .n{color:var(--text)}.stats .n.err{color:var(--error)}.stats .n.ok{color:var(--success)}.stats .n.warn{color:var(--warning)}
+.stats .l{color:var(--muted)}.stats .l.dim{color:var(--faint)}
+.stats .dot{margin:0 8px;color:var(--border)}
+.stats .warnseg{display:inline-flex;align-items:center;gap:4px;color:var(--warning)}
+.tbtn{height:28px;padding:0 10px;display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:500;border-radius:8px;border:1px solid var(--border);background:var(--hover);color:var(--text2);white-space:nowrap}
+.tbtn:hover{background:var(--elev);color:var(--text)}
+/* service facts: a quieter second line of Chips (Chip.tsx: 11px, line 18px, radius 3) */
+.facts{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:6px;flex:none}
+.chip{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;border-radius:3px;padding:0 6px;font-size:11px;line-height:18px}
+.c-ok{background:var(--success-m);color:var(--success)}.c-warn{background:var(--warning-m);color:var(--warning)}.c-err{background:var(--error-m);color:var(--error)}
+.c-info{background:var(--info-m);color:var(--info)}.c-mute{background:var(--hover);color:var(--muted)}
+.facts .info{color:var(--faint);display:inline-flex;margin-left:2px}
+.sentence{margin:5px 0 0;font-size:11px;color:var(--faint);flex:none;max-width:78ch}
+.rule{height:8px;flex:none}
+/* body: the only part that scrolls */
+.body{flex:1;min-height:0;overflow-y:auto;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+.ft{display:flex;align-items:center;gap:8px;margin-top:14px;flex:none}
+.ft .sel{margin-right:auto;font-size:12px;color:var(--muted)}
+.ft .sel b{color:var(--text);font-weight:600}
+/* Missing Metadata table canon */
+table.t{width:100%;border-collapse:separate;border-spacing:0}
+table.t th{position:sticky;top:0;z-index:3;background:var(--hover);padding:6px 6px;text-align:left;font-size:12px;font-weight:600;color:var(--text2);white-space:nowrap}
+table.t th.cb,table.t td.cb{width:34px;text-align:center;padding:0 6px}
+table.t td{padding:4px 6px;font-size:12px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
+tr.r.odd td{background:var(--surface)} tr.r.even td{background:var(--elev)}
+tr.r:hover td{background:var(--hover)}
+tr.r.off td.nm{color:var(--muted)}
+tr.gh td{background:var(--accent-15);border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:5px 6px}
+tr.gh.lock td{background:var(--hover)}
+.nm{color:var(--text2);white-space:nowrap}
+.hint{color:var(--text2);white-space:nowrap}
+.dim{color:var(--faint)}
+.mono{font-family:var(--mono)}
+.more td{padding:3px 6px 3px 40px;background:var(--surface);color:var(--faint);font-size:12px}
+.ghrow{display:flex;align-items:center;gap:8px;min-width:0}
+.ghrow .chev{display:inline-flex;color:var(--faint);flex:none}
+.ghrow .path{font-family:var(--mono);font-size:12px;color:var(--text);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;direction:rtl;text-align:left}
+.ghrow .path bdi{direction:ltr}
+.ghrow .path .pre{color:var(--faint)}
+.ghrow .ttl{font-size:12px;font-weight:600;color:var(--text);white-space:nowrap}
+.ghrow .cnt{font-size:12px;color:var(--muted);white-space:nowrap}.ghrow .cnt b{font-weight:500;color:var(--text)}
+.gfacts{margin:2px 0 0 24px;font-size:11px;color:var(--faint)}
+.gfacts b{font-weight:400;color:var(--text2)}
+.gfacts .dot{margin:0 6px;color:var(--border)}
+.pill{margin-left:auto;display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 8px;border-radius:999px;border:1px solid var(--border);background:var(--hover);color:var(--muted);font-size:11px;white-space:nowrap;flex:none}
+.pill.acc{border-color:var(--accent-40);background:var(--accent-15);color:var(--accent)}
+.pill.err{border-color:var(--error-50);background:var(--error-m);color:var(--error)}
+.pill.warn{border-color:var(--warning-50);background:var(--warning-m);color:var(--warning)}
+.arrow{color:var(--faint);margin:0 4px}
+.val-new{color:var(--text);font-weight:500}
+/* checkbox: Checkbox.tsx box, 13px radius 3, accent fill */
+input.cb{appearance:none;-webkit-appearance:none;margin:0;width:13px;height:13px;border:1px solid var(--border);border-radius:3px;background:transparent;cursor:pointer;vertical-align:middle;position:relative;flex:none}
+input.cb:checked{background:var(--accent);border-color:var(--accent)}
+input.cb:checked::after{content:"";position:absolute;left:3.5px;top:0.5px;width:3.5px;height:7px;border:solid var(--on-accent);border-width:0 2px 2px 0;transform:rotate(45deg)}
+input.cb:indeterminate{border-color:var(--accent)}
+input.cb:indeterminate::after{content:"";position:absolute;left:2.5px;top:5px;width:6px;height:2px;background:var(--accent)}
+input.cb:disabled{opacity:.4;cursor:not-allowed}
+/* Duplicates-style group (Black Hole) */
+.dg{border-bottom:1px solid var(--line)}
+.dg:last-child{border-bottom:0}
+.dg.open{background:color-mix(in srgb,var(--hover) 40%,transparent)}
+.dgh{display:flex;align-items:center;gap:8px;padding:8px 12px;width:100%;text-align:left}
+.dgh:hover{background:var(--hover)}
+.badge{display:inline-flex;align-items:center;height:20px;padding:0 6px;border-radius:4px;border:1px solid;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;flex:none}
+.b-light{background:var(--accent-15);color:var(--accent);border-color:var(--accent-40)}
+.b-flat{background:var(--warning-m);color:var(--warning);border-color:var(--warning-50)}
+.b-dark{background:var(--hover);color:var(--text2);border-color:var(--border)}
+.dgh .fn{font-family:var(--mono);font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.dgh .sm{font-size:11px;color:var(--muted);flex:none;white-space:nowrap}
+.dgh .sep{color:var(--border);flex:none}
+.dgh .cnt{font-size:12px;font-weight:600;color:var(--text);flex:none}
+.dgh .mv{font-size:11px;color:var(--error-80);flex:none;white-space:nowrap}
+.dgb{padding:2px 12px 10px}
+.dgnote{margin:0 0 4px 4px;font-size:11px;color:var(--faint)}
+.dgnote.warn{color:var(--warning)}
+.fr{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;border:1px solid transparent}
+.fr:hover{background:var(--hover)}
+.fr.mv{background:color-mix(in srgb,var(--error-m) 40%,transparent);border-color:var(--error-50)}
+.fr .lab{width:48px;flex:none;font-size:12px;font-weight:500;display:inline-flex;align-items:center;color:var(--success)}
+.fr.mv .lab{color:var(--error)}
+.fr .p{flex:1;min-width:0;font-family:var(--mono);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left;color:var(--text)}
+.fr .p bdi{direction:ltr}
+.fr .p .pre{color:var(--faint)}
+.fr.mv .p{text-decoration:line-through;color:var(--muted)}
+.fr .when{font-size:11px;color:var(--muted);flex:none;white-space:nowrap}
+.fr .act{width:96px;flex:none;text-align:right}
+.hidden{display:none}
+@media (max-width:700px){main{padding:12px}.mockbar{padding:8px 12px}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.7 18-8-14a2 2 0 0 0-3.5 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+  <symbol id="i-cross" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M22 12h-4M6 12H2M12 6V2M12 22v-4"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></symbol>
+  <symbol id="i-collapse" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 20 5-5 5 5M7 4l5 5 5-5"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 15 5 5 5-5M7 9l5-5 5 5"/></symbol>
+</svg>
+
+<div class="mockbar">
+  <b>MOCKUP</b>
+  <span>Theme</span>
+  <span class="seg" id="themeSeg"><button data-theme="dark" class="on">Dark</button><button data-theme="light">Light</button></span>
+  <label style="display:inline-flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" class="cb" id="notesToggle" checked> Design notes</label>
+  <span>Jump:</span><a href="#bh">Black Hole</a><a href="#md">Metadata</a><a href="#ps">Plate solve</a>
+  <span style="margin-left:auto">Static mockup. Ticks, folder rows and "+N more" work; Apply does nothing.</span>
+</div>
+
+<main>
+<div class="intro">
+  <h1>The assistant's plan window, redone to the app's canons</h1>
+  <p>Three plans in the same 960 px window (<code>DialogShell size="lg"</code>, 13 px title, 12.5 px body). Nothing in it is larger than the title.</p>
+</div>
+
+<div class="note"><b>Design notes</b> (hide with the toggle above)
+  <ul>
+    <li><b>One hierarchy, top to bottom.</b> Title (13 px semibold) &rarr; <b>one stats row</b> in the Duplicates-toolbar style (12 px; number in <code>text-content</code> or a status colour, label muted, <code>·</code> in <code>text-border</code>) &rarr; <b>service facts</b> as 11 px Chips &rarr; <b>one</b> explanatory sentence, 11 px faint &rarr; the list &rarr; footer. Counts are never the same size as sentences any more.</li>
+    <li><b>Grammar is built from counts</b> in the UI (1 frame / 2 frames, "is / are"), not copied from the backend sentence. No API names (<code>onlyUnsolved</code>) in the window.</li>
+    <li><b>Say it once.</b> What all frames of a folder share (object, filter, exposure, position hint, "no plate solve stored", why a value is proposed) sits on the group row. A frame row repeats only what differs from its group: a position hint, its own evidence, a lock reason as a chip (full text on hover). A reason that holds for the whole group (metadata "No value found") is on the group row, not on 1 829 rows.</li>
+    <li><b>Dense table</b> = Missing Metadata: sticky header <code>bg-surface-hover text-xs font-semibold text-content-secondary</code>, group row <code>bg-accent/15</code> with the folder (mono, as there), one-line rows <code>py-1</code>, file names 12 px in the UI font (the Missing Metadata page uses 14 px mono; here names must stay below the 13 px title). Per group ~12 rows, then "+N more" (expands in place). Black Hole keeps its Duplicates groups unchanged.</li>
+    <li><b>Pinned parts.</b> Stats, facts and footer do not scroll; the sticky table header and the list do. In code the summary block becomes <code>shrink-0</code> above the scrolling body (a small DialogShell child-layout change) or a sticky block with the measured offset the Missing Metadata table already uses.</li>
+    <li><b>Confirmation of an action over N frames</b> = <code>SetFrameTypeModal</code>: the footer reads <b>N of M</b> (ticked of offered), then Cancel / Apply. A group pill says "Solve 118 of 118" the way Duplicates says "Delete 2 of 3". Sizes appear only where the plan has them (Black Hole); a plate solve never shows "0 B".</li>
+    <li><b>Where each backend note goes</b> (the backend still sends <code>notes: string[]</code>; this needs it structured, see open question 1):
+      <table>
+        <tr><th>Backend note</th><th>Now</th><th>In this mockup</th></tr>
+        <tr><td>"552 of 552 frames can be solved"</td><td>note line</td><td>stats: <b>552</b> frames to solve; "N refused: reason" becomes a warning stat</td></tr>
+        <tr><td>"star catalog: installed" / "not installed"</td><td>note line</td><td>chip, green; amber with a Settings hint when missing (all frames locked)</td></tr>
+        <tr><td>"quad index packs: 0 installed"</td><td>note line</td><td>chip "Index packs 0"</td></tr>
+        <tr><td>"runs 3 frames at a time"</td><td>note line</td><td>chip "3 at a time"</td></tr>
+        <tr><td>"A solved frame gets its coordinates; ..."</td><td>note line</td><td>the one sentence, shortened, 11 px faint</td></tr>
+        <tr><td>"650 frames are not a light frame ..."</td><td>note line</td><td>stats: Left out: <b>650</b> not light frames</td></tr>
+        <tr><td>"339 light frames already have a plate solve ... (onlyUnsolved)"</td><td>note line</td><td>stats: <b>339</b> already solved (parameter name dropped)</td></tr>
+        <tr><td>"these changes take 1 frame out of their sessions and 2 out of calibration links"</td><td>note line</td><td>warning stat with an alert icon (Duplicates "will lose every copy" style)</td></tr>
+        <tr><td>"Only the catalog changes ..."</td><td>note line</td><td>the one sentence</td></tr>
+        <tr><td>group notes: "already in another group, left out" / "different bytes, left out" / "copy that stays not reachable"</td><td>note lines in each card</td><td>one muted line on the group; unreachable = amber pill + amber line; left-out copies counted in the stats</td></tr>
+        <tr><td>"N calibration links point at it, so it stays"</td><td>note line</td><td>row chip "Stays · 3 links", full text on hover</td></tr>
+        <tr><td>item evidence, equal in a group</td><td>on every row</td><td>once, on the group row</td></tr>
+        <tr><td><code>expiresAt</code>, <code>source</code></td><td>summary line, info icon</td><td>chip "Expires YYYY-MM-DD HH:MM:SS"; build and catalog stay on the (i) hover</td></tr>
+      </table>
+    </li>
+    <li><b>Light theme.</b> The app has no light overrides in <code>src/</code> (only <code>color-scheme: light dark</code>); the light set here is a Snow Storm mapping so the owner can judge contrast. Dark uses the exact tokens.</li>
+  </ul>
+</div>
+
+<!-- ============================ BLACK HOLE ============================ -->
+<div class="stagehead" id="bh"><h2>Black Hole</h2><span>3 groups, 7 copies. Duplicates-style groups; header and stats hierarchy fixed.</span></div>
+<div class="stage"><div class="win" role="dialog" aria-label="Move copies to the Black Hole">
+  <div class="hd"><h3>Move extra copies to the Black Hole</h3><button class="btn sm" aria-label="Close"><svg width="12" height="12"><use href="#i-x"/></svg></button></div>
+  <div class="top">
+    <div class="stats">
+      <span class="n">3</span><span class="l"> groups</span><span class="dot">·</span>
+      <span class="n err">3</span><span class="l"> files to the Black Hole</span><span class="dot">·</span>
+      <span class="n ok">203.0 MB</span><span class="l"> will free</span><span class="dot">·</span>
+      <span class="warnseg"><svg width="11" height="11"><use href="#i-alert"/></svg>1 group needs a copy that stays</span>
+    </div>
+    <button class="tbtn"><svg width="12" height="12"><use href="#i-collapse"/></svg>Collapse all</button>
+  </div>
+  <div class="facts">
+    <span class="chip c-mute">Expires 2026-11-21 14:32:07</span>
+    <span class="info" title="athenaeum-dev 0.7.2 · catalog /Users/…/athenaeum.db"><svg width="13" height="13"><use href="#i-info"/></svg></span>
+  </div>
+  <p class="sentence">Only the marked copies move. The copy that stays is never touched. Pick another copy with Keep this one.</p>
+  <div class="rule"></div>
+  <div class="body">
+    <!-- group 1 -->
+    <div class="dg open">
+      <div class="dgh">
+        <svg width="16" height="16" style="flex:none"><use href="#i-down"/></svg>
+        <span class="badge b-light">Light</span>
+        <span class="fn" title="2025-09-14_01-25-40__-9.90_180.00s_0006.fits">2025-09-14_01-25-40__-9.90_180.00s_0006.fits</span>
+        <span class="sm mono" style="font-family:var(--mono)">2025-09-14</span>
+        <span class="sep">·</span><span class="cnt">3</span><span class="sm">×</span><span class="sm">42.3 MB</span>
+        <span class="sep">·</span><span class="mv">84.6 MB to move</span>
+        <span class="pill err" style="margin-left:auto"><svg width="12" height="12"><use href="#i-trash"/></svg>Move 2 of 3</span>
+      </div>
+      <div class="dgb">
+        <p class="dgnote">Same content; bytes are compared with the copy that stays.</p>
+        <div class="fr"><input type="checkbox" class="cb" aria-label="Move this copy"><span class="lab">Keep</span>
+          <span class="p" title="/Volumes/Universe/Astrophotography/MBPMAX/Astro/Unsorted/2025-09-13/LIGHT/2025-09-14_01-25-40__-9.90_180.00s_0006.fits"><bdi><span class="pre">/Volumes/Universe/Astrophotography/</span>MBPMAX/Astro/Unsorted/2025-09-13/LIGHT/2025-09-14_01-25-40__-9.90_180.00s_0006.fits</bdi></span>
+          <span class="when">2025-09-14 01:28:47</span><span class="act"><span class="chip c-ok">Stays</span></span></div>
+        <div class="fr mv"><input type="checkbox" class="cb" checked aria-label="Move this copy"><span class="lab"><svg width="13" height="13"><use href="#i-trash"/></svg></span>
+          <span class="p" title="/Volumes/BigMac/Pictures/Import/2025-09-13/2025-09-14_01-25-40__-9.90_180.00s_0006.fits"><bdi><span class="pre">/Volumes/BigMac/</span>Pictures/Import/2025-09-13/2025-09-14_01-25-40__-9.90_180.00s_0006.fits</bdi></span>
+          <span class="when">2025-09-14 09:02:11</span><span class="act"><button class="linkbtn">Keep this one</button></span></div>
+        <div class="fr mv"><input type="checkbox" class="cb" checked aria-label="Move this copy"><span class="lab"><svg width="13" height="13"><use href="#i-trash"/></svg></span>
+          <span class="p" title="/Volumes/Universe/Astrophotography/Backup/2025-09-13/LIGHT/2025-09-14_01-25-40__-9.90_180.00s_0006.fits"><bdi><span class="pre">/Volumes/Universe/Astrophotography/</span>Backup/2025-09-13/LIGHT/2025-09-14_01-25-40__-9.90_180.00s_0006.fits</bdi></span>
+          <span class="when">2025-09-15 18:44:30</span><span class="act"><button class="linkbtn">Keep this one</button></span></div>
+      </div>
+    </div>
+    <!-- group 2: a copy that must stay -->
+    <div class="dg open">
+      <div class="dgh">
+        <svg width="16" height="16" style="flex:none"><use href="#i-down"/></svg>
+        <span class="badge b-flat">Flat</span>
+        <span class="fn">masterFlat_L_2025-09-14.xisf</span>
+        <span class="sm" style="font-family:var(--mono)">2025-09-14</span>
+        <span class="sep">·</span><span class="cnt">2</span><span class="sm">×</span><span class="sm">118.4 MB</span>
+        <span class="sep">·</span><span class="mv">118.4 MB to move</span>
+        <span class="pill err" style="margin-left:auto"><svg width="12" height="12"><use href="#i-trash"/></svg>Move 1 of 2</span>
+      </div>
+      <div class="dgb">
+        <p class="dgnote">Same content; bytes are compared with the copy that stays.</p>
+        <div class="fr"><input type="checkbox" class="cb" disabled aria-label="Cannot move this copy"><span class="lab"><svg width="13" height="13" style="color:var(--faint)"><use href="#i-lock"/></svg></span>
+          <span class="p" title="/Volumes/Universe/Astrophotography/Masters/Flat/masterFlat_L_2025-09-14.xisf"><bdi><span class="pre">/Volumes/Universe/Astrophotography/</span>Masters/Flat/masterFlat_L_2025-09-14.xisf</bdi></span>
+          <span class="when">2025-09-14 20:15:03</span><span class="act"><span class="chip c-info" title="3 calibration links point at this copy, so it stays">Stays · 3 links</span></span></div>
+        <div class="fr mv"><input type="checkbox" class="cb" checked aria-label="Move this copy"><span class="lab"><svg width="13" height="13"><use href="#i-trash"/></svg></span>
+          <span class="p" title="/Volumes/BigMac/Pictures/Import/masterFlat_L_2025-09-14.xisf"><bdi><span class="pre">/Volumes/BigMac/</span>Pictures/Import/masterFlat_L_2025-09-14.xisf</bdi></span>
+          <span class="when">2025-09-14 20:15:03</span><span class="act"><button class="linkbtn">Keep this one</button></span></div>
+      </div>
+    </div>
+    <!-- group 3: no copy picked -->
+    <div class="dg open">
+      <div class="dgh">
+        <svg width="16" height="16" style="flex:none"><use href="#i-down"/></svg>
+        <span class="badge b-dark">Dark</span>
+        <span class="fn">2025-09-12_22-41-07__-10.00_300.00s_0001.fits</span>
+        <span class="sm" style="font-family:var(--mono)">2025-09-12</span>
+        <span class="sep">·</span><span class="cnt">2</span><span class="sm">×</span><span class="sm">54.9 MB</span>
+        <span class="pill warn" style="margin-left:auto"><svg width="12" height="12"><use href="#i-alert"/></svg>Pick the copy that stays</span>
+      </div>
+      <div class="dgb">
+        <p class="dgnote warn">No copy is picked here: the copy that would stay, in /Volumes/Archive, cannot be reached.</p>
+        <div class="fr"><input type="checkbox" class="cb" aria-label="Move this copy"><span class="lab"></span>
+          <span class="p" title="/Volumes/Universe/Astrophotography/MBPMAX/Astro/Unsorted/2025-09-12/DARK/2025-09-12_22-41-07__-10.00_300.00s_0001.fits"><bdi><span class="pre">/Volumes/Universe/Astrophotography/</span>MBPMAX/Astro/Unsorted/2025-09-12/DARK/2025-09-12_22-41-07__-10.00_300.00s_0001.fits</bdi></span>
+          <span class="when">2025-09-12 22:46:12</span><span class="act"><button class="linkbtn">Keep this one</button></span></div>
+        <div class="fr"><input type="checkbox" class="cb" aria-label="Move this copy"><span class="lab"></span>
+          <span class="p" title="/Volumes/BigMac/Pictures/Import/2025-09-12/2025-09-12_22-41-07__-10.00_300.00s_0001.fits"><bdi><span class="pre">/Volumes/BigMac/</span>Pictures/Import/2025-09-12/2025-09-12_22-41-07__-10.00_300.00s_0001.fits</bdi></span>
+          <span class="when">2025-09-13 07:30:55</span><span class="act"><button class="linkbtn">Keep this one</button></span></div>
+      </div>
+    </div>
+  </div>
+  <div class="ft"><span class="sel"><b>3</b> of 7 files marked · <b>203.0 MB</b> will free</span><button class="btn">Cancel</button><button class="btn pri">Apply</button></div>
+</div></div>
+<div class="note"><b>Black Hole.</b> Cards are the Duplicates ones: same header (type badge, name, date, count × size, "to move", pill), same row (checkbox, Keep / trash marker, path with the scan root muted, modified time). Changed: the stats row replaces three lines of notes; "bytes are compared" is said once per group; a left-out copy and an unreachable keeper are one muted or amber line on their group instead of a window-level note; a locked copy shows a disabled box and a "Stays · 3 links" chip.</div>
+
+<!-- ============================ METADATA ============================ -->
+<div class="stagehead" id="md"><h2>Metadata</h2><span>1 value proposed, a locked group of 1,829 frames collapsed.</span></div>
+<div class="stage"><div class="win" role="dialog" aria-label="Fill missing metadata" id="winMd">
+  <div class="hd"><h3>Fill missing metadata</h3><button class="btn sm" aria-label="Close"><svg width="12" height="12"><use href="#i-x"/></svg></button></div>
+  <div class="top">
+    <div class="stats">
+      <span class="n ok">1</span><span class="l"> value to write</span><span class="dot">·</span>
+      <span class="n">1,829</span><span class="l"> frames left empty (no value found)</span><span class="dot">·</span>
+      <span class="warnseg"><svg width="11" height="11"><use href="#i-alert"/></svg>1 frame leaves its session · 2 calibration links removed</span>
+    </div>
+    <button class="tbtn" data-all="md"><svg width="12" height="12"><use href="#i-expand"/></svg><span>Expand all</span></button>
+  </div>
+  <div class="facts">
+    <span class="chip c-mute">Expires 2026-11-21 14:32:07</span>
+    <span class="info" title="athenaeum-dev 0.7.2 · catalog /Users/…/athenaeum.db"><svg width="13" height="13"><use href="#i-info"/></svg></span>
+  </div>
+  <p class="sentence">Only the catalog changes. Files on disk are not rewritten, and a later scan keeps these values.</p>
+  <div class="rule"></div>
+  <div class="body" id="bodyMd"><table class="t" id="tMd"></table></div>
+  <div class="ft"><span class="sel" id="selMd"></span><button class="btn">Cancel</button><button class="btn pri" id="applyMd">Apply</button></div>
+</div></div>
+<div class="note"><b>Metadata.</b> A proposed group reads "Object → Filter test" with its evidence once on the group row; each frame row is <i>name · folder · now → proposed</i>. A group with nothing proposed is collapsed by default with its count and its reason once (chip on the group row, full sentence on hover); its frames show a disabled box and "—", never 1,829 repeated chips. A frame whose lock differs from its group's would show a short chip in the Proposed column.</div>
+
+<!-- ============================ PLATE SOLVE ============================ -->
+<div class="stagehead" id="ps"><h2>Plate solve</h2><span>552 frames in 6 folders. Scroll the list: header, stats and footer stay.</span></div>
+<div class="stage"><div class="win" role="dialog" aria-label="Plate solve frames" id="winPs">
+  <div class="hd"><h3>Plate solve frames</h3><button class="btn sm" aria-label="Close"><svg width="12" height="12"><use href="#i-x"/></svg></button></div>
+  <div class="top">
+    <div class="stats">
+      <span class="n ok">552</span><span class="l"> frames to solve</span><span class="dot">·</span>
+      <span class="n">6</span><span class="l"> folders</span><span class="dot">·</span>
+      <span class="l dim">Left out: </span><span class="n">650</span><span class="l"> not light frames</span><span class="dot">·</span>
+      <span class="n">339</span><span class="l" title="They already have a plate solve"> already solved</span>
+    </div>
+    <button class="tbtn" data-all="ps"><svg width="12" height="12"><use href="#i-collapse"/></svg><span>Collapse all</span></button>
+  </div>
+  <div class="facts">
+    <span class="chip c-ok">Star catalog installed</span>
+    <span class="chip c-mute" title="Quad index packs installed">Index packs 0</span>
+    <span class="chip c-mute" title="How many frames are solved at the same time">3 at a time</span>
+    <span class="chip c-mute">Expires 2026-11-21 14:32:07</span>
+    <span class="info" title="athenaeum-dev 0.7.2 · catalog /Users/…/athenaeum.db"><svg width="13" height="13"><use href="#i-info"/></svg></span>
+  </div>
+  <p class="sentence">A solve writes the frame's coordinates and, when the frame has no object name, the name of the object found in its field.</p>
+  <div class="rule"></div>
+  <div class="body" id="bodyPs"><table class="t" id="tPs"></table></div>
+  <div class="ft"><span class="sel" id="selPs"></span><button class="btn">Cancel</button><button class="btn pri" id="applyPs">Apply</button></div>
+</div></div>
+<div class="note"><b>Plate solve.</b> The window used to repeat four lines per frame (552 times). Now each folder is one row (folder once, count, pill "Solve 118 of 118") with one muted line of what all its frames share, and each frame is one 12 px line: box, name, position hint if it has one. Exceptions are visible because they are the only thing in the column: folder 2 shows 3 hints in its first rows. File names are 12 px in the UI font. "+N more" opens the rest of the folder in place.</div>
+</main>
+
+<script>
+(function(){
+  var $ = function(s,r){return (r||document).querySelector(s)};
+  var fmt = function(n){return n.toLocaleString('en-US')};
+  var pad = function(n,w){return String(n).padStart(w||2,'0')};
+  var ROOT = '/Volumes/Universe/Astrophotography/MBPMAX/Astro/Unsorted/';
+  var SHOWN = 12;
+
+  /* ---- mock chrome ---- */
+  document.querySelectorAll('#themeSeg button').forEach(function(b){b.addEventListener('click',function(){
+    document.documentElement.dataset.theme=b.dataset.theme;
+    document.querySelectorAll('#themeSeg button').forEach(function(x){x.classList.toggle('on',x===b)});
+  })});
+  $('#notesToggle').addEventListener('change',function(e){document.body.classList.toggle('nonotes',!e.target.checked)});
+
+  /* ---- frame names: 2025-09-14_01-25-40__-9.90_180.00s_0006.fits ---- */
+  function frameName(start,i,exp,temp){
+    var d=new Date(start+i*(exp+7)*1000);
+    return d.getUTCFullYear()+'-'+pad(d.getUTCMonth()+1)+'-'+pad(d.getUTCDate())+'_'+pad(d.getUTCHours())+'-'+pad(d.getUTCMinutes())+'-'+pad(d.getUTCSeconds())+'__'+temp+'_'+exp.toFixed(2)+'s_'+pad(i+1,4)+'.fits';
+  }
+  function folderHtml(path){
+    var parts=path.split('/'), tail=parts.slice(-2).join('/'), head=path.slice(0,path.length-tail.length);
+    return '<span class="path" title="'+path+'"><bdi><span class="pre">'+head+'</span>'+tail+'</bdi></span>';
+  }
+
+  /* ---- generic grouped table ---- */
+  function Plan(opt){
+    var self=this; self.opt=opt; self.groups=opt.groups;
+    self.groups.forEach(function(g){g.off=new Set(); g.shown=SHOWN;});
+    self.table=$(opt.table); self.body=$(opt.body);
+    self.render();
+    self.table.addEventListener('click',function(e){
+      var t=e.target.closest('[data-act]'); if(!t) return;
+      var g=self.groups[+t.dataset.g]; var a=t.dataset.act;
+      if(a==='toggle'){g.open=!g.open}
+      else if(a==='more'){g.shown=g.n}
+      else return;
+      self.render();
+    });
+    self.table.addEventListener('change',function(e){
+      var t=e.target; if(t.type!=='checkbox') return;
+      if(t.dataset.all){
+        self.groups.forEach(function(g){if(g.locked) return; g.off.clear(); if(!t.checked){for(var i=0;i<g.n;i++) g.off.add(i);}});
+      } else {
+        var g=self.groups[+t.dataset.g];
+        if(t.dataset.i!==undefined){var i=+t.dataset.i; if(t.checked) g.off.delete(i); else g.off.add(i);}
+        else {g.off.clear(); if(!t.checked){for(var j=0;j<g.n;j++) g.off.add(j);}}
+      }
+      self.render();
+    });
+    var all=$('[data-all="'+opt.id+'"]');
+    if(all) all.addEventListener('click',function(){
+      var anyOpen=self.groups.some(function(g){return g.open});
+      self.groups.forEach(function(g){g.open=!anyOpen});
+      all.querySelector('span').textContent=anyOpen?'Expand all':'Collapse all';
+      all.querySelector('use').setAttribute('href',anyOpen?'#i-expand':'#i-collapse');
+      self.render();
+    });
+  }
+  Plan.prototype.render=function(){
+    var o=this.opt, h='', ticked=0, offered=0, self=this;
+    var tickable=this.groups.filter(function(g){return !g.locked});
+    tickable.forEach(function(g){offered+=g.n; ticked+=g.n-g.off.size});
+    h+='<thead><tr><th class="cb"><input type="checkbox" class="cb" data-all="1" data-ind="'+(ticked>0&&ticked<offered?1:0)+'" '+(ticked===offered&&offered>0?'checked':'')+(offered===0?' disabled':'')+' aria-label="Select all"></th>'+o.head+'</tr></thead><tbody>';
+    this.groups.forEach(function(g,gi){
+      var t=g.n-g.off.size;
+      h+='<tr class="gh'+(g.locked?' lock':'')+'"><td class="cb"><input type="checkbox" class="cb" data-g="'+gi+'" data-ind="'+(!g.locked&&t>0&&t<g.n?1:0)+'" '+(!g.locked&&t===g.n?'checked':'')+(g.locked?' disabled':'')+' aria-label="Include all in '+g.aria+'"></td>';
+      h+='<td colspan="'+o.cols+'"><div class="ghrow"><button data-act="toggle" data-g="'+gi+'" class="chev" aria-expanded="'+(!!g.open)+'" aria-label="'+(g.open?'Collapse':'Expand')+' '+g.aria+'"><svg width="14" height="14"><use href="#i-'+(g.open?'down':'right')+'"/></svg></button>';
+      h+=g.title+'<span class="cnt"><b>'+fmt(g.n)+'</b> '+(g.n===1?'frame':'frames')+'</span>';
+      h+=g.locked?g.lockPill:'<span class="pill '+o.pillCls+'"><svg width="12" height="12"><use href="#'+o.pillIcon+'"/></svg>'+o.pillWord+' '+fmt(t)+' of '+fmt(g.n)+'</span>';
+      h+='</div><div class="gfacts">'+g.facts+'</div></td></tr>';
+      if(g.open){
+        var lim=Math.min(g.shown,g.n);
+        for(var i=0;i<lim;i++){
+          var on=!g.off.has(i);
+          h+='<tr class="r '+(i%2?'odd':'even')+(g.locked||on?'':' off')+'"><td class="cb"><input type="checkbox" class="cb" data-g="'+gi+'" data-i="'+i+'" '+(on&&!g.locked?'checked':'')+(g.locked?' disabled':'')+' aria-label="Include '+g.name(i)+'"></td>'+o.row(g,i)+'</tr>';
+        }
+        if(lim<g.n) h+='<tr class="more"><td></td><td colspan="'+o.cols+'"><button class="linkbtn" data-act="more" data-g="'+gi+'">+'+fmt(g.n-lim)+' more '+(g.n-lim===1?'frame':'frames')+' in this folder</button></td></tr>';
+      }
+    });
+    h+='</tbody>';
+    this.table.innerHTML=h;
+    this.table.querySelectorAll('[data-ind="1"]').forEach(function(el){el.indeterminate=true});
+    $(o.sel).innerHTML='<b>'+fmt(ticked)+'</b> of <b>'+fmt(offered)+'</b> '+o.unit(offered)+' selected';
+    $(o.apply).disabled=ticked===0;
+  };
+
+  /* ---- plate solve: 552 frames, 6 folders ---- */
+  var psSpec=[
+    {d:'2025-09-13',n:118,obj:'M 78',flt:'L',exp:180,temp:'-9.90',hints:[],hintNote:'none'},
+    {d:'2025-09-14',n:143,obj:'M 78',flt:'L',exp:180,temp:'-9.90',hints:[2,6,9,31,48,77,90,101,120],hintNote:'on 9 frames'},
+    {d:'2025-09-20',n:96,obj:'NGC 2024',flt:'Ha',exp:300,temp:'-10.00',hints:[],hintNote:'none'},
+    {d:'2025-10-02',n:87,obj:'NGC 2024',flt:'Ha',exp:300,temp:'-10.00',hints:[],hintNote:'none'},
+    {d:'2025-10-11',n:74,obj:'IC 434',flt:'Ha',exp:300,temp:'-10.00',hints:[],hintNote:'none'},
+    {d:'2025-10-18',n:34,obj:null,flt:'OIII',exp:300,temp:'-10.00',hints:[],hintNote:'none'}
+  ];
+  var hintTexts=['05h 46m 45s  +00° 03′','05h 46m 44s  +00° 04′','05h 46m 46s  +00° 03′'];
+  var psGroups=psSpec.map(function(s){
+    var p=s.d.split('-'), start=Date.UTC(+p[0],+p[1]-1,+p[2],20,31,12), path=ROOT+s.d+'/LIGHT';
+    var dot='<span class="dot">·</span>';
+    return {
+      n:s.n,open:true,aria:path,
+      title:folderHtml(path),
+      facts:'Object <b>'+(s.obj||'none')+'</b>'+dot+'Filter <b>'+s.flt+'</b>'+dot+'Exposure <b>'+s.exp+' s</b>'+dot+'Position hint <b>'+s.hintNote+'</b>'+dot+'No plate solve stored yet',
+      name:function(i){return frameName(start,i,s.exp,s.temp)},
+      hint:function(i){var k=s.hints.indexOf(i);return k<0?'':hintTexts[k%3]}
+    };
+  });
+  new Plan({id:'ps',table:'#tPs',body:'#bodyPs',sel:'#selPs',apply:'#applyPs',cols:2,
+    head:'<th>File</th><th style="width:230px">Position hint</th>',
+    pillCls:'acc',pillIcon:'i-cross',pillWord:'Solve',
+    unit:function(){return 'frames'},
+    row:function(g,i){var h=g.hint(i);return '<td class="nm" title="'+g.name(i)+'">'+g.name(i)+'</td><td class="hint">'+(h||'')+'</td>'},
+    groups:psGroups});
+
+  /* ---- metadata ---- */
+  var mdStart=Date.UTC(2025,8,13,21,40,12);
+  var mdGroups=[
+    {n:1,open:true,aria:'Object: Filter test',
+     title:'<span class="ttl">Object <span class="arrow" style="margin:0">→</span> Filter test</span>',
+     facts:'Why: the other frames of that night carry the same object name',
+     name:function(i){return frameName(mdStart,5,30,'-9.90')},
+     folder:ROOT+'2025-09-13/LIGHT',now:'(empty)',proposed:'Filter test'},
+    {n:1829,open:false,locked:true,aria:'Object: nothing proposed',
+     title:'<span class="ttl">Object: nothing proposed</span>',
+     lockPill:'<span class="pill" title="No value could be found for these frames"><svg width="12" height="12"><use href="#i-lock"/></svg>No value found</span>',
+     facts:'No value could be found for these frames. They stay empty.',
+     name:function(i){return frameName(Date.UTC(2025,8,20,20,31,12),i,300,'-10.00')},
+     folder:ROOT+'2025-09-20/LIGHT',now:'(empty)',proposed:'—'}
+  ];
+  new Plan({id:'md',table:'#tMd',body:'#bodyMd',sel:'#selMd',apply:'#applyMd',cols:3,
+    head:'<th>File</th><th>Folder</th><th style="width:230px">Now → Proposed</th>',
+    pillCls:'acc',pillIcon:'i-pencil',pillWord:'Fill',
+    unit:function(n){return n===1?'value':'values'},
+    row:function(g,i){
+      var f=g.folder, short=f.split('/').slice(-3).join('/');
+      return '<td class="nm" title="'+g.name(i)+'">'+g.name(i)+'</td><td class="dim" style="font-size:11px;white-space:nowrap" title="'+f+'">…/'+short+'</td>'
+        +'<td style="white-space:nowrap"><span class="dim">'+g.now+'</span><span class="arrow">→</span><span class="'+(g.locked?'dim':'val-new')+'">'+g.proposed+'</span></td>';
+    },
+    groups:mdGroups});
+})();
+</script>
+</body>
+</html>

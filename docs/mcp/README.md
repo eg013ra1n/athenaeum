@@ -458,7 +458,18 @@ the module, the three tools and `McpHost::solves`, and its tool list simply lack
 `src/components/mcp/{PlanWindow,PlanView,planSelection}`, state in `src/contexts/McpPlanContext.tsx` (provider and window sit in `Layout.tsx`, once).
 The window is the one place a plan is looked over and decided: ticks, the copy that stays, **Apply** or **Cancel**. A `DialogShell size="lg"`.
 
-- **Looks like the Duplicates page.** Each group is a `PlanGroupCard` (`PlanGroupCard.tsx`) shaped like `DuplicateGroupCard`: a header (frame type, title, count x size, "to move", a pill), then one row per file with a marker that says what happens to *that* file from the current selection (Stays / To the Black Hole / Locked + reason; metadata and plate-solve rows say Will be filled / Will be solved). The copy that stays is picked with **Keep this one** on another copy (a checkbox per row marks what moves, as on the Duplicates page). No table, no horizontal scroll; header keywords are mapped to words in `planLabels.ts` (Type, Object, Filter, Exposure, Date, Camera); what every copy shares is said once per group. Bytes use `duplicates/presentation.ts`'s `formatBytes`, the Duplicates page's. The header is the title and one summary line; the build and catalog are on the info icon's `title`.
+- **Laid out as the owner-approved mockup** (`docs/superpowers/research/2026-11-21-mcp-plan-window-mockup.html`, 2026-11-21).
+  `PlanHeader.tsx`: the title; ONE stats row in the Duplicates toolbar's style (the live headline from the ticks — files to the
+  Black Hole and the bytes they free, frames to solve, values to write — then `summary.counts`, "Left out:" `summary.leftOut`
+  and amber `summary.warnings`, each a bright number and a muted label, `·` between); `summary.facts` as chips with the
+  expiry; `summary.explain` once, small and muted. The plan's `notes` are not shown: they are the assistant's text.
+  Black Hole groups are `PlanGroupCard`s shaped like `DuplicateGroupCard` (a marker per copy: Stays / To the Black Hole /
+  Locked + reason). Metadata and plate-solve plans are `PlanTable` dense rows in the Missing Metadata table's style: a group
+  row with the folder once, its count and pill and one muted line of the facts its frames share; one 12 px line per frame
+  (name, then only what differs from the group: now → proposed, a position hint, a lock chip); 12 frames, then "+N more"
+  that expands in place; a group locked for one reason is one collapsed row. Only the list scrolls
+  (`DialogShell bodyLayout="column"`, used by this window alone); title, stats, chips, table head and footer stay put.
+- **The summary.** `McpPlanView.summary` (`PlanSummary`, `mcp/plans/model.rs`) is what the stats row, chips and the one sentence show: `counts` (folders, groups), `leftOut` and `warnings` (a count and its words), `facts` (chips: label, value, tone `ok` / `warn` / `neutral`) and `explain`. Each planner fills it from the same values its `notes` are built from, never by parsing them; the `notes` stay for the assistant's text answer. A `SummaryCount` carries `label` (read with any count but 1) and `labelOne` (read with 1): the window shows `count === 1 ? labelOne : label`; a count of 0 is never sent. Every view carries a summary, empty while `preparing`. The headline that follows the ticks (files to move, frames to solve, values to write) is the window's own, not in the summary.
 - **Reads.** On mount `get_mcp_plan({ planId: null })` (a page opened later finds the plan that waits; the key is always sent); on every
   `mcp-plan-updated {planId}` `get_mcp_plan({ planId })` (required listener pattern; progress events come about every 250 ms). Only an undecided
   plan (`preparing`, `waiting`, `applying`) opens a closed window; an event for a finished plan does nothing.
@@ -476,7 +487,7 @@ The window is the one place a plan is looked over and decided: ticks, the copy t
 - **Events are not trusted alone.** The web build drops events (an EventSource reconnect, a lagged broadcast). While the tracked plan is
   `preparing`, `waiting` or `applying` (shown or hidden) the context re-reads it with `get_mcp_plan({ planId })` every 3 s and once when the
   tab becomes visible; the timer ends with the plan and on unmount. The re-read never swaps the shown plan for another id.
-- **States.** `preparing`: `done of total` and Cancel; `waiting`: groups, totals ("N files · X GB"), Cancel, Apply (disabled while
+- **States.** `preparing`: `done of total` and Cancel; `waiting`: groups, the footer "N of M … selected" (Black Hole: "· size will free"), Cancel, Apply (disabled while
   `selectionProblems` is non-empty, the problems are listed beside the totals); `applying`: read-only, only Close (it hides the window; above); `applied`: the report
   (applied / skipped / failed with each reason) until dismissed, also for a plan that `failed` while applying; `replaced`, `expired`, `failed`: state text and Close.
 - **Selection rules** (`planSelection.ts`, pure): the initial selection is the plan's `selected` items and `chosen` copies; a locked item can never be

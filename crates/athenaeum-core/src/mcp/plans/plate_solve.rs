@@ -28,7 +28,8 @@ use serde_json::{json, Map, Value};
 use super::black_hole::{guard, PlanDescription};
 use super::{
     catalog_values, plan_opened_text, stamp_for_plan, stamp_target, ItemSnapshot, McpPlanView, PlanApplier, PlanColumn,
-    PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState, ReportLine, PLAN_ITEM_CAP,
+    FactTone, PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState, PlanSummary, ReportLine,
+    SummaryCount, SummaryFact, PLAN_ITEM_CAP,
 };
 use crate::api::plate_solve::{
     cancel_plate_solve_run, dso_catalog, plate_solve_activity, prepare_plate_solve_batch, resolve_index_packs,
@@ -49,6 +50,9 @@ use crate::services::{PlateSolveOrigin, SolveProgress};
 
 const TITLE: &str = "Plate solve";
 /// The plan's note on what a solve writes besides the coordinates (the app's own behaviour, `store_result`).
+/// The window's one sentence for the same behaviour, shorter and without the app's internals.
+const SOLVE_EXPLAIN: &str =
+    "A solve writes the frame's coordinates and, when the frame has no object name, the name of the object found in its field.";
 pub const NAMES_THE_OBJECT: &str = "A solved frame gets its coordinates; a frame with no object name also gets the name of the catalogued object the solve finds in its field, as a solve started in Athenaeum does.";
 /// A plan answer lists at most this many groups with their items (the rest is summed) ...
 const GROUPS_LISTED: usize = GROUPS_SHOWN;
@@ -631,8 +635,15 @@ fn build_and_publish(
     let mut notes: Vec<String> = vec![format!("{solvable} of {} frames can be solved", candidates.len())];
     let mut reasons: Vec<(String, usize)> = refused.into_iter().collect();
     reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut summary = PlanSummary {
+        counts: vec![SummaryCount::new(groups.len(), "folder", "folders")],
+        explain: Some(SOLVE_EXPLAIN.to_string()),
+        ..PlanSummary::default()
+    };
     for (reason, n) in reasons {
         notes.push(format!("{} refused: {reason}", count_of(n, "frame", "frames")));
+        let label = format!("refused: {reason}");
+        summary.warnings.push(SummaryCount::new(n, &label, &label));
     }
     notes.push(if catalog.is_installed() { "star catalog: installed".to_string() } else { "star catalog: not installed".to_string() });
     notes.push(format!("quad index packs: {} installed", catalog.packs));
@@ -653,11 +664,27 @@ fn build_and_publish(
             if solved == 1 { "is" } else { "are" }
         ));
     }
+    if not_lights > 0 {
+        summary.left_out.push(SummaryCount::new(not_lights, "not a light frame", "not light frames"));
+    }
+    if solved > 0 {
+        summary.left_out.push(SummaryCount::new(solved, "already solved", "already solved"));
+    }
+    summary.facts = vec![
+        if catalog.is_installed() {
+            SummaryFact::new("Star catalog", "installed", FactTone::Ok)
+        } else {
+            SummaryFact::new("Star catalog", "not installed", FactTone::Warn)
+        },
+        SummaryFact::new("Index packs", catalog.packs.to_string(), FactTone::Neutral),
+        SummaryFact::new("At a time", concurrency.to_string(), FactTone::Neutral),
+    ];
     let content = PlanContent {
         title: TITLE.to_string(),
         columns: plan_columns(),
         groups,
         notes,
+        summary,
         snapshots,
         applier: Box::new(PlateSolveApplier { items: infos, resolve, only_unsolved }),
     };

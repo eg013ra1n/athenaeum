@@ -6,7 +6,7 @@ import { routeInvoke } from '../../test/apiMock';
 import { McpPlanProvider } from '../../contexts/McpPlanContext';
 import { PlanWindow } from './PlanWindow';
 import { formatBytes } from '../duplicates/presentation';
-import { metadataPlan, plan, plateSolvePlan } from './planFixtures';
+import { blackHoleMockupPlan, count, metadataPlan, metadataVolumePlan, plan, plateSolvePlan, plateSolveVolumePlan } from './planFixtures';
 import type { McpPlanView } from '../../types/mcp';
 
 vi.mock('../../api');
@@ -49,6 +49,10 @@ async function showThen(next: McpPlanView) {
 // Apply arms one second after the window shows a waiting plan.
 const armed = () =>
   waitFor(() => expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(false), { timeout: 2500 });
+
+// The header's live headline and the footer's "N of M", as the user reads them.
+const stats = () => screen.getByTestId('plan-stats').textContent ?? '';
+const picked = () => screen.getByTestId('plan-selection').textContent ?? '';
 
 const answers = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'answer_mcp_plan');
 
@@ -114,9 +118,11 @@ describe('PlanWindow', () => {
     newest = plans['plan-1'] = plan();
     mount();
     await screen.findByRole('dialog');
-    expect(screen.getByText(`3 files · ${formatBytes(7000)}`)).toBeTruthy();
+    expect(stats()).toContain(`3 files to the Black Hole·${formatBytes(7000)} will free`);
+    expect(picked()).toBe(`3 of 6 files marked · ${formatBytes(7000)} will free`);
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M42 Flat (2 copies)' }));
-    expect(screen.getByText(`2 files · ${formatBytes(3000)}`)).toBeTruthy();
+    expect(stats()).toContain(`2 files to the Black Hole·${formatBytes(3000)} will free`);
+    expect(picked()).toBe(`2 of 6 files marked · ${formatBytes(3000)} will free`);
     await armed();
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
     await waitFor(() => expect(answers()).toHaveLength(1));
@@ -202,7 +208,7 @@ describe('PlanWindow', () => {
     expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true);
     plans['plan-1'] = plan();
     await emit('plan-1');
-    await waitFor(() => expect(screen.getByText(`3 files · ${formatBytes(7000)}`)).toBeTruthy());
+    await waitFor(() => expect(stats()).toContain(`3 files to the Black Hole·${formatBytes(7000)} will free`));
     await armed();
   });
 
@@ -419,14 +425,14 @@ describe('PlanWindow', () => {
     await screen.findByRole('dialog');
     // This window's own ticks: group 1 is unticked here, so only the group-2 copy counts.
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M31 Light 300 s (3 copies)' }));
-    expect(screen.getByText(`1 file · ${formatBytes(4000)}`)).toBeTruthy();
+    expect(stats()).toContain(`1 file to the Black Hole·${formatBytes(4000)} will free`);
     // Another page applied only copy-3 of the first group: the backend recorded exactly that.
     const applied = plan({ state: { kind: 'applying' } });
     applied.groups[0].items[1].selected = false;
     applied.groups[1].items[1].selected = false;
     plans['plan-1'] = applied;
     await emit('plan-1');
-    await waitFor(() => expect(screen.getByText(`1 file · ${formatBytes(2000)}`)).toBeTruthy());
+    await waitFor(() => expect(stats()).toContain(`1 file to the Black Hole·${formatBytes(2000)} will free`));
     expect((screen.getByRole('checkbox', { name: 'Include copy-3.fits' }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole('checkbox', { name: 'Include copy-2.fits' }) as HTMLInputElement).checked).toBe(false);
   });
@@ -551,13 +557,16 @@ describe('PlanWindow', () => {
       ...unsized,
       groups: unsized.groups.map((g) => ({ ...g, chooseOne: null, items: g.items.map((i) => ({ ...i, sizeBytes: null })) })),
     });
-    expect(await screen.findByText(/^\d+ frames?$/)).toBeTruthy();
-    expect(screen.queryByText(/· 0 B/)).toBeNull();
+    await screen.findByTestId('plan-selection');
+    expect(picked()).toMatch(/^\d+ of \d+ frames selected$/);
+    expect(stats()).not.toMatch(/0 B|will free/);
     cleanup();
-    // A metadata plan counts frames too, with its sizes.
+    // A metadata plan counts values, and a size is the Black Hole's alone.
     await showThen(plan({ kind: 'metadata' }));
-    expect(await screen.findByText(/^\d+ frames? · /)).toBeTruthy();
-    expect(screen.queryByText(/files?/)).toBeNull();
+    await screen.findByTestId('plan-selection');
+    expect(picked()).toMatch(/^\d+ of \d+ values selected$/);
+    expect(stats()).toMatch(/\d+ values to write/);
+    expect(stats()).not.toMatch(/files?|will free/);
     cleanup();
     // A Black Hole plan keeps its "applied" chip.
     await showThen(
@@ -684,10 +693,12 @@ describe('PlanWindow in the Duplicates page\'s language', () => {
     newest = plans['plan-1'] = plan();
     mount();
     await screen.findByRole('dialog');
-    expect(screen.getByText(`3 files · ${formatBytes(7000)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
+    // The headline is the app's byte formatter over the ticks; the expiry is a chip, not part of the headline.
+    expect(stats()).toBe(`2 groups·3 files to the Black Hole·${formatBytes(7000)} will free`);
+    expect(screen.getByText('Expires 2026-11-20 15:00:00')).toBeTruthy();
     // Unticking lowers it.
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M42 Flat (2 copies)' }));
-    expect(screen.getByText(`2 files · ${formatBytes(3000)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
+    expect(stats()).toBe(`2 groups·2 files to the Black Hole·${formatBytes(3000)} will free`);
   });
 
   it('no_plan_scrolls_sideways', async () => {
@@ -706,26 +717,214 @@ describe('PlanWindow in the Duplicates page\'s language', () => {
     mount();
     const dialog = await screen.findByRole('dialog');
     expect(dialog.textContent).not.toMatch(/OBJECT|INSTRUME/);
-    expect(row('frame-1.fits').textContent).toMatch(/Object\(empty\)M31/);
-    expect(row('frame-1.fits').textContent).toMatch(/the folder name says M31/);
-    expect(row('frame-3.fits').textContent).toMatch(/Camera\(empty\)ASI2600MM/);
+    // The field and its why are said once, on the group row; a frame row is name, folder, now -> proposed.
+    expect(dialog.textContent).toContain('Object → M31');
+    expect(dialog.textContent).toContain('Camera → ASI2600MM');
+    // One per group that proposes it (both groups here), never one per frame.
+    expect(screen.getAllByText('Why: the folder name says M31')).toHaveLength(2);
+    expect(row('frame-1.fits').textContent).toMatch(/\(empty\)M31/);
+    expect(row('frame-1.fits').textContent).not.toMatch(/the folder name says M31/);
+    expect(row('frame-3.fits').textContent).toMatch(/\(empty\)ASI2600MM/);
+    // A frame locked on its own shows the reason as a chip, with the full text on hover.
     const locked = row('frame-2.fits');
-    expect(locked.textContent).toMatch(/the file is on a drive that is not connected/);
+    expect(locked.querySelector('[title="the file is on a drive that is not connected"]')).toBeTruthy();
     expect((screen.getByRole('checkbox', { name: 'Include frame-2.fits' }) as HTMLInputElement).disabled).toBe(true);
-    expect(screen.getByText(/^2 values to write/)).toBeTruthy();
+    expect(stats()).toMatch(/^2 values to write/);
   });
 
-  it('a_plate_solve_plan_shows_the_position_hint_and_what_a_solve_writes', async () => {
+  it('a_plate_solve_plan_shows_the_position_hint_once_per_group_and_per_frame', async () => {
     newest = plans['plan-1'] = plateSolvePlan();
     mount();
     await screen.findByRole('dialog');
-    expect(row('light-1.fits').textContent).toMatch(/Position hint\s*RA 10\.6847, Dec 41\.2690/);
-    expect(row('light-1.fits').textContent).toMatch(/A solve writes\s*its coordinates/);
-    expect(row('light-1.fits').textContent).not.toMatch(/name of the object/);
-    // A frame with no object name also gets the name of the object in its field.
-    expect(row('light-2.fits').textContent).toMatch(/the name of the object in its field/);
-    expect(row('light-2.fits').textContent).toMatch(/Position hint\s*none/);
-    expect(row('light-3.fits').textContent).toMatch(/the star catalog is not installed/);
-    expect(screen.getByText(/^2 frames to solve/)).toBeTruthy();
+    expect(row('light-1.fits').textContent).toContain('RA 10.6847, Dec 41.2690');
+    // A frame without a hint has an empty cell; what a solve writes is said once, in the sentence.
+    expect(row('light-2.fits').textContent).not.toMatch(/RA 10|Position hint/);
+    expect(row('light-1.fits').textContent).not.toMatch(/A solve writes/);
+    expect(screen.getAllByText("A solve writes the frame's coordinates.")).toHaveLength(1);
+    // The group row carries the evidence, once.
+    expect(screen.getAllByText(/No plate solve is stored for this frame/)).toHaveLength(1);
+    expect(row('light-3.fits').querySelector('[title="the star catalog is not installed"]')).toBeTruthy();
+    expect(stats()).toMatch(/^2 frames to solve/);
+  });
+});
+
+describe('PlanWindow as the approved mockup', () => {
+  const row = (fileName: string) => screen.getByText(fileName).closest('[data-testid="plan-row"]') as HTMLElement;
+  const rowsOf = () => screen.queryAllByTestId('plan-row');
+
+  it('the_stats_row_reads_the_summary_with_the_right_number', async () => {
+    newest = plans['plan-1'] = plateSolveVolumePlan();
+    mount();
+    await screen.findByRole('dialog');
+    expect(stats()).toBe('552 frames to solve·6 folders·Left out: 650 not light frames·339 already solved');
+    cleanup();
+    // One of anything uses the singular label; the thousands separator is the app's.
+    newest = plans['plan-1'] = plateSolveVolumePlan({
+      summary: { ...plateSolveVolumePlan().summary, counts: [count(1, 'folder', 'folders')], leftOut: [count(1, 'not a light frame', 'not light frames'), count(1829, 'x', 'frames already solved')] },
+    });
+    mount();
+    await screen.findByRole('dialog');
+    expect(stats()).toBe('552 frames to solve·1 folder·Left out: 1 not a light frame·1,829 frames already solved');
+  });
+
+  it('the_facts_are_chips_with_their_tone_and_the_sentence_is_said_once', async () => {
+    newest = plans['plan-1'] = plateSolveVolumePlan({
+      summary: {
+        ...plateSolveVolumePlan().summary,
+        facts: [
+          { label: 'Star catalog', value: 'not installed', tone: 'warn' },
+          { label: 'Index packs', value: '0', tone: 'neutral' },
+          { label: 'At a time', value: '3', tone: 'neutral' },
+          { label: 'Star catalog', value: 'installed', tone: 'ok' },
+        ],
+      },
+    });
+    mount();
+    await screen.findByRole('dialog');
+    const warn = screen.getByText('Star catalog not installed');
+    expect(warn.className).toMatch(/text-warning/);
+    expect(screen.getByText('Index packs 0').className).toMatch(/text-content-muted/);
+    expect(screen.getByText('3 at a time').className).toMatch(/text-content-muted/);
+    expect(screen.getByText('Star catalog installed').className).toMatch(/text-success/);
+    expect(screen.getAllByText(/^A solve writes the frame's coordinates and/)).toHaveLength(1);
+  });
+
+  it('no_element_renders_the_notes', async () => {
+    for (const make of [plan, metadataPlan, plateSolveVolumePlan]) {
+      newest = plans['plan-1'] = make();
+      mount();
+      const dialog = await screen.findByRole('dialog');
+      for (const note of make().notes) expect(dialog.textContent, `${make.name}: ${note}`).not.toContain(note);
+      cleanup();
+    }
+  });
+
+  it('a_plate_solve_frame_is_one_line_and_repeats_nothing_its_group_says', async () => {
+    newest = plans['plan-1'] = plateSolveVolumePlan();
+    mount();
+    await screen.findByRole('dialog');
+    const dialog = screen.getByRole('dialog');
+    // What the six folders share is on the group rows: object, filter, exposure, hint, evidence.
+    expect(dialog.textContent).toContain('Object M 78');
+    expect(dialog.textContent).toContain('Position hint on 9 frames');
+    expect(dialog.textContent).toContain('Position hint none');
+    expect(screen.getAllByText(/No plate solve is stored for this frame/)).toHaveLength(6);
+    const first = row('2025-09-13_20-31-12__light_0001.fits');
+    expect(first.textContent).toBe('2025-09-13_20-31-12__light_0001.fits');
+    // The frames of folder 2 that have a hint show it, and only they do.
+    expect(row('2025-09-14_20-31-12__light_0003.fits').textContent).toContain('05h 46m 45s');
+    expect(row('2025-09-14_20-31-12__light_0004.fits').textContent).toBe('2025-09-14_20-31-12__light_0004.fits');
+    expect(screen.getByText('2025-09-14_20-31-12__light_0003.fits').closest('[data-testid="plan-row"]')?.querySelectorAll('input')).toHaveLength(1);
+  });
+
+  it('a_group_shows_twelve_frames_then_plus_n_more_which_opens_in_place', async () => {
+    newest = plans['plan-1'] = plateSolveVolumePlan();
+    mount();
+    await screen.findByRole('dialog');
+    // Six folders, twelve frames each.
+    expect(rowsOf()).toHaveLength(6 * 12);
+    const more = screen.getByRole('button', { name: '+106 more frames in this folder' });
+    fireEvent.click(more);
+    expect(rowsOf()).toHaveLength(5 * 12 + 118);
+    expect(screen.queryByRole('button', { name: '+106 more frames in this folder' })).toBeNull();
+    // The group row says "Solve 118 of 118" and counts with the separator.
+    expect(screen.getByRole('dialog').textContent).toContain('Solve 118 of 118');
+    expect(screen.getByRole('dialog').textContent).toContain('143 frames');
+    // Unticking lowers the headline.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in /Volumes/Universe/Astrophotography/MBPMAX/Astro/Unsorted/2025-09-13/LIGHT' }));
+    expect(stats()).toMatch(/^434 frames to solve/);
+    expect(picked()).toBe('434 of 552 frames selected');
+  });
+
+  it('a_group_that_is_locked_for_one_reason_is_one_row_with_its_count_and_reason', async () => {
+    newest = plans['plan-1'] = metadataVolumePlan();
+    mount();
+    await screen.findByRole('dialog');
+    const dialog = screen.getByRole('dialog');
+    expect(stats()).toBe('1 value to write·Left out: 1,829 frames with no value found·1 frame leaves its session · 2 calibration links removed');
+    expect(dialog.textContent).toContain('1,829 frames');
+    // The reason is on the group row once, with its full text on hover; its frames are not rendered.
+    expect(screen.getAllByTitle('No value found')).toHaveLength(1);
+    expect(rowsOf()).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Expand Object: nothing proposed' }).getAttribute('aria-expanded')).toBe('false');
+    expect((screen.getByRole('checkbox', { name: 'Include all in Object: nothing proposed' }) as HTMLInputElement).disabled).toBe(true);
+    // Opened, it shows twelve disabled frames and "+N more".
+    fireEvent.click(screen.getByRole('button', { name: 'Expand Object: nothing proposed' }));
+    expect(rowsOf()).toHaveLength(1 + 12);
+    expect(screen.getByRole('button', { name: '+1,817 more frames in this group' })).toBeTruthy();
+    const frame = rowsOf()[1]!;
+    expect(frame.textContent).toMatch(/\(empty\)—$/);
+    expect(frame.querySelector('input')?.disabled).toBe(true);
+    // The proposed group reads "Object → Filter test", with its why once.
+    expect(dialog.textContent).toContain('Object → Filter test');
+    expect(screen.getAllByText('Why: the other frames of that night carry the same object name')).toHaveLength(1);
+  });
+
+  it('collapse_all_and_expand_all_follow_what_is_open', async () => {
+    newest = plans['plan-1'] = plateSolveVolumePlan();
+    mount();
+    await screen.findByRole('dialog');
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }));
+    expect(rowsOf()).toHaveLength(0);
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }));
+    expect(rowsOf()).toHaveLength(6 * 12);
+  });
+
+  it('select_all_in_the_table_head_ticks_and_unticks_every_frame', async () => {
+    newest = plans['plan-1'] = plateSolveVolumePlan();
+    mount();
+    await screen.findByRole('dialog');
+    const all = () => screen.getByRole('checkbox', { name: 'Select all' }) as HTMLInputElement;
+    expect(all().checked).toBe(true);
+    fireEvent.click(all());
+    expect(picked()).toBe('0 of 552 frames selected');
+    fireEvent.click(all());
+    expect(picked()).toBe('552 of 552 frames selected');
+  });
+
+  it('the_black_hole_cards_are_the_duplicates_ones_with_one_note_per_group', async () => {
+    newest = plans['plan-1'] = blackHoleMockupPlan();
+    mount();
+    await screen.findByRole('dialog');
+    const dialog = screen.getByRole('dialog');
+    // Counts, headline, size, and the group that needs its copy that stays, live.
+    expect(stats()).toContain('3 groups·3 files to the Black Hole·');
+    expect(stats()).toContain('1 group needs a copy that stays');
+    expect(picked()).toMatch(/^3 of 7 files marked · .* will free$/);
+    // Pills: "Move 2 of 3", and the group with no keeper asks for one.
+    expect(dialog.textContent).toContain('Move 2 of 3');
+    expect(dialog.textContent).toContain('Move 1 of 2');
+    expect(dialog.textContent).toContain('Pick the copy that stays');
+    // The master's lock is a chip, "Stays · 3 links", with the full reason on hover.
+    expect(screen.getByTitle('3 calibration links point at this copy, so it stays').textContent).toContain('Stays · 3 links');
+    // The unreachable keeper is an amber line on the group.
+    expect(screen.getByText(/cannot be reached/).className).toMatch(/text-warning/);
+    // The byte check is said once per group, not per row.
+    expect(screen.getAllByText('identical bytes to the copy that stays')).toHaveLength(3);
+    // Picking a copy that stays in group 3 clears the warning.
+    fireEvent.click(screen.getAllByRole('button', { name: /^Copy that stays: 2025-09-12_22-41-07/ })[0]!);
+    expect(stats()).not.toContain('needs a copy that stays');
+    expect(dialog.textContent).not.toContain('Pick the copy that stays');
+  });
+
+  it('the_list_scrolls_while_the_header_the_sentence_and_the_footer_stay', async () => {
+    newest = plans['plan-1'] = plateSolveVolumePlan();
+    mount();
+    const dialog = await screen.findByRole('dialog');
+    const list = screen.getByTestId('plan-list');
+    // The scrolling container is the list; the dialog body around it is a flex column that does not scroll.
+    expect(list.className).toMatch(/overflow-y-auto/);
+    const body = list.parentElement!;
+    expect(body.className).not.toMatch(/overflow/);
+    expect(body.className).toMatch(/flex-col/);
+    // Stats, chips, sentence and the footer sit outside the list.
+    for (const fixed of [screen.getByTestId('plan-stats'), screen.getByTestId('plan-header'), screen.getByTestId('plan-selection'), screen.getByRole('button', { name: 'Cancel' })]) {
+      expect(list.contains(fixed)).toBe(false);
+    }
+    expect(screen.getByText(/^A solve writes the frame's coordinates and/).closest('[data-testid="plan-list"]')).toBeNull();
+    // The table header is the first thing in the list and sticks to its top.
+    expect(screen.getByTestId('plan-table-head').className).toMatch(/sticky top-0/);
+    expect(dialog.contains(list)).toBe(true);
   });
 });

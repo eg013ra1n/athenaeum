@@ -23,8 +23,8 @@ use serde_json::{json, Map, Value};
 use super::black_hole::{guard, PlanDescription};
 use super::{
     catalog_values, plan_opened_text, stamp_for_plan, stamp_target, DiskStamp, ItemSnapshot, McpPlanView,
-    PlanApplier, PlanColumn, PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState,
-    ReportLine, PLAN_ITEM_CAP,
+    FactTone, PlanApplier, PlanColumn, PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection,
+    PlanState, PlanSummary, ReportLine, SummaryCount, SummaryFact, PLAN_ITEM_CAP,
 };
 use crate::api::ApiError;
 use crate::catalog_query::{fetch_scoped_frames, GROUPS_SHOWN};
@@ -39,6 +39,9 @@ use crate::scope::{Scope, ScopeFilter};
 /// The window's event a write to frames' metadata raises (the Missing Metadata view reloads on it).
 pub const METADATA_CHANGED: &str = "frames-metadata-changed";
 const TITLE: &str = "Fill missing metadata";
+/// The window's one sentence for what a fill changes (the note carries the same fact at more length).
+const CATALOG_ONLY_EXPLAIN: &str =
+    "Only the catalog changes. Files on disk are not rewritten, and a later scan keeps these values.";
 /// A plan answer lists at most this many groups with their items (the rest is summed) ...
 const GROUPS_LISTED: usize = GROUPS_SHOWN;
 /// ... and at most this many items of a group.
@@ -268,21 +271,57 @@ fn item_id(frame_id: i64, field: FillField) -> String {
     format!("item:{frame_id}:{}", field.as_str())
 }
 
-/// The note that says how many links the changes sever, as the metadata editor's confirm does.
-fn relations_note(host: &McpHost, frame_ids: &[i64]) -> Option<String> {
+/// The links the changes sever, as the metadata editor's confirm counts them.
+enum Relations {
+    /// Nothing is severed.
+    None,
+    Counted { sessions: usize, links: usize },
+    NotCounted,
+}
+
+impl Relations {
+    /// The note that says how many links the changes sever.
+    fn note(&self) -> Option<String> {
+        match self {
+            Relations::None => None,
+            Relations::Counted { sessions, links } => Some(format!(
+                "these changes take {} out of their sessions and {links} out of calibration links",
+                count_of(*sessions, "frame", "frames"),
+            )),
+            Relations::NotCounted => Some("the links these changes would remove could not be counted".to_string()),
+        }
+    }
+
+    /// The same values as the summary's warnings (a zero is left out) and, when the count failed, a fact.
+    fn add_to(&self, summary: &mut PlanSummary) {
+        match self {
+            Relations::None => {}
+            Relations::Counted { sessions, links } => {
+                if *sessions > 0 {
+                    summary.warnings.push(SummaryCount::new(*sessions, "frame leaves its session", "frames leave their sessions"));
+                }
+                if *links > 0 {
+                    summary.warnings.push(SummaryCount::new(*links, "calibration link removed", "calibration links removed"));
+                }
+            }
+            Relations::NotCounted => summary.facts.push(SummaryFact::new("Links removed", "not counted", FactTone::Warn)),
+        }
+    }
+}
+
+fn relations_of(host: &McpHost, frame_ids: &[i64]) -> Relations {
     if frame_ids.is_empty() {
-        return None;
+        return Relations::None;
     }
     match crate::api::files::count_frame_metadata_relations(host.ctx(), frame_ids.to_vec()) {
-        Ok(r) if r.affected_frame_count > 0 => Some(format!(
-            "these changes take {} out of their sessions and {} out of calibration links",
-            count_of(usize::try_from(r.session_member_count).unwrap_or(0), "frame", "frames"),
-            usize::try_from(r.calibration_set_member_count + r.calibration_set_consumer_count).unwrap_or(0)
-        )),
-        Ok(_) => None,
+        Ok(r) if r.affected_frame_count > 0 => Relations::Counted {
+            sessions: usize::try_from(r.session_member_count).unwrap_or(0),
+            links: usize::try_from(r.calibration_set_member_count + r.calibration_set_consumer_count).unwrap_or(0),
+        },
+        Ok(_) => Relations::None,
         Err(e) => {
             tracing::warn!(error = %e, "plan could not count the links its changes would remove");
-            Some("the links these changes would remove could not be counted".to_string())
+            Relations::NotCounted
         }
     }
 }
@@ -311,7 +350,7 @@ fn build_and_publish(host: &McpHost, id: &str, read: Read) -> Result<Result<(), 
         })
         .collect();
     let reachable: Vec<i64> = reachable.into_iter().collect();
-    let relations = relations_note(host, &reachable);
+    let relations = relations_of(host, &reachable);
 
     let mut groups: Vec<PlanGroup> = Vec::new();
     let mut plan_snapshots: HashMap<String, ItemSnapshot> = HashMap::new();
@@ -429,7 +468,13 @@ fn build_and_publish(host: &McpHost, id: &str, read: Read) -> Result<Result<(), 
     }
 
     let mut notes: Vec<String> = Vec::new();
-    notes.extend(relations);
+    notes.extend(relations.note());
+    let mut summary = PlanSummary { explain: Some(CATALOG_ONLY_EXPLAIN.to_string()), ..PlanSummary::default() };
+    let left_empty = none.iter().map(|n| n.frame_id).collect::<BTreeSet<i64>>().len();
+    if left_empty > 0 {
+        summary.left_out.push(SummaryCount::new(left_empty, "frame with no value found", "frames with no value found"));
+    }
+    relations.add_to(&mut summary);
     notes.push(
         "Only the catalog changes: the files on disk are not rewritten, and a frame keeps the value when Athenaeum scans its file again."
             .to_string(),
@@ -439,6 +484,7 @@ fn build_and_publish(host: &McpHost, id: &str, read: Read) -> Result<Result<(), 
         columns: plan_columns(),
         groups,
         notes,
+        summary,
         snapshots: plan_snapshots,
         applier: Box::new(MetadataApplier { items: infos }),
     };
