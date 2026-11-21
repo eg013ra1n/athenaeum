@@ -9,6 +9,7 @@
 //! both archive and file ops.
 
 pub mod db;
+pub mod dir_cleanup;
 pub mod executor;
 pub mod models;
 pub mod planner;

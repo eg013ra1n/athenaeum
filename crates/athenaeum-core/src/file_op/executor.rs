@@ -81,6 +81,11 @@ pub fn run_operation(
     run_move(conn, operation_id, &files, total, cancel, emitter)?;
 
     fdb::update_operation_status(conn, operation_id, FileOpStatus::Completed, None)?;
+    // Every file is moved: remove the folders that emptied at the source.
+    // Best effort — a folder left behind never fails a finished move.
+    if let Err(e) = crate::file_op::dir_cleanup::remove_emptied_source_dirs(conn, operation_id) {
+        tracing::warn!(operation_id, error = ?e, "file_op source folder cleanup failed");
+    }
     Ok(())
 }
 

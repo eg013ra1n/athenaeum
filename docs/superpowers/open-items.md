@@ -412,6 +412,11 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Move removes the folders it empties (2026-11-21)
+
+- In Browse Files, F6 a night folder with subfolders (and one empty subfolder) to another folder, once on the same disk and once to another volume (NAS): the folder is gone at the source, the tree with the empty subfolder is at the destination, and a pane that was inside the moved folder lands on its nearest existing parent.
+- The same with the folder open in Finder / Explorer during the move: if the OS writes `.DS_Store` / `Thumbs.db` into it, the folder stays (only empty folders are removed) and the log line `file_op emptied source folders removed` shows `kept` above 0.
+
 ### Assistant access (MCP) M1 — catalog questions (2026-11-20)
 
 Branch `mcp/m1-host`, merged to local `main` (spec `docs/superpowers/specs/2026-10-27-athenaeum-mcp-design.md`, plan

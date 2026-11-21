@@ -35,6 +35,7 @@
 
 use crate::duplicates::compute_xxhash;
 use crate::file_op::db::{self as fdb, FailedCommitMoveCandidate};
+use crate::file_op::dir_cleanup::remove_emptied_source_dirs;
 use crate::file_op::models::{FileDisposition, FileOpStatus, StepStatus};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -138,6 +139,11 @@ pub fn reconcile_abandoned_commit_moves(conn: &Connection) -> Result<ReconcileSu
                         error = %e,
                         "file_op reconcile: failed to mark operation completed"
                     );
+                }
+                // The healed file was the operation's last: its emptied
+                // source folders go now, as after an uninterrupted move.
+                if let Err(e) = remove_emptied_source_dirs(conn, *op_id) {
+                    tracing::warn!(operation_id = op_id, error = ?e, "file_op source folder cleanup failed");
                 }
             }
             Ok(false) => {}
