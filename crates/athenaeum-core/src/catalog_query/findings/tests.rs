@@ -311,12 +311,13 @@ fn missing_in_scope_equals_view_for_every_category() {
     let mut any_nonempty = 0;
     for name in names {
         let view = ids(&db::get_frames_with_missing_metadata(&conn, name).expect("view"));
+        assert!(!view.contains(&bh_frame), "{name}: the view leaves the Black Hole out");
         let everywhere = ids(&db::get_frames_with_missing_metadata_in(&conn, name, all_states.filter.as_ref().unwrap()).expect("all states"));
-        assert_eq!(everywhere, view, "{name}: every state is the view");
-        let mut without_bh = view.clone();
-        without_bh.remove(&bh_frame);
+        let mut everywhere_without_bh = everywhere.clone();
+        everywhere_without_bh.remove(&bh_frame);
+        assert_eq!(everywhere_without_bh, view, "{name}: every state is the view plus the Black Hole");
         let scoped = ids(&db::get_frames_with_missing_metadata_in(&conn, name, default.filter.as_ref().unwrap()).expect("default"));
-        assert_eq!(scoped, without_bh, "{name}: the default scope is the view minus the Black Hole");
+        assert_eq!(scoped, view, "{name}: the default scope is the view");
         if !view.is_empty() {
             any_nonempty += 1;
         }
@@ -326,7 +327,7 @@ fn missing_in_scope_equals_view_for_every_category() {
     // The finding's counts say the same.
     let found = find_missing_in_scope(&conn, &default, &[], 0).expect("finding");
     for (cat, name) in CATEGORIES {
-        let want = db::get_frames_with_missing_metadata(&conn, name).unwrap().iter().filter(|r| r.frame.id != Some(bh_frame)).count();
+        let want = db::get_frames_with_missing_metadata(&conn, name).unwrap().len();
         let got = found.counts.iter().find(|(c, _)| *c == cat).map(|(_, n)| *n).expect("a count per category");
         assert_eq!(got, want, "{name}");
     }

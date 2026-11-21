@@ -1698,6 +1698,8 @@ pub(crate) fn missing_metadata_clause(category: &str) -> (&'static str, &'static
     }
 }
 
+/// The Missing Metadata view: files that need a fix. A file in the Black Hole (itself, or inside a zip that is)
+/// is one the user rejected, so it is not listed ([`crate::db::file_not_in_black_hole_sql`], the app's one spelling).
 pub fn get_frames_with_missing_metadata(
     conn: &Connection,
     category: &str,
@@ -1706,7 +1708,8 @@ pub fn get_frames_with_missing_metadata(
 }
 
 /// [`get_frames_with_missing_metadata`] over the frames a scope lets through: the same clause, the same ordering,
-/// the scope's predicate on `fr.id` added. A scope's state decides Black Hole files; the view itself has no such rule.
+/// the scope's predicate on `fr.id` added instead of the view's Black Hole exclusion: a scope's state decides
+/// Black Hole files here.
 pub fn get_frames_with_missing_metadata_in(
     conn: &Connection,
     category: &str,
@@ -1726,7 +1729,10 @@ fn missing_metadata_rows(
     // table (populated by the existing duplicate-detection pipeline). No row
     // means the file isn't in any detected duplicate group; any match means it
     // is. Uses the `idx_dup_group_files_file` index for O(1) lookups.
-    let scope_clause = filter.map(|f| format!("AND ({})", f.sql)).unwrap_or_default();
+    let scope_clause = match filter {
+        Some(f) => format!("AND ({})", f.sql),
+        None => format!("AND {}", crate::db::file_not_in_black_hole_sql("f.id")),
+    };
     let query = format!(
         "{select}
          FROM files f
@@ -5426,6 +5432,35 @@ mod bulk_metadata_tests {
     }
 
     #[test]
+    fn plain_type_text_wins_over_an_explicit_master_flag() {
+        // The Set Frame Type dialog once sent `{imagetyp: "DARK", is_master: true}` for a master dark; the type
+        // text's derived flag wins, so the row came out a raw dark. Pinned: a caller names a master by its
+        // `Master*` type text, never by the flag next to a plain type.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/d.fits", Some("MasterDark"));
+        conn.execute("UPDATE frames SET is_master = 1 WHERE id = ?1", [frame_id])
+            .unwrap();
+
+        let edits = FrameMetadataEdits {
+            imagetyp: Some(Some("DARK".into())),
+            is_master: Some(true),
+            ..Default::default()
+        };
+        bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
+
+        let (typ, is_master): (String, i64) = conn
+            .query_row(
+                "SELECT imagetyp, is_master FROM frames WHERE id = ?1",
+                [frame_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(typ, "Dark");
+        assert_eq!(is_master, 0, "the plain type text decides, not the explicit flag");
+    }
+
+    #[test]
     fn imagetyp_derived_master_flag_overrides_explicit_edit() {
         // If a caller passes both imagetyp=MASTERDARK and is_master=false,
         // the imagetyp-derived flag wins so the row stays consistent.
@@ -5663,6 +5698,53 @@ mod bulk_metadata_tests {
         // value: Some(Some(v)) → "set to v".
         let edits: FrameMetadataEdits = serde_json::from_str(r#"{"xpixsz": 3.76}"#).unwrap();
         assert_eq!(edits.xpixsz, Some(Some(3.76)), "value → Some(Some(v))");
+    }
+
+    /// The Missing Metadata view leaves out a file the user rejected into the Black Hole: the file itself, and a
+    /// file inside a zip that sits in the Black Hole. A scope-filtered read decides Black Hole files by its state.
+    #[test]
+    fn missing_metadata_view_leaves_out_black_hole_files() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let file_of = |frame_id: i64| -> i64 {
+            conn.query_row("SELECT file_id FROM frames WHERE id = ?1", [frame_id], |r| r.get(0))
+                .unwrap()
+        };
+
+        // Three lights with no OBJECT: one in the catalog, one in the Black Hole, one inside a Black Hole zip.
+        let kept = insert_frame(&conn, "/x/kept.fits", Some("Light"));
+        let rejected = insert_frame(&conn, "/x/rejected.fits", Some("Light"));
+        let zipped = insert_frame(&conn, "/x/pack.zip#entry.fits", Some("Light"));
+        conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path) VALUES (?1, 'test', 'now', 'x')",
+            [file_of(rejected)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zip_archives (path, size, modified_at, scanned_at)
+             VALUES ('/x/pack.zip', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let zip_id: i64 = conn
+            .query_row("SELECT id FROM zip_archives WHERE path = '/x/pack.zip'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "UPDATE files SET archive_zip_path = '/x/pack.zip' WHERE id = ?1",
+            [file_of(zipped)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO black_hole_zips (zip_id, from_where, moved_at, original_path) VALUES (?1, 'test', 'now', 'x')",
+            [zip_id],
+        )
+        .unwrap();
+
+        for category in ["object", "all"] {
+            let rows = get_frames_with_missing_metadata(&conn, category).unwrap();
+            let ids: Vec<Option<i64>> = rows.iter().map(|r| r.frame.id).collect();
+            assert_eq!(ids, vec![Some(kept)], "{category}: only the catalog file is listed");
+        }
     }
 
     /// Regression test for the column indices in `missing_metadata_select()` /
