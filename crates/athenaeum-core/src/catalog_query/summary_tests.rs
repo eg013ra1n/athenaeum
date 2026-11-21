@@ -236,6 +236,39 @@ fn earlier_refused_rows_not_in_figures() {
     assert_eq!(v7.refused, vec![("stars trailed".to_string(), 1)]);
 }
 
+/// Sets the legacy trailed flag on a frame's analysis row.
+#[cfg(feature = "render")]
+fn flag_trailed(conn: &Connection, frame: i64) {
+    conn.execute("UPDATE frame_analysis SET possibly_trailed = 1 WHERE frame_id = ?1", [frame]).expect("flag");
+}
+
+#[cfg(feature = "render")]
+#[test]
+fn legacy_trailed_rows_are_refused_not_figures() {
+    let conn = catalog();
+    let (file, frame) = light(&conn, "cur.fits");
+    analyse(&conn, frame, file, Some(current()), 2.0, None);
+    // Legacy: no version, no verdict, trailed flag set; the app calls it unusable.
+    let (file, frame) = light(&conn, "legacy_trailed.fits");
+    analyse(&conn, frame, file, None, 9.0, None);
+    flag_trailed(&conn, frame);
+    let (file, frame) = light(&conn, "legacy_ok.fits");
+    analyse(&conn, frame, file, None, 3.0, None);
+    // A numbered version ignores the flag: its row still counts as a value.
+    let (file, frame) = light(&conn, "v7_flagged.fits");
+    analyse(&conn, frame, file, Some(7), 4.0, None);
+    flag_trailed(&conn, frame);
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, None, &frames, QualityMetric::Fwhm).expect("summary");
+    assert_eq!(q.earlier.len(), 2);
+    let (v7, legacy) = (&q.earlier[0], &q.earlier[1]);
+    assert_eq!((v7.version, v7.frames, v7.median), (Some(7), 1, Some(4.0)), "a numbered version ignores the flag");
+    assert!(v7.refused.is_empty());
+    assert_eq!((legacy.version, legacy.frames, legacy.median), (None, 1, Some(3.0)), "the trailed row is no figure");
+    assert_eq!(legacy.refused, vec![("stars trailed (legacy flag)".to_string(), 1)]);
+    assert!(q.refused.is_empty(), "an earlier refusal is not a current one");
+}
+
 #[cfg(all(feature = "render", feature = "solver"))]
 #[test]
 fn transparency_loss_has_no_earlier_figures() {

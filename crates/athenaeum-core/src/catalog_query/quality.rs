@@ -109,6 +109,9 @@ pub struct EarlierFigures {
     pub refused: Vec<(String, usize)>,
 }
 
+/// The refusal reason of a legacy row (no version recorded) the app treats as unusable by its trailed flag.
+const LEGACY_TRAILED: &str = "stars trailed (legacy flag)";
+
 fn verdict_label(v: FrameVerdict) -> &'static str {
     match v {
         FrameVerdict::Trailed => "stars trailed",
@@ -263,6 +266,9 @@ fn summarise(
                 let (values, verdicts) = earlier_rows.entry(row.measure_version).or_default();
                 if let Some(verdict) = row.frame_verdict {
                     *verdicts.entry(verdict_label(verdict)).or_default() += 1;
+                } else if row.measure_version.is_none() && row.possibly_trailed {
+                    // The app judges a legacy row so (`isUnusable`): no version, no verdict, trailed flag set.
+                    *verdicts.entry(LEGACY_TRAILED).or_default() += 1;
                 } else if let Some(x) = value_of(metric, row) {
                     values.push((*frame, x));
                 }
@@ -342,7 +348,8 @@ fn summarise(
         .collect();
     // Newest version first; `None` (legacy) sorts below every number, so it comes last.
     earlier.sort_by(|a, b| b.version.cmp(&a.version));
-    // The earlier rows' own sentence is told with their figures; this one only when they have none to show.
+    // The earlier rows' own sentence is told with their figures; this one only when they have none to show, and
+    // then it is told here alone (the text half prints this reason, nothing else about them).
     if older_version > 0 && earlier.is_empty() {
         parts.push(format!("{older_version} measured by an earlier version — run Analysis again"));
     }

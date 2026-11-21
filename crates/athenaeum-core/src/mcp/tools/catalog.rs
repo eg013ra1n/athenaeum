@@ -227,12 +227,17 @@ fn storage_json(s: &StorageSummary) -> Result<Value, ApiError> {
     }))
 }
 
+/// What cures figures of an earlier measurement version.
+const EARLIER_ACTION: &str = "run Analysis again for current figures";
+
 fn earlier_json(e: &EarlierFigures) -> Result<Value, ApiError> {
     let outliers = |v: &[(FileLine, f64)]| -> Result<Vec<Value>, ApiError> {
         v.iter().map(|(l, x)| Ok(json!({ "file": json(l)?, "value": x }))).collect()
     };
     Ok(json!({
         "version": e.version,
+        "legacy": e.version.is_none(),
+        "action": EARLIER_ACTION,
         "frames": e.frames,
         "min": e.min,
         "median": e.median,
@@ -336,7 +341,13 @@ fn earlier_line(e: &EarlierFigures) -> String {
         Some(v) => format!("measured by version {v}"),
         None => "measured before versions were recorded (legacy)".to_string(),
     };
-    let mut line = format!("  {} {who} — their figures, apart from the current ones", e.frames);
+    let mut line = if e.frames == 0 {
+        // Only refusals: no figures to speak of.
+        let n: usize = e.refused.iter().map(|(_, n)| n).sum();
+        format!("  {} {who}", count_of(n, "refused row", "refused rows"))
+    } else {
+        format!("  {} {who} — their figures, apart from the current ones", e.frames)
+    };
     if let (Some(a), Some(m), Some(b)) = (e.min, e.median, e.max) {
         line.push_str(&format!(": median {m:.3}, range {a:.3} … {b:.3}"));
     }
@@ -348,9 +359,9 @@ fn earlier_line(e: &EarlierFigures) -> String {
     }
     if !e.refused.is_empty() {
         let refused: Vec<String> = e.refused.iter().map(|(why, n)| format!("{} {why}", count_of(*n, "frame", "frames"))).collect();
-        line.push_str(&format!("; refused: {}", refused.join(", ")));
+        line.push_str(&format!("{} {}", if e.frames == 0 { ":" } else { "; refused:" }, refused.join(", ")));
     }
-    line.push_str("; run Analysis again for current figures");
+    line.push_str(&format!("; {EARLIER_ACTION}"));
     line
 }
 
@@ -364,12 +375,6 @@ fn quality_lines(q: &QualitySummary) -> Vec<String> {
     out.push(format!("Quality, {label}: measured on {}{range}", count_of(q.measured, "raw light", "raw lights")));
     if q.not_measured > 0 {
         out.push(format!("  {} not measured", count_of(q.not_measured, "raw light is", "raw lights are")));
-    }
-    if q.earlier.is_empty() && q.older_version > 0 {
-        out.push(format!(
-            "  {} measured by an earlier version of Athenaeum's measurement",
-            count_of(q.older_version, "raw light was", "raw lights were")
-        ));
     }
     for e in &q.earlier {
         out.push(earlier_line(e));
@@ -408,7 +413,7 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 /// The frame sets a scope names and nothing else: the id and stored name of every frame set the catalog holds under
 /// that name (the same normalized-name equality `resolve_scope` uses), in id order; a handle `set:<id>` names that
 /// one set. Empty for any other scope, and for a name or handle no set carries.
-fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, String)>, ApiError> {
+fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, Option<String>)>, ApiError> {
     let blank = |v: &Option<String>| v.as_deref().map_or(true, |s| s.trim().is_empty());
     let Some(name) = scope.frame_set.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { return Ok(Vec::new()) };
     let only_a_set = [&scope.object, &scope.folder, &scope.scan_root, &scope.camera, &scope.telescope, &scope.filter, &scope.frame_type, &scope.night, &scope.date_from, &scope.date_to]
@@ -427,7 +432,8 @@ fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, String
             .query_row("SELECT name FROM frames_set WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
             .optional()
             .map_err(|e| internal("the frame set", e))?;
-        return Ok(found.map(|n| vec![(id, n.unwrap_or_default())]).unwrap_or_default());
+        // An unnamed set keeps no name (the heading says so with `UNNAMED_SET`, the structured name stays null).
+        return Ok(found.map(|n| vec![(id, n.filter(|s| !s.is_empty()))]).unwrap_or_default());
     }
     let mut stmt = conn
         .prepare("SELECT id, name FROM frames_set WHERE name IS NOT NULL AND name <> '' ORDER BY id")
@@ -438,28 +444,28 @@ fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, String
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| internal("the frame sets", e))?;
     let wanted = normalize_value(name);
-    Ok(sets.into_iter().filter(|(_, n)| normalize_value(n) == wanted).collect())
+    Ok(sets.into_iter().filter(|(_, n)| normalize_value(n) == wanted).map(|(id, n)| (id, Some(n))).collect())
 }
 
 /// One frame set as an answer tells it: what tells it from another of the same name, and its page's figures.
 struct SetEntry {
     id: i64,
-    name: String,
+    name: Option<String>,
     nights: Option<(String, String)>,
     facts: cq::FrameSetFacts,
     totals: FrameSetTotals,
 }
 
-fn read_set(conn: &Connection, id: i64, name: &str) -> Result<SetEntry, ApiError> {
+fn read_set(conn: &Connection, id: i64, name: Option<&str>) -> Result<SetEntry, ApiError> {
     let totals = cq::frame_set_totals(conn, id).map_err(|e| internal("the frame set", format!("{e:#}")))?;
     let nights = cq::frame_set_nights(conn, id).map_err(|e| internal("the frame set's nights", format!("{e:#}")))?;
     let facts = cq::frame_set_facts(conn, id).map_err(|e| internal("the frame set's facts", format!("{e:#}")))?;
-    Ok(SetEntry { id, name: name.to_string(), nights, facts, totals })
+    Ok(SetEntry { id, name: name.map(str::to_string), nights, facts, totals })
 }
 
 /// `Frame set 'LDN 1272' (Stage, set:231), nights 2025-09-13 … 2025-09-13, camera ATR2600M, telescope Esprit, centre RA 05 40 00, Dec -02 27 00`.
 fn set_heading(e: &SetEntry) -> String {
-    let who = cq::SetRef { id: e.id, name: Some(e.name.clone()), tab: e.facts.tab }.describe();
+    let who = cq::SetRef { id: e.id, name: e.name.clone(), tab: e.facts.tab }.describe();
     let mut out = format!("Frame set {who}");
     if let Some((first, last)) = &e.nights {
         out.push_str(&format!(", nights {first} … {last}"));
@@ -553,14 +559,14 @@ pub fn query_frames(host: &McpHost, args: QueryFramesArgs) -> Result<Answer, Api
     match named.as_slice() {
         [] => lines.push(format!("Totals: {}.", totals_text(&result.totals))),
         [(set_id, name)] => {
-            let entry = read_set(&conn, *set_id, name)?;
+            let entry = read_set(&conn, *set_id, name.as_deref())?;
             lines.extend(frame_set_lines(&set_heading(&entry), &entry.totals));
             data.insert("frameSet".to_string(), frame_set_json(&entry)?);
         }
         many => {
             let mut read = Vec::with_capacity(many.len());
             for (set_id, name) in many {
-                read.push(read_set(&conn, *set_id, name)?);
+                read.push(read_set(&conn, *set_id, name.as_deref())?);
             }
             // By first night (a set with no dated member last), the id breaking a tie.
             read.sort_by(|a, b| {
@@ -1048,8 +1054,37 @@ mod quality_text_tests {
     }
 
     #[test]
-    fn older_rows_with_no_figures_keep_the_plain_sentence() {
-        let text = quality_lines(&summary(Vec::new(), 3)).join("\n");
+    fn older_rows_with_no_figures_say_it_once() {
+        // The reason `summarise` really produces when older rows leave no figures.
+        let mut q = summary(Vec::new(), 3);
+        q.not_measured_reason = Some("3 measured by an earlier version — run Analysis again".to_string());
+        let text = quality_lines(&q).join("\n");
         assert_eq!(text.matches("earlier version").count(), 1, "{text}");
+        assert!(text.contains("run Analysis again"), "{text}");
+    }
+
+    #[test]
+    fn a_version_with_only_refusals_says_refused_rows() {
+        let mut e = earlier(Some(7));
+        e.frames = 0;
+        e.min = None;
+        e.median = None;
+        e.max = None;
+        e.high_outliers = Vec::new();
+        e.refused = vec![("stars trailed".to_string(), 2), ("no stars found".to_string(), 1)];
+        let text = quality_lines(&summary(vec![e], 3)).join("\n");
+        assert!(text.contains("3 refused rows measured by version 7: 2 frames stars trailed, 1 frame no stars found; run Analysis again for current figures"), "{text}");
+        assert!(!text.contains("0 measured"), "{text}");
+        assert!(!text.contains("their figures"), "{text}");
+    }
+
+    #[test]
+    fn earlier_json_says_legacy_and_the_action() {
+        let v7 = earlier_json(&earlier(Some(7))).expect("json");
+        let legacy = earlier_json(&earlier(None)).expect("json");
+        assert_eq!((v7["legacy"].as_bool(), legacy["legacy"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(v7["action"], "run Analysis again for current figures");
+        assert_eq!(legacy["action"], "run Analysis again for current figures");
+        assert!(legacy["version"].is_null());
     }
 }

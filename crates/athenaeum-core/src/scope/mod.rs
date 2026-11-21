@@ -111,6 +111,9 @@ pub struct NearestHint {
     pub condition: &'static str,
     pub given: String,
     pub existing: Vec<String>,
+    /// `false` when the catalog was not searched for this entry (a file past the lookup cap): `existing` says
+    /// nothing then.
+    pub looked_up: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -293,7 +296,12 @@ pub fn hints_text(hints: &[NearestHint]) -> String {
     hints
         .iter()
         .map(|h| {
-            if h.existing.is_empty() {
+            if !h.looked_up {
+                format!(
+                    "no {} '{}' (not compared with the catalog: only the first {MAX_FILE_HINT_LOOKUPS} unknown files are)",
+                    h.condition, h.given
+                )
+            } else if h.existing.is_empty() {
                 format!("no {} '{}'; nothing like it in the catalog", h.condition, h.given)
             } else {
                 format!("no {} '{}'; the catalog has {}", h.condition, h.given, quoted_list(&h.existing))
@@ -453,7 +461,7 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
         )?;
         let hits = equal_values(&distinct, g);
         if hits.is_empty() {
-            hints.push(NearestHint { condition, given: g.to_string(), existing: nearest::nearest(&distinct, g) });
+            hints.push(NearestHint { condition, given: g.to_string(), existing: nearest::nearest(&distinct, g), looked_up: true });
         } else {
             conds.push(in_list(&format!("f.{col}"), &hits));
         }
@@ -474,7 +482,7 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
             all.extend(sets);
             all.sort();
             all.dedup();
-            hints.push(NearestHint { condition: "object", given: g.to_string(), existing: nearest::nearest(&all, g) });
+            hints.push(NearestHint { condition: "object", given: g.to_string(), existing: nearest::nearest(&all, g), looked_up: true });
         } else {
             let mut branches: Vec<String> = Vec::new();
             let mut params: Vec<Value> = Vec::new();
@@ -499,13 +507,13 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
             if exists {
                 conds.push((member_of_set_sql(true, "fs.id = ?"), vec![Value::Integer(id)]));
             } else {
-                hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: Vec::new() });
+                hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: Vec::new(), looked_up: true });
             }
         } else {
             let sets = set_names()?;
             let hits = equal_values(&sets, g);
             if hits.is_empty() {
-                hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: nearest::nearest(&sets, g) });
+                hints.push(NearestHint { condition: "frame set", given: g.to_string(), existing: nearest::nearest(&sets, g), looked_up: true });
             } else {
                 let (sql, p) = in_list("fs.name", &hits);
                 conds.push((member_of_set_sql(true, &sql), p));
@@ -522,15 +530,17 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
         }
         let mut ids: Vec<i64> = Vec::new();
         let mut unknown = 0usize;
-        for entry in entries {
+        // An entry listed twice is one entry: one hint, one lookup.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for entry in entries.into_iter().filter(|e| seen.insert(*e)) {
             match file_id_for_entry(conn, entry)? {
                 Some(id) => ids.push(id),
                 None => {
                     // The lookup by file name scans the catalog: only the first few unknown entries get it.
-                    let existing =
-                        if unknown < MAX_FILE_HINT_LOOKUPS { files_named_like(conn, entry)? } else { Vec::new() };
+                    let looked_up = unknown < MAX_FILE_HINT_LOOKUPS;
+                    let existing = if looked_up { files_named_like(conn, entry)? } else { Vec::new() };
                     unknown += 1;
-                    hints.push(NearestHint { condition: "file", given: entry.to_string(), existing });
+                    hints.push(NearestHint { condition: "file", given: entry.to_string(), existing, looked_up });
                 }
             }
         }
@@ -559,6 +569,7 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
                     condition: "frame type",
                     given: g.to_string(),
                     existing: nearest::nearest(&distinct, g),
+                    looked_up: true,
                 });
             }
         }
@@ -593,7 +604,7 @@ pub fn resolve_scope(conn: &Connection, scope: &Scope) -> Result<ResolvedScope> 
         let hits: Vec<String> =
             roots.iter().filter(|r| trim(&normalize_separators(r)) == wanted).cloned().collect();
         if hits.is_empty() {
-            hints.push(NearestHint { condition: "scan root", given: g.to_string(), existing: nearest::nearest(&roots, g) });
+            hints.push(NearestHint { condition: "scan root", given: g.to_string(), existing: nearest::nearest(&roots, g), looked_up: true });
         } else {
             let (sql, p) = scan_root_prefix_predicate("fl.path", &hits);
             conds.push((format!("({sql})"), p));

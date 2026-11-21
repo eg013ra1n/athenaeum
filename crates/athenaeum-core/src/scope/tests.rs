@@ -508,6 +508,7 @@ fn hint_formats_and_nearest() {
         condition: "filter",
         given: "Hb".into(),
         existing: existing.iter().map(|s| s.to_string()).collect(),
+        looked_up: true,
     };
     assert_eq!(hints_text(&[h(&[])]), "no filter 'Hb'; nothing like it in the catalog");
     assert_eq!(hints_text(&[h(&["Ha"])]), "no filter 'Hb'; the catalog has 'Ha'");
@@ -722,11 +723,34 @@ fn files_hint_lookups_are_capped() {
         assert_eq!(h.condition, "file");
         assert_eq!(h.given, entries[i]);
         if i < 5 {
+            assert!(h.looked_up, "hint {i} looks the name up");
             assert_eq!(h.existing, vec![c.path("M31/a.fits")], "hint {i} looks the name up");
         } else {
+            assert!(!h.looked_up, "hint {i} is past the lookup cap");
             assert!(h.existing.is_empty(), "hint {i} is past the lookup cap");
         }
     }
+    let text = hints_text(&r.hints);
+    assert!(text.contains(&format!("no file '{}' (not compared with the catalog: only the first 5 unknown files are)", entries[6])), "{text}");
+    assert!(!text.contains(&format!("no file '{}'; nothing like it", entries[6])), "{text}");
+}
+
+#[test]
+fn files_listed_twice_give_one_hint_and_one_lookup() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    let typo = c.path("gone/a.fits");
+    let padded = format!("  {typo} ");
+    let r = c.resolve(&files_scope(&[typo.clone(), padded, typo.clone()]));
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints.len(), 1, "one hint for one typo");
+    assert_eq!(r.hints[0].given, typo);
+    // Four other unknown entries after the duplicates: the duplicates used one lookup, not three.
+    let mut entries = vec![typo.clone(), typo.clone(), typo.clone()];
+    entries.extend((0..4).map(|i| c.path(&format!("gone{i}/a.fits"))));
+    let r = c.resolve(&files_scope(&entries));
+    assert_eq!(r.hints.len(), 5);
+    assert!(r.hints.iter().all(|h| h.looked_up), "the duplicates did not eat the lookup budget");
 }
 
 #[test]

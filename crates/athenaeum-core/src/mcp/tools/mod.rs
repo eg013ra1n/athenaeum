@@ -137,7 +137,7 @@ fn hints_json(resolved: &ResolvedScope) -> Value {
         resolved
             .hints
             .iter()
-            .map(|h| json!({ "condition": h.condition, "given": h.given, "existing": h.existing }))
+            .map(|h| json!({ "condition": h.condition, "given": h.given, "existing": h.existing, "lookedUp": h.looked_up }))
             .collect(),
     )
 }

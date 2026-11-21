@@ -717,11 +717,15 @@ async fn the_folder_list_is_capped_at_fifty() {
 
 /// A frame set `name` of `count` IC 5146 lights in its own folder; returns the set id.
 fn add_set(rig: &Rig, name: &str, dir: &str, count: usize, custom: bool) -> i64 {
+    add_set_named(rig, Some(name), dir, count, custom)
+}
+
+fn add_set_named(rig: &Rig, name: Option<&str>, dir: &str, count: usize, custom: bool) -> i64 {
     let database = rig.ctx.db.get().expect("db");
     let conn = database.conn();
     let dir = rig.base.join("nas").join(dir);
     let members: Vec<i64> = (0..count).map(|i| put(&conn, &dir, &format!("m{i}.fits"), &light("H")).1).collect();
-    let set = db::create_frames_set(&conn, Some(name), custom, None, None, Some("20 10 00"), Some("+42 10 00"), None, None, None, None).expect("set");
+    let set = db::create_frames_set(&conn, name, custom, None, None, Some("20 10 00"), Some("+42 10 00"), None, None, None, None).expect("set");
     let night = db::create_imaging_night(&conn, set, "2024-10-05T00:00:00Z", "2024-10-05T12:00:00Z").expect("night");
     let session = db::create_session(&conn, night, "CamA", members.len() as i32, None).expect("session");
     db::insert_session_members(&conn, session, &members).expect("members");
@@ -805,6 +809,20 @@ async fn frame_set_name_plus_other_field_lists_both_sets() {
     assert!(data.get("frameSets").is_none() && data.get("frameSet").is_none(), "{data}");
     let handles: Vec<&str> = data["frameSetsInScope"].as_array().expect("frameSetsInScope").iter().filter_map(|e| e["handle"].as_str()).collect();
     assert_eq!(handles, vec![format!("set:{wip}").as_str(), format!("set:{stage}").as_str()]);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn unnamed_set_by_handle_reads_unnamed() {
+    let rig = rig(true);
+    let set = add_set_named(&rig, None, "nameless", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": format!("set:{set}") } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains(&format!("Frame set '(unnamed)' (Stage, set:{set})")), "{said}");
+    assert!(!said.contains("Frame set ''"), "{said}");
+    assert!(data_of(&r)["frameSet"]["name"].is_null(), "{}", data_of(&r));
     client.close().await;
 }
 
