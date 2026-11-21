@@ -32,6 +32,7 @@ const OFF: McpStatus = {
   bridgeFound: false,
   clientConfig: null,
   claudeCodeCommand: null,
+  claudeDesktopConfig: null,
   lastError: null,
   blockedReason: null,
 };
@@ -45,6 +46,7 @@ const DESKTOP_ON: McpStatus = {
   bridgeFound: true,
   clientConfig: `{"mcpServers":{"athenaeum-dev":{"command":"${BRIDGE}","args":["--build","dev","--app-data-dir","/data"]}}}`,
   claudeCodeCommand: `claude mcp add athenaeum-dev -- "${BRIDGE}" --build dev --app-data-dir "/data"`,
+  claudeDesktopConfig: null,
 };
 
 let current: McpStatus = OFF;

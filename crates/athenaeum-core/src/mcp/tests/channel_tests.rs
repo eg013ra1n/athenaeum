@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::channel::{bind, connect, mcp_dir, spawn_closable, Endpoint, Stream, HANDSHAKE_PREFIX};
+use super::claude_desktop::{merge_desktop_entry, pick_config_dir};
 use super::{desktop_client_config, mcp_server_name, HostKind, McpHost, McpIdentity, NEEDS_API_KEY};
 use crate::api::ApiError;
 use crate::db;
@@ -840,4 +841,99 @@ fn client_config_names_build_and_server() {
     );
     assert!(command.starts_with("claude mcp add athenaeum -- "), "{command}");
     assert!(command.ends_with(&format!("--build release --app-data-dir \"{}\"", data.display())), "{command}");
+}
+
+// ---- Claude desktop's configuration file (smoke fixes, Task 5) ----
+
+fn sample_entry() -> Value {
+    json!({ "command": "bridge", "args": ["--build", "dev"] })
+}
+
+#[test]
+fn desktop_client_config_unchanged_by_refactor() {
+    let bridge = Path::new("bridge-dir").join("athenaeum-mcp");
+    let (config, _) = desktop_client_config("athenaeum-dev", &bridge, "dev", Some(Path::new("app-data")));
+    let expected = serde_json::to_string_pretty(&json!({
+        "mcpServers": { "athenaeum-dev": { "command": bridge.to_string_lossy(), "args": ["--build", "dev", "--app-data-dir", "app-data"] } }
+    }))
+    .expect("json");
+    assert_eq!(config, expected);
+    let entry = crate::mcp::desktop_server_entry(&bridge, "dev", Some(Path::new("app-data")));
+    assert_eq!(serde_json::from_str::<Value>(&config).expect("json")["mcpServers"]["athenaeum-dev"], entry);
+}
+
+#[test]
+fn merge_into_absent_file() {
+    let (text, replaced) = merge_desktop_entry(None, "athenaeum-dev", sample_entry()).expect("merged");
+    assert!(!replaced);
+    assert!(text.ends_with("}\n"), "pretty, with a trailing newline");
+    assert_eq!(serde_json::from_str::<Value>(&text).expect("json"), json!({ "mcpServers": { "athenaeum-dev": sample_entry() } }));
+}
+
+#[test]
+fn merge_keeps_other_keys_and_servers() {
+    let old = r#"{ "preferences": { "sidebarMode": "chat" }, "coworkUserFilesPath": "/x", "mcpServers": { "other": { "command": "o" } } }"#;
+    let (text, replaced) = merge_desktop_entry(Some(old), "athenaeum-dev", sample_entry()).expect("merged");
+    assert!(!replaced);
+    let now: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(now["preferences"], json!({ "sidebarMode": "chat" }));
+    assert_eq!(now["coworkUserFilesPath"], "/x");
+    assert_eq!(now["mcpServers"]["other"], json!({ "command": "o" }));
+    assert_eq!(now["mcpServers"]["athenaeum-dev"], sample_entry());
+}
+
+#[test]
+fn merge_adds_servers_to_a_file_without_them() {
+    let (text, replaced) = merge_desktop_entry(Some(r#"{"preferences":{}}"#), "athenaeum", sample_entry()).expect("merged");
+    assert!(!replaced);
+    assert_eq!(serde_json::from_str::<Value>(&text).expect("json"), json!({ "preferences": {}, "mcpServers": { "athenaeum": sample_entry() } }));
+}
+
+#[test]
+fn merge_replaces_same_name() {
+    let old = r#"{"mcpServers":{"athenaeum-dev":{"command":"old"},"other":{"command":"o"}}}"#;
+    let (text, replaced) = merge_desktop_entry(Some(old), "athenaeum-dev", sample_entry()).expect("merged");
+    assert!(replaced);
+    let now: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(now["mcpServers"]["athenaeum-dev"], sample_entry());
+    assert_eq!(now["mcpServers"]["other"], json!({ "command": "o" }));
+}
+
+#[test]
+fn merge_accepts_bom() {
+    let old = "\u{feff}{\"preferences\":{\"a\":1}}";
+    let (text, _) = merge_desktop_entry(Some(old), "athenaeum-dev", sample_entry()).expect("merged");
+    assert!(!text.starts_with('\u{feff}'));
+    assert_eq!(serde_json::from_str::<Value>(&text).expect("json")["preferences"], json!({ "a": 1 }));
+}
+
+#[test]
+fn merge_refuses_invalid_json() {
+    let err = merge_desktop_entry(Some("{\n  \"a\": 1,\n  oops\n}"), "athenaeum-dev", sample_entry()).expect_err("refused");
+    assert!(err.contains("not valid JSON") && err.contains("line 3") && err.contains("left as it is"), "{err}");
+}
+
+#[test]
+fn merge_refuses_non_object_top_level_and_servers() {
+    let err = merge_desktop_entry(Some("[1]"), "athenaeum-dev", sample_entry()).expect_err("refused");
+    assert!(err.contains("JSON object"), "{err}");
+    let err = merge_desktop_entry(Some(r#"{"mcpServers":"x"}"#), "athenaeum-dev", sample_entry()).expect_err("refused");
+    assert!(err.contains("\"mcpServers\"") && err.contains("not a JSON object"), "{err}");
+    let err = merge_desktop_entry(Some(r#"{"mcpServers":null}"#), "athenaeum-dev", sample_entry()).expect_err("refused");
+    assert!(err.contains("not a JSON object"), "{err}");
+}
+
+#[test]
+fn pick_config_dir_prefers_store_package() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let store = tmp.path().join("Packages").join("Claude_abc").join("LocalCache").join("Roaming").join("Claude");
+    let roaming = tmp.path().join("Roaming").join("Claude");
+    let absent = tmp.path().join("nothing");
+    // Both there: the package one wins; only %APPDATA%: it; none: None.
+    std::fs::create_dir_all(&store).expect("store");
+    std::fs::create_dir_all(&roaming).expect("roaming");
+    assert_eq!(pick_config_dir(&[store.clone(), roaming.clone()]), Some(store.clone()));
+    assert_eq!(pick_config_dir(&[absent.clone(), roaming.clone()]), Some(roaming.clone()));
+    assert_eq!(pick_config_dir(&[absent.clone()]), None);
+    assert_eq!(pick_config_dir(&[]), None);
 }

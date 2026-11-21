@@ -69,25 +69,33 @@ pub struct McpStatus {
     pub client_config: Option<String>,
     /// Desktop: the shell command that adds the bridge to Claude Code.
     pub claude_code_command: Option<String>,
+    /// Desktop: Claude desktop's configuration file (`claude_desktop_config.json`) when its folder exists; `null`
+    /// when Claude desktop is not installed for this user.
+    pub claude_desktop_config: Option<String>,
     /// Why it is not serving: the channel could not start, or another instance owns it.
     pub last_error: Option<String>,
     /// Web without `ATHENAEUM_API_KEY`: why turning it on is refused.
     pub blocked_reason: Option<String>,
 }
 
-/// `{"mcpServers":{"<name>":{"command":"<bridge>","args":["--build","<build>"(,"--app-data-dir","<dir>")]}}}` and the
-/// `claude mcp add` command for the same bridge.
-pub fn desktop_client_config(server_name: &str, bridge: &Path, build: &str, app_data_override: Option<&Path>) -> (String, String) {
+/// The server entry an assistant's configuration holds for the bridge: `{"command":"<bridge>","args":["--build","<build>"
+/// (,"--app-data-dir","<dir>")]}`.
+pub fn desktop_server_entry(bridge: &Path, build: &str, app_data_override: Option<&Path>) -> serde_json::Value {
     let mut args = vec!["--build".to_string(), build.to_string()];
-    let mut command = format!("claude mcp add {server_name} -- \"{}\" --build {build}", bridge.display());
     if let Some(dir) = app_data_override {
         args.push("--app-data-dir".to_string());
         args.push(dir.to_string_lossy().into_owned());
+    }
+    serde_json::json!({ "command": bridge.to_string_lossy(), "args": args })
+}
+
+/// `{"mcpServers":{"<name>":<entry>}}` and the `claude mcp add` command for the same bridge.
+pub fn desktop_client_config(server_name: &str, bridge: &Path, build: &str, app_data_override: Option<&Path>) -> (String, String) {
+    let mut command = format!("claude mcp add {server_name} -- \"{}\" --build {build}", bridge.display());
+    if let Some(dir) = app_data_override {
         command.push_str(&format!(" --app-data-dir \"{}\"", dir.display()));
     }
-    let config = serde_json::json!({
-        "mcpServers": { server_name: { "command": bridge.to_string_lossy(), "args": args } }
-    });
+    let config = serde_json::json!({ "mcpServers": { server_name: desktop_server_entry(bridge, build, app_data_override) } });
     (serde_json::to_string_pretty(&config).unwrap_or_default(), command)
 }
 
@@ -526,6 +534,12 @@ impl McpHost {
             bridge_path: bridge.map(|b| b.to_string_lossy().into_owned()),
             client_config: config.as_ref().map(|(json, _)| json.clone()),
             claude_code_command: config.map(|(_, command)| command),
+            claude_desktop_config: if desktop {
+                super::claude_desktop::claude_desktop_config_dir()
+                    .map(|dir| dir.join(super::claude_desktop::CONFIG_FILE).to_string_lossy().into_owned())
+            } else {
+                None
+            },
             last_error: ch.last_error.clone(),
             blocked_reason: self.web_blocked().then(|| NEEDS_API_KEY.to_string()),
         }

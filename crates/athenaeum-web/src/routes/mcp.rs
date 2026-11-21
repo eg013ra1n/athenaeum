@@ -75,6 +75,12 @@ pub async fn regenerate_mcp_token(State(state): State<WebAppState>) -> Result<Js
     api::regenerate_mcp_token(host(&state)?).map(Json).map_err(api_err)
 }
 
+/// POST /api/add_mcp_to_claude_desktop: desktop only (it writes the user's own Claude desktop file), so 501 here.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn add_mcp_to_claude_desktop() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    Err((StatusCode::NOT_IMPLEMENTED, "add_mcp_to_claude_desktop is not available in web mode".to_string()))
+}
+
 /// POST /api/get_mcp_plan: the plan by id, or the newest (`planId` absent); `null` when there is none.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_mcp_plan(
@@ -313,6 +319,7 @@ mod tests {
             ("get_mcp_status", "{}"),
             ("set_mcp_enabled", r#"{"enabled":false}"#),
             ("regenerate_mcp_token", "{}"),
+            ("add_mcp_to_claude_desktop", "{}"),
             ("get_mcp_plan", "{}"),
             ("answer_mcp_plan", r#"{"planId":"plan-nope","answer":{"action":"cancel"}}"#),
         ];
@@ -324,6 +331,15 @@ mod tests {
             let (status, text) = api(&fx.app, command, body, Some("k")).await;
             assert_ne!(status, StatusCode::UNAUTHORIZED, "{command} with the key: {text}");
         }
+        fx.finish();
+    }
+
+    #[tokio::test]
+    async fn add_to_claude_desktop_is_501_on_the_web() {
+        let fx = Fixture::new(Some("k"));
+        let (status, body) = api(&fx.app, "add_mcp_to_claude_desktop", "{}", Some("k")).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert_eq!(body, "add_mcp_to_claude_desktop is not available in web mode");
         fx.finish();
     }
 

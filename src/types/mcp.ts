@@ -39,6 +39,11 @@ clientConfig: string | null,
  */
 claudeCodeCommand: string | null, 
 /**
+ * Desktop: Claude desktop's configuration file (`claude_desktop_config.json`) when its folder exists; `null`
+ * when Claude desktop is not installed for this user.
+ */
+claudeDesktopConfig: string | null, 
+/**
  * Why it is not serving: the channel could not start, or another instance owns it.
  */
 lastError: string | null, 
@@ -46,6 +51,20 @@ lastError: string | null,
  * Web without `ATHENAEUM_API_KEY`: why turning it on is refused.
  */
 blockedReason: string | null, };
+
+export type ClaudeDesktopAdded = { 
+/**
+ * The configuration file that now holds the entry.
+ */
+path: string, 
+/**
+ * An entry of this name was there and has been replaced.
+ */
+replaced: boolean, 
+/**
+ * The copy of the file as it was; `null` when there was no file.
+ */
+backup: string | null, };
 
 export type McpSource = { 
 /**

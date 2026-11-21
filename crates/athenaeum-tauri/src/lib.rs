@@ -609,6 +609,7 @@ pub fn run() {
             commands::get_mcp_status,
             commands::set_mcp_enabled,
             commands::regenerate_mcp_token,
+            commands::add_mcp_to_claude_desktop,
             commands::get_mcp_plan,
             commands::answer_mcp_plan,
         ])

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use athenaeum_core::api::mcp as api;
-use athenaeum_core::mcp::{desktop_client_config, McpHost, McpPlanView, McpStatus, PlanAnswer};
+use athenaeum_core::mcp::{desktop_client_config, ClaudeDesktopAdded, McpHost, McpPlanView, McpStatus, PlanAnswer};
 use tauri::{AppHandle, Manager, State};
 
 use crate::mcp_bridge::{bridge_path_for, copies_to_app_data, refresh_bridge_copy, CopyOutcome};
@@ -119,6 +119,16 @@ pub async fn set_mcp_enabled(app_handle: AppHandle, host: State<'_, McpHostState
 pub async fn regenerate_mcp_token(app_handle: AppHandle, host: State<'_, McpHostState>) -> Result<McpStatus, String> {
     let status = api::regenerate_mcp_token(&host.0).map_err(|e| e.to_string())?;
     Ok(with_bridge(&app_handle, status))
+}
+
+/// Merges Athenaeum's entry into the user's Claude desktop configuration (`claude_desktop_config.json`), keeping every
+/// other key and server and a `.bak` of the old file. The entry is the one `get_mcp_status` shows in the copy block.
+/// Desktop only: the web route answers 501.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn add_mcp_to_claude_desktop(app_handle: AppHandle, host: State<'_, McpHostState>) -> Result<ClaudeDesktopAdded, String> {
+    let status = with_bridge(&app_handle, api::get_mcp_status(&host.0));
+    api::add_to_claude_desktop(&status).map_err(|e| e.to_string())
 }
 
 /// The plan the window shows: the one by id, or the newest (`None`), so a window that opens later finds the plan that
