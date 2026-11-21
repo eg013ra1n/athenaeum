@@ -134,7 +134,8 @@ pub async fn add_mcp_to_claude_desktop(app_handle: AppHandle, host: State<'_, Mc
 /// The plan the window shows: the one by id, or the newest (`None`), so a window that opens later finds the plan that
 /// waits. `null` when there is none.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+// Polled every 4 s while a plan waits for the user: debug, like the other hot-path commands.
+#[tracing::instrument(level = "debug", skip_all, err)]
 pub async fn get_mcp_plan(host: State<'_, McpHostState>, plan_id: Option<String>) -> Result<Option<McpPlanView>, String> {
     Ok(api::get_mcp_plan(&host.0, plan_id))
 }
