@@ -619,6 +619,21 @@ fn the_summary_counts_groups_left_out_copies_and_groups_that_need_a_keeper() {
 }
 
 #[test]
+fn the_summary_warns_when_a_file_named_to_keep_is_not_in_the_groups() {
+    let rig = rig();
+    header_copy(&rig, "u-a", "t32.fits", b"CCCC");
+    header_copy(&rig, "u-b", "t32.fits", b"CCCC");
+    // A catalog file outside the planned group: naming it to keep matches no copy of the plan.
+    let outsider = header_copy(&rig, "u-c", "t33.fits", b"DDDD");
+    let view = plan(&rig, BlackHoleSource::Duplicates, &[header_handle("t32.fits")], None, &[&outsider]);
+    let warning = SummaryCount::new(1, "file named to keep is not in these groups", "files named to keep are not in these groups");
+    assert!(view.summary.warnings.contains(&warning), "{:?}", view.summary.warnings);
+    assert_eq!(warning.text(), "file named to keep is not in these groups");
+    // The assistant's notes keep saying which entry it was.
+    assert!(view.notes.iter().any(|n| n.contains("which is not a copy in these groups")), "{:?}", view.notes);
+}
+
+#[test]
 fn the_summary_counts_a_master_that_stays_with_its_links() {
     let rig = rig();
     let m1 = master_copy(&rig, "MasterDark-60s.xisf", 60.0, b"M1");

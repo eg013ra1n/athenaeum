@@ -475,6 +475,8 @@ struct Assembled {
     group_infos: HashMap<String, GroupInfo>,
     pairs: Vec<Pair>,
     notes: Vec<String>,
+    /// `keepFiles` entries that named no copy of these groups (the window warns: the assistant's keep rule matched nothing).
+    unmatched_keep: usize,
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -492,6 +494,7 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
         group_infos: HashMap::new(),
         pairs: Vec::new(),
         notes: Vec::new(),
+        unmatched_keep: 0,
     };
     let mut matched_entries: HashSet<String> = HashSet::new();
     // The header cache and the master cache are built apart, so one file can sit in two groups: it is planned once.
@@ -620,6 +623,7 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
     for entry in rules.ids.iter().map(|id| format!("file:{id}")).chain(rules.paths.iter().cloned()) {
         if !matched_entries.contains(&entry) {
             out.notes.push(format!("keepFiles names {entry}, which is not a copy in these groups"));
+            out.unmatched_keep += 1;
         }
     }
     out.notes.sort();
@@ -787,6 +791,13 @@ fn summary_of(out: &Assembled) -> PlanSummary {
     let needing = out.groups.iter().filter(|g| g.chosen.is_none() && !g.items.is_empty()).count();
     if needing > 0 {
         summary.warnings.push(SummaryCount::new(needing, "group needs a copy that stays", "groups need a copy that stays"));
+    }
+    if out.unmatched_keep > 0 {
+        summary.warnings.push(SummaryCount::new(
+            out.unmatched_keep,
+            "file named to keep is not in these groups",
+            "files named to keep are not in these groups",
+        ));
     }
     summary
 }
