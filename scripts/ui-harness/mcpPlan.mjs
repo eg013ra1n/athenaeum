@@ -230,6 +230,9 @@ export function mcpPlanHandlers(kind = 'black_hole') {
   });
   const lines = (reason) => BUILDERS[kind]().groups.flatMap((g) => g.items.filter((i) => i.selected).map((i) => ({ itemId: i.id, fileName: i.fileName, folder: i.folder, reason })));
   return {
+    // The Files page the plan opens over: its folder reads answer empty, never null (a null count map blanks the page).
+    get_missing_files_counts: () => ({}),
+    get_folder_overview: () => ({ scan_roots: [], archive_roots: [] }),
     // A page that opens finds the plan; once answered, a reload brings a new waiting plan back.
     get_mcp_plan: (args) => {
       if (args?.planId == null && state.kind !== 'waiting' && state.kind !== 'applying') {
