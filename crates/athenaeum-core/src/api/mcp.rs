@@ -181,4 +181,74 @@ mod tests {
         web.client_config = None;
         assert_refused(add_to_claude_desktop_at(&web, tmp.path()).expect_err("web"), "bridge program");
     }
+
+    #[test]
+    fn empty_config_keeps_an_older_backup() {
+        for blank in ["", "  \n\t", "\u{feff}\n"] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let older = "{\"mcpServers\":{\"other\":{\"command\":\"x\",\"env\":{\"KEY\":\"secret\"}}}}";
+            std::fs::write(bak(tmp.path()), older).expect("seed bak");
+            std::fs::write(file(tmp.path()), blank).expect("seed empty");
+            let added = add_to_claude_desktop_at(&status(true), tmp.path()).expect("added");
+            assert_eq!(added.backup, None, "{blank:?}: an empty file is not backed up");
+            assert_eq!(std::fs::read_to_string(bak(tmp.path())).expect("bak"), older, "{blank:?}: the older backup is left alone");
+            assert!(std::fs::read_to_string(file(tmp.path())).expect("file").contains(NAME));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_keeps_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(file(tmp.path()), "{\"preferences\":{}}").expect("seed");
+        std::fs::set_permissions(file(tmp.path()), std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        add_to_claude_desktop_at(&status(true), tmp.path()).expect("added");
+        let mode = std::fs::metadata(file(tmp.path())).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the new file has the old file's mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_is_written_at_its_target() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dotfiles = tmp.path().join("dotfiles");
+        let dir = tmp.path().join("Claude");
+        std::fs::create_dir_all(&dotfiles).expect("dotfiles");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let real = dotfiles.join("claude_desktop_config.json");
+        std::fs::write(&real, "{\"preferences\":{\"a\":1}}").expect("seed");
+        std::os::unix::fs::symlink(&real, file(&dir)).expect("link");
+        add_to_claude_desktop_at(&status(true), &dir).expect("added");
+        assert!(std::fs::symlink_metadata(file(&dir)).expect("meta").file_type().is_symlink(), "the link survives");
+        let now: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&real).expect("target")).expect("json");
+        assert_eq!(now["preferences"]["a"], 1);
+        assert!(now["mcpServers"][NAME]["command"].is_string(), "the target holds the merge");
+        assert_eq!(std::fs::read_dir(&dotfiles).expect("dir").count(), 1, "no temp file is left at the target");
+    }
+
+    #[test]
+    fn a_file_changed_before_the_rename_is_left_as_it_is() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old = "{\"preferences\":{\"a\":1}}";
+        let newer = "{\"preferences\":{\"a\":2},\"mcpServers\":{\"later\":{\"command\":\"y\"}}}";
+        std::fs::write(file(tmp.path()), old).expect("seed");
+        let entry = serde_json::json!({ "command": "c" });
+        let path = file(tmp.path());
+        let err = claude_desktop::add_entry_checked(tmp.path(), NAME, entry, &|| std::fs::write(&path, newer).expect("second writer")).expect_err("refused");
+        assert_refused(err, "Claude desktop changed claude_desktop_config.json just now; it was left as it is. Try again.");
+        assert_eq!(std::fs::read_to_string(&path).expect("file"), newer, "the other writer's file stays");
+        assert_eq!(std::fs::read_to_string(bak(tmp.path())).expect("bak"), old, "the backup holds the file as it was");
+        assert_eq!(std::fs::read_dir(tmp.path()).expect("dir").count(), 2, "no temp file is left");
+    }
+
+    #[test]
+    fn a_file_created_before_the_rename_is_left_as_it_is() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = file(tmp.path());
+        let err = claude_desktop::add_entry_checked(tmp.path(), NAME, serde_json::json!({}), &|| std::fs::write(&path, "{}").expect("second writer")).expect_err("refused");
+        assert_refused(err, "just now");
+        assert_eq!(std::fs::read_to_string(&path).expect("file"), "{}");
+        assert_eq!(std::fs::read_dir(tmp.path()).expect("dir").count(), 1);
+    }
 }

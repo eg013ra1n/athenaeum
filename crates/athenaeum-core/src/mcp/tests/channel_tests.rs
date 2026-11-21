@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::channel::{bind, connect, mcp_dir, spawn_closable, Endpoint, Stream, HANDSHAKE_PREFIX};
-use super::claude_desktop::{merge_desktop_entry, pick_config_dir};
+use super::claude_desktop::{merge_desktop_entry, order_by_recency, pick_config_dir};
 use super::{desktop_client_config, mcp_server_name, HostKind, McpHost, McpIdentity, NEEDS_API_KEY};
 use crate::api::ApiError;
 use crate::db;
@@ -936,4 +936,22 @@ fn pick_config_dir_prefers_store_package() {
     assert_eq!(pick_config_dir(&[absent.clone(), roaming.clone()]), Some(roaming.clone()));
     assert_eq!(pick_config_dir(&[absent.clone()]), None);
     assert_eq!(pick_config_dir(&[]), None);
+}
+
+#[test]
+fn package_folders_come_most_recently_used_first() {
+    use std::time::{Duration, SystemTime};
+    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let old = PathBuf::from("Claude_a");
+    let new = PathBuf::from("Claude_b");
+    let unknown = PathBuf::from("Claude_c");
+    let unknown_too = PathBuf::from("Claude_0");
+    let ordered = order_by_recency(vec![
+        (unknown.clone(), None),
+        (old.clone(), Some(base)),
+        (new.clone(), Some(base + Duration::from_secs(60))),
+        (unknown_too.clone(), None),
+    ]);
+    assert_eq!(ordered, vec![new, old, unknown_too, unknown]);
+    assert!(order_by_recency(Vec::new()).is_empty());
 }
