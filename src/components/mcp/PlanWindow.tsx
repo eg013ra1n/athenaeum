@@ -165,6 +165,8 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
         {/* The build and catalog the plan came from: the assistant's own answer already says them. */}
         <span
           title={`${plan.source.build} ${plan.source.version} · catalog ${plan.source.catalog}`}
+          aria-label={`${plan.source.build} ${plan.source.version} · catalog ${plan.source.catalog}`}
+          role="note"
           className="inline-flex shrink-0 text-content-faint"
         >
           <Info size={13} aria-hidden />

@@ -1,8 +1,9 @@
 // What the Duplicates page and the assistant's plan window share: the one byte format and the frame-type colours.
 
-/** The Duplicates page's byte format: bytes under 1 KiB, else megabytes, else gigabytes. */
+/** The Duplicates page's byte format: bytes under 1 KiB, kilobytes under 1 MiB, else megabytes, else gigabytes. */
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   const mb = bytes / 1024 / 1024;
   if (mb < 1024) return `${mb.toFixed(1)} MB`;
   return `${(mb / 1024).toFixed(2)} GB`;

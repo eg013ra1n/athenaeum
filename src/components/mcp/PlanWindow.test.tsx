@@ -114,9 +114,9 @@ describe('PlanWindow', () => {
     newest = plans['plan-1'] = plan();
     mount();
     await screen.findByRole('dialog');
-    expect(screen.getByText(`3 files · ${formatBytes(6800)}`)).toBeTruthy();
+    expect(screen.getByText(`3 files · ${formatBytes(7000)}`)).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M42 Flat (2 copies)' }));
-    expect(screen.getByText(`2 files · ${formatBytes(2900)}`)).toBeTruthy();
+    expect(screen.getByText(`2 files · ${formatBytes(3000)}`)).toBeTruthy();
     await armed();
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
     await waitFor(() => expect(answers()).toHaveLength(1));
@@ -202,7 +202,7 @@ describe('PlanWindow', () => {
     expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true);
     plans['plan-1'] = plan();
     await emit('plan-1');
-    await waitFor(() => expect(screen.getByText(`3 files · ${formatBytes(6800)}`)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(`3 files · ${formatBytes(7000)}`)).toBeTruthy());
     await armed();
   });
 
@@ -419,7 +419,7 @@ describe('PlanWindow', () => {
     await screen.findByRole('dialog');
     // This window's own ticks: group 1 is unticked here, so only the group-2 copy counts.
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M31 Light 300 s (3 copies)' }));
-    expect(screen.getByText(`1 file · ${formatBytes(3900)}`)).toBeTruthy();
+    expect(screen.getByText(`1 file · ${formatBytes(4000)}`)).toBeTruthy();
     // Another page applied only copy-3 of the first group: the backend recorded exactly that.
     const applied = plan({ state: { kind: 'applying' } });
     applied.groups[0].items[1].selected = false;
@@ -684,10 +684,10 @@ describe('PlanWindow in the Duplicates page\'s language', () => {
     newest = plans['plan-1'] = plan();
     mount();
     await screen.findByRole('dialog');
-    expect(screen.getByText(`3 files · ${formatBytes(6800)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
+    expect(screen.getByText(`3 files · ${formatBytes(7000)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
     // Unticking lowers it.
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M42 Flat (2 copies)' }));
-    expect(screen.getByText(`2 files · ${formatBytes(2900)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
+    expect(screen.getByText(`2 files · ${formatBytes(3000)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
   });
 
   it('no_plan_scrolls_sideways', async () => {

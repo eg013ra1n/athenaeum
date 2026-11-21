@@ -41,8 +41,8 @@ export function PlanGroupCard({ kind, group, facts, chosen, included, readOnly, 
   const { shared, own } = splitFacts(facts, group);
   // The header says the frame type and the night once (as the Duplicates header does); the rest is said in the body.
   const headerKeys = kind === 'black_hole' ? ['IMAGETYP', 'DATE-OBS'] : [];
-  const type = shared.find((f) => f.key === 'IMAGETYP');
-  const date = shared.find((f) => f.key === 'DATE-OBS');
+  const type = kind === 'black_hole' ? shared.find((f) => f.key === 'IMAGETYP') : undefined;
+  const date = kind === 'black_hole' ? shared.find((f) => f.key === 'DATE-OBS') : undefined;
   const bodyShared = shared.filter((f) => !headerKeys.includes(f.key));
   const sized = group.items.some((i) => i.sizeBytes != null);
   const movedBytes = group.items.filter((i) => included.includes(i.id)).reduce((n, i) => n + (i.sizeBytes ?? 0), 0);
