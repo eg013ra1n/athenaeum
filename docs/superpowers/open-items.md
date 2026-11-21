@@ -321,6 +321,12 @@ contain forward slashes.
 
 ## Known flaky test
 
+- **`api::collab_exchange::tests::a_dropped_project_export_frees_the_slot` (2026-11-21, GitHub Linux, once; passed on the
+  next run).** It polls the export future once with `timeout(Duration::ZERO)` and asserts the first poll does not finish
+  it ("the first poll must not finish the export"); on a fast runner the one-frame export finished in that poll. A
+  timing premise, not a product fault: if it recurs, make the premise guaranteed (hold something the export needs while
+  the first poll runs), never widen a timeout.
+
 - `stacking::run::normalize::tests::local_normalization_sidecars_are_cached_on_the_second_run`
   failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
   (2026-09-18, 2431 passed alongside it) and passed twice in isolation and in

@@ -135,8 +135,8 @@ pub struct ZeroPointPassComplete {
 /// Ends the pass thread on EVERY exit path (a normal end, a panic, an early return): the running flag is freed when the
 /// thread did not already free it ([`Self::disarm`] is called after [`SolvePassGuard::finish`] released it, so a normal
 /// end is not released twice; without the release a dead pass would leave every later batch queueing behind it until
-/// restart), and then, the guard being free, the pass announces its end: one `zero-point-pass-complete` event for the
-/// Analysis tab and one request for an auto-publish run, which was held while the pass worked.
+/// restart), and then, the guard being free, the pass asks for the auto-publish run it held while it worked and only
+/// then announces its end with one `zero-point-pass-complete` event for the Analysis tab.
 #[cfg(feature = "solver")]
 struct PassRelease {
     key: std::path::PathBuf,
@@ -163,12 +163,14 @@ impl Drop for PassRelease {
         if self.armed {
             with_pass_guard(&self.key, SolvePassGuard::abandon);
         }
+        // The held auto-publish run is asked for BEFORE the end is announced, so whoever reacts to the event finds the
+        // request already made (the order is otherwise free; a test asserting it raced on a slow Windows runner).
+        crate::api::collab_autopublish::request_auto_publish(None);
         emit_event(
             self.emitter.as_ref(),
             "zero-point-pass-complete",
             &ZeroPointPassComplete { frames: self.frames, measured: self.measured },
         );
-        crate::api::collab_autopublish::request_auto_publish(None);
     }
 }
 
