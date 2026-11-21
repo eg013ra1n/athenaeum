@@ -245,7 +245,8 @@ describe('AssistantAccessSection', () => {
       fireEvent.click(button);
       await waitFor(() => expect(button.disabled).toBe(true));
       resolve({ path: CFG, replaced: true, backup: `${CFG}.bak` });
-      expect(await screen.findByText(`Added to ${CFG}. Restart Claude desktop to load it. Replaced the earlier entry.`)).toBeTruthy();
+      const line = await screen.findByText(`Added to ${CFG}. Restart Claude desktop to load it. Replaced the earlier entry.`);
+      expect(line.getAttribute('role')).toBe('status');
       expect(callsOf('add_mcp_to_claude_desktop')).toHaveLength(1);
       expect(callsOf('add_mcp_to_claude_desktop')[0]!.length).toBe(1); // no args
       await waitFor(() => expect(button.disabled).toBe(false));
@@ -265,7 +266,12 @@ describe('AssistantAccessSection', () => {
       await renderSection(WITH_CFG);
       fireEvent.click(await screen.findByRole('button', { name: 'Add to Claude desktop' }));
       await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(1));
-      expect(notifyMock.mock.calls[0]![0]).toMatchObject({ tone: 'warning', detail: why, dedupeKey: 'mcp-settings' });
+      expect(notifyMock.mock.calls[0]![0]).toMatchObject({
+        tone: 'warning',
+        title: 'Not added to Claude desktop',
+        detail: why,
+        dedupeKey: 'mcp-settings',
+      });
       expect(screen.queryByText(/Restart Claude desktop to load it/)).toBeNull();
     });
   });

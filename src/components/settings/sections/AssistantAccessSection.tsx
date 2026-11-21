@@ -66,12 +66,12 @@ export function AssistantAccessSection() {
   const notifyRef = useRef(notify);
   notifyRef.current = notify;
 
-  const fail = useCallback((what: string, err: unknown) => {
+  const fail = useCallback((what: string, err: unknown, title = 'Assistant access not changed') => {
     console.error(`[mcp-settings] ${what} failed:`, err);
     notifyRef.current({
       kind: 'generic',
       tone: 'warning',
-      title: 'Assistant access not changed',
+      title,
       detail: errMsg(err),
       dedupeKey: NOTIFY_KEY,
     });
@@ -83,8 +83,12 @@ export function AssistantAccessSection() {
     return String(s.enabled);
   }, []);
 
+  // The last "Added to …" line; cleared when access is switched, so it never reappears stale.
+  const [added, setAdded] = useState<{ result: ClaudeDesktopAdded; at: number } | null>(null);
+
   const write = useCallback(
     async (enabled: boolean): Promise<void> => {
+      setAdded(null);
       try {
         setStatus(await api.invoke<McpStatus>('set_mcp_enabled', { enabled }));
       } catch (err) {
@@ -107,7 +111,6 @@ export function AssistantAccessSection() {
   // The write runs once per click: the ref closes the gap before the disabled state renders.
   const [adding, setAdding] = useState(false);
   const addingRef = useRef(false);
-  const [added, setAdded] = useState<{ result: ClaudeDesktopAdded; at: number } | null>(null);
   const addToClaudeDesktop = async () => {
     if (addingRef.current) return;
     addingRef.current = true;
@@ -117,7 +120,7 @@ export function AssistantAccessSection() {
       setAdded({ result, at: Date.now() });
     } catch (err) {
       setAdded(null);
-      fail('add_mcp_to_claude_desktop', err);
+      fail('add_mcp_to_claude_desktop', err, 'Not added to Claude desktop');
     } finally {
       addingRef.current = false;
       setAdding(false);
@@ -232,7 +235,7 @@ export function AssistantAccessSection() {
                     </div>
                     <p className="text-xs text-content-muted">{fieldMeta(SECTION, 'addToClaudeDesktop').help}</p>
                     {added && (
-                      <p className="text-xs text-content-muted break-all">
+                      <p role="status" className="text-xs text-content-muted break-all">
                         {`Added to ${added.result.path}. Restart Claude desktop to load it.${added.result.replaced ? ' Replaced the earlier entry.' : ''}`}
                       </p>
                     )}
