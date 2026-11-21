@@ -26,3 +26,8 @@ lengths (FL). One finished run, #9, exists (`get_project_stacking_runs`, `get_st
 its reference was moved by the second pass, so the reference strip shows every line and the schematic outlines that
 frame in gold. The writes the tab can reach are echoed, never stored. The plan still
 carries its `grid` blocker, so Run stays refused until a grid is confirmed.
+
+The `mcp-plan` scenario (`HARNESS_SCENARIO=mcp-plan HARNESS_PLAN=black_hole|metadata|plate_solve npm run ui:harness`, default
+`black_hole`) shows the assistant's plan window over any page: the web build asks `get_mcp_plan` on load and the harness answers
+with a waiting plan. The Black Hole plan names the same files as the two groups on http://localhost:1430/files (Duplicates tab).
+An answer is echoed (Apply ends in a report, Cancel in "cancelled"); reload the page to get the plan back. Fixtures: `mcpPlan.mjs`.

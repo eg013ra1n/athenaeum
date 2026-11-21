@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Circle, Loader2
 import type { DuplicateFile, DuplicateGroup } from '../../types/models';
 import type { RuleKind } from '../../types/helpers';
 import type { FileVerifyResult, GroupVerifyStatus } from '../../hooks/useDeepVerify';
+import { formatBytes, imagetypClass } from './presentation';
 import { groupDeletionStatus, RULE_KIND_META, type DeletionStatus } from './keepRules';
 
 interface DuplicateGroupCardProps {
@@ -23,13 +24,6 @@ interface DuplicateGroupCardProps {
   verifyStatus?: GroupVerifyStatus;
   /** Per-file results, for inline status indicators when expanded. */
   fileVerifyResults?: Map<number, FileVerifyResult>;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const mb = bytes / 1024 / 1024;
-  if (mb < 1024) return `${mb.toFixed(1)} MB`;
-  return `${(mb / 1024).toFixed(2)} GB`;
 }
 
 function formatDate(iso: string): string {
@@ -118,19 +112,6 @@ function summarize<T>(values: Array<T | null | undefined>): T | 'mixed' | null {
   if (defined.length === 0) return null;
   const first = defined[0];
   return defined.every((v) => v === first) ? first : 'mixed';
-}
-
-const IMAGETYP_STYLES: Record<string, string> = {
-  LIGHT: 'bg-accent/15 text-accent border-accent/40',
-  FLAT: 'bg-warning-muted text-warning border-warning/50',
-  DARK: 'bg-surface-hover text-content-secondary border-border',
-  BIAS: 'bg-info-muted text-info border-info/50',
-  DARKFLAT: 'bg-surface-hover text-content-secondary border-border',
-};
-
-function imagetypClass(value: string): string {
-  const key = value.toUpperCase();
-  return IMAGETYP_STYLES[key] ?? 'bg-surface-hover text-content-secondary border-border';
 }
 
 function headerSummary(files: DuplicateFile[]): {

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Info } from 'lucide-react';
 import { Button, DialogShell } from '../ui';
-import { formatBytes } from '../stacking/formatBytes';
+import { formatBytes } from '../duplicates/presentation';
 import { useMcpPlan } from '../../contexts/McpPlanContext';
 import { PlanView } from './PlanView';
 import { chooseOne, initialSelection, selectionProblems, toggleGroup, toggleItem, totals } from './planSelection';
@@ -22,6 +22,16 @@ const APPLY_ARM_MS = 1000;
 
 const files = (n: number) => `${n} file${n === 1 ? '' : 's'}`;
 const frames = (n: number) => `${n} frame${n === 1 ? '' : 's'}`;
+
+/** The line under the title: what Apply would do, in the units of the plan's kind, and when the plan expires. */
+function summaryLine(plan: McpPlanView, sum: { items: number; bytes: number }, hasSizes: boolean, waiting: boolean): string {
+  const n = sum.items;
+  let what: string;
+  if (plan.kind === 'black_hole') what = `${files(n)}${hasSizes ? ` · ${formatBytes(sum.bytes)}` : ''} to the Black Hole`;
+  else if (plan.kind === 'metadata') what = `${n} value${n === 1 ? '' : 's'} to write`;
+  else what = `${frames(n)} to solve`;
+  return plan.expiresAt && waiting ? `${what} · expires ${plan.expiresAt}` : what;
+}
 
 function PlanDialog({ plan }: { plan: McpPlanView }) {
   const { busy, apply, cancel, dismiss, openNewer } = useMcpPlan();
@@ -48,6 +58,7 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
   // A plan that carries no sizes (a plate solve) shows a count only, never "0 B".
   const hasSizes = plan.groups.some((g) => g.items.some((i) => i.sizeBytes != null));
   const problems = waiting ? selectionProblems(plan, sel) : [];
+  const summary = (waiting || kind === 'applying') ? summaryLine(plan, sum, hasSizes, waiting) : null;
 
   // Nothing pressable has the initial focus: the window opens by itself over any page, so a Space or Enter meant for
   // something else must press nothing. The title line takes it (`data-autofocus`, not a tab stop of its own).
@@ -149,9 +160,17 @@ function PlanDialog({ plan }: { plan: McpPlanView }) {
       onClose={mode === 'cancel' ? () => void cancel() : dismiss}
       footer={footer}
     >
-      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5 text-[11.5px] text-content-muted">
-        <span className="min-w-0 break-all">{`${plan.source.build} ${plan.source.version} · catalog ${plan.source.catalog}`}</span>
-        {plan.expiresAt && waiting && <span>Expires {plan.expiresAt}</span>}
+      <div className="mb-3 flex items-center gap-1.5 text-[12px] text-content-muted">
+        {summary && <span className="min-w-0">{summary}</span>}
+        {/* The build and catalog the plan came from: the assistant's own answer already says them. */}
+        <span
+          title={`${plan.source.build} ${plan.source.version} · catalog ${plan.source.catalog}`}
+          aria-label={`${plan.source.build} ${plan.source.version} · catalog ${plan.source.catalog}`}
+          role="note"
+          className="inline-flex shrink-0 text-content-faint"
+        >
+          <Info size={13} aria-hidden />
+        </span>
       </div>
       {superseded && (
         <div role="status" className="mb-3 flex items-center gap-2 rounded-md border border-warning/50 bg-warning-muted px-2.5 py-2 text-content">

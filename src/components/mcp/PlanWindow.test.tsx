@@ -5,7 +5,8 @@ import { api } from '../../api';
 import { routeInvoke } from '../../test/apiMock';
 import { McpPlanProvider } from '../../contexts/McpPlanContext';
 import { PlanWindow } from './PlanWindow';
-import { plan } from './planFixtures';
+import { formatBytes } from '../duplicates/presentation';
+import { metadataPlan, plan, plateSolvePlan } from './planFixtures';
 import type { McpPlanView } from '../../types/mcp';
 
 vi.mock('../../api');
@@ -80,7 +81,8 @@ describe('PlanWindow', () => {
     const first = mount();
     expect(await screen.findByRole('dialog', { name: /Move duplicate copies/ })).toBeTruthy();
     expect(api.invoke).toHaveBeenCalledWith('get_mcp_plan', { planId: null });
-    expect(screen.getByText(/athenaeum-dev 0\.7\.1 · catalog \/home\/me\/catalog\.db/)).toBeTruthy();
+    // The build and catalog are reachable on the info icon, not printed in the header.
+    expect(screen.getByTitle('athenaeum-dev 0.7.1 · catalog /home/me/catalog.db')).toBeTruthy();
     // StrictMode mounted twice: exactly one listener is alive.
     expect(handlers.size).toBe(1);
     first.unmount();
@@ -112,9 +114,9 @@ describe('PlanWindow', () => {
     newest = plans['plan-1'] = plan();
     mount();
     await screen.findByRole('dialog');
-    expect(screen.getByText('3 files · 6.8 KB')).toBeTruthy();
+    expect(screen.getByText(`3 files · ${formatBytes(7000)}`)).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M42 Flat (2 copies)' }));
-    expect(screen.getByText('2 files · 2.9 KB')).toBeTruthy();
+    expect(screen.getByText(`2 files · ${formatBytes(3000)}`)).toBeTruthy();
     await armed();
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
     await waitFor(() => expect(answers()).toHaveLength(1));
@@ -138,7 +140,7 @@ describe('PlanWindow', () => {
     newest = plans['plan-1'] = plan();
     mount();
     await screen.findByRole('dialog');
-    fireEvent.click(screen.getByRole('radio', { name: 'Copy that stays: copy-2.fits' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy that stays: copy-2.fits' }));
     expect((screen.getByRole('checkbox', { name: 'Include copy-2.fits' }) as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByRole('checkbox', { name: 'Include copy-1.fits' }) as HTMLInputElement).checked).toBe(false);
     await armed();
@@ -152,16 +154,18 @@ describe('PlanWindow', () => {
     newest = plans['plan-1'] = plan();
     mount();
     await screen.findByRole('dialog');
-    const radio = (n: number) => screen.getByRole('radio', { name: `Copy that stays: copy-${n}.fits` }) as HTMLInputElement;
-    expect(radio(6).disabled).toBe(false);
-    fireEvent.click(radio(6));
-    expect(radio(6).checked).toBe(true);
+    // The copy that stays offers no "keep" button of its own; every other candidate does.
+    const keep = (n: number) => screen.queryByRole('button', { name: `Copy that stays: copy-${n}.fits` }) as HTMLButtonElement | null;
+    expect(keep(6)!.disabled).toBe(false);
+    fireEvent.click(keep(6)!);
+    expect(keep(6)).toBeNull();
+    expect(keep(4)).toBeTruthy();
     // The locked copy that stays still cannot be ticked.
     expect((screen.getByRole('checkbox', { name: 'Include copy-6.fits' }) as HTMLInputElement).disabled).toBe(true);
     // A misclick back to the planned keeper works.
-    fireEvent.click(radio(4));
-    expect(radio(4).checked).toBe(true);
-    expect(radio(6).checked).toBe(false);
+    fireEvent.click(keep(4)!);
+    expect(keep(4)).toBeNull();
+    expect(keep(6)).toBeTruthy();
   });
 
   it('a_partly_ticked_group_shows_half_ticked', async () => {
@@ -198,7 +202,7 @@ describe('PlanWindow', () => {
     expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true);
     plans['plan-1'] = plan();
     await emit('plan-1');
-    await waitFor(() => expect(screen.getByText('3 files · 6.8 KB')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(`3 files · ${formatBytes(7000)}`)).toBeTruthy());
     await armed();
   });
 
@@ -415,14 +419,14 @@ describe('PlanWindow', () => {
     await screen.findByRole('dialog');
     // This window's own ticks: group 1 is unticked here, so only the group-2 copy counts.
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M31 Light 300 s (3 copies)' }));
-    expect(screen.getByText('1 file · 3.9 KB')).toBeTruthy();
+    expect(screen.getByText(`1 file · ${formatBytes(4000)}`)).toBeTruthy();
     // Another page applied only copy-3 of the first group: the backend recorded exactly that.
     const applied = plan({ state: { kind: 'applying' } });
     applied.groups[0].items[1].selected = false;
     applied.groups[1].items[1].selected = false;
     plans['plan-1'] = applied;
     await emit('plan-1');
-    await waitFor(() => expect(screen.getByText('1 file · 2.0 KB')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(`1 file · ${formatBytes(2000)}`)).toBeTruthy());
     expect((screen.getByRole('checkbox', { name: 'Include copy-3.fits' }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole('checkbox', { name: 'Include copy-2.fits' }) as HTMLInputElement).checked).toBe(false);
   });
@@ -629,5 +633,99 @@ describe('PlanWindow', () => {
       warn.mockRestore();
       vi.useRealTimers();
     }
+  });
+});
+
+describe('PlanWindow in the Duplicates page\'s language', () => {
+  const row = (fileName: string) => screen.getByText(fileName).closest('[data-testid="plan-row"]') as HTMLElement;
+
+  it('the_copy_that_stays_never_reads_move', async () => {
+    newest = plans['plan-1'] = plan();
+    mount();
+    await screen.findByRole('dialog');
+    // copy-1 stays: it says so and never the group's action; the ticked copies say where they go.
+    expect(row('copy-1.fits').textContent).toMatch(/Stays/);
+    expect(row('copy-1.fits').textContent).not.toMatch(/Black Hole/);
+    expect(row('copy-2.fits').textContent).toMatch(/To the Black Hole/);
+    // The marker follows the selection: pick copy-2 and the words swap.
+    fireEvent.click(screen.getByRole('button', { name: 'Copy that stays: copy-2.fits' }));
+    expect(row('copy-2.fits').textContent).toMatch(/Stays/);
+    expect(row('copy-2.fits').textContent).not.toMatch(/Black Hole/);
+    expect(row('copy-1.fits').textContent).not.toMatch(/Black Hole/);
+    // Untick copy-3: it stays too.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include copy-3.fits' }));
+    expect(row('copy-3.fits').textContent).not.toMatch(/Black Hole/);
+    // The planner's wording for the whole group is printed nowhere.
+    expect(screen.queryByText(/moves to the Black Hole/)).toBeNull();
+  });
+
+  it('a_locked_row_says_locked_and_why', async () => {
+    newest = plans['plan-1'] = plan();
+    mount();
+    await screen.findByRole('dialog');
+    const locked = row('copy-6.fits');
+    expect(locked.textContent).toMatch(/Locked/);
+    expect(locked.textContent).toMatch(/calibration links point at it; it stays in v1/);
+    expect(locked.textContent).not.toMatch(/To the Black Hole/);
+  });
+
+  it('labels_are_human_never_header_keywords', async () => {
+    newest = plans['plan-1'] = plan();
+    mount();
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.textContent).not.toMatch(/IMAGETYP|OBJECT|FILTER|EXPTIME|DATE-OBS|INSTRUME/);
+    for (const word of ['Object', 'Filter', 'Exposure', 'Camera']) expect(dialog.textContent).toContain(word);
+    expect(dialog.textContent).toContain('300 s');
+    // What the copies share is said once for the group, not on every row.
+    expect(screen.getAllByText('ASI2600MM')).toHaveLength(2);
+  });
+
+  it('the_summary_size_is_the_shared_formatters', async () => {
+    newest = plans['plan-1'] = plan();
+    mount();
+    await screen.findByRole('dialog');
+    expect(screen.getByText(`3 files · ${formatBytes(7000)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
+    // Unticking lowers it.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include all in M42 Flat (2 copies)' }));
+    expect(screen.getByText(`2 files · ${formatBytes(3000)} to the Black Hole · expires 2026-11-20 15:00:00`)).toBeTruthy();
+  });
+
+  it('no_plan_scrolls_sideways', async () => {
+    for (const make of [plan, metadataPlan, plateSolvePlan]) {
+      newest = plans['plan-1'] = make();
+      mount();
+      await screen.findByRole('dialog');
+      expect(document.body.innerHTML, make.name).not.toContain('overflow-x-auto');
+      expect(document.querySelector('table'), make.name).toBeNull();
+      cleanup();
+    }
+  });
+
+  it('a_metadata_plan_shows_what_changes_and_why', async () => {
+    newest = plans['plan-1'] = metadataPlan();
+    mount();
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.textContent).not.toMatch(/OBJECT|INSTRUME/);
+    expect(row('frame-1.fits').textContent).toMatch(/Object\(empty\)M31/);
+    expect(row('frame-1.fits').textContent).toMatch(/the folder name says M31/);
+    expect(row('frame-3.fits').textContent).toMatch(/Camera\(empty\)ASI2600MM/);
+    const locked = row('frame-2.fits');
+    expect(locked.textContent).toMatch(/the file is on a drive that is not connected/);
+    expect((screen.getByRole('checkbox', { name: 'Include frame-2.fits' }) as HTMLInputElement).disabled).toBe(true);
+    expect(screen.getByText(/^2 values to write/)).toBeTruthy();
+  });
+
+  it('a_plate_solve_plan_shows_the_position_hint_and_what_a_solve_writes', async () => {
+    newest = plans['plan-1'] = plateSolvePlan();
+    mount();
+    await screen.findByRole('dialog');
+    expect(row('light-1.fits').textContent).toMatch(/Position hint\s*RA 10\.6847, Dec 41\.2690/);
+    expect(row('light-1.fits').textContent).toMatch(/A solve writes\s*its coordinates/);
+    expect(row('light-1.fits').textContent).not.toMatch(/name of the object/);
+    // A frame with no object name also gets the name of the object in its field.
+    expect(row('light-2.fits').textContent).toMatch(/the name of the object in its field/);
+    expect(row('light-2.fits').textContent).toMatch(/Position hint\s*none/);
+    expect(row('light-3.fits').textContent).toMatch(/the star catalog is not installed/);
+    expect(screen.getByText(/^2 frames to solve/)).toBeTruthy();
   });
 });

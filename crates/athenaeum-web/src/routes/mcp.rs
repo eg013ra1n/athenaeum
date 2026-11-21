@@ -82,7 +82,8 @@ pub async fn add_mcp_to_claude_desktop() -> Result<Json<serde_json::Value>, (Sta
 }
 
 /// POST /api/get_mcp_plan: the plan by id, or the newest (`planId` absent); `null` when there is none.
-#[tracing::instrument(skip_all, err(Debug))]
+// Polled every 4 s while a plan waits for the user: debug, like the other hot-path commands.
+#[tracing::instrument(level = "debug", skip_all, err(Debug))]
 pub async fn get_mcp_plan(
     State(state): State<WebAppState>,
     Json(req): Json<GetMcpPlanReq>,

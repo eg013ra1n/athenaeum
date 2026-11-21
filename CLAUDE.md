@@ -85,7 +85,7 @@ Tauri commands: 330 in 27 modules under `crates/athenaeum-tauri/src/commands/`, 
 ## Adding a Tauri Command
 
 1. Logic in `athenaeum-core/src/api/<module>.rs` (handler takes `&ServiceContext`, typed args, `&PathPolicy` for user paths, `&dyn ProgressEmitter` for progress); new model types go in the `ts_export.rs` registry.
-2. Tauri wrapper in `commands/<domain>.rs` (re-exported by `commands/mod.rs`) with `#[tracing::instrument(skip_all, err)]` directly under `#[tauri::command]` (`level = "debug"` for per-frame/per-index commands); register in `invoke_handler![]` (`tauri/src/lib.rs`).
+2. Tauri wrapper in `commands/<domain>.rs` (re-exported by `commands/mod.rs`) with `#[tracing::instrument(skip_all, err)]` directly under `#[tauri::command]` (`level = "debug"` for per-frame/per-index and polled commands); register in `invoke_handler![]` (`tauri/src/lib.rs`).
 3. Axum mirror in `routes/<same_domain>.rs` with the same attribute (`err(Debug)` for `(StatusCode, String)`), registered in `build_router` (`web/src/routes/mod.rs`); progress via `SseProgressEmitter::new(state.event_tx.clone())`.
 4. React calls `api.invoke('command_name', { args })`. Code sample: `docs/architecture/commands.md`.
 
