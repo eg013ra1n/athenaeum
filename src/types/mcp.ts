@@ -134,6 +134,42 @@ export type PlanReport = { applied: Array<ReportLine>, skipped: Array<ReportLine
  */
 runId: string | null, };
 
+export type SummaryCount = { count: number, 
+/**
+ * Reads with any count but 1 ("not light frames").
+ */
+label: string, 
+/**
+ * Reads with a count of exactly 1 ("not a light frame"); the window shows it when `count === 1`.
+ */
+labelOne: string, };
+
+export type FactTone = "ok" | "warn" | "neutral";
+
+export type SummaryFact = { label: string, value: string, tone: FactTone, };
+
+export type PlanSummary = { 
+/**
+ * Counts that do not follow the selection (6 folders, 3 groups).
+ */
+counts: Array<SummaryCount>, 
+/**
+ * What the plan left out and why (650 not light frames, 339 already solved).
+ */
+leftOut: Array<SummaryCount>, 
+/**
+ * Consequences to see before Apply, shown amber (1 frame leaves its session).
+ */
+warnings: Array<SummaryCount>, 
+/**
+ * Service facts shown as chips.
+ */
+facts: Array<SummaryFact>, 
+/**
+ * The one explanatory sentence, plain and short.
+ */
+explain: string | null, };
+
 export type McpPlanView = { planId: string, kind: PlanKind, title: string, source: McpSource, state: PlanState, 
 /**
  * Set when `state` is `replaced`: the plan that took its place.
@@ -142,7 +178,7 @@ replacedBy: string | null,
 /**
  * `YYYY-MM-DD HH:MM:SS` (local time), display only; set once the plan waits.
  */
-expiresAt: string | null, columns: Array<PlanColumn>, groups: Array<PlanGroup>, notes: Array<string>, report: PlanReport | null, };
+expiresAt: string | null, columns: Array<PlanColumn>, groups: Array<PlanGroup>, notes: Array<string>, summary: PlanSummary, report: PlanReport | null, };
 
 export type GroupSelection = { groupId: string, chosen: string | null, 
 /**

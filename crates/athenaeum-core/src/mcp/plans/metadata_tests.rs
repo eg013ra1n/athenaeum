@@ -317,6 +317,16 @@ fn the_plan_groups_by_value_locks_what_has_no_evidence_and_counts_the_links() {
     assert_eq!(view.notes[0], "these changes take 0 frames out of their sessions and 1 out of calibration links");
     assert!(view.notes.iter().any(|n| n.starts_with("Only the catalog changes")), "{:?}", view.notes);
 
+    // The summary carries the numbers of that note, and of the frame nothing could be said for.
+    let s = &view.summary;
+    assert!(s.counts.is_empty(), "{:?}", s.counts);
+    assert_eq!(s.left_out, vec![SummaryCount::new(1, "frame with no value found", "frames with no value found")]);
+    // 0 sessions are left out of the warnings; 1 calibration link is the note's "1 out of calibration links".
+    assert_eq!(s.warnings, vec![SummaryCount::new(1, "calibration link removed", "calibration links removed")]);
+    assert_eq!(s.warnings[0].text(), "calibration link removed");
+    assert!(s.facts.is_empty(), "{:?}", s.facts);
+    assert!(s.explain.as_deref().is_some_and(|e| e.starts_with("Only the catalog changes.")), "{:?}", s.explain);
+
     // The answer is the plan: its words and its data say the same.
     assert!(answer.text.contains("Plan plan-") && answer.text.contains("is ready: 3 values proposed in 2 groups."), "{}", answer.text);
     assert!(answer.text.contains("- Object: M 31: 2 frames"), "{}", answer.text);

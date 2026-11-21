@@ -33,7 +33,7 @@ pub use plate_solve::{PlanPlateSolveArgs, SolveRunArgs};
 pub use model::{
     catalog_values, disk_stamp, stamp_for_plan, stamp_target, DiskStamp, GroupSelection, ItemSnapshot, McpPlanView,
     PlanAnswer, PlanColumn, PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState,
-    ReportLine, NOT_REACHABLE,
+    PlanSummary, ReportLine, FactTone, SummaryCount, SummaryFact, NOT_REACHABLE,
 };
 
 #[cfg(test)]
@@ -96,6 +96,7 @@ struct Plan {
     columns: Vec<PlanColumn>,
     groups: Vec<PlanGroup>,
     notes: Vec<String>,
+    summary: PlanSummary,
     report: Option<PlanReport>,
     cancel: Arc<AtomicBool>,
     content: Option<Arc<Content>>,
@@ -119,6 +120,7 @@ impl Plan {
             columns: self.columns.clone(),
             groups: self.groups.clone(),
             notes: self.notes.clone(),
+            summary: self.summary.clone(),
             report: self.report.clone(),
         }
     }
@@ -235,6 +237,7 @@ impl PlanStore {
             columns: Vec::new(),
             groups: Vec::new(),
             notes: Vec::new(),
+            summary: PlanSummary::default(),
             report: None,
             cancel: Arc::clone(&cancel),
             content: None,
@@ -320,6 +323,7 @@ impl PlanStore {
             p.columns = c.columns;
             p.groups = c.groups;
             p.notes = c.notes;
+            p.summary = c.summary;
             p.content = Some(Arc::new(Content { snapshots: c.snapshots, applier: c.applier }));
             p.state = PlanState::Waiting;
             p.deadline = Some(deadline);

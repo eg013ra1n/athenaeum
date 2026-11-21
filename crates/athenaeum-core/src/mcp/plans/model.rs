@@ -131,6 +131,74 @@ pub struct PlanReport {
     pub run_id: Option<String>,
 }
 
+/// A count and its words. `label` reads with any count but 1 ("not light frames"), `label_one` with exactly 1
+/// ("not a light frame"); the window picks `label_one` when `count == 1`. Both are plain lowercase words a user reads:
+/// no parameter or field names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryCount {
+    pub count: u64,
+    /// Reads with any count but 1 ("not light frames").
+    pub label: String,
+    /// Reads with a count of exactly 1 ("not a light frame"); the window shows it when `count === 1`.
+    pub label_one: String,
+}
+
+impl SummaryCount {
+    /// `n` with its two spellings: `SummaryCount::new(1, "frame leaves its session", "frames leave their sessions")`.
+    pub fn new(count: usize, one: &str, many: &str) -> Self {
+        Self { count: count as u64, label: many.to_string(), label_one: one.to_string() }
+    }
+
+    /// The label that reads with this count.
+    pub fn text(&self) -> &str {
+        if self.count == 1 { &self.label_one } else { &self.label }
+    }
+}
+
+/// How a service fact shows: green, amber, or plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
+pub enum FactTone {
+    Ok,
+    Warn,
+    Neutral,
+}
+
+/// One service fact the window shows as a chip: "Star catalog: installed".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryFact {
+    pub label: String,
+    pub value: String,
+    pub tone: FactTone,
+}
+
+impl SummaryFact {
+    pub fn new(label: &str, value: impl Into<String>, tone: FactTone) -> Self {
+        Self { label: label.to_string(), value: value.into(), tone }
+    }
+}
+
+/// What the plan window's stats row, chips and sentence show, built by the planner from the same values as `notes`
+/// (never parsed from them). The headline that follows the user's ticks (files to move, frames to solve, values to
+/// write) is the window's own and is not here. Every plan carries one, empty when there is nothing to say. Counts of
+/// zero are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSummary {
+    /// Counts that do not follow the selection (6 folders, 3 groups).
+    pub counts: Vec<SummaryCount>,
+    /// What the plan left out and why (650 not light frames, 339 already solved).
+    pub left_out: Vec<SummaryCount>,
+    /// Consequences to see before Apply, shown amber (1 frame leaves its session).
+    pub warnings: Vec<SummaryCount>,
+    /// Service facts shown as chips.
+    pub facts: Vec<SummaryFact>,
+    /// The one explanatory sentence, plain and short.
+    pub explain: Option<String>,
+}
+
 /// A plan as the window and the status tool read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +215,7 @@ pub struct McpPlanView {
     pub columns: Vec<PlanColumn>,
     pub groups: Vec<PlanGroup>,
     pub notes: Vec<String>,
+    pub summary: PlanSummary,
     pub report: Option<PlanReport>,
 }
 
@@ -320,6 +389,7 @@ pub struct PlanContent {
     pub columns: Vec<PlanColumn>,
     pub groups: Vec<PlanGroup>,
     pub notes: Vec<String>,
+    pub summary: PlanSummary,
     /// By item id: every item that can be included, and every candidate (the copy that stays included).
     pub snapshots: HashMap<String, ItemSnapshot>,
     pub applier: Box<dyn PlanApplier>,

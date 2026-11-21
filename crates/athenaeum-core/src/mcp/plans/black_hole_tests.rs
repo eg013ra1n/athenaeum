@@ -595,6 +595,44 @@ fn header_pair_that_differs_in_bytes_is_dropped() {
 }
 
 #[test]
+fn the_summary_counts_groups_left_out_copies_and_groups_that_need_a_keeper() {
+    let rig = rig();
+    // Group one: a keeper in its folder, a same copy, a copy that differs in bytes.
+    let a = header_copy(&rig, "s-a", "t30.fits", b"AAAA");
+    header_copy(&rig, "s-b", "t30.fits", b"AAAA");
+    header_copy(&rig, "s-c", "t30.fits", b"AABA");
+    // Group two: no copy sits in the folder, so nothing picks the copy that stays.
+    header_copy(&rig, "s-d", "t31.fits", b"BBBB");
+    header_copy(&rig, "s-e", "t31.fits", b"BBBB");
+    let view = plan(&rig, BlackHoleSource::Duplicates, &[header_handle("t30.fits"), header_handle("t31.fits")], Some(&a.dir()), &[]);
+    let s = &view.summary;
+
+    assert_eq!(s.counts, vec![SummaryCount::new(2, "group", "groups")]);
+    assert_eq!(s.left_out, vec![SummaryCount::new(1, "copy with different bytes", "copies with different bytes")]);
+    assert_eq!(s.warnings, vec![SummaryCount::new(1, "group needs a copy that stays", "groups need a copy that stays")]);
+    assert_eq!(s.warnings[0].text(), "group needs a copy that stays");
+    // The same events say the same in the group notes.
+    assert!(view.groups[0].note.as_deref().unwrap_or("").contains("different bytes from the copy that stays"), "{:?}", view.groups[0].note);
+    assert!(view.groups[1].note.as_deref().unwrap_or("").contains("no instruction picks the copy that stays here"), "{:?}", view.groups[1].note);
+    assert!(s.facts.is_empty());
+    assert!(s.explain.as_deref().is_some_and(|e| e.contains("The copy that stays is never touched")), "{:?}", s.explain);
+}
+
+#[test]
+fn the_summary_counts_a_master_that_stays_with_its_links() {
+    let rig = rig();
+    let m1 = master_copy(&rig, "MasterDark-60s.xisf", 60.0, b"M1");
+    let m2 = master_copy(&rig, "MasterDark-60s-2.xisf", 60.0, b"M2");
+    link_master(&rig, &m1, 2);
+    let view = plan(&rig, BlackHoleSource::RebuiltMasters, &[rebuilt_handle(&m1)], None, &[&m2]);
+    assert_eq!(
+        view.summary.left_out,
+        vec![SummaryCount::new(1, "master that stays (calibration links)", "masters that stay (calibration links)")]
+    );
+    assert!(view.summary.warnings.is_empty(), "{:?}", view.summary.warnings);
+}
+
+#[test]
 fn header_pair_rechecked_after_keeper_change() {
     let rig = rig();
     let a = header_copy(&rig, "r-a", "t8.fits", b"AAAA");
@@ -1047,6 +1085,7 @@ fn a_file_in_two_groups_is_planned_once() {
                 columns: plan_columns(),
                 groups: out.groups.clone(),
                 notes: vec![],
+                summary: PlanSummary::default(),
                 snapshots: out.snapshots.clone(),
                 applier: Box::new(BlackHoleApplier { items: out.items, groups: out.group_infos, verify: real_verify() }),
             },

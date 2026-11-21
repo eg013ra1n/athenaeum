@@ -425,6 +425,7 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
                     columns: vec![],
                     groups: vec![],
                     notes: vec![],
+                    summary: crate::mcp::plans::PlanSummary::default(),
                     snapshots: HashMap::new(),
                     applier: Box::new(Nothing),
                 },
@@ -709,6 +710,7 @@ use crate::mcp::{mcp_server_name, HostKind, McpHost, McpIdentity, McpSource, Pla
             columns: vec![],
             groups: vec![],
             notes: vec![],
+            summary: crate::mcp::plans::PlanSummary::default(),
             report: None,
         }
     }

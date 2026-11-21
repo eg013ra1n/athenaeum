@@ -33,7 +33,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     plan_opened_text, stamp_for_plan, stamp_target, DiskStamp, ItemSnapshot, McpPlanView, PlanApplier, PlanColumn,
-    PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState, ReportLine, PLAN_ITEM_CAP,
+    PlanContent, PlanGroup, PlanItem, PlanKind, PlanReport, PlanSelection, PlanState, PlanSummary, ReportLine,
+    SummaryCount, PLAN_ITEM_CAP,
 };
 use crate::api::ApiError;
 use crate::calibration_library::rebuilt_copies::{find_rebuilt_master_copies, master_link_count};
@@ -445,8 +446,28 @@ struct Pair {
     keeper_file: i64,
 }
 
+/// The copies a plan leaves out, by why; the summary's `left_out` and the group notes read the same events.
+#[derive(Default)]
+struct LeftOut {
+    /// Already in an earlier group of the plan.
+    other_group: usize,
+    /// Same key, different bytes from the copy that stays.
+    differing: usize,
+    /// The byte comparison failed.
+    uncompared: usize,
+    /// A master that calibration links point at.
+    linked: usize,
+    /// A master whose registration superseded raw frames.
+    superseding: usize,
+    /// Inside a zip.
+    in_zip: usize,
+    /// Its file could not be stamped.
+    unreachable: usize,
+}
+
 struct Assembled {
     groups: Vec<PlanGroup>,
+    left_out: LeftOut,
     /// Per group, the notes that join into `PlanGroup::note`.
     group_notes: Vec<Vec<String>>,
     snapshots: HashMap<String, ItemSnapshot>,
@@ -464,6 +485,7 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
     let rules = KeepRules::new(args);
     let mut out = Assembled {
         groups: Vec::new(),
+        left_out: LeftOut::default(),
         group_notes: Vec::new(),
         snapshots: HashMap::new(),
         items: HashMap::new(),
@@ -481,6 +503,7 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
         copies.retain(|c| {
             let first = placed.insert(c.file_id);
             if !first {
+                out.left_out.other_group += 1;
                 notes.push(format!("{} in {} is already in another group of this plan and is left out here", c.name, c.folder));
             }
             first
@@ -525,12 +548,16 @@ fn assemble(specs: &[(String, GroupSpec)], loaded: Vec<Vec<CopyRow>>, args: &Pla
             let keeper = chosen_idx == Some(i);
             // The kept copy is shown by `chosen` alone: the window may keep another one, so it is not locked.
             let locked = if let Err(reason) = &stamps[i] {
+                out.left_out.unreachable += 1;
                 Some(reason.clone())
             } else if c.zip.is_some() {
+                out.left_out.in_zip += 1;
                 Some(IN_ZIP.to_string())
             } else if c.master && c.linked > 0 {
+                out.left_out.linked += 1;
                 Some(LINKED.to_string())
             } else if c.master && c.superseding {
+                out.left_out.superseding += 1;
                 Some(SUPERSEDING.to_string())
             } else {
                 None
@@ -621,12 +648,14 @@ fn record_checks(out: &mut Assembled, results: &[(usize, Result<VerifyPairResult
                     VerifyMethod::StoredHash => "its full-file hash differs from the copy that stays".to_string(),
                 });
                 *differing.entry(pair.group).or_default() += 1;
+                out.left_out.differing += 1;
             }
             Err(e) => {
                 item.locked = Some("could not be compared with the copy that stays".to_string());
                 item.selected = false;
                 item.evidence = Some(format!("the byte comparison failed: {e}"));
                 *unreadable.entry(pair.group).or_default() += 1;
+                out.left_out.uncompared += 1;
             }
         }
     }
@@ -729,6 +758,39 @@ pub(super) fn guard<T>(host: &McpHost, id: &str, step: impl FnOnce() -> Result<T
     }
 }
 
+/// The window's counts for an assembled plan, after the byte checks: groups, the copies left out and why, and the groups
+/// whose copy that stays the user must still pick.
+fn summary_of(out: &Assembled) -> PlanSummary {
+    let l = &out.left_out;
+    let mut summary = PlanSummary {
+        counts: vec![SummaryCount::new(out.groups.len(), "group", "groups")],
+        explain: Some(
+            "Only the marked copies move to the Black Hole. The copy that stays is never touched; pick another with Keep this one."
+                .to_string(),
+        ),
+        ..PlanSummary::default()
+    };
+    let rows = [
+        (l.other_group, "copy already in another group", "copies already in another group"),
+        (l.differing, "copy with different bytes", "copies with different bytes"),
+        (l.uncompared, "copy that could not be compared", "copies that could not be compared"),
+        (l.linked, "master that stays (calibration links)", "masters that stay (calibration links)"),
+        (l.superseding, "master that stays (raw frames superseded)", "masters that stay (raw frames superseded)"),
+        (l.in_zip, "copy inside a zip", "copies inside a zip"),
+        (l.unreachable, "copy not reachable", "copies not reachable"),
+    ];
+    for (n, one, many) in rows {
+        if n > 0 {
+            summary.left_out.push(SummaryCount::new(n, one, many));
+        }
+    }
+    let needing = out.groups.iter().filter(|g| g.chosen.is_none() && !g.items.is_empty()).count();
+    if needing > 0 {
+        summary.warnings.push(SummaryCount::new(needing, "group needs a copy that stays", "groups need a copy that stays"));
+    }
+    summary
+}
+
 /// Byte-checks the pairs (when there are any) and publishes the plan.
 fn check_and_publish(
     host: &McpHost,
@@ -759,12 +821,14 @@ fn check_and_publish(
     for (g, notes) in out.groups.iter_mut().zip(&out.group_notes) {
         g.note = (!notes.is_empty()).then(|| notes.join("; "));
     }
+    let summary = summary_of(&out);
     let applier = BlackHoleApplier { items: out.items, groups: out.group_infos, verify: Arc::clone(verify) };
     let content = PlanContent {
         title: title.to_string(),
         columns: plan_columns(),
         groups: out.groups,
         notes: out.notes,
+        summary,
         snapshots: out.snapshots,
         applier: Box::new(applier),
     };

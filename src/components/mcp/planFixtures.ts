@@ -75,6 +75,7 @@ export function plan(over: Partial<McpPlanView> = {}): McpPlanView {
       },
     ],
     notes: [],
+    summary: { counts: [], leftOut: [], warnings: [], facts: [], explain: null },
     report: null,
     ...over,
   };

@@ -277,6 +277,56 @@ fn non_lights_and_solved_lights_are_counted_not_listed() {
 }
 
 #[test]
+fn the_summary_carries_the_values_the_notes_are_built_from() {
+    let rig = rig();
+    light(&rig, "sum", "lights-0001.fits");
+    let trailed = light(&rig, "sum", "lights-0002.fits");
+    mark_trailed(&rig, &trailed);
+    let solved_light = mount_light(&rig, "sum", "lights-0003.fits");
+    store_solve(&rig, &solved_light);
+    put(&rig, "sum", "flat-0001.fits", |f| f.imagetyp = Some(ImageType::Flat));
+    put(&rig, "sum", "flat-0002.fits", |f| f.imagetyp = Some(ImageType::Flat));
+    let view = plan(&rig, args(&rig, "sum"));
+    let s = &view.summary;
+
+    let refused = item(&view, &trailed).locked.clone().expect("the trailed frame is refused");
+    assert_eq!(s.counts, vec![SummaryCount::new(1, "folder", "folders")]);
+    assert_eq!(
+        s.left_out,
+        vec![SummaryCount::new(2, "not a light frame", "not light frames"), SummaryCount::new(1, "already solved", "already solved")]
+    );
+    let label = format!("refused: {refused}");
+    assert_eq!(s.warnings, vec![SummaryCount::new(1, &label, &label)]);
+    assert!(view.notes.iter().any(|n| *n == format!("1 frame refused: {refused}")), "{:?}", view.notes);
+    assert!(view.notes.iter().any(|n| n.starts_with("2 frames are not a light frame")), "{:?}", view.notes);
+    assert_eq!(s.warnings[0].text(), label);
+    assert_eq!(s.left_out[0].text(), "not light frames");
+    let at_a_time = view.notes.iter().find_map(|n| n.strip_prefix("runs ")?.strip_suffix(" frames at a time")).expect("the note").to_string();
+    assert_eq!(
+        s.facts,
+        vec![
+            SummaryFact::new("Star catalog", "installed", FactTone::Ok),
+            SummaryFact::new("Index packs", "0", FactTone::Neutral),
+            SummaryFact::new("At a time", at_a_time, FactTone::Neutral),
+        ]
+    );
+    assert!(s.explain.as_deref().is_some_and(|e| e.starts_with("A solve writes the frame's coordinates")), "{:?}", s.explain);
+}
+
+#[test]
+fn the_summary_says_a_missing_catalog_in_its_facts() {
+    let rig = rig();
+    light(&rig, "sumnocat", "lights-0001.fits");
+    let answer = prepare(&rig.host, args(&rig, "sumnocat"), Resolvers::real()).expect("a plan with every item locked");
+    let id = answer.data["planId"].as_str().expect("a plan id").to_string();
+    let view = rig.host.plans.view(Some(&id)).expect("plan");
+    assert_eq!(view.summary.facts[0], SummaryFact::new("Star catalog", "not installed", FactTone::Warn));
+    assert!(view.notes.iter().any(|n| n == "star catalog: not installed"), "{:?}", view.notes);
+    // Nothing is counted as refused while the catalog is the reason for every lock.
+    assert!(view.summary.warnings.is_empty(), "{:?}", view.summary.warnings);
+}
+
+#[test]
 fn planning_refused_while_a_ui_batch_runs() {
     let rig = rig();
     light(&rig, "busy", "lights-0001.fits");

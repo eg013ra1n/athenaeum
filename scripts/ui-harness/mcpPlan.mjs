@@ -79,6 +79,7 @@ function blackHolePlan() {
   return {
     columns: ['IMAGETYP', 'OBJECT', 'FILTER', 'EXPTIME', 'DATE-OBS', 'INSTRUME', 'size', 'modified'].map((k) => ({ key: k, label: k === 'size' ? 'Size' : k === 'modified' ? 'Modified' : k })),
     title: 'Move duplicate copies to the Black Hole',
+    summary: { counts: [], leftOut: [], warnings: [], facts: [], explain: null },
     notes: ['2 groups of byte-identical copies; the copy in the first folder of each stays'],
     groups: GROUPS.map((g, i) => ({
       id: `group:${i + 1}`,
@@ -120,6 +121,7 @@ function metadataPlan() {
   return {
     columns: [{ key: 'field', label: 'Field' }, { key: 'current', label: 'Now' }, { key: 'proposed', label: 'Proposed' }],
     title: 'Fill in missing metadata',
+    summary: { counts: [], leftOut: [], warnings: [], facts: [], explain: null },
     notes: ['Only the catalog changes: the files on disk are not rewritten, and a frame keeps the value when Athenaeum scans its file again.'],
     groups: [
       {
@@ -178,6 +180,7 @@ function plateSolvePlan() {
   return {
     columns: [{ key: 'object', label: 'Object' }, { key: 'filter', label: 'Filter' }, { key: 'exposure', label: 'Exposure' }, { key: 'coordinates', label: 'Coordinates' }],
     title: 'Plate solve',
+    summary: { counts: [], leftOut: [], warnings: [], facts: [], explain: null },
     notes: [
       '3 of 4 frames can be solved',
       '1 frame refused: the file is on a drive that is not connected',
