@@ -585,10 +585,10 @@ Branch `frame-level-cache` (spec `docs/superpowers/specs/2026-11-08-stacking-fra
 
 Branch `stacking-frames-block` (spec `docs/superpowers/specs/2026-11-06-stacking-frames-block-design.md`, plan `docs/superpowers/plans/2026-11-06-stacking-frames-block-plan.md`). Reference: `docs/stacking/README.md` ("The Frames block"). Code-complete with every task reviewed. The first look at the table was a web build on a catalog copy (set 182, run #8), never the desktop window. Owed by a human, in the desktop app, on real data:
 
-- **The reference strip on a run whose two-pass pick moved the reference.** Open the Stacking tab of a set (or a project) whose selected run moved its reference (set 182, run #8 is one). Line 1 of the strip names both files: `Registration reference, run #N: <file> · <group> · weight … · auto · two-pass moved it from <file>`. Line 2 reads `Next run: auto, picked at run time`, or the pinned file with `manual`. Select another run in Results and line 1 follows it. A native-geometry run reads `per group`, and each group header names its own `Reference:`. Delete this line when it passes.
+- **The reference strip on a run whose two-pass pick moved the reference.** Open the Stacking tab of a set (or a project) whose selected run moved its reference (set 182, run #8 is one). The `Run #N aligned onto` row names the file, then its group, weight and `chosen automatically`, then `The second pass moved it here from <file>`. The `Next run aligns onto` row reads `a frame it picks automatically when it starts`, or the pinned file with `pinned by hand`. Select another run in Results and the first row follows it. A native-geometry run reads `each group's own frame, named in its header`, and each group header names its own `Reference:`. Delete this line when it passes.
 - **The frame-set star seen across the Analysis and Stacking tabs.** Star a frame in the Stacking Frames table: the Reference panel reads Manual, the strip's line 2 names the file, and the Analysis tab shows the same frame's star filled. Click the filled star in Stacking: the stored reference is cleared, Analysis shows no star and the mode is Auto. Star a frame in Analysis, switch the Reference panel to Manual, and see Stacking's star on it. One known difference, not a failure: Manual switched to Auto in the Reference panel keeps the stored frame, so Analysis keeps its star and Stacking shows none. Delete this line when it passes.
 - **Aligned Blink on a frame-set run in the desktop app.** It needs a fresh run, because run #8's working folder is gone: a small run of set 182 (a few L and a few R frames) with its working folder under `~/.athenaeum-acc/` and a `REGISTRY.tsv` row (the disk rule). Select frames of the run and press Blink. Aligned is the default and the stars stand still across the L frames. The R frames show their original, with `original — registration failed in run #N` in the context strip. The switch flips to Original and back. The star and contour buttons are off in Aligned mode. Start a second run of the set, then blink the first run: every entry shows its original with `original — a later run replaced it`. Delete the working folder and its registry row afterwards. Delete this line when it passes.
-- **Blink on a project run with a member's frame missing on this device.** Use a project with some members' frames landed and some not (on the dev catalog the LDN1272 test project's own frames read `own_missing` until the catalog lands them: see that item under Collab wave 6c). Select rows that include a frame that is not on this device and a row whose frame left the project. Blink opens over the rest and the notice reads `N of M frames are not on this device.`, with N counting every row it did not open. `Exclude from next run`, `Include` and `Use as reference` work on the entries that opened, with no Black Hole, and the table shows the change after Blink closes. Delete this line when it passes.
+- **Blink on a project run with a member's frame missing on this device.** Use a project with some members' frames landed and some not. Select rows that include a frame that is not on this device and a row whose frame left the project. Blink opens over the rest and the notice reads `N of M frames are not on this device.`, with N counting every row it did not open. `Exclude from next run`, `Include` and `Use as reference` work on the entries that opened, with no Black Hole, and the table shows the change after Blink closes. Delete this line when it passes.
 
 ### Collab wave 6c — the project's Stacking tab (2026-11-06)
 
@@ -596,7 +596,6 @@ Branch `collab-v3-wave6c` (plan `docs/superpowers/plans/2026-11-05-collab-v3-wav
 
 Run-B re-check on the branch head (backend 0f9ed98a, a catalog copy, 2026-11-06), every bar beside the 2026-10-04 value: the run completes (871 s, was 810 s); WCS probe OSC 0.154 px, mono 0.471 px (0.157 / 0.465); the lowest LN overlap 0.976 mono, 0.997 OSC (0.973 / 0.987); the crop rectangle x0 73, 4402 × 5760 equals CRPIX (same); the statistics rectangles cover ≥ 42 mono and ≥ 51 OSC frames (same); no memory refusal; 0 plate-solve-seed fallbacks (5); no plan or run warning. The masters are `LDN1272-test_Project_None_osc_180s_101x.fits` and `LDN1272-test_Project_L_mono_180s_83x.fits` (one exposure each, so D9 keeps the name). Not a bar: LN against the photometric truth is now a 0.23–0.43 % median gap (was 1.4–9.7 %).
 
-- **The dev catalog lists the LDN1272 test project's 188 own frames as `own_missing`.** The published files are in `/Volumes/bigbase3/Projects/ldn1272-test-project/vilen/` and match the manifest sizes, but the catalog has no landed path for them, so the project's Stacking tab on the dev catalog shows "No frame of this project is on this device yet". The run above repaired its copy only. Check why the catalog lost them (the volume offline at a check?) before the real-window look. Delete this line when the dev catalog shows them landed.
 - **The grid schematic on a real project.** Open the Stacking tab of a real project: every member's frames sit where the sky chart puts them, north up and east left. Edit the scale in the dialog and watch the outlines move. Delete this line when it passes.
 - **The coverage thumbnail after a run.** A deep centre, thin edges, the overhanging frames visible; a `stops` master named `…_<min>-<max>s_…`. Delete this line when it passes.
 - **Confirm a grid as the coordinator with `Use proposal`.** A second member's tab leaves "Waiting for the coordinator to confirm the grid" without reopening the page. Delete this line when it passes.
@@ -617,7 +616,7 @@ PR #22 (#18 phase 3, merged as f21775c4; reference `docs/skychart/README.md`, "A
 web build in headless Chromium. Owed by a human:
 
 - **App smoke on the desktop build** (`npm run tauri dev`, the real dev DB, about 10 minutes). The desktop host was never built in the cycle (its cloud container has no webkit). Pick each NSNS
-  preset under the chart at the North America Nebula: the tiles draw, and the credit's link opens the project page in the system browser. Settings → General → Sky background shows the cache limit,
+  preset under the chart at the North America Nebula: the tiles draw, and the credit's link opens the project page in the system browser. Settings → Sky Chart → Sky background shows the cache limit,
   the total with Clear all, and per survey its servers and pack share; About → Acknowledgements shows the survey credits. Delete this line when it passes.
 - **The cache limit on a real cache.** Set the limit below what a browsed cache already holds (e.g. 1 GB over a few GB of DSS and NSNS tiles): the trim runs in the background, brings the total to
   about 90 % of the limit, removes the longest-unused tiles first and keeps each survey's last offline pack (`pack-tiles.txt`); the Settings total follows. Only the `hips::cache` tests cover it.
@@ -644,13 +643,6 @@ corpus arm and the positive control of the fold are the controller's gates and a
   overlay. The headless half passed on 2026-11-05 (R-OSP-19, phase 4: the commands' rows and the overlay's 500 stars equal `star_probe` bit for bit, a truncated frame gives an error, not
   zeros). Delete this line once someone has looked.
 
-### The robust quad seed and the coverage gate (2026-11-03)
-
-Branch `robust-seed` (reference `docs/stacking/README.md` "Robust quad seed and the coverage gate"). Owed, on the owner's catalog after the update:
-
-- **Re-stack runB / LDN1272 and set 204.** Every mono frame registers with at least half its group's median inliers, and no frame is refused for coverage (no "registration inliers cover … of the overlap"
-  failure in the run log; no "registration kept under half its group's median inliers" warn on a mono group). The first stack after the update re-registers every set once.
-
 ### Plan D — the stacking weight (2026-11-02)
 
 Branch `plan-d` (reference `docs/stacking/README.md` R-OSP-18; after note `docs/superpowers/research/2026-11-02-stacking-weight-after-plan-d.md`). The weight was judged at master level on three real trees and on a
@@ -659,7 +651,7 @@ copy of set 109 through the release web build; no app window was opened by hand.
 - **Results card, SNR gain.** After one stack of a colour frame set the card shows every plane's gain ("SNR gain 7.41 / 7.99 / 7.86×": two decimals, " / " between planes); an older run of the same set shows
   "SNR gain —" with the tooltip "measured with an older formula — re-run to get the SNR gain"; a run under the Noise weight mode shows a gain too, not "—".
 - **Frames table.** A PSF-weight run shows one weight scale per group; a frame that fell out after Register shows no weight (no Measure-time value beside the common-set ones).
-- **The first stack after the update** re-measures, re-registers and re-normalizes every set once (Calibrate stays cached); the second stack of the same set does not. Time the first one on the production catalog.
+- **The first stack after the update** recomputes every set once (since the file identity, Calibrate too: see "Stacking frame-level cache" above); the second stack of the same set does not. Time the first one on the production catalog.
 - **Analysis rows measured before the update are stale at version 8**, as at Plan C's bump: the plate-solve input gate refuses nothing from them until the frame is re-analysed. After re-analysing a set with a
   trailed frame, check that the gate refuses it before solving, with the "Stars are trails" line.
 - **The run log** (athenaeum-logs, one stack): a "weights: frame-common star set" info per plane with `common_stars` and `candidates`; no "registration map may be wrong" warn on a correctly registered set.
@@ -684,23 +676,12 @@ Not yet seen by a human:
   OSC frame's ellipses sit on its stars.
 - **The first start after the update rebuilds `star_metrics`** (every `star_metrics` row is rewritten to the nullable `snr` / `hfr`). On the dev catalog 510 501 stars took 2.25 s with no
   orphans; the production catalog (~40 000 files) has not been tried - expect seconds to a minute.
-- **The plate-solve input gate stays quiet until a frame's Analysis row is re-measured at `MEASURE_VERSION` 7** (`plate_solve/service.rs::input_gate_reason`: a row
-  from an older version refuses nothing). After re-analysing a set with a trailed frame, check that the gate refuses it before solving, with the "Stars are trails" line.
 - **The Blink HTTP cost after Blend.** The m42 measure fell 0.387 → 0.385 s (C9BL) but the web host's Blink call (0.404 s at C9, before Blend) was not re-timed.
 
 ### The Measure aperture correction `c` on undersampled OSC planes (2026-10-20)
 
 Product findings of the Plan A closing diagnostic (note `docs/superpowers/research/2026-10-20-star-measurement-after-plan-a.md`, section 7; first Plan B item). Weights and LN read `c`.
 
-- (a) RESOLVED by Plan B B0 (commits c04ef5df, 4566d628, 20697493; `docs/stacking/README.md` R-OSP-16): `c`, its SE and its star count are kept per plane in the `metrics` payload (`apertureCorrection` / `apertureSe` / `apertureStars`), one info per (group, channel) at a kept level, LN's growth factor, pairs and per-side `c` on the run summary; the four before-runs' `c` tables are recorded there.
-- Dependency (R-PB0-8): met on `plan-b` by B4 (21c151a0: `MEASURE_VERSION` 5); B0 must not reach main without it, and the one merge is the owner's word.
-- (b) Hot pixels feed `c` on an uncorrected R plane: raw 0013 p0 `c` 1.334 vs 2.097 / 2.074 (0004 / 0007); 36 of its 64 `c` stars are hot pixels; the same stars' 0004 → 0013 ratio 0.617 vs 1.007 / 0.970 on p1 / p2 (R weight ×0.40). Stacking is exposed only on a refused hot-pixel map (no `ATH_CHPX`) or a raw-mode measurement.
-- (c) Sharp R, probe path (own β): mosaic 0176 → 0206 p0 ratio 0.863 after `c` vs ~0.985 on G / B (~×0.77 R weight); the product fits at the group β (2.24 on set 204 OSC), so unverified there until (a).
-- (d) Brightness dependence on undersampled R / B: real-star aperture / model 1.57 (top 64) → ~1.2 (rank 500–2000) on raw 0004 p0; G flat (1.23 → 1.18). One `c` per plane overstates fainter stars there.
-- (b)-(d) RESOLVED by Plan B B4 (athenaeum 21c151a0, 71a4a738, 13aee664; `docs/stacking/README.md` R-OSP-16 B4; lab `star-lab/results/plan-b/b4/verdict.md`): (b) the cross-plane point-source screen refuses the hot pixels (0013 p0 screened 1984, 0 hot among its 33 qualifiers; R's `c` ratio 0004 → 0013 0.8615 vs the G / B mean 0.8601, +0.17 %, R-PB4-4); (c) at the group β B4's `c` equals B0's kept `c` (0176 p0 1.934); (d) the brightness trend is a β-bound fit bias, so the sample stays the top 64 by model flux, now at `StarFit.snr` ≥ 20 (PB-13'; every stratified sample moved a lab family away from truth). Both `c = 1` floors judged: floor (i) takes the group channel's median kept `c` (R-PB4-5), floor (ii) is not reached in the product (R-PB4-6). Master level on the three real trees: weights ρ 1.0000, nothing moved.
-- Plan C items from B4 (measured, not fixed): moved to **Plan D** below (Plan C took only the Analysis switch).
-- Plan A debt: the ERP has never run Task 14b's 15 new units. (The Plan B lab hygiene is RESOLVED at B6: lab 4e4e757, fc0a3e2, ecddc4f; `docs/stacking/README.md` R-OSP-16 B6.)
-- Plan B close (B6, 2026-10-24; `docs/stacking/README.md` R-OSP-16 B6). B1 open item 1 (hc11-G parity 1.226 %) is RESOLVED: a probe re-computation artefact (the `.athln` side is the 2026-10-06 before-run's measurement, 384 matches vs the probe's 523; hc11's members are the noisy ones). B1 open item 2 (the ERP's real-set gap and mono / OSC sign flip) stays a recorded limit, not investigated (the ERP is a column, never the referee).
 - **Runner environment (owed to the runner):** the runner box fails the localhost-QUIC tests (`sharing::iroh` 65, `api::collab_live` 45, `collab_v3_live_e2e` 10: "sync control send ... timed out"; `iroh_roundtrip_two_endpoints_localhost` alone too, 31 s on an idle machine). The dev Mac passes them 432 / 0. Not Plan B (no sharing or collab code touched); likely the macOS Local Network permission.
 - Set 204 run 7 LN's own `c` (log `ln scale: per-side ring`): OSC p0 1.00, p1 1.13, p2 1.12, mono 1.13, benign.
 
@@ -720,7 +701,6 @@ Code-complete with green gates on branch `ln-model-fixes` (core all targets 3737
 
 **Measurement/detector cycle (owner-authorized 2026-10-06; spec §15 point 18).** Four items moved out of this cycle, plus an older one:
 
-- **F1's masked far-annulus sky,** with a realism-upgraded synthetic lab. F1's `[6F, 8F]` median sky reads neighbour light on a dense field (lab +0.9 %/px² at about 600 stars/Mpx, +1.6 … +2.2 crowded; this cycle's fields hold 5–40 stars/Mpx and read at most +0.1 %/px²). `ln_annulus_crowding` shows when a field is dense.
 - **The blue-plane offset:** −0.6 % against the truth in both OSC sets.
 - **The PSF fit's background setup** (clipped-median start, region growth).
 - **The β flips in the master FWHM measurement:** `measure_probe`'s `fwhmPx` jumps ±2.6 … 6.7 % when β flips (−6.3 … +6.7 % at checkpoint B); the second-moment read is flat (±0.02 %). A fit whose β differs between two masters is a harness flag, not a reading.
@@ -736,16 +716,11 @@ Code-complete with green gates on branch `ln-model-fixes` (core all targets 3737
   - The limiting factor on a small field is the shared star selection, not the aperture rule.
   - A member excluded for this reason now reads "N of M matched stars fit the common aperture inside the frame (< 20); PSF signal may keep this frame", and the run adds one group warning.
   - Still not measured: real small sensors, heavy binning, and large dither offsets. A per-frame fallback would mix two estimators in one group.
-  - **The owed `c = 1` floor question ("fall back to 1 below 5 growth pairs?") is CLOSED as moot** (Plan B B4, R-PB4-6, 2026-10-23): over 504 cases (set 204 and run B mono crops down to 200 × 150, 2 × 2 binned, masked corners, synthetic pairs) 193 were excluded by `MIN_MATCHES` 20 first and the 294 others kept at least 14 growth pairs, so the floor is not reached in the product; the code stays as built (1–4 pairs keep the factor with a warn, 0 pairs factor 1 with a warn), the warns being the detector for the unmeasured cases above.
-- **The LN estimator, Plan B B3 (2026-10-23; R-PB3-1 / R-PB3-2; `docs/stacking/README.md` R-OSP-16 B3; lab `star-lab/results/plan-b/b3/verdict.md`).** F1 as is stays the default; psfSel on Measure's `c` is rejected; the F1 v2 sky (the masked far-annulus item above, port L3-gc5) is out by its entry test (real 0.582 % against F1's 0.296 %; a cosmic-ray move of 1.35 pp against ±0.53). Nothing changed in the product, so no release line. The measured, not fixed items (F1's synthetic-vs-real size gap, psfSel's entry rule) moved to **Plan D** below; recorded only:
-  - **The set 204 mono referee at n 10–11** (SE median 1.19 %, above its allowance on every counted cell): recorded only; it sets no level (R-PB3-2).
-- **LN's own estimates, Plan B B5 (2026-10-23; R-PB5-1 / -2 / -3 and the owner's word on R11-3; `docs/stacking/README.md` R-OSP-16 B5; lab `star-lab/results/plan-b/b5/verdict.md`).** The F1 branch (module seeds out of scope, `k` and `unverdicted_clip_range` kept); C-9 no change (the proposed annulus mean is measured out); F1 reads B1's 34 nebula-sky cells bit for bit, 4 over the F-13 bar, its recorded limit; R11-3 a recorded limit (3.64 / 5.98). Nothing changed in the product, so no release line. The measured, not fixed item (PSF signal on deep nebula) moved to **Plan D** below.
 
 ### Collab wave 6b-3 — project stacking on the grid (2026-10-03)
 
 Code-complete with green gates: the composed map, both caches, LN on the overlap with the 25 % fallback, the coverage maps, crop, grid output, the seven commands on both hosts, `start_stacking` for a project, and the fake-hub e2e. Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §5.5–§5.9, §9, §15; plan `docs/superpowers/plans/2026-10-03-collab-v3-wave6b3-project-grid-stacking-plan.md`. Reference: `docs/stacking/README.md` (The project path on the grid, wave 6b-3). Owed:
 
-- **Collab-live timing tests and this branch's test load.** A full-suite run on `main` 20c7c1ef (2026-10-04) passed 3540/0 in 168 s, both timing tests included. On this branch the suite takes about 250 s and `clean_exit_kill_and_restart` (3.0 s against 2 s) and `a_stop_is_observed_while_starting_and_while_the_stream_opens` (1.89 s against 1 s) failed in most full runs, each passing solo. The collab-live code is untouched; the heavier 6b-3 stacking tests (the fake-hub e2e, the project runs) load the CPU while the wall-clock tests measure. Owed before the push: keep the two wall-clock tests off a saturated CPU (a shared test lock with the heavy project-run tests, or capped test thread pools) — never a wider bound.
 - **Real-data acceptance (done 2026-10-04, recorded here for the history).** LDN1272-test on copies of the `.dev` catalog, branch head 9f9624ce.
   - Set-204 frame-set regression, a fresh `main` 20c7c1ef run back to back with the branch: IDENTICAL — 6 masters raw-identical, registration rows 565/565, `.athln` 197/197, calibrated frames 302/302.
   - Run A (the reference's own geometry, set 109's config: local normalization off, drizzle off, no crop): PAIRS PASS — median within 0.008 %, MAD 0.12 %, noise 0.54 %, FWHM 0.17 % (limits 0.1/1/2/1 %); calibration equivalence max |delta| = 0 on 3 mono + 3 OSC frames; WCS probe worst 0.133 px OSC, 0.477 px mono (limit 0.5); 184 frames both sides; walls 601 s personal, 690 s project. Reference 28934, 1.887274"/px, rotation 269.5729°, aspect 0.999810, skew 1.39e-04.
@@ -757,13 +732,8 @@ Code-complete with green gates: the composed map, both caches, LN on the overlap
 - **Drizzle coverage resolution.** A drop whose weight is below `W`'s f32 resolution at a pixel is not counted (D9). Expected to be invisible at real weights; look at it if a drizzle coverage map shows holes where the drizzled master has signal. Also watch for Memory refusals on a large grid x k^2 drizzle with coverage on.
 - **Crop disk use.** A crop run holds every output twice for a moment (scratch FITS, then the final file); the plan's space estimate counts it (review M6). A failed finalization leaves `runs/run-<id>-uncropped/` in place on purpose, and no cleanup level removes it.
 - **Run B's "noise per arcsec^2"** is sigma_px * scale (D23), measured on the master cropped to `coverage >= ceil(n/2)`. It is a white-noise equivalent: resampling (and more so drizzle) correlates a stack's pixels, so it understates the true per-area noise by a factor that depends on the scale. Owner ruling owed if another definition is wanted.
-- **LN's relative scale is biased by PSF width — measured on real data (run B, 2026-10-04), shared with frame sets.** Against the PSF-width-unbiased photometric truth (`grid-report.py --ln-truth`, ≤ 0.2 % on synthetic pairs), the applied LN scale falls short by about 4.7 % per px² of PSF-variance difference between a member and its LN reference: ATR2600M normal rows r = −0.93, slope −4.7 %/px² (median gap 6.3 %, up to 10–16 % for members at FWHM 5.5–6 px against a 3.4 px reference); ZWO ASI2600MC Duo the same slope, median 1.4 % (its seeing varied less). Each group's member and reference come from the SAME camera (mono and OSC never share a group), so this is seeing variation within one night, not a cross-instrument effect. The scale code (`stacking::ln::scale`, the target fitted at the reference's β) is shared with frame sets, so a frame set with variable seeing carries the same normalization error. Owed: its own cycle — reproduce on a frame set, find the cause, validate any fix at master level on the whole group. **Resolved by the LN model fixes cycle (2026-10-06):** the cause was the partial-aperture PSF flux, F1 (common aperture, growth curve) reads the truth to a median |gap| of 0.27–0.44 % on all five datasets and is the default (L-24); see the LN model fixes entry above.
 - **`work_usage` does not count `tmp/`.** `Intermediates` and `All` cleanup now remove it, so a cleanup can free more than the Settings readout showed. Showing it needs a TS change (a `tmpBytes` field); not done in this wave.
 - **The plan's stale stages are identity-blind.** After a catalog or plate-solve config change the plan cannot predict a re-solve: Register may re-run while the plan shows it cached, and the "will be plate-solved" warning still appears. Only the Reference check judges with the installed solver identity. A display mismatch only.
-- **Flaky tests under full-suite load (code untouched by this branch; see the load note above).**
-  - `api::collab_live` timing: `clean_exit_kill_and_restart` scenario 3 took 3.0 s against its 2 s limit (three re-gates), and `a_stop_is_observed_while_starting_and_while_the_stream_opens` took 1.89 s against 1 s. Both pass solo. Collab live is untouched by 6b-3.
-  - `landing_free_bytes_is_bounded_by_the_collaboration_root` compares two `free_bytes` reads taken at different moments, so concurrent test writes break it. It passes solo: a test-design flaw, not a product bug.
-  - `a5_a_redesignation_mid_run_refetches_into_the_new_folder` failed once in a full run (Task 2a); it passed alone and in the next full run.
 
 ### Collab wave 6b-2 — the project path up to the geometry (2026-10-03)
 
@@ -786,7 +756,6 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
 - **Unsupported files are excluded, not read.** A tile-compressed FITS, an image in an extension HDU and a distributed XISF leave a project run as "unsupported file", and the plan names them and counts them out of the ≥ 3 rule. Nothing in the owner's data needs them today. A reader for any of them is its own cycle.
 - **A float file in the ADU domain is used in place as if it were 0..1.** Prepare does not look at pixel values, so a float FITS another tool wrote in ADU (0..65535) would be measured and stacked in ADU. Every replica a member publishes is 0..1 by construction; an attested set's float lights are the open case. Check the first real attested float set. If it is in ADU, add a value-range probe to `prepare_action`, in its own cycle.
 - **The 25 % LN-overlap threshold cannot be re-measured on the acceptance set (6b-3).** LDN1272-test's two rigs are two groups whose members share their framing, so nothing falls under 25 %. The fallback is reachable only in synthetic fixtures and the fake-hub e2e. The owner's option is to publish set 195 "Ghost Nebula QHY" (~60 % overlap) into a test-hub project; that exercises partial overlap, not the < 25 % fallback.
-- **Flaky collab-live tests seen in this cycle's full runs (not touched by this branch):** `api::collab_v3_live_e2e_tests::edited_touched_and_deleted_replicas` (failed once even alone, then 5/5), `a_publishing_switch_returns_at_once_while_the_reannounce_retries`, `sharing::iroh::collab_pool::tests::concurrent_gets_for_an_unreachable_provider_share_one_dial`, plus the known `landing_free_bytes_is_bounded_by_the_collaboration_root`.
 
 ### Collab wave 6a — owner smoke (2026-10-02)
 
@@ -827,17 +796,16 @@ mockup in the dev harness (`npm run ui:harness`, spec
 
 ### Hub — test hub and production (2026-10-26)
 
-- **Both hubs run hub `main` `515b604`** (migrations up to 0027: collab v1–v3, the contributor path, the observability
-  goals). Production (`projects.artfrom.space`) was deployed 2026-10-25 with app v0.7.0: preflight
+- **Production runs hub `main` `515b604`** (migrations up to 0027: collab v1–v3, the contributor path, the observability
+  goals), deployed 2026-10-25 with app v0.7.0: preflight
   `package_announcements` = 0, no join requests; after the deploy health ok, the v3 routes answer 401, the portal
   shell loads, migrations 27, `feed epoch` in the journal, no errors in the first 15 minutes. v0.6.4 clients get
-  `409 collab_api_outdated` ("update required") on collaboration calls — the compat gate as designed.
-- **Owed — one collaboration smoke from a v0.7.0 install against production** (sign in, open a project, publish one
-  frame, see it received on a second device).
+  `409 collab_api_outdated` ("update required") on collaboration calls — the compat gate as designed. The test hub
+  runs branch `transparency-loss-metric` since 2026-11-19 (see Collab v3 sub-wave 6.5).
+- **Owed — one collaboration smoke from a release install (v0.7.0 or later) against production** (sign in, open a
+  project, publish one frame, see it received on a second device).
 - **Hub CI runner disk.** The linux runner (62 GB) filled twice from the hub test target; hub `515b604` builds tests
   without debuginfo or incremental state. Watch the next few hub pipelines' disk use.
-- **Repo hygiene.** `Documents/Projects/athenaeum-hub-portal/` is a STALE copy of the portal (still the
-  free-text threshold editor); the deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
 
 ### Collab observability wave 1 + 2 (2026-09-30)
 
@@ -872,9 +840,6 @@ Added by the smoke-fixes cycle (2026-09-30, `docs/superpowers/plans/2026-09-30-c
 - a moderator who is not coordinator sees Moderation, Exclude and Restore, and no false approval line;
 - a member coming online shows within about 2 s without reopening the page.
 
-The hub fix (`holder-device-names`, `b485578`) is on the test hub; hub `main` push and production: see the hub
-state entry above.
-
 Deferred, not built this cycle: Ask to exclude (hub mechanism, publisher side) and per-frame Download /
 Stop keeping in the Library tab (core want/unwant override on top of the replication policy, plus replica
 deletion with the last-copy warning).
@@ -885,75 +850,21 @@ The owner's first hands-on pass over wave 3. Three findings; two fixed, one
 a model gap since built as the contributor path. All of it is merged and on
 the test hub; what is owed below is hands-on checks there.
 
-- **FIXED — "Save as new version" with an untouched draft minted a version.**
-  Portal `ThresholdEditor` disables Save while the parsed draft equals the
-  stored rules ("No changes to save."; `3.50` typed over `3.5` is not a
-  change; add/remove/reorder is). Hub `post_thresholds` answers 409 `rules are
-  identical to the current version` by jsonb equality and mints nothing
-  (`tests/thresholds.rs::identical_rules_are_refused`). Hub `f2c1385`.
-  - The FULL hub suite ran green on 2026-09-28 (`DATABASE_URL=… cargo test`
-    in `athenaeum-hub`, exit 0). Owed: a portal click-through on the test
-    hub: open Admin → Quality
-    thresholds untouched → Save disabled with the hint; edit a value → Save
-    enabled → v+1; post the same rules from a second tab → the `Error: rules
-    are identical…` note.
-- **FIXED — the trailed-frames rule read "Trailed frames · reject if ·
-  reject".** The fixed operand word in the portal editor is now `trailed`
-  (same hub commit); the app's project page renders that rule as `Reject
-  trailed frames` instead of `not_trailed — reject when true` (app
-  `f34cf13d`). Owed: a look at both on the test hub.
-- **BUILT as the contributor path (below) — OSC frames (any frame without a `FILTER` header)
-  could not be published: `filter "" is not in the project dictionary`.** Root
-  cause: the spec §6.2 mapping mechanism — `filter_mappings (instrume,
-  filter_raw) → canonical` per account, the normaliser, the publish-flow modal
-  listing every unmapped raw name with a Select — was deferred by wave 2
-  (plan ruling P3, "belongs to wave 3") and wave 3 became the live exchange
-  and never built it. Today the ONLY path is an exact match against a
-  dictionary canonical or alias (`collab::filters::match_filter`), so an
-  empty `FILTER` (4353 RGGB lights in the dev catalog) and every foreign
-  spelling (`Filter#1`, `Slot 0`, `1`…`7`, `H`, `O`, `S` in the same
-  catalog) fail the gate with no way out; the hub's coordinator remap
-  (`PATCH …/frames/{uuid}` `filterCanonical`) exists but has no app UI and
-  only works AFTER a publish that cannot happen.
-  **Owner ruling 2026-09-28** (also a standing decision above): an unset
-  `FILTER` is a frame state — OSC or mono — not a camera property, so no
-  `channel = "osc"` special case and no OSC-derived canonical; the empty name
-  is simply one more unmapped raw name in the §6.2 flow and the publisher
-  chooses. **Next cycle, in another session — spec amendment to §6.2, then a
-  two-repo plan:**
-  1. App: `filter_mappings` table, the normaliser from §6.2, the modal before
-     publish (`(no FILTER) · <INSTRUME> → [Select]`, `Filter#1 · <INSTRUME>
-     → [Select]`), remembered per account and asked once; the gate reads the
-     mapping, not only the dictionary.
-  2. Hub: a default dictionary entry for unfiltered frames so there is
-     something to map to — proposed canonical `None`, kind `unfiltered`,
-     aliases `nofilter`, `no filter`, `none` — added as a NEW dictionary
-     version to every existing project (the wave-1 seed constant and
-     migration 0022 must stay byte-equal per
-     `tests/dictionary.rs::migration_backfill_json_matches_default_dictionary`,
-     so this is a new migration, not an edit of 0022).
-  3. Portal: a dictionary editor (today the dictionary is only seeded; there
-     is no UI to add `L-eXtreme`, `Dualband`, …), so a coordinator can grow
-     the vocabulary the publishers map into.
-  **Spec written and approved 2026-09-28, scope widened the same day to
-  the whole contributor path after a process audit:**
-  `docs/superpowers/specs/2026-09-28-collab-v3-contributor-path-design.md`
-  (amendment A7 of the per-frame spec) — filter mapping (canonical `None`,
-  kind `unfiltered`, mapping per account e-mail, two `PUT /dictionary`
-  refusals, portal dictionary editor) + R3 attestation seeded in place +
-  a blocker list with actions above the gate table + the frame set's
-  Project block/column + the auto-publish switch for every member; two
-  plans follow (hub+portal, app).
-  Hub+portal plan DONE (`contributor-path-hub`, `2aae815`), merged into hub
-  `main` and live on the test hub (migration 0026). OWED: the portal
-  click-through of acceptance step 1 (the dictionary editor, the two
-  `PUT /dictionary` refusals) on the test hub.
-  - Follow-up (final review of the hub branch, 2026-09-28): "remap them
-    first" names a control neither the portal nor the app has — the
-    coordinator remap (`PATCH …/frames/{uuid}` `filterCanonical`) has no UI;
-    and the in-use count includes `rejected` frames the coordinator never
-    sees in coverage. Owner to rule: a remap action in the portal, or
-    exclude `rejected` from the count.
+- **FIXED — "Save as new version" with an untouched draft minted a version** (hub `f2c1385`, pinned by
+  `tests/thresholds.rs::identical_rules_are_refused`). Owed: a portal click-through on the test hub — Admin →
+  Quality thresholds untouched → Save disabled with "No changes to save."; edit a value → Save enabled → v+1; post
+  the same rules from a second tab → the `Error: rules are identical…` note.
+- **FIXED — the trailed-frames rule read "Trailed frames · reject if · reject"** (hub `f2c1385`, app `f34cf13d`).
+  Owed: on the test hub, the portal editor's fixed operand reads `trailed` and the app's project page reads
+  `Reject trailed frames`.
+- **BUILT as the contributor path — a frame without a `FILTER` header could not be published.** Spec
+  `docs/superpowers/specs/2026-09-28-collab-v3-contributor-path-design.md` (amendment A7 of the per-frame spec); the
+  ruling is the standing decision "An unset `FILTER` is a frame state". Hub+portal plan `contributor-path-hub`
+  (`2aae815`, migration 0026, on the test hub); app plan `contributor-path-app` (`73cc81bb`), merged and pushed with `15799598`.
+  OWED on the test hub: the portal click-through of acceptance step 1 (the dictionary editor, the two
+  `PUT /dictionary` refusals) and the app's acceptance smoke of spec §13 steps 2–8.
+  - Follow-up (final review of the hub branch, 2026-09-28): the in-use count includes `rejected` frames the
+    coordinator never sees in coverage. Owner to rule: exclude `rejected` from the count, or keep it.
   - Follow-up (app final review 2026-09-29): `project_frames_local.landed_path`
     is UNIQUE table-wide, so one attested original can back ONE project's own
     row; a second project's attested publish of the same set is held back
@@ -962,10 +873,6 @@ the test hub; what is owed below is hands-on checks there.
     `set_own_version` writes the winner's content identity against the
     loser's old path. Needs per-project uniqueness (schema change, its own
     cycle).
-  App plan DONE (`contributor-path-app`, `73cc81bb`), merged into `main`:
-  core suite (all targets) + no-default-features check + frontend suite
-  green. OWED: the acceptance smoke of spec §13 steps 2–8 against the test
-  hub.
   - Final-review fix wave (2026-09-29), informational, do not re-flag:
     `meta.calibration` goes stale after an attested↔generated transition
     (versions carry no meta) — informational (F8); a version post could
@@ -975,6 +882,7 @@ the test hub; what is owed below is hands-on checks there.
   - The attestation confirm does not repeat the §6.5 debayered-RGB caveat
     (the help line does).
 - Parked (app final re-review 2026-09-29, rulings in the SDD ledger): the I2 identical-bytes `landed_path` move is not gated on `w.staged == w.target` (only reachable in the C1c race; add the gate when next in that code); the project page's mount effect passes `tab === 'contribute'` where `activeTab` is the rendered tab (a stored, unavailable tab loads without chips until a publish/mapping save); the removal-site `was_external_recipe` skip has no isolating test; the lookup-error warn text says "a files row still references it".
+
 ### Collab v3 wave 3 — the app on the live exchange (2026-09-25 → 27)
 
 Merged into `main` (app branch `collab-v3-wave3`). The app follows the hub
@@ -1106,41 +1014,12 @@ local policy, and the package layer retired. Reference: `docs/transfers/README.m
 (three contexts, three relay-disabled iroh nodes, one fake hub; the plan's nine steps
 and a one-copy disk ledger).
 
-- **Superseded by wave 3** (above): the version poll, the replication pass, the
-  maintenance loop and the loss guard this section describes are gone, and the
-  three-machine acceptance, the click-through and the relevant decisions are
-  re-listed under "Collab v3 wave 3 — the app on the live exchange". What
-  follows is kept for the record.
-- **Three-machine acceptance — replaced by the wave-3 one above**, kept for the record:
-  1. (Dropped: the test hub now runs wave 3.)
-  2. Three machines: this Mac, a second account's device, and the Linux runner or a
-     VM. Test relay. One project with `requireApproval`.
-  3. Walk the §15 subset:
-     - publish 20 frames;
-     - approve with trust;
-     - replication with `filters = [R]`;
-     - 10 more frames after a scan (auto-publish announces within 15 s of the scan's
-       analysis and solve);
-     - delete 3 replicas, then delete 15 at once;
-     - exclusion shows as `Excluded` on B.
-  4. Measure `du -sh` of each Collaboration root and of each working dir's `blobs/`
-     before and after. The expected ledger: the collab root is the payload plus under
-     1 %, and personal `blobs/` is unchanged. Measure the "before" AFTER the stores
-     exist: each store's `blobs.db` is a preallocated 1 MiB redb file whatever it
-     holds (the in-process ledger measures growth over that zero for the same reason —
-     6 MiB of test frames cannot absorb 2 MiB of fixed databases at 1 %).
-  5. Also record the relay-byte fraction (spec §12).
-- **Owed — desktop click-through** of the adapted collab UI (Projects page on
-  frames, "Update required", Receive tab policy, moderation queue, app-root
-  collab notifications R29; the loss banner is gone with wave 3).
-- **Owed before push — the full core suite on an idle machine.**
-  `sync::ingest_tests::ingest_releases_conn_between_frames` failed under full-suite
-  load on the dev Mac and passed alone (adjudicated as load in tasks 2 and 12); it
-  was root-caused as a timing probe and made deterministic on 2026-09-26 (see the
-  Windows section), so it no longer needs an idle machine. Two stacking tests did the same once in task 2
-  (`writer_output_matches_…` with an integer-overflow panic in
-  `geometry/pixel_map.rs`, and `a_tps_run_never_holds_…`) — a load-dependent
-  overflow panic is suspicious and worth one look of its own.
+- **Owed — desktop click-through** of what wave 2 added and wave 3 kept: the "Update required" state against a hub
+  with an older API, and the app-root collab notifications (R29). The Projects page, the Receive tab and moderation
+  were rebuilt later and are listed under wave 3 and the observability waves.
+- **A load-dependent overflow panic, worth one look of its own.** In wave 2's task 2 two stacking tests failed once under
+  full-suite load and passed alone: `writer_output_matches_…` with an integer-overflow panic in
+  `geometry/pixel_map.rs`, and `a_tps_run_never_holds_…`.
 - **Owner decisions to confirm**:
   - **R31** — the project WBPP export takes published ∧ accepted ∧ on disk ∧ not
     awaiting GC, so a contributor's own pending/rejected frames are NOT in it (their
@@ -1164,10 +1043,8 @@ and a one-copy disk ledger).
     the scanner's
     walk drops unreadable entries silently, so the foreign-file prune can drop a row
     for an unreadable-but-present file; the ATH_PRJ divert outside the root can
-    repoint a replica outside it; the `db/collab.rs::upsert_project` doc says "Six
-    columns" and lists nine; the dead `OverlapRule::Skip => {}` arm in
-    `api/sync.rs`; `hub_client.rs` size; the Receive tab's `formatGb` duplicates
-    `formatBytes`; "Your publications" lost its published-at timestamp.
+    repoint a replica outside it; the dead `OverlapRule::Skip => {}` arm in
+    `api/sync.rs`; `hub_client.rs` size.
 - **Do NOT re-flag**:
   - An mtime-only touch of a source or master sends no new version (P19): the frame
     is regenerated, the bytes come out identical, only the recipe is stored. A new
@@ -1205,9 +1082,8 @@ holders" section).
   §11)"`); the row deleted, 0022 re-run, success — `project_frames` present, `package_announcements`
   gone. Full hub suite green at `6761b09` (202/0), portal suite green at `ac704d5` (214/0), tsc +
   build clean, hub release build 0 warnings.
-- **On the test hub** (`project_frames` holds 188 rows on 2026-10-25). Owed: one authenticated
-  `GET /api/v1/me/project-versions` with a device token answers `200` with a list, never an error;
-  the retired `POST …/projects/{id}/announcements` answers `409 {"error":"collab_api_outdated"}`.
+- **On the test hub** (`project_frames` holds 188 rows on 2026-10-25). Owed: the retired
+  `POST …/projects/{id}/announcements` answers `409 {"error":"collab_api_outdated"}`.
 - **Do NOT re-flag**: an app older than the collab v3 client getting `409 collab_api_outdated` on
   every collaboration call from a wave-1-or-later hub is the compat gate as designed (spec §11),
   not a hub regression.
@@ -1255,8 +1131,6 @@ like against a same-evening Tier A build re-run (−33 %), every gated §8 row P
 - **Owner decision owed (carried from Tier A)**: the rustafits submodule (its own public repo)
   carries pre-existing third-party product names in comments/docs — does the 2026-09-19 no-names
   rule extend to it?
-- **Nothing pushed**: `main`, `perf/stacking-tierC` and rustafits `perf/stacking-kernels` — push
-  on the owner's word.
 
 Decisions, do NOT re-flag:
 
@@ -1285,11 +1159,7 @@ Decisions, do NOT re-flag:
 - **Owner smokes**: the Register panel note replacing the "Write registered frames" toggle
   (`dc9f6287`); the plan gate's `space` refusal wording on a small working folder (the registered
   artifacts now count — ≈ the calibrated footprint again).
-- **Owner decision owed**: the rustafits submodule (its own public repo) carries pre-existing
-  third-party product names in comments/docs (`background.rs`, `mod.rs`, `metrics.rs`,
-  `stretch.rs`, `fits.rs`, the CLI) — does the 2026-09-19 no-names rule extend to it?
-- **Nothing pushed**: `main` (Tier A merged), `perf/stacking-tierA`, rustafits
-  `perf/stacking-kernels` — push on the owner's word.
+- **Owner decision owed**: the rustafits product-name question, kept once under Stacking perf Tier C.
 
 ### Settings redesign (2026-09-18)
 
@@ -1300,8 +1170,8 @@ gate is green (`npm test` — registry coverage, hook, search and panel tests �
 `npx tsc --noEmit`, the Rust defaults pins); what is owed is the desktop
 click-through, since only a static check of the served bundle stood in for it:
 
-- **Each of the seven tabs opens and renders its sections** — General · Blink ·
-  Analysis · Plate Solving · Calibration · Stacking · Transfers — with no Save
+- **Each of the eight tabs opens and renders its sections** — General · Blink ·
+  Analysis · Plate Solving · Calibration · Stacking · Sky Chart · Transfers — with no Save
   button and no "saved" banner anywhere on the page; Account and Sync sit under
   Transfers; Frame set grouping comes before Session detection on General.
 - **A text field commits on blur and on Enter, Escape restores** — e.g.
@@ -1403,14 +1273,12 @@ carrying the updater — so the feature cannot be exercised end to end until
 the tag AFTER it. The astronet parser switch (§6.6) is done: deployed
 2026-09-18, the first `/updates/latest.json` check already counted.
 
-**Owner smokes owed, on the next tag (v0.6.5 or a beta of it):**
+**Owner smokes owed, on any update from one tag to the next (v0.7.0 on 2026-10-25 and v0.7.1 on 2026-11-07 have shipped since; no run is written up):**
 
-- On every OS a v0.6.4 install shows the new version in the dialog →
-  install → restart → *What's new in <version>*; `spctl --assess --type
-  execute` passes on the UPDATED macOS bundle (proves the plugin's
-  replacement is still a validly signed/notarized `.app`, not just the
-  original install); a Docker container still on 0.6.4 shows *available*
-  with `docker pull vsharifov/athenaeum:<version>`.
+- On macOS an older install shows the new version in the dialog → install → restart → *What's new in <version>*.
+- `spctl --assess --type execute` passes on the UPDATED macOS bundle (proves the plugin's replacement is still a
+  validly signed/notarized `.app`, not just the original install); the same flow on Windows and Linux; a Docker
+  container on an older version shows *available* with `docker pull vsharifov/athenaeum:<version>`.
 - The adoption dashboard shows the new version's pings through the
   `/updates/latest*.json` paths.
 
@@ -1451,10 +1319,7 @@ kind list, the XISF attributes. Not run by hand:
   normalization) / Integrate, each live; after a `deleteIntermediates`
   run the cacheable entries show `stale` and are inert, the footer says
   "Nothing is cached — the run starts from Calibrate", and the plan
-  warning line names the run and the policy. The owner's own set (109,
-  prod catalog) is in exactly that state: run 1 cleaned it under v0.6.2,
-  so its `metrics` rows are gone too and the line will NOT say
-  "measurements are still cached" until a v0.6.3 run has measured it.
+  warning line names the run and the policy.
 - **Deferred, named:** `metrics` rows kept by `deleteIntermediates` are a
   behaviour change for `get_stacking_work_usage`'s consumers only in the
   sense that nothing counts them (they hold no bytes) — verify the
@@ -1462,18 +1327,10 @@ kind list, the XISF attributes. Not run by hand:
   `cleanup_stale_note` keys on the LAST run only: a `deleteIntermediates`
   run followed by a failed keepAll run yields no line (the staleness is
   then two runs old); acceptable, the stage rows still show `Stale`.
-- **CI:** the release commit `f6312aef` was RED on both jobs — not on the
-  grid pin (green on both platforms) but on two WALL-CLOCK probes the
-  shared runners cannot honour: `local_normalization_sidecars_are_cached_
-  on_the_second_run` (a fully-cached `stage_output` took 1.03 s against a
-  1 s ceiling, Linux) and `sync_e2e::bidirectional_simultaneous_transfers_
-  both_complete` (announce→fetching gap 346 ms against a 300 ms ceiling,
-  Windows). Both ceilings are now logged-not-asserted under `CI`, the
-  functional pins (`cached_ln`, the relative serialization assertions)
-  untouched — the `ingest_releases_conn_between_frames` convention. The
-  follow-up commit on `main` after the tag is the first candidate for a
-  green reading; confirm both jobs on it. If another timing probe
-  surfaces, gate it the same way rather than widening a ceiling.
+- **CI convention (v0.6.3):** a wall-clock probe the shared runners cannot honour is logged, not asserted, under
+  `CI`, with the functional pins untouched (`local_normalization_sidecars_are_cached_on_the_second_run`,
+  `sync_e2e::bidirectional_simultaneous_transfers_both_complete`; the `ingest_releases_conn_between_frames`
+  convention). If another timing probe surfaces, gate it the same way rather than widening a ceiling.
 
 ### Stacking M4d — outputs (2026-09-14)
 
@@ -1493,25 +1350,8 @@ thumbnail has resolved instead of firing both at once. Everything below is
 what the four task reports left open, plus what the acceptance run itself
 left behind.
 
-- **Acceptance run (Task 6), what it settled and what it owes:** Bayer drizzle
-  CLOSES the M3/M4a residual "OSC drizzled G/B ≈ 10–12 % broader than the
-  external tool's" — against the external CFA drizzle of the same frames our G
-  is +0.5 %, B +0.2 %, R +4 %. **Ruling R-T6-1:** the plan's colour-fringing
-  target "R/B centroid offset from G ≤ 0.1 px" is unattainable on this data by
-  construction — the external tool's own CFA drizzle measures 0.28 / 0.21 px and
-  the VNG-debayered control 0.15 / 0.13 — so it is re-stated as "offsets and
-  per-plane FWHM ratios within 25 % of the external CFA drizzle's, same
-  directions" (ours 0.36 / 0.23 px, R/G 1.24 vs 1.20): PASS. The broader R
-  plane in colour-pure drizzle (R/G 1.24 here, 1.20 external, 1.06 debayered) is
-  therefore a property of the data (a wavelength-dependent displacement that
-  registration on the G-dominated frame cannot follow), not of the deposit —
-  bounded by the 0.036 px same-star G agreement with the debayered control.
-  Cost if the ruling is wrong: a real sub-0.1-px deposit bias hiding under a
-  data-borne 0.3-px chromatic offset. **The XISF smoke FAILED on the owner's
-  machine (2026-09-15):** the external tool refused the v0.6.2 masters —
-  "Missing bounds Image attribute, which is mandatory for a floating point
-  real image" — fixed in v0.6.3 (`bounds="0:1"` + `imageType`, see the
-  Stacking v0.6.3 subsection). **OWNER SMOKES OWED:** the
+- **Acceptance run (Task 6, `docs/superpowers/research/2026-09-14-m4d-acceptance-run.md`), what it
+  owes:** **OWNER SMOKES OWED:** the
   desktop click-through of the preset menu (save-as inline form, apply disabled
   during a run, delete confirm, the `'<name>'` label) and of the results-card
   thumbnails (master + drizzle, both groups). Not exercised by the run:
@@ -1523,7 +1363,7 @@ left behind.
   reported on a colour-pure drizzle. Deferred minor: the stacking paths gate
   reuses `api::sync::validate_transfer_dir`, so its overlap warning about the
   stacking OUTPUT folder reads "transfer folder overlaps a scan root"
-  (`api/sync.rs:267`) — log wording, pre-existing since Plan 5a.
+  (`api/sync.rs` ~278) — log wording, pre-existing since Plan 5a.
 
 - **Task 1 (Bayer drizzle):** `DrizzleStats` carries no Bayer marker of its
   own — a run's provenance says whether it drizzled Bayer-pure only through
@@ -1589,10 +1429,6 @@ left behind.
   cause a spurious server-side rejection); and no test exercises real
   contention on the presets' `BEGIN IMMEDIATE` transaction (`begin_presets_
   write`).
-- **Cross-task:** the headless check (`cargo check -p athenaeum-core
-  --no-default-features`) does not exercise `integration/` or `stacking/` —
-  already recorded under Stacking M4c below; one pointer is enough rather
-  than repeating the finding.
 
 ### Stacking M4c — algorithms (2026-09-12)
 
@@ -1704,12 +1540,6 @@ left behind.
   with `background_grid` and `ln_probe`) lives in prose at three sites rather than in a
   shared helper. A comment in the noise-control test misattributes σ_z ≈ 0.03 to the
   `NOISE` level where `LOUD` is what produces it.
-- **CLOSED (Task 0, comment-only, final fix wave):** `structure_map`'s 0.56× → 0.60×
-  for the sensitivity-0.5 plane-anchored ratio (the figure the adjacent pin states);
-  the noise-comparison doc table's `all` row now says its min/max ARE the group
-  extremes and names the source report's 2.2443 as the transcription typo it is; and
-  the "correlated noise" attribution is hedged to "consistent with", the evidence
-  being a ratio rather than a measurement of the correlation.
 - **Deferred (whole-branch review, recorded by the final fix wave, not fixed):**
   - a TPS `transform_json` is ≈ 100 KB per frame (≈ 40 MB of `registration_results`
     rows per 368-frame `tps` run), and with `writeRegisteredFrames` on it becomes an
@@ -1736,11 +1566,10 @@ left behind.
     be renamed without a migration. A project-wide naming cleanup with its own cycle,
     not an M4c item; M4c's own code names nothing.
 - **Owed (owner), after Task 7:** an own look at the acceptance masters and the desktop
-  click-through of what M4c added to the tab — the Measure panel's `Seed detector`
-  select (with the two peak-only controls disabled under `structure`), the Integrate
-  panel's three new rejection methods and its Large-scale rejection block, the Register
-  panel's `tps` distortion with `TPS smoothing (λ)` and `Local distortion loop`, and
-  the Normalize panel's now-live `localScale` checkbox. Task 7 will add its own lines.
+  click-through of what M4c added to the tab — the Integrate panel's three new rejection
+  methods and its Large-scale rejection block, the Register panel's `tps` distortion with
+  `TPS smoothing (λ)` and `Local distortion loop`, and the Normalize panel's `Local scale`
+  checkbox. (The Measure panel's seed detector is the seed source select since f3f9fc91.)
 - **Task 7 acceptance (2026-09-12, `docs/superpowers/research/2026-09-12-m4c-acceptance-run.md`):**
   the Winsorized deferral of spec §6.3 is CLOSED — the real master dark rebuilt with the
   new reference loop sits inside every target (median −0.002 %, MAD +0.010 %, hot pixels
@@ -1749,8 +1578,8 @@ left behind.
     p10 0.67× the baseline's, second-moment width +3.4 %; Winsorized 4/3: p10 0.73×,
     width +1.0 %; mono, G/B and the brightest stars untouched) — a Chauvenet / k·σ high
     side on the skewed per-pixel distribution of VNG-interpolated cores. Both are opt-in
-    and outside the Auto ladder at n ≥ 20; the Integrate panel's help owes a caution for
-    colour data (final fix wave), a star-protecting variant is a later item.
+    and outside the Auto ladder at n ≥ 20; the Integrate panel's help now cautions on
+    colour data (`IntegratePanel.tsx`), a star-protecting variant is a later item.
   - **ESD rejects 0.15 %** on this set (the brief's 1–5 % was a guess; the trail is
     still rejected) and every non-linear-fit method's master is 6–13 % quieter than the
     5.0/3.5 linear fit's — the Auto linear-fit thresholds cost real noise for their 3 %;
@@ -1774,15 +1603,11 @@ left behind.
     (≈ +8 min on 160 OSC frames — the plane loop is outer); integration holds one
     inverse grid per frame for a whole group (≈ 0.9 GB at 208 frames). No measurable
     FWHM gain over `polynomial3` on this field.
-  - **The M3 drizzled OSC G/B FWHM residual (≈ +6 % ratio) is unchanged under TPS** —
-    it is not registration distortion; the VNG planes / M4d's Bayer drizzle own it.
   - **LN local scale's ripple is measurable:** +3.1 / +5.4 % master noise on G/B at
     σ_z ≈ 0.10 (R −3.4 %), corners < 0.1 %, LN time within noise; the math reference's
     surface-simplification step (or a node-count-aware λ) is the follow-up before the
     flag can default on. The barycentre pass won on 6.2 % of channel-frames.
-  - **Owed (owner):** the desktop click-through of the Integrate / Register / Normalize /
-    Measure panels (two Chrome instances were connected to the automation; a static
-    check of the served bundle stands in), and the Windows/Linux runs.
+  - **Owed (owner):** the Windows/Linux runs; the desktop click-through is the bullet above.
 
 ### Stacking M4b — mixed pixel scales (2026-09-11)
 
@@ -1796,16 +1621,6 @@ coRegistered | native` mode where native gives each group its own reference and
 geometry with no cross-group registration; and the frames table's `WCS` chip on a
 seeded row's registration model.
 
-- **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4b-acceptance-run.md`, 7 runs on the
-  30-best-frames subsets of sets 166 / 108 / 195, both modes): every cross-scale group registered onto
-  its reference through the plate-solve seed at the expected scale — ×0.207 and ×1.457 (set 166, rms
-  ≤ 0.61 px), ×0.502 (set 108, rms ≤ 1.02 px, same-star centroids 0.15 px between the bin-1 and bin-2
-  masters), ×1.285 (set 195's 352-mm subsets, rms ≤ 0.64 px); native mode gave each group its own
-  reference, geometry and WCS with `ATH_RGEO = 'native'`; the reference's own master is bit-identical
-  between the modes on all three sets; the header convention R-M4b-1 held on 1 781 solved frames
-  (0 beyond 2 %). Four acceptance-time fixes landed: T6-F1 (plan-gate readiness and scale statistics
-  over the included frames, R-T6-6/7), R-T6-4 (seed trigger 5 %), R-T6-9 (the plate-solve seed as the
-  fallback after a quad failure), R-T6-8/10 recorded as data/target rulings.
 - **Residual (registration):** the quad seed does not converge for an H-alpha field against an O-filter
   reference of the SAME rig (set 195: 14 of 30 frames, both field rotations, all well solved) — now
   carried by the plate-solve fallback (R-T6-9); the quad matcher's own robustness across filters is an
@@ -1813,9 +1628,6 @@ seeded row's registration model.
 - **Policy (M4c):** `failOnMaxRms` off lets a registration with rms 44 px into the stack with only a
   warning (one H frame of set 195, an H→O quad mis-match that "succeeded") — treat an RMS beyond a hard
   multiple of `maxRmsPx` as a registration FAILURE so the fallback and the exclusion apply.
-- **Calibration matcher (not M4b):** frame geometry (`NAXIS1/2`) is not a matching parameter — a
-  same-camera calibration set from another ROI links (set 166: a 9576×6388 flat matched a 6384×4258
-  master dark) and the master build refuses it at run time; the plan gate cannot see it.
 - **Noise:** the run emits one `skipped: fewer than 3 included frames` warning per excluded group (14 on
   set 195) — fold them into one line.
 - **Deferred (final review, R-T6-9 re-review):** a solved reference frame that needs fresh registration
@@ -1846,8 +1658,6 @@ seeded row's registration model.
   `resolve_group_geometry`'s per-group `frame_calibration_hash` at stage 4: one
   group's unresolvable hash takes the run down with it, for the same reason and with
   the same fix if one is wanted.
-- **Deferred (final review):** `run.rs` is ≈ 13 000 lines after M4b — a
-  `stacking/register_stage.rs` extraction is due before M4c adds to stage 5.
 - **Deferred (final review):** `GroupsTable.tsx` hand-mirrors `SCALE_TOLERANCE = 1.25`.
 - **Deferred (final review):** `groups.rs::median_f64` duplicates `weights::median_of`.
 - **Deferred (final review):** `align.rs::gate_center` reconstructs the applied gate
@@ -1863,44 +1673,18 @@ seeded row's registration model.
 
 M4a (plan `docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`, rulings R-M4a-1…19): noise-relative measurement seeds (`measurement.detectionSigma`, calibrated to 20 on 368 external frames) with the reference's adaptive region and inner-region acceptance; the linear-fit rejection on the minimum-absolute-deviation line; the two-pass registration-reference pick; the LN row-evaluator weight table and borrowed reference planes; the XISF reader fixes; `PSF_FIT_VERSION` in both artifact hashes. **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4a-acceptance-run.md`, run 13 on LDN 1272, 56 min): mono meets every target (fits 1.02/1.05/0.82 of the external tool's, PSFSW ρ 0.92, top-20 18/20, drizzle ratio equal to the external's to 0.6 %); rejected fractions 2.985 % / 2.733 % at the Auto 5.0/3.5 with `LINEAR_FIT_SIGMA_SCALE` left at 1.0; the two-pass pick switched the reference to the frame the owner had pinned by hand (`_0073`); LN 368/368 with no exclusions (the R-M4a-15 recompute confirmed against M2's numbers). Two residuals, both OSC, recorded below.
 
-- **Residual (OSC weights):** the bright, undersampled night (measured FWHM 1.55 px)
-  still yields 3.8–7× the reference's fit count (run 13: OSC PSFSW ρ 0.93/0.82/0.68 against ≥ 0.90; top-20 15/20 passes; the M3 night inversion is gone); two bounded experiments with a
-  3×3 median pre-filter on the detection image (rulings R-M4a-13/-14, the
-  option ships off) closed ~20 % of it and cost the blue channel's weight
-  correlation. Closing it properly needs the rest of the reference's
-  structure-map front end (math reference §5.1) — tracked as M4c Task 0
-  (the structure-map seed detector, ruling R-M4c-11), not a smoke.
-- **Plan-gate note (twoPass).** With `reference.twoPass` on,
-  `plan.rs::compute_register_stale` (ruling R-M4a-6) correctly reports
-  Register "not stale" against a switched reference — but the two-pass
-  pick's own dry pass over the reference's group is NOT cached and reruns
-  on every run regardless of staleness (bounded, ≈ 1–2 min on the LDN 1272
-  acceptance set). Informational, not a bug.
-- **Cleanup candidate: `MeasureOptions.min_snr ≤ 10` is inert.** The
-  detector's own gate (`snr > 10`) already excludes everything a
-  `min_snr` at or below 10 would filter, so such a config value changes
-  nothing measurable; noted for a future cleanup pass, not fixed here.
-- **Two pre-existing load flakes seen during M4a** (both pass in
-  isolation, both predate this cycle — not new regressions): the M3
+- **A pre-existing load flake seen during M4a** (passes in isolation, predates this cycle): the M3
   drizzle `rej/run-<id>` cleanup-on-cancel tests (a race that Task 4's
-  RAII de-registration change narrows but does not fully close) and
-  `sync::ingest_tests::ingest_releases_conn_between_frames` (a
-  self-documented timing probe; made deterministic 2026-09-26).
+  RAII de-registration change narrows but does not fully close).
 
-- **Residual (OSC drizzle):** the G/B drizzled/undrizzled FWHM ratio is 0.836 / 0.819 against
-  the external tool's 0.744 / 0.737 under the same (new) estimator — +12 / +11 %, the M3 residual
-  unchanged in kind; the weight change moved it by ≈ +1 %. Ruled out so far: rejection strength,
-  level conventions, registration distortion, weights. M4c: a common-subset drizzle with both weight
-  sets and a star-by-star comparison across magnitudes (the external R plane is its own outlier, ecc 0.41).
 - **Integrate stage cost (ruling R-M4a-17):** run 13's Integrate took 10.85 min for both groups against
   run 11's clean 5.01 (2.2×, at the revisit threshold) — measured while the controller's own comparison
   scripts ran on the same machine, so an upper bound; the mono group alone was 1.7×. The hybrid option
   (the robust line on the first rejection iteration, least squares afterwards) is the recorded fallback if a
   clean re-measurement exceeds 2×.
 - **Owed:** the owner's own click-through on the desktop build of the Measure panel's `Detection threshold (σ)`
-  field, the Reference panel's `Two-pass pick` checkbox and the results card's `switched from #… (two-pass)` line
-  (the acceptance verified them through the LAN browser's accessible text only — the narrow viewport refused
-  screenshots again).
+  field, the Reference panel's `Two-pass pick` checkbox and the provenance modal's `switched from #… (two-pass)` line
+  (the acceptance verified them through the LAN browser's accessible text only).
 - **Owed:** one M4a run on Windows and one on Linux (the web build) — the two-pass dry pass and the `.rej`
   sink condition are the platform-neutral parts; nothing platform-specific was added, but the suite's two
   load flakes (below) are worth watching there.
@@ -1918,13 +1702,6 @@ drizzled/undrizzled FWHM ratio equals the external reference's to 0.05 %; the
 OSC master now matches the external one in level and background shape after
 Task 8. Two misses/gaps recorded below.
 
-- **M4 item: the OSC drizzle is ≈ 10 % broader than the external one by the
-  fitted FWHM** (G/B ratios 0.83 / 0.82 vs 0.75 / 0.74; re-measured under the M4a estimator in run 13: 0.836 / 0.819 vs 0.744 / 0.737 — see the M4a section) while the same bright
-  stars' half-maximum radii are 4 % smaller in ours and our drizzle carries
-  26 % less pixel-scale noise at equal master noise. Ruled out: rejection
-  strength, level conventions, registration distortion (polynomial3 changed
-  nothing). Compare star by star across magnitudes; drizzle a common subset
-  with both weight sets.
 - **Provisional constant:** `DRIZZLE_SECONDS_PER_PLANE_AT_2X = 1.2` in
   `stageSummary.ts` measured 1.17 s (mono) / 1.33 s (OSC per plane) on a
   clean 16 GB machine — keep; revisit with the M4 performance work.
@@ -1959,13 +1736,8 @@ misses, both recorded below.
   `PreparedReferenceChannel` so it now runs once per group, not once per
   frame — the per-frame PSF cost roughly halves. Re-measure this stage's
   wall time in M3's acceptance run.
-- **Owed:** the owner's own click-through of the LN block on the desktop
-  build (Enable local normalization, scale, reference frames, the `local`
-  rejection-normalization option and its 5 s reset notice, `LN: n/m frames`
-  in Results, the frames table's Scale column) and of the narrow-layout
-  toolbar: the acceptance click-through at ≈ 1250 CSS px found the toolbar
-  row overflowing the pane (fixed in the M2 final fix wave — the fix is what
-  needs the owner's eyes at 1024 px).
+- **Owed:** the owner's eyes on the Stacking tab's toolbar at 1024 px: the acceptance click-through at ≈ 1250 CSS px
+  found the toolbar row overflowing the pane, fixed in the M2 final fix wave.
 - **Owed:** one LN run on Windows and one on Linux (the web build) — the
   sidecar writer's tmp-and-rename and the fan-out's RAM probe are the
   platform-specific parts.
@@ -1998,11 +1770,8 @@ catalog on 2026-09-10 — note `docs/superpowers/research/2026-09-09-m1-acceptan
 masters are bit-identical to Checkpoint B's; one attributed miss: measurement
 time on a 16 GB machine). The tab is enabled for every build since that run.
 
-- **Owed:** the owner's own click-through of the Stacking tab on the desktop
-  build — board/inspector/frames/results, Settings → Stacking, the frame-set
-  page showing no Registration tab — and specifically the **narrow-layout
-  check** (disclosure, toolbar wrap, table overflow at ≈ 900 px), which the
-  acceptance harness could not take (its browser window ignored resizes).
+- **Owed:** the narrow-layout check of the Stacking tab on the desktop build (disclosure, toolbar wrap,
+  table overflow at ≈ 900 px), which the acceptance harness could not take (its browser window ignored resizes).
 - **Owed:** one stacking run on Windows and one on Linux (the web build) — the
   acceptance run was macOS only; the folder validator, `statvfs` free space
   (now also `GetDiskFreeSpaceExW` — stacking's `space` blocker is live on
@@ -2012,19 +1781,6 @@ time on a 16 GB machine). The tab is enabled for every build since that run.
   Collaboration root on a network share — `GetDiskFreeSpaceExW` has never run
   on Windows; confirm the refusal figure and that an unreadable share stays
   "unknown" (run proceeds, `warn!`).
-- **Follow-up (web host, found by the acceptance run):** opening Settings →
-  General wedged the web server — `api::account::build_status` →
-  `TokenStore::load` → `SecKeychainFindGenericPassword` blocked in a mach
-  call to `securityd` (a macOS Keychain access prompt for an unsigned binary)
-  and every other request queued behind it. The account status must not block
-  the runtime: `spawn_blocking` around the keychain read and no shared lock
-  held across it.
-- **Follow-up (M4 performance):** the measurement fan-out admits
-  `clamp(RAM/4 ÷ working set, 1, cores)` frames and the working set is
-  8 planes × W × H × 4 B — on a 16 GB machine that is one OSC frame at a
-  time (10.4 min for 368 frames vs the 5 min target). Measurement needs far
-  fewer than eight full planes resident; recompute the working set from what
-  the measurement actually holds.
 - **Minor UI (fix wave of Plan 5b):** Integrate summary "min weight 0.01" for
   0.005; master labels with 0-decimal exposures ("Flat 0s"); the Integrate
   row's "N / M · P %" pairing a per-group count with the current group's band
@@ -2072,20 +1828,15 @@ Pinned by six collector/summary tests, one send test and two readiness tests.
 - Frame-set **Send** in the sets mode after a build: the receiver must get the
   raw frames (regrouped into sets by its post-package pass), not the master.
 
-The companion Folders change from the same evening — the Missing Files panel
-now also renders on ROLE folders, so a master whose file is gone can be purged
-(and its raw set un-superseded) from the Calibration Library rather than only
-from Equipment — is verified and needs no smoke: click-through on the web build
-plus the owner's own confirmation in the desktop dev build, 2026-09-08.
-
 ### Plate-solve input-gate controls (2026-09-07)
 
 Backlog v0.5.6 item 1: `PlateSolveSettingsPanel.tsx` grew a **Batch Concurrency** field and an **Input Gate** section. Plan C C7 (2026-10-24) removed
 the two number fields (`input_max_eccentricity`, `input_min_trail_r2`) and the 0.85 / 0.65 defaults: the gate is the `trailed` verdict alone
 (`docs/platesolving/input-and-acceptance-gates.md`), so the old "tightening will not catch more trailed frames" copy is gone with them.
 
-- Still by hand: the `input_gate_enabled` toggle survives Save → restart and **Reset to Defaults** puts it back on; a frame the gate refused attempts a
-  solve again once the toggle is off. (The gate stays quiet on a frame until its Analysis row is re-measured at `MEASURE_VERSION` 7.)
+- Still by hand: the `input_gate_enabled` toggle (Settings → Plate Solving → Input Gate) survives a restart and its
+  field reset puts it back on; a frame the gate refused attempts a solve again once the toggle is off. (The gate stays
+  quiet on a frame until its Analysis row is re-measured at `MEASURE_VERSION` 8.)
 - Owner decision, 2026-09-07: the acceptance-gate group (`blind_*`, 7 fields) stays unexposed. It is what stopped v0.5.5's false 16–193x solutions from
   reaching the catalog. If it ever surfaces it belongs behind an "Advanced" disclosure naming the failure it prevents.
 
@@ -2104,12 +1855,6 @@ freezing at 100%).
 
 - An SSD-backed scan root has no measurement at all yet (spec §9 lists it as an open
   item) — the storage class D3 expects to benefit most from read concurrency.
-- **`cargo check -p athenaeum-core --no-default-features` does NOT compile
-  `integration/`** — the whole module is `#[cfg(feature = "render")]`-gated at
-  `lib.rs`, so a green headless check exercises none of this cycle's code and must
-  never be cited as evidence for it. `masters.rs` and `light_cal.rs` are render-gated
-  the same way. The only headless-relevant gate for this cycle is that `--workspace`
-  still builds and tests green with the feature on (the default).
 - After the 2026-09-06 review fixes: start a 100-frame build, press Cancel
   mid-read, and confirm the row stops within a couple of seconds (it used to
   wait for the whole band, ~6 s on the owner's 30-frame dark, ~25 s on a
@@ -2338,9 +2083,9 @@ column on the next start (`DROP INDEX` then `DROP COLUMN`, guarded on
 `2026-08-27-duplicate-detection-design.md` was corrected: its stated reader
 (`has_duplicate`) never read the column.
 
-- First launch on the production catalog: the log carries one
-  `dropped write-only column` line, `SELECT COUNT(*) FROM pragma_table_info('files')
-  WHERE name='metadata_hash'` is 0, and the second launch logs nothing.
+- On the production catalog the write-only column is gone: `SELECT COUNT(*) FROM pragma_table_info('files')
+  WHERE name='metadata_hash'` is 0 (the build that drops it logs one `dropped write-only column` line at its first
+  launch and nothing after).
 - Files page, Missing-metadata view and the Duplicates view open and list
   frames — the shared file+frame projection lost a column and every index
   after it moved down by one.
@@ -2545,9 +2290,7 @@ triggers, verified empirically.
 
 Consolidated list in the audit's "Post-cycle follow-ups"
 (`research/2026-08-02-calibration-audit.md`). A Windows smoke is owed for the
-filename-claim and rename path. Note that `LIGHT_CAL_ENGINE_VERSION` went 1 → 2, so
-every previously calibrated light derives *stale* — intended, and a release note is
-owed for it.
+filename-claim and rename path.
 
 ### Cross-platform path fixes — 2026-07-30
 
@@ -2565,8 +2308,7 @@ Status section. What remains is the manual smoke list:
 
 The eleven-item checklist in `plans/2026-07-29-folders-screen-redesign.md`, plus three
 from the minors fix wave: an unknown-kind row stays visible; a toggle failure raises a
-dialog rather than a banner; the tinted checkbox renders. The artfrom.space guide still
-describes the old tab name.
+dialog rather than a banner; the tinted checkbox renders.
 
 ### Carried from the memory cleanup (2026-10-23) — older cycles' residue
 
