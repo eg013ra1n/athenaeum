@@ -253,6 +253,8 @@ fn everything_scope(c: &Cat, scan_root: &str) -> Scope {
         date_to: Some("2024-12-31".into()),
         year: Some(2024),
         state: Some(vec![FrameState::Catalog, FrameState::SoftArchived, FrameState::Zipped, FrameState::BlackHole]),
+        tab: None,
+        files: None,
     }
 }
 
@@ -506,6 +508,7 @@ fn hint_formats_and_nearest() {
         condition: "filter",
         given: "Hb".into(),
         existing: existing.iter().map(|s| s.to_string()).collect(),
+        looked_up: true,
     };
     assert_eq!(hints_text(&[h(&[])]), "no filter 'Hb'; nothing like it in the catalog");
     assert_eq!(hints_text(&[h(&["Ha"])]), "no filter 'Hb'; the catalog has 'Ha'");
@@ -628,4 +631,288 @@ fn malformed_night_is_an_error_in_words() {
 fn unknown_scope_field_is_refused() {
     let err = serde_json::from_str::<Scope>(r#"{"exposure": 300}"#).expect_err("refused").to_string();
     assert!(err.contains("exposure"), "{err}");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Exact files, a frame-set handle and a tab
+// ---------------------------------------------------------------------------------------------------------------
+
+fn files_scope(entries: &[String]) -> Scope {
+    Scope { files: Some(entries.to_vec()), ..Default::default() }
+}
+
+impl Cat {
+    /// The line an answer prints for a file, read through the same query an answer uses.
+    fn printed(&self, file_id: i64) -> crate::catalog_query::FileLine {
+        let filter = ScopeFilter { sql: "fr.file_id = ?".to_string(), params: vec![Value::Integer(file_id)] };
+        let frames = crate::catalog_query::fetch_scoped_frames(&self.db.conn(), &filter).expect("frames");
+        crate::catalog_query::file_line(&frames[0])
+    }
+
+    fn mark_custom(&self, set_id: i64) {
+        self.db.conn().execute("UPDATE frames_set SET is_custom = 1 WHERE id = ?1", [set_id]).expect("custom");
+    }
+}
+
+#[test]
+fn files_by_path_and_handle_select_exactly_those() {
+    let c = cat();
+    let (f1, _) = c.add(&light("M31/a.fits"));
+    let (f2, _) = c.add(&light("M31/b.fits"));
+    c.add(&light("M31/c.fits"));
+    let by_path = files_scope(&[c.path("M31/a.fits")]);
+    assert_eq!(c.scoped_names(&by_path), vec!["a.fits".to_string()]);
+    let both = files_scope(&[format!("file:{f1}"), c.path("M31/b.fits")]);
+    assert_eq!(c.scoped_names(&both), vec!["a.fits".to_string(), "b.fits".to_string()]);
+    assert_eq!(c.resolve(&both).description, "2 named files");
+    let one = files_scope(&[format!("file:{f2}")]);
+    assert_eq!(c.resolve(&one).description, "1 named file");
+}
+
+#[test]
+fn empty_files_list_matches_nothing() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    let r = c.resolve(&files_scope(&[]));
+    assert!(r.filter.is_none(), "an empty files list is never the whole catalog");
+    assert_eq!(r.hints.len(), 1);
+    assert_eq!(r.hints[0].condition, "file");
+    assert!(r.hints[0].looked_up);
+    assert!(hints_text(&r.hints).contains("files names no file"), "{}", hints_text(&r.hints));
+    // Absent `files` is still no filter.
+    assert_eq!(c.scoped_names(&Scope::default()).len(), 1);
+}
+
+#[test]
+fn blank_files_entries_match_nothing() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    for entries in [vec![String::new()], vec!["   ".to_string(), "\t".to_string()]] {
+        let r = c.resolve(&files_scope(&entries));
+        assert!(r.filter.is_none(), "{entries:?}");
+        assert_eq!(r.hints.len(), 1, "{entries:?}");
+        assert!(hints_text(&r.hints).contains("files names no file"), "{entries:?}");
+    }
+    // A blank entry beside a real one is dropped; the real one still narrows.
+    let mixed = files_scope(&[String::new(), c.path("M31/a.fits")]);
+    assert_eq!(c.scoped_names(&mixed), vec!["a.fits".to_string()]);
+}
+
+#[test]
+fn files_named_as_an_answer_prints_them() {
+    let c = cat();
+    let (loose, _) = c.add(&light("M31/loose.fits"));
+    let (zipped, _) = c.add(&light("M31/zip_member.fits"));
+    c.add(&light("M31/other.fits"));
+    c.in_zip(zipped);
+    let sep = std::path::MAIN_SEPARATOR;
+    let zip = c.path("a.zip");
+    c.db.conn()
+        .execute(
+            "UPDATE files SET path = ?2, archive_path_in_zip = 'zip_member.fits' WHERE id = ?1",
+            rusqlite::params![zipped, format!("{zip}!{sep}zip_member.fits")],
+        )
+        .expect("zip path");
+    let entries: Vec<String> = [loose, zipped]
+        .into_iter()
+        .map(|id| {
+            let line = c.printed(id);
+            format!("{}{}{}", line.folder, sep, line.file_name)
+        })
+        .collect();
+    assert_eq!(c.scoped_names(&files_scope(&entries)), vec!["loose.fits".to_string(), "zip_member.fits".to_string()]);
+}
+
+#[test]
+fn files_named_by_printed_name_when_it_differs_from_the_path() {
+    let c = cat();
+    let (id, _) = c.add(&light("M31/stored_as.fits"));
+    c.add(&light("M31/other.fits"));
+    c.db.conn()
+        .execute("UPDATE files SET filename = 'Shown.fits' WHERE id = ?1", [id])
+        .expect("rename display name");
+    let line = c.printed(id);
+    assert_eq!(line.file_name, "Shown.fits");
+    let entry = format!("{}{}{}", line.folder, std::path::MAIN_SEPARATOR, line.file_name);
+    assert_ne!(entry, c.path("M31/stored_as.fits"), "only the printed-name lookup can find it");
+    assert_eq!(c.scoped_names(&files_scope(&[entry])), vec!["Shown.fits".to_string()]);
+}
+
+#[test]
+fn files_hint_lookups_are_capped() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    let entries: Vec<String> = (0..7).map(|i| c.path(&format!("gone{i}/a.fits"))).collect();
+    let r = c.resolve(&files_scope(&entries));
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints.len(), 7);
+    for (i, h) in r.hints.iter().enumerate() {
+        assert_eq!(h.condition, "file");
+        assert_eq!(h.given, entries[i]);
+        if i < 5 {
+            assert!(h.looked_up, "hint {i} looks the name up");
+            assert_eq!(h.existing, vec![c.path("M31/a.fits")], "hint {i} looks the name up");
+        } else {
+            assert!(!h.looked_up, "hint {i} is past the lookup cap");
+            assert!(h.existing.is_empty(), "hint {i} is past the lookup cap");
+        }
+    }
+    let text = hints_text(&r.hints);
+    assert!(text.contains(&format!("no file '{}' (not compared with the catalog: only the first 5 unknown files are)", entries[6])), "{text}");
+    assert!(!text.contains(&format!("no file '{}'; nothing like it", entries[6])), "{text}");
+}
+
+#[test]
+fn files_listed_twice_give_one_hint_and_one_lookup() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    let typo = c.path("gone/a.fits");
+    let padded = format!("  {typo} ");
+    let r = c.resolve(&files_scope(&[typo.clone(), padded, typo.clone()]));
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints.len(), 1, "one hint for one typo");
+    assert_eq!(r.hints[0].given, typo);
+    // Four other unknown entries after the duplicates: the duplicates used one lookup, not three.
+    let mut entries = vec![typo.clone(), typo.clone(), typo.clone()];
+    entries.extend((0..4).map(|i| c.path(&format!("gone{i}/a.fits"))));
+    let r = c.resolve(&files_scope(&entries));
+    assert_eq!(r.hints.len(), 5);
+    assert!(r.hints.iter().all(|h| h.looked_up), "the duplicates did not eat the lookup budget");
+}
+
+#[test]
+fn files_narrow_with_other_fields() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    c.add(&Fx { path: "M31/b.fits", imagetyp: Some(ImageType::Dark), ..Default::default() });
+    let entries = [c.path("M31/a.fits"), c.path("M31/b.fits")];
+    let s = Scope { frame_type: Some("lights".into()), ..files_scope(&entries) };
+    assert_eq!(c.scoped_names(&s), vec!["a.fits".to_string()]);
+}
+
+#[test]
+fn files_one_bad_entry_matches_nothing_and_hints() {
+    let c = cat();
+    c.add(&light("M31/a.fits"));
+    c.add(&light("M31/b.fits"));
+    let typo = c.path("M32/a.fits");
+    let r = c.resolve(&files_scope(&[c.path("M31/b.fits"), typo.clone()]));
+    assert!(r.filter.is_none(), "one bad entry empties the whole scope");
+    assert_eq!(r.hints.len(), 1);
+    assert_eq!(r.hints[0].condition, "file");
+    assert_eq!(r.hints[0].given, typo);
+    assert_eq!(r.hints[0].existing, vec![c.path("M31/a.fits")]);
+    // A handle no file has.
+    let r = c.resolve(&files_scope(&["file:99999".to_string()]));
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints[0].condition, "file");
+}
+
+#[test]
+fn files_over_cap_refused() {
+    let c = cat();
+    let many: Vec<String> = (0..2001).map(|i| format!("file:{i}")).collect();
+    let err = resolve_scope(&c.db.conn(), &files_scope(&many)).expect_err("over the cap");
+    assert!(err.to_string().contains("at most 2000 files"), "{err}");
+    let ok: Vec<String> = (0..2000).map(|i| format!("file:{i}")).collect();
+    assert!(resolve_scope(&c.db.conn(), &files_scope(&ok)).is_ok());
+}
+
+#[test]
+fn frame_set_handle_selects_one_of_two_same_named() {
+    let c = cat();
+    let (_, a) = c.add(&light("one/a.fits"));
+    let (_, b) = c.add(&light("two/b.fits"));
+    let s1 = c.set_of(Some("LDN 1272"), false, &[a]);
+    let s2 = c.set_of(Some("LDN 1272"), false, &[b]);
+    assert_eq!(frame_set_handle(s1), format!("set:{s1}"));
+    assert_eq!(parse_frame_set_handle(&frame_set_handle(s2)), Some(s2));
+    assert_eq!(parse_frame_set_handle("LDN 1272"), None);
+    let by = |id: i64| Scope { frame_set: Some(frame_set_handle(id)), ..Default::default() };
+    assert_eq!(c.scoped_names(&by(s1)), vec!["a.fits".to_string()]);
+    assert_eq!(c.scoped_names(&by(s2)), vec!["b.fits".to_string()]);
+    assert_eq!(c.resolve(&by(s2)).description, format!("frame set set:{s2}"));
+    // The name still takes both.
+    let named = Scope { frame_set: Some("LDN 1272".into()), ..Default::default() };
+    assert_eq!(c.scoped_names(&named), vec!["a.fits".to_string(), "b.fits".to_string()]);
+}
+
+#[test]
+fn frame_set_handle_unknown_hints() {
+    let c = cat();
+    let (_, a) = c.add(&light("one/a.fits"));
+    c.set_of(Some("LDN 1272"), false, &[a]);
+    let r = c.resolve(&Scope { frame_set: Some("set:9999".into()), ..Default::default() });
+    assert!(r.filter.is_none());
+    assert_eq!(r.hints.len(), 1);
+    assert_eq!(r.hints[0].condition, "frame set");
+    assert_eq!(r.hints[0].given, "set:9999");
+    assert!(r.hints[0].existing.is_empty());
+}
+
+#[test]
+fn tab_stage_selects_frames_of_non_custom_unarchived_sets() {
+    let c = cat();
+    let (_, w) = c.add(&light("w/wip.fits"));
+    let (_, s) = c.add(&light("s/stage.fits"));
+    let (_, a) = c.add(&light("a/archived.fits"));
+    let wip = c.set_of(Some("W"), false, &[w]);
+    c.mark_custom(wip);
+    c.set_of(Some("S"), false, &[s]);
+    c.set_of(Some("A"), true, &[a]);
+    let tab = |t| Scope { tab: Some(t), ..Default::default() };
+    assert_eq!(c.scoped_names(&tab(FrameSetTab::Stage)), vec!["stage.fits".to_string()]);
+    assert_eq!(c.scoped_names(&tab(FrameSetTab::Wip)), vec!["wip.fits".to_string()]);
+    assert_eq!(c.scoped_names(&tab(FrameSetTab::Archive)), vec!["archived.fits".to_string()]);
+    assert_eq!(c.resolve(&tab(FrameSetTab::Stage)).description, "in Stage");
+}
+
+#[test]
+fn frame_set_and_tab_are_one_set() {
+    let c = cat();
+    let (_, f) = c.add(&light("x/both.fits"));
+    c.set_of(Some("X"), false, &[f]);
+    let wip = c.set_of(Some("Y"), false, &[f]);
+    c.mark_custom(wip);
+    let scope = |name: &str| Scope { frame_set: Some(name.into()), tab: Some(FrameSetTab::Wip), ..Default::default() };
+    // X is a Stage set; the frame also sits in WIP set Y, but no one set is both X and WIP.
+    assert_eq!(c.scoped_names(&scope("X")), Vec::<String>::new());
+    assert_eq!(c.scoped_names(&scope("Y")), vec!["both.fits".to_string()]);
+    // By handle the same.
+    assert_eq!(c.scoped_names(&scope(&frame_set_handle(wip))), vec!["both.fits".to_string()]);
+    // `tab` alone still finds the frame.
+    let alone = Scope { tab: Some(FrameSetTab::Wip), ..Default::default() };
+    assert_eq!(c.scoped_names(&alone), vec!["both.fits".to_string()]);
+}
+
+#[test]
+fn tab_archive_wins_over_custom() {
+    let c = cat();
+    let (_, a) = c.add(&light("a/archived.fits"));
+    let set = c.set_of(Some("A"), true, &[a]);
+    c.mark_custom(set);
+    let tab = |t| Scope { tab: Some(t), ..Default::default() };
+    assert_eq!(c.scoped_names(&tab(FrameSetTab::Archive)), vec!["archived.fits".to_string()]);
+    assert_eq!(c.scoped_names(&tab(FrameSetTab::Wip)), Vec::<String>::new());
+    assert_eq!(c.scoped_names(&tab(FrameSetTab::Stage)), Vec::<String>::new());
+}
+
+#[test]
+fn describe_scope_names_files_and_handle() {
+    let s = Scope {
+        frame_set: Some("set:231".into()),
+        tab: Some(FrameSetTab::Wip),
+        files: Some(vec!["a".into(), "b".into()]),
+        ..Default::default()
+    };
+    assert_eq!(describe_scope(&s), "frame set set:231, in WIP, 2 named files");
+    assert_eq!(describe_scope(&Scope { files: Some(vec!["a".into()]), ..Default::default() }), "1 named file");
+}
+
+#[test]
+fn describe_scope_counts_a_file_listed_twice_once() {
+    let twice = Scope { files: Some(vec!["a".into(), " a ".into(), "a".into()]), ..Default::default() };
+    assert_eq!(describe_scope(&twice), "1 named file");
+    let two = Scope { files: Some(vec!["a".into(), "b".into(), "a".into()]), ..Default::default() };
+    assert_eq!(describe_scope(&two), "2 named files");
 }

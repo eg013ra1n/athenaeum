@@ -79,12 +79,27 @@ fn light(rig: &Rig, dir: &str, name: &str) -> Fx {
     })
 }
 
-fn located_light(rig: &Rig, dir: &str, name: &str) -> Fx {
+/// A light whose header holds mount coordinates but that has no stored plate solve.
+fn mount_light(rig: &Rig, dir: &str, name: &str) -> Fx {
     put(rig, dir, name, |f| {
         f.imagetyp = Some(ImageType::Light);
         f.ra = Some(10.68);
         f.dec = Some(41.27);
     })
+}
+
+/// A minimal stored plate solve for the frame (the app's own "solved").
+fn store_solve(rig: &Rig, fx: &Fx) {
+    let database = rig.ctx.db.get().expect("db");
+    let conn = database.conn();
+    conn.execute(
+        "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2, matched_stars, \
+         total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec, field_rotation_deg, solve_time_ms, \
+         catalog_used, algorithm_used, solved_at) \
+         VALUES (?1, 1, 1, 10, 10, 0.001, 0, 0, 0.001, 50, 60, 0.3, 0.5, 1.0, 0, 10, 'c', 'a', '2026-03-01T23:00:00Z')",
+        [fx.frame_id],
+    )
+    .expect("a stored solve");
 }
 
 fn dir_of(rig: &Rig, dir: &str) -> PathBuf {
@@ -239,20 +254,21 @@ fn eligible_subset_is_n_of_m() {
 }
 
 #[test]
-fn non_lights_and_located_lights_are_counted_not_listed() {
+fn non_lights_and_solved_lights_are_counted_not_listed() {
     let rig = rig();
     let todo = light(&rig, "mixed", "lights-0001.fits");
-    let located = located_light(&rig, "mixed", "lights-0002.fits");
+    let solved_light = mount_light(&rig, "mixed", "lights-0002.fits");
+    store_solve(&rig, &solved_light);
     let flat = put(&rig, "mixed", "flat-0001.fits", |f| f.imagetyp = Some(ImageType::Flat));
     let view = plan(&rig, args(&rig, "mixed"));
     let ids: Vec<&str> = view.groups.iter().flat_map(|g| g.items.iter()).map(|i| i.id.as_str()).collect();
-    assert_eq!(ids, vec![format!("item:{}", todo.file_id)], "only the light that misses coordinates is listed");
+    assert_eq!(ids, vec![format!("item:{}", todo.file_id)], "only the light with no stored solve is listed");
     assert!(view.notes.iter().any(|n| n == "1 of 1 frames can be solved"), "{:?}", view.notes);
     assert!(view.notes.iter().any(|n| n.contains("1 frame is not a light frame and is left out")), "{:?}", view.notes);
-    assert!(view.notes.iter().any(|n| n.contains("1 light frame already has coordinates and is left out")), "{:?}", view.notes);
-    let _ = (located, flat);
+    assert!(view.notes.iter().any(|n| n.contains("1 light frame already has a plate solve and is left out")), "{:?}", view.notes);
+    let _ = (solved_light, flat);
 
-    // onlyUnsolved false lists the located light too.
+    // onlyUnsolved false lists the solved light too.
     let mut all = args(&rig, "mixed");
     all.only_unsolved = false;
     let view = plan(&rig, all);
@@ -308,12 +324,13 @@ fn missing_catalog_locks_every_item() {
 fn a_request_with_nothing_to_solve_is_refused_and_keeps_the_waiting_plan() {
     let rig = rig();
     light(&rig, "keep", "lights-0001.fits");
-    located_light(&rig, "keep2", "lights-0001.fits");
+    let solved = mount_light(&rig, "keep2", "lights-0001.fits");
+    store_solve(&rig, &solved);
     put(&rig, "darks", "dark-0001.fits", |f| f.imagetyp = Some(ImageType::Dark));
     let waiting = plan(&rig, args(&rig, "keep"));
 
-    let located = prepare(&rig.host, args(&rig, "keep2"), installed()).err().expect("refused").to_string();
-    assert!(located.contains("already has coordinates") && located.contains("nothing was planned"), "{located}");
+    let refused = prepare(&rig.host, args(&rig, "keep2"), installed()).err().expect("refused").to_string();
+    assert!(refused.contains("already has a plate solve") && refused.contains("nothing was planned"), "{refused}");
     let darks = prepare(&rig.host, args(&rig, "darks"), installed()).err().expect("refused").to_string();
     assert!(darks.contains("no light frame") && darks.contains("nothing was planned"), "{darks}");
     let none = prepare(
@@ -402,6 +419,7 @@ fn a_batch_that_takes_the_slot_after_ready_ends_the_plan_failed() {
             ItemInfo { frame_id: a.frame_id, file_name: a.name.clone(), folder: text(&dir_of(&rig, "race")) },
         )]),
         resolve: installed(),
+        only_unsolved: true,
     };
     assert!(applier.ready(&rig.host).is_ok(), "an idle slot is ready");
     // A batch takes the slot between `ready` and the start: the start's own refusal stays the safety net.
@@ -563,38 +581,173 @@ fn cancel_solve_stops_only_its_run() {
 }
 
 #[test]
+fn default_plans_lights_with_header_coordinates_but_no_solve() {
+    let rig = rig();
+    let mount = mount_light(&rig, "mount", "lights-0001.fits");
+    let bare = light(&rig, "mount", "lights-0002.fits");
+    let (view, answer) = plan_answer(&rig, args(&rig, "mount"));
+    for fx in [&mount, &bare] {
+        let i = item(&view, fx);
+        assert!(i.selected && i.locked.is_none(), "{} is proposed", fx.name);
+        assert_eq!(i.evidence.as_deref(), Some("no plate solve is stored for this frame"));
+    }
+    // The header's position is shown, and is the solver's hint.
+    assert_eq!(item(&view, &mount).values["coordinates"], "RA 10.6800, Dec 41.2700");
+    assert_eq!(item(&view, &bare).values["coordinates"], "none");
+    assert_eq!(answer.data["solvable"], 2);
+}
+
+#[test]
+fn default_skips_lights_with_a_stored_solve() {
+    let rig = rig();
+    let todo = mount_light(&rig, "solved", "lights-0001.fits");
+    let done = mount_light(&rig, "solved", "lights-0002.fits");
+    store_solve(&rig, &done);
+    let view = plan(&rig, args(&rig, "solved"));
+    let ids: Vec<&str> = view.groups.iter().flat_map(|g| g.items.iter()).map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, vec![format!("item:{}", todo.file_id)]);
+    assert!(view.notes.iter().any(|n| n.contains("1 light frame already has a plate solve and is left out")), "{:?}", view.notes);
+}
+
+#[test]
+fn all_solved_refusal_names_plate_solve() {
+    let rig = rig();
+    for n in 0..3 {
+        let fx = light(&rig, "all-solved", &format!("lights-000{n}.fits"));
+        store_solve(&rig, &fx);
+    }
+    let said = prepare(&rig.host, args(&rig, "all-solved"), installed()).err().expect("refused").to_string();
+    assert!(
+        said.contains("every light frame in the scope (")
+            && said.contains(") already has a plate solve (3); pass onlyUnsolved false to solve them again; nothing was planned"),
+        "{said}"
+    );
+    assert!(!said.contains("coordinates"), "{said}");
+}
+
+#[test]
+fn only_unsolved_false_plans_solved_lights() {
+    let rig = rig();
+    let todo = light(&rig, "again", "lights-0001.fits");
+    let done = light(&rig, "again", "lights-0002.fits");
+    store_solve(&rig, &done);
+    let mut all = args(&rig, "again");
+    all.only_unsolved = false;
+    let view = plan(&rig, all);
+    for fx in [&todo, &done] {
+        let i = item(&view, fx);
+        assert!(i.selected && i.locked.is_none(), "{} is proposed", fx.name);
+        assert!(i.evidence.is_none(), "{:?}", i.evidence);
+    }
+    assert!(!view.notes.iter().any(|n| n.contains("plate solve and")), "{:?}", view.notes);
+}
+
+#[test]
+fn apply_skips_frame_solved_since_plan() {
+    let _lock = crate::api::collab_autopublish::test_lock();
+    let rig = rig();
+    let a = light(&rig, "since", "lights-0001.fits");
+    let b = light(&rig, "since", "lights-0002.fits");
+    let view = plan(&rig, args(&rig, "since"));
+    // A solve lands (the user solved one frame in Athenaeum) while the plan waits.
+    store_solve(&rig, &b);
+    let done = apply(&rig, &view.plan_id, proposal(&view));
+    assert_eq!(done.state, PlanState::Applied);
+    let report = done.report.clone().expect("a report");
+    assert_eq!((report.applied.len(), report.skipped.len(), report.failed.len()), (1, 1, 0), "{report:?}");
+    assert_eq!(report.applied[0].file_name, a.name);
+    assert_eq!(report.skipped[0].file_name, b.name);
+    assert_eq!(report.skipped[0].reason, "solved since the plan was made");
+    let run_id = report.run_id.clone().expect("the run's id");
+    let outcome = finished(&rig, &run_id);
+    crate::api::collab_autopublish::reset_dirty_state_for_test();
+    assert_eq!(outcome.solved + outcome.failed, 1, "only the unsolved frame went to the run");
+    let said = crate::mcp::tools::plans::status_answer(&done);
+    assert!(said.text.contains("started a plate solve of 1 frame (run"), "{}", said.text);
+    assert!(said.text.contains("solved since the plan was made"), "{}", said.text);
+}
+
+#[test]
+fn apply_with_every_frame_solved_since_starts_no_run() {
+    let _lock = crate::api::collab_autopublish::test_lock();
+    let rig = rig();
+    let a = light(&rig, "all-since", "lights-0001.fits");
+    let b = light(&rig, "all-since", "lights-0002.fits");
+    let view = plan(&rig, args(&rig, "all-since"));
+    store_solve(&rig, &a);
+    store_solve(&rig, &b);
+    let done = apply(&rig, &view.plan_id, proposal(&view));
+    assert_eq!(done.state, PlanState::Applied, "{:?}", done.state);
+    let report = done.report.clone().expect("a report");
+    assert!(report.run_id.is_none(), "{report:?}");
+    assert_eq!((report.applied.len(), report.skipped.len(), report.failed.len()), (0, 2, 0), "{report:?}");
+    assert!(rig.ctx.active_plate_solves.lock().unwrap().is_empty(), "no run holds the slot");
+    assert!(busy_refusal(&rig.host).is_none(), "the solve slot is free");
+    let said = crate::mcp::tools::plans::status_answer(&done);
+    assert!(
+        said.text.contains("did not start a plate solve: every selected frame was solved since the plan was made"),
+        "{}",
+        said.text
+    );
+    crate::api::collab_autopublish::reset_dirty_state_for_test();
+}
+
+#[test]
+fn re_solve_plan_solves_solved_frames_again() {
+    let _lock = crate::api::collab_autopublish::test_lock();
+    let rig = rig();
+    let done_light = light(&rig, "resolve", "lights-0001.fits");
+    store_solve(&rig, &done_light);
+    let mut all = args(&rig, "resolve");
+    all.only_unsolved = false;
+    let view = plan(&rig, all);
+    let done = apply(&rig, &view.plan_id, proposal(&view));
+    assert_eq!(done.state, PlanState::Applied, "{:?}", done.state);
+    let report = done.report.clone().expect("a report");
+    assert_eq!((report.applied.len(), report.skipped.len(), report.failed.len()), (1, 0, 0), "{report:?}");
+    let run_id = report.run_id.clone().expect("a run started");
+    finished(&rig, &run_id);
+    crate::api::collab_autopublish::reset_dirty_state_for_test();
+}
+
+/// `PLAN_ITEM_CAP + 1` lights in one transaction, each with `set` applied to its frame.
+fn bulk_lights(rig: &Rig, dir: &str, set: impl Fn(&mut Frame)) {
+    let database = rig.ctx.db.get().expect("db");
+    let conn = database.conn();
+    let tx = conn.unchecked_transaction().expect("transaction");
+    for n in 0..=PLAN_ITEM_CAP {
+        let name = format!("lights-{n:05}.fits");
+        let path = rig.base.join("nas").join(dir).join(&name);
+        let file_id = db::insert_file(
+            &tx,
+            &File {
+                id: None,
+                path: text(&path),
+                filename: name,
+                size: 4,
+                modified_at: Utc::now(),
+                format: FileFormat::FITS,
+                created_at: Utc::now(),
+                content_hash: None,
+                archived_in_operation: None,
+                archive_zip_path: None,
+                archive_path_in_zip: None,
+                uuid: None,
+                updated_at: None,
+            },
+        )
+        .expect("file row");
+        let mut frame = Frame { file_id, imagetyp: Some(ImageType::Light), ..Default::default() };
+        set(&mut frame);
+        db::insert_frame(&tx, &frame).expect("frame row");
+    }
+    tx.commit().expect("commit");
+}
+
+#[test]
 fn an_unscoped_request_over_the_cap_reads_no_frame() {
     let rig = rig();
-    {
-        let database = rig.ctx.db.get().expect("db");
-        let conn = database.conn();
-        let tx = conn.unchecked_transaction().expect("transaction");
-        for n in 0..=PLAN_ITEM_CAP {
-            let name = format!("lights-{n:05}.fits");
-            let path = rig.base.join("nas").join("many").join(&name);
-            let file_id = db::insert_file(
-                &tx,
-                &File {
-                    id: None,
-                    path: text(&path),
-                    filename: name,
-                    size: 4,
-                    modified_at: Utc::now(),
-                    format: FileFormat::FITS,
-                    created_at: Utc::now(),
-                    content_hash: None,
-                    archived_in_operation: None,
-                    archive_zip_path: None,
-                    archive_path_in_zip: None,
-                    uuid: None,
-                    updated_at: None,
-                },
-            )
-            .expect("file row");
-            db::insert_frame(&tx, &Frame { file_id, imagetyp: Some(ImageType::Light), ..Default::default() }).expect("frame row");
-        }
-        tx.commit().expect("commit");
-    }
+    bulk_lights(&rig, "many", |_| {});
     super::super::reset_catalog_value_reads();
     let said = prepare(&rig.host, PlanPlateSolveArgs { scope: Scope::default(), only_unsolved: true }, installed())
         .err()
@@ -602,6 +755,23 @@ fn an_unscoped_request_over_the_cap_reads_no_frame() {
         .to_string();
     assert!(said.contains("at most 2 000"), "{said}");
     assert_eq!(super::super::catalog_value_reads(), 0, "the cap is counted before any frame is read");
+    assert!(rig.host.plans.view(None).is_none(), "no plan began");
+}
+
+#[test]
+fn unscoped_default_over_cap_refused() {
+    // Mount coordinates in every header and no stored solve: all of them are unsolved, so the cap sentence answers
+    // (the old test of "coordinates missing" would have planned nothing here).
+    let rig = rig();
+    bulk_lights(&rig, "many-solved", |f| {
+        f.ra = Some(10.68);
+        f.dec = Some(41.27);
+    });
+    let said = prepare(&rig.host, PlanPlateSolveArgs { scope: Scope::default(), only_unsolved: true }, installed())
+        .err()
+        .expect("refused over the cap")
+        .to_string();
+    assert!(said.contains("2001 items") && said.contains("at most 2 000") && said.contains("narrow the scope"), "{said}");
     assert!(rig.host.plans.view(None).is_none(), "no plan began");
 }
 

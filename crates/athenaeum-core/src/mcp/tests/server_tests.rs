@@ -213,11 +213,11 @@ fn data_of(r: &CallToolResult) -> Value {
     r.structured_content.clone().expect("a structured half")
 }
 
-/// Every object with a `handle` also has `fileName` and `folder`.
+/// Every object with a file handle also has `fileName` and `folder` (a frame set's `set:<id>` handle names itself).
 fn assert_handles_are_named(v: &Value, whence: &str) {
     match v {
         Value::Object(map) => {
-            if map.contains_key("handle") {
+            if map.get("handle").is_some_and(|h| !h.as_str().is_some_and(|h| h.starts_with("set:"))) {
                 assert!(map.contains_key("fileName") && map.contains_key("folder"), "{whence}: a handle without its file name and folder: {v}");
             }
             for (k, x) in map {
@@ -553,7 +553,9 @@ async fn frame_set_question_equals_its_page() {
         assert_eq!(g["totals"]["integrationS"], *seconds);
     }
     let said = text_of(&r);
-    assert!(said.contains("Frame set 'IC 5146 set', as its page shows it: 6 frames, integration 30 min."), "{said}");
+    let set_id: i64 = rig.host.reader().expect("reader").query_row("SELECT id FROM frames_set WHERE name = 'IC 5146 set'", [], |r| r.get(0)).expect("set id");
+    assert!(said.contains(&format!("Frame set 'IC 5146 set' (Stage, set:{set_id}), nights 2024-10-05 … 2024-10-05, camera CamA, telescope ScopeA, as its page shows it: 6 frames, integration 30 min.")), "{said}");
+    assert_eq!(data["frameSet"]["handle"], format!("set:{set_id}"));
     assert!(said.contains("1 frame of this set is in the Black Hole and not counted (5 min)."), "{said}");
     assert!(!said.contains("35 min"), "never the stored column: {said}");
     assert_eq!(data["frameSet"]["blackHoleLeftOut"], json!({ "frames": 1, "integrationS": 300.0 }));
@@ -608,7 +610,7 @@ async fn frame_sets_that_share_a_name_are_answered_set_by_set() {
     let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": "LDN 1272" }, "groupBy": ["filter"] })).await;
     assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
     let said = text_of(&r);
-    assert!(said.contains("2 frame sets are named 'LDN 1272'; each is shown with its own page's figures."), "{said}");
+    assert!(said.contains("2 frame sets are named 'LDN 1272'; each is shown with its own page's figures; ask again with frameSet set:<id> for one of them."), "{said}");
     let early_text = format!("2 frames, integration {}.", crate::catalog_query::format_duration(early_totals.integration_s));
     let late_text = format!("3 frames, integration {}.", crate::catalog_query::format_duration(late_totals.integration_s));
     let (e, l) = (said.find(&early_text).unwrap_or_else(|| panic!("{early_text}: {said}")), said.find(&late_text).unwrap_or_else(|| panic!("{late_text}: {said}")));
@@ -708,5 +710,231 @@ async fn the_folder_list_is_capped_at_fifty() {
     assert_eq!(data["byFolder"].as_array().expect("byFolder").len(), 50);
     assert_eq!(data["otherFolders"], json!({ "folders": 2, "files": 2 }));
     assert_eq!(data["filesMissing"], 52);
+    client.close().await;
+}
+
+// ---- frame sets of one name ----
+
+/// A frame set `name` of `count` IC 5146 lights in its own folder; returns the set id.
+fn add_set(rig: &Rig, name: &str, dir: &str, count: usize, custom: bool) -> i64 {
+    add_set_named(rig, Some(name), dir, count, custom)
+}
+
+fn add_set_named(rig: &Rig, name: Option<&str>, dir: &str, count: usize, custom: bool) -> i64 {
+    let database = rig.ctx.db.get().expect("db");
+    let conn = database.conn();
+    let dir = rig.base.join("nas").join(dir);
+    let members: Vec<i64> = (0..count).map(|i| put(&conn, &dir, &format!("m{i}.fits"), &light("H")).1).collect();
+    let set = db::create_frames_set(&conn, name, custom, None, None, Some("20 10 00"), Some("+42 10 00"), None, None, None, None).expect("set");
+    let night = db::create_imaging_night(&conn, set, "2024-10-05T00:00:00Z", "2024-10-05T12:00:00Z").expect("night");
+    let session = db::create_session(&conn, night, "CamA", members.len() as i32, None).expect("session");
+    db::insert_session_members(&conn, session, &members).expect("members");
+    set
+}
+
+#[tokio::test]
+async fn frame_sets_named_entries_carry_handle_tab_cameras() {
+    let rig = rig(true);
+    let wip = add_set(&rig, "LDN 1272", "ldn_wip", 3, true);
+    let stage = add_set(&rig, "LDN 1272", "ldn_stage", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": "LDN 1272" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains(&format!("Frame set 'LDN 1272' (WIP, set:{wip}), nights 2024-10-05 … 2024-10-05, camera CamA")), "{said}");
+    assert!(said.contains(&format!("Frame set 'LDN 1272' (Stage, set:{stage}), nights")), "{said}");
+    assert!(said.contains("centre RA 20 10 00, Dec +42 10 00"), "{said}");
+    assert!(said.contains("ask again with frameSet set:<id> for one of them"), "{said}");
+    assert!(!said.contains("file:"), "file handles stay out of the text: {said}");
+
+    let sets = data_of(&r)["frameSets"].as_array().expect("frameSets").clone();
+    assert_eq!(sets.len(), 2);
+    let by_handle = |h: String| sets.iter().find(|s| s["handle"] == h).unwrap_or_else(|| panic!("no entry for {h}")).clone();
+    let (w, s) = (by_handle(format!("set:{wip}")), by_handle(format!("set:{stage}")));
+    assert_eq!((w["tab"].as_str(), s["tab"].as_str()), (Some("wip"), Some("stage")));
+    assert_eq!(w["frames"], 3);
+    assert_eq!(s["frames"], 2);
+    assert_eq!(w["cameras"], json!(["CamA"]));
+    assert_eq!(w["telescopes"], json!(["ScopeA"]));
+    assert_eq!(w["centre"], json!({ "objctra": "20 10 00", "objctdec": "+42 10 00" }));
+    assert!(data_of(&r).get("frameSetsInScope").is_none(), "the set-by-set block ran: {}", data_of(&r));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn object_scope_lists_its_frame_sets() {
+    let rig = rig(true);
+    let wip = add_set(&rig, "LDN 1272", "ldn_wip", 3, true);
+    let stage = add_set(&rig, "LDN 1272", "ldn_stage", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "object": "IC 5146" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains("Frame sets in scope: "), "{said}");
+    assert!(said.contains(&format!("'LDN 1272' (WIP, set:{wip}): 3 frames")), "{said}");
+    assert!(said.contains(&format!("'LDN 1272' (Stage, set:{stage}): 2 frames")), "{said}");
+    let listed = data_of(&r)["frameSetsInScope"].as_array().expect("frameSetsInScope").clone();
+    assert_eq!(listed.len(), 3, "the two LDN sets and the IC 5146 set");
+    assert_eq!(listed[0]["frames"], 6, "largest first");
+    let ldn = listed.iter().find(|e| e["handle"] == format!("set:{stage}")).expect("the stage set");
+    assert_eq!((ldn["name"].as_str(), ldn["tab"].as_str(), ldn["frames"].as_u64()), (Some("LDN 1272"), Some("stage"), Some(2)));
+
+    // A scope that names a tab lists the sets of that tab only.
+    let r = ask(&client, "query_frames", json!({ "scope": { "tab": "wip" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let listed = data_of(&r)["frameSetsInScope"].as_array().expect("frameSetsInScope").clone();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["handle"], format!("set:{wip}"));
+
+    // A scope that names none of the three has no such line.
+    let r = ask(&client, "query_frames", json!({ "scope": { "filter": "H" } })).await;
+    assert!(data_of(&r).get("frameSetsInScope").is_none());
+    assert!(!text_of(&r).contains("Frame sets in scope"), "{}", text_of(&r));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn frame_set_name_plus_other_field_lists_both_sets() {
+    let rig = rig(true);
+    let wip = add_set(&rig, "LDN 1272", "ldn_wip", 3, true);
+    let stage = add_set(&rig, "LDN 1272", "ldn_stage", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": "LDN 1272", "frameType": "lights" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains("Totals: 5 frames"), "{said}");
+    assert!(said.contains(&format!("set:{wip}")) && said.contains(&format!("set:{stage}")), "both sets are named: {said}");
+    assert!(said.contains("(WIP, set:") && said.contains("(Stage, set:"), "{said}");
+    let data = data_of(&r);
+    assert!(data.get("frameSets").is_none() && data.get("frameSet").is_none(), "{data}");
+    let handles: Vec<&str> = data["frameSetsInScope"].as_array().expect("frameSetsInScope").iter().filter_map(|e| e["handle"].as_str()).collect();
+    assert_eq!(handles, vec![format!("set:{wip}").as_str(), format!("set:{stage}").as_str()]);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn unnamed_set_by_handle_reads_unnamed() {
+    let rig = rig(true);
+    let set = add_set_named(&rig, None, "nameless", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": format!("set:{set}") } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains(&format!("Frame set '(unnamed)' (Stage, set:{set})")), "{said}");
+    assert!(!said.contains("Frame set ''"), "{said}");
+    assert!(data_of(&r)["frameSet"]["name"].is_null(), "{}", data_of(&r));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn frame_set_handle_scope_answers_one_set() {
+    let rig = rig(true);
+    let wip = add_set(&rig, "LDN 1272", "ldn_wip", 3, true);
+    let stage = add_set(&rig, "LDN 1272", "ldn_stage", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": format!("set:{stage}") }, "groupBy": ["frame_set"] })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains(&format!("Frame set 'LDN 1272' (Stage, set:{stage})")), "{said}");
+    assert!(said.contains("as its page shows it: 2 frames"), "{said}");
+    assert!(!said.contains(&format!("set:{wip}")), "the other set is not named: {said}");
+    assert!(!said.contains("frame sets are named"), "{said}");
+    let data = data_of(&r);
+    assert_eq!(data["frameSet"]["handle"], format!("set:{stage}"));
+    assert_eq!(data["frameSet"]["frames"], 2);
+    assert!(data.get("frameSets").is_none(), "{data}");
+    assert_eq!(data["totals"]["frames"], 2);
+    assert_eq!(data["groups"][0]["frameSetHandles"], json!([format!("set:{stage}")]));
+    assert!(said.contains(&format!("(Stage, set:{stage})")), "{said}");
+
+    // A handle no set carries is answered with a hint, not a silent empty answer.
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": "set:99999" } })).await;
+    assert!(text_of(&r).contains("set:99999"), "{}", text_of(&r));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn frame_set_name_plus_tab_lists_only_that_tab() {
+    let rig = rig(true);
+    let wip = add_set(&rig, "LDN 1272", "ldn_wip", 3, true);
+    let stage = add_set(&rig, "LDN 1272", "ldn_stage", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "frameSet": "LDN 1272", "tab": "stage" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(!said.contains("frame sets are named") && !said.contains("as its page shows it"), "the set-by-set block did not run: {said}");
+    assert!(said.contains("Totals: 2 frames"), "{said}");
+    assert!(said.contains(&format!("(Stage, set:{stage})")), "{said}");
+    assert!(!said.contains(&format!("set:{wip}")), "{said}");
+    let data = data_of(&r);
+    assert!(data.get("frameSets").is_none() && data.get("frameSet").is_none(), "{data}");
+    let listed = data["frameSetsInScope"].as_array().expect("frameSetsInScope");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["handle"], format!("set:{stage}"));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn calibration_lines_tell_same_named_sets_apart() {
+    let rig = rig(true);
+    let wip = add_set(&rig, "LDN 1272", "ldn_wip", 3, true);
+    let stage = add_set(&rig, "LDN 1272", "ldn_stage", 2, false);
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "filter": "H" }, "calibration": true })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    let lines: Vec<&str> = said.lines().filter(|l| l.contains("LDN 1272")).collect();
+    assert_eq!(lines.len(), 2, "one line per set of the name: {said}");
+    assert!(lines.iter().any(|l| l.contains(&format!("'LDN 1272' (WIP, set:{wip})"))), "{said}");
+    assert!(lines.iter().any(|l| l.contains(&format!("'LDN 1272' (Stage, set:{stage})"))), "{said}");
+    let structured: Vec<Value> =
+        data_of(&r)["calibration"]["lines"].as_array().expect("lines").iter().filter(|l| l["frameSet"] == "LDN 1272").cloned().collect();
+    let handles: Vec<&str> = structured.iter().filter_map(|l| l["frameSetHandle"].as_str()).collect();
+    assert_eq!(handles.len(), 2, "{structured:?}");
+    assert_ne!(handles[0], handles[1]);
+    assert!(handles.contains(&format!("set:{wip}").as_str()) && handles.contains(&format!("set:{stage}").as_str()), "{handles:?}");
+    let tab_of = |h: String| structured.iter().find(|l| l["frameSetHandle"] == h).and_then(|l| l["tab"].as_str().map(str::to_string));
+    assert_eq!(tab_of(format!("set:{wip}")).as_deref(), Some("wip"));
+    assert_eq!(tab_of(format!("set:{stage}")).as_deref(), Some("stage"));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn frame_sets_in_scope_lists_up_to_fifty_and_says_how_to_narrow() {
+    let rig = rig(true);
+    let small = add_set(&rig, "Small", "small", 1, false);
+    // The rig holds one set of its own, so 52 sets in all.
+    for i in 0..50 {
+        add_set(&rig, &format!("Filler {i:02}"), &format!("filler_{i:02}"), 2, false);
+    }
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "tab": "stage" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    let listed = data_of(&r)["frameSetsInScope"].as_array().expect("frameSetsInScope").clone();
+    assert_eq!(listed.len(), 50, "the cap is the number of groups groupBy shows");
+    assert_eq!(data_of(&r)["frameSetsInScopeMore"], 2);
+    assert!(said.contains("; and 2 more frame sets; narrow by object, night or camera to list them."), "{said}");
+    assert!(!listed.iter().any(|e| e["handle"] == format!("set:{small}")), "the one-frame set is the smallest, past the cap");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn unnamed_set_is_listed_by_handle() {
+    let rig = rig(true);
+    let set = add_set(&rig, "Placeholder", "unnamed_dir", 2, false);
+    {
+        let database = rig.ctx.db.get().expect("db");
+        database.conn().execute("UPDATE frames_set SET name = NULL WHERE id = ?1", [set]).expect("clear name");
+    }
+    let client = legacy(&rig.host).await;
+    let r = ask(&client, "query_frames", json!({ "scope": { "tab": "stage" } })).await;
+    assert_eq!(r.is_error, Some(false), "{}", text_of(&r));
+    let said = text_of(&r);
+    assert!(said.contains(&format!("'(unnamed)' (Stage, set:{set}): 2 frames")), "{said}");
+    let listed = data_of(&r)["frameSetsInScope"].as_array().expect("frameSetsInScope").clone();
+    let entry = listed.iter().find(|e| e["handle"] == format!("set:{set}")).expect("the unnamed set is listed");
+    assert!(entry["name"].is_null(), "{entry}");
+    assert_eq!(entry["frames"], 2);
     client.close().await;
 }

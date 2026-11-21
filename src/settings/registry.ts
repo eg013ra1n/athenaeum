@@ -260,6 +260,12 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
         help: 'Connected assistants are cut off and must reconnect with the new key.',
         keywords: ['mcp', 'token', 'key'],
       },
+      {
+        id: 'addToClaudeDesktop',
+        label: 'Add to Claude desktop',
+        help: "Writes Athenaeum's entry into Claude desktop's configuration and keeps a copy of the old file. Restart Claude desktop afterwards.",
+        keywords: ['mcp', 'claude', 'desktop', 'configuration'],
+      },
     ],
   },
   {

@@ -20,13 +20,14 @@ mod summary_tests;
 mod tests;
 
 pub use calibration::{calibration_summary, CalibrationLine, FRAME_SETS_PAGE};
+pub(crate) use details::file_id_of;
 pub use details::{file_details, CalibrationLink, FileDetails};
 pub use findings::{
     find_duplicates_in_scope, find_missing_in_scope, processing_folder_note, CopyLine, DuplicateFinding,
     MissingCategory, MissingFinding,
 };
 pub use frontend_truth::{frame_set_tab, missing_flags, FrameSetTab, MissingFlags};
-pub use quality::{quality_summary, QualityMetric, QualitySummary, OUTLIERS_SHOWN};
+pub use quality::{quality_summary, EarlierFigures, QualityMetric, QualitySummary, OUTLIERS_SHOWN};
 pub use storage::{storage_summary, StorageLine, StorageSummary};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -50,6 +51,30 @@ pub const EXAMPLES_PER_GROUP: usize = 3;
 /// Files on one page of the file list.
 pub const FILES_PAGE: u32 = 50;
 
+/// What the text calls a frame set that has no name.
+pub const UNNAMED_SET: &str = "(unnamed)";
+
+/// A frame set a frame belongs to: two sets may share a name, so the id and the Objects tab come with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetRef {
+    pub id: i64,
+    /// `None` for a set with no name (the page shows it unnamed).
+    pub name: Option<String>,
+    pub tab: FrameSetTab,
+}
+
+impl SetRef {
+    /// `set:<id>`.
+    pub fn handle(&self) -> String {
+        crate::scope::frame_set_handle(self.id)
+    }
+
+    /// `'LDN 1272' (Stage, set:231)`: what tells two sets of one name apart.
+    pub fn describe(&self) -> String {
+        format!("'{}' ({}, {})", self.name.as_deref().unwrap_or(UNNAMED_SET), crate::scope::tab_label(self.tab), self.handle())
+    }
+}
+
 /// A frame the scope lets through, with what grouping needs that the row itself does not carry.
 #[derive(Debug, Clone)]
 pub struct ScopedFrame {
@@ -59,8 +84,8 @@ pub struct ScopedFrame {
     /// R1 night of the observation time.
     pub night: Option<String>,
     pub state: FrameState,
-    /// Names of the frame sets that use this copy of the frame.
-    pub frame_sets: Vec<String>,
+    /// The frame sets that use this copy of the frame, in id order (two sets may share a name).
+    pub frame_sets: Vec<SetRef>,
     /// The scan root the file lives under (its path and kind), when one does.
     pub scan_root: Option<(String, String)>,
 }
@@ -136,6 +161,9 @@ pub struct FrameGroup {
     pub label: String,
     pub totals: Totals,
     pub examples: Vec<FileLine>,
+    /// When grouped by frame set: the handles (`set:<id>`) of the sets this group names, in id order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub frame_set_handles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,7 +278,7 @@ fn key_value(f: &ScopedFrame, key: GroupKey) -> String {
         GroupKey::Camera => text(frame.and_then(|x| x.instrume.as_ref()), "camera"),
         GroupKey::Telescope => text(frame.and_then(|x| x.telescop.as_ref()), "telescope"),
         GroupKey::FrameSet if f.frame_sets.is_empty() => none_of("frame set"),
-        GroupKey::FrameSet => f.frame_sets.join(", "),
+        GroupKey::FrameSet => f.frame_sets.iter().map(SetRef::describe).collect::<Vec<_>>().join(", "),
         GroupKey::Night => f.night.clone().unwrap_or_else(|| none_of("night")),
         GroupKey::Month => f.night.as_deref().and_then(|n| n.get(..7)).map_or_else(|| none_of("night"), str::to_string),
         GroupKey::Year => f.night.as_deref().and_then(|n| n.get(..4)).map_or_else(|| none_of("night"), str::to_string),
@@ -349,6 +377,8 @@ struct Acc {
     nights: BTreeSet<String>,
     /// Indices of the first frames of the group, in input order.
     examples: Vec<usize>,
+    /// Handles of the frame sets of the group's frames (kept only when grouping by frame set).
+    set_handles: BTreeMap<i64, String>,
 }
 
 impl Acc {
@@ -366,6 +396,12 @@ impl Acc {
         }
         if self.examples.len() < EXAMPLES_PER_GROUP {
             self.examples.push(index);
+        }
+    }
+
+    fn add_sets(&mut self, f: &ScopedFrame) {
+        for s in &f.frame_sets {
+            self.set_handles.entry(s.id).or_insert_with(|| s.handle());
         }
     }
 
@@ -400,13 +436,18 @@ pub fn query_frames(frames: &[ScopedFrame], group_by: &[GroupKey], files_page: O
         }
     }
 
+    let by_set = keys.contains(&GroupKey::FrameSet);
     let mut all = Acc::default();
     let mut groups: HashMap<Vec<String>, Acc> = HashMap::new();
     for (i, f) in frames.iter().enumerate() {
         all.add(i, f);
         if !keys.is_empty() {
             let values: Vec<String> = keys.iter().map(|k| key_value(f, *k)).collect();
-            groups.entry(values).or_default().add(i, f);
+            let acc = groups.entry(values).or_default();
+            acc.add(i, f);
+            if by_set {
+                acc.add_sets(f);
+            }
         }
     }
 
@@ -428,6 +469,7 @@ pub fn query_frames(frames: &[ScopedFrame], group_by: &[GroupKey], files_page: O
             shown.push(FrameGroup {
                 totals: acc.totals(),
                 examples: acc.examples.iter().map(|i| file_line(&frames[*i])).collect(),
+                frame_set_handles: acc.set_handles.values().cloned().collect(),
                 key,
                 label,
             });
@@ -463,8 +505,8 @@ pub fn format_duration(seconds: f64) -> String {
 // ---- fetching ----
 
 /// The frames `filter` lets through, in three statements however many there are: the rows (with their night text
-/// and their state, the state decided by the scope's own [`frame_state_sql`]), the names of the frame sets that
-/// use them (one grouped read), and the scan roots (read once, matched in Rust). Ordered by observation time,
+/// and their state, the state decided by the scope's own [`frame_state_sql`]), the [`SetRef`]s of the frame sets
+/// that use them (one grouped read; a set with no name is kept, unnamed), and the scan roots (read once, matched in Rust). Ordered by observation time,
 /// then path.
 pub fn fetch_scoped_frames(conn: &Connection, filter: &ScopeFilter) -> Result<Vec<ScopedFrame>> {
     // The state test is written for `f` = frames / `fl` = files; this scalar subquery names them so, and the row's
@@ -497,7 +539,7 @@ pub fn fetch_scoped_frames(conn: &Connection, filter: &ScopeFilter) -> Result<Ve
         .context("read scoped frames")?;
     drop(stmt);
 
-    let sets = fetch_set_names(conn, filter)?;
+    let sets = fetch_set_refs(conn, filter)?;
     let roots = fetch_scan_roots(conn)?;
 
     let mut out = Vec::with_capacity(rows.len());
@@ -519,32 +561,36 @@ pub fn fetch_scoped_frames(conn: &Connection, filter: &ScopeFilter) -> Result<Ve
     Ok(out)
 }
 
-/// Statement two: frame id -> names of the sets that use this copy of the frame, sorted.
-fn fetch_set_names(conn: &Connection, filter: &ScopeFilter) -> Result<HashMap<i64, Vec<String>>> {
+/// Statement two: frame id -> the sets that use this copy of the frame, in id order.
+fn fetch_set_refs(conn: &Connection, filter: &ScopeFilter) -> Result<HashMap<i64, Vec<SetRef>>> {
     let sql = format!(
-        "SELECT sm.frame_id, group_concat(fs.name, char(31)) \
+        "SELECT sm.frame_id, fs.id, fs.name, COALESCE(fs.is_custom, 0), COALESCE(fs.is_archived, 0) \
          FROM session_members sm \
          JOIN sessions ss ON ss.id = sm.session_id \
          JOIN imaging_nights sn ON sn.id = ss.imaging_night_id \
          JOIN frames_set fs ON fs.id = sn.frames_set_id \
          JOIN frames f ON f.id = sm.frame_id \
          WHERE sm.frame_id IN (SELECT fr.id FROM frames fr WHERE {filter}) \
-           AND fs.name IS NOT NULL AND fs.name <> '' AND {used} \
-         GROUP BY sm.frame_id",
+           AND {used} \
+         ORDER BY sm.frame_id, fs.id",
         filter = filter.sql,
         used = frame_is_used_copy_sql("fs.id"),
     );
     let mut stmt = conn.prepare(&sql).with_context(|| format!("prepare set names: {sql}"))?;
     let rows = stmt
-        .query_map(params_from_iter(filter.params.iter()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .query_map(params_from_iter(filter.params.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, bool>(3)?, r.get::<_, bool>(4)?))
+        })
         .context("run set names")?;
-    let mut out = HashMap::new();
+    let mut out: HashMap<i64, Vec<SetRef>> = HashMap::new();
     for row in rows {
-        let (id, joined) = row.context("read set names")?;
-        let mut names: Vec<String> = joined.split('\u{1f}').map(str::to_string).collect();
-        names.sort();
-        names.dedup();
-        out.insert(id, names);
+        let (frame_id, id, name, is_custom, is_archived) = row.context("read set names")?;
+        let entry = out.entry(frame_id).or_default();
+        // A frame in one set through two sessions is listed once.
+        if entry.iter().all(|s| s.id != id) {
+            let name = name.filter(|n| !n.trim().is_empty());
+            entry.push(SetRef { id, name, tab: frame_set_tab(is_custom, is_archived) });
+        }
     }
     Ok(out)
 }
@@ -576,6 +622,53 @@ fn scan_root_of(roots: &[(String, String, String)], file_path: &str) -> Option<(
 }
 
 // ---- frame set parity ----
+
+/// What tells a frame set apart from another of the same name: the Objects tab, the cameras and telescopes of its
+/// members and the centre it stores.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameSetFacts {
+    pub tab: FrameSetTab,
+    /// Distinct non-empty INSTRUME of the members the page counts, sorted.
+    pub cameras: Vec<String>,
+    /// Distinct non-empty TELESCOP of the same members, sorted.
+    pub telescopes: Vec<String>,
+    /// `objctra` / `objctdec` as the set stores them; `None` when it stores neither.
+    pub centre: Option<(Option<String>, Option<String>)>,
+}
+
+/// The facts of one frame set (see [`FrameSetFacts`]).
+pub fn frame_set_facts(conn: &Connection, frames_set_id: i64) -> Result<FrameSetFacts> {
+    let (is_custom, is_archived, ra, dec): (bool, bool, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT COALESCE(is_custom, 0), COALESCE(is_archived, 0), objctra, objctdec FROM frames_set WHERE id = ?1",
+            [frames_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .with_context(|| format!("read frame set {frames_set_id}"))?;
+    let used = frame_is_used_copy_sql("?1");
+    let distinct = |column: &str| -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT DISTINCT TRIM(f.{column}) FROM frames f \
+             WHERE {MEMBER_OF_SET} AND {FRAME_NOT_IN_BLACK_HOLE_SQL} AND {used} \
+               AND f.{column} IS NOT NULL AND TRIM(f.{column}) <> '' ORDER BY 1"
+        );
+        let mut stmt = conn.prepare(&sql).with_context(|| format!("prepare set {column}: {sql}"))?;
+        let values = stmt
+            .query_map([frames_set_id], |r| r.get::<_, String>(0))
+            .with_context(|| format!("run set {column}"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| format!("read set {column}"))?;
+        Ok(values)
+    };
+    let present = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let (ra, dec) = (present(ra), present(dec));
+    Ok(FrameSetFacts {
+        tab: frame_set_tab(is_custom, is_archived),
+        cameras: distinct("instrume")?,
+        telescopes: distinct("telescop")?,
+        centre: (ra.is_some() || dec.is_some()).then_some((ra, dec)),
+    })
+}
 
 /// SQL on `frames f`: a member of set `?1`.
 const MEMBER_OF_SET: &str = "f.id IN (SELECT msm.frame_id FROM session_members msm \

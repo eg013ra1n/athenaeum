@@ -158,6 +158,7 @@ fn a_group_key_serialises_with_snake_case_names() {
         label: "x".to_string(),
         totals: totals(1),
         examples: Vec::new(),
+        frame_set_handles: Vec::new(),
     };
     let v = serde_json::to_value(&g).unwrap();
     assert_eq!(v["key"]["frame_set"], "A");
@@ -331,7 +332,7 @@ fn fetch_count(rows: usize) -> usize {
     let n = STATEMENTS.load(Ordering::SeqCst);
     conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     assert_eq!(got.len(), rows);
-    assert!(got.iter().all(|f| f.frame_sets == vec!["IC 5146".to_string()]));
+    assert!(got.iter().all(|f| f.frame_sets.len() == 1 && f.frame_sets[0].name.as_deref() == Some("IC 5146") && f.frame_sets[0].tab == FrameSetTab::Stage));
     n
 }
 
@@ -371,7 +372,8 @@ fn fetch_gives_folder_night_state_sets_and_root() {
     assert_eq!(by_name["b.fits"].state, FrameState::SoftArchived);
     assert_eq!(by_name["c.fits"].state, FrameState::Zipped);
     assert_eq!(by_name["d.fits"].state, FrameState::BlackHole);
-    assert_eq!(by_name["a.fits"].frame_sets, vec!["Set A".to_string()]);
+    let a_sets = &by_name["a.fits"].frame_sets;
+    assert_eq!((a_sets.len(), a_sets[0].name.as_deref(), a_sets[0].tab), (1, Some("Set A"), FrameSetTab::Stage));
     assert!(by_name["d.fits"].frame_sets.is_empty());
     assert_eq!(by_name["a.fits"].folder, dir);
     assert_eq!(by_name["a.fits"].night.as_deref(), Some("2024-10-05"));
@@ -472,4 +474,49 @@ fn a_set_that_does_not_exist_is_said() {
     let conn = catalog();
     let e = frame_set_totals(&conn, 99).unwrap_err().to_string();
     assert!(e.contains("99"), "{e}");
+}
+
+#[test]
+fn group_by_frame_set_splits_same_named_sets() {
+    let conn = catalog();
+    let dir = if cfg!(windows) { "C:\\data\\ldn" } else { "/data/ldn" };
+    let wip_frames: Vec<i64> = (0..3).map(|i| light(&conn, dir, &format!("w{i}.fits"), "H").1).collect();
+    let stage_frames: Vec<i64> = (0..2).map(|i| light(&conn, dir, &format!("s{i}.fits"), "H").1).collect();
+    let wip = set_of(&conn, "LDN 1272", false, None, &wip_frames);
+    conn.execute("UPDATE frames_set SET is_custom = 1 WHERE id = ?1", [wip]).unwrap();
+    let stage = set_of(&conn, "LDN 1272", false, None, &stage_frames);
+
+    let frames = all_frames(&conn, &Scope::default());
+    let r = query_frames(&frames, &[GroupKey::FrameSet], None);
+    assert_eq!(r.groups_total, 2, "two sets of one name are two groups");
+    let wip_label = format!("'LDN 1272' (WIP, set:{wip})");
+    let stage_label = format!("'LDN 1272' (Stage, set:{stage})");
+    let by_label: BTreeMap<&str, &FrameGroup> = r.groups.iter().map(|g| (g.key[&GroupKey::FrameSet].as_str(), g)).collect();
+    assert_eq!(by_label[wip_label.as_str()].totals.frames, 3);
+    assert_eq!(by_label[wip_label.as_str()].frame_set_handles, vec![format!("set:{wip}")]);
+    assert_eq!(by_label[stage_label.as_str()].totals.frames, 2);
+    assert!(r.groups.iter().all(|g| g.label.contains("(WIP, set:") || g.label.contains("(Stage, set:")), "{:?}", r.groups);
+
+    // Not grouped by set: no handles in the group's data.
+    let plain = query_frames(&frames, &[GroupKey::Filter], None);
+    assert!(plain.groups.iter().all(|g| g.frame_set_handles.is_empty()));
+}
+
+#[test]
+fn frame_set_facts_name_tab_cameras_telescopes_and_centre() {
+    let conn = catalog();
+    let dir = if cfg!(windows) { "C:\\data\\f" } else { "/data/f" };
+    let (_, a) = light(&conn, dir, "a.fits", "H");
+    let (_, b) = light(&conn, dir, "b.fits", "H");
+    conn.execute("UPDATE frames SET instrume = 'CamB', telescop = 'Tele' WHERE id = ?1", [a]).unwrap();
+    conn.execute("UPDATE frames SET instrume = 'CamA', telescop = '' WHERE id = ?1", [b]).unwrap();
+    let set = set_of(&conn, "S", true, None, &[a, b]);
+    conn.execute("UPDATE frames_set SET objctra = '05 40 00', objctdec = '-02 27 00' WHERE id = ?1", [set]).unwrap();
+    let facts = frame_set_facts(&conn, set).unwrap();
+    assert_eq!(facts.tab, FrameSetTab::Archive);
+    assert_eq!(facts.cameras, vec!["CamA".to_string(), "CamB".to_string()]);
+    assert_eq!(facts.telescopes, vec!["Tele".to_string()]);
+    assert_eq!(facts.centre, Some((Some("05 40 00".to_string()), Some("-02 27 00".to_string()))));
+    let bare = set_of(&conn, "T", false, None, &[]);
+    assert_eq!(frame_set_facts(&conn, bare).unwrap().centre, None);
 }

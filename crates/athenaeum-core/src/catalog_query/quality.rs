@@ -1,6 +1,7 @@
 //! How good the frames are: one stored measurement over the raw lights of a scope, as a range, a median and the
 //! outliers named by file (MCP plan, Task 3). A value that was not measured is said to be not measured and never
-//! estimated; a row written by an earlier measurement version is counted apart and never enters the figures.
+//! estimated; a row written by an earlier measurement version is counted apart and never enters the current figures:
+//! each earlier version (and the legacy rows, no version recorded) forms figures of its own (`earlier`).
 //!
 //! Partition of the raw lights asked about: `measured + not_measured + older_version + sum(refused)`. Only raw
 //! lights are asked (analysis measures nothing else), and a frame flagged `is_master` is never one.
@@ -74,6 +75,9 @@ pub struct QualitySummary {
     pub not_measured: usize,
     /// Frames whose analysis was written by an earlier measurement version.
     pub older_version: usize,
+    /// The rows of earlier measurement versions, one entry per version, newest first, the legacy rows (no version
+    /// recorded) last. Their figures are never mixed into the current ones. Empty for `TransparencyLoss`.
+    pub earlier: Vec<EarlierFigures>,
     /// Frames the measurement refused (a frame-level verdict), by reason.
     pub refused: Vec<(String, usize)>,
     pub min: Option<f64>,
@@ -86,6 +90,27 @@ pub struct QualitySummary {
     /// Names the app action that would produce what is missing; `None` when nothing is missing.
     pub not_measured_reason: Option<String>,
 }
+
+/// The figures of the rows one earlier measurement version wrote, formed with the current outlier rule over those
+/// rows alone.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EarlierFigures {
+    /// The measurement version; `None` for a legacy row (written before versions were recorded).
+    pub version: Option<u32>,
+    /// Rows with a value.
+    pub frames: usize,
+    pub min: Option<f64>,
+    pub median: Option<f64>,
+    pub max: Option<f64>,
+    pub low_outliers: Vec<(FileLine, f64)>,
+    pub high_outliers: Vec<(FileLine, f64)>,
+    /// Rows this version refused (a frame-level verdict), by reason, most first.
+    pub refused: Vec<(String, usize)>,
+}
+
+/// The refusal reason of a legacy row (no version recorded) the app treats as unusable by its trailed flag.
+const LEGACY_TRAILED: &str = "stars trailed (legacy flag)";
 
 fn verdict_label(v: FrameVerdict) -> &'static str {
     match v {
@@ -127,6 +152,7 @@ fn empty(metric: QualityMetric, not_measured: usize, reason: Option<String>) -> 
         measured: 0,
         not_measured,
         older_version: 0,
+        earlier: Vec::new(),
         refused: Vec::new(),
         min: None,
         median: None,
@@ -222,6 +248,8 @@ fn summarise(
     let mut not_measured = 0usize;
     let mut older_version = 0usize;
     let mut refused: HashMap<&'static str, usize> = HashMap::new();
+    // The rows of each earlier version, apart: their values and their refusals.
+    let mut earlier_rows: HashMap<Option<u32>, (Vec<(&ScopedFrame, f64)>, HashMap<&'static str, usize>)> = HashMap::new();
     // The app's own sentence for a frame whose missing transparency loss no action cures, counted.
     #[cfg_attr(not(feature = "solver"), allow(unused_mut))]
     let mut why: HashMap<String, usize> = HashMap::new();
@@ -233,6 +261,18 @@ fn summarise(
         };
         if row.measure_version != current {
             older_version += 1;
+            // The transparency loss is current by its own zero-point version, not by this one.
+            if metric != QualityMetric::TransparencyLoss {
+                let (values, verdicts) = earlier_rows.entry(row.measure_version).or_default();
+                if let Some(verdict) = row.frame_verdict {
+                    *verdicts.entry(verdict_label(verdict)).or_default() += 1;
+                } else if row.measure_version.is_none() && row.possibly_trailed {
+                    // The app judges a legacy row so (`isUnusable`): no version, no verdict, trailed flag set.
+                    *verdicts.entry(LEGACY_TRAILED).or_default() += 1;
+                } else if let Some(x) = value_of(metric, row) {
+                    values.push((*frame, x));
+                }
+            }
             continue;
         }
         if let Some(verdict) = row.frame_verdict {
@@ -289,28 +329,74 @@ fn summarise(
             parts.push(format!("{not_measured} not measured — {RUN_ANALYSIS}"));
         }
     }
-    if older_version > 0 {
+    let mut earlier: Vec<EarlierFigures> = earlier_rows
+        .into_iter()
+        .filter(|(_, (values, verdicts))| !values.is_empty() || !verdicts.is_empty())
+        .map(|(version, (values, verdicts))| {
+            let figures = figures_of(&values);
+            EarlierFigures {
+                version,
+                frames: values.len(),
+                min: figures.min,
+                median: figures.median,
+                max: figures.max,
+                low_outliers: figures.low,
+                high_outliers: figures.high,
+                refused: sorted_refusals(verdicts),
+            }
+        })
+        .collect();
+    // Newest version first; `None` (legacy) sorts below every number, so it comes last.
+    earlier.sort_by(|a, b| b.version.cmp(&a.version));
+    // The earlier rows' own sentence is told with their figures; this one only when they have none to show, and
+    // then it is told here alone (the text half prints this reason, nothing else about them).
+    if older_version > 0 && earlier.is_empty() {
         parts.push(format!("{older_version} measured by an earlier version — run Analysis again"));
     }
     let not_measured_reason = (!parts.is_empty()).then(|| parts.join("; "));
 
-    let mut refused: Vec<(String, usize)> = refused.into_iter().map(|(k, n)| (k.to_string(), n)).collect();
-    refused.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
     let mut summary = empty(metric, not_measured, not_measured_reason);
     summary.measured = measured.len();
     summary.older_version = older_version;
-    summary.refused = refused;
-    if measured.is_empty() {
-        return Ok(summary);
-    }
+    summary.earlier = earlier;
+    summary.refused = sorted_refusals(refused);
+    let figures = figures_of(&measured);
+    summary.min = figures.min;
+    summary.median = figures.median;
+    summary.max = figures.max;
+    summary.low_outliers = figures.low;
+    summary.high_outliers = figures.high;
+    Ok(summary)
+}
 
+/// Refusal counts as `(reason, count)`, most first, ties by reason.
+fn sorted_refusals(refused: HashMap<&'static str, usize>) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = refused.into_iter().map(|(k, n)| (k.to_string(), n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+/// Range, median and outliers of a set of measured values; all empty for no values.
+#[derive(Default)]
+struct Figures {
+    min: Option<f64>,
+    median: Option<f64>,
+    max: Option<f64>,
+    low: Vec<(FileLine, f64)>,
+    high: Vec<(FileLine, f64)>,
+}
+
+fn figures_of(measured: &[(&ScopedFrame, f64)]) -> Figures {
+    let mut out = Figures::default();
+    if measured.is_empty() {
+        return out;
+    }
     let mut values: Vec<f64> = measured.iter().map(|(_, x)| *x).collect();
     values.sort_by(f64::total_cmp);
     let median = median_sorted(&values);
-    summary.min = values.first().copied();
-    summary.max = values.last().copied();
-    summary.median = Some(median);
+    out.min = values.first().copied();
+    out.max = values.last().copied();
+    out.median = Some(median);
 
     let mut deviations: Vec<f64> = values.iter().map(|x| (x - median).abs()).collect();
     deviations.sort_by(f64::total_cmp);
@@ -319,7 +405,7 @@ fn summarise(
         let limit = OUTLIER_SIGMAS * MAD_SIGMA * mad;
         let mut low: Vec<(&ScopedFrame, f64)> = Vec::new();
         let mut high: Vec<(&ScopedFrame, f64)> = Vec::new();
-        for (frame, x) in &measured {
+        for (frame, x) in measured {
             if (x - median).abs() > limit {
                 if *x < median { low.push((*frame, *x)) } else { high.push((*frame, *x)) }
             }
@@ -330,8 +416,8 @@ fn summarise(
         let named = |list: Vec<(&ScopedFrame, f64)>| -> Vec<(FileLine, f64)> {
             list.into_iter().take(OUTLIERS_SHOWN).map(|(f, x)| (file_line(f), x)).collect()
         };
-        summary.low_outliers = named(low);
-        summary.high_outliers = named(high);
+        out.low = named(low);
+        out.high = named(high);
     }
-    Ok(summary)
+    out
 }

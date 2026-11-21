@@ -147,13 +147,13 @@ fn tools_list_result() -> Value {
             },
             {
                 "name": "list_operations",
-                "description": "List completed operation spans (scan, archive_op, file_op, solve, export) with their id and duration.",
+                "description": "List completed operation spans (scan, archive_op, file_op, solve, export, mcp_plan_apply) with their id and duration.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "kind": {
                             "type": "string",
-                            "description": "Filter to one operation kind: scan|archive_op|file_op|solve|export."
+                            "description": "Filter to one operation kind: scan|archive_op|file_op|solve|export|mcp_plan_apply."
                         },
                         "since": {
                             "type": "string",

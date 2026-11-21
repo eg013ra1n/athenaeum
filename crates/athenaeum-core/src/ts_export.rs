@@ -489,6 +489,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
         // Assistant access: the Settings section's status (Task 6) and the plan window's types (Task 12).
         ("mcp.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::mcp::McpStatus,
+            crate::mcp::ClaudeDesktopAdded,
             crate::mcp::McpSource,
             crate::mcp::plans::PlanState,
             crate::mcp::plans::PlanKind,

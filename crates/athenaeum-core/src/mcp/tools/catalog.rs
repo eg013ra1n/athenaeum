@@ -8,19 +8,22 @@
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 
 use super::{prepare, run, to_json as json, FileArgs, MissingArgs, Prep, QueryFramesArgs, ScopeArgs};
 use crate::api::ApiError;
 use crate::catalog_query::{
-    self as cq, CalibrationLine, FileLine, FrameGroup, FrameSetTotals, MissingCategory, QualityMetric, QualitySummary,
+    self as cq, CalibrationLine, EarlierFigures, FileLine, FrameGroup, FrameSetTotals, MissingCategory, QualityMetric, QualitySummary,
     ScopedFrame, StorageSummary, Totals, FRAME_SETS_PAGE, GROUPS_SHOWN,
 };
 use crate::mcp::answer::{bytes_text, count_of};
 use crate::mcp::{Answer, AthenaeumMcp, McpHost};
-use crate::scope::{normalize_value, FrameState, Scope};
+use crate::scope::{normalize_value, parse_frame_set_handle, FrameState, Scope};
 
+/// Frame sets the text half lists for a scope that names an object, a frame set or a tab (the structured half
+/// carries the same).
+const SETS_IN_SCOPE_SHOWN: usize = 50;
 /// Folders the text half lists in a storage summary (the structured half carries up to 50).
 const STORAGE_FOLDERS_IN_TEXT: usize = 10;
 /// Groups listed with their example files when the answer has this few groups.
@@ -41,7 +44,7 @@ impl AthenaeumMcp {
     }
 
     #[tool(
-        description = "Count, group and list frames under one scope (object, frame set, folder, scan root, camera, telescope, filter, frame type, exposure, night, date range, year, state). Answers totals and integration time, optionally grouped (groupBy), with a page of files (filesPage), a stored-measurement summary (quality), which light groups have darks, flats and bias linked (calibration) and where the files live (storage). A scope that is exactly one frame set answers the figures of that frame set's page. Black Hole files are left out unless the scope's state asks. A value the catalog does not hold is answered with the nearest ones it does.",
+        description = "Count, group and list frames under one scope (object, frame set, Objects tab, exact files, folder, scan root, camera, telescope, filter, frame type, exposure, night, date range, year, state). Two frame sets may share a name: every answer names a frame set with its tab and handle `set:<number>` (a scope's frameSet takes the handle to mean that one set), with its cameras, telescopes and centre. Answers totals and integration time, optionally grouped (groupBy), with a page of files (filesPage), a stored-measurement summary (quality), which light groups have darks, flats and bias linked (calibration) and where the files live (storage). A scope that is exactly one frame set answers the figures of that frame set's page. Black Hole files are left out unless the scope's state asks. A value the catalog does not hold is answered with the nearest ones it does.",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn query_frames(&self, Parameters(args): Parameters<QueryFramesArgs>) -> CallToolResult {
@@ -186,19 +189,31 @@ fn indented(lines: impl IntoIterator<Item = String>) -> Vec<String> {
 
 // ---- json pieces whose Rust shape is a tuple ----
 
-fn frame_set_json(name: &str, nights: Option<&(String, String)>, t: &FrameSetTotals) -> Value {
+fn centre_json(centre: &Option<(Option<String>, Option<String>)>) -> Value {
+    match centre {
+        Some((ra, dec)) => json!({ "objctra": ra, "objctdec": dec }),
+        None => Value::Null,
+    }
+}
+
+fn frame_set_json(e: &SetEntry) -> Result<Value, ApiError> {
+    let t = &e.totals;
     let mut v = json!({
-        "name": name,
+        "handle": crate::scope::frame_set_handle(e.id),
+        "name": e.name,
+        "tab": json(&e.facts.tab)?,
+        "cameras": e.facts.cameras,
+        "telescopes": e.facts.telescopes,
+        "centre": centre_json(&e.facts.centre),
         "frames": t.frames,
         "integrationS": t.integration_s,
         "blackHoleLeftOut": t.black_hole_left_out.map(|(n, s)| json!({ "frames": n, "integrationS": s })),
         "byFilter": t.by_filter.iter().map(|(f, n, s)| json!({ "filter": f, "frames": n, "integrationS": s })).collect::<Vec<_>>(),
     });
-    // Only the several-sets answer names the nights, so the one-set shape is exactly what it was.
-    if let (Some((first, last)), Some(obj)) = (nights, v.as_object_mut()) {
+    if let (Some((first, last)), Some(obj)) = (&e.nights, v.as_object_mut()) {
         obj.insert("nights".to_string(), json!({ "first": first, "last": last }));
     }
-    v
+    Ok(v)
 }
 
 fn storage_json(s: &StorageSummary) -> Result<Value, ApiError> {
@@ -212,6 +227,27 @@ fn storage_json(s: &StorageSummary) -> Result<Value, ApiError> {
     }))
 }
 
+/// What cures figures of an earlier measurement version.
+const EARLIER_ACTION: &str = "run Analysis again for current figures";
+
+fn earlier_json(e: &EarlierFigures) -> Result<Value, ApiError> {
+    let outliers = |v: &[(FileLine, f64)]| -> Result<Vec<Value>, ApiError> {
+        v.iter().map(|(l, x)| Ok(json!({ "file": json(l)?, "value": x }))).collect()
+    };
+    Ok(json!({
+        "version": e.version,
+        "legacy": e.version.is_none(),
+        "action": EARLIER_ACTION,
+        "frames": e.frames,
+        "min": e.min,
+        "median": e.median,
+        "max": e.max,
+        "lowOutliers": outliers(&e.low_outliers)?,
+        "highOutliers": outliers(&e.high_outliers)?,
+        "refused": e.refused.iter().map(|(why, n)| json!({ "reason": why, "frames": n })).collect::<Vec<_>>(),
+    }))
+}
+
 fn quality_json(q: &QualitySummary) -> Result<Value, ApiError> {
     let outliers = |v: &[(FileLine, f64)]| -> Result<Vec<Value>, ApiError> {
         v.iter().map(|(l, x)| Ok(json!({ "file": json(l)?, "value": x }))).collect()
@@ -221,6 +257,7 @@ fn quality_json(q: &QualitySummary) -> Result<Value, ApiError> {
         "measured": q.measured,
         "notMeasured": q.not_measured,
         "olderVersion": q.older_version,
+        "earlier": q.earlier.iter().map(earlier_json).collect::<Result<Vec<_>, ApiError>>()?,
         "refused": q.refused.iter().map(|(why, n)| json!({ "reason": why, "frames": n })).collect::<Vec<_>>(),
         "min": q.min,
         "median": q.median,
@@ -240,7 +277,7 @@ fn calibration_lines(lines: &[CalibrationLine], sets_total: usize) -> Vec<String
     for l in lines {
         let mut line = format!(
             "- {}, night {}, {}, filter {}: {} — darks {}, flats {}, bias {}",
-            l.frame_set,
+            l.set.describe(),
             l.night,
             l.camera,
             l.filter,
@@ -298,6 +335,36 @@ fn storage_lines(s: &StorageSummary) -> Vec<String> {
     out
 }
 
+/// One earlier measurement version in words: its own figures, apart from the current ones, named once.
+fn earlier_line(e: &EarlierFigures) -> String {
+    let who = match e.version {
+        Some(v) => format!("measured by version {v}"),
+        None => "measured before versions were recorded (legacy)".to_string(),
+    };
+    let mut line = if e.frames == 0 {
+        // Only refusals: no figures to speak of.
+        let n: usize = e.refused.iter().map(|(_, n)| n).sum();
+        format!("  {} {who}", count_of(n, "refused row", "refused rows"))
+    } else {
+        format!("  {} {who} — their figures, apart from the current ones", e.frames)
+    };
+    if let (Some(a), Some(m), Some(b)) = (e.min, e.median, e.max) {
+        line.push_str(&format!(": median {m:.3}, range {a:.3} … {b:.3}"));
+    }
+    for (title, list) in [("low outliers", &e.low_outliers), ("high outliers", &e.high_outliers)] {
+        if !list.is_empty() {
+            let named: Vec<String> = list.iter().map(|(l, v)| format!("{v:.3}: {}", file_text(l))).collect();
+            line.push_str(&format!("; {title} {}", named.join(" | ")));
+        }
+    }
+    if !e.refused.is_empty() {
+        let refused: Vec<String> = e.refused.iter().map(|(why, n)| format!("{} {why}", count_of(*n, "frame", "frames"))).collect();
+        line.push_str(&format!("{} {}", if e.frames == 0 { ":" } else { "; refused:" }, refused.join(", ")));
+    }
+    line.push_str(&format!("; {EARLIER_ACTION}"));
+    line
+}
+
 fn quality_lines(q: &QualitySummary) -> Vec<String> {
     let label = metric_label(q.metric);
     let mut out = Vec::new();
@@ -309,11 +376,8 @@ fn quality_lines(q: &QualitySummary) -> Vec<String> {
     if q.not_measured > 0 {
         out.push(format!("  {} not measured", count_of(q.not_measured, "raw light is", "raw lights are")));
     }
-    if q.older_version > 0 {
-        out.push(format!(
-            "  {} measured by an older version of Athenaeum's measurement",
-            count_of(q.older_version, "raw light was", "raw lights were")
-        ));
+    for e in &q.earlier {
+        out.push(earlier_line(e));
     }
     for (why, n) in &q.refused {
         out.push(format!("  {}: {why}", count_of(*n, "frame", "frames")));
@@ -347,19 +411,29 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 // ---- query_frames ----
 
 /// The frame sets a scope names and nothing else: the id and stored name of every frame set the catalog holds under
-/// that name (the same normalized-name equality `resolve_scope` uses), in id order. Empty for any other scope, and
-/// for a name no set carries.
-fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, String)>, ApiError> {
+/// that name (the same normalized-name equality `resolve_scope` uses), in id order; a handle `set:<id>` names that
+/// one set. Empty for any other scope, and for a name or handle no set carries.
+fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, Option<String>)>, ApiError> {
     let blank = |v: &Option<String>| v.as_deref().map_or(true, |s| s.trim().is_empty());
     let Some(name) = scope.frame_set.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { return Ok(Vec::new()) };
     let only_a_set = [&scope.object, &scope.folder, &scope.scan_root, &scope.camera, &scope.telescope, &scope.filter, &scope.frame_type, &scope.night, &scope.date_from, &scope.date_to]
         .into_iter()
         .all(blank)
+        && scope.tab.is_none()
+        && scope.files.as_deref().map_or(true, |f| f.iter().all(|s| s.trim().is_empty()))
         && scope.exposure_s.is_none()
         && scope.year.is_none()
         && scope.state.as_deref().map_or(true, |s| s.is_empty() || (FrameState::DEFAULT.iter().all(|d| s.contains(d)) && !s.contains(&FrameState::BlackHole)));
     if !only_a_set {
         return Ok(Vec::new());
+    }
+    if let Some(id) = parse_frame_set_handle(name) {
+        let found: Option<Option<String>> = conn
+            .query_row("SELECT name FROM frames_set WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .map_err(|e| internal("the frame set", e))?;
+        // An unnamed set keeps no name (the heading says so with `UNNAMED_SET`, the structured name stays null).
+        return Ok(found.map(|n| vec![(id, n.filter(|s| !s.is_empty()))]).unwrap_or_default());
     }
     let mut stmt = conn
         .prepare("SELECT id, name FROM frames_set WHERE name IS NOT NULL AND name <> '' ORDER BY id")
@@ -370,7 +444,62 @@ fn frame_sets_named(conn: &Connection, scope: &Scope) -> Result<Vec<(i64, String
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| internal("the frame sets", e))?;
     let wanted = normalize_value(name);
-    Ok(sets.into_iter().filter(|(_, n)| normalize_value(n) == wanted).collect())
+    Ok(sets.into_iter().filter(|(_, n)| normalize_value(n) == wanted).map(|(id, n)| (id, Some(n))).collect())
+}
+
+/// One frame set as an answer tells it: what tells it from another of the same name, and its page's figures.
+struct SetEntry {
+    id: i64,
+    name: Option<String>,
+    nights: Option<(String, String)>,
+    facts: cq::FrameSetFacts,
+    totals: FrameSetTotals,
+}
+
+fn read_set(conn: &Connection, id: i64, name: Option<&str>) -> Result<SetEntry, ApiError> {
+    let totals = cq::frame_set_totals(conn, id).map_err(|e| internal("the frame set", format!("{e:#}")))?;
+    let nights = cq::frame_set_nights(conn, id).map_err(|e| internal("the frame set's nights", format!("{e:#}")))?;
+    let facts = cq::frame_set_facts(conn, id).map_err(|e| internal("the frame set's facts", format!("{e:#}")))?;
+    Ok(SetEntry { id, name: name.map(str::to_string), nights, facts, totals })
+}
+
+/// `Frame set 'LDN 1272' (Stage, set:231), nights 2025-09-13 … 2025-09-13, camera ATR2600M, telescope Esprit, centre RA 05 40 00, Dec -02 27 00`.
+fn set_heading(e: &SetEntry) -> String {
+    let who = cq::SetRef { id: e.id, name: e.name.clone(), tab: e.facts.tab }.describe();
+    let mut out = format!("Frame set {who}");
+    if let Some((first, last)) = &e.nights {
+        out.push_str(&format!(", nights {first} … {last}"));
+    }
+    if !e.facts.cameras.is_empty() {
+        out.push_str(&format!(", {} {}", if e.facts.cameras.len() == 1 { "camera" } else { "cameras" }, e.facts.cameras.join(", ")));
+    }
+    if !e.facts.telescopes.is_empty() {
+        out.push_str(&format!(", {} {}", if e.facts.telescopes.len() == 1 { "telescope" } else { "telescopes" }, e.facts.telescopes.join(", ")));
+    }
+    if let Some((ra, dec)) = &e.facts.centre {
+        let parts: Vec<String> = [("RA", ra), ("Dec", dec)].into_iter().filter_map(|(k, v)| v.as_ref().map(|v| format!("{k} {v}"))).collect();
+        out.push_str(&format!(", centre {}", parts.join(", ")));
+    }
+    out
+}
+
+/// The frame sets the frames belong to, most frames first (the id breaking a tie), with their frame counts.
+fn sets_of_frames(frames: &[ScopedFrame]) -> Vec<(cq::SetRef, usize)> {
+    let mut by_id: std::collections::BTreeMap<i64, (cq::SetRef, usize)> = std::collections::BTreeMap::new();
+    for f in frames {
+        for s in &f.frame_sets {
+            by_id.entry(s.id).or_insert_with(|| (s.clone(), 0)).1 += 1;
+        }
+    }
+    let mut v: Vec<(cq::SetRef, usize)> = by_id.into_values().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.id.cmp(&b.0.id)));
+    v
+}
+
+/// A scope that names an object, a frame set or a tab.
+fn names_sets(scope: &Scope) -> bool {
+    let given = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    given(&scope.object) || given(&scope.frame_set) || scope.tab.is_some()
 }
 
 /// The frame set's own figures as a sentence: the page's frame count and integration time, and the Black Hole
@@ -430,35 +559,58 @@ pub fn query_frames(host: &McpHost, args: QueryFramesArgs) -> Result<Answer, Api
     match named.as_slice() {
         [] => lines.push(format!("Totals: {}.", totals_text(&result.totals))),
         [(set_id, name)] => {
-            let t = cq::frame_set_totals(&conn, *set_id).map_err(|e| internal("the frame set", format!("{e:#}")))?;
-            lines.extend(frame_set_lines(&format!("Frame set '{name}'"), &t));
-            data.insert("frameSet".to_string(), frame_set_json(name, None, &t));
+            let entry = read_set(&conn, *set_id, name.as_deref())?;
+            lines.extend(frame_set_lines(&set_heading(&entry), &entry.totals));
+            data.insert("frameSet".to_string(), frame_set_json(&entry)?);
         }
         many => {
             let mut read = Vec::with_capacity(many.len());
             for (set_id, name) in many {
-                let t = cq::frame_set_totals(&conn, *set_id).map_err(|e| internal("the frame set", format!("{e:#}")))?;
-                let nights = cq::frame_set_nights(&conn, *set_id).map_err(|e| internal("the frame set's nights", format!("{e:#}")))?;
-                read.push((*set_id, name, nights, t));
+                read.push(read_set(&conn, *set_id, name.as_deref())?);
             }
             // By first night (a set with no dated member last), the id breaking a tie.
             read.sort_by(|a, b| {
-                let key = |x: &(i64, &String, Option<(String, String)>, FrameSetTotals)| (x.2.is_none(), x.2.as_ref().map(|n| n.0.clone()), x.0);
+                let key = |x: &SetEntry| (x.nights.is_none(), x.nights.as_ref().map(|n| n.0.clone()), x.id);
                 key(a).cmp(&key(b))
             });
             let wanted = args.scope.frame_set.as_deref().map(str::trim).unwrap_or_default();
-            lines.push(format!("{} frame sets are named '{wanted}'; each is shown with its own page's figures.", many.len()));
-            for (_, name, nights, t) in &read {
-                let heading = match nights {
-                    Some((first, last)) => format!("Frame set '{name}', nights {first} … {last}"),
-                    None => format!("Frame set '{name}'"),
-                };
-                lines.extend(frame_set_lines(&heading, t));
+            lines.push(format!(
+                "{} frame sets are named '{wanted}'; each is shown with its own page's figures; ask again with frameSet set:<id> for one of them.",
+                many.len()
+            ));
+            for e in &read {
+                lines.extend(frame_set_lines(&set_heading(e), &e.totals));
             }
-            data.insert(
-                "frameSets".to_string(),
-                Value::Array(read.iter().map(|(_, name, nights, t)| frame_set_json(name, nights.as_ref(), t)).collect()),
+            data.insert("frameSets".to_string(), Value::Array(read.iter().map(frame_set_json).collect::<Result<Vec<_>, _>>()?));
+        }
+    }
+    // Two sets of one name are told apart by handle wherever the scope reaches sets and no set-by-set block ran.
+    if named.is_empty() && names_sets(&args.scope) {
+        let sets = sets_of_frames(&frames);
+        if !sets.is_empty() {
+            let entry = |(s, n): &(cq::SetRef, usize)| format!("{}: {}", s.describe(), count_of(*n, "frame", "frames"));
+            let mut text = format!(
+                "Frame sets in scope: {}",
+                sets.iter().take(SETS_IN_SCOPE_SHOWN).map(entry).collect::<Vec<_>>().join("; ")
             );
+            let rest = sets.len().saturating_sub(SETS_IN_SCOPE_SHOWN);
+            if rest > 0 {
+                text.push_str(&format!(
+                    "; and {}; narrow by object, night or camera to list them",
+                    count_of(rest, "more frame set", "more frame sets")
+                ));
+            }
+            text.push('.');
+            lines.push(text);
+            let listed: Result<Vec<Value>, ApiError> = sets
+                .iter()
+                .take(SETS_IN_SCOPE_SHOWN)
+                .map(|(s, n)| Ok(json!({ "handle": s.handle(), "name": s.name, "tab": json(&s.tab)?, "frames": n })))
+                .collect();
+            data.insert("frameSetsInScope".to_string(), Value::Array(listed?));
+            if rest > 0 {
+                data.insert("frameSetsInScopeMore".to_string(), json!(rest));
+            }
         }
     }
     data.insert("totals".to_string(), json(&result.totals)?);
@@ -826,4 +978,113 @@ pub fn find_missing_metadata(host: &McpHost, args: MissingArgs) -> Result<Answer
     data.insert("otherFolders".to_string(), json!({ "folders": more_folders, "files": more_files }));
     data.insert("page".to_string(), json(&found.page)?);
     Ok(prep.answer(&lines.join("\n"), data))
+}
+
+#[cfg(test)]
+mod quality_text_tests {
+    use super::*;
+    use crate::catalog_query::QualityMetric;
+    use crate::scope::FrameState;
+
+    fn line(name: &str) -> FileLine {
+        FileLine {
+            handle: "file:1".to_string(),
+            file_name: name.to_string(),
+            folder: "/data/night".to_string(),
+            imagetyp: Some("Light".to_string()),
+            object: None,
+            filter: None,
+            exptime_s: None,
+            gain: None,
+            offset: None,
+            ccd_temp: None,
+            binning: None,
+            width: None,
+            height: None,
+            date_obs: None,
+            night: None,
+            instrume: None,
+            telescop: None,
+            state: FrameState::Catalog,
+        }
+    }
+
+    fn earlier(version: Option<u32>) -> EarlierFigures {
+        EarlierFigures {
+            version,
+            frames: 368,
+            min: Some(2.41),
+            median: Some(3.12),
+            max: Some(5.9),
+            low_outliers: Vec::new(),
+            high_outliers: vec![(line("far.fits"), 5.9)],
+            refused: vec![("stars trailed".to_string(), 2)],
+        }
+    }
+
+    fn summary(earlier: Vec<EarlierFigures>, older_version: usize) -> QualitySummary {
+        QualitySummary {
+            metric: QualityMetric::Fwhm,
+            measured: 2,
+            not_measured: 0,
+            older_version,
+            earlier,
+            refused: Vec::new(),
+            min: Some(2.0),
+            median: Some(2.1),
+            max: Some(2.2),
+            low_outliers: Vec::new(),
+            high_outliers: Vec::new(),
+            not_measured_reason: None,
+        }
+    }
+
+    #[test]
+    fn earlier_text_names_each_version_once() {
+        let text = quality_lines(&summary(vec![earlier(Some(7)), earlier(None)], 736)).join("\n");
+        assert_eq!(text.matches("measured by version 7").count(), 1, "{text}");
+        assert_eq!(text.matches("measured before versions were recorded (legacy)").count(), 1, "{text}");
+        assert_eq!(text.matches("run Analysis again for current figures").count(), 2, "{text}");
+        assert!(text.contains("368 measured by version 7 — their figures, apart from the current ones: median 3.120, range 2.410 … 5.900"), "{text}");
+        assert!(text.contains("high outliers 5.900: "), "{text}");
+        assert!(text.contains("far.fits"), "{text}");
+        assert!(text.contains("refused: 2 frames stars trailed"), "{text}");
+        assert!(!text.contains("older version"), "the old sentence is replaced: {text}");
+        assert!(!text.contains("earlier version"), "{text}");
+    }
+
+    #[test]
+    fn older_rows_with_no_figures_say_it_once() {
+        // The reason `summarise` really produces when older rows leave no figures.
+        let mut q = summary(Vec::new(), 3);
+        q.not_measured_reason = Some("3 measured by an earlier version — run Analysis again".to_string());
+        let text = quality_lines(&q).join("\n");
+        assert_eq!(text.matches("earlier version").count(), 1, "{text}");
+        assert!(text.contains("run Analysis again"), "{text}");
+    }
+
+    #[test]
+    fn a_version_with_only_refusals_says_refused_rows() {
+        let mut e = earlier(Some(7));
+        e.frames = 0;
+        e.min = None;
+        e.median = None;
+        e.max = None;
+        e.high_outliers = Vec::new();
+        e.refused = vec![("stars trailed".to_string(), 2), ("no stars found".to_string(), 1)];
+        let text = quality_lines(&summary(vec![e], 3)).join("\n");
+        assert!(text.contains("3 refused rows measured by version 7: 2 frames stars trailed, 1 frame no stars found; run Analysis again for current figures"), "{text}");
+        assert!(!text.contains("0 measured"), "{text}");
+        assert!(!text.contains("their figures"), "{text}");
+    }
+
+    #[test]
+    fn earlier_json_says_legacy_and_the_action() {
+        let v7 = earlier_json(&earlier(Some(7))).expect("json");
+        let legacy = earlier_json(&earlier(None)).expect("json");
+        assert_eq!((v7["legacy"].as_bool(), legacy["legacy"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(v7["action"], "run Analysis again for current figures");
+        assert_eq!(legacy["action"], "run Analysis again for current figures");
+        assert!(legacy["version"].is_null());
+    }
 }

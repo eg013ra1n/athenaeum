@@ -164,7 +164,121 @@ fn unmeasured_is_said_not_estimated() {
     assert!(q.refused.is_empty());
     let reason = q.not_measured_reason.expect("something is missing");
     assert!(reason.contains("run Analysis on these frames in Athenaeum"), "{reason}");
-    assert!(reason.contains("measured by an earlier version — run Analysis again"), "{reason}");
+    // The earlier rows are told with their own figures (`earlier`), not in the reason.
+    assert!(!reason.contains("earlier version"), "{reason}");
+    assert_eq!(q.earlier.len(), 1);
+    assert_eq!((q.earlier[0].version, q.earlier[0].frames, q.earlier[0].median), (Some(current() - 1), 1, Some(9.0)));
+}
+
+#[cfg(feature = "render")]
+#[test]
+fn earlier_rows_form_figures_per_version() {
+    let conn = catalog();
+    for (i, fwhm) in [2.0, 2.2].into_iter().enumerate() {
+        let (file, frame) = light(&conn, &format!("cur{i}.fits"));
+        analyse(&conn, frame, file, Some(current()), fwhm, None);
+    }
+    for (i, fwhm) in [3.0, 3.1, 3.2].into_iter().enumerate() {
+        let (file, frame) = light(&conn, &format!("legacy{i}.fits"));
+        analyse(&conn, frame, file, None, fwhm, None);
+    }
+    for (i, fwhm) in [4.0, 4.4].into_iter().enumerate() {
+        let (file, frame) = light(&conn, &format!("v7_{i}.fits"));
+        analyse(&conn, frame, file, Some(7), fwhm, None);
+    }
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, None, &frames, QualityMetric::Fwhm).expect("summary");
+    assert_eq!((q.measured, q.not_measured, q.older_version), (2, 0, 5));
+    assert_eq!((q.min, q.median, q.max), (Some(2.0), Some(2.1), Some(2.2)), "only the current rows");
+    assert_eq!(q.earlier.len(), 2);
+    let (v7, legacy) = (&q.earlier[0], &q.earlier[1]);
+    assert_eq!((v7.version, v7.frames), (Some(7), 2), "newest version first");
+    assert_eq!((v7.min, v7.median, v7.max), (Some(4.0), Some(4.2), Some(4.4)));
+    assert_eq!((legacy.version, legacy.frames), (None, 3), "legacy last");
+    assert_eq!((legacy.min, legacy.median, legacy.max), (Some(3.0), Some(3.1), Some(3.2)));
+    assert!(q.not_measured_reason.is_none(), "{:?}", q.not_measured_reason);
+}
+
+#[cfg(feature = "render")]
+#[test]
+fn earlier_outliers_use_the_rule_over_their_own_rows() {
+    let conn = catalog();
+    let (file, frame) = light(&conn, "cur.fits");
+    analyse(&conn, frame, file, Some(current()), 2.0, None);
+    for (i, fwhm) in [3.0, 3.1, 3.0, 3.2, 3.1, 9.0].into_iter().enumerate() {
+        let (file, frame) = light(&conn, &format!("old{}.fits", i + 1));
+        analyse(&conn, frame, file, None, fwhm, None);
+    }
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, None, &frames, QualityMetric::Fwhm).expect("summary");
+    assert!(q.high_outliers.is_empty() && q.low_outliers.is_empty(), "the current figures hold one row");
+    assert_eq!(q.earlier[0].high_outliers.len(), 1);
+    assert_eq!(q.earlier[0].high_outliers[0].0.file_name, "old6.fits");
+}
+
+#[cfg(feature = "render")]
+#[test]
+fn earlier_refused_rows_not_in_figures() {
+    let conn = catalog();
+    let (file, frame) = light(&conn, "cur.fits");
+    analyse(&conn, frame, file, Some(current()), 2.0, None);
+    let (file, frame) = light(&conn, "v7_ok.fits");
+    analyse(&conn, frame, file, Some(7), 4.0, None);
+    let (file, frame) = light(&conn, "v7_trailed.fits");
+    analyse(&conn, frame, file, Some(7), 0.0, Some(FrameVerdict::Trailed));
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, None, &frames, QualityMetric::Fwhm).expect("summary");
+    assert_eq!((q.measured, q.older_version), (1, 2));
+    assert!(q.refused.is_empty(), "an earlier refusal is not a current one");
+    assert_eq!(q.earlier.len(), 1);
+    let v7 = &q.earlier[0];
+    assert_eq!((v7.frames, v7.min, v7.max), (1, Some(4.0), Some(4.0)), "the refused row is no figure");
+    assert_eq!(v7.refused, vec![("stars trailed".to_string(), 1)]);
+}
+
+/// Sets the legacy trailed flag on a frame's analysis row.
+#[cfg(feature = "render")]
+fn flag_trailed(conn: &Connection, frame: i64) {
+    conn.execute("UPDATE frame_analysis SET possibly_trailed = 1 WHERE frame_id = ?1", [frame]).expect("flag");
+}
+
+#[cfg(feature = "render")]
+#[test]
+fn legacy_trailed_rows_are_refused_not_figures() {
+    let conn = catalog();
+    let (file, frame) = light(&conn, "cur.fits");
+    analyse(&conn, frame, file, Some(current()), 2.0, None);
+    // Legacy: no version, no verdict, trailed flag set; the app calls it unusable.
+    let (file, frame) = light(&conn, "legacy_trailed.fits");
+    analyse(&conn, frame, file, None, 9.0, None);
+    flag_trailed(&conn, frame);
+    let (file, frame) = light(&conn, "legacy_ok.fits");
+    analyse(&conn, frame, file, None, 3.0, None);
+    // A numbered version ignores the flag: its row still counts as a value.
+    let (file, frame) = light(&conn, "v7_flagged.fits");
+    analyse(&conn, frame, file, Some(7), 4.0, None);
+    flag_trailed(&conn, frame);
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, None, &frames, QualityMetric::Fwhm).expect("summary");
+    assert_eq!(q.earlier.len(), 2);
+    let (v7, legacy) = (&q.earlier[0], &q.earlier[1]);
+    assert_eq!((v7.version, v7.frames, v7.median), (Some(7), 1, Some(4.0)), "a numbered version ignores the flag");
+    assert!(v7.refused.is_empty());
+    assert_eq!((legacy.version, legacy.frames, legacy.median), (None, 1, Some(3.0)), "the trailed row is no figure");
+    assert_eq!(legacy.refused, vec![("stars trailed (legacy flag)".to_string(), 1)]);
+    assert!(q.refused.is_empty(), "an earlier refusal is not a current one");
+}
+
+#[cfg(all(feature = "render", feature = "solver"))]
+#[test]
+fn transparency_loss_has_no_earlier_figures() {
+    let conn = catalog();
+    let (file, frame) = light(&conn, "old.fits");
+    analyse(&conn, frame, file, Some(current() - 1), 2.0, None);
+    let frames = scoped(&conn, &Scope::default());
+    let q = quality_summary(&conn, Some("cat"), &frames, QualityMetric::TransparencyLoss).expect("summary");
+    assert_eq!(q.older_version, 1);
+    assert!(q.earlier.is_empty());
 }
 
 #[cfg(feature = "render")]

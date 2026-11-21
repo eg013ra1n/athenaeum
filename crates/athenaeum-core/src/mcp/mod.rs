@@ -10,6 +10,7 @@
 
 pub mod answer;
 pub mod channel;
+pub mod claude_desktop;
 pub mod infer;
 pub mod lifecycle;
 pub mod plans;
@@ -35,7 +36,8 @@ use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 
 pub use answer::{to_tool_result, Answer};
-pub use lifecycle::{desktop_client_config, McpStatus, NEEDS_API_KEY};
+pub use claude_desktop::{claude_desktop_config_dir, ClaudeDesktopAdded};
+pub use lifecycle::{desktop_client_config, desktop_server_entry, McpStatus, NEEDS_API_KEY};
 pub use plans::{McpPlanView, PlanAnswer, PlanKind, PlanStore};
 pub use server::AthenaeumMcp;
 

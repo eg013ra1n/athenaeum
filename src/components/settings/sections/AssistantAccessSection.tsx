@@ -9,9 +9,10 @@ import { isTauri } from '../../../utils/platform';
 import { useNotifications } from '../../../contexts/NotificationContext';
 import { fieldMeta } from '../../../settings/registry';
 import { Button } from '../../ui/Button';
-import type { McpStatus } from '../../../types/mcp';
+import type { ClaudeDesktopAdded, McpStatus } from '../../../types/mcp';
 import { SettingsSection } from '../SettingsSection';
 import { SettingToggle } from '../SettingToggle';
+import { SavedTick } from '../ResetButton';
 
 const SECTION = 'general.assistantAccess';
 const NOTIFY_KEY = 'mcp-settings';
@@ -52,7 +53,7 @@ function CopyBlock({ title, text, label }: { title: string; text: string; label:
         <span className="text-xs text-content-muted">{title}</span>
         <CopyButton text={text} label={label} />
       </div>
-      <pre className="bg-surface-secondary rounded p-3 text-xs font-mono text-content whitespace-pre-wrap break-all">{text}</pre>
+      <pre className="bg-surface-secondary rounded p-3 text-xs font-mono text-content whitespace-pre overflow-x-auto">{text}</pre>
     </div>
   );
 }
@@ -65,12 +66,12 @@ export function AssistantAccessSection() {
   const notifyRef = useRef(notify);
   notifyRef.current = notify;
 
-  const fail = useCallback((what: string, err: unknown) => {
+  const fail = useCallback((what: string, err: unknown, title = 'Assistant access not changed') => {
     console.error(`[mcp-settings] ${what} failed:`, err);
     notifyRef.current({
       kind: 'generic',
       tone: 'warning',
-      title: 'Assistant access not changed',
+      title,
       detail: errMsg(err),
       dedupeKey: NOTIFY_KEY,
     });
@@ -82,8 +83,12 @@ export function AssistantAccessSection() {
     return String(s.enabled);
   }, []);
 
+  // The last "Added to …" line; cleared when access is switched, so it never reappears stale.
+  const [added, setAdded] = useState<{ result: ClaudeDesktopAdded; at: number } | null>(null);
+
   const write = useCallback(
     async (enabled: boolean): Promise<void> => {
+      setAdded(null);
       try {
         setStatus(await api.invoke<McpStatus>('set_mcp_enabled', { enabled }));
       } catch (err) {
@@ -100,6 +105,25 @@ export function AssistantAccessSection() {
       setStatus(await api.invoke<McpStatus>('regenerate_mcp_token'));
     } catch (err) {
       fail('regenerate_mcp_token', err);
+    }
+  };
+
+  // The write runs once per click: the ref closes the gap before the disabled state renders.
+  const [adding, setAdding] = useState(false);
+  const addingRef = useRef(false);
+  const addToClaudeDesktop = async () => {
+    if (addingRef.current) return;
+    addingRef.current = true;
+    setAdding(true);
+    try {
+      const result = await api.invoke<ClaudeDesktopAdded>('add_mcp_to_claude_desktop');
+      setAdded({ result, at: Date.now() });
+    } catch (err) {
+      setAdded(null);
+      fail('add_mcp_to_claude_desktop', err, 'Not added to Claude desktop');
+    } finally {
+      addingRef.current = false;
+      setAdding(false);
     }
   };
 
@@ -199,6 +223,22 @@ export function AssistantAccessSection() {
                       every launch. Move Athenaeum to the Applications folder, restart it, then copy the configuration
                       again.
                     </p>
+                  </div>
+                )}
+                {status.bridgeFound && !translocated && status.claudeDesktopConfig && (
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <Button onClick={() => void addToClaudeDesktop()} disabled={adding}>
+                        {fieldMeta(SECTION, 'addToClaudeDesktop').label}
+                      </Button>
+                      <SavedTick savedAt={added?.at ?? null} />
+                    </div>
+                    <p className="text-xs text-content-muted">{fieldMeta(SECTION, 'addToClaudeDesktop').help}</p>
+                    {added && (
+                      <p role="status" className="text-xs text-content-muted break-all">
+                        {`Added to ${added.result.path}. Restart Claude desktop to load it.${added.result.replaced ? ' Replaced the earlier entry.' : ''}`}
+                      </p>
+                    )}
                   </div>
                 )}
                 {status.bridgeFound && status.clientConfig && (

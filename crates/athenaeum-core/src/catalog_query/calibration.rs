@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rusqlite::params_from_iter;
 use serde::Serialize;
 
-use super::{is_raw_light, none_of, ScopedFrame};
+use super::{frame_set_tab, is_raw_light, none_of, FrameSetTab, ScopedFrame, SetRef, UNNAMED_SET};
 use crate::api::ApiError;
 use crate::services::ServiceContext;
 
@@ -22,7 +22,15 @@ const ID_CHUNK: usize = 900;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationLine {
+    /// The frame set's name (two sets may share one: the handle and the tab tell them apart).
     pub frame_set: String,
+    /// `set:<id>` of the frame set.
+    pub frame_set_handle: String,
+    /// The Objects tab the frame set shows under.
+    pub tab: FrameSetTab,
+    /// The set as the text names it ([`SetRef::describe`]).
+    #[serde(skip)]
+    pub set: SetRef,
     /// The scope's night of the group's lights (`YYYY-MM-DD`), or `first to last` when the group spans several.
     pub night: String,
     pub camera: String,
@@ -38,8 +46,8 @@ pub struct CalibrationLine {
     pub reason: Option<String>,
 }
 
-/// The frame sets (id, name) the given frame ids belong to.
-fn sets_of_lights(ctx: &ServiceContext, frame_ids: &[i64]) -> Result<BTreeMap<i64, String>, ApiError> {
+/// The frame sets (by id) the given frame ids belong to.
+fn sets_of_lights(ctx: &ServiceContext, frame_ids: &[i64]) -> Result<BTreeMap<i64, SetRef>, ApiError> {
     let db = crate::api::db(ctx)?;
     let conn = db.conn();
     let mut sets = BTreeMap::new();
@@ -48,7 +56,7 @@ fn sets_of_lights(ctx: &ServiceContext, frame_ids: &[i64]) -> Result<BTreeMap<i6
         // A copy the set does not use (a second copy of a frame it already holds) reaches no line below.
         let used = crate::db::frame_is_used_copy_sql("fs.id");
         let sql = format!(
-            "SELECT DISTINCT fs.id, fs.name FROM session_members sm \
+            "SELECT DISTINCT fs.id, fs.name, COALESCE(fs.is_custom, 0), COALESCE(fs.is_archived, 0) FROM session_members sm \
              JOIN sessions ss ON ss.id = sm.session_id \
              JOIN imaging_nights n ON n.id = ss.imaging_night_id \
              JOIN frames_set fs ON fs.id = n.frames_set_id \
@@ -60,15 +68,17 @@ fn sets_of_lights(ctx: &ServiceContext, frame_ids: &[i64]) -> Result<BTreeMap<i6
             ApiError::Internal(format!("could not read the frame sets: {e}"))
         })?;
         let rows = stmt
-            .query_map(params_from_iter(chunk.iter()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+            .query_map(params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, bool>(2)?, r.get::<_, bool>(3)?))
+            })
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
             .map_err(|e| {
                 tracing::error!(error = %e, "calibration summary: frame set read failed");
                 ApiError::Internal(format!("could not read the frame sets: {e}"))
             })?;
-        for (id, name) in rows {
-            let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| none_of("name"));
-            sets.insert(id, name);
+        for (id, name, is_custom, is_archived) in rows {
+            let name = name.filter(|n| !n.trim().is_empty());
+            sets.insert(id, SetRef { id, name, tab: frame_set_tab(is_custom, is_archived) });
         }
     }
     Ok(sets)
@@ -119,12 +129,13 @@ pub fn calibration_summary(
     let sets = sets_of_lights(ctx, &ids)?;
     let total = sets.len();
 
-    let mut ordered: Vec<(i64, String)> = sets.into_iter().collect();
-    ordered.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut ordered: Vec<SetRef> = sets.into_values().collect();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     let start = (page as usize).saturating_mul(FRAME_SETS_PAGE as usize);
 
     let mut lines = Vec::new();
-    for (set_id, set_name) in ordered.into_iter().skip(start).take(FRAME_SETS_PAGE as usize) {
+    for set in ordered.into_iter().skip(start).take(FRAME_SETS_PAGE as usize) {
+        let set_id = set.id;
         let hierarchy = crate::api::calibration::get_calibration_hierarchy_for_frame_set(ctx, set_id)?;
         let reason = readiness_reason(ctx, set_id)?;
         for date in &hierarchy.date_groups {
@@ -146,7 +157,10 @@ pub fn calibration_summary(
                     }
                     let base = group.filter.clone().unwrap_or_else(|| none_of("filter"));
                     lines.push(CalibrationLine {
-                        frame_set: set_name.clone(),
+                        frame_set: set.name.clone().unwrap_or_else(|| UNNAMED_SET.to_string()),
+                        frame_set_handle: set.handle(),
+                        tab: set.tab,
+                        set: set.clone(),
                         night: nights_text(&nights),
                         camera: if camera.instrume == "Unknown Camera" { none_of("camera") } else { camera.instrume.clone() },
                         filter: match group.exptime {

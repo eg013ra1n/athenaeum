@@ -59,8 +59,8 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(format!("could not read {what}: {e}"))
 }
 
-/// The id of the file `file` names, if the catalog holds one.
-fn file_id_of(conn: &Connection, file: &str) -> Result<Option<i64>, ApiError> {
+/// The id of the file `file` names (a `file:<n>` handle or a full catalog path), if the catalog holds one.
+pub(crate) fn file_id_of(conn: &Connection, file: &str) -> Result<Option<i64>, ApiError> {
     if let Some(id) = file.strip_prefix("file:") {
         let Ok(id) = id.trim().parse::<i64>() else { return Ok(None) };
         return conn
