@@ -364,6 +364,9 @@ copied into the MCP nor fixed by its plan; each is a small fix of its own. Delet
   file is listed for another gap. The MCP keeps the lights-only rule for those two.
 - **The folder overview counts Black Hole rows.** `get_folder_overview` counts them per scan root; the MCP's storage
   figures report them apart.
+- **The Missing Metadata view's Excluded list may list Black Hole files (found 2026-11-22, from the code, not run).**
+  `get_excluded_frames_with_metadata` joins `excluded_frames` only, with no Black Hole filter, so a file both excluded
+  and in the Black Hole would be listed. Not checked: whether Send to Void removes its `excluded_frames` row.
 - **Autofind (slot key 1) has no guard against a second run.** A second object autofind replaces the first's handle;
   the batch slot (key 0) refuses a second batch since MCP v1.
 
