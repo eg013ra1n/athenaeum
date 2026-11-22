@@ -227,6 +227,7 @@ async fn main() {
         compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
         iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
         zip_cache: Arc::new(zip_cache),
+        apply_running: Default::default(),
     });
 
     // SSE broadcast channel

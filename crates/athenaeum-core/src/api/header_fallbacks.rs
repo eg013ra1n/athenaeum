@@ -7,6 +7,7 @@
 
 use crate::api::{db, ApiError};
 use crate::header_fallbacks::apply::HeaderFallbackCounts;
+use crate::events::ProgressEmitter;
 use crate::header_fallbacks::{self, HeaderFallbackConfig};
 use crate::services::ServiceContext;
 
@@ -87,6 +88,44 @@ pub fn preview_header_fallbacks(ctx: &ServiceContext) -> Result<HeaderFallbackCo
         .map_err(|e| internal("cannot read the FITS keyword rules", format!("{e:#}")))?;
     header_fallbacks::apply::preview(&conn, &rules)
         .map_err(|e| internal("cannot preview the FITS keyword rules", format!("{e:#}")))
+}
+
+/// Clears `apply_running` when the run ends, however it ends.
+struct ApplyRunning<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ApplyRunning<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Re-read the catalog's frames from their stored headers under the stored rules and write what
+/// changed (D3, D16, D17); regroups the raw calibration frames whose grouping values changed.
+/// Progress goes out as `header-fallbacks-progress`. Blocking: the hosts call it from
+/// `spawn_blocking`. A second Apply on this context while one runs is a conflict.
+pub fn apply_header_fallbacks(
+    ctx: &ServiceContext,
+    emitter: &dyn ProgressEmitter,
+) -> Result<HeaderFallbackCounts, ApiError> {
+    use std::sync::atomic::Ordering;
+    if ctx.apply_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        tracing::warn!("header fallbacks apply refused: one is running");
+        return Err(ApiError::Conflict("FITS keyword rules are already being applied".to_string()));
+    }
+    let _running = ApplyRunning(&ctx.apply_running);
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rules = header_fallbacks::load(&conn)
+        .map_err(|e| internal("cannot read the FITS keyword rules", format!("{e:#}")))?;
+    let gap_hours = ctx
+        .settings
+        .get_session_gap_threshold_hours(&conn)
+        .map_err(|e| internal("cannot read the session gap threshold", format!("{e:#}")))?;
+    let report = header_fallbacks::apply::apply(&conn, &rules, gap_hours, emitter)
+        .map_err(|e| internal("cannot apply the FITS keyword rules", format!("{e:#}")))?;
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_autopublish::request_auto_publish_for_sets(&report.frame_sets_touched);
+    Ok(report.counts)
 }
 
 #[cfg(test)]
@@ -247,5 +286,53 @@ mod tests {
         assert_eq!(counts.by_field[0].field, HeaderField::CcdTemp);
         write_garbage(&ctx);
         assert!(matches!(preview_header_fallbacks(&ctx), Err(ApiError::Internal(_))));
+    }
+
+    #[test]
+    fn apply_writes_under_the_stored_rules() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES ('a.fits', 'a.fits', 1, '2026-01-01', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (1, 'Light')", []).unwrap();
+            conn.execute("INSERT INTO fits_header (file_id, header) VALUES (1, 'MY-TEMP = -3')", []).unwrap();
+        }
+        set_header_fallbacks(&ctx, doc(HeaderField::CcdTemp, &["MY-TEMP", "CCD-TEMP", "DET-TEMP"])).unwrap();
+        let counts = apply_header_fallbacks(&ctx, &crate::events::NullEmitter).unwrap();
+        assert_eq!(counts.frames_changed, 1);
+        let conn = ctx.db.get().unwrap().conn();
+        let t: f64 = conn.query_row("SELECT ccd_temp FROM frames WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(t, -3.0);
+        drop(conn);
+        assert_eq!(preview_header_fallbacks(&ctx).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    #[test]
+    fn second_apply_while_one_runs_is_a_conflict() {
+        use std::sync::atomic::Ordering;
+        let (_tmp, ctx) = test_ctx();
+        let (_tmp2, other) = test_ctx();
+        ctx.apply_running.store(true, Ordering::SeqCst);
+        let err = apply_header_fallbacks(&ctx, &crate::events::NullEmitter).unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)), "{err}");
+        // A refused call leaves the running one's flag alone; another context is not affected.
+        assert!(ctx.apply_running.load(Ordering::SeqCst));
+        assert!(apply_header_fallbacks(&other, &crate::events::NullEmitter).is_ok());
+        ctx.apply_running.store(false, Ordering::SeqCst);
+        assert!(apply_header_fallbacks(&ctx, &crate::events::NullEmitter).is_ok());
+        assert!(!ctx.apply_running.load(Ordering::SeqCst), "the flag is released after a run");
+    }
+
+    #[test]
+    fn a_failed_apply_releases_the_flag() {
+        use std::sync::atomic::Ordering;
+        let (_tmp, ctx) = test_ctx();
+        write_garbage(&ctx);
+        assert!(matches!(apply_header_fallbacks(&ctx, &crate::events::NullEmitter), Err(ApiError::Internal(_))));
+        assert!(!ctx.apply_running.load(Ordering::SeqCst));
     }
 }

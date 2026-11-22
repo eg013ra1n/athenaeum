@@ -11,16 +11,17 @@
 //! equals none of them and is kept, and `frames.override` plays no part: a plate-solved frame is
 //! filled and corrected like any other.
 
-use super::calibration::{movable_sets_of, needs_regroup};
+use super::calibration::{is_deferred, movable_sets_of, needs_regroup, regroup, Deferred};
 use super::resolve::{resolve_field, resolve_keyword, same_value, FieldValue, ResolvedFields};
 use super::{HeaderField, HeaderFallbackConfig};
+use crate::events::{emit_event, ProgressEmitter};
 use crate::fits_parser::header_keys::stored_header_key_map;
 use crate::models::FileFormat;
 use crate::scanner::{instrume_for_scan, path_has_root_prefix, split_unique_camera_suffix};
-use rusqlite::types::ValueRef;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 /// Frames per page: one read (and, in Apply, one write transaction) of this many frames.
@@ -45,6 +46,27 @@ pub struct HeaderFallbackCounts {
     pub values_kept: usize,
     pub sets_regrouped: usize,
     pub frames_without_header: usize,
+}
+
+// The progress event of Apply: one per page of frames, then one when the calibration sets are done.
+// `phase` is "frames" or "calibration".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderFallbackProgress {
+    pub phase: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// The event name of [`HeaderFallbackProgress`] on both hosts.
+pub const PROGRESS_EVENT: &str = "header-fallbacks-progress";
+
+/// What Apply did: the counts (the same figures the preview gave) and the frame sets that hold a
+/// changed frame (for the auto-publish trigger, D16).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    pub counts: HeaderFallbackCounts,
+    pub frame_sets_touched: Vec<i64>,
 }
 
 /// One frame as the catalog holds it: the twelve columns and the newest stored header.
@@ -286,13 +308,36 @@ pub fn plan_frame(rules: &HeaderFallbackConfig, row: &CatalogRow, roots: &ScanRo
     plan
 }
 
+/// Adds one frame's plan to the counts. Returns whether the frame has changes to write.
+fn tally(counts: &mut HeaderFallbackCounts, by_field: &mut BTreeMap<HeaderField, usize>, plan: &FramePlan) -> bool {
+    if plan.no_header {
+        counts.frames_without_header += 1;
+        return false;
+    }
+    counts.values_kept += plan.kept;
+    if plan.changes.is_empty() {
+        return false;
+    }
+    counts.frames_changed += 1;
+    for (field, _) in &plan.changes {
+        *by_field.entry(*field).or_insert(0) += 1;
+    }
+    true
+}
+
+/// The non-zero per-field counts in field order, and the same as the log's `fieldId=count` text.
+fn finish_by_field(counts: &mut HeaderFallbackCounts, by_field: BTreeMap<HeaderField, usize>) -> String {
+    counts.by_field = by_field.into_iter().map(|(field, frames)| FieldCount { field, frames }).collect();
+    counts.by_field.iter().map(|c| format!("{}={}", c.field.id(), c.frames)).collect::<Vec<_>>().join(" ")
+}
+
 /// Count what the rules would change in the whole catalog. Reads only.
 pub fn preview(conn: &Connection, rules: &HeaderFallbackConfig) -> anyhow::Result<HeaderFallbackCounts> {
     let started = Instant::now();
     let roots = ScanRoots::load(conn)?;
     let mut by_field: BTreeMap<HeaderField, usize> = BTreeMap::new();
     let mut counts = HeaderFallbackCounts::default();
-    let mut regroup: Vec<i64> = Vec::new();
+    let mut regroup_ids: Vec<i64> = Vec::new();
 
     let mut after = 0i64;
     loop {
@@ -302,20 +347,10 @@ pub fn preview(conn: &Connection, rules: &HeaderFallbackConfig) -> anyhow::Resul
         let page_len = rows.len();
         for row in &rows {
             let plan = plan_frame(rules, row, &roots);
-            if plan.no_header {
-                counts.frames_without_header += 1;
-                continue;
-            }
-            counts.values_kept += plan.kept;
-            if plan.changes.is_empty() {
-                continue;
-            }
-            counts.frames_changed += 1;
-            for (field, _) in &plan.changes {
-                *by_field.entry(*field).or_insert(0) += 1;
-            }
-            if needs_regroup(row.imagetyp.as_deref(), &row.values, &plan.changes) {
-                regroup.push(row.frame_id);
+            if tally(&mut counts, &mut by_field, &plan)
+                && needs_regroup(row.imagetyp.as_deref(), &row.values, &plan.changes)
+            {
+                regroup_ids.push(row.frame_id);
             }
         }
         if page_len < PAGE_SIZE {
@@ -323,14 +358,8 @@ pub fn preview(conn: &Connection, rules: &HeaderFallbackConfig) -> anyhow::Resul
         }
     }
 
-    counts.sets_regrouped = movable_sets_of(conn, &regroup)?.len();
-    counts.by_field = by_field.into_iter().map(|(field, frames)| FieldCount { field, frames }).collect();
-    let by_field_text = counts
-        .by_field
-        .iter()
-        .map(|c| format!("{}={}", c.field.id(), c.frames))
-        .collect::<Vec<_>>()
-        .join(" ");
+    counts.sets_regrouped = movable_sets_of(conn, &regroup_ids)?.len();
+    let by_field_text = finish_by_field(&mut counts, by_field);
     tracing::debug!(
         count = counts.frames_changed,
         kept = counts.values_kept,
@@ -341,6 +370,143 @@ pub fn preview(conn: &Connection, rules: &HeaderFallbackConfig) -> anyhow::Resul
         "header fallbacks previewed"
     );
     Ok(counts)
+}
+
+/// Writes the planned columns of one frame: `frames` columns of the twelve fields only (never
+/// `override`, never a `files` row).
+pub(super) fn write_columns(
+    conn: &Connection,
+    frame_id: i64,
+    changes: &[(HeaderField, Option<FieldValue>)],
+) -> rusqlite::Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let sets = changes.iter().map(|(f, _)| format!("{} = ?", f.column())).collect::<Vec<_>>().join(", ");
+    let mut values: Vec<Value> = changes
+        .iter()
+        .map(|(_, v)| match v {
+            Some(FieldValue::Number(n)) => Value::Real(*n),
+            Some(FieldValue::Text(t)) => Value::Text(t.clone()),
+            None => Value::Null,
+        })
+        .collect();
+    values.push(Value::Integer(frame_id));
+    conn.prepare_cached(&format!("UPDATE frames SET {sets} WHERE id = ?"))?
+        .execute(rusqlite::params_from_iter(values.iter()))?;
+    Ok(())
+}
+
+/// Apply the rules to the catalog: [`PAGE_SIZE`] frames per write transaction.
+pub fn apply(
+    conn: &Connection,
+    rules: &HeaderFallbackConfig,
+    gap_hours: f64,
+    emitter: &dyn ProgressEmitter,
+) -> anyhow::Result<ApplyReport> {
+    apply_in_pages(conn, rules, gap_hours, emitter, PAGE_SIZE)
+}
+
+/// Apply with a given page size (tests use a small one).
+///
+/// 1. Pages of frames by id, each read and written in one `BEGIN IMMEDIATE` transaction, so a
+///    scan or a monitor cycle interleaves between pages. Raw calibration frames that must be
+///    regrouped, and master frames with a change in a set column, wait for step 3.
+/// 2. After the last page, the nights of every frame set with an `instrume` or `exptime` change
+///    are re-derived, once per set.
+/// 3. One transaction writes the deferred frames, regroups the raw ones and updates the
+///    master-library sets ([`regroup`]).
+pub(crate) fn apply_in_pages(
+    conn: &Connection,
+    rules: &HeaderFallbackConfig,
+    gap_hours: f64,
+    emitter: &dyn ProgressEmitter,
+    page_size: usize,
+) -> anyhow::Result<ApplyReport> {
+    use anyhow::Context;
+    let started = Instant::now();
+    let page_size = page_size.max(1);
+    let roots = ScanRoots::load(conn)?;
+    let total: usize = conn.query_row("SELECT COUNT(*) FROM frames", [], |r| r.get::<_, i64>(0))? as usize;
+
+    let mut by_field: BTreeMap<HeaderField, usize> = BTreeMap::new();
+    let mut counts = HeaderFallbackCounts::default();
+    let mut deferred: Vec<Deferred> = Vec::new();
+    let mut frame_sets: BTreeSet<i64> = BTreeSet::new();
+    let mut night_sets: BTreeSet<i64> = BTreeSet::new();
+    let mut after = 0i64;
+    let mut done = 0usize;
+
+    loop {
+        let sp = crate::db::SavepointGuard::new(conn, "header_fallbacks_page")?;
+        let rows = read_rows(conn, after, page_size)?;
+        let Some(last) = rows.last() else {
+            sp.commit()?;
+            break;
+        };
+        after = last.frame_id;
+        let page_len = rows.len();
+        let mut changed_ids: Vec<i64> = Vec::new();
+        let mut night_ids: Vec<i64> = Vec::new();
+        for row in &rows {
+            let plan = plan_frame(rules, row, &roots);
+            if !tally(&mut counts, &mut by_field, &plan) {
+                continue;
+            }
+            changed_ids.push(row.frame_id);
+            if plan.changes.iter().any(|(f, _)| matches!(f, HeaderField::Instrume | HeaderField::Exptime)) {
+                night_ids.push(row.frame_id);
+            }
+            if is_deferred(row.imagetyp.as_deref(), &row.values, &plan.changes) {
+                deferred.push(Deferred {
+                    frame_id: row.frame_id,
+                    imagetyp: row.imagetyp.clone().unwrap_or_default(),
+                    changes: plan.changes,
+                });
+            } else {
+                write_columns(conn, row.frame_id, &plan.changes)
+                    .with_context(|| format!("cannot write frame {}", row.frame_id))?;
+            }
+        }
+        sp.commit()?;
+        done += page_len;
+        frame_sets.extend(crate::db::calibration_links::frame_set_ids_for_frames(conn, &changed_ids)?);
+        night_sets.extend(crate::db::calibration_links::frame_set_ids_for_frames(conn, &night_ids)?);
+        emit_event(emitter, PROGRESS_EVENT, &HeaderFallbackProgress { phase: "frames".into(), done, total });
+        if page_len < page_size {
+            break;
+        }
+    }
+
+    for set_id in &night_sets {
+        let sp = crate::db::SavepointGuard::new(conn, "header_fallbacks_nights")?;
+        crate::sessions::rederive_for_frame_set(conn, *set_id, &[], gap_hours)
+            .with_context(|| format!("cannot re-derive the nights of frame set {set_id}"))?;
+        sp.commit()?;
+    }
+
+    let report = {
+        let sp = crate::db::SavepointGuard::new(conn, "header_fallbacks_calibration")?;
+        let report = regroup(conn, &deferred).context("cannot regroup the calibration sets")?;
+        sp.commit()?;
+        report
+    };
+    emit_event(emitter, PROGRESS_EVENT, &HeaderFallbackProgress { phase: "calibration".into(), done: total, total });
+
+    counts.sets_regrouped = report.sets_regrouped;
+    let by_field_text = finish_by_field(&mut counts, by_field);
+    tracing::info!(
+        count = counts.frames_changed,
+        kept = counts.values_kept,
+        no_header = counts.frames_without_header,
+        sets_regrouped = report.sets_regrouped,
+        master_sets = report.master_sets,
+        lineage_kept = report.lineage_kept,
+        by_field = %by_field_text,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "header fallbacks applied"
+    );
+    Ok(ApplyReport { counts, frame_sets_touched: frame_sets.into_iter().collect() })
 }
 
 #[cfg(test)]
@@ -790,20 +956,6 @@ mod tests {
             .collect()
     }
 
-    /// What Apply will write for each planned change, standing in for it in these tests.
-    fn write_changes(conn: &Connection, frame_id: i64, changes: &[(HeaderField, Option<FieldValue>)]) {
-        use rusqlite::types::Value;
-        for (field, value) in changes {
-            let v = match value {
-                Some(FieldValue::Number(n)) => Value::Real(*n),
-                Some(FieldValue::Text(t)) => Value::Text(t.clone()),
-                None => Value::Null,
-            };
-            conn.execute(&format!("UPDATE frames SET {} = ?1 WHERE id = ?2", field.column()), params![v, frame_id])
-                .unwrap();
-        }
-    }
-
     /// A card line: keyword, then the value part as the stored header text would carry it.
     fn card_line(key: &str, value: &str) -> String {
         format!("{key:<8}= {value}")
@@ -927,16 +1079,14 @@ mod tests {
         }
     }
 
-    /// Scan under `a`, plan and write the changes for `b`, and compare all twelve fields with a
-    /// fresh scan of the same files under `b`.
+    /// Scan under `a`, Apply `b` (two frames a page, so the pages and the calibration pass are
+    /// the real write path), and compare all twelve fields with a fresh scan of the same files
+    /// under `b`.
     fn assert_apply_equals_a_scan(a: &HeaderFallbackConfig, b: &HeaderFallbackConfig, unique: bool) {
         let dir = tempfile::tempdir().unwrap();
         rules_fixture(dir.path());
         let applied = scan_root_under(dir.path(), unique, a);
-        let roots = ScanRoots::load(&applied).unwrap();
-        for row in read_rows(&applied, 0, 100_000).unwrap() {
-            write_changes(&applied, row.frame_id, &plan_frame(b, &row, &roots).changes);
-        }
+        apply_in_pages(&applied, b, 6.0, &crate::events::NullEmitter, 2).unwrap();
         let scanned = scan_root_under(dir.path(), unique, b);
         assert_eq!(stored_by_name(&applied), stored_by_name(&scanned), "unique camera root: {unique}");
         assert_eq!(preview(&applied, b).unwrap(), HeaderFallbackCounts::default(), "unique: {unique}");
@@ -1093,5 +1243,395 @@ mod tests {
             .unwrap();
         assert_eq!(stored, ["Cam N1", "Cam N1"]);
         assert_eq!(preview(&conn, &HeaderFallbackConfig::default()).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    // ── Apply ──
+
+    use crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, MasterFrameIds};
+    use crate::events::NullEmitter;
+
+    fn apply_default(conn: &Connection, rules: &HeaderFallbackConfig) -> ApplyReport {
+        apply_in_pages(conn, rules, 6.0, &NullEmitter, 2).unwrap()
+    }
+
+    fn set_date(conn: &Connection, frame_id: i64, date_obs: &str) {
+        conn.execute("UPDATE frames SET date_obs = ?1 WHERE id = ?2", params![date_obs, frame_id]).unwrap();
+    }
+
+    fn column(conn: &Connection, table: &str, col: &str, id: i64) -> Option<f64> {
+        conn.query_row(&format!("SELECT {col} FROM {table} WHERE id = ?1"), params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn raw_dark_sets(conn: &Connection) -> Vec<(i64, Option<f64>, i64)> {
+        conn.prepare(
+            "SELECT id, ccd_temp, frame_count FROM calibration_set
+              WHERE imagetyp = 'Dark' AND COALESCE(is_master_library, 0) = 0 ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn members(conn: &Connection, set_id: i64) -> Vec<i64> {
+        conn.prepare("SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 ORDER BY frame_id")
+            .unwrap()
+            .query_map(params![set_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn group_darks(conn: &Connection, ids: Vec<i64>) {
+        create_calibration_sets_from_scan_with_masters(conn, vec![], ids, vec![], vec![], MasterFrameIds::default())
+            .unwrap();
+    }
+
+    /// Four 60 s gain 100 darks 5 minutes apart, the temperature NULL in the columns, `temps` in
+    /// the headers.
+    fn four_darks(conn: &Connection, temps: [&str; 4]) -> Vec<i64> {
+        let values = ResolvedFields { gain: Some(100.0), exptime: Some(60.0), ..ResolvedFields::default() };
+        let mut ids = Vec::new();
+        for (i, t) in temps.iter().enumerate() {
+            let h = fits_text(&[("DET-TEMP", t), ("GAIN", "100"), ("EXPTIME", "60")]);
+            let id = add_frame(conn, &format!("d{i}.fits"), "FITS", "Dark", &values, Some(&h));
+            set_date(conn, id, &format!("2026-01-01T22:{:02}:00Z", i * 5));
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn darks_with_null_temperature_are_regrouped_by_temperature() {
+        let conn = catalog();
+        let ids = four_darks(&conn, ["-10", "-10", "-20", "-20"]);
+        group_darks(&conn, ids.clone());
+        let before = raw_dark_sets(&conn);
+        assert_eq!(before.len(), 1);
+        assert_eq!(members(&conn, before[0].0), ids);
+
+        let report = apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(report.counts.sets_regrouped, 1);
+        assert_eq!(report.counts.frames_changed, 4);
+        let after = raw_dark_sets(&conn);
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert!(after.iter().all(|(id, _, _)| *id != before[0].0), "the old set is gone");
+        assert_eq!(members(&conn, after[0].0), ids[..2]);
+        assert_eq!(members(&conn, after[1].0), ids[2..]);
+        assert!((after[0].1.unwrap() + 10.0).abs() < 1e-9 && (after[1].1.unwrap() + 20.0).abs() < 1e-9, "{after:?}");
+        assert_eq!(preview(&conn, &HeaderFallbackConfig::default()).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    #[test]
+    fn master_library_set_takes_its_masters_new_values() {
+        let conn = catalog();
+        let values = ResolvedFields { exptime: Some(60.0), ..ResolvedFields::default() };
+        let h = fits_text(&[("GAIN", "100"), ("EXPTIME", "60"), ("DET-TEMP", "-5")]);
+        let id = add_frame(&conn, "m.fits", "FITS", "MasterDark", &values, Some(&h));
+        crate::calibration::scan_integration::create_master_sets_from_frames(&conn, &[id], "MasterDark").unwrap();
+        let set_id: i64 = conn
+            .query_row("SELECT set_id FROM calibration_set_frames WHERE frame_id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        // A value the master's set carries and the frame's header does not change.
+        conn.execute("UPDATE calibration_set SET exptime = 999 WHERE id = ?1", params![set_id]).unwrap();
+        assert_eq!(column(&conn, "calibration_set", "gain", set_id), None);
+
+        let report = apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(report.counts.frames_changed, 1);
+        assert_eq!(report.counts.sets_regrouped, 0, "a master's set is not regrouped");
+        assert_eq!(column(&conn, "frames", "gain", id), Some(100.0));
+        assert_eq!(column(&conn, "calibration_set", "gain", set_id), Some(100.0));
+        assert_eq!(column(&conn, "calibration_set", "ccd_temp", set_id), Some(-5.0));
+        assert_eq!(column(&conn, "calibration_set", "temp_min", set_id), Some(-5.0));
+        assert_eq!(column(&conn, "calibration_set", "temp_max", set_id), Some(-5.0));
+        assert_eq!(column(&conn, "calibration_set", "exptime", set_id), Some(999.0), "an unchanged column is not rewritten");
+        assert_eq!(members(&conn, set_id), vec![id]);
+    }
+
+    fn light_set(conn: &Connection, ids: &[i64]) {
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        crate::sessions::rederive_for_frame_set(conn, 1, ids, 6.0).unwrap();
+    }
+
+    fn night_ids(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT id FROM imaging_nights ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn lights_keep_frame_set_nights_and_links() {
+        let conn = catalog();
+        let h = fits_text(&[("INSTRUME", "'OldCam'"), ("CAMERA", "'NewCam'")]);
+        let values = ResolvedFields { instrume: Some("OldCam".into()), ..ResolvedFields::default() };
+        let a = add_frame(&conn, "l1.fits", "FITS", "Light", &values, Some(&h));
+        let b = add_frame(&conn, "l2.fits", "FITS", "Light", &values, Some(&h));
+        set_date(&conn, a, "2026-01-01T22:00:00Z");
+        set_date(&conn, b, "2026-01-01T22:30:00Z");
+        light_set(&conn, &[a, b]);
+        let dark_set = calibration_set(&conn, "Dark");
+        for id in [a, b] {
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type)
+                 VALUES (?1, 'frame', ?2, 'Dark')",
+                params![id, dark_set],
+            )
+            .unwrap();
+        }
+        let links = |c: &Connection| -> Vec<(i64, i64)> {
+            c.prepare("SELECT source_id, calibration_set_id FROM calibration_set_to_frames ORDER BY source_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let links_before = links(&conn);
+        assert_eq!(links_before.len(), 2);
+
+        let rules = rules_with(HeaderField::Instrume, &["CAMERA", "INSTRUME"], &[]);
+        let report = apply_default(&conn, &rules);
+        assert_eq!(report.counts.frames_changed, 2);
+        assert_eq!(report.frame_sets_touched, vec![1]);
+        assert_eq!(crate::db::get_frame_ids_for_frame_set(&conn, 1).unwrap(), vec![a, b]);
+        let session_cameras: Vec<String> = conn
+            .prepare("SELECT instrume FROM sessions")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(session_cameras, ["NewCam"]);
+        assert_eq!(links(&conn), links_before);
+    }
+
+    #[test]
+    fn a_frame_set_spanning_pages_is_rederived_once() {
+        let conn = catalog();
+        let h = fits_text(&[("EXPTIME", "30")]);
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id = add_frame(&conn, &format!("l{i}.fits"), "FITS", "Light", &ResolvedFields::default(), Some(&h));
+            set_date(&conn, id, &format!("2026-01-01T22:{:02}:00Z", i * 5));
+            ids.push(id);
+        }
+        light_set(&conn, &ids);
+        assert_eq!(night_ids(&conn), vec![1]);
+
+        let report = apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(report.counts.frames_changed, 5);
+        // Pages of two frames: three pages, one rebuild of the one night.
+        assert_eq!(night_ids(&conn), vec![2]);
+        let total: f64 = conn.query_row("SELECT total_exp_time FROM sessions", [], |r| r.get(0)).unwrap();
+        assert!((total - 150.0).abs() < 1e-9, "{total}");
+    }
+
+    #[test]
+    fn frames_in_a_superseded_set_keep_their_membership() {
+        let conn = catalog();
+        let h = fits_text(&[("DET-TEMP", "-10")]);
+        let master = calibration_set(&conn, "MasterDark");
+        conn.execute("UPDATE calibration_set SET is_master_library = 1 WHERE id = ?1", params![master]).unwrap();
+        let frozen = calibration_set(&conn, "Dark");
+        conn.execute("UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2", params![master, frozen]).unwrap();
+        let id = add_frame(&conn, "s.fits", "FITS", "Dark", &ResolvedFields::default(), Some(&h));
+        put_in_set(&conn, frozen, id);
+
+        let report = apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(report.counts.frames_changed, 1);
+        assert_eq!(report.counts.sets_regrouped, 0);
+        assert_eq!(members(&conn, frozen), vec![id]);
+        assert_eq!(column(&conn, "frames", "ccd_temp", id), Some(-10.0));
+        let live_raw: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE imagetyp = 'Dark' AND superseded_by_set_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_raw, 0, "no new raw set beside the lineage");
+    }
+
+    #[test]
+    fn apply_never_touches_override_or_hashes() {
+        let conn = catalog();
+        let h = fits_text(&[("DET-TEMP", "-10")]);
+        let id = add_frame(&conn, "a.fits", "FITS", "Light", &ResolvedFields::default(), Some(&h));
+        conn.execute("UPDATE frames SET override = 1 WHERE id = ?1", params![id]).unwrap();
+        conn.execute("UPDATE files SET content_hash = 'c1', strong_hash = 's1'", []).unwrap();
+        let snapshot = |c: &Connection| -> (i64, String, String) {
+            c.query_row(
+                "SELECT fr.override, fi.content_hash, fi.strong_hash FROM frames fr JOIN files fi ON fi.id = fr.file_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let before = snapshot(&conn);
+        assert_eq!(apply_default(&conn, &HeaderFallbackConfig::default()).counts.frames_changed, 1);
+        assert_eq!(snapshot(&conn), before);
+        assert_eq!(column(&conn, "frames", "ccd_temp", id), Some(-10.0));
+    }
+
+    #[test]
+    fn second_preview_after_apply_reads_zero() {
+        let conn = catalog();
+        let h = fits_text(&[("CCD-TEMP", "-10"), ("DET-TEMP", "12")]);
+        let values = ResolvedFields { ccd_temp: Some(-10.0), ..ResolvedFields::default() };
+        let ids: Vec<i64> =
+            (0..3).map(|i| add_frame(&conn, &format!("l{i}.fits"), "FITS", "Light", &values, Some(&h))).collect();
+        let rules = rules_with(HeaderField::CcdTemp, &["DET-TEMP", "CCD-TEMP"], &[]);
+        let counts = preview(&conn, &rules).unwrap();
+        assert_eq!(counts.by_field, vec![FieldCount { field: HeaderField::CcdTemp, frames: 3 }]);
+
+        let report = apply_default(&conn, &rules);
+        assert_eq!(report.counts, counts);
+        assert_eq!(report.counts.frames_changed, 3);
+        for id in ids {
+            assert_eq!(column(&conn, "frames", "ccd_temp", id), Some(12.0));
+        }
+        assert_eq!(preview(&conn, &rules).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    #[test]
+    fn nan_header_value_converges_after_apply() {
+        let conn = catalog();
+        let h = fits_text(&[("CCD-TEMP", "NaN"), ("DET-TEMP", "-5")]);
+        let id = add_frame(&conn, "a.fits", "FITS", "Light", &ResolvedFields::default(), Some(&h));
+        apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(column(&conn, "frames", "ccd_temp", id), Some(-5.0));
+        assert_eq!(preview(&conn, &HeaderFallbackConfig::default()).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    #[test]
+    fn apply_counts_equal_the_preview_counts() {
+        let conn = catalog();
+        add_root(&conn, 3, "/cams/three", true);
+        // Darks to regroup, a typed value to keep, a camera to rename, a frame without a header.
+        let ids = four_darks(&conn, ["-10", "-10", "-20", "-20"]);
+        group_darks(&conn, ids);
+        let typed = ResolvedFields { gain: Some(7.0), ..ResolvedFields::default() };
+        add_frame(&conn, "/cams/three/t.fits", "FITS", "Light", &typed, Some(&fits_text(&[("GAIN", "100")])));
+        let cam = ResolvedFields { instrume: Some("Old N3".into()), ..ResolvedFields::default() };
+        add_frame(&conn, "/cams/three/c.fits", "FITS", "Light", &cam, Some(&fits_text(&[("INSTRUME", "'Old'"), ("CAMERA", "'New'")])));
+        add_frame(&conn, "n.fits", "FITS", "Light", &ResolvedFields::default(), None);
+        let rules = rules_with(HeaderField::Instrume, &["CAMERA", "INSTRUME"], &[]);
+
+        let expected = preview(&conn, &rules).unwrap();
+        assert!(expected.sets_regrouped == 1 && expected.frames_without_header == 1 && expected.values_kept >= 1);
+        assert_eq!(apply_default(&conn, &rules).counts, expected);
+        // Nothing is left to change; the kept value and the headerless frame stay counted.
+        let again = preview(&conn, &rules).unwrap();
+        assert_eq!(
+            again,
+            HeaderFallbackCounts {
+                values_kept: expected.values_kept,
+                frames_without_header: expected.frames_without_header,
+                ..HeaderFallbackCounts::default()
+            }
+        );
+    }
+
+    struct Probe {
+        path: std::path::PathBuf,
+        changed_at_event: std::sync::Mutex<Vec<(String, i64)>>,
+    }
+
+    impl ProgressEmitter for Probe {
+        fn emit_json(&self, _event_name: &str, payload: serde_json::Value) {
+            let phase = payload["phase"].as_str().unwrap_or_default().to_string();
+            // A second connection takes the write lock between the pages: no page transaction is open.
+            let other = Connection::open(&self.path).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            let changed: i64 =
+                other.query_row("SELECT COUNT(*) FROM frames WHERE ccd_temp IS NOT NULL", [], |r| r.get(0)).unwrap();
+            self.changed_at_event.lock().unwrap().push((phase, changed));
+        }
+    }
+
+    #[test]
+    fn each_page_commits_before_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let conn = Connection::open(&path).unwrap();
+        init_db(&conn).unwrap();
+        let h = fits_text(&[("DET-TEMP", "-5")]);
+        for i in 0..5 {
+            add_frame(&conn, &format!("l{i}.fits"), "FITS", "Light", &ResolvedFields::default(), Some(&h));
+        }
+        let probe = Probe { path: path.clone(), changed_at_event: Default::default() };
+        let report = apply_in_pages(&conn, &HeaderFallbackConfig::default(), 6.0, &probe, 2).unwrap();
+        assert_eq!(report.counts.frames_changed, 5);
+        let seen = probe.changed_at_event.lock().unwrap().clone();
+        let phases: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(phases, ["frames", "frames", "frames", "calibration"]);
+        let changed: Vec<i64> = seen.iter().map(|(_, n)| *n).collect();
+        assert_eq!(changed, [2, 4, 5, 5]);
+    }
+
+    /// A set that keeps other members when one frame leaves it: what the bulk edit leaves stale.
+    #[test]
+    fn a_set_that_keeps_members_after_a_regroup_keeps_its_aggregates() {
+        let conn = catalog();
+        let ids = four_darks(&conn, ["-10", "-10", "-10", "-11"]);
+        // The columns carry the temperatures a scan stores, and the set describes all four frames.
+        for (id, t) in ids.iter().zip([-10.0, -10.0, -10.0, -11.0]) {
+            conn.execute("UPDATE frames SET ccd_temp = ?1 WHERE id = ?2", params![t, id]).unwrap();
+        }
+        group_darks(&conn, ids.clone());
+        let before = raw_dark_sets(&conn);
+        assert_eq!(before.len(), 1);
+        let set_id = before[0].0;
+        let (min_before, max_before) =
+            (column(&conn, "calibration_set", "temp_min", set_id), column(&conn, "calibration_set", "temp_max", set_id));
+        assert_eq!((min_before, max_before), (Some(-11.0), Some(-10.0)));
+        // The fourth dark takes another exposure under the new rules.
+        let h = fits_text(&[("DET-TEMP", "-11"), ("GAIN", "100"), ("EXPTIME", "60"), ("EXPOSURE", "120")]);
+        conn.execute(
+            "UPDATE fits_header SET header = ?1 WHERE file_id = (SELECT file_id FROM frames WHERE id = ?2)",
+            params![h, ids[3]],
+        )
+        .unwrap();
+        let rules = rules_with(HeaderField::Exptime, &["EXPOSURE", "EXPTIME"], &[]);
+        apply_default(&conn, &rules);
+
+        let after = raw_dark_sets(&conn);
+        assert_eq!(after.len(), 2, "{after:?}");
+        let (old, new) = (after[0].0, after[1].0);
+        assert_eq!(old, set_id);
+        assert_eq!(members(&conn, old), ids[..3]);
+        assert_eq!(members(&conn, new), vec![ids[3]]);
+        // frame_count follows the membership triggers; the stored temperatures describe the old four.
+        assert_eq!(after[0].2, 3);
+        assert_eq!(column(&conn, "calibration_set", "temp_min", old), min_before, "temp_min stays as it was");
+        assert_eq!(column(&conn, "calibration_set", "temp_max", old), max_before);
+    }
+
+    /// A dark's focal length is not in its group key and a dark set does not carry one.
+    #[test]
+    fn a_focal_length_change_on_a_dark_leaves_its_set_alone() {
+        let conn = catalog();
+        let ids = four_darks(&conn, ["-10", "-10", "-10", "-10"]);
+        group_darks(&conn, ids.clone());
+        let set_id = raw_dark_sets(&conn)[0].0;
+        assert_eq!(column(&conn, "calibration_set", "focallen", set_id), None);
+        for id in &ids {
+            let h = fits_text(&[("DET-TEMP", "-10"), ("GAIN", "100"), ("EXPTIME", "60"), ("FOCALLEN", "530")]);
+            conn.execute(
+                "UPDATE fits_header SET header = ?1 WHERE file_id = (SELECT file_id FROM frames WHERE id = ?2)",
+                params![h, id],
+            )
+            .unwrap();
+            conn.execute("UPDATE frames SET ccd_temp = -10 WHERE id = ?1", params![id]).unwrap();
+        }
+        let report = apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(report.counts.sets_regrouped, 0);
+        assert_eq!(column(&conn, "frames", "focallen", ids[0]), Some(530.0));
+        assert_eq!(raw_dark_sets(&conn).iter().map(|s| s.0).collect::<Vec<_>>(), vec![set_id]);
+        assert_eq!(column(&conn, "calibration_set", "focallen", set_id), None, "the set's own copy is not rewritten");
     }
 }

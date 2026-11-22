@@ -332,6 +332,28 @@ pub async fn preview_header_fallbacks(
         .map_err(api_err)
 }
 
+/// POST /api/apply_header_fallbacks
+///
+/// Write what the stored rules change in the catalog, regrouping the raw calibration frames whose
+/// grouping values change. Emits `header-fallbacks-progress` over SSE. Runs on a blocking thread;
+/// a second Apply while one runs answers 409.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn apply_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let event_tx = state.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let emitter = crate::events::SseProgressEmitter::new(event_tx);
+        athenaeum_core::api::header_fallbacks::apply_header_fallbacks(&ctx, &emitter)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("FITS keyword apply task panicked: {e}")))?
+    .map(Json)
+    .map_err(api_err)
+}
+
 #[cfg(test)]
 mod logging_config_tests {
     use super::*;
@@ -375,6 +397,7 @@ mod logging_config_tests {
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(athenaeum_core::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {
@@ -570,6 +593,18 @@ mod header_fallbacks_tests {
         let state = test_state(db);
         let counts = preview_header_fallbacks(State(state), Json(serde_json::json!({}))).await.unwrap().0;
         assert_eq!(counts, athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts::default());
+    }
+
+    #[tokio::test]
+    async fn apply_header_fallbacks_changes_nothing_in_an_empty_catalog_and_conflicts_when_running() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let counts = apply_header_fallbacks(State(state.clone()), Json(serde_json::json!({}))).await.unwrap().0;
+        assert_eq!(counts, athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts::default());
+        state.ctx.apply_running.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = apply_header_fallbacks(State(state), Json(serde_json::json!({}))).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT, "{err:?}");
     }
 
     #[tokio::test]

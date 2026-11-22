@@ -191,3 +191,22 @@ pub async fn preview_header_fallbacks(
         .map_err(|e| format!("FITS keyword preview task panicked: {e}"))?
         .map_err(|e| e.to_string())
 }
+
+/// Write what the stored keyword rules change in the catalog (regrouping the raw calibration
+/// frames whose grouping values change). Emits `header-fallbacks-progress`. Runs on a blocking
+/// thread; a second Apply while one runs is refused.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn apply_header_fallbacks(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        let emitter = crate::tauri_events::TauriProgressEmitter(app_handle);
+        athenaeum_core::api::header_fallbacks::apply_header_fallbacks(&ctx, &emitter)
+    })
+    .await
+    .map_err(|e| format!("FITS keyword apply task panicked: {e}"))?
+    .map_err(|e| e.to_string())
+}

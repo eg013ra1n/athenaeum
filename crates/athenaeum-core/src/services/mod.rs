@@ -139,6 +139,11 @@ pub struct ServiceContext {
     /// Where zip entries are extracted for consumers that need local bytes
     /// ([`crate::zip_store::materialize`]). Built from the app data directory at startup.
     pub zip_cache: Arc<crate::zip_store::cache::ZipCache>,
+    /// Set while `api::header_fallbacks::apply_header_fallbacks` runs on this context (FITS
+    /// keyword fallbacks, D17): a second Apply is refused with a conflict. A field of the context,
+    /// not a process static, so two contexts (and the api tests) never see each other's run.
+    /// `pub` because the hosts build their own `ServiceContext` literals.
+    pub apply_running: Arc<AtomicBool>,
 }
 
 impl ServiceContext {
@@ -195,6 +200,7 @@ impl ServiceContext {
             compute_queue: compute_queue::ComputeQueue::new(),
             iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: Arc::new(crate::zip_store::cache::ZipCache::at(zip_cache_dir)),
+            apply_running: Default::default(),
         }
     }
 }
