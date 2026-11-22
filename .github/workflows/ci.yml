@@ -168,6 +168,14 @@ jobs:
         # side gates them by target_arch with its next release.
         run: cargo test --workspace --no-fail-fast -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip hedge_cancels_the_loser_and_bounds_duplicate_bytes --skip the_legacy_entry_points_are_output_identical_to_1_3_0 --skip the_bounded_fit_at_one_sample_per_pixel_is_byte_identical_to_before --skip fit_moffat_2d_is_byte_identical_to_before
 
+      # Headless stays headless: core without its default features compiles, and
+      # neither native-heavy dependency (rustafits, solvemyastro) is in its
+      # normal dependency tree, starloom's layers included.
+      - name: Headless core builds without rustafits or solvemyastro
+        run: |
+          cargo check -p athenaeum-core --no-default-features
+          cargo tree -p athenaeum-core --no-default-features -e normal --prefix none | grep -E '^(rustafits|solvemyastro) ' && exit 1 || true
+
       - name: Typecheck frontend
         run: npx tsc --noEmit
 

@@ -29,6 +29,8 @@ check() { # $1 = relative file, $2 = actual, $3 = expected
 }
 
 check "package.json" "$(read_json_version "$REPO_ROOT/package.json")" "$VERSION"
+# starloom is not listed: it is a standalone crate with its own version line (SL-12), not part of the
+# Athenaeum release tag.
 for crate in athenaeum-core athenaeum-tauri athenaeum-web athenaeum-mcp perseus; do
   check "crates/$crate/Cargo.toml" "$(read_cargo_version "$REPO_ROOT/crates/$crate/Cargo.toml")" "$VERSION"
 done

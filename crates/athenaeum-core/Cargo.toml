@@ -36,6 +36,8 @@ rustafits = { path = "../../rustafits", default-features = false, features = ["s
 # Standalone plate solver (clean-room quad-matching implementation). Path dep like
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.
 solvemyastro = { path = "../../solvemyastro", optional = true }
+# The stacking kernel. Base layer and `ts` always; `render` / `solver` add its `engine` / `stack` layers.
+starloom = { path = "../starloom", default-features = false, features = ["ts"] }
 sha2 = "0.11"
 md-5 = "0.11"
 byteorder = "1"
@@ -188,13 +190,15 @@ windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", 
 # Default keeps today's full behavior for the desktop/web builds. Headless
 # consumers build with `--no-default-features` to omit both native-heavy deps.
 default = ["render", "solver"]
-render = ["dep:rustafits"]
-solver = ["dep:solvemyastro"]
+# `render` and `solver` also switch on starloom's `engine` and `stack` layers. Today nothing builds `solver`
+# without `render`: `solver` alone would pull starloom's `engine` (and so rustafits) through `starloom/stack`.
+render = ["dep:rustafits", "starloom/engine"]
+solver = ["dep:solvemyastro", "starloom/stack"]
 # Debug-only Moffat LM solve counters (rustafits `lm-counters`), printed by the star_probe example as one `lmCounters` line;
 # zero numeric effect, never in default (fast-measurement S2b-1).
 lm-counters = ["render", "rustafits/lm-counters"]
 # Test doubles and test-only transports for this crate's and dependants' tests (`LoopbackTransport`, `IrohTransport`); never in default.
-test-support = []
+test-support = ["starloom/test-support"]
 
 [[example]]
 name = "band_profile"

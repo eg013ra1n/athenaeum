@@ -1,0 +1,51 @@
+[package]
+name = "starloom"
+version = "0.1.0"
+description = "The astrophotography stacking kernel: geometry, resampling, FITS/XISF writing, calibration, registration, integration and drizzle"
+edition = "2021"
+license = "Apache-2.0"
+
+# Standalone manifest (SL-12): no [workspace] table and no `workspace = true` keys, so the crate
+# publishes on its own. Versions and features below are copied from athenaeum-core's manifest.
+
+[dependencies]
+# `engine`: the image pipeline. `serde`: the `star_measure` / `stats` types a stacking config stores.
+rustafits = { path = "../../rustafits", default-features = false, features = ["serde"], optional = true }
+# `stack`: the registration quad matcher.
+solvemyastro = { path = "../../solvemyastro", optional = true }
+# Not optional until Task 9: the moved code derives `TS` unconditionally.
+# no-serde-warnings: ts-rs cannot parse type-irrelevant serde attrs and warns on every build.
+ts-rs = { version = "12", features = ["chrono-impl", "no-serde-warnings"] }
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip` only (core's spec): never `preserve_order` or `arbitrary_precision`.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tracing = "0.1"
+anyhow = "1"
+rayon = "1.10"
+byteorder = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
+
+# The platform memory probe (`sys::platform_memory`): GlobalMemoryStatusEx and the job-object limits.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_Threading"] }
+
+[features]
+default = ["stack", "ts"]
+# Layer 2: needs the rustafits image pipeline (integration, light calibration, cosmetic correction).
+engine = ["dep:rustafits"]
+# Layer 3: registration, measurement, rejection, drizzle, weighting. Needs the quad matcher.
+stack = ["engine", "dep:solvemyastro"]
+# ts-rs derives; Task 9 makes this `["dep:ts-rs"]`.
+ts = []
+# Test hooks and fixtures that tests in dependent crates read (SL-17); never in default.
+test-support = []
+
+[lints.rust]
+unexpected_cfgs = "deny"
+
+[dev-dependencies]
+rustafits = { path = "../../rustafits", default-features = false, features = ["serde", "test-support"] }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

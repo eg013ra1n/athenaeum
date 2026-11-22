@@ -422,6 +422,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "solvemyastro",
+ "starloom",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -6823,6 +6824,27 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "starloom"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "chrono",
+ "libc",
+ "rayon",
+ "rustafits",
+ "serde",
+ "serde_json",
+ "solvemyastro",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "ts-rs",
+ "windows-sys 0.59.0",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "string_cache"

@@ -8,6 +8,7 @@ members = [
     "crates/catalog-builder",
     "crates/log-mcp",
     "crates/perseus",
+    "crates/starloom",
     "rustafits",
     "solvemyastro",
 ]
@@ -16,6 +17,10 @@ opt-level = 2
 
 # Workspace members aren't covered by package."*" above.
 [profile.dev.package.athenaeum-core]
+opt-level = 2
+
+# The stacking kernel was core code and ran at this level; it stays there.
+[profile.dev.package.starloom]
 opt-level = 2
 
 # solvemyastro is the hot numeric path (gnomonic projection, quad matching,
