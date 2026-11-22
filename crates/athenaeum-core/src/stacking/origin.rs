@@ -102,7 +102,8 @@ pub(crate) fn prepare_input(origin: &FrameOrigin, frame: &GroupFrame) -> Prepare
 /// describes the mosaic in file row order.
 pub(crate) fn cfa_geometry_of_file(path: &Path) -> anyhow::Result<Option<CfaGeometry>> {
     let fields = if crate::stacking::project_source::is_xisf(path) {
-        let f = crate::fits_parser::parse_xisf(path, 0)?;
+        // Origin reads only the CFA fields, which the FITS keyword rules do not govern.
+        let f = crate::fits_parser::parse_xisf(path, 0, &crate::header_fallbacks::HeaderFallbackConfig::default())?;
         (f.bayerpat, f.xbayroff, f.ybayroff)
     } else {
         let header = crate::fits_parser::FitsHeader::from_path(path)?;
@@ -119,7 +120,13 @@ pub(crate) fn cfa_geometry_of_header_bytes(
     is_xisf: bool,
 ) -> anyhow::Result<Option<CfaGeometry>> {
     let fields = if is_xisf {
-        let (f, _) = crate::fits_parser::parse_xisf_header_bytes(bytes, 0, label)?;
+        // Origin reads only the CFA fields, which the FITS keyword rules do not govern.
+        let (f, _) = crate::fits_parser::parse_xisf_header_bytes(
+            bytes,
+            0,
+            label,
+            &crate::header_fallbacks::HeaderFallbackConfig::default(),
+        )?;
         (f.bayerpat, f.xbayroff, f.ybayroff)
     } else {
         fits_cfa_fields(&crate::fits_parser::FitsHeader::from_bytes(bytes)?)

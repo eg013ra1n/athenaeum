@@ -5093,7 +5093,7 @@ mod tests {
                 // consensus reads are exactly what a scan of these files
                 // produces — not values hand-typed to match the assertion.
                 let (parsed, header_text) =
-                    crate::fits_parser::parse_fits_with_header(&p, 0).unwrap();
+                    crate::fits_parser::parse_fits_with_header(&p, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
                 assert_eq!(parsed.xbayroff, Some(1), "fixture sanity: parsed phase");
                 conn.execute(
                     "INSERT INTO files (path, filename, size, modified_at, format)

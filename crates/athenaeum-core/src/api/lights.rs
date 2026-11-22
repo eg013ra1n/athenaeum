@@ -3381,7 +3381,7 @@ mod real_data_e2e {
             (w, h, data)
         }
         fn header_keys(path: &Path) -> std::collections::HashMap<String, String> {
-            let (_f, text) = crate::fits_parser::parse_fits_with_header(path, 0).unwrap();
+            let (_f, text) = crate::fits_parser::parse_fits_with_header(path, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
             parse_stored_header_keys(FileFormat::FITS, &text)
         }
         let files_count = |conn: &Connection, path: &str| -> i64 {

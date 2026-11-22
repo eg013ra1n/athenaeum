@@ -604,9 +604,12 @@ fn parse_frame(path: &Path) -> Result<athenaeum_core::models::Frame> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
+    // Perseus builds `frame_meta` with no catalog: the default keyword rules. The receiving
+    // catalog applies its own rules through Apply (the wire carries values, not rules).
+    let rules = athenaeum_core::header_fallbacks::HeaderFallbackConfig::default();
     match ext.as_str() {
-        "xisf" => parse_xisf(path, 0).with_context(|| format!("parse XISF {}", path.display())),
-        _ => parse_fits_with_header(path, 0)
+        "xisf" => parse_xisf(path, 0, &rules).with_context(|| format!("parse XISF {}", path.display())),
+        _ => parse_fits_with_header(path, 0, &rules)
             .map(|(frame, _header)| frame)
             .with_context(|| format!("parse FITS {}", path.display())),
     }

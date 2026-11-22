@@ -157,22 +157,29 @@ pub fn extract_fits_header(path: &Path) -> Result<String> {
 }
 
 /// Parse FITS file and return both Frame metadata and raw header text in a single read.
-pub fn parse_fits_with_header(path: &Path, file_id: i64) -> Result<(Frame, String)> {
+pub fn parse_fits_with_header(
+    path: &Path,
+    file_id: i64,
+    rules: &HeaderFallbackConfig,
+) -> Result<(Frame, String)> {
     tracing::debug!(path = %path.display(), "parsing FITS (combined)");
     let header = FitsHeader::from_path(path)?;
-    // Task 3 makes the rules a parameter
-    frame_and_text_from_fits_header(&header, file_id, path, &HeaderFallbackConfig::default())
+    frame_and_text_from_fits_header(&header, file_id, path, rules)
 }
 
 /// Parse the header blocks of a FITS file held in memory (through the END card, as
 /// `zip_store::reader::read_headers` returns them). `display_path` is the catalog path of the
 /// frame: it drives the file-name heuristics exactly as a disk path does. Same header parser
 /// (`FitsHeader::parse_from_reader`) and same frame assembly as `parse_fits_with_header`.
-pub fn parse_fits_header_bytes(bytes: &[u8], file_id: i64, display_path: &Path) -> Result<(Frame, String)> {
+pub fn parse_fits_header_bytes(
+    bytes: &[u8],
+    file_id: i64,
+    display_path: &Path,
+    rules: &HeaderFallbackConfig,
+) -> Result<(Frame, String)> {
     tracing::debug!(path = %display_path.display(), "parsing FITS header bytes");
     let header = FitsHeader::from_bytes(bytes)?;
-    // Task 3 makes the rules a parameter
-    frame_and_text_from_fits_header(&header, file_id, display_path, &HeaderFallbackConfig::default())
+    frame_and_text_from_fits_header(&header, file_id, display_path, rules)
 }
 
 fn frame_and_text_from_fits_header(
@@ -189,11 +196,15 @@ fn frame_and_text_from_fits_header(
 /// Parse an XISF header held in memory: the 16-byte prelude plus the XML, as
 /// `zip_store::reader::read_headers` returns it for an `.xisf` entry. Returns the frame and the
 /// same header text `extract_xisf_header` gives for a disk file.
-pub fn parse_xisf_header_bytes(bytes: &[u8], file_id: i64, display_path: &Path) -> Result<(Frame, String)> {
+pub fn parse_xisf_header_bytes(
+    bytes: &[u8],
+    file_id: i64,
+    display_path: &Path,
+    rules: &HeaderFallbackConfig,
+) -> Result<(Frame, String)> {
     tracing::debug!(path = %display_path.display(), "parsing XISF header bytes");
     let xml = xisf_xml_from_bytes(bytes)?;
-    // Task 3 makes the rules a parameter
-    let frame = parse_xisf_xml(xml, file_id, display_path, &HeaderFallbackConfig::default())?;
+    let frame = parse_xisf_xml(xml, file_id, display_path, rules)?;
     let header_text = xisf_header_text(xml, display_path)?;
     Ok((frame, header_text))
 }
@@ -318,11 +329,10 @@ fn xisf_header_text(content: &[u8], path: &Path) -> Result<String> {
 
 /// Parse FITS file metadata (single-result variant; prefer parse_fits_with_header for scanning)
 #[allow(dead_code)]
-pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
+pub fn parse_fits(path: &Path, file_id: i64, rules: &HeaderFallbackConfig) -> Result<Frame> {
     tracing::debug!(path = %path.display(), "parsing FITS");
     let header = FitsHeader::from_path(path)?;
-    // Task 3 makes the rules a parameter
-    build_frame_from_header(&header, file_id, path, &HeaderFallbackConfig::default())
+    build_frame_from_header(&header, file_id, path, rules)
 }
 
 /// Already-resolved keyword values shared by the FITS and XISF `Frame`
@@ -657,12 +667,11 @@ pub(crate) fn build_frame_from_header(
 }
 
 /// Parse XISF file metadata
-pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
+pub fn parse_xisf(path: &Path, file_id: i64, rules: &HeaderFallbackConfig) -> Result<Frame> {
     tracing::debug!(path = %path.display(), "opening XISF for parsing");
 
     let content = read_xisf_header(path)?;
-    // Task 3 makes the rules a parameter
-    parse_xisf_xml(&content, file_id, path, &HeaderFallbackConfig::default())
+    parse_xisf_xml(&content, file_id, path, rules)
 }
 
 /// `Frame` from an XISF XML block. `path` is the disk path or the virtual catalog path of a
@@ -1187,7 +1196,7 @@ mod tests {
             &xisf,
             &[("BAYERPAT", "'RGGB'"), ("XBAYROFF", "'1'"), ("YBAYROFF", "'0'")],
         );
-        let frame = parse_xisf(&xisf, 1).unwrap();
+        let frame = parse_xisf(&xisf, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.xbayroff, Some(1));
         assert_eq!(frame.ybayroff, Some(0));
     }
@@ -1213,7 +1222,7 @@ mod tests {
             &xisf,
             &[("BAYERPAT", "'RGGB'"), ("XBAYROFF", "1.0"), ("YBAYROFF", "0.0")],
         );
-        let frame = parse_xisf(&xisf, 1).unwrap();
+        let frame = parse_xisf(&xisf, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.xbayroff, Some(1));
         assert_eq!(frame.ybayroff, Some(0));
     }
@@ -1240,7 +1249,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("no_naxis.xisf");
         write_xisf_with_keywords(&path, &[("IMAGETYP", "'Dark'")]);
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!((frame.naxis1, frame.naxis2), (Some(100), Some(100)));
     }
 
@@ -1279,7 +1288,7 @@ mod tests {
             ],
         );
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
         assert_eq!(frame.xbayroff, Some(1));
         assert_eq!(frame.ybayroff, Some(0));
@@ -1293,7 +1302,7 @@ mod tests {
         let path = dir.path().join("mono.xisf");
         write_xisf_with_keywords(&path, &[("OBJECT", "'M33'")]);
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.xbayroff, None, "absent XBAYROFF must not become 0");
         assert_eq!(frame.ybayroff, None, "absent YBAYROFF must not become 0");
         assert_eq!(frame.roworder, None);
@@ -1312,7 +1321,7 @@ mod tests {
              <ColorFilterArray pattern=\"RGGB\" width=\"2\" height=\"2\" name=\"RGGB\"/>\n",
         );
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
         // The element carries no phase offsets — assuming (0,0) would misalign
         // the CFA grid just as surely as a wrong pattern would.
@@ -1332,7 +1341,7 @@ mod tests {
              <ColorFilterArray pattern=\"RGGB\" width=\"2\" height=\"2\" name=\"RGGB\"/>\n",
         );
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.bayerpat.as_deref(), Some("BGGR"));
     }
 
@@ -1349,7 +1358,7 @@ mod tests {
              <ColorFilterArray pattern=\"RGGB\" width=\"2\" height=\"2\" name=\"RGGB\"/>\n",
         );
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"), "the element is the only declaration present");
     }
 
@@ -1362,7 +1371,7 @@ mod tests {
         let path = dir.path().join("blank_kw.xisf");
         write_xisf_with_keywords(&path, &[("BAYERPAT", "'   '"), ("OBJECT", "'M33'")]);
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.bayerpat, None, "a blank keyword declares nothing");
     }
 
@@ -1377,7 +1386,7 @@ mod tests {
             "<ColorFilterArray pattern=\"XYZW\" width=\"2\" height=\"2\" name=\"XYZW\"/>\n",
         );
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.bayerpat, None);
     }
 
@@ -1388,7 +1397,7 @@ mod tests {
         let path = dir.path().join("mono_nocfa.xisf");
         write_xisf_with_keywords(&path, &[("OBJECT", "'M33'")]);
 
-        let frame = parse_xisf(&path, 1).unwrap();
+        let frame = parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap();
         assert_eq!(frame.bayerpat, None);
     }
 
@@ -1444,7 +1453,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("temp.xisf");
         write_xisf_with_keywords(&path, keywords);
-        parse_xisf(&path, 1).unwrap()
+        parse_xisf(&path, 1, &HeaderFallbackConfig::default()).unwrap()
     }
 
     #[test]
@@ -1587,13 +1596,13 @@ mod from_bytes_tests {
         for extra_blocks in [0, 2] {
             let p = dir.path().join(format!("L_{extra_blocks}.fits"));
             let header_len = write_light_fits(&p, extra_blocks);
-            let disk = parse_fits_with_header(&p, 7).unwrap();
+            let disk = parse_fits_with_header(&p, 7, &HeaderFallbackConfig::default()).unwrap();
             let all = std::fs::read(&p).unwrap();
             // Exactly what zip_store::reader::read_headers hands over: the blocks through END.
-            let from_bytes = parse_fits_header_bytes(&all[..header_len], 7, &p).unwrap();
+            let from_bytes = parse_fits_header_bytes(&all[..header_len], 7, &p, &HeaderFallbackConfig::default()).unwrap();
             assert_same(&disk, &from_bytes);
             // Bytes past END (a caller that passes the whole file) change nothing.
-            assert_same(&disk, &parse_fits_header_bytes(&all, 7, &p).unwrap());
+            assert_same(&disk, &parse_fits_header_bytes(&all, 7, &p, &HeaderFallbackConfig::default()).unwrap());
             assert_eq!(disk.0.object.as_deref(), Some("M33"));
             assert_eq!(disk.0.filter.as_deref(), Some("Ha"));
         }
@@ -1605,9 +1614,9 @@ mod from_bytes_tests {
         let p = dir.path().join("L.fits");
         write_light_fits(&p, 0);
         let all = std::fs::read(&p).unwrap();
-        let err = parse_fits_header_bytes(&all[..80 * 15], 1, &p).unwrap_err();
+        let err = parse_fits_header_bytes(&all[..80 * 15], 1, &p, &HeaderFallbackConfig::default()).unwrap_err();
         assert!(err.to_string().contains("END"), "{err}");
-        assert!(parse_fits_header_bytes(&[], 1, &p).is_err());
+        assert!(parse_fits_header_bytes(&[], 1, &p, &HeaderFallbackConfig::default()).is_err());
     }
 
     #[test]
@@ -1618,8 +1627,8 @@ mod from_bytes_tests {
         let all = std::fs::read(&p).unwrap();
         let plain = Path::new("/nas/night.zip/Lights/L_001.fits");
         let master = Path::new("/nas/night.zip/masterDark_300s.fits");
-        assert!(!parse_fits_header_bytes(&all[..header_len], 1, plain).unwrap().0.is_master);
-        assert!(parse_fits_header_bytes(&all[..header_len], 1, master).unwrap().0.is_master);
+        assert!(!parse_fits_header_bytes(&all[..header_len], 1, plain, &HeaderFallbackConfig::default()).unwrap().0.is_master);
+        assert!(parse_fits_header_bytes(&all[..header_len], 1, master, &HeaderFallbackConfig::default()).unwrap().0.is_master);
     }
 
     fn xisf_cards() -> Vec<Card> {
@@ -1646,15 +1655,15 @@ mod from_bytes_tests {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("L.xisf");
         write_xisf_f32(&p, 4, 2, 1, &[0.1; 8], &xisf_cards()).unwrap();
-        let disk = (parse_xisf(&p, 9).unwrap(), extract_xisf_header(&p).unwrap());
+        let disk = (parse_xisf(&p, 9, &HeaderFallbackConfig::default()).unwrap(), extract_xisf_header(&p).unwrap());
         let bytes = xisf_header_bytes(&p);
-        let from_bytes = parse_xisf_header_bytes(&bytes, 9, &p).unwrap();
+        let from_bytes = parse_xisf_header_bytes(&bytes, 9, &p, &HeaderFallbackConfig::default()).unwrap();
         assert_same(&disk, &from_bytes);
         assert_eq!(from_bytes.0.filter.as_deref(), Some("OIII"));
         assert_eq!(from_bytes.0.bayerpat.as_deref(), Some("RGGB"));
         // The whole file works too: the length in the prelude bounds the XML.
         let all = std::fs::read(&p).unwrap();
-        assert_same(&disk, &parse_xisf_header_bytes(&all, 9, &p).unwrap());
+        assert_same(&disk, &parse_xisf_header_bytes(&all, 9, &p, &HeaderFallbackConfig::default()).unwrap());
     }
 
     #[test]
@@ -1668,29 +1677,29 @@ mod from_bytes_tests {
         bytes.extend_from_slice(xml.as_bytes());
 
         let display = Path::new("/nas/night.zip/Masters/master_flat.xisf");
-        let (frame, text) = parse_xisf_header_bytes(&bytes, 1, display).unwrap();
+        let (frame, text) = parse_xisf_header_bytes(&bytes, 1, display, &HeaderFallbackConfig::default()).unwrap();
         assert!(text.contains("/nas/night.zip/Masters/master_flat.xisf"), "{text}");
         assert!(frame.is_master);
         let plain = Path::new("/nas/night.zip/Lights/L_001.xisf");
-        assert!(!parse_xisf_header_bytes(&bytes, 1, plain).unwrap().0.is_master);
+        assert!(!parse_xisf_header_bytes(&bytes, 1, plain, &HeaderFallbackConfig::default()).unwrap().0.is_master);
     }
 
     #[test]
     fn xisf_bytes_with_a_bad_prelude_are_refused() {
         let p = Path::new("/z.zip/a.xisf");
-        assert!(parse_xisf_header_bytes(&[], 1, p).is_err());
-        assert!(parse_xisf_header_bytes(b"XISF0100", 1, p).is_err());
+        assert!(parse_xisf_header_bytes(&[], 1, p, &HeaderFallbackConfig::default()).is_err());
+        assert!(parse_xisf_header_bytes(b"XISF0100", 1, p, &HeaderFallbackConfig::default()).is_err());
         let mut bad_sig = vec![0u8; 32];
         bad_sig[..8].copy_from_slice(b"NOTXISF1");
-        assert!(parse_xisf_header_bytes(&bad_sig, 1, p).unwrap_err().to_string().contains("signature"));
+        assert!(parse_xisf_header_bytes(&bad_sig, 1, p, &HeaderFallbackConfig::default()).unwrap_err().to_string().contains("signature"));
         let mut huge = vec![0u8; 16];
         huge[..8].copy_from_slice(b"XISF0100");
         huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(parse_xisf_header_bytes(&huge, 1, p).unwrap_err().to_string().contains("too large"));
+        assert!(parse_xisf_header_bytes(&huge, 1, p, &HeaderFallbackConfig::default()).unwrap_err().to_string().contains("too large"));
         let mut short = vec![0u8; 20];
         short[..8].copy_from_slice(b"XISF0100");
         short[8..12].copy_from_slice(&100u32.to_le_bytes());
-        assert!(parse_xisf_header_bytes(&short, 1, p).unwrap_err().to_string().contains("truncated"));
+        assert!(parse_xisf_header_bytes(&short, 1, p, &HeaderFallbackConfig::default()).unwrap_err().to_string().contains("truncated"));
     }
 
     #[test]
@@ -1718,11 +1727,11 @@ mod from_bytes_tests {
         let virt = |e: &str| PathBuf::from(format!("{}{}{}", zip.display(), std::path::MAIN_SEPARATOR, e));
 
         let fits_bytes = headers[0].1.as_ref().unwrap();
-        let from_zip = parse_fits_header_bytes(fits_bytes, 3, &virt("Lights/L_001.fits")).unwrap();
-        assert_same(&parse_fits_with_header(&fits, 3).unwrap(), &from_zip);
+        let from_zip = parse_fits_header_bytes(fits_bytes, 3, &virt("Lights/L_001.fits"), &HeaderFallbackConfig::default()).unwrap();
+        assert_same(&parse_fits_with_header(&fits, 3, &HeaderFallbackConfig::default()).unwrap(), &from_zip);
 
         let xisf_bytes = headers[1].1.as_ref().unwrap();
-        let from_zip = parse_xisf_header_bytes(xisf_bytes, 4, &virt("Lights/L_002.xisf")).unwrap();
-        assert_same(&(parse_xisf(&xisf, 4).unwrap(), extract_xisf_header(&xisf).unwrap()), &from_zip);
+        let from_zip = parse_xisf_header_bytes(xisf_bytes, 4, &virt("Lights/L_002.xisf"), &HeaderFallbackConfig::default()).unwrap();
+        assert_same(&(parse_xisf(&xisf, 4, &HeaderFallbackConfig::default()).unwrap(), extract_xisf_header(&xisf).unwrap()), &from_zip);
     }
 }

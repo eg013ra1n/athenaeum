@@ -49,7 +49,8 @@ pub fn needs_vng_gate(path: &Path, resolution: Resolution) -> bool {
     if is_xisf {
         return true;
     }
-    match crate::fits_parser::parse_fits(path, 0).map(|f| f.bayerpat) {
+    // The frame builder's own read of this card (the keyword rules do not govern it).
+    match crate::fits_parser::FitsHeader::from_path(path).map(|h| h.get_str("BAYERPAT")) {
         Ok(pat) => pat.is_some_and(|p| !p.trim().is_empty()),
         Err(error) => {
             tracing::warn!(path = %path.display(), error = %error, "header probe failed — taking the VNG gate defensively");

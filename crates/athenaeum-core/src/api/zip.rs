@@ -591,8 +591,22 @@ pub fn check_zip_entry_readable(policy: &PathPolicy, zip_path: &str, entry: &str
 
 /// Reads the header of `entry` in `zip_path` and parses it like a scan does. Read-only: the catalog is not
 /// touched, so an entry the scan has not cataloged (yet) can be looked at. Only the entry's first bytes are read.
-pub fn get_zip_entry_header(policy: &PathPolicy, zip_path: &str, entry: &str) -> Result<ZipEntryHeader, ApiError> {
+/// The frame is read under the catalog's FITS keyword rules, as a scan would read it.
+pub fn get_zip_entry_header(
+    ctx: &ServiceContext,
+    policy: &PathPolicy,
+    zip_path: &str,
+    entry: &str,
+) -> Result<ZipEntryHeader, ApiError> {
     check_zip_entry_readable(policy, zip_path, entry)?;
+    let rules = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        crate::header_fallbacks::load(&conn).map_err(|e| {
+            tracing::error!(error = %format!("{e:#}"), "stored FITS keyword rules not readable");
+            ApiError::Internal(format!("The stored FITS keyword rules could not be read: {e:#}"))
+        })?
+    };
     let zip = Path::new(zip_path);
     let (bytes, _) = crate::zip_store::reader::read_entry_header(zip, entry).map_err(|e| {
         tracing::warn!(zip_path, zip_entry = entry, error = %format!("{e:#}"), "zip entry header not readable");
@@ -604,9 +618,9 @@ pub fn get_zip_entry_header(policy: &PathPolicy, zip_path: &str, entry: &str) ->
     })?;
     let vpath = crate::zip_store::scan::virtual_path(zip, entry);
     let parsed = if entry.to_ascii_lowercase().ends_with(".xisf") {
-        crate::fits_parser::parse_xisf_header_bytes(&bytes, 0, Path::new(&vpath))
+        crate::fits_parser::parse_xisf_header_bytes(&bytes, 0, Path::new(&vpath), &rules)
     } else {
-        crate::fits_parser::parse_fits_header_bytes(&bytes, 0, Path::new(&vpath))
+        crate::fits_parser::parse_fits_header_bytes(&bytes, 0, Path::new(&vpath), &rules)
     };
     let (frame, header) = parsed.map_err(|e| {
         tracing::warn!(zip_path, zip_entry = entry, error = %format!("{e:#}"), "zip entry header not parseable");
@@ -1206,20 +1220,46 @@ mod tests {
         let (_tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", light(1)), ("notes.txt", b"hello".to_vec())]);
         let zip_s = zip.to_string_lossy().into_owned();
         let before = catalog_dump(&ctx.db.get().unwrap().conn());
-        let header = get_zip_entry_header(&PathPolicy::AllowAll, &zip_s, "Lights/L_001.fits").unwrap();
+        let header = get_zip_entry_header(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights/L_001.fits").unwrap();
         assert_eq!(header.entry, "Lights/L_001.fits");
         assert_eq!(header.frame.object.as_deref(), Some("M33"));
         assert!(header.header.contains("OBJECT"), "{}", header.header);
         assert_eq!(catalog_dump(&ctx.db.get().unwrap().conn()), before);
 
         for bad in ["notes.txt", "../x.fits", "/abs.fits", "Lights//L_001.fits", ""] {
-            assert!(get_zip_entry_header(&PathPolicy::AllowAll, &zip_s, bad).is_err(), "{bad:?} must be refused");
+            assert!(get_zip_entry_header(&ctx, &PathPolicy::AllowAll, &zip_s, bad).is_err(), "{bad:?} must be refused");
         }
-        assert!(get_zip_entry_header(&PathPolicy::AllowAll, &zip_s, "Lights/missing.fits").is_err());
+        assert!(get_zip_entry_header(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights/missing.fits").is_err());
         let elsewhere = PathPolicy::AllowedRoots(vec![PathBuf::from("/nonexistent-root")]);
-        assert!(get_zip_entry_header(&elsewhere, &zip_s, "Lights/L_001.fits").is_err(), "a zip outside the allowed roots");
+        assert!(get_zip_entry_header(&ctx, &elsewhere, &zip_s, "Lights/L_001.fits").is_err(), "a zip outside the allowed roots");
         let top = list_zip_entries(&ctx, &PathPolicy::AllowAll, &zip_s, "").unwrap();
         assert!(top.other_entries.iter().any(|o| o.name == "notes.txt" && !o.readable));
+    }
+
+    #[test]
+    fn zip_entry_header_reads_the_catalog_rules() {
+        use crate::header_fallbacks::{FieldRule, HeaderField, HeaderFallbackConfig};
+        use crate::zip_store::scan::test_support::fits_bytes;
+        let entry = fits_bytes(&[
+            "CCD-TEMP=                -10.0".to_string(),
+            "MY-TEMP =                 -3.0".to_string(),
+        ]);
+        let (_tmp, ctx, zip) = listing_fixture(&[("Lights/L_001.fits", entry)]);
+        let zip_s = zip.to_string_lossy().into_owned();
+        let standard = get_zip_entry_header(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights/L_001.fits").unwrap();
+        assert_eq!(standard.frame.ccd_temp, Some(-10.0));
+
+        let mut rules = HeaderFallbackConfig::default();
+        rules.fields.insert(
+            HeaderField::CcdTemp,
+            FieldRule { order: vec!["MY-TEMP".into(), "CCD-TEMP".into(), "DET-TEMP".into()], retired: Vec::new() },
+        );
+        {
+            let database = ctx.db.get().unwrap();
+            crate::header_fallbacks::store(&database.conn(), &rules).unwrap();
+        }
+        let custom = get_zip_entry_header(&ctx, &PathPolicy::AllowAll, &zip_s, "Lights/L_001.fits").unwrap();
+        assert_eq!(custom.frame.ccd_temp, Some(-3.0), "read under the catalog's rules");
     }
 
     #[test]

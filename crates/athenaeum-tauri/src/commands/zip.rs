@@ -70,8 +70,13 @@ pub async fn list_zip_entries(
 /// first bytes (`spawn_blocking`). Writes nothing.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn get_zip_entry_header(zip_path: String, entry: String) -> Result<ZipEntryHeader, String> {
-    tokio::task::spawn_blocking(move || api::get_zip_entry_header(&PathPolicy::AllowAll, &zip_path, &entry))
+pub async fn get_zip_entry_header(
+    state: State<'_, AppState>,
+    zip_path: String,
+    entry: String,
+) -> Result<ZipEntryHeader, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::get_zip_entry_header(&ctx, &PathPolicy::AllowAll, &zip_path, &entry))
         .await
         .map_err(|e| format!("Zip entry header task panicked: {}", e))?
         .map_err(|e| e.to_string())

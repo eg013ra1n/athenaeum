@@ -99,7 +99,8 @@ pub async fn get_zip_entry_header(
     Json(args): Json<ZipEntryArgs>,
 ) -> Result<Json<ZipEntryHeader>, (StatusCode, String)> {
     let policy = allowed_roots_policy(&state.allowed_paths);
-    let header = tokio::task::spawn_blocking(move || api::get_zip_entry_header(&policy, &args.zip_path, &args.entry))
+    let ctx = state.ctx.clone();
+    let header = tokio::task::spawn_blocking(move || api::get_zip_entry_header(&ctx, &policy, &args.zip_path, &args.entry))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Zip entry header task panicked: {}", e)))?
         .map_err(api_err)?;

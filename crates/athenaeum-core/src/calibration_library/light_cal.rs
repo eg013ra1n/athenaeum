@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::duplicates::compute_xxhash;
-use crate::fits_parser::parse_fits_with_header;
+use crate::fits_parser::extract_fits_header;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::Bayer;
 use crate::fits_writer::{write_image_f32_with, Card, Durability, OutputFormat, XisfBounds};
@@ -752,7 +752,7 @@ pub fn resolve_flat_norm_divisor(
 /// treated as a mismatch — unreachable for an Athenaeum-built master (the
 /// pattern and the constants ride together, both gated on the same parse).
 fn read_ath_channel_norms(flat_path: &Path, light: CfaGeometry) -> Option<[f64; 3]> {
-    let (_, header_text) = parse_fits_with_header(flat_path, 0).ok()?;
+    let header_text = extract_fits_header(flat_path).ok()?;
     let keys = parse_stored_header_keys(FileFormat::FITS, &header_text);
     let read = |kw: &str| -> Option<f64> {
         keys.get(kw)
@@ -980,7 +980,7 @@ fn two_sided_trimmed_mean(data: &[f32], trim_fraction: f64) -> f64 {
 /// divisor (non-finite, zero, negative) counts as absent for the same reason —
 /// recomputing from the pixels beats trusting a broken stamp.
 fn read_ath_fnrm(flat_path: &Path) -> Option<f64> {
-    let (_, header_text) = parse_fits_with_header(flat_path, 0).ok()?;
+    let header_text = extract_fits_header(flat_path).ok()?;
     let keys = parse_stored_header_keys(FileFormat::FITS, &header_text);
     keys.get("ATH_FNRM")
         .and_then(|s| s.parse::<f64>().ok())

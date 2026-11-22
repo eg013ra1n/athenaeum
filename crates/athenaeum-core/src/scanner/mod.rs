@@ -10,6 +10,7 @@ use crate::fits_parser::{
     calibrated_light_identity, extract_xisf_header, parse_fits_with_header, parse_xisf,
     CalibratedIdentity,
 };
+use crate::header_fallbacks::HeaderFallbackConfig;
 use crate::models::{File, Frame, FileFormat, ImageType};
 use chrono::Utc;
 use rayon::prelude::*;
@@ -163,6 +164,43 @@ pub(crate) fn is_zip_file(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("zip"))
 }
 
+/// A trailing ` N<digits>` (digits non-empty) of an INSTRUME value: the unique-camera suffix a scan
+/// root adds to keep two cameras of one model apart. Returns the base name and the digits.
+pub(crate) fn split_unique_camera_suffix(s: &str) -> (&str, Option<&str>) {
+    if let Some(pos) = s.rfind(" N") {
+        let digits = &s[pos + 2..];
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            return (&s[..pos], Some(digits));
+        }
+    }
+    (s, None)
+}
+
+/// `INSTRUME` as stored for a frame living under `root_id`: the base name (any previous
+/// ` N<digits>` suffix removed), plus ` N<root_id>` when the root keeps cameras apart. For a value
+/// read back from the catalog (a moved or adopted row).
+pub(crate) fn instrume_for_root(stored: Option<String>, unique_camera: bool, root_id: i64) -> Option<String> {
+    stored.map(|i| {
+        let base = split_unique_camera_suffix(&i).0;
+        if unique_camera {
+            format!("{base} N{root_id}")
+        } else {
+            base.to_string()
+        }
+    })
+}
+
+/// `INSTRUME` for a value a scan has just parsed from a header: unchanged when the root does not
+/// keep cameras apart, otherwise as [`instrume_for_root`] (so a header that already ends in
+/// ` N<digits>` never gets a second suffix).
+pub(crate) fn instrume_for_scan(parsed: Option<String>, unique_camera: bool, root_id: i64) -> Option<String> {
+    if unique_camera {
+        instrume_for_root(parsed, true, root_id)
+    } else {
+        parsed
+    }
+}
+
 /// What the zip pass of a walker did, summed over its zips.
 #[derive(Default)]
 struct ZipPass {
@@ -197,6 +235,7 @@ fn run_zip_pass(
     zips: &[PathBuf],
     root_id: i64,
     unique_camera: bool,
+    rules: &HeaderFallbackConfig,
     is_cancelled: &dyn Fn() -> bool,
     on_zip: &mut dyn FnMut(usize, usize, &Path),
 ) -> ZipPass {
@@ -207,7 +246,7 @@ fn run_zip_pass(
             break;
         }
         on_zip(idx, zips.len(), zip);
-        match crate::zip_store::scan::scan_zip(conn, zip, root_id, unique_camera) {
+        match crate::zip_store::scan::scan_zip_with(conn, zip, root_id, unique_camera, rules) {
             Ok(outcome) => {
                 pass.files_inserted += outcome.files_inserted;
                 pass.adopted += outcome.adopted;
@@ -232,6 +271,8 @@ pub fn scan_directory(
     unique_camera: bool,
     root_id: i64,
 ) -> ScanResult {
+    // One rule set per run: the catalog's FITS keyword rules, read once.
+    let rules = crate::header_fallbacks::load_for_scan(conn);
     let mut result = ScanResult {
         files_found: 0,
         files_processed: 0,
@@ -404,7 +445,7 @@ pub fn scan_directory(
             // bookkeeping (junction tables, calibration links) stays
             // valid; just record the error and move on.
             match reparse_and_update_in_place(
-                file_path, file_id, conn, unique_camera, root_id, false,
+                file_path, file_id, conn, unique_camera, root_id, false, &rules,
             ) {
                 Ok(()) => {
                     *processed.lock().unwrap() += 1;
@@ -420,7 +461,7 @@ pub fn scan_directory(
             continue;
         }
 
-        match process_file(file_path, conn, unique_camera, root_id) {
+        match process_file(file_path, conn, unique_camera, root_id, &rules) {
             Ok(frame_info) => {
                 *processed.lock().unwrap() += 1;
 
@@ -456,6 +497,7 @@ pub fn scan_directory(
         &zips,
         root_id,
         unique_camera,
+        &rules,
         &|| false,
         &mut |idx, total, zip| {
             if let Some(ref cb) = progress_callback {
@@ -559,6 +601,7 @@ fn process_file(
     conn: &Connection,
     unique_camera: bool,
     root_id: i64,
+    rules: &HeaderFallbackConfig,
 ) -> anyhow::Result<Option<(i64, ImageType)>> {
     // Get file metadata
     let metadata = std::fs::metadata(path)?;
@@ -597,7 +640,7 @@ fn process_file(
     // This also serves for the moved-file fingerprint check
     let (early_frame, header_text) = match format {
         FileFormat::FITS => {
-            let (f, h) = parse_fits_with_header(path, 0)?;
+            let (f, h) = parse_fits_with_header(path, 0, rules)?;
             (Some(f), Some(h))
         }
         FileFormat::XISF => {
@@ -674,20 +717,7 @@ fn process_file(
                 rusqlite::params![file_id],
                 |row| row.get(0),
             ).optional()?.flatten();
-            let base_instrume = raw_instrume.as_ref().map(|i| {
-                if let Some(pos) = i.rfind(" N") {
-                    let suffix = &i[pos + 2..];
-                    if suffix.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty() {
-                        return i[..pos].to_string();
-                    }
-                }
-                i.clone()
-            });
-            let new_instrume = if unique_camera {
-                base_instrume.map(|i| format!("{} N{}", i, root_id))
-            } else {
-                base_instrume
-            };
+            let new_instrume = instrume_for_root(raw_instrume, unique_camera, root_id);
             conn.execute(
                 "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
                 rusqlite::params![new_instrume, file_id],
@@ -733,15 +763,11 @@ fn process_file(
             f.file_id = file_id;
             f
         }
-        None => parse_xisf(path, file_id)?,
+        None => parse_xisf(path, file_id, rules)?,
     };
 
     // Apply unique camera suffix to INSTRUME if enabled
-    if unique_camera {
-        if let Some(ref instrume) = frame.instrume {
-            frame.instrume = Some(format!("{} N{}", instrume, root_id));
-        }
-    }
+    frame.instrume = instrume_for_scan(frame.instrume.take(), unique_camera, root_id);
 
     let frame_id = insert_frame(conn, &frame)?;
     let imagetyp = frame.imagetyp.clone();
@@ -1131,6 +1157,7 @@ fn reparse_and_update_in_place(
     unique_camera: bool,
     root_id: i64,
     warn_override_skip: bool,
+    rules: &HeaderFallbackConfig,
 ) -> anyhow::Result<()> {
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len() as i64;
@@ -1147,11 +1174,11 @@ fn reparse_and_update_in_place(
     // than missing.
     let (frame, header_text) = match format {
         FileFormat::FITS => {
-            let (f, h) = parse_fits_with_header(path, file_id)?;
+            let (f, h) = parse_fits_with_header(path, file_id, rules)?;
             (f, Some(h))
         }
         FileFormat::XISF => {
-            let f = parse_xisf(path, file_id)?;
+            let f = parse_xisf(path, file_id, rules)?;
             // A failed header extraction is the ONE way this function can
             // leave the stored header blob describing different bytes than the
             // frames columns it is about to write (light-cal copy-through
@@ -1206,25 +1233,9 @@ pub(crate) fn apply_parsed_in_place(
     path: &Path,
     warn_override_skip: bool,
 ) -> anyhow::Result<()> {
-    let new_instrume = if unique_camera {
-        frame.instrume.as_ref().map(|i| {
-            // Strip a previous " N<digits>" suffix before re-applying so we
-            // don't accumulate "N1 N1 N1" on repeated rescans.
-            let base = if let Some(pos) = i.rfind(" N") {
-                let suffix = &i[pos + 2..];
-                if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                    &i[..pos]
-                } else {
-                    i.as_str()
-                }
-            } else {
-                i.as_str()
-            };
-            format!("{} N{}", base, root_id)
-        })
-    } else {
-        frame.instrume.clone()
-    };
+    // `instrume_for_scan` strips a previous " N<digits>" suffix before re-applying it, so repeated
+    // rescans never accumulate "N1 N1 N1".
+    let new_instrume = instrume_for_scan(frame.instrume.clone(), unique_camera, root_id);
 
     // Defensive: ensure no more than one frames row points at this file_id.
     // frame_count == 1 → UPDATE in place (the common case).
@@ -1359,7 +1370,8 @@ pub fn resync_catalog_rows_from_disk(
     file_id: i64,
     path: &Path,
 ) -> anyhow::Result<()> {
-    reparse_and_update_in_place(path, file_id, conn, false, 0, true)
+    let rules = crate::header_fallbacks::load_for_scan(conn);
+    reparse_and_update_in_place(path, file_id, conn, false, 0, true, &rules)
 }
 
 /// The write half of `reparse_and_update_in_place`. Runs inside the
@@ -1589,6 +1601,7 @@ fn emit_scan_complete<E: ProgressEmitter>(emitter: &E, root_id: i64, result: &Sc
 fn process_file_parallel(
     path: &PathBuf,
     root_id: i64,
+    rules: &HeaderFallbackConfig,
 ) -> Result<FileProcessResult, String> {
     tracing::debug!(root_id, path = %path.display(), "processing file");
 
@@ -1640,11 +1653,11 @@ fn process_file_parallel(
     // Parse metadata and extract header in a single read for FITS files
     let (frame, header) = match format {
         FileFormat::FITS => {
-            let (f, h) = parse_fits_with_header(path, 0).map_err(|e| e.to_string())?;
+            let (f, h) = parse_fits_with_header(path, 0, rules).map_err(|e| e.to_string())?;
             (f, Some(h))
         }
         FileFormat::XISF => {
-            let f = parse_xisf(path, 0).map_err(|e| e.to_string())?;
+            let f = parse_xisf(path, 0, rules).map_err(|e| e.to_string())?;
             let h = extract_xisf_header(path).ok();
             (f, h)
         }
@@ -1686,7 +1699,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     cancel_flag: Arc<AtomicBool>,
     unique_camera: bool,
 ) -> ScanResult {
-    match scan_files_parallel(root_path, root_id, conn, emitter, cancel_flag.clone(), unique_camera) {
+    let rules = crate::header_fallbacks::load_for_scan(conn);
+    match scan_files_parallel(root_path, root_id, conn, emitter, cancel_flag.clone(), unique_camera, &rules) {
         ParallelScan::Done(result) => result,
         ParallelScan::ZipsPending(pending) => finish_zip_pass(conn, emitter, cancel_flag, *pending),
     }
@@ -1706,6 +1720,8 @@ pub(crate) struct PendingZips {
     zips: Vec<PathBuf>,
     root_id: i64,
     unique_camera: bool,
+    /// The run's FITS keyword rules, read once when the file pass started.
+    rules: HeaderFallbackConfig,
     total_new: usize,
     lights_count: usize,
     flat_frame_ids: Vec<i64>,
@@ -1735,8 +1751,9 @@ pub(crate) fn scan_files_parallel<E: ProgressEmitter>(
     emitter: &E,
     cancel_flag: Arc<AtomicBool>,
     unique_camera: bool,
+    rules: &HeaderFallbackConfig,
 ) -> ParallelScan {
-    scan_files_parallel_to_depth(root_path, root_id, conn, emitter, cancel_flag, unique_camera, WALK_MAX_DEPTH)
+    scan_files_parallel_to_depth(root_path, root_id, conn, emitter, cancel_flag, unique_camera, rules, WALK_MAX_DEPTH)
 }
 
 /// Deepest level a scan walks below its root.
@@ -1751,6 +1768,7 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
     emitter: &E,
     cancel_flag: Arc<AtomicBool>,
     unique_camera: bool,
+    rules: &HeaderFallbackConfig,
     max_depth: usize,
 ) -> ParallelScan {
     let mut result = ScanResult {
@@ -2024,7 +2042,7 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
             // headers). Without this, rayon swallows the panic and the file
             // silently disappears from the result with no error trail.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                process_file_parallel(path, root_id)
+                process_file_parallel(path, root_id, rules)
             }));
 
             match outcome {
@@ -2294,7 +2312,7 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
         if let Some(&file_id) = modified_files_by_path.get(&file_result.file.path).filter(|_| !archived_row_repointed) {
             let path_buf = PathBuf::from(&file_result.file.path);
             match reparse_and_update_in_place(
-                &path_buf, file_id, conn, unique_camera, root_id, false,
+                &path_buf, file_id, conn, unique_camera, root_id, false, rules,
             ) {
                 Ok(()) => {
                     result.files_processed += 1;
@@ -2352,11 +2370,8 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
         file_result.frame.file_id = file_id;
 
         // Apply unique camera suffix to INSTRUME if enabled
-        if unique_camera {
-            if let Some(ref instrume) = file_result.frame.instrume {
-                file_result.frame.instrume = Some(format!("{} N{}", instrume, root_id));
-            }
-        }
+        file_result.frame.instrume =
+            instrume_for_scan(file_result.frame.instrume.take(), unique_camera, root_id);
 
         let frame_id = match insert_frame(conn, &file_result.frame) {
             Ok(id) => id,
@@ -2472,6 +2487,7 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
         zips,
         root_id,
         unique_camera,
+        rules: rules.clone(),
         total_new,
         lights_count,
         flat_frame_ids,
@@ -2500,6 +2516,7 @@ pub(crate) fn finish_zip_pass<E: ProgressEmitter>(
         zips,
         root_id,
         unique_camera,
+        rules,
         total_new,
         mut lights_count,
         mut flat_frame_ids,
@@ -2521,6 +2538,7 @@ pub(crate) fn finish_zip_pass<E: ProgressEmitter>(
         &zips,
         root_id,
         unique_camera,
+        &rules,
         &|| cancel_flag.load(Ordering::SeqCst),
         &mut |idx, total, zip| {
             emit_progress(
@@ -2759,7 +2777,8 @@ pub(crate) fn rescan_directory_shallow<E: ProgressEmitter>(
     unique_camera: bool,
 ) -> ScanResult {
     let cancel = Arc::new(AtomicBool::new(false));
-    match scan_files_parallel_to_depth(dir, root_id, conn, emitter, cancel.clone(), unique_camera, 1) {
+    let rules = crate::header_fallbacks::load_for_scan(conn);
+    match scan_files_parallel_to_depth(dir, root_id, conn, emitter, cancel.clone(), unique_camera, &rules, 1) {
         ParallelScan::Done(result) => result,
         ParallelScan::ZipsPending(pending) => finish_zip_pass(conn, emitter, cancel, *pending),
     }
@@ -2777,6 +2796,7 @@ pub(crate) fn rescan_zips<E: ProgressEmitter>(
 ) -> ScanResult {
     zips.sort();
     zips.dedup();
+    let rules = crate::header_fallbacks::load_for_scan(conn);
     let pending = PendingZips {
         result: ScanResult {
             files_found: 0,
@@ -2795,6 +2815,7 @@ pub(crate) fn rescan_zips<E: ProgressEmitter>(
         zips,
         root_id,
         unique_camera,
+        rules,
         total_new: 0,
         lights_count: 0,
         flat_frame_ids: Vec::new(),
@@ -2861,6 +2882,11 @@ pub fn run_registered_scans<E: ProgressEmitter>(
 ) -> Vec<(i64, Result<RegisteredScanOutcome, String>)> {
     let mut results: Vec<(i64, Result<RegisteredScanOutcome, String>)> = Vec::with_capacity(root_ids.len());
     let mut waiting: Vec<(usize, RegisteredScan<'_>, PendingZips)> = Vec::new();
+    // One rule set for every root of the run, read once.
+    let rules: Option<HeaderFallbackConfig> = ctx.db.get().map(|db| {
+        let conn = db.conn();
+        crate::header_fallbacks::load_for_scan(&conn)
+    });
 
     for &root_id in root_ids {
         let span = tracing::info_span!("scan", root_id);
@@ -2872,7 +2898,7 @@ pub fn run_registered_scans<E: ProgressEmitter>(
                 continue;
             }
         };
-        let Some(db) = ctx.db.get() else {
+        let (Some(db), Some(rules)) = (ctx.db.get(), rules.as_ref()) else {
             results.push((root_id, Err("Database not initialized".to_string())));
             continue;
         };
@@ -2885,6 +2911,7 @@ pub fn run_registered_scans<E: ProgressEmitter>(
                 emitter,
                 scan.cancel_flag.clone(),
                 scan.root.unique_camera,
+                rules,
             )
         };
         match walked {
@@ -3616,7 +3643,7 @@ mod moved_file_guard_tests {
         .unwrap();
 
         let (_frame, header_text) =
-            parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+            parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
 
         let old_path = offline_root.join("L_001.fits");
         let old_path_str = old_path.to_str().unwrap().to_string();
@@ -3625,7 +3652,7 @@ mod moved_file_guard_tests {
         let new_path = online_root.join("L_001.fits");
         std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
 
-        let result = process_file(&new_path, &conn, false, 2).unwrap();
+        let result = process_file(&new_path, &conn, false, 2, &HeaderFallbackConfig::default()).unwrap();
         assert!(
             result.is_some(),
             "guard must let the new file insert instead of silently treating it as a move"
@@ -3674,7 +3701,7 @@ mod moved_file_guard_tests {
         .unwrap();
 
         let (_frame, header_text) =
-            parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+            parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
 
         // Old row's path is under an existing root directory, but the file
         // itself was never written there (it "moved away").
@@ -3685,7 +3712,7 @@ mod moved_file_guard_tests {
         let new_path = new_root.join("L_001.fits");
         std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
 
-        let result = process_file(&new_path, &conn, false, 2).unwrap();
+        let result = process_file(&new_path, &conn, false, 2, &HeaderFallbackConfig::default()).unwrap();
         assert!(
             result.is_none(),
             "a genuine move must short-circuit with Ok(None), not insert a new row"
@@ -3723,7 +3750,7 @@ mod moved_file_guard_tests {
         init_db(&conn).unwrap();
         conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [old_root.to_str().unwrap()]).unwrap();
         conn.execute("INSERT INTO scan_roots (id, path) VALUES (2, ?1)", [new_root.to_str().unwrap()]).unwrap();
-        let (_frame, header_text) = parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+        let (_frame, header_text) = parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
         let old_time = chrono::DateTime::<Utc>::from(at(old_secs)).to_rfc3339();
         let old_path = old_root.join("L_001.fits");
@@ -3741,7 +3768,7 @@ mod moved_file_guard_tests {
 
         match via {
             0 => {
-                let result = process_file(&new_path, &conn, false, 2).unwrap();
+                let result = process_file(&new_path, &conn, false, 2, &HeaderFallbackConfig::default()).unwrap();
                 assert!(result.is_none(), "the fixture is a genuine move");
             }
             1 => {
@@ -3804,7 +3831,7 @@ mod moved_file_guard_tests {
             init_db(&conn).unwrap();
             conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", [root.to_str().unwrap()]).unwrap();
 
-            let (_frame, header_text) = parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+            let (_frame, header_text) = parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
             // The archived row: its original location (under a root that is online) no longer holds the file.
             let original = root.join("Lights").join("L_001.fits");
             let zip = tmp.path().join("archive.zip");
@@ -5347,5 +5374,186 @@ mod zip_pass_tests {
         assert!(pass.changed_catalog());
         assert_eq!(pass.rows_written(), 1);
         assert!(!ZipPass::default().changed_catalog());
+    }
+}
+
+/// The scanner reads every header under the catalog's FITS keyword rules (issue #21).
+#[cfg(test)]
+mod header_rules_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use crate::events::NullEmitter;
+    use crate::fits_writer::{write_xisf_f32, Card, CardValue};
+    use crate::header_fallbacks::{FieldRule, HeaderField};
+    use crate::zip_store::scan::test_support::fits_bytes;
+    use rusqlite::params;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    fn fresh_db(root: &Path) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", params![root.to_str().unwrap()]).unwrap();
+        conn
+    }
+
+    /// `MY-TEMP` first for the sensor temperature, the standard keywords behind it.
+    fn my_temp_first() -> HeaderFallbackConfig {
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.insert(
+            HeaderField::CcdTemp,
+            FieldRule {
+                order: vec!["MY-TEMP".into(), "CCD-TEMP".into(), "DET-TEMP".into()],
+                retired: Vec::new(),
+            },
+        );
+        cfg
+    }
+
+    /// A FITS light carrying `CCD-TEMP = -10` and `MY-TEMP = -3` (`seq` makes its bytes unique).
+    fn fits_with_two_temps(seq: u32) -> Vec<u8> {
+        fits_bytes(&[
+            "CCD-TEMP=                -10.0".to_string(),
+            "MY-TEMP =                 -3.0".to_string(),
+            format!("SEQNUM  = {seq:>20}"),
+        ])
+    }
+
+    fn write_xisf_with_two_temps(path: &Path) {
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
+            Card::new("CCD-TEMP", CardValue::Real(-10.0)).unwrap(),
+            Card::new("MY-TEMP", CardValue::Real(-3.0)).unwrap(),
+        ];
+        write_xisf_f32(path, 2, 2, 1, &[0.0, 0.25, 0.5, 1.0], &cards).unwrap();
+    }
+
+    fn ccd_temp_of(conn: &Connection, path: &Path) -> Option<f64> {
+        conn.query_row(
+            "SELECT fr.ccd_temp FROM frames fr JOIN files fi ON fi.id = fr.file_id WHERE fi.path = ?1",
+            params![path.to_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn seed_files(root: &Path) -> (PathBuf, PathBuf) {
+        let fits = root.join("L_001.fits");
+        std::fs::write(&fits, fits_with_two_temps(1)).unwrap();
+        let xisf = root.join("L_002.xisf");
+        write_xisf_with_two_temps(&xisf);
+        (fits, xisf)
+    }
+
+    #[test]
+    fn serial_scan_reads_a_user_keyword_first() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        crate::header_fallbacks::store(&conn, &my_temp_first()).unwrap();
+        let (fits, xisf) = seed_files(root.path());
+        let result = scan_directory(root.path(), &conn, None, false, 1);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(ccd_temp_of(&conn, &fits), Some(-3.0));
+        assert_eq!(ccd_temp_of(&conn, &xisf), Some(-3.0));
+    }
+
+    #[test]
+    fn a_catalog_without_stored_rules_reads_the_standard_keywords() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        let (fits, xisf) = seed_files(root.path());
+        let result = scan_directory(root.path(), &conn, None, false, 1);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(ccd_temp_of(&conn, &fits), Some(-10.0));
+        assert_eq!(ccd_temp_of(&conn, &xisf), Some(-10.0));
+    }
+
+    #[test]
+    fn parallel_scan_reads_a_user_keyword_first() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        crate::header_fallbacks::store(&conn, &my_temp_first()).unwrap();
+        let (fits, xisf) = seed_files(root.path());
+        let result =
+            scan_directory_parallel(root.path(), 1, &conn, &NullEmitter, Arc::new(AtomicBool::new(false)), false);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(ccd_temp_of(&conn, &fits), Some(-3.0));
+        assert_eq!(ccd_temp_of(&conn, &xisf), Some(-3.0));
+    }
+
+    #[test]
+    fn a_registered_scan_reads_the_catalog_rules() {
+        let root = TempDir::new().unwrap();
+        let ctx = crate::services::ServiceContext::new_for_tests(root.path().join("catalog.db"));
+        let scan_dir = root.path().join("astro");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        let (fits, xisf) = seed_files(&scan_dir);
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", params![scan_dir.to_str().unwrap()])
+                .unwrap();
+            crate::header_fallbacks::store(&conn, &my_temp_first()).unwrap();
+        }
+        let outcomes = run_registered_scans(&ctx, &NullEmitter, &[1]);
+        assert_eq!(outcomes.len(), 1);
+        let outcome = outcomes.into_iter().next().unwrap().1.unwrap();
+        assert!(outcome.result.errors.is_empty(), "{:?}", outcome.result.errors);
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+        assert_eq!(ccd_temp_of(&conn, &fits), Some(-3.0));
+        assert_eq!(ccd_temp_of(&conn, &xisf), Some(-3.0));
+    }
+
+    #[test]
+    fn in_place_reparse_reads_the_catalog_rules() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        let fits = root.path().join("L_001.fits");
+        std::fs::write(&fits, fits_with_two_temps(1)).unwrap();
+        let first = scan_directory(root.path(), &conn, None, false, 1);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(ccd_temp_of(&conn, &fits), Some(-10.0), "scanned under the standard keywords");
+
+        // The user reorders the keywords; the file changes on disk, so the scan re-parses it in place.
+        crate::header_fallbacks::store(&conn, &my_temp_first()).unwrap();
+        std::fs::write(&fits, fits_with_two_temps(2)).unwrap();
+        let later = std::fs::metadata(&fits).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&fits).unwrap().set_modified(later).unwrap();
+        let second = scan_directory(root.path(), &conn, None, false, 1);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.files_processed, 1);
+        assert_eq!(ccd_temp_of(&conn, &fits), Some(-3.0), "re-parsed under the catalog's rules");
+    }
+
+    #[test]
+    fn a_rules_row_that_does_not_decode_scans_with_the_defaults() {
+        let root = TempDir::new().unwrap();
+        let conn = fresh_db(root.path());
+        crate::db::set_setting(&conn, crate::settings::keys::CATALOG_HEADER_FALLBACKS, "not json").unwrap();
+        let (fits, _xisf) = seed_files(root.path());
+        let result = scan_directory(root.path(), &conn, None, false, 1);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(ccd_temp_of(&conn, &fits), Some(-10.0));
+    }
+
+    #[test]
+    fn instrume_for_scan_appends_once_and_leaves_a_plain_root_alone() {
+        assert_eq!(instrume_for_scan(Some("Cam N3".into()), true, 3), Some("Cam N3".into()));
+        assert_eq!(instrume_for_scan(Some("Cam".into()), true, 3), Some("Cam N3".into()));
+        assert_eq!(instrume_for_scan(Some("Cam N3".into()), false, 3), Some("Cam N3".into()));
+        assert_eq!(instrume_for_scan(None, true, 3), None);
+        assert_eq!(instrume_for_root(Some("Cam N3".into()), false, 5), Some("Cam".into()));
+        assert_eq!(instrume_for_root(Some("Cam N3".into()), true, 5), Some("Cam N5".into()));
+        assert_eq!(instrume_for_root(Some("Cam".into()), true, 5), Some("Cam N5".into()));
+    }
+
+    #[test]
+    fn the_unique_camera_suffix_needs_digits_after_n() {
+        assert_eq!(split_unique_camera_suffix("Cam N3"), ("Cam", Some("3")));
+        assert_eq!(split_unique_camera_suffix("Cam N"), ("Cam N", None));
+        assert_eq!(split_unique_camera_suffix("Cam N3x"), ("Cam N3x", None));
+        assert_eq!(split_unique_camera_suffix("Cam"), ("Cam", None));
+        assert_eq!(split_unique_camera_suffix("ZWO N 12"), ("ZWO N 12", None));
     }
 }

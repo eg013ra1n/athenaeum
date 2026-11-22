@@ -147,7 +147,11 @@ pub fn get_frame_metadata_originals(
 ) -> Result<Vec<crate::fits_parser::stored_header::FrameOriginalSnapshot>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(crate::db::get_frame_metadata_originals(&conn, &frame_ids)?)
+    let rules = crate::header_fallbacks::load(&conn).map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "stored FITS keyword rules not readable");
+        ApiError::Internal(format!("The stored FITS keyword rules could not be read: {e:#}"))
+    })?;
+    Ok(crate::db::get_frame_metadata_originals(&conn, &frame_ids, &rules)?)
 }
 
 /// Aggregate a summary of which framesets / calibration sets the given
