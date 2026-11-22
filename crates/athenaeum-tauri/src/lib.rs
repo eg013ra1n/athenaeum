@@ -315,6 +315,7 @@ pub fn run() {
             commands::get_header_fallbacks,
             commands::set_header_fallbacks,
             commands::reset_header_fallbacks,
+            commands::preview_header_fallbacks,
             commands::get_logging_config,
             commands::set_logging_config,
             commands::set_blink_threads,

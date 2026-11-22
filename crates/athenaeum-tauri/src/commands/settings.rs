@@ -177,3 +177,17 @@ pub async fn reset_header_fallbacks(
 ) -> Result<athenaeum_core::header_fallbacks::HeaderFallbackConfig, String> {
     athenaeum_core::api::header_fallbacks::reset_header_fallbacks(&state.ctx).map_err(|e| e.to_string())
 }
+
+/// What the stored keyword rules would change in the catalog (a read-only count). Runs on a
+/// blocking thread: it reads every frame.
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip_all, err)]
+pub async fn preview_header_fallbacks(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || athenaeum_core::api::header_fallbacks::preview_header_fallbacks(&ctx))
+        .await
+        .map_err(|e| format!("FITS keyword preview task panicked: {e}"))?
+        .map_err(|e| e.to_string())
+}

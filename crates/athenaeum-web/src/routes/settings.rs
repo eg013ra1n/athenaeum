@@ -313,6 +313,25 @@ pub async fn reset_header_fallbacks(
         .map_err(api_err)
 }
 
+/// POST /api/preview_header_fallbacks
+///
+/// What the stored rules would change in the catalog (a read-only count). Runs on a blocking
+/// thread: it reads every frame.
+#[tracing::instrument(level = "debug", skip_all, err(Debug))]
+pub async fn preview_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || athenaeum_core::api::header_fallbacks::preview_header_fallbacks(&ctx))
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("FITS keyword preview task panicked: {e}"))
+        })?
+        .map(Json)
+        .map_err(api_err)
+}
+
 #[cfg(test)]
 mod logging_config_tests {
     use super::*;
@@ -542,6 +561,15 @@ mod header_fallbacks_tests {
             .0;
         assert_eq!(reset.order(HeaderField::Gain), ["GAIN"]);
         assert_eq!(reset.retired(HeaderField::Gain), ["G2"]);
+    }
+
+    #[tokio::test]
+    async fn preview_header_fallbacks_counts_an_empty_catalog_as_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let counts = preview_header_fallbacks(State(state), Json(serde_json::json!({}))).await.unwrap().0;
+        assert_eq!(counts, athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts::default());
     }
 
     #[tokio::test]

@@ -2565,5 +2565,9 @@ retired: Array<string>, };
 
 export type HeaderFallbackConfig = { fields: { [key in HeaderField]?: FieldRule }, };
 
+export type FieldCount = { field: HeaderField, frames: number, };
+
+export type HeaderFallbackCounts = { byField: Array<FieldCount>, framesChanged: number, valuesKept: number, setsRegrouped: number, framesWithoutHeader: number, };
+
 export type SettingsDefaults = { kv: { [key in string]: string }, analysis: AnalysisConfig, plateSolve: PlateSolveConfig, calibrationMatching: CalibrationMatchingConfig, logging: LoggingConfig, stacking: StackingConfig, headerFallbacks: HeaderFallbackConfig, };
 

@@ -321,6 +321,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::header_fallbacks::HeaderField,
             crate::header_fallbacks::FieldRule,
             crate::header_fallbacks::HeaderFallbackConfig,
+            crate::header_fallbacks::apply::FieldCount,
+            crate::header_fallbacks::apply::HeaderFallbackCounts,
             crate::api::settings::SettingsDefaults,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}import type {{ FileWithFrame, Frame }} from './models';\n\n{}", decls![

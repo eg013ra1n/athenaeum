@@ -5,6 +5,8 @@
 //! explicit argument of every function that turns a header into a `Frame`; the one resolver in
 //! [`resolve`] applies it to a `HeaderKeyMap` (see `fits_parser::header_keys`).
 
+pub mod apply;
+pub(crate) mod calibration;
 pub mod resolve;
 
 pub use resolve::{

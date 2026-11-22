@@ -6,6 +6,7 @@
 //! the stored document (D12) and every keyword dropped from an order ends up retired.
 
 use crate::api::{db, ApiError};
+use crate::header_fallbacks::apply::HeaderFallbackCounts;
 use crate::header_fallbacks::{self, HeaderFallbackConfig};
 use crate::services::ServiceContext;
 
@@ -74,6 +75,18 @@ pub fn reset_header_fallbacks(ctx: &ServiceContext) -> Result<HeaderFallbackConf
     tx.commit().map_err(|e| internal("cannot commit the FITS keyword rules", e))?;
     tracing::info!("FITS keyword rules reset to the default orders");
     Ok(reset)
+}
+
+/// What the stored rules would change in the catalog, counted from the stored headers; writes
+/// nothing. Blocking (it reads every frame): the hosts call it from `spawn_blocking`. A stored
+/// document that cannot be decoded is an error, as for [`get_header_fallbacks`].
+pub fn preview_header_fallbacks(ctx: &ServiceContext) -> Result<HeaderFallbackCounts, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rules = header_fallbacks::load(&conn)
+        .map_err(|e| internal("cannot read the FITS keyword rules", format!("{e:#}")))?;
+    header_fallbacks::apply::preview(&conn, &rules)
+        .map_err(|e| internal("cannot preview the FITS keyword rules", format!("{e:#}")))
 }
 
 #[cfg(test)]
@@ -200,5 +213,39 @@ mod tests {
         assert_eq!(reset_header_fallbacks(&ctx).unwrap(), HeaderFallbackConfig::default());
         assert_eq!(raw_row(&ctx), None);
         assert_eq!(get_header_fallbacks(&ctx).unwrap(), HeaderFallbackConfig::default());
+    }
+
+    #[test]
+    fn preview_reads_the_stored_rules_and_counts_nothing_on_an_empty_catalog() {
+        let (_tmp, ctx) = test_ctx();
+        assert_eq!(preview_header_fallbacks(&ctx).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    #[test]
+    fn preview_uses_the_stored_rules_and_reports_an_unreadable_row() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES ('a.fits', 'a.fits', 1, '2026-01-01', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (1, 'Light')", []).unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header) VALUES (1, 'MY-TEMP = -3')",
+                [],
+            )
+            .unwrap();
+        }
+        // The standard keywords find nothing in this header; with MY-TEMP added the column is filled.
+        assert_eq!(preview_header_fallbacks(&ctx).unwrap().frames_changed, 0);
+        set_header_fallbacks(&ctx, doc(HeaderField::CcdTemp, &["MY-TEMP", "CCD-TEMP", "DET-TEMP"])).unwrap();
+        let counts = preview_header_fallbacks(&ctx).unwrap();
+        assert_eq!(counts.frames_changed, 1);
+        assert_eq!(counts.by_field.len(), 1);
+        assert_eq!(counts.by_field[0].field, HeaderField::CcdTemp);
+        write_garbage(&ctx);
+        assert!(matches!(preview_header_fallbacks(&ctx), Err(ApiError::Internal(_))));
     }
 }
