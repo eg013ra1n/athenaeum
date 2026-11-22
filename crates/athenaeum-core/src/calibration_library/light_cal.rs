@@ -765,6 +765,36 @@ mod tests {
         );
     }
 
+    /// Regression guard (ruling R3): the `ATH_FNRM` reader is FITS-only, so a master flat written as XISF never has
+    /// its card honoured; the constant is recomputed from the pixels.
+    #[test]
+    fn non_fits_master_flat_recomputes_from_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (9usize, 9usize);
+        let fill = |x: usize, _y: usize| 100.0 + x as f32;
+        let mut fdata = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                fdata[y * w + x] = fill(x, y);
+            }
+        }
+        let flat = dir.path().join("flat_card_differs.xisf");
+        crate::fits_writer::write_xisf_f32(&flat, w, h, 1, &fdata, &[fnrm_card(999.0)]).unwrap();
+        let from_pixels = central_third_mean(&fdata, w, h);
+        assert!((from_pixels - 999.0).abs() > 1.0, "fixture: the card must differ from the pixels");
+
+        let core =
+            flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, TRIMMED_MEAN_TAIL_FRACTION).unwrap();
+        // The pixel reader takes an XISF float plane as unit-range and scales it to 16-bit ADU, so the
+        // pixel-derived constant is the plane's mean times 65535.
+        let expected = from_pixels * 65535.0;
+        assert!(
+            (core - expected).abs() <= expected * 1e-9,
+            "a non-FITS master flat must recompute from pixels ({expected}), got {core}"
+        );
+        assert!((core - 999.0).abs() > 1.0, "the ATH_FNRM card of a non-FITS flat must be ignored, got {core}");
+    }
+
     #[test]
     fn pedestal_adds_after_scale_divide() {
         let dir = tempfile::tempdir().unwrap();

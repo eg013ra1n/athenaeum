@@ -1,16 +1,23 @@
 //! The version tripwire (spec SL-19): the stage versions that enter a hash or a file header are starloom
 //! constants. A starloom bump changes output bits, so Athenaeum accepts it on purpose: this test names each value
 //! the application was last checked against.
-#![cfg(feature = "solver")]
 
+#[cfg(feature = "render")]
 use starloom::calibration_library::LIGHT_CAL_VERSION;
+#[cfg(feature = "solver")]
 use starloom::stacking::config::DRIZZLE_KERNEL_VERSION;
+#[cfg(feature = "solver")]
 use starloom::stacking::integrate::SNR_GAIN_VERSION;
+#[cfg(feature = "solver")]
 use starloom::stacking::ln::grid::LN_GRID_VERSION;
+#[cfg(feature = "solver")]
 use starloom::stacking::ln::LN_MODEL_VERSION;
+#[cfg(feature = "solver")]
 use starloom::stacking::pass1_artifact::PASS1_ARTIFACT_VERSION;
+#[cfg(feature = "solver")]
 use starloom::stacking::register::align::ALIGN_VERSION;
 
+#[cfg(feature = "solver")]
 #[test]
 fn starloom_versions_are_the_accepted_ones() {
     let accepted = "a starloom bump changed this version: accept it on purpose (spec SL-19)";
@@ -20,6 +27,13 @@ fn starloom_versions_are_the_accepted_ones() {
     assert_eq!(DRIZZLE_KERNEL_VERSION, 2, "DRIZZLE_KERNEL_VERSION: {accepted}");
     assert_eq!(PASS1_ARTIFACT_VERSION, 1, "PASS1_ARTIFACT_VERSION: {accepted}");
     assert_eq!(LN_GRID_VERSION, 1, "LN_GRID_VERSION (the .athln version): {accepted}");
+}
+
+// Light calibration lives under `engine`, so these two stay checked in a `render`-only build.
+#[cfg(feature = "render")]
+#[test]
+fn starloom_light_cal_versions_are_the_accepted_ones() {
+    let accepted = "a starloom bump changed this version: accept it on purpose (spec SL-19)";
     assert_eq!(LIGHT_CAL_VERSION, 1, "LIGHT_CAL_VERSION: {accepted}");
     assert_eq!(
         athenaeum_core::models::LIGHT_CAL_ENGINE_VERSION,
