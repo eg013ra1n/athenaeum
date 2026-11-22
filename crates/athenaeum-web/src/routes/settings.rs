@@ -264,6 +264,55 @@ pub async fn get_settings_defaults(
         .map_err(api_err)
 }
 
+// ── FITS keyword rules (issue #21) ───────────────────────────────────────────
+
+/// POST /api/get_header_fallbacks
+///
+/// The user's ordered header keywords per catalog field (expanded document).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::HeaderFallbackConfig>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::get_header_fallbacks(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Request body for `set_header_fallbacks`: `api.invoke('set_header_fallbacks', { config })`
+/// sends `{ "config": { ... } }`, per the Tauri named-arg convention.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetHeaderFallbacksArgs {
+    pub config: athenaeum_core::header_fallbacks::HeaderFallbackConfig,
+}
+
+/// POST /api/set_header_fallbacks
+///
+/// Validates and stores the rules; a document that breaks a rule is a 400.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetHeaderFallbacksArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::set_header_fallbacks(&state.ctx, args.config)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/reset_header_fallbacks
+///
+/// Every field back to its default chain; returns the stored document.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn reset_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::HeaderFallbackConfig>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::reset_header_fallbacks(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
+}
+
 #[cfg(test)]
 mod logging_config_tests {
     use super::*;
@@ -458,5 +507,54 @@ mod logging_config_tests {
             .await
             .expect("in range");
         assert_eq!(state.image_semaphore.read().unwrap().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_header_fallbacks_then_get_reflects_change() {
+        use athenaeum_core::header_fallbacks::{HeaderField, HeaderFallbackConfig};
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.get_mut(&HeaderField::Gain).unwrap().order = vec!["G2".into(), "GAIN".into()];
+        let _ = set_header_fallbacks(State(state.clone()), Json(SetHeaderFallbacksArgs { config: cfg }))
+            .await
+            .expect("valid rules must be accepted");
+
+        let got = get_header_fallbacks(State(state.clone()), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(got.order(HeaderField::Gain), ["G2", "GAIN"]);
+
+        let reset = reset_header_fallbacks(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(reset.order(HeaderField::Gain), ["GAIN"]);
+        assert_eq!(reset.retired(HeaderField::Gain), ["G2"]);
+    }
+
+    #[tokio::test]
+    async fn set_header_fallbacks_rejects_a_dropped_default_keyword_with_400() {
+        use athenaeum_core::header_fallbacks::{HeaderField, HeaderFallbackConfig};
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.get_mut(&HeaderField::CcdTemp).unwrap().order = vec!["CCD-TEMP".into()];
+        let err = set_header_fallbacks(State(state), Json(SetHeaderFallbacksArgs { config: cfg }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The frontend sends `{ "config": ... }`; a bare document must not deserialize.
+    #[test]
+    fn bare_header_fallbacks_body_fails_to_deserialize_into_wrapped_args() {
+        let bare = serde_json::to_value(athenaeum_core::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
+        assert!(serde_json::from_value::<SetHeaderFallbacksArgs>(bare).is_err());
     }
 }

@@ -7,6 +7,7 @@
 use crate::analysis::config::AnalysisConfig;
 use crate::api::ApiError;
 use crate::calibration::config::CalibrationMatchingConfig;
+use crate::header_fallbacks::HeaderFallbackConfig;
 use crate::logging::config::LoggingConfig;
 use crate::monitor::MonitorService;
 use crate::plate_solve::config::PlateSolveConfig;
@@ -24,6 +25,7 @@ pub struct SettingsDefaults {
     pub calibration_matching: CalibrationMatchingConfig,
     pub logging: LoggingConfig,
     pub stacking: StackingConfig,
+    pub header_fallbacks: HeaderFallbackConfig,
 }
 
 /// Every default a fresh Settings page needs, built without touching the
@@ -39,6 +41,7 @@ pub fn get_settings_defaults(_ctx: &ServiceContext) -> Result<SettingsDefaults, 
         calibration_matching: CalibrationMatchingConfig::default(),
         logging: LoggingConfig::default(),
         stacking: StackingConfig::default(),
+        header_fallbacks: HeaderFallbackConfig::default(),
     })
 }
 
@@ -160,6 +163,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&d.stacking).unwrap(),
             serde_json::to_value(StackingConfig::default()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&d.header_fallbacks).unwrap(),
+            serde_json::to_value(HeaderFallbackConfig::default()).unwrap()
+        );
+        let reset = crate::api::header_fallbacks::reset_header_fallbacks(&ctx).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reset).unwrap(),
+            serde_json::to_value(&d.header_fallbacks).unwrap()
         );
         assert_eq!(
             d.kv.get("calibration.master_format").map(String::as_str),

@@ -2551,5 +2551,19 @@ dockerImage: string | null, };
 
 export type WhatsNew = { version: string, notes: string, blogUrl: string, };
 
-export type SettingsDefaults = { kv: { [key in string]: string }, analysis: AnalysisConfig, plateSolve: PlateSolveConfig, calibrationMatching: CalibrationMatchingConfig, logging: LoggingConfig, stacking: StackingConfig, };
+export type HeaderField = "ccdTemp" | "setTemp" | "gain" | "offset" | "exptime" | "focallen" | "xpixsz" | "ypixsz" | "object" | "filter" | "instrume" | "telescop";
+
+export type FieldRule = { 
+/**
+ * Keywords tried first to last; the first usable value wins.
+ */
+order: Array<string>, 
+/**
+ * Keywords the user took out of the order, newest last. Never read by a scan.
+ */
+retired: Array<string>, };
+
+export type HeaderFallbackConfig = { fields: { [key in HeaderField]?: FieldRule }, };
+
+export type SettingsDefaults = { kv: { [key in string]: string }, analysis: AnalysisConfig, plateSolve: PlateSolveConfig, calibrationMatching: CalibrationMatchingConfig, logging: LoggingConfig, stacking: StackingConfig, headerFallbacks: HeaderFallbackConfig, };
 

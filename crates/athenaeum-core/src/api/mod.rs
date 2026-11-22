@@ -8,6 +8,8 @@ pub mod calibration;
 // deletion. Ungated: archive + db only.
 pub mod archive;
 pub mod files;
+// The user's ordered FITS/XISF header keywords per catalog field: get / set / reset. Ungated.
+pub mod header_fallbacks;
 // Missing-files listing, recheck, sync, ignore / unignore and purge. Ungated: db + zip_store only.
 pub mod missing_files;
 pub mod scan_roots;

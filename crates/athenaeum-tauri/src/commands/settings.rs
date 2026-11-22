@@ -148,3 +148,32 @@ pub async fn get_settings_defaults(
 ) -> Result<athenaeum_core::api::settings::SettingsDefaults, String> {
     athenaeum_core::api::settings::get_settings_defaults(&state.ctx).map_err(|e| e.to_string())
 }
+
+/// The user's ordered header keywords per catalog field (expanded document, `retired` included).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_header_fallbacks(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::header_fallbacks::HeaderFallbackConfig, String> {
+    athenaeum_core::api::header_fallbacks::get_header_fallbacks(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Validate and store the keyword rules; keywords dropped from an order are retired.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_header_fallbacks(
+    config: athenaeum_core::header_fallbacks::HeaderFallbackConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    athenaeum_core::api::header_fallbacks::set_header_fallbacks(&state.ctx, config)
+        .map_err(|e| e.to_string())
+}
+
+/// Every field back to its default keyword chain; returns the stored document.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn reset_header_fallbacks(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::header_fallbacks::HeaderFallbackConfig, String> {
+    athenaeum_core::api::header_fallbacks::reset_header_fallbacks(&state.ctx).map_err(|e| e.to_string())
+}
