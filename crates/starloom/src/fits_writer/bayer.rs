@@ -44,3 +44,33 @@ impl Bayer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stored-column spellings `Bayer::parse` has to survive: quoted (FITS
+    /// card text kept verbatim by the parser), padded, and lower-cased. Anything
+    /// it cannot vouch for is `None`, never a guess.
+    #[test]
+    fn bayer_parse_normalizes_stored_spellings() {
+        for pattern in [Bayer::Rggb, Bayer::Bggr, Bayer::Gbrg, Bayer::Grbg] {
+            let canonical = pattern.as_str();
+            for spelling in [
+                canonical.to_string(),
+                canonical.to_ascii_lowercase(),
+                format!("'{canonical}'"),
+                format!("  '{canonical}  '  "),
+            ] {
+                assert_eq!(
+                    Bayer::parse(&spelling),
+                    Some(pattern),
+                    "spelling {spelling:?}"
+                );
+            }
+        }
+        for bad in ["", "   ", "RGB", "RGGBX", "''", "MONO"] {
+            assert_eq!(Bayer::parse(bad), None, "{bad:?} must not parse");
+        }
+    }
+}

@@ -59,11 +59,10 @@ pub fn flip_vertical_for_path(path: &Path) -> bool {
     }
 }
 
-/// The canonical `ROWORDER` spellings, so a writer that has to state the
-/// order explicitly (the XISF writer — see [`row_order_is_bottom_up`])
-/// spells it the same way this rule reads it.
-pub const ROW_ORDER_TOP_DOWN: &str = "TOP-DOWN";
-pub const ROW_ORDER_BOTTOM_UP: &str = "BOTTOM-UP";
+/// The canonical `ROWORDER` spellings (defined in `starloom`, which the XISF writer lives in), so a writer that has
+/// to state the order explicitly (the XISF writer — see [`row_order_is_bottom_up`]) spells it the same way this
+/// rule reads it.
+pub use starloom::orientation::{ROW_ORDER_BOTTOM_UP, ROW_ORDER_TOP_DOWN};
 
 /// The row-order rule over an already-read `ROWORDER` value — the ONE
 /// place the table in the module docs is encoded (M4d Task 2 fix round 1,

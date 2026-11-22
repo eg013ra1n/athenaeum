@@ -1,94 +1,94 @@
 //! Standards-compliant FITS writer (FITS 4.0): BITPIX=-32 primary HDU, typed keyword vocabulary.
-pub mod card;
+//!
+//! The writer core (cards, the FITS and XISF writers, `Durability`, `XisfBounds`, `OutputFormat`) lives in
+//! `starloom`; this module re-exports it under the old paths. The XISF writers named here write Athenaeum's own
+//! `CreatorApplication` ([`athenaeum_creator`]), where `starloom`'s plain names write `starloom <version>`.
+pub use starloom::fits_writer::{card, writer};
 pub mod header_patch;
 pub mod keywords;
-pub mod writer;
 pub mod xisf_patch;
-pub mod xisf_writer;
+/// The XISF writers under their old paths: the library's items, with the three plain writers that reach the
+/// `CreatorApplication` property replaced by wrappers that pass [`athenaeum_creator`].
+pub mod xisf_writer {
+    pub use starloom::fits_writer::xisf_writer::*;
+    use starloom::fits_writer::xisf_writer as lib;
+    use starloom::fits_writer::{Card, FitsWriteError};
+    use super::{athenaeum_creator, Durability, XisfBounds};
+    use std::io::Write;
+    use std::path::Path;
+
+    /// The stacking convention: unit-scaled samples (`ATH_CSCL`), `bounds="0:1"`.
+    /// Always [`Durability::Durable`] — see [`write_xisf_f32_with`] for a caller that can afford to skip the fsync.
+    pub fn write_xisf_f32(
+        path: &Path,
+        width: usize,
+        height: usize,
+        channels: usize,
+        data: &[f32],
+        cards: &[Card],
+    ) -> Result<(), FitsWriteError> {
+        lib::write_xisf_f32_with_creator(path, width, height, channels, data, cards, &athenaeum_creator())
+    }
+
+    /// [`lib::write_xisf_f32_with`] with Athenaeum's `CreatorApplication`.
+    pub fn write_xisf_f32_with(
+        path: &Path,
+        width: usize,
+        height: usize,
+        channels: usize,
+        data: &[f32],
+        cards: &[Card],
+        bounds: XisfBounds,
+        durability: Durability,
+    ) -> Result<(), FitsWriteError> {
+        lib::write_xisf_f32_with_with_creator(
+            path,
+            width,
+            height,
+            channels,
+            data,
+            cards,
+            bounds,
+            durability,
+            &athenaeum_creator(),
+        )
+    }
+
+    /// [`write_xisf_f32_with`]'s streaming body — the whole unit, header and attachment, into one sink.
+    pub fn write_xisf_f32_to<W: Write>(
+        w: W,
+        width: usize,
+        height: usize,
+        channels: usize,
+        data: &[f32],
+        cards: &[Card],
+        bounds: XisfBounds,
+    ) -> Result<(), FitsWriteError> {
+        lib::write_xisf_f32_to_with_creator(w, width, height, channels, data, cards, bounds, &athenaeum_creator())
+    }
+}
 // Consumes plate_solve::storage::PlateSolveRecord, which is itself gated —
 // plate_solve builds on astroimage (render) and solvemyastro (solver).
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod wcs;
 pub use card::{Card, CardValue, FitsWriteError};
+pub use starloom::fits_writer::{Durability, OutputFormat, XisfBounds};
 pub use writer::{
     write_fits_f32, write_fits_f32_streaming_to, write_fits_f32_streaming_with, write_fits_f32_to,
     write_fits_f32_with,
 };
 pub use xisf_writer::{write_xisf_f32, write_xisf_f32_to, xisf_keyword_value};
 
-/// Whether a write must survive power loss before its rename makes it
-/// visible (perf tier 1 Task 6). `Durable` = `sync_all` before the rename —
-/// every master, every export. `Volatile` = flush only: the run's own
-/// calibrated intermediates, which the artifact row keys on a hash and a
-/// stat, so a file a crash loses or truncates is a cache miss — not a claim
-/// that it can never read back as a WRONG answer in principle: on a
-/// filesystem without ordered metadata a rename that landed before its data
-/// was flushed can, in theory, reappear at the recorded size with garbage
-/// inside it. APFS and ext4 (`data=ordered`) — the filesystems this app
-/// ships on — make that unreachable, which is what the "cache miss, not a
-/// wrong answer" claim actually rests on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Durability {
-    Durable,
-    Volatile,
-}
-
-/// The container an output image is written in. One enum for every writer
-/// in the app — stacking masters, calibration masters, calibrated lights —
-/// so no two features can disagree about what "xisf" means.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default, ts_rs::TS,
-)]
-#[serde(rename_all = "camelCase")]
-pub enum OutputFormat {
-    #[default]
-    Fits,
-    /// Monolithic XISF 1.0, one uncompressed Float32 image, the same cards
-    /// as the FITS file (`xisf_writer`).
-    Xisf,
-}
-
-impl OutputFormat {
-    pub fn extension(self) -> &'static str {
-        match self {
-            OutputFormat::Fits => "fits",
-            OutputFormat::Xisf => "xisf",
-        }
-    }
-
-    /// The container a file on disk already has — a rebuild keeps it.
-    pub fn from_path(path: &std::path::Path) -> Self {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some(ext) if ext.eq_ignore_ascii_case("xisf") => OutputFormat::Xisf,
-            _ => OutputFormat::Fits,
-        }
-    }
-}
-
-/// The representable range an XISF Float32 image declares (XISF 1.0
-/// §11.5.1, mandatory). Which one applies is the CALLER's knowledge: a
-/// stacking master and a calibrated light are unit-scaled (`ATH_CSCL`), a
-/// calibration master is raw ADU. rustafits' reader normalizes by these
-/// bounds and multiplies by 65535, so both come back in the ADU domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XisfBounds {
-    Unit,
-    Adu16,
-}
-
-impl XisfBounds {
-    pub fn attr(self) -> &'static str {
-        match self {
-            XisfBounds::Unit => "0:1",
-            XisfBounds::Adu16 => "0:65535",
-        }
-    }
+/// The `XISF:CreatorApplication` of every file Athenaeum writes: `Athenaeum <athenaeum-core version>`. Evaluated
+/// here, in core, so the string is the app's own and not the library's.
+pub fn athenaeum_creator() -> String {
+    format!("Athenaeum {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// One image in the chosen container — the ONE place the two writers are
 /// chosen between. `bounds` only matters for XISF. Always
-/// [`Durability::Durable`] — see [`write_image_f32_with`] for a caller that
-/// can afford to skip the fsync.
+/// [`Durability::Durable`] — see [`write_image_f32_with`] for a caller
+/// that can afford to skip the fsync.
 pub fn write_image_f32(
     path: &std::path::Path,
     width: usize,
@@ -99,7 +99,7 @@ pub fn write_image_f32(
     format: OutputFormat,
     bounds: XisfBounds,
 ) -> Result<(), card::FitsWriteError> {
-    write_image_f32_with(
+    starloom::fits_writer::write_image_f32_with_creator(
         path,
         width,
         height,
@@ -108,7 +108,7 @@ pub fn write_image_f32(
         cards,
         format,
         bounds,
-        Durability::Durable,
+        &athenaeum_creator(),
     )
 }
 
@@ -127,12 +127,43 @@ pub fn write_image_f32_with(
     bounds: XisfBounds,
     durability: Durability,
 ) -> Result<(), card::FitsWriteError> {
-    match format {
-        OutputFormat::Fits => {
-            writer::write_fits_f32_with(path, width, height, channels, data, cards, durability)
-        }
-        OutputFormat::Xisf => xisf_writer::write_xisf_f32_with(
-            path, width, height, channels, data, cards, bounds, durability,
-        ),
+    starloom::fits_writer::write_image_f32_with_with_creator(
+        path,
+        width,
+        height,
+        channels,
+        data,
+        cards,
+        format,
+        bounds,
+        durability,
+        &athenaeum_creator(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard for the move of the writer core to `starloom`: a file written through Athenaeum's own writer names
+    /// Athenaeum, and its version, in the XISF `CreatorApplication` property, never the library's own name.
+    #[test]
+    fn athenaeum_xisf_creator_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creator.xisf");
+        let data: Vec<f32> = (0..16).map(|i| i as f32 / 16.0).collect();
+        write_xisf_f32(&path, 4, 4, 1, &data, &[]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let marker = "<Property id=\"XISF:CreatorApplication\" type=\"String\" value=\"";
+        let start = text.find(marker).expect("the CreatorApplication property is written") + marker.len();
+        let creator = &text[start..start + text[start..].find('"').expect("the property value is closed")];
+        assert_eq!(creator, format!("Athenaeum {}", env!("CARGO_PKG_VERSION")));
+        assert!(!creator.contains("starloom"), "{creator}");
+        // The same through the container switch.
+        let path2 = dir.path().join("creator2.xisf");
+        write_image_f32(&path2, 4, 4, 1, &data, &[], OutputFormat::Xisf, XisfBounds::Unit).unwrap();
+        let text2 = String::from_utf8_lossy(&std::fs::read(&path2).unwrap()).into_owned();
+        assert!(text2.contains(&format!("{marker}Athenaeum {}\"", env!("CARGO_PKG_VERSION"))), "{text2}");
     }
 }

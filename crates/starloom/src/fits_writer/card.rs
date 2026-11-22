@@ -7,7 +7,8 @@ pub const BLOCK_SIZE: usize = 2880;
 // used to hard-code its own `ATH_STKC_MAX_CHARS = 68` copy of this same
 // number (with a comment naming this constant, which it could not actually
 // reference) so the two would silently drift if this one ever changed.
-pub(crate) const MAX_STR_CONTENT: usize = 68; // printable chars inside the quotes of one card
+#[doc(hidden)]
+pub const MAX_STR_CONTENT: usize = 68; // printable chars inside the quotes of one card
 
 #[derive(Debug)]
 pub enum FitsWriteError {
@@ -113,7 +114,8 @@ impl Card {
     /// Internal constructor for writer-owned structural cards.
     /// Bypasses only the RESERVED-keyword check (SIMPLE/BITPIX/END/etc. are legitimate here);
     /// charset/length validation still applies via a debug assertion.
-    pub(crate) fn structural(keyword: &str, value: CardValue, comment: &str) -> Card {
+    #[doc(hidden)]
+    pub fn structural(keyword: &str, value: CardValue, comment: &str) -> Card {
         debug_assert!(
             !keyword.is_empty()
                 && keyword.len() <= 8

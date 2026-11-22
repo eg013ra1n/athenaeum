@@ -8,6 +8,10 @@
 
 use std::sync::OnceLock;
 
+// The memory probe moved to `starloom::sys`; these two parsers keep their old path for `integration::band_budget`'s tests.
+#[cfg(test)]
+pub(crate) use starloom::sys::{linux_total_ram_from, parse_cgroup_limit};
+
 /// The static facts about the machine. `Option` fields are `None` when the
 /// platform cannot say (non-hybrid x86 has no P / E split; no cgroup quota).
 #[derive(Debug, Clone, PartialEq)]
@@ -62,7 +66,7 @@ fn probe_profile() -> MachineProfile {
         });
     let (perf_cores, eff_cores) = platform_core_split();
     let cpu_quota = platform_cpu_quota(logical_cpus);
-    let (mem_total, mem_limit) = platform_memory();
+    let (mem_total, mem_limit) = starloom::sys::platform_memory();
     let mem_limit = match (mem_total, mem_limit) {
         (Some(t), Some(l)) if l < t => Some(l),
         (None, Some(l)) => Some(l),
@@ -225,42 +229,6 @@ pub(crate) fn parse_proc_io(text: &str) -> Option<(u64, u64)> {
             .and_then(|r| r.trim().parse().ok())
     };
     Some((field("read_bytes:")?, field("write_bytes:")?))
-}
-
-/// Parse one cgroup memory-limit file. `None` means "no limit here": cgroup v2
-/// writes the literal `max`, and v1 writes a sentinel near `u64::MAX` — a
-/// number that large is not a container limit, it is the absence of one.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-pub(crate) fn parse_cgroup_limit(text: &str) -> Option<u64> {
-    const UNLIMITED_FLOOR: u64 = 1 << 62;
-    let v: u64 = text.trim().parse().ok()?;
-    if v == 0 || v >= UNLIMITED_FLOOR {
-        None
-    } else {
-        Some(v)
-    }
-}
-
-/// Pure computation over `/proc/meminfo`'s content plus the two possible
-/// cgroup limit-file contents: `min(MemTotal, container limit)`. cgroup v2
-/// wins when it names a real limit; `max` (or absent) falls through to v1.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn linux_total_ram_from(
-    meminfo: &str,
-    v2: Option<&str>,
-    v1: Option<&str>,
-) -> Option<u64> {
-    let total = parse_kb_field(meminfo, "MemTotal:")?;
-    Some(match cgroup_limit(v2, v1) {
-        Some(l) => total.min(l),
-        None => total,
-    })
-}
-
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-fn cgroup_limit(v2: Option<&str>, v1: Option<&str>) -> Option<u64> {
-    v2.and_then(parse_cgroup_limit)
-        .or_else(|| v1.and_then(parse_cgroup_limit))
 }
 
 /// Efficiency classes `(class, physical cores)` -> `(perf, eff)`. One class
@@ -555,17 +523,6 @@ fn platform_cpu_quota(_logical: usize) -> Option<f64> {
     None
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn platform_memory() -> (Option<u64>, Option<u64>) {
-    let mut size: u64 = 0;
-    if sysctl_raw("hw.memsize", &mut size) && size > 0 {
-        (Some(size), None)
-    } else {
-        tracing::warn!("hw.memsize probe failed; physical memory unknown");
-        (None, None)
-    }
-}
-
 /// Free + inactive + purgeable pages (the kernel's `free_count` already
 /// includes the speculative pages, so they are not added twice) x page size.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -807,20 +764,6 @@ fn platform_cpu_quota(_logical: usize) -> Option<f64> {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_memory() -> (Option<u64>, Option<u64>) {
-    let total = match read_trimmed("/proc/meminfo") {
-        Some(m) => parse_kb_field(&m, "MemTotal:"),
-        None => {
-            tracing::warn!("/proc/meminfo unreadable; physical memory unknown");
-            None
-        }
-    };
-    let v2 = read_trimmed("/sys/fs/cgroup/memory.max");
-    let v1 = read_trimmed("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-    (total, cgroup_limit(v2.as_deref(), v1.as_deref()))
-}
-
-#[cfg(target_os = "linux")]
 pub fn available_memory() -> Option<u64> {
     let avail = parse_kb_field(&read_trimmed("/proc/meminfo")?, "MemAvailable:")?;
     let limit = profile().mem_limit;
@@ -960,49 +903,6 @@ fn platform_cpu_quota(logical: usize) -> Option<f64> {
 }
 
 #[cfg(windows)]
-fn platform_memory() -> (Option<u64>, Option<u64>) {
-    use windows_sys::Win32::System::JobObjects::{
-        JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    };
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    // SAFETY: MEMORYSTATUSEX is a plain POD struct; zeroing it and stamping
-    // dwLength is exactly the documented calling convention.
-    let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    let total = if unsafe { GlobalMemoryStatusEx(&mut st) } != 0 && st.ullTotalPhys > 0 {
-        Some(st.ullTotalPhys)
-    } else {
-        tracing::warn!("GlobalMemoryStatusEx failed; physical memory unknown");
-        None
-    };
-    // SAFETY: as in `platform_cpu_quota`.
-    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        QueryInformationJobObject(
-            std::ptr::null_mut(),
-            JobObjectExtendedLimitInformation,
-            &mut info as *mut _ as *mut core::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            std::ptr::null_mut(),
-        )
-    };
-    let mut limit: Option<u64> = None;
-    if ok != 0 {
-        let flags = info.BasicLimitInformation.LimitFlags;
-        if flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0 && info.JobMemoryLimit > 0 {
-            limit = Some(info.JobMemoryLimit as u64);
-        }
-        if flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0 && info.ProcessMemoryLimit > 0 {
-            let p = info.ProcessMemoryLimit as u64;
-            limit = Some(limit.map_or(p, |l| l.min(p)));
-        }
-    }
-    (total, limit)
-}
-
-#[cfg(windows)]
 pub fn available_memory() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: see `platform_memory`.
@@ -1087,10 +987,6 @@ fn platform_core_split() -> (Option<usize>, Option<usize>) {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 fn platform_cpu_quota(_logical: usize) -> Option<f64> {
     None
-}
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
-fn platform_memory() -> (Option<u64>, Option<u64>) {
-    (None, None)
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 pub fn available_memory() -> Option<u64> {
