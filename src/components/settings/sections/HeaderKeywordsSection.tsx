@@ -25,6 +25,7 @@ import { ConfirmDialog } from '../../ConfirmDialog';
 import { Button } from '../../ui';
 import { ResetButton } from '../ResetButton';
 import { SettingsSection } from '../SettingsSection';
+import { HeaderKeywordsTransfer } from './HeaderKeywordsTransfer';
 import { KeywordChain } from './KeywordChain';
 
 export { HEADER_FIELD_LABELS };
@@ -274,7 +275,12 @@ export function HeaderKeywordsSection() {
         : 'Applying…';
 
   return (
-    <SettingsSection id="general.headerKeywords" onResetAll={onResetAll} resetScopeLabel={RESET_ALL_SCOPE}>
+    <SettingsSection
+      id="general.headerKeywords"
+      onResetAll={onResetAll}
+      resetScopeLabel={RESET_ALL_SCOPE}
+      actions={<HeaderKeywordsTransfer onImport={(config) => patch(() => config)} />}
+    >
       <div className="space-y-2.5">
         {HEADER_FIELDS.map((f) => (
           <FieldRow

@@ -417,7 +417,7 @@ export function buildFixtures(scenario = 'default') {
     get_setting: (args) => args.defaultValue ?? null,
   };
   if (scenario === 'stacking') Object.assign(handlers, stackingHandlers({ projectId: PID, card, nameOf: (id) => MBY[id].name, acc }));
-  if (scenario === 'header-keywords') Object.assign(handlers, headerKeywordsHandlers(process.env.HARNESS_PREVIEW || 'counts'));
+  if (scenario === 'header-keywords') Object.assign(handlers, headerKeywordsHandlers(process.env.HARNESS_PREVIEW || 'counts', process.env.HARNESS_IMPORT || 'change'));
   if (scenario === 'mcp-plan') Object.assign(handlers, mcpPlanHandlers(process.env.HARNESS_PLAN || 'black_hole'));
   return { handlers, counts: { frames: FRAMES.length, members: MEMBERS.length } };
 }

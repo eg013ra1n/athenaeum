@@ -26,8 +26,14 @@ http.createServer((req, res) => {
     const args = body ? JSON.parse(body) : {};
     const h = handlers[cmd];
     let out;
-    if (h) out = h(args);
-    else {
+    if (h) {
+      try { out = h(args); } catch (e) {
+        // A handler that throws answers like the real server's refusal: an error status with the text.
+        res.writeHead(500, { ...CORS, 'Content-Type': 'text/plain' });
+        res.end(e instanceof Error ? e.message : String(e));
+        return;
+      }
+    } else {
       if (!unknown.has(cmd)) { unknown.add(cmd); console.log(`[harness] unknown command ${cmd} ${body}`); }
       out = /^list_/.test(cmd) ? [] : null;
     }

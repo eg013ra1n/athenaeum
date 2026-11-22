@@ -40,3 +40,4 @@ nothing to change (the line is hidden). `set_header_fallbacks` echoes what it re
 `reset_header_fallbacks` and `apply_header_fallbacks` answer like the real ones; nothing is stored, so a reload brings the
 default chains back and the preview line stays after Apply. The harness has no events, so the `header-fallbacks-progress` line
 (`Applying… 120 of 312 frames`) never shows here; the section's test drives it. Fixtures: `headerKeywords.mjs`.
+Its Export… downloads a fixed JSON text; Import… (any file) answers by `HARNESS_IMPORT=change|same|refuse`: one changed field (Sensor temperature, the confirm lists it), no change (the dialog says the file matches), or a refusal (a warning notification with the server text). Import's Import button feeds the rules to the autosave; the desktop file dialogs cannot be shown here.

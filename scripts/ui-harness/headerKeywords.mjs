@@ -24,7 +24,13 @@ const defaultDocument = () => ({
   fields: Object.fromEntries(Object.entries(CHAINS).map(([f, order]) => [f, { order: [...order], retired: [] }])),
 });
 
-export function headerKeywordsHandlers(mode = 'counts') {
+const EXPORT_TEXT = JSON.stringify(
+  { format: 'athenaeum.header-fallbacks', version: 1, fields: { ccdTemp: ['DET-TEMP', 'CCD-TEMP'] } },
+  null,
+  2,
+);
+
+export function headerKeywordsHandlers(mode = 'counts', importMode = 'change') {
   const counts = mode === 'empty'
     ? { byField: [], framesChanged: 0, valuesKept: 0, setsRegrouped: 0, framesWithoutHeader: 0 }
     : {
@@ -47,5 +53,16 @@ export function headerKeywordsHandlers(mode = 'counts') {
     reset_header_fallbacks: () => defaultDocument(),
     preview_header_fallbacks: () => counts,
     apply_header_fallbacks: () => counts,
+    // Export… downloads a fixed text. Import… answers by `HARNESS_IMPORT`: `change` (default) one changed field,
+    // `same` no change, `refuse` a refusal (the server answers an error with a 500 and its text).
+    export_header_fallbacks: () => EXPORT_TEXT,
+    plan_header_fallbacks_import: (args) => {
+      console.log(`[harness] plan_header_fallbacks_import ${importMode} (${String(args.text ?? args.path ?? '').length} chars)`);
+      if (importMode === 'refuse') throw new Error('unknown field "bogus"');
+      const config = defaultDocument();
+      if (importMode === 'same') return { config, changes: [] };
+      config.fields.ccdTemp.order = ['DET-TEMP', 'CCD-TEMP'];
+      return { config, changes: [{ field: 'ccdTemp', before: CHAINS.ccdTemp, after: ['DET-TEMP', 'CCD-TEMP'] }] };
+    },
   };
 }
