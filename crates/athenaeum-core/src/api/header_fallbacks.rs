@@ -125,6 +125,15 @@ pub fn apply_header_fallbacks(
         .map_err(|e| internal("cannot apply the FITS keyword rules", format!("{e:#}")))?;
     #[cfg(all(feature = "render", feature = "solver"))]
     crate::api::collab_autopublish::request_auto_publish_for_sets(&report.frame_sets_touched);
+    // The frames and the calibration sets are written and auto-publish is asked for; the nights
+    // that could not be re-derived are the error (the same kind as any other Apply failure).
+    if !report.failed_night_sets.is_empty() {
+        let ids = report.failed_night_sets.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+        return Err(internal(
+            "cannot apply the FITS keyword rules",
+            format!("the nights of frame set(s) {ids} could not be re-derived; the frames and calibration sets are updated"),
+        ));
+    }
     Ok(report.counts)
 }
 
@@ -309,6 +318,38 @@ mod tests {
         assert_eq!(t, -3.0);
         drop(conn);
         assert_eq!(preview_header_fallbacks(&ctx).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    #[test]
+    fn failed_nights_are_an_error_after_the_frames_are_written() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES ('a.fits', 'a.fits', 1, '2026-01-01', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, date_obs) VALUES (1, 'Light', '2026-01-01T22:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO fits_header (file_id, header) VALUES (1, 'EXPTIME = 30')", []).unwrap();
+            conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+            crate::sessions::rederive_for_frame_set(&conn, 1, &[1], 6.0).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_night BEFORE INSERT ON imaging_nights
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
+        }
+        let err = apply_header_fallbacks(&ctx, &crate::events::NullEmitter).unwrap_err();
+        assert!(matches!(err, ApiError::Internal(ref m) if m.contains("frame set(s) 1 ")), "{err}");
+        let conn = ctx.db.get().unwrap().conn();
+        let exptime: f64 = conn.query_row("SELECT exptime FROM frames WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(exptime, 30.0, "the frame is written");
+        assert!(!ctx.apply_running.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

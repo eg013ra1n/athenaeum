@@ -67,6 +67,9 @@ pub const PROGRESS_EVENT: &str = "header-fallbacks-progress";
 pub struct ApplyReport {
     pub counts: HeaderFallbackCounts,
     pub frame_sets_touched: Vec<i64>,
+    /// Frame sets whose nights could not be re-derived: their frames and the calibration sets are
+    /// written all the same, so the caller reports the failure after it has used the rest.
+    pub failed_night_sets: Vec<i64>,
 }
 
 /// One frame as the catalog holds it: the twelve columns and the newest stored header.
@@ -460,8 +463,8 @@ pub fn apply(
 ///    scan or a monitor cycle interleaves between pages. Raw calibration frames that must be
 ///    regrouped, and master frames with a change in a set column, wait for step 3.
 /// 2. After the last page, the nights of every frame set with an `instrume` or `exptime` change
-///    are re-derived, once per set. A set that fails is logged and the rest go on; the error comes
-///    back after step 3.
+///    are re-derived, once per set. A set that fails is logged and the rest go on; its id is in
+///    [`ApplyReport::failed_night_sets`].
 /// 3. One transaction plans the deferred frames again from the catalog as it is then, writes them,
 ///    regroups the raw ones and updates the master-library sets ([`regroup`]).
 pub(crate) fn apply_in_pages(
@@ -526,7 +529,7 @@ pub(crate) fn apply_in_pages(
     }
 
     // A set that fails is logged and left; the rest and the calibration step still run, and the
-    // failure is returned at the end (the frames are written, so a second Apply would not retry it).
+    // report names it (the frames are written, so a second Apply would not retry it).
     let mut failed_nights: Vec<i64> = Vec::new();
     for set_id in &night_sets {
         let result = (|| -> anyhow::Result<()> {
@@ -552,10 +555,6 @@ pub(crate) fn apply_in_pages(
     };
     let total = total.max(done);
     emit_event(emitter, PROGRESS_EVENT, &HeaderFallbackProgress { phase: "calibration".into(), done: total, total });
-    if !failed_nights.is_empty() {
-        let ids = failed_nights.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
-        anyhow::bail!("the nights of frame set(s) {ids} could not be re-derived; the frames and calibration sets are updated");
-    }
 
     counts.sets_regrouped = report.sets_regrouped;
     let by_field_text = finish_by_field(&mut counts, by_field);
@@ -570,7 +569,11 @@ pub(crate) fn apply_in_pages(
         duration_ms = started.elapsed().as_millis() as u64,
         "header fallbacks applied"
     );
-    Ok(ApplyReport { counts, frame_sets_touched: frame_sets.into_iter().collect() })
+    Ok(ApplyReport {
+        counts,
+        frame_sets_touched: frame_sets.into_iter().collect(),
+        failed_night_sets: failed_nights,
+    })
 }
 
 #[cfg(test)]
@@ -1952,9 +1955,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = apply_in_pages(&conn, &HeaderFallbackConfig::default(), 6.0, &NullEmitter, 2).unwrap_err();
-        let text = format!("{err:#}");
-        assert!(text.contains("frame set(s) 1 "), "{text}");
+        let report = apply_in_pages(&conn, &HeaderFallbackConfig::default(), 6.0, &NullEmitter, 2).unwrap();
+        assert_eq!(report.failed_night_sets, vec![1]);
+        assert_eq!(report.frame_sets_touched, vec![1, 2], "both sets hold frames Apply wrote");
         assert_ne!(nights_of(&conn, 2), second_before, "the other frame set was re-derived");
         assert_eq!(column(&conn, "frames", "ccd_temp", darks[0]), Some(-10.0), "the calibration step ran");
     }
