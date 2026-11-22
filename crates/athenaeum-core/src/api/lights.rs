@@ -1981,7 +1981,8 @@ mod tests {
         seed_header_and_bayer(
             &conn,
             file_id,
-            "<xisf><FITSKeyword name=\"BAYERPAT\" value=\"\"/>\
+            // The XML declaration is what the scanner's extraction (and now this reader) looks for.
+            "<?xml version=\"1.0\"?><xisf><FITSKeyword name=\"BAYERPAT\" value=\"\"/>\
              <FITSKeyword name=\"ROWORDER\" value=\"'  '\"/>\
              <FITSKeyword name=\"INSTRUME\" value=\"'TestCam'\"/></xisf>",
             Some("RGGB"),
@@ -1990,8 +1991,9 @@ mod tests {
             Some("TOP-DOWN"),
         );
 
-        // Sanity: the parser really does hand back a blank BAYERPAT card here —
-        // if that ever changes, this test's premise is gone, not just its assert.
+        // Sanity: the stored-header map drops a blank value (the scanner reads a blank keyword
+        // as absent, C4), so no blank BAYERPAT card reaches the cards below; the catalog column
+        // fills the card either way.
         let raw: HashMap<String, String> = parse_stored_header_keys(
             FileFormat::XISF,
             &conn
@@ -2002,7 +2004,7 @@ mod tests {
                 )
                 .unwrap(),
         );
-        assert_eq!(raw.get("BAYERPAT").map(String::as_str), Some(""));
+        assert_eq!(raw.get("BAYERPAT"), None);
 
         let cards = source_cards_for_file(&conn, 1, file_id, FileFormat::XISF).unwrap();
         assert_eq!(card_str(&cards, "BAYERPAT").as_deref(), Some("RGGB"));

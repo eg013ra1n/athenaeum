@@ -8,6 +8,7 @@ pub mod fingerprint;
 pub mod calibration;
 pub mod db;
 pub mod fits_parser;
+pub mod header_fallbacks;
 pub mod fits_writer;
 pub mod clustering;
 pub mod collab;

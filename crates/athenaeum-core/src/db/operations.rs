@@ -3991,7 +3991,9 @@ pub fn get_frame_memberships_summary(
 /// Only frames currently flagged `override = 1` are inspected; clean rows
 /// are skipped so the cost is proportional to actual edits.
 pub fn recompute_override_flag_for_frames(conn: &Connection, frame_ids: &[i64]) -> Result<usize> {
-    use crate::fits_parser::stored_header::{parse_stored_header_keys, snapshot_from_keys};
+    use crate::fits_parser::header_keys::stored_header_key_map;
+    use crate::fits_parser::stored_header::snapshot_from_keys;
+    use crate::header_fallbacks::HeaderFallbackConfig;
     use crate::models::FileFormat;
 
     if frame_ids.is_empty() {
@@ -4092,8 +4094,9 @@ pub fn recompute_override_flag_for_frames(conn: &Connection, frame_ids: &[i64]) 
             // so leave override = 1.
             _ => continue,
         };
-        let keys = parse_stored_header_keys(format, &header_text);
-        let snap = snapshot_from_keys(frame_id, &keys);
+        let keys = stored_header_key_map(format, &header_text);
+        // Task 3 threads the rules
+        let snap = snapshot_from_keys(frame_id, &keys, &HeaderFallbackConfig::default());
 
         let all_match = opt_str_eq(&object, &snap.object)
             && opt_str_eq(&filter, &snap.filter)
@@ -4171,9 +4174,9 @@ pub fn get_frame_metadata_originals(
     conn: &Connection,
     frame_ids: &[i64],
 ) -> Result<Vec<crate::fits_parser::stored_header::FrameOriginalSnapshot>> {
-    use crate::fits_parser::stored_header::{
-        parse_stored_header_keys, snapshot_from_keys, FrameOriginalSnapshot,
-    };
+    use crate::fits_parser::header_keys::stored_header_key_map;
+    use crate::fits_parser::stored_header::{snapshot_from_keys, FrameOriginalSnapshot};
+    use crate::header_fallbacks::HeaderFallbackConfig;
     use crate::models::FileFormat;
 
     if frame_ids.is_empty() {
@@ -4211,8 +4214,9 @@ pub fn get_frame_metadata_originals(
         };
         match header {
             Some(text) if !text.is_empty() => {
-                let keys = parse_stored_header_keys(format, &text);
-                out.push(snapshot_from_keys(frame_id, &keys));
+                let keys = stored_header_key_map(format, &text);
+                // Task 3 threads the rules
+                out.push(snapshot_from_keys(frame_id, &keys, &HeaderFallbackConfig::default()));
             }
             // No stored header (rare — may pre-date the fits_header table or
             // a DB without re-scan after the migration). Emit an empty snapshot
