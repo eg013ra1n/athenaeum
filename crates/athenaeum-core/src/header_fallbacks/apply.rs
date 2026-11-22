@@ -26,8 +26,8 @@ use std::time::Instant;
 /// Frames per page: one read (and, in Apply, one write transaction) of this many frames.
 pub const PAGE_SIZE: usize = 500;
 
-// How many frames a field would change in. Plain comments, not docs: ts-rs copies a doc
-// comment into the generated declaration.
+// How many frames a field would change in. Plain comments here by choice: ts-rs copies only
+// field-level docs into the declaration, so a struct-level `///` would also be safe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FieldCount {
@@ -58,11 +58,12 @@ pub struct CatalogRow {
     pub header: Option<String>,
 }
 
-/// A numeric column read leniently: anything that is not a number is absent.
+/// A numeric column read leniently: anything that is not a finite number is absent.
 fn number_at(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<f64>> {
     Ok(match row.get_ref(idx)? {
         ValueRef::Integer(i) => Some(i as f64),
-        ValueRef::Real(r) => Some(r),
+        // A stored +-inf or NaN is no value (D7): the resolver never produces one, a scan stores NULL.
+        ValueRef::Real(r) if r.is_finite() => Some(r),
         _ => None,
     })
 }
@@ -173,35 +174,57 @@ fn text_of(v: &Option<FieldValue>) -> Option<&str> {
     }
 }
 
-/// The `instrume` rule (D9, R4). The scan root's ` N<digits>` suffix is the catalog's own and is
-/// never read from, or written by, the header: the base name of the column is compared with the
-/// base names of the candidates, and the column's own suffix is kept on the new value. A NULL
-/// column takes what a scan of this file would store. `None` = the column is not from the header.
+/// The `instrume` rule (D9, R4, R5). The scan root's ` N<digits>` suffix belongs to the catalog,
+/// and a row's INSTRUME can be in any of the forms the catalog's writers give it, so the column is
+/// matched against each candidate in the forms a scan, a master registration and a move produce.
+/// The first match wins; `None` = the column is not from the header.
+///
+/// 1. NULL column: what a scan of this file would store.
+/// 2. The column is the scan form of a candidate (the scan and re-parse form; in a plain root
+///    the candidate itself): the scan form of the new value.
+/// 3. The column is a candidate exactly (a master registered without the suffix): the new value
+///    unchanged.
+/// 4. The column has the base name of a candidate (a moved, adopted or reconciled row): the base
+///    of the new value, with the column's own suffix if it has one.
 fn instrume_value(
     current: &Option<FieldValue>,
     candidates: &[FieldValue],
     resolved: &Option<FieldValue>,
     root: Option<(i64, bool)>,
 ) -> Option<Option<FieldValue>> {
+    let (root_id, unique) = root.unwrap_or((0, false));
     let resolved_text = text_of(resolved);
+    let scan_form = |t: Option<&str>| instrume_for_scan(t.map(str::to_string), unique, root_id).map(FieldValue::Text);
     let Some(current) = text_of(current) else {
-        let (root_id, unique) = root.unwrap_or((0, false));
-        return Some(instrume_for_scan(resolved_text.map(str::to_string), unique, root_id).map(FieldValue::Text));
+        return Some(scan_form(resolved_text));
     };
-    let (base, suffix) = split_unique_camera_suffix(current);
-    let from_header = candidates
+    let names: Vec<&str> = candidates
         .iter()
-        .any(|c| matches!(c, FieldValue::Text(t) if split_unique_camera_suffix(t).0 == base));
-    if !from_header {
-        return None;
-    }
-    Some(resolved_text.map(|r| {
-        let new_base = split_unique_camera_suffix(r).0;
-        FieldValue::Text(match suffix {
-            Some(n) => format!("{new_base} N{n}"),
-            None => new_base.to_string(),
+        .filter_map(|c| match c {
+            FieldValue::Text(t) => Some(t.as_str()),
+            FieldValue::Number(_) => None,
         })
-    }))
+        .collect();
+    if names
+        .iter()
+        .any(|c| instrume_for_scan(Some((*c).to_string()), unique, root_id).as_deref() == Some(current))
+    {
+        return Some(scan_form(resolved_text));
+    }
+    if names.contains(&current) {
+        return Some(resolved.clone());
+    }
+    let (base, suffix) = split_unique_camera_suffix(current);
+    if names.iter().any(|c| split_unique_camera_suffix(c).0 == base) {
+        return Some(resolved_text.map(|r| {
+            let new_base = split_unique_camera_suffix(r).0;
+            FieldValue::Text(match suffix {
+                Some(n) => format!("{new_base} N{n}"),
+                None => new_base.to_string(),
+            })
+        }));
+    }
+    None
 }
 
 /// The per-field test of one frame under `rules` (spec §5.4).
@@ -231,15 +254,13 @@ pub fn plan_frame(rules: &HeaderFallbackConfig, row: &CatalogRow, roots: &ScanRo
             .chain(rules.retired(field))
             .filter_map(|k| resolve_keyword(field, k, &keys))
             .collect();
-        // D10: an XISF pixel size the stored dump cannot show (a `<Property>`) is left alone.
-        if is_xisf
-            && matches!(field, HeaderField::Xpixsz | HeaderField::Ypixsz)
-            && candidates.is_empty()
-            && current.is_some()
+        let resolved = resolve_field(field, rules.order(field), &keys);
+        // D10: an XISF pixel size the stored dump cannot show (a `<Property>`) is left alone: the
+        // order chain resolves nothing, so the scan took the Property and Apply cannot tell.
+        if is_xisf && matches!(field, HeaderField::Xpixsz | HeaderField::Ypixsz) && resolved.is_none() && current.is_some()
         {
             continue;
         }
-        let resolved = resolve_field(field, rules.order(field), &keys);
         let new = if field == HeaderField::Instrume {
             instrume_value(&current, &candidates, &resolved, root)
         } else {
@@ -690,7 +711,13 @@ mod tests {
     }
 
     fn scan_root_with(root: &std::path::Path, unique_camera: bool) -> Connection {
+        scan_root_under(root, unique_camera, &HeaderFallbackConfig::default())
+    }
+
+    /// A catalog scanned from `root` under `rules` (stored first: the scanner loads them itself).
+    fn scan_root_under(root: &std::path::Path, unique_camera: bool, rules: &HeaderFallbackConfig) -> Connection {
         let conn = catalog();
+        crate::header_fallbacks::store(&conn, rules).unwrap();
         add_root(&conn, 1, root.to_str().unwrap(), unique_camera);
         let result = crate::scanner::scan_directory(root, &conn, None, unique_camera, 1);
         assert!(result.errors.is_empty(), "{:?}", result.errors);
@@ -727,11 +754,321 @@ mod tests {
             Card::new("OBJECT", CardValue::Str("".into())).unwrap(),
         ];
         write_xisf_f32(&dir.path().join("b.xisf"), 2, 2, 1, &[0.0, 0.25, 0.5, 1.0], &cards).unwrap();
+        // XISF: EXPTIME in Fortran D notation (a string value, read as a number).
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
+            Card::new("EXPTIME", CardValue::Str("1.2D+02".into())).unwrap(),
+        ];
+        write_xisf_f32(&dir.path().join("c.xisf"), 2, 2, 1, &[0.0, 0.25, 0.5, 1.0], &cards).unwrap();
 
         let conn = scan_root_with(dir.path(), false);
-        let frames: i64 = conn.query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0)).unwrap();
-        assert_eq!(frames, 2);
+        let stored = stored_by_name(&conn);
+        assert_eq!(stored.len(), 3);
+        let a = &stored["a.fits"];
+        assert_eq!(a.ccd_temp, Some(-5.5));
+        assert_eq!(a.gain, Some(120.0));
+        assert_eq!(a.exptime, Some(120.0));
+        // The CONTINUE card joins the two pieces (the reader drops the space before the `&`).
+        let object = a.object.as_deref().unwrap();
+        assert!(object.starts_with("NGC 7000 North") && object.ends_with("America"), "{object:?}");
+        assert_eq!(a.filter.as_deref(), Some("O'III"));
+        assert_eq!(stored["b.xisf"].exptime, Some(120.0));
+        assert_eq!(stored["b.xisf"].filter.as_deref(), Some("Ha"));
+        assert_eq!(stored["c.xisf"].exptime, Some(120.0));
         assert_eq!(preview(&conn, &HeaderFallbackConfig::default()).unwrap(), HeaderFallbackCounts::default());
+    }
+
+    /// The twelve columns of every frame, by file name.
+    fn stored_by_name(conn: &Connection) -> BTreeMap<String, ResolvedFields> {
+        read_rows(conn, 0, 100_000)
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                let name = std::path::Path::new(&r.file_path).file_name().unwrap().to_string_lossy().into_owned();
+                (name, r.values)
+            })
+            .collect()
+    }
+
+    /// What Apply will write for each planned change, standing in for it in these tests.
+    fn write_changes(conn: &Connection, frame_id: i64, changes: &[(HeaderField, Option<FieldValue>)]) {
+        use rusqlite::types::Value;
+        for (field, value) in changes {
+            let v = match value {
+                Some(FieldValue::Number(n)) => Value::Real(*n),
+                Some(FieldValue::Text(t)) => Value::Text(t.clone()),
+                None => Value::Null,
+            };
+            conn.execute(&format!("UPDATE frames SET {} = ?1 WHERE id = ?2", field.column()), params![v, frame_id])
+                .unwrap();
+        }
+    }
+
+    /// A card line: keyword, then the value part as the stored header text would carry it.
+    fn card_line(key: &str, value: &str) -> String {
+        format!("{key:<8}= {value}")
+    }
+
+    fn real(v: &str) -> String {
+        format!("{v:>20}")
+    }
+
+    fn quoted(v: &str) -> String {
+        format!("'{v}'")
+    }
+
+    fn write_fits(dir: &std::path::Path, name: &str, cards: &[(&str, String)]) {
+        let lines: Vec<String> = cards.iter().map(|(k, v)| card_line(k, v)).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        std::fs::write(dir.join(name), fits_file(&refs)).unwrap();
+    }
+
+    /// Files that tell the default rules and the custom ones apart in every field they touch,
+    /// the camera name in the forms of the review's two traced cases among them.
+    fn rules_fixture(dir: &std::path::Path) {
+        use crate::fits_writer::{write_xisf_f32, Card, CardValue};
+        write_fits(
+            dir,
+            "a.fits",
+            &[
+                ("IMAGETYP", quoted("Light")),
+                ("DET-TEMP", real("-5.5")),
+                ("CCD-TEMP", real("-10")),
+                ("MY-TEMP", real("3")),
+                ("EXPOSURE", real("60")),
+                ("EXPTIME", real("120")),
+                ("MYGAIN", real("77")),
+                ("GAIN", real("120")),
+                ("OFFSET", real("10")),
+                ("CAMERA", quoted("Other")),
+                ("INSTRUME", quoted("Cam")),
+                ("FILTER", quoted("Ha")),
+                ("OLDFILT", quoted("Lum")),
+                ("OBJECT", quoted("M31")),
+                ("TELESCOP", quoted("Scope")),
+                ("FOCALLEN", real("530")),
+                ("XPIXSZ", real("4.5")),
+                ("PIXSIZE1", real("3.76")),
+            ],
+        );
+        // Case (a): the header's own INSTRUME ends in ` N3`, and CAMERA names another camera.
+        write_fits(
+            dir,
+            "b.fits",
+            &[
+                ("IMAGETYP", quoted("Dark")),
+                ("DET-TEMP", real("-10")),
+                ("EXPTIME", real("300")),
+                ("INSTRUME", quoted("Cam N3")),
+                ("CAMERA", quoted("Other")),
+            ],
+        );
+        // Case (b): CAMERA carries the ` N3`, INSTRUME does not.
+        write_fits(
+            dir,
+            "c.fits",
+            &[("IMAGETYP", quoted("Light")), ("INSTRUME", quoted("Cam")), ("CAMERA", quoted("Cam N3"))],
+        );
+        write_fits(dir, "d.fits", &[("IMAGETYP", quoted("Light")), ("INSTRUME", quoted("Cam"))]);
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
+            Card::new("EXPOSURE", CardValue::Real(60.0)).unwrap(),
+            Card::new("EXPTIME", CardValue::Str("1.2D+02".into())).unwrap(),
+            Card::new("INSTRUME", CardValue::Str("XCam N2".into())).unwrap(),
+            Card::new("CAMERA", CardValue::Str("XOther".into())).unwrap(),
+            Card::new("FILTER", CardValue::Str("Ha  ".into())).unwrap(),
+            Card::new("MYGAIN", CardValue::Real(77.0)).unwrap(),
+            Card::new("GAIN", CardValue::Real(120.0)).unwrap(),
+        ];
+        write_xisf_f32(&dir.join("e.xisf"), 2, 2, 1, &[0.0, 0.25, 0.5, 1.0], &cards).unwrap();
+    }
+
+    fn set_rule(cfg: &mut HeaderFallbackConfig, field: HeaderField, order: &[&str], retired: &[&str]) {
+        cfg.fields.insert(
+            field,
+            FieldRule {
+                order: order.iter().map(|s| (*s).to_string()).collect(),
+                retired: retired.iter().map(|s| (*s).to_string()).collect(),
+            },
+        );
+    }
+
+    /// Rules that move the first keyword of five fields and retire two others.
+    fn custom_rules() -> HeaderFallbackConfig {
+        let mut cfg = HeaderFallbackConfig::default();
+        set_rule(&mut cfg, HeaderField::CcdTemp, &["DET-TEMP", "CCD-TEMP"], &["MY-TEMP"]);
+        set_rule(&mut cfg, HeaderField::Exptime, &["EXPOSURE", "EXPTIME"], &[]);
+        set_rule(&mut cfg, HeaderField::Gain, &["MYGAIN", "GAIN"], &[]);
+        set_rule(&mut cfg, HeaderField::Instrume, &["CAMERA", "INSTRUME"], &[]);
+        set_rule(&mut cfg, HeaderField::Filter, &["FILTER"], &["OLDFILT"]);
+        crate::header_fallbacks::validate(&cfg).unwrap()
+    }
+
+    #[test]
+    fn custom_rules_on_a_freshly_scanned_catalog_preview_zero() {
+        for unique in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            rules_fixture(dir.path());
+            let rules = custom_rules();
+            let conn = scan_root_under(dir.path(), unique, &rules);
+            let stored = stored_by_name(&conn);
+            assert_eq!(stored.len(), 5);
+            // The scan really read the custom order: the first keyword of each moved field.
+            assert_eq!(stored["a.fits"].ccd_temp, Some(-5.5));
+            assert_eq!(stored["a.fits"].exptime, Some(60.0));
+            assert_eq!(stored["a.fits"].gain, Some(77.0));
+            let loaded = crate::header_fallbacks::load(&conn).unwrap();
+            assert_eq!(loaded, rules);
+            assert_eq!(
+                preview(&conn, &loaded).unwrap(),
+                HeaderFallbackCounts::default(),
+                "unique camera root: {unique}"
+            );
+        }
+    }
+
+    /// Scan under `a`, plan and write the changes for `b`, and compare all twelve fields with a
+    /// fresh scan of the same files under `b`.
+    fn assert_apply_equals_a_scan(a: &HeaderFallbackConfig, b: &HeaderFallbackConfig, unique: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        rules_fixture(dir.path());
+        let applied = scan_root_under(dir.path(), unique, a);
+        let roots = ScanRoots::load(&applied).unwrap();
+        for row in read_rows(&applied, 0, 100_000).unwrap() {
+            write_changes(&applied, row.frame_id, &plan_frame(b, &row, &roots).changes);
+        }
+        let scanned = scan_root_under(dir.path(), unique, b);
+        assert_eq!(stored_by_name(&applied), stored_by_name(&scanned), "unique camera root: {unique}");
+        assert_eq!(preview(&applied, b).unwrap(), HeaderFallbackCounts::default(), "unique: {unique}");
+    }
+
+    #[test]
+    fn applying_the_planned_changes_gives_what_a_scan_under_the_new_rules_stores() {
+        let custom = custom_rules();
+        // The default order with what the custom one had beyond it retired.
+        let back = custom.reset_orders();
+        for unique in [false, true] {
+            assert_apply_equals_a_scan(&HeaderFallbackConfig::default(), &custom, unique);
+            assert_apply_equals_a_scan(&custom, &back, unique);
+            assert_apply_equals_a_scan(&custom, &custom, unique);
+        }
+    }
+
+    #[test]
+    fn instrume_follows_the_scan_form_in_the_two_traced_cases() {
+        let conn = catalog();
+        add_root(&conn, 5, "/cams/five", true);
+        add_root(&conn, 6, "/cams/six", false);
+        let rules = rules_with(HeaderField::Instrume, &["CAMERA", "INSTRUME"], &[]);
+        // (a) plain root: the column `Cam N3` is the header's own INSTRUME, not the catalog's suffix.
+        let a = fits_text(&[("INSTRUME", "'Cam N3'"), ("CAMERA", "'Other'")]);
+        let col = ResolvedFields { instrume: Some("Cam N3".into()), ..ResolvedFields::default() };
+        let id = add_frame(&conn, "/cams/six/a.fits", "FITS", "Light", &col, Some(&a));
+        assert_eq!(plan_of(&conn, &rules, id).changes, vec![(HeaderField::Instrume, text("Other"))]);
+        // The same in a unique-camera root: the suffix is the root's.
+        let col = ResolvedFields { instrume: Some("Cam N5".into()), ..ResolvedFields::default() };
+        let id = add_frame(&conn, "/cams/five/a.fits", "FITS", "Light", &col, Some(&a));
+        assert_eq!(plan_of(&conn, &rules, id).changes, vec![(HeaderField::Instrume, text("Other N5"))]);
+        // (b) plain root: the column `Cam` is what a scan stores for INSTRUME `Cam`; CAMERA now says `Cam N3`.
+        let b = fits_text(&[("INSTRUME", "'Cam'"), ("CAMERA", "'Cam N3'")]);
+        let col = ResolvedFields { instrume: Some("Cam".into()), ..ResolvedFields::default() };
+        let id = add_frame(&conn, "/cams/six/b.fits", "FITS", "Light", &col, Some(&b));
+        assert_eq!(plan_of(&conn, &rules, id).changes, vec![(HeaderField::Instrume, text("Cam N3"))]);
+        // A master registered without the suffix in a unique root is a candidate exactly: no suffix is added.
+        let col = ResolvedFields { instrume: Some("Cam".into()), ..ResolvedFields::default() };
+        let c = fits_text(&[("INSTRUME", "'Cam'"), ("CAMERA", "'Cam2'")]);
+        let id = add_frame(&conn, "/cams/five/m.fits", "FITS", "Light", &col, Some(&c));
+        assert_eq!(plan_of(&conn, &rules, id).changes, vec![(HeaderField::Instrume, text("Cam2"))]);
+        let id = add_frame(&conn, "/cams/five/n.fits", "FITS", "Light", &col, Some(&fits_text(&[("INSTRUME", "'Cam'")])));
+        assert!(plan_of(&conn, &HeaderFallbackConfig::default(), id).changes.is_empty());
+    }
+
+    #[test]
+    fn an_xisf_pixel_size_with_a_retired_keyword_in_the_dump_is_left_alone() {
+        let conn = catalog();
+        // The `<Property>` pixel size (3.76) is in the columns; the dump has only the retired keyword.
+        let h = xisf_text(&[("FILTER", "Ha"), ("OLDPIX", "3.76")]);
+        let values = ResolvedFields {
+            xpixsz: Some(3.76),
+            ypixsz: Some(3.76),
+            filter: Some("Ha".into()),
+            ..ResolvedFields::default()
+        };
+        let id = add_frame(&conn, "a.xisf", "XISF", "Light", &values, Some(&h));
+        let mut rules = HeaderFallbackConfig::default();
+        set_rule(&mut rules, HeaderField::Xpixsz, &["XPIXSZ", "PIXSIZE1"], &["OLDPIX"]);
+        set_rule(&mut rules, HeaderField::Ypixsz, &["YPIXSZ", "PIXSIZE2"], &["OLDPIX"]);
+        let plan = plan_of(&conn, &rules, id);
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.kept, 0);
+        assert_eq!(preview(&conn, &rules).unwrap(), HeaderFallbackCounts::default());
+        // A FITS frame has no Property: there the retired keyword's value is cleared.
+        let fits = fits_text(&[("OLDPIX", "3.76"), ("FILTER", "'Ha'")]);
+        let id = add_frame(&conn, "a.fits", "FITS", "Light", &values, Some(&fits));
+        let plan = plan_of(&conn, &rules, id);
+        assert_eq!(plan.changes, vec![(HeaderField::Xpixsz, None), (HeaderField::Ypixsz, None)]);
+    }
+
+    #[test]
+    fn a_stored_infinity_reads_as_absent() {
+        let conn = catalog();
+        let h = fits_text(&[("GAIN", "100")]);
+        let id = add_frame(&conn, "a.fits", "FITS", "Light", &ResolvedFields::default(), Some(&h));
+        conn.execute("UPDATE frames SET gain = 1e999, offset = -1e999 WHERE id = ?1", params![id]).unwrap();
+        let rows = read_rows(&conn, 0, 10).unwrap();
+        assert_eq!(rows[0].values.gain, None);
+        assert_eq!(rows[0].values.offset, None);
+        // Filled from the header like any NULL, and not counted as kept.
+        let plan = plan_of(&conn, &HeaderFallbackConfig::default(), id);
+        assert_eq!(plan.changes, vec![(HeaderField::Gain, num(100.0))]);
+        assert_eq!(plan.kept, 0);
+    }
+
+    #[test]
+    fn a_blank_text_column_is_cleared_when_the_header_has_no_value() {
+        let conn = catalog();
+        let h = fits_text(&[("DET-TEMP", "-5")]);
+        let values = ResolvedFields {
+            ccd_temp: Some(-5.0),
+            filter: Some("  ".into()),
+            object: Some(String::new()),
+            ..ResolvedFields::default()
+        };
+        let id = add_frame(&conn, "a.fits", "FITS", "Light", &values, Some(&h));
+        let plan = plan_of(&conn, &HeaderFallbackConfig::default(), id);
+        assert_eq!(plan.changes, vec![(HeaderField::Object, None), (HeaderField::Filter, None)]);
+        assert_eq!(plan.kept, 0);
+    }
+
+    #[test]
+    fn master_library_and_source_sets_are_not_counted_as_regrouped() {
+        let conn = catalog();
+        let h = fits_text(&[("DET-TEMP", "-5.5")]);
+        let none = ResolvedFields::default();
+        // A master library set: its frames change, its set is not moved.
+        let library = calibration_set(&conn, "MasterDark");
+        conn.execute("UPDATE calibration_set SET is_master_library = 1 WHERE id = ?1", params![library]).unwrap();
+        let id = add_frame(&conn, "lib.fits", "FITS", "Dark", &none, Some(&h));
+        put_in_set(&conn, library, id);
+        // The raw set a master was built from.
+        let master = calibration_set(&conn, "MasterDark");
+        let source = calibration_set(&conn, "Dark");
+        conn.execute(
+            "INSERT INTO master_provenance (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (?1, ?2, '{}', '[]', 'h', '2026-01-01')",
+            params![master, source],
+        )
+        .unwrap();
+        let id = add_frame(&conn, "src.fits", "FITS", "Dark", &none, Some(&h));
+        put_in_set(&conn, source, id);
+        let counts = preview(&conn, &HeaderFallbackConfig::default()).unwrap();
+        assert_eq!(counts.frames_changed, 2);
+        assert_eq!(counts.sets_regrouped, 0);
+        // A plain raw set beside them is counted.
+        let raw = calibration_set(&conn, "Dark");
+        let id = add_frame(&conn, "raw.fits", "FITS", "Dark", &none, Some(&h));
+        put_in_set(&conn, raw, id);
+        assert_eq!(preview(&conn, &HeaderFallbackConfig::default()).unwrap().sets_regrouped, 1);
     }
 
     #[test]
