@@ -57,8 +57,11 @@ check:versions:
 # --- Windows Build ---
 build:windows:
   stage: build
+  # windows-release, not windows: that tag stays with a runner another project
+  # still uses, and GitLab cannot unassign a runner from its owner project, so
+  # a tag only the Windows release runner carries is what keeps these jobs on it.
   tags:
-    - windows
+    - windows-release
   only:
     - tags
   # Dedicated windows machine — starts parallel to linux/macos, gated only on
@@ -333,7 +336,7 @@ smoke:linux:
   tags: [linux]
 smoke:windows:
   extends: .runner_smoke
-  tags: [windows]
+  tags: [windows-release]
   script:
     - Write-Output "runner ok on $env:COMPUTERNAME"; Get-Location
 
@@ -408,7 +411,7 @@ build:perseus:macos:
 build:perseus:windows:
   stage: build
   tags:
-    - windows
+    - windows-release   # see build:windows
   only:
     - tags
   needs:
