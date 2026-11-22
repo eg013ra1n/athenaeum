@@ -1,6 +1,196 @@
-//! The FITS/XISF writer core: `Durability`, `XisfBounds`, `OutputFormat` and `write_image_f32(_with)` (Task 4).
+//! The FITS/XISF writer core: `Durability`, `XisfBounds`, `OutputFormat` and `write_image_f32(_with)`.
+//!
+//! Every writer that reaches the XISF `CREATOR` has a `_with_creator` sibling taking the application string as a
+//! trailing `creator: &str`; the plain names write [`STARLOOM_CREATOR`].
 
 pub mod bayer;
 pub mod card;
 pub mod writer;
 pub mod xisf_writer;
+pub use card::{Card, CardValue, FitsWriteError};
+pub use writer::{
+    write_fits_f32, write_fits_f32_streaming_to, write_fits_f32_streaming_with, write_fits_f32_to,
+    write_fits_f32_with,
+};
+pub use xisf_writer::{
+    write_xisf_f32, write_xisf_f32_to, write_xisf_f32_to_with_creator, write_xisf_f32_with_creator,
+    write_xisf_f32_with_with_creator, xisf_keyword_value,
+};
+
+/// The default `XISF:CreatorApplication` of a file this crate writes (ruling R-M4d-3). A caller that has its own
+/// application name passes it to a `_with_creator` writer instead.
+pub const STARLOOM_CREATOR: &str = concat!("starloom ", env!("CARGO_PKG_VERSION"));
+
+/// Whether a write must survive power loss before its rename makes it
+/// visible (perf tier 1 Task 6). `Durable` = `sync_all` before the rename —
+/// every master, every export. `Volatile` = flush only: the run's own
+/// calibrated intermediates, which the artifact row keys on a hash and a
+/// stat, so a file a crash loses or truncates is a cache miss — not a claim
+/// that it can never read back as a WRONG answer in principle: on a
+/// filesystem without ordered metadata a rename that landed before its data
+/// was flushed can, in theory, reappear at the recorded size with garbage
+/// inside it. APFS and ext4 (`data=ordered`) — the filesystems this app
+/// ships on — make that unreachable, which is what the "cache miss, not a
+/// wrong answer" claim actually rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    Durable,
+    Volatile,
+}
+
+/// The container an output image is written in. One enum for every writer
+/// in the app — stacking masters, calibration masters, calibrated lights —
+/// so no two features can disagree about what "xisf" means.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum OutputFormat {
+    #[default]
+    Fits,
+    /// Monolithic XISF 1.0, one uncompressed Float32 image, the same cards
+    /// as the FITS file (`xisf_writer`).
+    Xisf,
+}
+
+impl OutputFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            OutputFormat::Fits => "fits",
+            OutputFormat::Xisf => "xisf",
+        }
+    }
+
+    /// The container a file on disk already has — a rebuild keeps it.
+    pub fn from_path(path: &std::path::Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("xisf") => OutputFormat::Xisf,
+            _ => OutputFormat::Fits,
+        }
+    }
+}
+
+/// The representable range an XISF Float32 image declares (XISF 1.0
+/// §11.5.1, mandatory). Which one applies is the CALLER's knowledge: a
+/// stacking master and a calibrated light are unit-scaled (`ATH_CSCL`), a
+/// calibration master is raw ADU. rustafits' reader normalizes by these
+/// bounds and multiplies by 65535, so both come back in the ADU domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XisfBounds {
+    Unit,
+    Adu16,
+}
+
+impl XisfBounds {
+    pub fn attr(self) -> &'static str {
+        match self {
+            XisfBounds::Unit => "0:1",
+            XisfBounds::Adu16 => "0:65535",
+        }
+    }
+}
+
+/// One image in the chosen container — the ONE place the two writers are
+/// chosen between. `bounds` only matters for XISF. Always
+/// [`Durability::Durable`] — see [`write_image_f32_with`] for a caller that
+/// can afford to skip the fsync.
+pub fn write_image_f32(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[card::Card],
+    format: OutputFormat,
+    bounds: XisfBounds,
+) -> Result<(), card::FitsWriteError> {
+    write_image_f32_with(
+        path,
+        width,
+        height,
+        channels,
+        data,
+        cards,
+        format,
+        bounds,
+        Durability::Durable,
+    )
+}
+
+/// [`write_image_f32`] with the durability as a parameter (perf tier 1 Task
+/// 6) — the stacking run's regenerable calibrated intermediates pass
+/// [`Durability::Volatile`]; every other caller (masters, exports, sends,
+/// Perseus) passes [`Durability::Durable`].
+pub fn write_image_f32_with(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[card::Card],
+    format: OutputFormat,
+    bounds: XisfBounds,
+    durability: Durability,
+) -> Result<(), card::FitsWriteError> {
+    write_image_f32_with_with_creator(
+        path,
+        width,
+        height,
+        channels,
+        data,
+        cards,
+        format,
+        bounds,
+        durability,
+        STARLOOM_CREATOR,
+    )
+}
+
+/// [`write_image_f32`] with the `XISF:CreatorApplication` string as a parameter (a FITS file has no such field).
+pub fn write_image_f32_with_creator(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[card::Card],
+    format: OutputFormat,
+    bounds: XisfBounds,
+    creator: &str,
+) -> Result<(), card::FitsWriteError> {
+    write_image_f32_with_with_creator(
+        path,
+        width,
+        height,
+        channels,
+        data,
+        cards,
+        format,
+        bounds,
+        Durability::Durable,
+        creator,
+    )
+}
+
+/// [`write_image_f32_with`] with the `XISF:CreatorApplication` string as a parameter.
+pub fn write_image_f32_with_with_creator(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[card::Card],
+    format: OutputFormat,
+    bounds: XisfBounds,
+    durability: Durability,
+    creator: &str,
+) -> Result<(), card::FitsWriteError> {
+    match format {
+        OutputFormat::Fits => {
+            writer::write_fits_f32_with(path, width, height, channels, data, cards, durability)
+        }
+        OutputFormat::Xisf => xisf_writer::write_xisf_f32_with_with_creator(
+            path, width, height, channels, data, cards, bounds, durability, creator,
+        ),
+    }
+}
