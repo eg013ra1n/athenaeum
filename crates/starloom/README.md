@@ -11,3 +11,18 @@ Starloom is the astrophotography stacking kernel behind Athenaeum: geometry and 
 | `test-support` | — | test hooks and fixtures that dependent crates' tests read; never in default | nothing |
 
 `default = ["stack", "ts"]`. The crate is standalone: its manifest has no `[workspace]` table. Licence: Apache-2.0.
+
+## Versions
+
+A stage version is a public constant. A change to a stage's output bits bumps that stage's version in the same change. The values below are the ones the dependent application's tripwire test asserts; the ones marked "hash" enter a stage hash or a file header, so a bump invalidates the matching cached results.
+
+| Constant | Value | Layer | Enters |
+| ---- | ---- | ---- | ---- |
+| `ALIGN_VERSION` (`stacking/register/align.rs`) | 1 | `stack` | the registration stage hash and the two-pass key (hash) |
+| `LN_MODEL_VERSION` (`stacking/ln/mod.rs`) | 4 | `stack` | the normalization stage hash and the seeds-calibration hash (hash) |
+| `SNR_GAIN_VERSION` (`stacking/integrate.rs`) | 2 | `stack` | the group statistics and the run summary |
+| `DRIZZLE_KERNEL_VERSION` (`stacking/config.rs`) | 2 | `stack` | the run-level config hash (hash) |
+| `PASS1_ARTIFACT_VERSION` (`stacking/pass1_artifact.rs`) | 1 | `stack` | the pass-1 artifact file header and its stage hash (hash) |
+| `LN_GRID_VERSION` (`stacking/ln/grid.rs`, the `.athln` `VERSION`) | 1 | `stack` | the `.athln` sidecar header |
+| `LIGHT_CAL_VERSION` (`calibration_library/mod.rs`) | 1 | base | nothing inside starloom; the caller marks its calibrated lights with it |
+| `MEASURE_VERSION` | 8 | lives in `rustafits` | star measurement; unchanged by starloom |

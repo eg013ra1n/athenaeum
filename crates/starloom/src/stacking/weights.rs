@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use super::measure::{ChannelMeasurement, FrameMeasurement};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum WeightMode {
@@ -27,7 +26,6 @@ pub enum WeightMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct FormulaWeights {
@@ -275,7 +273,6 @@ pub fn compute_weights(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct SelectionConfig {

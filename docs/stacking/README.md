@@ -33,6 +33,8 @@ one file per stage, each with its tests beside it in `<file>_tests.rs` (a child 
 | `frames.rs` | the frame rows, the exclusion of a frame that changed during the run, the frame-level file names |
 | `tests.rs` | the rig every stage's tests use, and the tests of a run as a whole |
 
+**Where the kernel lives** (2026-11-22, starloom phase 0): the run above is the Athenaeum half and stays in `crates/athenaeum-core/src/stacking/run/`; every stage calls the kernel in `crates/starloom/src/` (`stacking/{measure,register,ln,drizzle,integrate,rej,weights,config,common_set,psf_signal,structure,prefilter,pass1_artifact,crop,groups}`, `integration/`, `geometry/`, `resample/`, `calibration_library/{light_cal,cosmetic}`, `fits_writer/` writer core), which core re-exports at the old `crate::stacking::…` / `crate::integration::…` paths. Path names in the history sections below are the old core ones: read `stacking/X` as `crates/starloom/src/stacking/X` when X is a kernel file.
+
 A type nearly every stage reads (`RunContext`, `MeasuredFrame`) stays in `mod.rs` with its fields private; an item, a
 field or a method one stage owns and a neighbour reads is `pub(super)`. The funnel test in `origin.rs` scans every production file of the folder, so a new file needs no entry.
 
@@ -243,7 +245,7 @@ member's sidecar too, not just its own.
 `stacking::run` reads the cached sidecars back into `GroupInput.ln`
 (indexed like the group's own frame list, `None` for a frame with no
 grid) and forwards it to `integrate_planes`, which wraps each channel's
-`LnGrid` as an opaque row-evaluator factory so `integration/engine.rs`
+`LnGrid` as an opaque row-evaluator factory so `crates/starloom/src/integration/engine.rs`
 never depends on the `stacking` tree directly (`StackParams.local`, a
 factory called once per rayon worker — never shared behind a lock). The
 engine's band loop applies `v' = A·v + B` (the SAME bicubic B-spline
@@ -268,7 +270,7 @@ is M4). On-disk layout: `<working_dir>/<set_slug>/ln/<group>/reference.fits`
 **LN runs end to end through `start_stacking`.** The two M1-era guards that
 used to block it — `build_plan`'s Gate 6 (`plan.rs`, code `"unsupported"`)
 refusing any plan with `normalization.local.enabled = true`, and
-`integrate_group` (`stacking/integrate.rs`) refusing
+`integrate_group` (`crates/starloom/src/stacking/integrate.rs`) refusing
 `normalization.rejection == "local"` with a `BadInput` before it ever
 reached the engine — were both lifted in the same cycle; nothing routes
 around `start_stacking` to exercise LN any more. **Acceptance run
@@ -375,7 +377,7 @@ OSC 0.91/0.80/0.68, top-20 14/20 (baseline: mono 1.11–1.21 / 0.924 / 18;
 OSC 1.6–7.6× / 0.93/0.86/0.44 / 12); 10 PASS / 12 MISS of the R-M4a-2
 targets vs 7/15 before. Rejection (stage 7) `LinearFitClip` now fits the
 sorted stack against rank with the minimum-absolute-deviation line
-(`integration/combine.rs::medfit_line`: intercept = median of `y − b·x`,
+(`crates/starloom/src/integration/combine.rs::medfit_line`: intercept = median of `y − b·x`,
 slope bracketed and bisected on the sign of `Σ x·sgn(residual)`,
 warm-started from the previous iteration, exact-root early return,
 `select_nth` median) instead of the least-squares one; dispersion `s =
@@ -391,7 +393,7 @@ The XISF reader (rustafits `formats/xisf.rs`) now picks the largest
 `<Image>` (ties keep the first — the external tool's masters carry a
 same-size weight-map image after the data) and honours `byteOrder="big"`
 and `bounds="lo:hi"`; the u16-domain float convention (samples × 65535)
-stays a cross-crate contract (`integration/banded.rs::spill_via_read_raw`,
+stays a cross-crate contract (`crates/starloom/src/integration/banded.rs::spill_via_read_raw`,
 `analysis/analyzer.rs`, R-M4a-11) — the M3 "XISF branch untrustworthy"
 finding was the two probes' own `Float32` arm never dividing by 65535,
 fixed in `examples/measure_probe.rs` and `examples/weight_audit.rs`. Two
@@ -495,7 +497,7 @@ R-T4-1…5 and R-T5-1/2): the algorithm half of §14's M4 — six items, every
 one an added arm on an existing enum or an optional pass inside a stage
 that already runs, so no table changed and no command was added.
 
-**The structure-map seed detector** (`stacking/structure.rs`, ruling
+**The structure-map seed detector** (`crates/starloom/src/stacking/structure.rs`, ruling
 R-M4c-11) lets stage 3 seed its PSF fits from the math reference's §5.1
 structure map instead of the peak threshold —
 `measurement.seedDetector = "peak" | "structure"`, **default `peak`**. The
@@ -546,18 +548,18 @@ round-trips and mirrors the source. A plane with no noise estimate (a
 noiseless synthetic) seeds nothing under the matched filter, by design.
 
 **Three more rejection algorithms** (ruling R-M4c-1): `Rejection::{MinMax,
-Esd, Rcr}` appended to the engine enum (`integration/combine.rs`) and
+Esd, Rcr}` appended to the engine enum (`crates/starloom/src/integration/combine.rs`) and
 `RejectionChoice::{minMax, esd, rcr}` to the config
-(`stacking/integrate.rs`), defaults `MinMax { low: 1, high: 1 }` / `Esd {
+(`crates/starloom/src/stacking/integrate.rs`), defaults `MinMax { low: 1, high: 1 }` / `Esd {
 outliersFraction: 0.3, alpha: 0.05, lowRelaxation: 1.5 }` / `Rcr { limit:
 0.5 }`. **The Auto ladder is byte-for-byte unchanged** (`n < 8` percentile
 0.2/0.1, `8 ≤ n < 20` Winsorized 4.0/3.0, `n ≥ 20` linear fit 5.0/3.5) and
 never resolves to any of the three — they are user choices only, so no
 existing group's rejection moved because they exist.
-`integration/student_t.rs` (new leaf) carries the numerics with no new
+`crates/starloom/src/integration/student_t.rs` (new leaf) carries the numerics with no new
 dependency:
 `erfc`/`erfinv` (bit-identical copies of `stacking::robust`'s, which is
-unreachable from `integration/`), `ln_gamma`, the regularized incomplete
+unreachable from `crates/starloom/src/integration/`), `ln_gamma`, the regularized incomplete
 beta by Lentz's continued fraction, `t_quantile` by bisection, and
 `esd_critical(n, i, alpha)` = ESD's `λ_i`; `with_esd_lambdas` memoizes the
 `λ` vector per `(n, alpha)` in a thread-local map (ruling R-M4c-2) so the
@@ -576,7 +578,7 @@ Throughput on a real plane is an ESTIMATE, never measured (order 50 s per
 26 Mpx plane for RCR) — Task 7's job.
 
 **Winsorized sigma clipping now runs the reference loop** (ruling
-R-M4c-3): `winsorized_location_scale` in `integration/combine.rs` replaces
+R-M4c-3): `winsorized_location_scale` in `crates/starloom/src/integration/combine.rs` replaces
 the retired fixed point — `μ = median`, `σ = WINSORIZE_MAD_TO_SIGMA
 (1.4826) · MAD`, then `t = μ ± WINSORIZE_CLAMP_SIGMA (1.5) · σ` with a
 first-pass `WINSORIZE_CUTOFF_SIGMA (5.0)` mapping a gross outlier to the
@@ -604,7 +606,7 @@ produces different pixels than the original build; provenance shape and the
 
 **Large-scale rejection** (ruling R-M4c-4) is an optional SECOND
 integration pass that removes what the per-pixel algorithms leave as
-speckle — a satellite trail's faint shoulders. `integration/source.rs::
+speckle — a satellite trail's faint shoulders. `crates/starloom/src/integration/source.rs::
 RejectionBitSource` is the read-side mirror of M3's `RejectionBitSink`,
 ROW-based and plane-bound (`words_per_row`/`frames`/`forced_row`) because
 `StackParams` is per-plane and a `&dyn` call per SAMPLE would be ≈ 5×10⁹
@@ -642,7 +644,7 @@ for. Run pin: 6 frames, a flat-topped trail whose 2-px shoulders survive
 the per-pixel clip — the shoulder band reads +11.70 % of a control row
 without large-scale and +0.40 % with it.
 
-**Thin-plate-spline distortion** (rulings R-M4c-5/6/7): `geometry/tps.rs`
+**Thin-plate-spline distortion** (rulings R-M4c-5/6/7): `crates/starloom/src/geometry/tps.rs`
 (ungated, no `stacking` dependency) holds `ThinPlateSpline` — the classic
 `φ(r) = r² ln r` with an affine part, two scalar splines (x and y) sharing
 nodes, Bookstein's bordered system with both right-hand sides on ONE
@@ -695,7 +697,7 @@ reference, the node set carries that position twice and Bookstein's system
 is exactly singular; roughly one synthetic seed in three fell back to its
 linear model before the fix (the correspondence ambiguity itself stands for
 every model). The local distortion loop lives in
-`stacking/register/local_loop.rs` (extracted from `align`): with
+`crates/starloom/src/stacking/register/local_loop.rs` (extracted from `align`): with
 `registration.localDistortion` and any distortion model, up to
 `LOCAL_DISTORTION_ROUNDS = 3` rounds of re-pair through the whole current
 map at `ransacTolerancePx · (1 + round)` → RANSAC a corrector homography →
@@ -758,7 +760,7 @@ athenaeum-core --no-default-features` passes while `lib.rs` carries
 compiled at all (verified in Task 2 by appending a deliberate type error to
 `combine.rs` and watching the check stay green); of the trees this cycle
 touched only `geometry/` is genuinely ungated, so the headless gate is not
-coverage for anything under `integration/`. And **`cargo test --lib` hides
+coverage for anything under `integration/`. (Since the starloom move the code is `crates/starloom/src/integration/`, starloom's `engine` layer, and core's `integration` module re-exports it behind `render`; `geometry/` is starloom's base layer, built without a feature, and the same headless fact holds for core's re-export.) And **`cargo test --lib` hides
 example breakage** — a public-signature change that breaks
 `examples/*_probe.rs` surfaces only under
 `cargo check -p athenaeum-core --all-targets`, which is the re-gate to run
@@ -834,7 +836,7 @@ enters the whole-config run fingerprint but no per-stage hash, and the plan
 gate's Calibrate staleness follows the pair (I2): a cached calibrated frame
 whose mosaic row is missing regenerates BOTH files in one generation.
 `drizzle.bayer` (default false) makes stage 8's deposit colour-pure:
-`cfa_plane_of(pattern, x, y)` (`stacking/drizzle/geom.rs`, four const
+`cfa_plane_of(pattern, x, y)` (`crates/starloom/src/stacking/drizzle/geom.rs`, four const
 tables keyed on `(y&1)*2+(x&1)`) routes every output plane's source read to
 the mosaic's own colour sites — R and B each cover a quarter of the pixels,
 G half — while everything else (the `.rej` lookup at the reference
@@ -1089,7 +1091,7 @@ per-frame MEASUREMENT hash** (rulings C-17/C-18) — the seed population moves
 with `measurement.detectionSigma`/`seedDetector`/`seedPrefilter`/`maxStars`,
 so a Measure config change re-normalizes and re-registers instead of reusing
 stale sidecars/rows. (4) **The drizzle deposit goes through a per-phase
-overlap table** (`stacking/drizzle/phase_table.rs`, `PHASES = 64` — ruling
+overlap table** (`crates/starloom/src/stacking/drizzle/phase_table.rs`, `PHASES = 64` — ruling
 C-21, the plan's 2 % per-pixel bound against the exact clip is unreachable at
 32; residual ≤ 1.0–1.6 %, level 1 ± 8e-6, `Σ area` per phase = the drop's
 area to 1e-6): one 212 KB table per (frame, plane) for a linear map, per
@@ -1948,7 +1950,7 @@ migration: stored runs, rows and `master_lights` are untouched; a set reaches
 the new model through the normal cache invalidation (below).
 
 - **The background model at the LN scale (item 1, L-1…L-6, P-1…P-3, P-9,
-  P-19…P-21).** `stacking/ln/background.rs` no longer holds a robust level per
+  P-19…P-21).** `crates/starloom/src/stacking/ln/background.rs` no longer holds a robust level per
   128-px cell with a validity gate and a neighbour fill (retired, with
   `rejection_limit`, the 3.0σ/3.2σ deviation thresholds and the full-plane
   cleaned copy). One procedure, for the reference and every target alike:
@@ -2368,23 +2370,23 @@ and landed up to 6.4 px off. Detail, rulings and the bars live in the plan.
   The runB mono common set 10 429 → 10 453 (0.962 of its candidates). hc11 moved nothing; its three
   frames under half the median (70062, 69954, 69865) stay and the diagnostic names them.
 
-**Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
-plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
-integrate,master_cards}.rs`,
-`stacking/register/{mod,detect,align,frame,wcs_seed,local_loop,writer}.rs`,
+**Key files**: kernel in `crates/starloom/src/` (since the starloom move; core re-exports it at the old paths):
+`stacking/{config,groups,measure,weights,psf_signal,prefilter,structure,integrate,rej,common_set,pass1_artifact,crop}.rs`,
+`stacking/register/{mod,detect,align,frame,wcs_seed,local_loop}.rs`,
 `stacking/ln/{mod,grid,background,scale,reference,selection,aperture,scale_rule,calibration}.rs`,
-`stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
+`stacking/drizzle/{mod,geom,phase_table}.rs`, `integration/student_t.rs`, `geometry/tps.rs`,
+`fits_writer/xisf_writer.rs`; Athenaeum side in `crates/athenaeum-core/src/`:
+`stacking/{config,groups,paths,plan,run,provenance,weights,master_cards,fits_artifact}.rs`,
+`stacking/register/writer.rs`,
 `stacking/{origin,project_source,prepare,solve,grid_map,crop}.rs`,
 `collab/{grid,grid_geometry,frame_meta}.rs`, `api/collab_grid.rs`,
 `plate_solve/{service,layers}.rs`,
-`crates/athenaeum-core/src/integration/student_t.rs`,
-`crates/athenaeum-core/src/geometry/tps.rs`,
 `crates/athenaeum-core/src/api/stacking.rs` (also `list_stacking_presets`/
 `save_stacking_preset`/`delete_stacking_preset`, M4d Task 4),
 `crates/athenaeum-core/src/api/files.rs` (`render_preview_from_path`/
 `preview_step`, M4d Task 3), `crates/athenaeum-core/src/db/stacking.rs`
 (`master_lights` rows, M4d Task 3), `crates/athenaeum-core/src/
-fits_writer/{wcs,xisf_writer}.rs`; dev probes
+fits_writer/wcs.rs`; dev probes
 `examples/{measure,register,integrate,ln}_probe.rs`, `examples/regfrag_probe.rs` and the weight-audit
 harness `examples/weight_audit.rs` (+ athenaeum-lab `harness/
 weight_audit_compare.py`).
@@ -4642,7 +4644,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     real counted cells it reads median |gap| 0.40 % with every dataset's slope inside the referee's ±1 %/px ceiling, while psfSel, exact on
     synthetic, reads 1.32 % with −3.9…−4.6 %/px on real OSC and run B mono and −2…−8 % on the lever."
     *B5's branch.* F1 as is is not module-fed: its seeds are `register::detect::detect_stars` on the integrated reference and Measure's fits
-    (or detection) on the target, the mismatch corrected by the seeds calibration `k` (C-14, `stacking/ln/calibration.rs`), and its flux
+    (or detection) on the target, the mismatch corrected by the seeds calibration `k` (C-14, `crates/starloom/src/stacking/ln/calibration.rs`), and its flux
     reads its own a·F circles and [6F, 8F] sky, not the module's ring or `c`. B5 Step 0 therefore takes the "F1 as is" branch: Steps 1–2
     (module seeds and their guards) are skipped, `k` and `unverdicted_clip_range` are kept and recorded beside LN's other screens (Register's
     0.95, L-14's 0.75, L-23's map); Steps 3 (C-9, the nebula sky; P.1 reads psfSel and F1) and 4 (R11-3, the package) run, against B4's
@@ -4877,7 +4879,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
     and every `fit_stars_at` caller still fit without it, mono registration inherits it through Measure's fits. The "until Plan D" cost above is paid.
   *`fieldWidthAtFloor` per site (R-OSP-15's per-site table; code read at the plan-c head).* `FieldWidth::at_floor()` is read by two things only:
   the detection warn (`star_measure/seeds.rs`, "field width at the clamp floor") and the stacking channel flag
-  (`stacking/measure.rs`, `field_width_at_floor: m.field_width.at_floor()`); no Analysis consumer reads it (`ChannelMeasurement::at_floor` is a
+  (`crates/starloom/src/stacking/measure.rs`, `field_width_at_floor: m.field_width.at_floor()`); no Analysis consumer reads it (`ChannelMeasurement::at_floor` is a
   different notion: `c` not measured).
 
   | call site | field width from | warn | flag |
@@ -4946,7 +4948,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
   saturated stars included (60-82 % of the light), and the extrapolated light of a clipped star grows with the blur: the weight credited a soft sub for
   light it did not have, any refusal of a clipped star re-ranked the frames against seeing (C10 r1), and set 109's top weight went to one of its widest
   frames. After it, the weight's flux term is summed over a frame-common set of stars every included frame holds unclipped, matched through the stored
-  registration maps (`stacking/common_set.rs`, called from `run/reweigh.rs::reweigh_groups` at the end of stage 5); `c`'s colour sample keeps point-like stars the
+  registration maps (`crates/starloom/src/stacking/common_set.rs`, called from `run/reweigh.rs::reweigh_groups` at the end of stage 5); `c`'s colour sample keeps point-like stars the
   knot flag took (PD-9); the Blend refusal joins the stacking Measure (PD-10); the SNR gain reads the same set. Final code sha **f899a691** (the runs'
   sha); 584f6b35 after it moves one log-only constant (PD-44) and 174eea6f regenerates `src/types/stacking.ts` (doc text); the DF docs round after that
   changes doc comments, two test lines and these docs, no behaviour.
@@ -5179,7 +5181,7 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       star-test corpus has no such file (header scan of its 147 FITS), so no corpus number moves.
     - *The deprecation.* `ImageAnalyzer::analyze*` is deprecated in rustafits 1.8.0 and goes in 2.0, together with `SeedOverride::Full` and the
       lab's `legacy-analysis` arm (D-6). Athenaeum has three callers, each now under an item- or statement-level `#[allow(deprecated)]` with a
-      comment naming D-6: the `Detector::Full` arm of `stacking/measure.rs` (`SeedOverride::Full`), `examples/star_probe.rs` (`legacy_analyze`) and
+      comment naming D-6: the `Detector::Full` arm of `crates/starloom/src/stacking/measure.rs` (`SeedOverride::Full`), `examples/star_probe.rs` (`legacy_analyze`) and
       `examples/integrate_probe.rs` (`full_seed_positions`). `cargo build --all-targets` of `athenaeum-core`, `athenaeum-tauri` and `athenaeum-web`
       prints no `use of deprecated`. No other code changed.
     - *Gates.* G5-d: `athenaeum-core --all-targets` 4549 / 0 / 15 with no pin edited, `ts_contract` green and `src/types` unchanged, the
@@ -5483,7 +5485,7 @@ In-app light stacking — the frame set's own master light(s) from its matched c
 - **A light in the Black Hole is not stacked** (2026-10-25, release blocker): `groups::load_group_members` — the one light source of a frame set's plan AND run — skips a light whose file has a `black_hole` row, so the plan's counts and the run's frames agree with the frame-set views, which already list such a light apart. Restoring the file brings it back. Found on set 182 (164 lights, 25 blackholed; its run 8 had stacked 11 of them). Checked 2026-10-31 on a copy of the owner's catalog through the release web build: the plan reads 62 / 30 / 27 / 20 = 139, and so does the Objects card (`member_count`). Transfer dedup still counts a blackholed file as present (an owner ruling of 2026-07-22); that rule is not this one.
 - **A frame held twice is stacked once** (2026-10-29): `groups::load_group_members` also splices `db::frame_is_used_copy_sql`, so of two copies of one raw frame in the set (two disk copies, or a disk copy and a zip entry; the Duplicates page's header identity) only the used one enters the plan and the run — disk before zip, then present, then the lowest id (`docs/frame_sets/README.md`). Before, both entered with double weight (dev set 271: 24 lights for 12 frames). The fragment only removes rows and the query keeps its `ORDER BY`, so a set without duplicates plans and stacks exactly as before.
 - **Frames and masters inside a zip** (2026-10-28, zip plan Task 8): a catalog row with `archive_zip_path` + `archive_path_in_zip` is read through `zip_store::materialize`, never opened by its catalog path. The plan gate extracts nothing: a master is "missing" only when `zip_store::presence::catalog_path_is_present` says it is on neither disk nor in a zip (so the `masterFiles` blocker reads "{n} master file(s) missing on disk and in zip files"), the manual reference's `onDisk` uses the same rule, and a zip master's stage-1 identity is its entry's size + CRC32 (`InputIdentity::master_token`, `<size>|zip:<crc32>`; the entry's time inside the zip when no CRC was recorded). Prepare (attested sets, projects) classifies a zip-resident frame from its entry's header bytes (`prepare::probe_zip_entry`, the same verdict `probe_file` gives the extracted file) and decides stage-1 freshness BEFORE extracting, so a re-run whose artifacts are all fresh reads nothing out of the zip; only a frame that needs real work is extracted (`resolve_prepare_job`, on the run's cancel flag), and the cache pin stays in the job until the group's fan-out ends (a copy that fails leaves no partial in `prepared/`); a float light that would be used IN PLACE (or a mosaic kept as `calibrated_mosaic`) is copied into `prepared/` first (`detach_zip_source`), because a `calibrated` artifact must never name a cache file the cache may evict. Group colour for a zipped attested light comes from the entry's header bytes (`project_source::ZipShapes`: one directory read per zip per grouping pass), not an extraction. A project plan does not probe a zipped landed file (the run does, after extracting it). `solve.rs` reads the stage-1 artifact, so it needed no change. A master that lives in a zip is never rebuilt in place, whether or not its zip is reachable: a rebuild writes at the row's `files.path`, which for a zip-resident row is `<zip>/<entry>` (or the pre-zip original), never ours to create. `masters::zip_resident_master_block` is asked by the readiness split (`classify_master_rebuildability`: the master is `masters_unrebuildable`, so the `masterFiles` blocker reads "... cannot be rebuilt: master is inside X.zip, which is not reachable"), by `resolve_rebuild_target`, and by `run_build`'s Rebuild branch as the last guard. Master builds (`run_build`) extract the member frames and a zip pre-calibration master in one batch and release the pins once every band is read.
-- **The PSF-family weight reads a frame-common star set** (Plan D, 2026-11-02; PD-1, PD-3, PD-32, PD-19 b; R-OSP-18): under `PsfSignalWeight` / `PsfSnr` the weight's flux term (`commonTflux`, `commonTmeanFlux`) is summed over stars every included frame holds unclipped, never over a frame's own accepted fits, so a clipped star and the blur's extrapolated light no longer drive it. The set is built per (group, plane) after the persisting registration pass (`stacking/common_set.rs`, called from `run/reweigh.rs::reweigh_groups` at the end of stage 5, from the `.athf` fits through the stored registration maps, no pixel read): the anchor is the lowest-FWHM member at or above the median star count, candidates are its in-statistic fits (unsaturated, not extended; on 3 planes PD-9's sibling-rescued too), isolated (a fit carrying `BLEND_NEIGHBOUR` is not, PD-36), with SNR ≥ 20, a star is a member when ≥ 90 % of the included aligned members hold it (≥ 20 stars, `COMMON_MIN_STARS`), and each frame's flux is a paired ratio to the anchor's. On a 3-plane image each star is read as the sum within 3 ring FWHM (`ap_sum`, `.athf` v3: the β-floor plane's model misses the wings) and PD-9's rescued stars join the set (`StarFlags::SIBLING_POINT`); on a 1- or 2-plane image it is model × `c`. Everything before the set exists (stage 3's selection, the run reference, the two-pass pick) keeps the Measure-time weight, the registration reference stays on it (PD-11), and `min_weight_fraction` is applied to the common-set weight (a frame is never re-admitted). A plane under 20 stars, or with a member lacking a fresh `.athf`, falls back whole (every member keeps its Measure-time inputs: one `warn!` and a run warning; PD-6); a set under 0.6 of the anchor's candidates warns in the log that the anchor's registration map may be wrong (PD-44). **The set is built in every weight mode** (PD-19 b), for the SNR gain: outside the PSF family nothing but the gain, the run warnings and `rc.common_stars` changes, and the weights, `psfSnr`, `psf_signal_weight` and the stored `metrics` are bit-identical to stage 3's. `MEASURE_VERSION` 8 carries `c`'s colour sample (PD-9) and the Blend refusal on the stacking Measure (PD-10) with it: the first stack after the update re-measures every set once. Method rule for a change to this weight: a stage floor is not transitive, so the bars are read at master level against the pre-change base AND stage by stage (R-OSP-18).
+- **The PSF-family weight reads a frame-common star set** (Plan D, 2026-11-02; PD-1, PD-3, PD-32, PD-19 b; R-OSP-18): under `PsfSignalWeight` / `PsfSnr` the weight's flux term (`commonTflux`, `commonTmeanFlux`) is summed over stars every included frame holds unclipped, never over a frame's own accepted fits, so a clipped star and the blur's extrapolated light no longer drive it. The set is built per (group, plane) after the persisting registration pass (`crates/starloom/src/stacking/common_set.rs`, called from `run/reweigh.rs::reweigh_groups` at the end of stage 5, from the `.athf` fits through the stored registration maps, no pixel read): the anchor is the lowest-FWHM member at or above the median star count, candidates are its in-statistic fits (unsaturated, not extended; on 3 planes PD-9's sibling-rescued too), isolated (a fit carrying `BLEND_NEIGHBOUR` is not, PD-36), with SNR ≥ 20, a star is a member when ≥ 90 % of the included aligned members hold it (≥ 20 stars, `COMMON_MIN_STARS`), and each frame's flux is a paired ratio to the anchor's. On a 3-plane image each star is read as the sum within 3 ring FWHM (`ap_sum`, `.athf` v3: the β-floor plane's model misses the wings) and PD-9's rescued stars join the set (`StarFlags::SIBLING_POINT`); on a 1- or 2-plane image it is model × `c`. Everything before the set exists (stage 3's selection, the run reference, the two-pass pick) keeps the Measure-time weight, the registration reference stays on it (PD-11), and `min_weight_fraction` is applied to the common-set weight (a frame is never re-admitted). A plane under 20 stars, or with a member lacking a fresh `.athf`, falls back whole (every member keeps its Measure-time inputs: one `warn!` and a run warning; PD-6); a set under 0.6 of the anchor's candidates warns in the log that the anchor's registration map may be wrong (PD-44). **The set is built in every weight mode** (PD-19 b), for the SNR gain: outside the PSF family nothing but the gain, the run warnings and `rc.common_stars` changes, and the weights, `psfSnr`, `psf_signal_weight` and the stored `metrics` are bit-identical to stage 3's. `MEASURE_VERSION` 8 carries `c`'s colour sample (PD-9) and the Blend refusal on the stacking Measure (PD-10) with it: the first stack after the update re-measures every set once. Method rule for a change to this weight: a stage floor is not transitive, so the bars are read at master level against the pre-change base AND stage by stage (R-OSP-18).
 - **SNR gain is an SNR factor, measured like for like** (2026-10-25): `GroupStats.snr_gain` = `√(PSF SNR master / PSF SNR best sub)` from `integrate::paired_snr_gain` — the best sub read through the same registration source the master integrated (registered artifact or on-the-fly warp) and both measured with the master's options on the largest rectangle where both are finite. PSF SNR is TFlux²/σ² (a power ratio), and the smoothing cubic B-spline lowers every warped frame's noise, so the old `master_psf_snr / best_sub_psf_snr` (raw sub) read 751.98× and 777.33× on set 109 (208 / 160 frames); eight equal synthetic frames now read ≈ 0.9 √N where the old figure read 54.8. `master_psf_snr` / `best_sub_psf_snr` stay each image's own measurement. Cost: one extra frame read + two measurements per plane per group. Runs stored before the fix keep their old figure, but it no longer passes for the new metric: `GroupStats.snr_gain_version` (`integrate::SNR_GAIN_VERSION`, 1 at v0.7.0 and 2 since Plan D, `#[serde(default)]`) marks a gain measured now, a pre-v0.7.0 `stats_json` has no key and reads 0, and the Results panel (`src/components/stacking/snrGain.ts`) shows "SNR gain —" with the tooltip "measured before v0.7.0 — re-run to get the SNR gain" for it. **On real data** (2026-10-31, set 109 re-stacked on a copy of the owner's catalog through the release web build at 549e20a5, run 9, 19 min): mono 208 frames 7.08× (√N 14.42), OSC 160 frames R / G / B 7.41 / 7.99 / 7.86× (√N 12.65) — bounded by √N, the 752× gone. It reads low on this set because PSF SNR carries the tflux width dependence (open-items → Plan D → the stacking weight): per-frame PSF SNR grows ≈ FWHM² across the mono group, and the best sub by weight (`…_0071.fits`) is one of the widest frames, 4.88 px against the master's 2.96 px; scaled by that law the mono gain is near 11.7×. **Plan D (2026-11-02; D1b, DF-c): the gain is read over the group's frame-common star set (`SNR_GAIN_VERSION` 2).** TFlux is summed over the stars matched and usable in BOTH crops, so a clipped star or a wider PSF's extra flux no longer moves the figure, and the best sub (the top frame by the weight) is a sharp one (set 109 mono: 1.65 px against a group median 2.61); a v1 gain shows "SNR gain —" with "measured with an older formula — re-run to get the SNR gain", a colour group shows every plane ("SNR gain 7.41 / 7.99 / 7.86×", an unmeasured plane "—"), and the set is built in every weight mode, so a gain of 0 reads "not measured for this group" whatever the mode. **PD-35:** the stored `masterPsfSnr` is a set-total (∝ (Σ signal)²), so it is comparable within one (plane, set) only, never across planes or sets and never as a gain; the paired `snrGain` is the figure. **PD-48:** the figure's ceiling is the run's own weighted-mean prediction, not √N: per plane, measured `snrGain` ≤ Σ w · SNR / (√Σ w² · SNR_b) (SNR = √`psfSnr`, w the plane's weight, b = `best_by_weight`'s frame; √N and RMS(SNR) / SNR_b are printed beside, and "above run 9's" stands). √N presumes the top-weight frame is a top-SNR frame; it is not where the sharpest frame sits under bright sky (set 109 OSC: the sharpest frame is under the Moon, so G's 13.45 above √160 = 12.65 is correct; over the max-SNR sub the same master reads 8.40 / 9.17 / 9.29). A ratio above 1 (correlated noise, a wrong N) is a defect and stops. Set 109 at f899a691: mono 8.05 (run 9: 7.08), OSC 10.66 / 13.45 / 10.76 (7.41 / 7.99 / 7.86), realized / predicted 0.79 / 0.81 / 0.78 (OSC) / 0.79 (mono).
 - **The run** (`stacking::run`): one `stacking-run-<id>` thread admitted through the shared `ComputeQueue` (the sidebar's `ComputeQueueIndicator` lists it — no separate widget), cooperative cancel via `ServiceContext::active_stacks`, `heal_interrupted_runs` from every API entry point, `stacking-progress` throttled 300 ms (`FanOutTicker` inside the fan-out stages), exactly one `stacking-complete` from the single exit path.
 - **Config precedence is WHOLE-CONFIG** (`resolve_config`): a stored per-set document IS the run's config, no field-level merge; new fields are `#[serde(default)]` without a version bump. Presets (Default / Fast preview / Maximum quality) are a single Rust source of truth; user presets are one `stacking.presets` settings row, entry-wise decoded, written under `BEGIN IMMEDIATE`.
@@ -5492,5 +5494,5 @@ In-app light stacking — the frame set's own master light(s) from its matched c
 - **Tab** (`src/components/stacking/`): `StackingTab` → `PipelineBoard`/`StageRow` (ten rows: nine stages + the display-only Debayer) + `GroupsTable`, `StageInspector` + one panel per stage, `FramesTable` (the Frames block: exclusion from the next run and the reference star are the frame-level writes), `ResultsPanel`/`ProvenanceModal`. Settings → Stacking: global defaults + working/output folders (`<working_dir>/<set_slug>/{calibrated,measured,registered,ln,runs,rej,previews}/`) + a Compute section (`compute.memory_budget_mb`, the frame memory budget; 0 = auto = a quarter of the effective memory, clamped above it; R-OSP-13).
 - **Method rules**: a numeric change is judged on the WHOLE group at master level (a full checkpoint), never on a few-frame probe; a speedup that misses a spec §8 tolerance row is reverted with its numbers; only interleaved before/after brackets are comparable on this Mac; `cargo check --no-default-features` does not compile `integration/`, and `cargo test --lib` hides example breakage (`--all-targets`). Per-core efficiency (SIMD / branchless, bit-identical, scalar oracle kept) comes before threads or GPU, and work units are compared with the ERP, not stage walls (R-OSP-14). Measured-out ideas are recorded in the reference and in doc comments — do not re-propose them. Acceptance harness and the synthetic star lab: the private `athenaeum-lab` repository (`harness/acceptance/`, `star-lab/`; reuse, never rebuild; `ATHENAEUM_REPO` names this checkout). Lab and measurement tools are committed there, never here; the Rust probes stay in `examples/`.
 
-Key files: `crates/athenaeum-core/src/stacking/{config,groups,paths,plan,run,provenance,measure,weights,psf_signal,structure,integrate,master_cards,rej,fits_artifact}.rs`, `stacking/register/`, `stacking/ln/`, `stacking/drizzle/`, `integration/` (engine, combiners, `student_t.rs`), `geometry/tps.rs`, `fits_writer/{wcs,xisf_writer}.rs`, `api/stacking.rs`, `db/stacking.rs`; probes `examples/{measure,register,integrate,ln,drizzle}_probe.rs`, `examples/weight_audit.rs`. Frontend: `src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.
+Key files: kernel in `crates/starloom/src/` (core re-exports it at the old paths): `stacking/{config,groups,measure,weights,psf_signal,structure,integrate,rej,common_set,pass1_artifact}.rs`, `stacking/register/`, `stacking/ln/`, `stacking/drizzle/`, `integration/` (engine, combiners, `student_t.rs`), `geometry/tps.rs`, `fits_writer/xisf_writer.rs`; Athenaeum side in `crates/athenaeum-core/src/`: `stacking/{config,groups,paths,plan,run,provenance,weights,master_cards,fits_artifact}.rs`, `fits_writer/wcs.rs`, `api/stacking.rs`, `db/stacking.rs`; probes `examples/{measure,register,integrate,ln,drizzle}_probe.rs`, `examples/weight_audit.rs`. Frontend: `src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.
 

@@ -57,7 +57,6 @@ mod tests {
     use super::*;
     use crate::fits_parser::FitsHeader;
 
-
     /// The header's card keys in file order, from the first non-structural card on.
     fn header_keys(path: &Path) -> Vec<String> {
         let text = crate::fits_parser::extract_fits_header(path).unwrap();

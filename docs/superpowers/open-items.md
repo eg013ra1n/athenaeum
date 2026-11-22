@@ -321,6 +321,11 @@ contain forward slashes.
 
 ## Known flaky test
 
+- **`services::machine::tests::proc_sample_reads_something` (Windows, 2026-11-22, once; passed on two reruns).** It asserts
+  a non-zero `cpu_ns` after a 2 M-iteration busy loop; `GetProcessTimes` ticks at about 15.6 ms, so a loop that finishes inside
+  one tick reads 0 (the footprint half of the sample was readable). Not a product fault. Owed: make the test burn CPU until
+  the process clock advances instead of a fixed loop count.
+
 - **`api::collab_exchange::tests::a_dropped_project_export_frees_the_slot` (2026-11-21, GitHub Linux, once; passed on the
   next run).** It polls the export future once with `timeout(Duration::ZERO)` and asserts the first poll does not finish
   it ("the first poll must not finish the export"); on a fast runner the one-frame export finished in that poll. A
@@ -414,6 +419,21 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Starloom phase 0 — the stacking kernel lives in `crates/starloom` (2026-11-22)
+
+Branch `starloom-p0` (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`). Identity on real data was proven
+through the web host (set 204 masters, registration rows, LN files, calibrated frames, measure and the OSC XISF run: 0 differences against `main`). Owed by hand:
+- **A stack run in the desktop window.** In `npm run tauri dev` on the dev catalog, stack one small set (a few lights, one
+  group): the run completes and the master opens in the viewer. The same core path ran end to end through `athenaeum-web`
+  byte-identical; this is the desktop-only check.
+- **Phase-1 renames and hidden items (deferred, not smokes).** `write_xisf_f32_with_with_creator` and
+  `write_image_f32_with_with_creator` get their final names; the `#[doc(hidden)] pub` items made public by the move
+  (`FitsInfo`, `probe_fits`, `fits_info_from_reader`, `release_ln_row_buffers`, `check_pass1_head`, `common_psf_snr`,
+  `included_after_min_weight`, `large_scale_passes`, `positions_in_crop`, `low_inlier_frames`, `PREFIX_LEN`, `median_f64`,
+  `clamp_configured_mb`, `per_job_budget`) are either given a designed API or made private; the `ATH_*` names kept
+  verbatim in starloom's `tracing` message strings (`calibration_library/light_cal.rs`, about lines 667, 734 and 741) lose
+  them together with a log-text change that is accepted on purpose.
 
 ### Move removes the folders it empties (2026-11-21)
 

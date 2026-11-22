@@ -14,7 +14,6 @@ use crate::integration::IntegrationError;
 
 pub use starloom::stacking::measure::*;
 
-
 /// The calibrated frame's gain in e- per CALIBRATED unit, read from its header (Plan A Task 11, ruling R11-6, PA-22):
 /// `EGAIN` (e- per ADU of the raw sensor) times `ATH_CSCL` (the calibrated light's unit divisor, ADU per unit). `ATH_CFNM`
 /// is the flat's normalisation and plays no part. No camera table: a frame without either card, or one that is not a
@@ -117,7 +116,6 @@ pub fn measure_frame_pass1(
     measure_frame_pass1_gain(path, opts, pool, cancel, gain_from_header(path))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,7 +146,8 @@ mod tests {
         ];
         write_fits_f32(&p, w, h, 1, &data, &cards).unwrap();
         let opts = MeasureOptions::default();
-        // Before the switch the kernel has its own option type; after it the two are one.
+        // Core's wrapper and the kernel take the same option type (`MeasureOptions` is starloom's); `kernel_opts` is the
+        // kernel call's own default value.
         let kernel_opts = starloom::stacking::measure::MeasureOptions::default();
         let cancel = AtomicBool::new(false);
         let working: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
