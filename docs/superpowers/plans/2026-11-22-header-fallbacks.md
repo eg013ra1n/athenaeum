@@ -10,8 +10,8 @@ the raw calibration frames whose grouping values change (GitHub issue #21, relea
 argument of every function that turns a header into a `Frame`. One key reader per stored format (the scanner's own card
 parser and XISF keyword extraction) feeds one resolver that the FITS builder, the XISF builder, the metadata pane's
 snapshot, `recompute_override_flag_for_frames` and Apply all call. Apply is a per-field test over stored headers, written
-in `BEGIN IMMEDIATE` batches, followed by one calibration transaction that detaches, prunes and regroups through the
-scanner's own grouping path.
+in `BEGIN IMMEDIATE` batches, followed by one night re-derivation per affected frame set and one calibration
+transaction that detaches, prunes and regroups through the scanner's own grouping path.
 
 **Tech Stack:** Rust (rusqlite, serde, ts-rs 12, quick-xml), Tauri 2, Axum, React/TS (vitest, Testing Library).
 
@@ -24,7 +24,7 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
 | ---- | ---- | ---- |
 | D1 | Module `header_fallbacks` (`mod.rs` config, `resolve.rs`, `apply.rs`, `calibration.rs`, `transfer.rs`); key readers in `fits_parser/header_keys.rs`; command handlers in `api/header_fallbacks.rs`; host wrappers in the `settings` modules of both hosts. | The rules are a catalog setting, the readers belong to the parser, and one domain module keeps the seven commands together. |
 | D2 | Every frame-building parser takes a new last argument `rules: &HeaderFallbackConfig`; no default-rule wrapper survives Task 3. Scanner, zip-scan, `register_master` and `api` entry points that already hold the catalog `conn` load the rules from it once at their start; their internals take `rules`. | The compiler forces every parser caller to decide (spec §4 approach 1) while scanner/zip tests keep their current calls; "one rule set per run" holds because loading happens once per entry point. |
-| D3 | Apply pages are 500 frames by `frames.id`, one `SavepointGuard` (= `BEGIN IMMEDIATE` on an autocommit connection, `db/operations.rs:478-499`) per page, one progress event per page; the calibration writes run after the pages in one more transaction. | A 500-row page holds the write lock for milliseconds, so a scan or monitor cycle interleaves; deferring calibration frames to one final transaction means a crash before it leaves those changes still visible in the next preview, so a re-Apply finishes them. |
+| D3 | Apply pages are 500 frames by `frames.id`, one `SavepointGuard` (= `BEGIN IMMEDIATE` on an autocommit connection, `db/operations.rs:478-499`) per page, one progress event per page; after the last page the nights of the affected frame sets are re-derived once per set (one transaction per set), then the calibration writes run in one more transaction. | A page only writes frame columns (about 500 `UPDATE`s), so it holds the lock briefly and a scan or monitor cycle interleaves; night re-derivation deletes and recreates every night of a set (`sessions/mod.rs:83`), so it runs once per set after the pages, never inside a page. Deferring calibration frames to the final transaction means a crash before it leaves those changes still visible in the next preview, so a re-Apply finishes them; a crash between the last page and the night pass leaves those sets' nights as they were until their next re-derive (a rescan or bulk edit). |
 | D4 | The preview runs once on mount and 800 ms after each successful save (`savedAt`); at most one preview is in flight and a save during it schedules exactly one follow-up; no server-side cancel. | The preview only reads, so a stale one costs time, not data; coalescing bounds the load to one blocking task, and a generation check discards any stale answer. |
 | D5 | Copy of the section: see Task 7 (exact strings). | Within the sketch's meaning (§5.6). |
 | D6 | `normalize_keyword(raw)` = `raw.trim().to_uppercase()`, `None` when the result is empty or contains `=`. Applied to every header key when a key map is built and to every user keyword. | FITS keywords are case-insensitive; the scanner already upper-cases standard keys; upper-casing both sides lets a user match a HIERARCH name (`ESO DET TEMP`) whatever its case, inner spaces kept. |
@@ -38,16 +38,12 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
 | D14 | Loading the stored rules inserts a default keyword the document lacks after its predecessor in the default chain (first if it has none), the import rule of §5.7; an unknown field id is skipped with a `warn!`. A document that still fails to decode: `load` errs (Settings, preview and Apply show the error); `load_for_scan` logs `error!` and scans with the defaults. | A later version adding a default keyword must not throw away the user's rules; a scan must not stop on a bad settings row. |
 | D15 | Import files: at most 1 MiB, a UTF-8 BOM is stripped, `version` must be exactly `1`, a missing `fields` object is refused. Desktop reads/writes the file in core by path (`PathPolicy::AllowAll`); the web passes text and its routes use `PathPolicy::AllowedRoots(vec![])`, so a path is refused (403). | `fs:default` (`crates/athenaeum-tauri/capabilities/default.json`) grants no write to user-chosen paths; a thin core command is the spec's allowed alternative (§5.7). |
 | D16 | Apply mirrors the bulk edit's auto-publish trigger (`api/files.rs:118-137`) for the frame sets of changed frames. | Apply is a bulk metadata edit by rules; a project's gate may read the changed values. |
-| D17 | A second Apply while one runs is refused with `ApiError::Conflict` (HTTP 409). | Double click, a second window or web + desktop on one catalog would otherwise race two calibration transactions. |
+| D17 | A second Apply on the same `ServiceContext` while one runs is refused with `ApiError::Conflict` (HTTP 409); the flag lives on `ServiceContext`, not in a process static. | Double click or a second window of one host would otherwise run two Applies at once. Desktop and web sharing one catalog are protected by `BEGIN IMMEDIATE` (each page and the calibration transaction serialize on the write lock, and Apply is idempotent), not by the flag; a context-held flag also keeps api tests from racing under `--test-threads=4`. |
 
 ## Spec conflicts and gaps (decided above, flagged for the controller)
 
-- **S1 (D10)** §5.1 keeps the XISF `<Property>` pixel-size fallback last, and §5.4 reads only stored headers; the stored
-  XISF dump (`fits_parser/mod.rs:197-278`) holds no `<Property>`. If a user adds a pixel-size keyword that an XISF file
-  carries beside the Property, a rescan of that (changed) file would take the keyword while Apply keeps the Property
-  value. Changing the dump format would change every XISF header fingerprint (moved-file detection), so it is not done.
-- **S2 (D11)** O7 says a raw frame whose grouping value changed leaves its set; for a superseded or provenance-anchor
-  set this breaks the built-master chain §5.5 step 4 protects. Frames there stay.
+- **S1** §5.1 vs §5.4 on the XISF `<Property>` pixel size: decided in D10.
+- **S2** O7 vs the lineage chain of §5.5 step 4: decided in D11.
 - **S3** §5.1 counts three inline unique-camera copies in `scanner/mod.rs`; there are five sites plus one in
   `zip_store/scan.rs` with two behaviours: strip-then-append (`scanner/mod.rs:677-690`, `:1209-1227`,
   `zip_store/scan.rs:296-309`) and append-only (`scanner/mod.rs:740-744`, `:2261-2266`, `:2355-2359`,
@@ -55,7 +51,8 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
   already ending in ` N<digits>` in a unique-camera root no longer gets a second suffix.
 - **S4** The dark/dark-flat set reuse query (`calibration/scan_integration.rs:711-805`) ignores temperature, so when only
   some darks of a set change temperature and their time window overlaps the surviving set, the scanner's path puts them
-  back into it. Pre-existing; reported in Task 9 with the stale-aggregate finding of §5.5 step 2.
+  back into it. Pre-existing; reported in Task 9 with the stale-aggregate finding of §5.5 step 2 and the stale `focallen`
+  copy of a dark set (`scan_integration.rs:840-843`).
 - **S5** `rustafits_processor/mod.rs:52` and `plate_solve/hints.rs:138` also build frames / snapshots; neither is in
   §5.3's list. Task 3 handles both.
 
@@ -70,28 +67,22 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
   `… cargo test -p athenaeum-core --lib <filter> -- --test-threads=4` and `CC <crate>` means `… cargo check -p <crate>`.
   Scope tests to the module; only Task 9 runs whole suites.
 - TS types are generated: `… cargo test -p athenaeum-core --test ts_contract` with `TS_RS_WRITE=1` added to the env
-  (regenerates `src/types/*.ts`), then the same without it (must pass). Never hand-edit `src/types/models.ts`.
+  (regenerates `src/types/*.ts`), then the same without it (must pass). Never hand-edit `src/types/models.ts`; new
+  types go in the `models.ts` list of `ts_export.rs:70-322`.
 - Tests pass on Windows, Linux and macOS: no bare path compared with log text, no OS separator in an assert (build
   expected paths with `Path::join`). Test names, and names of files tests create, use letters, digits, `_` and `-` only.
-- Never name another program or code base (stacker, solver, processing program, capture tool) in code, comments, docs
-  or commits; the comparison program is "the ERP".
-- Every byte written outside the repo goes under `~/.athenaeum-acc/` with a `REGISTRY.tsv` row; acceptance runs on a
-  COPY of `~/Library/Application Support/com.vsharifov.athenaeum.dev/athenaeum.db`, never the live file.
-- Commits: author is the user (`eg013ra1n`, the repo's git config); every message ends with exactly:
-  ```
-  Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_01W1fw3c6tBbkPswBfTicVAR
-  ```
-- Implementers: `rust-engineer` (sonnet) for Rust tasks, `frontend-dev` for UI tasks (marked per task). UI reuses
-  `src/components/ui/` primitives (`Button`, `Chip`, `DialogShell` via `ConfirmDialog`) and copies the look of
-  `LoggingSettings.tsx` / `SettingsSection`; never an ad-hoc toast — `notify()` from `useNotifications()` only.
-- Two backends in sync: each new command is a Tauri command in `crates/athenaeum-tauri/src/commands/settings.rs`
-  (registered in `invoke_handler![]`, `crates/athenaeum-tauri/src/lib.rs:310-318`) and an Axum route in
+- Acceptance runs on a COPY of `~/Library/Application Support/com.vsharifov.athenaeum.dev/athenaeum.db`, never the live
+  file; scratch data under `~/.athenaeum-acc/` with a `REGISTRY.tsv` row.
+- Commits: author is the user (`eg013ra1n`, the repo's git config); every message ends with the attribution trailer
+  lines the session's system reminder gives (never a hard-coded copy).
+- Implementers: `rust-engineer` (sonnet) for Rust tasks, `frontend-dev` for UI tasks (marked per task). UI copies the
+  look of `LoggingSettings.tsx` / `SettingsSection` and uses `ConfirmDialog` for confirmations.
+- Hosts: each new command is a Tauri command in `crates/athenaeum-tauri/src/commands/settings.rs` (registered in
+  `invoke_handler![]`, `crates/athenaeum-tauri/src/lib.rs:310-318`) and an Axum route in
   `crates/athenaeum-web/src/routes/settings.rs` (registered in `build_router`, `routes/mod.rs:106-115`) in the same
-  task; logic in `athenaeum-core/src/api/header_fallbacks.rs`; `routes/parity_tests.rs` must pass. Every new command
-  wears `#[tracing::instrument(skip_all, err)]` (web: `err(Debug)`); `preview_header_fallbacks` adds `level = "debug"`.
-  Long commands (preview, apply) run in `spawn_blocking` on both hosts (pattern: `commands/analysis.rs:53-68`,
-  `routes/analysis.rs:127-145`).
+  task; logic in `athenaeum-core/src/api/header_fallbacks.rs`; `routes/parity_tests.rs` must pass.
+  `preview_header_fallbacks` adds `level = "debug"` to the instrument attribute. Long commands (preview, apply) run in
+  `spawn_blocking` on both hosts (pattern: `commands/analysis.rs:53-68`, `routes/analysis.rs:127-145`).
 - New commands, exact names (330 → 337): `get_header_fallbacks`, `set_header_fallbacks`, `reset_header_fallbacks`,
   `preview_header_fallbacks`, `apply_header_fallbacks`, `export_header_fallbacks`, `plan_header_fallbacks_import`.
   Progress event: `header-fallbacks-progress`.
@@ -102,35 +93,16 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
   `ypixsz` → `YPIXSZ`, `PIXSIZE2`; `object` → `OBJECT`; `filter` → `FILTER`; `instrume` → `INSTRUME`;
   `telescop` → `TELESCOP`. Columns are the snake_case names (`ccd_temp`, `set_temp`, …). Number fields: the first
   eight; text fields: the last four.
-- Serde camelCase at the boundary; new types in `ts_export.rs`'s `models.ts` list (`ts_export.rs:70-322`).
-- `anyhow::Result` inside core, `ApiError` in `api/`; never swallow an error: `tracing` before returning.
-- Logging: `tracing` only; messages are short stable phrases. New field names (added to the logging spec's dictionary
-  in Task 4): `no_header`, `sets_regrouped`, `master_sets`, `lineage_kept`, `by_field`. Existing names used: `count`,
-  `kept`, `key`, `error`, `reason`, `duration_ms`, `frame_id`, `path`.
+- New log field names (added to the logging spec's dictionary in Task 4): `no_header`, `sets_regrouped`,
+  `master_sets`, `lineage_kept`, `by_field`. Existing names used: `count`, `kept`, `key`, `error`, `reason`,
+  `duration_ms`, `frame_id`, `path`.
 - Untouched by this work: the scanner's whole-row `frames.override = 1` rule for a modified file; the sync wire and
   `frame_meta` (C3); `files` hashes; `frames.override` (Apply never writes it).
-- Settings contract: no Save button, no banner, `notify()` on failure only (Apply's end notification is the one action
-  result §5.6 asks for); `src/settings/registry.ts` describes the section.
 - No new dependency (frontend drag and drop is native events).
 
-## Review Focus
-
-1. **Reordered chain where a frame carries both keywords with different values** (`CCD-TEMP = -10`, `DET-TEMP = 12`,
-   user moves `DET-TEMP` first): Apply writes 12, and a second preview reads 0 — test
-   `second_preview_after_apply_reads_zero` in Task 5.
-2. **A numeric keyword holding `NaN`, `INF`, `n/a` or `''`**: treated as absent, the next keyword wins, and the preview
-   converges to 0 after Apply — tests `resolver_treats_nan_inf_text_and_blank_as_absent` (Task 1) and
-   `nan_header_value_converges_after_apply` (Task 5).
-3. **A keyword typed as a case or space variant of a default** (`ccd-temp `, `det-temp` in `ccdTemp`): normalised,
-   refused as a repeat with the keyword named, nothing saved — tests `validate_normalises_then_refuses_a_repeat`
-   (Task 2) and `adding_a_case_variant_of_a_default_shows_an_inline_error` (Task 7).
-4. **An import file saved by a desktop editor** (UTF-8 BOM, CRLF line ends), or a 10 MB / binary file: the BOM and CRLF
-   are accepted; oversized is refused before parsing; binary is "not a JSON file" — tests
-   `import_accepts_a_bom_and_crlf`, `import_refuses_a_file_over_one_mib`, `import_refuses_bytes_that_are_not_json`
-   (Task 6).
-5. **Apply started twice, or while a scan writes**: the second Apply gets 409 and the first completes; each page commits
-   before the next, so another writer gets the lock between pages — tests `second_apply_while_one_runs_is_a_conflict`
-   and `each_page_commits_before_the_next` (Task 5).
+The review-focus items (reordered chain with two differing values, `NaN`/`INF`/`n/a`/blank values, case or space
+variants of a default keyword, a BOM/CRLF/oversized/binary import file, a second Apply or a scan during Apply) are
+pinned by named tests in Tasks 1, 2, 5, 6 and 7.
 
 ---
 
@@ -195,10 +167,8 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
 
 **Approach notes (the parts the signatures do not fix):**
 - `FitsHeader` gains `order: Vec<String>` (a key is pushed when first inserted). The card loop of `parse_from_reader`
-  moves into a private `CardAccumulator { keywords, order, raw_cards, last_keyword, last_had_continuation }` with
-  `fn push(&mut self, card: &str) -> bool` (true at `END`); `parse_from_reader` feeds it 80-byte cards,
-  `from_header_text` feeds `text.split('\n')`, one trailing `\r` stripped, a line shorter than 80 bytes padded with
-  spaces to 80 bytes, stopping at `END`, never failing. Same accumulator ⇒ same values as the scan (C2).
+  moves into a private `CardAccumulator`; `from_header_text` feeds it the text line by line (one trailing `\r` stripped,
+  short lines padded to 80 bytes, stopping at `END`, never failing). Same accumulator ⇒ same values as the scan (C2).
 - `HeaderKeyMap` keys go through `normalize_keyword`; a key it refuses is dropped. `into_legacy_map` drops the keys
   `COMMENT` and `HISTORY`, trims every value and drops blank ones — the old contract (UPPERCASE keys, non-empty
   values) with the scanner's values (`get_str` semantics).
@@ -214,9 +184,8 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
 - `xisf_keyword_pairs` = the `<?xml`…`</xisf>` slice plus the `FITSKeyword` `Event::Empty` loop now in
   `xisf_header_text`, returning `(name, value)` with outer `'…'` stripped, in document order. `xisf_header_text`
   formats those pairs (output byte-identical to today, `XISF_DUMP_BANNER` first). `parse_xisf_xml` keeps its single
-  event loop, but its `FITSKeyword` arm calls the same per-element helper and pushes into a `Vec<(String, String)>`;
-  `fits_keywords` (the case-sensitive map every non-listed field still reads) is built from that Vec with last-wins
-  inserts, exactly as today.
+  event loop, with its `FITSKeyword` arm calling the same per-element helper; `fits_keywords` (the case-sensitive map
+  every non-listed field still reads) is built from the pairs with last-wins inserts, exactly as today.
 - Both builders compute `let r = resolve_all(rules, &keys)` (FITS: `HeaderKeyMap::from_fits_header(header)`; XISF:
   `HeaderKeyMap::from_last_wins(pairs.clone())`) and take the twelve fields from `r`; XISF `xpixsz`/`ypixsz` then
   `.or_else(...)` the existing `Instrument:Sensor:XPixelSize`/`YPixelSize` property fallback. Every other field's code
@@ -292,9 +261,11 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
 ```
 `parity_tests.rs` (spec §9.1 parity):
 ```rust
+// K = the shared keyword set of both formats: DET-TEMP -5.5, ESO DET TEMP -7.25, EXPOSURE 120, OBJECT M42,
+// FILTER 'Ha / 7nm', GAIN 100, PIXSIZE1 3.76, INSTRUME Cam (no duplicates: FITS keeps the first, XISF the last).
 #[test] fn parity_fits_builder_and_stored_text_agree_under_default_and_custom_rules() {
-    // 2880-byte block: DET-TEMP=-5.5, HIERARCH ESO DET TEMP = -7.25, EXPOSURE=120, OBJECT='O''Brien',
-    // FILTER='Long filter &' CONTINUE '  two', GAIN=100, PIXSIZE1=3.76, INSTRUME='Cam', END.
+    // 2880-byte block: K, plus HIERARCH spelling of ESO DET TEMP, OBJECT='O''Brien' (doubled quote),
+    // FILTER='Long filter &' CONTINUE '  two', END.
     for rules in [HeaderFallbackConfig::default(), custom()] { // custom: ccdTemp [ESO DET TEMP, CCD-TEMP, DET-TEMP], exptime [EXPOSURE, EXPTIME]
         let header = FitsHeader::from_bytes(&block).unwrap();
         let frame = build_frame_from_header(&header, 0, Path::new("p.fits"), &rules).unwrap();
@@ -303,10 +274,16 @@ calls C1–C4 are settled). Read it beside this plan. Section numbers below (§5
     }
 }
 #[test] fn parity_xisf_builder_dump_and_raw_xml_agree_under_default_and_custom_rules() {
-    // XML with FITSKeyword: DET-TEMP -5.5, "ESO DET TEMP" -7.25, EXPOSURE 120, FILTER 'Ha / 7nm', GAIN 100 then GAIN 120,
-    // OBJECT '  M42  '. frame via parse_xisf_xml; dump via xisf_header_text; raw XML text itself.
+    // XML with FITSKeyword: K, plus GAIN 100 then GAIN 120 and OBJECT '  M42  '. frame via parse_xisf_xml; dump via
+    // xisf_header_text; raw XML text itself.
     // assert fields_of(&frame) == resolve_all(rules, dump map) == resolve_all(rules, xml map) for both rule sets;
     // assert filter == Some("Ha / 7nm"), gain == Some(120.0)
+}
+#[test] fn parity_one_keyword_set_gives_the_same_fields_through_fits_and_xisf() {
+    // exactly K, once as a FITS block through build_frame_from_header, once as FITSKeyword elements through
+    // parse_xisf_xml, and each through its stored text (stored_header_key_map): for both rule sets
+    // fields_of(fits) == fields_of(xisf) == resolve_all(rules, stored fits map) == resolve_all(rules, stored xisf map),
+    // compared on the fields K carries (spec 9.1)
 }
 ```
 `stored_header.rs` tests (existing ones adapted to `HeaderKeyMap` + default rules; the XISF-dump test at
@@ -331,8 +308,10 @@ own `xisf_header_text`, and its `parse_xisf_xml_text(dump).is_empty()` line remo
 
 - [ ] **Step 4: Run them and see them pass** — `CT fits_parser::` and `CT header_fallbacks::` → PASS.
 
-- [ ] **Step 5: Run the consumers of the legacy map** — `CT stored_header`, `CT db::repair`, `CT sync::ingest`,
-  `CT calibration::geometry`, `CT calibration_library::headers`, `CT zip_store::scan`, `CT scanner::` → PASS. A failure
+- [ ] **Step 5: Run the consumers of the changed readers** — `CT stored_header`, `CT db::repair`, `CT db::operations`,
+  `CT sync::ingest`, `CT calibration::geometry`, `CT calibration_library::headers`, `CT calibration_library::light_cal`,
+  `CT calibration_library::light_resolve`, `CT stacking::master_cards`, `CT stacking::run::output_tests`,
+  `CT collab::frame_meta`, `CT fits_parser::calibrated_light`, `CT zip_store::scan`, `CT scanner::` → PASS. A failure
   that is a move toward the scanner's reading (HIERARCH now present, doubled quote, XISF " / ", last duplicate) is fixed
   in the test with a one-line comment naming the difference; any other failure is a bug in this task.
 
@@ -436,18 +415,14 @@ returning the same. Web: `set_header_fallbacks_then_get_reflects_change` in `rou
 
 **Files:**
 - Modify: `crates/athenaeum-core/src/fits_parser/mod.rs` (public parse functions 148-193, 282-286, 630-635 gain `rules`)
-- Modify: `crates/athenaeum-core/src/scanner/mod.rs` — `scan_directory` 228-552 (loads), `process_file` 557-772,
-  `reparse_and_update_in_place` 1127-1189, `apply_parsed_in_place` 1196-1227, `resync_catalog_rows_from_disk`
-  1357-1363 (loads), `process_file_parallel` 1589-1670, `scan_directory_parallel` 1681-1693 (loads),
-  `scan_files_parallel(_to_depth)` 1731-1760, `PendingZips` 1705-1720, `finish_zip_pass` 2492+, `run_zip_pass`
-  195-225, moved/new-file instrume sites 677-690, 740-744, 2259-2266, 2355-2359, `rescan_directory_shallow` 2754
-  (loads), `rescan_zips` 2771 (loads), `run_registered_scans` 2857-2924 (loads once)
-- Modify: `crates/athenaeum-core/src/zip_store/scan.rs` — `instrume_for_root` 294-309 (moves to scanner),
-  adopt 385, `stage_entry` 427-470, `insert_entry` 533-565, `scan_zip` 790 (loads) + `scan_zip_with`
+- Modify: `crates/athenaeum-core/src/scanner/mod.rs` (the loading entry points and the instrume sites listed under
+  Approach notes; every other parser caller in it follows from the compiler), `crates/athenaeum-core/src/zip_store/scan.rs`
+  (`instrume_for_root` 294-309 moves to the scanner; `scan_zip` loads, `scan_zip_with` takes `rules`)
 - Modify: `crates/athenaeum-core/src/api/zip.rs:592-614` (`get_zip_entry_header` takes `ctx`), `crates/athenaeum-tauri/src/commands/zip.rs:73-74`, `crates/athenaeum-web/src/routes/zip.rs:97-102`
 - Modify: `crates/athenaeum-core/src/calibration_library/register.rs:74-130` (loads from `conn`)
 - Modify: `crates/athenaeum-core/src/db/operations.rs` — `bulk_update_frame_metadata` 2118-2124 (loads),
-  `recompute_override_flag_for_frames` 3993-4119, `get_frame_metadata_originals` 4170-4227
+  `recompute_override_flag_for_frames` 3993-4119, `get_frame_metadata_originals` 4170-4227, new
+  `latest_header_subquery`
 - Modify: `crates/athenaeum-core/src/api/files.rs:144-151`, `crates/athenaeum-core/src/plate_solve/hints.rs:137-138`
 - Modify (frame discarded / header-only): `crates/athenaeum-core/src/calibration_library/light_cal.rs:755, 983`,
   `crates/athenaeum-core/src/stacking/origin.rs:105, 122`, `crates/athenaeum-core/src/rustafits_processor/mod.rs:52`,
@@ -475,7 +450,12 @@ returning the same. Web: `set_header_fallbacks_then_get_reflects_change` in `rou
   (loads with `header_fallbacks::load`, error → `ApiError::Internal`). Both host wrappers move `state.ctx.clone()` into
   their `spawn_blocking`.
 - Produces (`crate::db`): `recompute_override_flag_for_frames(conn, frame_ids, rules: &HeaderFallbackConfig)`,
-  `get_frame_metadata_originals(conn, frame_ids, rules: &HeaderFallbackConfig)`.
+  `get_frame_metadata_originals(conn, frame_ids, rules: &HeaderFallbackConfig)`;
+  `pub(crate) fn latest_header_subquery(file_id_expr: &str) -> String` =
+  `(SELECT header FROM fits_header WHERE file_id = {file_id_expr} ORDER BY id DESC LIMIT 1)` — the one choice of the
+  `fits_header` row (`file_id` is not unique). The snapshot, the override recompute (both currently a plain
+  `LEFT JOIN`, `operations.rs:4012, 4192`) and Task 4's `read_rows` all use it, so the pane's "original" and Apply read
+  the same row.
 
 **Approach notes:**
 - Rule loading points: `scan_directory`, `scan_directory_parallel`, `rescan_directory_shallow`, `rescan_zips`,
@@ -515,6 +495,10 @@ returning the same. Web: `set_header_fallbacks_then_get_reflects_change` in `rou
 #[test] fn register_master_reads_the_catalog_rules() { /* master FITS with MY-GAIN=139 first in gain; reg frame gain == 139 */ }
 // db/operations.rs
 #[test] fn metadata_originals_follow_the_catalog_rules() { /* header CCD-TEMP=-10, MY-TEMP=-3; custom rules → snapshot ccd_temp -3; default → -10 */ }
+#[test] fn snapshot_override_recompute_and_apply_read_the_same_header_row() {
+    // one file with two fits_header rows (older CCD-TEMP=-10, newer CCD-TEMP=-3): get_frame_metadata_originals gives
+    // ccd_temp -3; recompute_override_flag_for_frames judges against -3 (override clears for a frame holding -3)
+}
 #[test] fn override_recompute_reads_under_the_catalog_rules() {
     // frame override=1 with every field equal to the header under custom rules (ccd_temp = MY-TEMP value):
     // recompute(.., &custom) clears override; recompute(.., &default) leaves it 1
@@ -552,15 +536,15 @@ The existing `direct_registration_matches_scanner_ingestion_*` tests (`register.
 
 **Interfaces:**
 - Consumes: Task 1 resolver and readers; Task 2 `load`; Task 3 `split_unique_camera_suffix`, `instrume_for_scan`,
-  `crate::scanner::path_has_root_prefix` (`scanner/mod.rs:60`).
+  `latest_header_subquery`, `crate::scanner::path_has_root_prefix` (`scanner/mod.rs:60`).
 - Produces (`crate::header_fallbacks::apply`):
   - `pub struct FieldCount { pub field: HeaderField, pub frames: usize }` (camelCase, TS)
   - `pub struct HeaderFallbackCounts { pub by_field: Vec<FieldCount>, pub frames_changed: usize, pub values_kept: usize, pub sets_regrouped: usize, pub frames_without_header: usize }`
     (camelCase, TS; `by_field` holds non-zero counts only, in `HeaderField::ALL` order)
   - `pub struct CatalogRow { pub frame_id: i64, pub file_path: String, pub format: String, pub imagetyp: Option<String>, pub values: ResolvedFields, pub header: Option<String> }`
   - `pub fn read_rows(conn: &Connection, after_frame_id: i64, limit: usize) -> anyhow::Result<Vec<CatalogRow>>`
-    (`frames JOIN files`, the twelve columns, `(SELECT header FROM fits_header WHERE file_id = fr.file_id ORDER BY id DESC LIMIT 1)`
-    — `idx_fits_header_file_id` exists, `db/schema.rs:3418`; keyset `WHERE fr.id > ?1 ORDER BY fr.id LIMIT ?2`)
+    (`frames JOIN files`, the twelve columns, `latest_header_subquery("fr.file_id")` — `idx_fits_header_file_id`
+    exists, `db/schema.rs:3418`; keyset `WHERE fr.id > ?1 ORDER BY fr.id LIMIT ?2`)
   - `pub struct ScanRoots` with `pub fn load(conn: &Connection) -> anyhow::Result<ScanRoots>` and
     `pub fn root_of(&self, file_path: &str) -> Option<(i64, bool)>` (longest separator-strict prefix via `path_has_root_prefix`; `(id, unique_camera)`)
   - `pub struct FramePlan { pub changes: Vec<(HeaderField, Option<FieldValue>)>, pub kept: usize, pub no_header: bool }`
@@ -568,14 +552,15 @@ The existing `direct_registration_matches_scanner_ingestion_*` tests (`register.
   - `pub const PAGE_SIZE: usize = 500;`
   - `pub fn preview(conn: &Connection, rules: &HeaderFallbackConfig) -> anyhow::Result<HeaderFallbackCounts>`
 - Produces (`crate::header_fallbacks::calibration`):
-  - `pub(crate) fn grouping_fields(imagetyp: &str) -> &'static [HeaderField]` — `"Bias"`: Instrume, Gain, Offset,
-    CcdTemp; `"Dark"`/`"DarkFlat"`: Instrume, Gain, Offset, Exptime, CcdTemp; `"Flat"`: Instrume, Filter, Gain, Offset,
-    Exptime, Focallen, CcdTemp; anything else: `&[]` (from the group keys at `calibration/scan_integration.rs:59-86`
-    plus the temperature clustering).
-  - `pub(crate) const MASTER_TYPES: [&str; 4] = ["MasterDark", "MasterFlat", "MasterBias", "MasterDarkFlat"];`
-    `pub(crate) const MASTER_SET_FIELDS: [HeaderField; 7] = [Exptime, Filter, CcdTemp, Gain, Offset, Instrume, Focallen];`
-    (the listed columns `create_master_sets_from_frames` writes, `scan_integration.rs:932-953`)
-  - `pub(crate) fn needs_regroup(imagetyp: Option<&str>, changes: &[(HeaderField, Option<FieldValue>)]) -> bool`
+  - `pub(crate) fn grouping_fields(imagetyp: &str) -> &'static [HeaderField]` — the non-temperature group keys:
+    `"Bias"`: Instrume, Gain, Offset; `"Dark"`/`"DarkFlat"`: Instrume, Gain, Offset, Exptime; `"Flat"`: Instrume,
+    Filter, Gain, Offset, Exptime, Focallen; anything else: `&[]` (from the group keys at
+    `calibration/scan_integration.rs:59-86`). The temperature is not a field here: the scanner clusters on
+    `effective_temp(ccd_temp, set_temp)` (`models.rs:37-39`; `scan_integration.rs:541-544, 598-601, 652-655`).
+  - `pub(crate) fn needs_regroup(imagetyp: Option<&str>, old: &ResolvedFields, changes: &[(HeaderField, Option<FieldValue>)]) -> bool`
+    — true for a raw type (`Bias`, `Dark`, `DarkFlat`, `Flat`) when a change is in `grouping_fields(imagetyp)` or when
+    `effective_temp(ccd_temp, set_temp)` computed from `old` differs (`same_value` on the `Option`) from the one
+    computed from `old` with `changes` applied (so a `setTemp` change counts only for a frame whose `ccd_temp` is NULL).
   - `pub(crate) fn movable_sets_of(conn: &Connection, frame_ids: &[i64]) -> anyhow::Result<BTreeSet<i64>>` — sets
     holding those frames with `COALESCE(is_master_library,0) = 0 AND superseded_by_set_id IS NULL AND id NOT IN (SELECT source_set_id FROM master_provenance WHERE source_set_id IS NOT NULL)`
     (the lineage guard of `db/schema.rs:110-115`), ids chunked by 500.
@@ -611,6 +596,10 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
 - [ ] **Step 1: Write the failing tests** (in `apply.rs`; catalog = `init_db` in-memory or tempdir, rows inserted with
   header text produced by `FitsHeader::from_bytes(block).to_header_text()` / `xisf_header_text`)
 ```rust
+#[test] fn needs_regroup_follows_the_effective_temperature() {
+    // Dark, ccd_temp NULL, set_temp -10: a setTemp change to -20 → true; same Dark with ccd_temp -10: a setTemp change
+    // → false; a ccdTemp change → true; a Light with any change → false; a Dark with a focallen-only change → false
+}
 #[test] fn null_value_is_filled() { /* ccd_temp NULL, header DET-TEMP=-5.5 → changes [(CcdTemp, Some(-5.5))] */ }
 #[test] fn header_value_replaced_after_reordering() { /* column -10 (CCD-TEMP), DET-TEMP=12, order [DET-TEMP, CCD-TEMP] → Some(12.0) */ }
 #[test] fn typed_value_is_kept() { /* column -20, header CCD-TEMP=-10 → no change, kept == 1 */ }
@@ -650,17 +639,22 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
 
 **Files:**
 - Modify: `crates/athenaeum-core/src/header_fallbacks/apply.rs`, `crates/athenaeum-core/src/header_fallbacks/calibration.rs`
-- Modify: `crates/athenaeum-core/src/api/header_fallbacks.rs`, `crates/athenaeum-core/src/ts_export.rs`
+- Modify: `crates/athenaeum-core/src/services/mod.rs` (`ServiceContext` gains the Apply flag),
+  `crates/athenaeum-core/src/api/header_fallbacks.rs`, `crates/athenaeum-core/src/ts_export.rs`
 - Modify: `crates/athenaeum-tauri/src/commands/settings.rs`, `crates/athenaeum-tauri/src/lib.rs`,
   `crates/athenaeum-web/src/routes/settings.rs`, `crates/athenaeum-web/src/routes/mod.rs`
 - Regenerate: `src/types/models.ts`
 
 **Interfaces:**
-- Consumes: Task 4 `read_rows`, `plan_frame`, `ScanRoots`, `needs_regroup`, `movable_sets_of`, `MASTER_TYPES`,
-  `MASTER_SET_FIELDS`, `PAGE_SIZE`; `crate::db::SavepointGuard`; `crate::sessions::rederive_for_frame_set(conn, set_id, &[], gap_hours)`;
+- Consumes: Task 4 `read_rows`, `plan_frame`, `ScanRoots`, `needs_regroup`, `movable_sets_of`, `PAGE_SIZE`; `crate::db::SavepointGuard`; `crate::sessions::rederive_for_frame_set(conn, set_id, &[], gap_hours)`;
   `crate::db::calibration_links::frame_set_ids_for_frames`; `crate::db::schema::prune_orphaned_calibration_sets`;
   `crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, MasterFrameIds}`;
   `crate::events::emit_event`.
+- Produces (`crate::header_fallbacks::calibration`; moved here from Task 4 so nothing sits unused):
+  `pub(crate) const MASTER_TYPES: [&str; 4] = ["MasterDark", "MasterFlat", "MasterBias", "MasterDarkFlat"];` (the
+  scanner classifies masters by `imagetyp` only, `scanner/mod.rs:472-484`) and
+  `pub(crate) const MASTER_SET_FIELDS: [HeaderField; 7] = [Exptime, Filter, CcdTemp, Gain, Offset, Instrume, Focallen];`
+  (the columns `create_master_sets_from_frames` writes, `scan_integration.rs:932-953`).
 - Produces (`crate::header_fallbacks::apply`):
   - `pub const PROGRESS_EVENT: &str = "header-fallbacks-progress";`
   - `pub struct HeaderFallbackProgress { pub phase: String, pub done: usize, pub total: usize }` (camelCase, TS; `phase` is `"frames"` or `"calibration"`)
@@ -668,7 +662,8 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
   - `pub fn apply(conn: &Connection, rules: &HeaderFallbackConfig, gap_hours: f64, emitter: &dyn ProgressEmitter) -> anyhow::Result<ApplyReport>`
     = `apply_in_pages(conn, rules, gap_hours, emitter, PAGE_SIZE)`; `pub(crate) fn apply_in_pages(.., page_size: usize)`.
 - Produces (`crate::api::header_fallbacks`): `pub fn apply_header_fallbacks(ctx: &ServiceContext, emitter: &dyn ProgressEmitter) -> Result<HeaderFallbackCounts, ApiError>`
-  — a `static APPLY_RUNNING: AtomicBool` with a drop guard; when set: `warn!("header fallbacks apply refused: one is running")`
+  — `ServiceContext` gains `pub(crate) apply_running: Arc<AtomicBool>` (D17; not a process static), taken by
+  compare-exchange with a drop guard; when already set: `warn!("header fallbacks apply refused: one is running")`
   and `ApiError::Conflict("FITS keyword rules are already being applied")`; gap hours from
   `ctx.settings.get_session_gap_threshold_hours(&conn)`; after `apply`, `#[cfg(all(feature = "render", feature = "solver"))]`
   `crate::api::collab_autopublish::request_auto_publish_for_sets(&report.frame_sets_touched)` (D16). Hosts:
@@ -677,27 +672,27 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
 
 **Apply's order of work:**
 1. `total` = `SELECT COUNT(*) FROM frames`; `ScanRoots::load`.
-2. **Pages** (`read_rows` by `page_size`): plan every row (Task 4's `plan_frame`, so preview and Apply cannot differ).
-   A frame is **deferred** to step 3 when `needs_regroup(imagetyp, changes)` or (`imagetyp ∈ MASTER_TYPES` and a
-   change is in `MASTER_SET_FIELDS`); every other changed frame is written now, in one `SavepointGuard` per page:
-   `UPDATE frames SET <col> = ?, … WHERE id = ?` with columns from `HeaderField::column()` (no other column, no
-   `override`, no `files` row). In the same transaction, the frame sets of this page's frames with an `Instrume` or
-   `Exptime` change (`frame_set_ids_for_frames`) are re-derived with `rederive_for_frame_set(conn, id, &[], gap_hours)`.
-   Commit; emit `HeaderFallbackProgress { phase: "frames", done, total }`; add this page's changed frames' sets to
-   `frame_sets_touched`.
-3. **Calibration** (one `SavepointGuard`): write the deferred frames' columns; for raw ones,
-   `sets = movable_sets_of(ids)`, `DELETE FROM calibration_set_frames WHERE frame_id = ? AND set_id IN (sets)` (the
-   `calibration_set_empty_prune` trigger removes an emptied set at once), `prune_orphaned_calibration_sets(conn)`, then
-   `create_calibration_sets_from_scan_with_masters(conn, flats, darks, bias, darkflats, MasterFrameIds::default())` with
-   the moved frames split by imagetyp (`Flat`, `Dark`, `Bias`, `DarkFlat`). Raw frames in a frozen set keep their row
-   (D11, counted `lineage_kept`). For each deferred master frame:
-   `UPDATE calibration_set SET exptime = ?, filter = ?, ccd_temp = ?, gain = ?, offset = ?, instrume = ?, focallen = ?, temp_min = ?, temp_max = ? WHERE is_master_library = 1 AND id IN (SELECT set_id FROM calibration_set_frames WHERE frame_id = ?)`
-   with the frame's new values (temp_min = temp_max = ccd_temp, as `create_master_sets_from_frames` writes). Commit;
-   emit `{ phase: "calibration", done: total, total }`.
-4. `counts.sets_regrouped` = distinct sets left in step 3; log
+2. **Pages** (`read_rows` by `page_size`, `plan_frame` for every row, so preview and Apply cannot differ). A frame is
+   **deferred** to step 4 when `needs_regroup(imagetyp, &row.values, changes)` or (`imagetyp ∈ MASTER_TYPES` and a change
+   is in `MASTER_SET_FIELDS`); every other changed frame is written now, in one `SavepointGuard` per page, by
+   `UPDATE frames SET <col> = ?, … WHERE id = ?` over `HeaderField::column()` only (never `override`, never a `files`
+   row). Commit; emit `HeaderFallbackProgress { phase: "frames", done, total }`. Across pages collect
+   `frame_sets_touched` (the frame sets of changed frames, `frame_set_ids_for_frames`) and `night_sets` (those with an
+   `Instrume` or `Exptime` change).
+3. **Nights**: after the last page, `rederive_for_frame_set(conn, id, &[], gap_hours)` once per set in `night_sets`,
+   one `SavepointGuard` per set (D3). Never inside a page.
+4. **Calibration** (one `SavepointGuard`): write the deferred frames' columns. Raw ones: `movable_sets_of(ids)`; delete
+   their `calibration_set_frames` rows in those sets (the `calibration_set_empty_prune` trigger removes an emptied set),
+   `prune_orphaned_calibration_sets`, then `create_calibration_sets_from_scan_with_masters(.., MasterFrameIds::default())`
+   with the moved frames split by imagetyp; raw frames in a frozen set keep their row (D11, counted `lineage_kept`).
+   Master frames: update the `is_master_library = 1` set holding the frame, writing only the `MASTER_SET_FIELDS`
+   columns whose value changed (`temp_min` and `temp_max` follow `ccd_temp`, as `create_master_sets_from_frames` writes
+   them). Commit; emit `{ phase: "calibration", done: total, total }`.
+5. `counts.sets_regrouped` = distinct sets left in step 4; log
    `info!(count = frames_changed, kept, no_header, sets_regrouped, master_sets, lineage_kept, by_field = %…, duration_ms, "header fallbacks applied")`.
    A set that kept other members is left as the bulk edit leaves it (§5.5 step 2): note in the task report whether its
-   `frame_count`/`temp_min`/`temp_max` went stale in the tests (Task 9 records the finding).
+   `frame_count`/`temp_min`/`temp_max` went stale in the tests, and whether a dark set's own `focallen` copy
+   (`scan_integration.rs:840-843`) went stale when `focallen` changed without a regroup (Task 9 records both findings).
 
 - [ ] **Step 1: Write the failing tests** (in `apply.rs` / `calibration.rs`; calibration fixtures as in
   `calibration/scan_integration.rs` tests 971+, frame-set fixtures as in `sessions/mod.rs` tests)
@@ -707,10 +702,14 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
     // headers DET-TEMP -10, -10, -20, -20. apply(default) →
     // 2 sets: {d1,d2} ccd_temp≈-10, {d3,d4} ≈-20; the old set id no longer exists; counts.sets_regrouped == 1
 }
-#[test] fn master_library_set_takes_its_masters_new_values() { /* MasterDark frame gain NULL + GAIN=100 → its set.gain == 100 */ }
+#[test] fn master_library_set_takes_its_masters_new_values() { /* MasterDark frame gain NULL + GAIN=100 → its set.gain == 100; an unchanged column (exptime) is not rewritten */ }
 #[test] fn lights_keep_frame_set_nights_and_links() {
     // frame set with 2 lights in one night, linked to a dark set; instrume rule change →
     // get_frame_ids_for_frame_set unchanged; sessions.instrume == new name; calibration_set_to_frames rows unchanged
+}
+#[test] fn a_frame_set_spanning_pages_is_rederived_once() {
+    // 5 lights of one frame set, page_size 2, exptime change on all: nights are rebuilt once, not three times
+    // (the nights' row ids advance by one rebuild's night count only); sessions.exptime is new
 }
 #[test] fn frames_in_a_superseded_set_keep_their_membership() { /* seed_superseded_dark_lineage; temp change → membership unchanged, frame ccd_temp written, no new raw set */ }
 #[test] fn apply_never_touches_override_or_hashes() { /* override and files.content_hash/strong_hash identical before/after */ }
@@ -726,14 +725,14 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
 }
 // api/header_fallbacks.rs
 #[test] fn second_apply_while_one_runs_is_a_conflict() {
-    // hold APPLY_RUNNING (test helper) → apply_header_fallbacks(&ctx, &NullEmitter) is Err(ApiError::Conflict(_));
-    // released → Ok
+    // set this ctx's apply_running flag (test helper) → apply_header_fallbacks(&ctx, &NullEmitter) is
+    // Err(ApiError::Conflict(_)); released → Ok; a second ctx over another catalog is not affected (tests do not race)
 }
 ```
 
 - [ ] **Step 2: Run them and see them fail** — `CT header_fallbacks::`, `CT api::header_fallbacks` → FAIL.
 
-- [ ] **Step 3: Implement** the order of work above, the api handler and both host wrappers.
+- [ ] **Step 3: Implement** the order of work above, the `ServiceContext` flag, the api handler and both host wrappers.
 
 - [ ] **Step 4: Run** — ts_contract (write, then check); `CT header_fallbacks::`, `CT api::header_fallbacks`,
   `CT calibration::scan_integration`, `CT sessions::` → PASS; web `settings` + `parity` → PASS; `CC athenaeum-tauri` → OK.
@@ -756,9 +755,7 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
 - Produces (`crate::header_fallbacks::transfer`):
   - `pub const FILE_FORMAT: &str = "athenaeum.header-fallbacks";` `pub const FILE_VERSION: u64 = 1;`
     `pub const MAX_IMPORT_BYTES: usize = 1_048_576;` `pub const DEFAULT_FILE_NAME: &str = "athenaeum-fits-keywords.json";`
-  - `pub fn export_text(cfg: &HeaderFallbackConfig) -> String` — pretty JSON
-    `{ "format": FILE_FORMAT, "version": 1, "fields": { "<id>": [order…] } }`, only fields whose order differs from the
-    default chain, never `retired`, no paths, field keys in `HeaderField::ALL` order.
+  - `pub fn export_text(cfg: &HeaderFallbackConfig) -> String` — pretty JSON in the shape its test fixes.
   - `pub struct FieldOrderChange { pub field: HeaderField, pub before: Vec<String>, pub after: Vec<String> }` (camelCase, TS)
   - `pub struct HeaderFallbackImportPlan { pub config: HeaderFallbackConfig, pub changes: Vec<FieldOrderChange> }` (camelCase, TS)
   - `pub enum ImportError` with `Display` naming the problem: `TooLarge(usize)` "the file is larger than 1 MB",
@@ -799,14 +796,11 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
 #[test] fn import_accepts_a_bom_and_crlf() { /* "\u{feff}{\r\n \"format\": …\r\n}" → Ok */ }
 #[test] fn import_refuses_a_file_over_one_mib() { /* 1_048_577 bytes → TooLarge */ }
 #[test] fn import_refuses_bytes_that_are_not_json() { /* "\u{0}PK\u{3}" → NotJson */ }
-#[test] fn import_refuses_an_unknown_format() {}
-#[test] fn import_refuses_version_two() {}            // and a missing or non-integer version
-#[test] fn import_refuses_a_file_without_fields() {}
-#[test] fn import_refuses_an_unknown_field() {}       // message contains the id
-#[test] fn import_refuses_a_field_that_is_not_a_list() {}
-#[test] fn import_refuses_a_non_string_keyword() {}
-#[test] fn import_refuses_an_invalid_keyword() {}     // "" and "A=B"
-#[test] fn import_refuses_a_repeated_keyword() {}     // ["CCD-TEMP","DET-TEMP","ccd-temp"]
+// one test per remaining refusal, each asserting the matching `ImportError` and that its message names the problem:
+// import_refuses_an_unknown_format, import_refuses_version_two (and a missing or non-integer version),
+// import_refuses_a_file_without_fields, import_refuses_an_unknown_field (message contains the id),
+// import_refuses_a_field_that_is_not_a_list, import_refuses_a_non_string_keyword,
+// import_refuses_an_invalid_keyword ("" and "A=B"), import_refuses_a_repeated_keyword (["CCD-TEMP","DET-TEMP","ccd-temp"])
 #[test] fn refused_import_changes_nothing() { /* after any refusal, load(conn) == before */ }
 #[test] fn import_by_path_is_refused_on_a_restricted_policy() { /* PathPolicy::AllowedRoots(vec![]) + path → ApiError::Forbidden */ }
 #[test] fn export_to_a_path_writes_the_same_text() { /* tempdir join "rules.json"; file content == returned text */ }
@@ -844,8 +838,10 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
 
 **Behaviour and copy (D5):**
 - Document: `useAutosaveDocument<HeaderFallbackConfig>({ load: () => api.invoke('get_header_fallbacks'), save: (config) => api.invoke('set_header_fallbacks', { config }), resetAll: () => api.invoke('reset_header_fallbacks').then(() => {}), defaults: defaults?.headerFallbacks ?? null, label: 'FITS keywords' })`.
+  The preview is keyed on `savedAt`, which only a save sets (`useAutosaveDocument.ts:146`; `resetAll` reloads without
+  touching it, `:220-234`), so the section wraps `resetAll`: `const onResetAll = async () => { await resetAll(); refresh(); }`.
   `SettingsSection id="general.headerKeywords"` renders unconditionally (loading text inside while `doc` is null), with
-  `onResetAll={resetAll}` and `resetScopeLabel="This puts every field's keywords back in the default order. Catalog values change only when you apply."`.
+  `onResetAll={onResetAll}` and `resetScopeLabel="This puts every field's keywords back in the default order. Catalog values change only when you apply."`.
 - Registry: title `FITS keywords`; description `Which header keyword each catalog field is read from, first match wins. Your files are never changed.`;
   one field per `HeaderField` (`id` = the field id, `label` = `HEADER_FIELD_LABELS[f]`,
   `help` = `Tried in order; the first keyword with a usable value fills the field.`, `keywords` = the default chain
@@ -858,10 +854,8 @@ and logs `debug!(count, kept, no_header, sets_regrouped, by_field = %by_field_te
   blur), and `ResetButton` (`visible={!isDefault(\`fields.${f}.order\`)}`, `defaultLabel` = the default chain joined by
   `, `, `onReset={() => resetField(\`fields.${f}.order\`)}`).
 - Chips: `Chip tone="mute"` for a default keyword (no ×), `tone="info"` with a × button (`aria-label="Remove {KW}"`) for
-  a user keyword; a `GripVertical` icon (lucide, size 10). Each chip is a focusable `<button type="button">` with
-  `aria-label="{KW}, {i} of {n}{, standard keyword}. Arrow keys move it."`; ArrowLeft/ArrowUp move it one earlier,
-  ArrowRight/ArrowDown one later, Home/End to first/last, Delete/Backspace remove a user keyword; focus follows the
-  chip. Drag: `draggable`, `dataTransfer.setData('text/plain', index)`, `onDragOver` `preventDefault`, `onDrop` moves.
+  a user keyword; a `GripVertical` icon. Keyboard and native drag move a chip, focus follows the chip; Delete/Backspace
+  remove a user keyword.
 - Add: `trim().toUpperCase()`; empty or containing `=` → inline `Keywords can't be empty or contain "=".`; already in
   this field's list → inline `{KW} is already in this list.`; nothing is patched while an inline error shows (the
   server's `validate` stays the authority; its refusal arrives through the hook's `FITS keywords not saved` notify).
@@ -894,6 +888,7 @@ it('shows the reset button only for a field off its default', ...)
 it('hides the preview line when nothing changes', ...)                             // framesChanged 0 → no 'Apply to catalog'
 it('shows counts and opens the confirm with the calibration line', ...)           // setsRegrouped 3 → 'Darks, flats and bias in 3 calibration sets…'
 it('applies, shows progress and notifies once', ...)                               // emits header-fallbacks-progress; one success notify; preview refreshed
+it('reset_all_refreshes_the_preview', ...)                                          // Reset all → reset_header_fallbacks called, then preview_header_fallbacks called again (count 2 → new counts shown), without a save
 it('re-runs the preview once after a burst of saves', ...)                         // 3 saves inside 800 ms → preview_header_fallbacks called twice in total (mount + 1)
 ```
 
@@ -981,7 +976,9 @@ it('notifies a refused file and applies nothing', ...)           // invoke rejec
 - Produces: `cargo run --release -p athenaeum-core --example header_fallbacks_probe -- --db <copy> [--rules <json>] (preview | apply | both <field> <KW1> <KW2>)`.
   `preview` prints the counts, then per (field, format, old value NULL or not) the number of changes and up to 5
   samples `frame_id  file name  folder  old → new`; `apply` runs `apply(..)` with `NullEmitter` and prints the counts;
-  `both` counts frames whose stored header resolves both keywords to different values. Output ≤ 60 lines.
+  `both` counts frames whose stored header resolves both keywords to different values. Output: counts first, then
+  the per-class samples, ≤ 60 lines; `preview` also prints the number of FITS rows whose stored header has a line
+  that is not an 80-column card (a hand dump; Step 4).
 
 - [ ] **Step 1: Docs.** `docs/catalog/README.md`: the field table of §5.1, the rules (O1–O3, fixed keywords, retired,
   one rule set per run, sync and Perseus follow the receiving catalog), Apply's per-field test of §5.4 with the accepted
@@ -990,8 +987,8 @@ it('notifies a refused file and applies nothing', ...)           // invoke rejec
   metadata pane no longer reads `CCDTEMP` or `EGAIN`). `docs/calibration/matching.md`: Apply regroups changed raw
   calibration frames through the scanner path, frozen-lineage sets keep their frames (D11), master-library sets take
   their master's values. `docs/superpowers/open-items.md`: the owner smoke of §9.4 under "Unverified by hand"; the S4
-  reuse-ignores-temperature finding and the stale-aggregate finding of §5.5 step 2 (with what Task 5's tests showed)
-  under the findings section.
+  reuse-ignores-temperature finding, the stale-aggregate finding of §5.5 step 2 and the stale `focallen` copy of a dark
+  set (`scan_integration.rs:840-843`), with what Task 5's tests showed, under the findings section.
 
 - [ ] **Step 2: Release-note lines** — put these three lines in the task report for the 0.7.2 notes (the release skill
   rewrites `RELEASE_NOTES.md`; do not edit it here):
@@ -1011,7 +1008,10 @@ printf '%s\tjob\theader-fallbacks\t2026-11-22\t2026-12-06\tdev catalog copy for 
 - [ ] **Step 4: Acceptance §9.2 — default rules.** Run the probe `preview` on the copy. Every non-zero class must be
   one of: frames cataloged before 0.7.1 with only `DET-TEMP`; XISF frames with `EXPOSURE` and no `EXPTIME`; XISF text
   with padding or blanks; XISF numbers the old `str::parse` refused (padding, D-notation) or keywords in non-upper case;
-  values from the aligned stored-header reader. Name the class of every count with its samples in the report. Anything
+  values from the aligned stored-header reader. Name the class of every count with its samples in the report. Also
+  report the FITS rows whose stored header is not 80-column cards (a hand dump such as `EXPTIME = 300`: its 7-letter keys
+  parse as cards, so `has_keywords()` is true, the eq-text fallback is skipped and the other keys are lost; the values
+  count as kept and nothing is written, so `values_kept` is inflated by these rows). Anything
   else is a parity bug: STOP and report it with samples, do not continue to Step 5. Record the preview's duration.
 
 - [ ] **Step 5: Acceptance §9.3 — reversed temperature order.** On the same copy: `apply` with default rules, then
