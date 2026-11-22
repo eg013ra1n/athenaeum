@@ -384,7 +384,7 @@ pub fn load_for_scan(conn: &Connection) -> HeaderFallbackConfig {
             tracing::error!(
                 key = SETTINGS_KEY,
                 error = %format!("{e:#}"),
-                "stored FITS keyword rules do not decode; using the default"
+                "stored FITS keyword rules could not be read; using the default"
             );
             HeaderFallbackConfig::default()
         }

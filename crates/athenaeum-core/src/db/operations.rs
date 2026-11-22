@@ -2119,7 +2119,7 @@ pub fn bulk_update_frame_metadata(
     // frame. If the user just reverted everything back to its original
     // file-header values, drop the flag so the row stops looking edited.
     // Errors here aren't fatal — the edits themselves succeeded already.
-    // The header is read under the catalog's FITS keyword rules; rules that do not decode leave the
+    // The header is read under the catalog's FITS keyword rules; rules that cannot be read leave the
     // flag on (the safe side: the frame keeps looking edited).
     match crate::header_fallbacks::load(conn) {
         Ok(rules) => {
@@ -2129,9 +2129,9 @@ pub fn bulk_update_frame_metadata(
         }
         Err(e) => {
             tracing::warn!(
-                key = "catalog.header_fallbacks",
+                key = crate::settings::keys::CATALOG_HEADER_FALLBACKS,
                 error = %format!("{e:#}"),
-                "stored FITS keyword rules do not decode; override flags not recomputed"
+                "stored FITS keyword rules could not be read; override flags not recomputed"
             );
         }
     }
@@ -5245,7 +5245,7 @@ mod bulk_metadata_tests {
         );
     }
 
-    /// `CCD-TEMP` first, then the standard keywords, behind `MY-TEMP`.
+    /// `MY-TEMP` first, then the standard keywords.
     fn my_temp_rules() -> crate::header_fallbacks::HeaderFallbackConfig {
         use crate::header_fallbacks::{FieldRule, HeaderField, HeaderFallbackConfig};
         let mut cfg = HeaderFallbackConfig::default();
@@ -5368,6 +5368,36 @@ mod bulk_metadata_tests {
         let flag: i64 =
             conn.query_row("SELECT override FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap();
         assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn bulk_update_keeps_the_override_flag_when_the_stored_rules_cannot_be_read() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
+        conn.execute("UPDATE frames SET object = 'M42' WHERE id = ?1", [frame_id]).unwrap();
+        insert_fits_header_for_file(
+            &conn,
+            file_id_of(&conn, frame_id),
+            &format!("{}\n{}", card80("OBJECT  = 'M42'"), card80("IMAGETYP= 'Light'")),
+        );
+        let edit = |object: &str| FrameMetadataEdits { object: Some(Some(object.into())), ..Default::default() };
+        let flag = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT override FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap()
+        };
+        let object = |conn: &Connection| -> Option<String> {
+            conn.query_row("SELECT object FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap()
+        };
+
+        bulk_update_frame_metadata(&conn, &[frame_id], &edit("OTHER")).unwrap();
+        assert_eq!(flag(&conn), 1);
+
+        // The revert would clear the flag, but the stored rules cannot be read: the edit is
+        // committed and the flag stays on (the safe side).
+        crate::db::set_setting(&conn, crate::settings::keys::CATALOG_HEADER_FALLBACKS, "not json").unwrap();
+        bulk_update_frame_metadata(&conn, &[frame_id], &edit("M42")).unwrap();
+        assert_eq!(object(&conn).as_deref(), Some("M42"), "the edit is committed");
+        assert_eq!(flag(&conn), 1, "the flag is not recomputed");
     }
 
     #[test]

@@ -2274,14 +2274,10 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
                     ));
                 }
 
-                // Update INSTRUME based on destination root's unique_camera setting
-                // file_result.frame.instrume has the raw FITS header value (no suffix)
-                let new_instrume = if unique_camera {
-                    file_result.frame.instrume.as_ref()
-                        .map(|i| format!("{} N{}", i, root_id))
-                } else {
-                    file_result.frame.instrume.clone()
-                };
+                // Update INSTRUME based on destination root's unique_camera setting.
+                // file_result.frame.instrume is the value parsed from the header; a header that
+                // already ends in this root's suffix is not suffixed twice.
+                let new_instrume = instrume_for_scan(file_result.frame.instrume.clone(), unique_camera, root_id);
                 if let Err(e) = conn.execute(
                     "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
                     rusqlite::params![new_instrume, file_id],
@@ -5514,6 +5510,15 @@ mod header_rules_tests {
         let first = scan_directory(root.path(), &conn, None, false, 1);
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert_eq!(ccd_temp_of(&conn, &fits), Some(-10.0), "scanned under the standard keywords");
+        let ids_of = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT fi.id, fr.id FROM files fi JOIN frames fr ON fr.file_id = fi.id WHERE fi.path = ?1",
+                params![fits.to_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let ids_before = ids_of(&conn);
 
         // The user reorders the keywords; the file changes on disk, so the scan re-parses it in place.
         crate::header_fallbacks::store(&conn, &my_temp_first()).unwrap();
@@ -5524,6 +5529,7 @@ mod header_rules_tests {
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert_eq!(second.files_processed, 1);
         assert_eq!(ccd_temp_of(&conn, &fits), Some(-3.0), "re-parsed under the catalog's rules");
+        assert_eq!(ids_of(&conn), ids_before, "the rows were re-parsed in place, not deleted and inserted");
     }
 
     #[test]
@@ -5535,6 +5541,100 @@ mod header_rules_tests {
         let result = scan_directory(root.path(), &conn, None, false, 1);
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(ccd_temp_of(&conn, &fits), Some(-10.0));
+    }
+
+    /// A FITS light whose `INSTRUME` is `instrume` (`seq` makes its bytes, so its fingerprint, unique).
+    fn fits_with_instrume(instrume: &str, seq: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in [
+            "SIMPLE  =                    T".to_string(),
+            "BITPIX  =                    8".to_string(),
+            "NAXIS   =                    0".to_string(),
+            "OBJECT  = 'M33     '".to_string(),
+            "TELESCOP= 'T       '".to_string(),
+            format!("INSTRUME= '{instrume}'"),
+            "IMAGETYP= 'Light   '".to_string(),
+            format!("SEQNUM  = {seq:>20}"),
+            "END".to_string(),
+        ] {
+            out.extend(format!("{c:<80}").into_bytes());
+        }
+        while out.len() % 2880 != 0 {
+            out.push(b' ');
+        }
+        out
+    }
+
+    fn instrume_of(conn: &Connection, path: &Path) -> Option<String> {
+        conn.query_row(
+            "SELECT fr.instrume FROM frames fr JOIN files fi ON fi.id = fr.file_id WHERE fi.path = ?1",
+            params![path.to_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// `plain.fits` (INSTRUME `Cam`) and `suffixed.fits` (INSTRUME `Cam N1`, the suffix of root 1).
+    fn seed_instrume_files(dir: &Path) -> (PathBuf, PathBuf) {
+        let plain = dir.join("plain.fits");
+        std::fs::write(&plain, fits_with_instrume("Cam", 1)).unwrap();
+        let suffixed = dir.join("suffixed.fits");
+        std::fs::write(&suffixed, fits_with_instrume("Cam N1", 2)).unwrap();
+        (plain, suffixed)
+    }
+
+    #[test]
+    fn a_unique_camera_root_suffixes_a_new_row_once_in_both_walkers() {
+        let serial_root = TempDir::new().unwrap();
+        let conn = fresh_db(serial_root.path());
+        let (plain, suffixed) = seed_instrume_files(serial_root.path());
+        let result = scan_directory(serial_root.path(), &conn, None, true, 1);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(instrume_of(&conn, &plain).as_deref(), Some("Cam N1"));
+        assert_eq!(instrume_of(&conn, &suffixed).as_deref(), Some("Cam N1"), "serial: no double suffix");
+
+        let parallel_root = TempDir::new().unwrap();
+        let conn = fresh_db(parallel_root.path());
+        let (plain, suffixed) = seed_instrume_files(parallel_root.path());
+        let result = scan_directory_parallel(
+            parallel_root.path(),
+            1,
+            &conn,
+            &NullEmitter,
+            Arc::new(AtomicBool::new(false)),
+            true,
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(instrume_of(&conn, &plain).as_deref(), Some("Cam N1"));
+        assert_eq!(instrume_of(&conn, &suffixed).as_deref(), Some("Cam N1"), "parallel: no double suffix");
+    }
+
+    #[test]
+    fn the_parallel_walkers_moved_file_takes_the_destination_roots_suffix_once() {
+        let from = TempDir::new().unwrap();
+        let to = TempDir::new().unwrap();
+        let conn = fresh_db(from.path());
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (2, ?1)", params![to.path().to_str().unwrap()])
+            .unwrap();
+        let (plain, suffixed) = seed_instrume_files(from.path());
+        let scan = |dir: &Path, root_id: i64| {
+            scan_directory_parallel(dir, root_id, &conn, &NullEmitter, Arc::new(AtomicBool::new(false)), true)
+        };
+        let first = scan(from.path(), 1);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(instrume_of(&conn, &suffixed).as_deref(), Some("Cam N1"));
+
+        // Move both files to root 2: the rows follow them and take root 2's suffix, once.
+        let moved_plain = to.path().join("plain.fits");
+        let moved_suffixed = to.path().join("suffixed.fits");
+        std::fs::rename(&plain, &moved_plain).unwrap();
+        std::fs::rename(&suffixed, &moved_suffixed).unwrap();
+        let second = scan(to.path(), 2);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2, "the files were moved, not added");
+        assert_eq!(instrume_of(&conn, &moved_plain).as_deref(), Some("Cam N2"));
+        assert_eq!(instrume_of(&conn, &moved_suffixed).as_deref(), Some("Cam N2"), "no `Cam N1 N2`");
     }
 
     #[test]

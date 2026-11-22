@@ -23,7 +23,7 @@ fn previous_for_merge(conn: &rusqlite::Connection) -> HeaderFallbackConfig {
         tracing::error!(
             key = crate::settings::keys::CATALOG_HEADER_FALLBACKS,
             error = %format!("{e:#}"),
-            "stored FITS keyword rules do not decode; replacing them without their retired keywords"
+            "stored FITS keyword rules could not be read; replacing them without their retired keywords"
         );
         HeaderFallbackConfig::default()
     })
