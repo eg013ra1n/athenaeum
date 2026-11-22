@@ -75,6 +75,20 @@ async function renderSection() {
   await settle();
 }
 
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function applyButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'Apply to catalog' }) as HTMLButtonElement;
+}
+
 function chip(keyword: string): HTMLElement {
   const el = screen.getByText(keyword).closest('li');
   if (!el) throw new Error(`no chip for ${keyword}`);
@@ -126,24 +140,81 @@ describe('HeaderKeywordsSection', () => {
   it('moves a chip with the arrow keys and saves the new order', async () => {
     await renderSection();
     const first = chip('CCD-TEMP');
-    first.focus();
+    // jsdom keeps focus on a keyed node that React moves, and React itself calls focus() to restore the focused node,
+    // so nothing is focused here: the only focus() call is the one the chip's own effect makes.
+    const focused: HTMLElement[] = [];
+    vi.spyOn(HTMLElement.prototype, 'focus').mockImplementation(function (this: HTMLElement) {
+      focused.push(this);
+    });
     fireEvent.keyDown(first, { key: 'ArrowRight' });
     await settle();
     // Focus follows the chip it moved.
-    expect((document.activeElement as HTMLElement).dataset.keyword).toBe('CCD-TEMP');
+    expect(focused.map((el) => el.dataset.keyword)).toEqual(['CCD-TEMP']);
+    expect(chip('CCD-TEMP')).toBe(focused[0]);
+    vi.restoreAllMocks();
     await advance(500);
     expect(callsOf('set_header_fallbacks')).toHaveLength(1);
     expect(savedOrder(0, 'ccdTemp')).toEqual(['DET-TEMP', 'CCD-TEMP']);
+    // The move is announced.
+    expect(screen.getByText('Moved CCD-TEMP to position 2 of 2.')).toBeTruthy();
   });
 
-  it('moves a chip by drag and drop', async () => {
+  it('labels each list with the field label and keeps every chip and remove button in the Tab order', async () => {
     await renderSection();
-    const dataTransfer = { setData: vi.fn(), getData: vi.fn(() => ''), effectAllowed: '', dropEffect: '' };
-    fireEvent.dragStart(chip('CCD-TEMP'), { dataTransfer });
-    fireEvent.dragOver(chip('DET-TEMP'), { dataTransfer });
-    fireEvent.drop(chip('DET-TEMP'), { dataTransfer });
+    expect(screen.getByRole('list', { name: 'Sensor temperature keywords' })).toBeTruthy();
+    expect(screen.queryByLabelText(/^ccdTemp keywords/)).toBeNull();
+    typeKeyword('Gain', 'my-gain');
+    expect(chip('GAIN').tabIndex).toBe(0);
+    expect(chip('MY-GAIN').tabIndex).toBe(0);
+    expect(screen.getByLabelText('Remove MY-GAIN').tabIndex).toBe(0);
+  });
+
+  it('moves a chip by pointer drag: one save on release, none while it moves', async () => {
+    await renderSection();
+    // Chips side by side, 60 px wide: CCD-TEMP 0-60, DET-TEMP 60-120.
+    const rects: Record<string, [number, number]> = { 'CCD-TEMP': [0, 60], 'DET-TEMP': [60, 120] };
+    for (const [kw, [l, r]] of Object.entries(rects)) {
+      chip(kw).getBoundingClientRect = () =>
+        ({ left: l, right: r, top: 0, bottom: 20, width: r - l, height: 20, x: l, y: 0 }) as DOMRect;
+    }
+    const capture = vi.fn();
+    chip('CCD-TEMP').setPointerCapture = capture;
+
+    fireEvent.pointerDown(chip('CCD-TEMP'), { pointerId: 1, button: 0, clientX: 30, clientY: 10 });
+    expect(capture).toHaveBeenCalledWith(1);
+    // Short of DET-TEMP's midpoint (90): nothing moves.
+    fireEvent.pointerMove(chip('CCD-TEMP'), { pointerId: 1, clientX: 80, clientY: 10 });
+    expect(screen.getAllByRole('listitem')[0]!.getAttribute('data-keyword')).toBe('CCD-TEMP');
+    // Past it: the dragged chip takes DET-TEMP's place, shown at once.
+    fireEvent.pointerMove(chip('CCD-TEMP'), { pointerId: 1, clientX: 100, clientY: 10 });
+    expect(screen.getAllByRole('listitem')[0]!.getAttribute('data-keyword')).toBe('DET-TEMP');
+    await advance(2000);
+    expect(callsOf('set_header_fallbacks')).toHaveLength(0);
+
+    fireEvent.pointerUp(chip('CCD-TEMP'), { pointerId: 1, clientX: 100, clientY: 10 });
     await advance(500);
+    expect(callsOf('set_header_fallbacks')).toHaveLength(1);
     expect(savedOrder(0, 'ccdTemp')).toEqual(['DET-TEMP', 'CCD-TEMP']);
+    expect(screen.getByText('Moved CCD-TEMP to position 2 of 2.')).toBeTruthy();
+  });
+
+  it('cancels a pointer drag with Escape and saves nothing', async () => {
+    await renderSection();
+    const rects: Record<string, [number, number]> = { 'CCD-TEMP': [0, 60], 'DET-TEMP': [60, 120] };
+    for (const [kw, [l, r]] of Object.entries(rects)) {
+      chip(kw).getBoundingClientRect = () =>
+        ({ left: l, right: r, top: 0, bottom: 20, width: r - l, height: 20, x: l, y: 0 }) as DOMRect;
+    }
+    chip('CCD-TEMP').setPointerCapture = vi.fn();
+    fireEvent.pointerDown(chip('CCD-TEMP'), { pointerId: 1, button: 0, clientX: 30, clientY: 10 });
+    fireEvent.pointerMove(chip('CCD-TEMP'), { pointerId: 1, clientX: 100, clientY: 10 });
+    expect(screen.getAllByRole('listitem')[0]!.getAttribute('data-keyword')).toBe('DET-TEMP');
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.getAllByRole('listitem')[0]!.getAttribute('data-keyword')).toBe('CCD-TEMP');
+    // A release after the cancel is no drop.
+    fireEvent.pointerUp(chip('CCD-TEMP'), { pointerId: 1, clientX: 100, clientY: 10 });
+    await advance(2000);
+    expect(callsOf('set_header_fallbacks')).toHaveLength(0);
   });
 
   it('adds a keyword upper-cased and removes it with its button', async () => {
@@ -238,6 +309,104 @@ describe('HeaderKeywordsSection', () => {
     expect(screen.getByText('1 value you set yourself is kept.')).toBeTruthy();
   });
 
+  it('says one frame, one calibration set and one frame without a header in the singular', async () => {
+    preview = {
+      byField: [{ field: 'gain', frames: 1 }],
+      framesChanged: 1,
+      valuesKept: 0,
+      setsRegrouped: 1,
+      framesWithoutHeader: 1,
+    };
+    routeInvoke({
+      get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+      get_header_fallbacks: () => defaultDoc(),
+      preview_header_fallbacks: () => preview,
+      apply_header_fallbacks: () => preview,
+    });
+    await renderSection();
+    fireEvent.click(screen.getByText('Apply to catalog'));
+    expect(screen.getByText(/Gain: 1 frame(?!s)/)).toBeTruthy();
+    expect(screen.getByText(/Darks, flats and bias in 1 calibration set will be grouped again\./)).toBeTruthy();
+    expect(screen.getByText(/1 frame has no stored header and is not changed\./)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    await settle();
+    expect(notifyMock).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: '1 frame changed, 1 calibration set grouped again.' }),
+    );
+  });
+
+  it('keeps Apply shut until the edit is saved and its preview has landed (the confirm never shows old rules)', async () => {
+    preview = SOME_CHANGE;
+    const NEW_COUNTS: HeaderFallbackCounts = {
+      byField: [{ field: 'ccdTemp', frames: 7 }],
+      framesChanged: 7,
+      valuesKept: 0,
+      setsRegrouped: 0,
+      framesWithoutHeader: 0,
+    };
+    const second = deferred<HeaderFallbackCounts>();
+    let previews = 0;
+    routeInvoke({
+      get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+      get_header_fallbacks: () => defaultDoc(),
+      set_header_fallbacks: undefined,
+      preview_header_fallbacks: () => (previews++ === 0 ? SOME_CHANGE : second.promise),
+      apply_header_fallbacks: () => NEW_COUNTS,
+    });
+    await renderSection();
+    expect(applyButton().disabled).toBe(false);
+
+    // An edit: the button shuts at once, before the debounced save.
+    fireEvent.keyDown(chip('CCD-TEMP'), { key: 'ArrowRight' });
+    expect(applyButton().disabled).toBe(true);
+    fireEvent.click(applyButton());
+    expect(screen.queryByText('Apply FITS keywords to the catalog?')).toBeNull();
+
+    // The save has landed, the follow-up preview has not been asked yet.
+    await advance(500);
+    expect(callsOf('set_header_fallbacks')).toHaveLength(1);
+    expect(applyButton().disabled).toBe(true);
+    fireEvent.click(applyButton());
+    expect(screen.queryByText('Apply FITS keywords to the catalog?')).toBeNull();
+
+    // The preview is out, not answered.
+    await advance(800);
+    expect(callsOf('preview_header_fallbacks')).toHaveLength(2);
+    expect(applyButton().disabled).toBe(true);
+    fireEvent.click(applyButton());
+    expect(screen.queryByText('Apply FITS keywords to the catalog?')).toBeNull();
+
+    // Both have landed: the confirm shows the new counts, and one Apply runs.
+    await act(async () => {
+      second.resolve(NEW_COUNTS);
+    });
+    await settle();
+    expect(applyButton().disabled).toBe(false);
+    fireEvent.click(applyButton());
+    expect(screen.getByText('Apply FITS keywords to the catalog?')).toBeTruthy();
+    expect(screen.getByText(/Sensor temperature: 7 frames/)).toBeTruthy();
+    expect(screen.queryByText(/Exposure: 22 frames/)).toBeNull();
+    expect(callsOf('apply_header_fallbacks')).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    await settle();
+    expect(callsOf('apply_header_fallbacks')).toHaveLength(1);
+  });
+
+  it('closes an open confirm when an edit follows, rather than applying other rules', async () => {
+    preview = SOME_CHANGE;
+    await renderSection();
+    fireEvent.click(applyButton());
+    expect(screen.getByText('Apply FITS keywords to the catalog?')).toBeTruthy();
+    fireEvent.keyDown(chip('CCD-TEMP'), { key: 'ArrowRight' });
+    expect(screen.queryByText('Apply FITS keywords to the catalog?')).toBeNull();
+    await advance(500);
+    await advance(800);
+    await settle();
+    // It does not come back on its own.
+    expect(screen.queryByText('Apply FITS keywords to the catalog?')).toBeNull();
+    expect(callsOf('apply_header_fallbacks')).toHaveLength(0);
+  });
+
   it('applies, shows progress and notifies once', async () => {
     preview = SOME_CHANGE;
     let finish: (c: HeaderFallbackCounts) => void = () => {};
@@ -286,7 +455,7 @@ describe('HeaderKeywordsSection', () => {
       get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
       get_header_fallbacks: () => defaultDoc(),
       preview_header_fallbacks: () => preview,
-      apply_header_fallbacks: () => Promise.reject(new Error('FITS keyword rules are already being applied')),
+      apply_header_fallbacks: () => Promise.reject('FITS keyword rules are already being applied'),
     });
     await renderSection();
     fireEvent.click(screen.getByText('Apply to catalog'));
@@ -316,8 +485,48 @@ describe('HeaderKeywordsSection', () => {
       tone: 'warning',
       title: 'FITS keyword preview failed',
       detail: 'catalog busy',
-      dedupeKey: 'header-fallbacks-preview',
+      dedupeKey: expect.stringMatching(/^header-fallbacks-preview-/),
     });
+  });
+
+  it('uses a notification key of its own per mount, so a later visit is not silenced', async () => {
+    routeInvoke({
+      get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+      get_header_fallbacks: () => defaultDoc(),
+      preview_header_fallbacks: () => Promise.reject(new Error('catalog busy')),
+    });
+    const first = render(
+      <SettingsDefaultsProvider>
+        <HeaderKeywordsSection />
+      </SettingsDefaultsProvider>,
+    );
+    await settle();
+    first.unmount();
+    await renderSection();
+    expect(notifyMock).toHaveBeenCalledTimes(2);
+    const keys = notifyMock.mock.calls.map(([n]) => (n as { dedupeKey: string }).dedupeKey);
+    expect(keys[0]).not.toBe(keys[1]);
+  });
+
+  it('hides the line and Apply when the preview of the saved rules fails', async () => {
+    preview = SOME_CHANGE;
+    let fail = false;
+    routeInvoke({
+      get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+      get_header_fallbacks: () => defaultDoc(),
+      set_header_fallbacks: undefined,
+      preview_header_fallbacks: () => (fail ? Promise.reject(new Error('catalog busy')) : preview),
+    });
+    await renderSection();
+    expect(screen.getByText('Apply to catalog')).toBeTruthy();
+    fail = true;
+    fireEvent.keyDown(chip('CCD-TEMP'), { key: 'ArrowRight' });
+    await advance(500);
+    await advance(800);
+    await settle();
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('Apply to catalog')).toBeNull();
+    expect(screen.queryByText(/read differently/)).toBeNull();
   });
 
   it('reset_all_refreshes_the_preview', async () => {
@@ -355,5 +564,48 @@ describe('HeaderKeywordsSection', () => {
     expect(callsOf('preview_header_fallbacks')).toHaveLength(2);
     await advance(3000);
     expect(callsOf('preview_header_fallbacks')).toHaveLength(2);
+  });
+
+  describe('preview calls', () => {
+    it('keeps one call in flight, queues a single follow-up and drops the outdated answer', async () => {
+      const first = deferred<HeaderFallbackCounts>();
+      const next = deferred<HeaderFallbackCounts>();
+      const answers = [first, next];
+      routeInvoke({
+        get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+        get_header_fallbacks: () => defaultDoc(),
+        set_header_fallbacks: undefined,
+        preview_header_fallbacks: () => (answers.shift() ?? deferred<HeaderFallbackCounts>()).promise,
+      });
+      await renderSection();
+      expect(callsOf('preview_header_fallbacks')).toHaveLength(1);
+
+      // Two saves while the first call is out: both triggers coalesce, no second call yet.
+      fireEvent.keyDown(chip('CCD-TEMP'), { key: 'ArrowRight' });
+      await advance(500);
+      await advance(800);
+      fireEvent.keyDown(chip('CCD-TEMP'), { key: 'ArrowLeft' });
+      await advance(500);
+      await advance(800);
+      expect(callsOf('set_header_fallbacks')).toHaveLength(2);
+      expect(callsOf('preview_header_fallbacks')).toHaveLength(1);
+
+      // The first answer is for rules that have changed since: dropped, and exactly one follow-up starts.
+      await act(async () => {
+        first.resolve(SOME_CHANGE);
+      });
+      await settle();
+      expect(screen.queryByText(/read differently/)).toBeNull();
+      expect(callsOf('preview_header_fallbacks')).toHaveLength(2);
+
+      await act(async () => {
+        next.resolve({ ...NO_CHANGE, byField: [{ field: 'gain', frames: 5 }], framesChanged: 5 });
+      });
+      await settle();
+      expect(screen.getByText('5 frames read differently under these rules:')).toBeTruthy();
+      expect(applyButton().disabled).toBe(false);
+      await advance(3000);
+      expect(callsOf('preview_header_fallbacks')).toHaveLength(2);
+    });
   });
 });

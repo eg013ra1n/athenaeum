@@ -74,12 +74,13 @@ analysis marks it Trailed is refused before solving; the eccentricity / R² pair
 `general.headerKeywords` (FITS keyword fallbacks, 0.7.2) is "FITS keywords": a typed config, `HeaderFallbackConfig`
 (`catalog.header_fallbacks`; `get/set/reset_header_fallbacks`), bound by `useAutosaveDocument` in
 `HeaderKeywordsSection`. One row per `HeaderField` (`src/settings/headerFields.ts` holds the order, labels and built-in
-chains the registry's search terms use): `KeywordChain` chips reorder by native drag and by the arrow keys (focus follows
-the chip), a user keyword has a ×, the add input commits on Enter or blur and refuses an empty keyword, one with `=` and a
+chains the registry's search terms use): `KeywordChain` chips reorder by pointer drag (pointer events with capture; one save on release, Escape cancels; not HTML5
+drag and drop, which the Windows webview blocks unless file drops are off app-wide) and by the arrow keys (focus follows
+the chip, a live region announces the move), a user keyword has a ×, the add input commits on Enter or blur and refuses an empty keyword, one with `=` and a
 repeat inline (the server's `validate` stays the authority). `useHeaderFallbackPreview` asks `preview_header_fallbacks`
 once the document loads and 800 ms after each save (one call in flight, a stale answer dropped); Reset all and a finished
-Apply call `refresh()` themselves, because only a save sets `savedAt`. Apply (`apply_header_fallbacks`) confirms through
-`ConfirmDialog`, shows `header-fallbacks-progress` on the button and ends in one `notify()`. The registry's section
+Apply call `refresh()` themselves, because only a save sets `savedAt`. Apply (`apply_header_fallbacks`) waits until the edit is saved and the preview of the saved rules has answered
+(`dirty` from `useAutosaveDocument`, `current` from the preview hook), confirms through `ConfirmDialog`, shows `header-fallbacks-progress` on the button and ends in one `notify()`. The registry's section
 `keywords` (an optional `SettingsSectionMeta` field, read by the search index) carry the search terms of a whole section.
 
 `general.compute` (owner, 2026-11-13) is one KV number, `compute.max_concurrent` ("Heavy jobs at the same time",

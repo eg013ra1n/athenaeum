@@ -74,6 +74,8 @@ export interface UseAutosaveDocumentResult<D> {
   patch(p: Partial<D> | ((d: D) => D)): void;
   error: string | null;
   saving: boolean;
+  /** An edit not yet sent: true from `patch` until the debounced write takes it (or a reset clears it). */
+  dirty: boolean;
   savedAt: number | null;
   isDefault(path: string): boolean;
   resetField(path: string): void;
@@ -88,6 +90,7 @@ export function useAutosaveDocument<D>(opts: UseAutosaveDocumentOptions<D>): Use
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [dirty, setDirty] = useState(false);
 
   // Same "load must never write" discipline as `StackingTab.tsx`/
   // `StackingSection.tsx`: `dirtyRef` is set ONLY by `patch` (and
@@ -95,6 +98,7 @@ export function useAutosaveDocument<D>(opts: UseAutosaveDocumentOptions<D>): Use
   // successful `resetAll`'s reload.
   const dirtyRef = useRef(false);
   const pendingRef = useRef<D | null>(null);
+  const docLoadedRef = useRef(false);
 
   // "Latest ref" pattern: `opts.load`/`save`/`resetAll`/`defaults`/`label`
   // are typically fresh closures/values on every render (the caller is not
@@ -121,6 +125,7 @@ export function useAutosaveDocument<D>(opts: UseAutosaveDocumentOptions<D>): Use
       try {
         const next = await loadRef.current();
         if (cancelled) return;
+        docLoadedRef.current = true;
         setDoc(next);
         setError(null);
       } catch (err) {
@@ -138,6 +143,7 @@ export function useAutosaveDocument<D>(opts: UseAutosaveDocumentOptions<D>): Use
     if (!payload) return;
     dirtyRef.current = false;
     pendingRef.current = null;
+    setDirty(false);
     setSaving(true);
     try {
       await saveRef.current(payload);
@@ -184,6 +190,7 @@ export function useAutosaveDocument<D>(opts: UseAutosaveDocumentOptions<D>): Use
   }, [sendPending]);
 
   const patch = useCallback((p: Partial<D> | ((d: D) => D)) => {
+    if (docLoadedRef.current) setDirty(true);
     setDoc((prev) => {
       if (prev === null) {
         console.error('[useAutosaveDocument] patch called before the document loaded — dropping');
@@ -230,6 +237,7 @@ export function useAutosaveDocument<D>(opts: UseAutosaveDocumentOptions<D>): Use
       // re-send what was just reset, then reload to pick it up.
       dirtyRef.current = false;
       pendingRef.current = null;
+      setDirty(false);
       const next = await loadRef.current();
       setDoc(next);
       setError(null);
@@ -246,5 +254,5 @@ export function useAutosaveDocument<D>(opts: UseAutosaveDocumentOptions<D>): Use
     }
   }, []);
 
-  return { doc, patch, error, saving, savedAt, isDefault, resetField, resetAll };
+  return { doc, patch, error, saving, dirty, savedAt, isDefault, resetField, resetAll };
 }

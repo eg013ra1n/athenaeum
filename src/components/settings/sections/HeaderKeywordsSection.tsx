@@ -3,7 +3,7 @@
 // `useAutosaveDocument`; no Save button, no banner. Below the rows, a preview of how many frames already in the
 // catalog would read differently, and an explicit Apply (confirmed, with progress) that re-reads them.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../../../api';
 import { useNotifications } from '../../../contexts/NotificationContext';
 import { useAutosaveDocument } from '../../../hooks/useAutosaveDocument';
@@ -124,15 +124,19 @@ function FieldRow({ field, order, defaultChain, showReset, onChange, onReset }: 
 function confirmMessage(counts: HeaderFallbackCounts): string {
   const lines = counts.byField
     .filter((c) => c.frames > 0)
-    .map((c) => `${HEADER_FIELD_LABELS[c.field]}: ${c.frames} frames`);
+    .map((c) => `${HEADER_FIELD_LABELS[c.field]}: ${c.frames} ${plural(c.frames, 'frame', 'frames')}`);
   if (counts.valuesKept > 0) lines.push(`Values you set yourself stay as they are (${counts.valuesKept}).`);
   if (counts.setsRegrouped > 0) {
     lines.push(
-      `Darks, flats and bias in ${counts.setsRegrouped} calibration sets will be grouped again. Lights linked to them are matched again at the next matching.`,
+      `Darks, flats and bias in ${counts.setsRegrouped} ${plural(counts.setsRegrouped, 'calibration set', 'calibration sets')} will be grouped again. Lights linked to them are matched again at the next matching.`,
     );
   }
   if (counts.framesWithoutHeader > 0) {
-    lines.push(`${counts.framesWithoutHeader} frames have no stored header and are not changed.`);
+    lines.push(
+      counts.framesWithoutHeader === 1
+        ? '1 frame has no stored header and is not changed.'
+        : `${counts.framesWithoutHeader} frames have no stored header and are not changed.`,
+    );
   }
   return lines.join('\n');
 }
@@ -141,7 +145,7 @@ export function HeaderKeywordsSection() {
   const { defaults } = useSettingsDefaults();
   const { notify } = useNotifications();
 
-  const { doc, patch, error, saving, savedAt, isDefault, resetField, resetAll } =
+  const { doc, patch, error, saving, dirty, savedAt, isDefault, resetField, resetAll } =
     useAutosaveDocument<HeaderFallbackConfig>({
       load: () => api.invoke<HeaderFallbackConfig>('get_header_fallbacks'),
       save: (config) => api.invoke('set_header_fallbacks', { config }),
@@ -150,7 +154,15 @@ export function HeaderKeywordsSection() {
       label: 'FITS keywords',
     });
 
-  const { counts, refresh } = useHeaderFallbackPreview({ enabled: doc !== null, savedAt });
+  const { counts, current, refresh } = useHeaderFallbackPreview({ enabled: doc !== null, savedAt });
+
+  // Apply re-reads the frames under the rules the server has stored. It is offered, and the confirm stands, only while
+  // the screen's rules are those stored ones (nothing waiting to be saved, no save running, none refused) and `counts`
+  // is the preview of them. The refs let a click or confirm that follows a state change within one event re-check.
+  const ready = counts !== null && current && !dirty && !saving && error === null;
+  const readyRef = useRef(ready);
+  readyRef.current = ready;
+  const applyingRef = useRef(false);
 
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -184,7 +196,22 @@ export function HeaderKeywordsSection() {
     };
   }, []);
 
+  // A confirm the rules outran closes; it does not come back on its own with the new counts.
+  useEffect(() => {
+    if (!ready) setConfirmOpen(false);
+  }, [ready]);
+
+  const openConfirm = () => {
+    if (!readyRef.current || applyingRef.current) return;
+    setConfirmOpen(true);
+  };
+
   const apply = async () => {
+    if (!readyRef.current || applyingRef.current) {
+      setConfirmOpen(false);
+      return;
+    }
+    applyingRef.current = true;
     setConfirmOpen(false);
     setProgress(null);
     setConfirmed(counts);
@@ -195,7 +222,7 @@ export function HeaderKeywordsSection() {
         kind: 'generic',
         tone: 'success',
         title: 'FITS keywords applied',
-        detail: `${done.framesChanged} frames changed, ${done.setsRegrouped} calibration sets grouped again.`,
+        detail: `${done.framesChanged} ${plural(done.framesChanged, 'frame', 'frames')} changed, ${done.setsRegrouped} ${plural(done.setsRegrouped, 'calibration set', 'calibration sets')} grouped again.`,
       });
       refresh();
     } catch (err) {
@@ -208,6 +235,7 @@ export function HeaderKeywordsSection() {
         detail: errMsg(err),
       });
     } finally {
+      applyingRef.current = false;
       setApplying(false);
     }
   };
@@ -274,7 +302,7 @@ export function HeaderKeywordsSection() {
                 .map((c) => `${HEADER_FIELD_LABELS[c.field]} ${c.frames}`)
                 .join(' · ')}
             </p>
-            <Button variant="primary" disabled={applying || saving} onClick={() => setConfirmOpen(true)}>
+            <Button variant="primary" disabled={applying || !ready} onClick={openConfirm}>
               {applying ? progressLabel : 'Apply to catalog'}
             </Button>
           </div>
@@ -288,7 +316,7 @@ export function HeaderKeywordsSection() {
       )}
 
       <ConfirmDialog
-        isOpen={confirmOpen && counts !== null}
+        isOpen={confirmOpen && ready}
         title="Apply FITS keywords to the catalog?"
         message={counts ? confirmMessage(counts) : ''}
         confirmText="Apply"
