@@ -89,7 +89,7 @@ struct Computed {
 
 /// The recorded rows, upstream first. A row is recorded by hand (see the module doc).
 const GOLDENS: &[Golden] = &[
-    // aarch64-macos, macOS 27.2.1 (sw_vers -productVersion), rustafits a8e6b79 (v1.8.0-14-ga8e6b79, the revision the workspace locks).
+    // aarch64-macos, macOS 27.2.1 (sw_vers -productVersion), rustafits 1.9.0 (a8e6b79, v1.9.0-2, the revision the workspace locks).
     Golden { stage: "measure", platform: "aarch64-macos", versions: &[("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0x15dfd60956642ce3 },
     Golden { stage: "pass1_artifact", platform: "aarch64-macos", versions: &[("MEASURE_STAGE_VERSION", 1), ("PASS1_ARTIFACT_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0x312dae5cab562ff8 },
     Golden { stage: "register", platform: "aarch64-macos", versions: &[("ALIGN_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xb6d64ba321698e0a },
@@ -408,13 +408,13 @@ fn compute(pool: &Arc<rayon::ThreadPool>) -> Vec<Computed> {
     };
     let ln_sidecar = d.join("ln_member.athln");
     pool.install(|| {
-        let for_detection = LnReferenceForDetection::build(&ln_reference, PsfModel::Moffat4, 200, None, None);
+        let for_detection = LnReferenceForDetection::build(&ln_reference, PsfModel::Moffat4, 200, Some(pool), None);
         let ref_models: Vec<BackgroundModel> = ln_reference
             .planes
             .iter()
             .map(|p| {
                 BackgroundModel::fit(
-                    TileTable::measure(p, ln_reference.width, ln_reference.height, &CLEANING, None),
+                    TileTable::measure(p, ln_reference.width, ln_reference.height, &CLEANING, Some(pool)),
                     ln_cfg.scale,
                 )
                 .expect("the fixture reference has a background")
@@ -474,7 +474,7 @@ fn compute(pool: &Arc<rayon::ThreadPool>) -> Vec<Computed> {
         location_tgt: 0.1875,
     };
     let grid_path = d.join("literal.athln");
-    LnFrameGrids { channels: vec![grid] }.write(&grid_path).unwrap();
+    pool.install(|| LnFrameGrids { channels: vec![grid] }.write(&grid_path).unwrap());
     rows.push(Computed {
         stage: "ln_grid_format",
         versions: &["LN_GRID_VERSION"],
@@ -755,11 +755,14 @@ fn compute(pool: &Arc<rayon::ThreadPool>) -> Vec<Computed> {
         cos_light[k] = 4000.0;
     }
     let cos_dark_path = write_mono(d, "cos_dark.fits", 64, 64, &cos_dark);
-    let map = match hot_pixel_map_from_dark(&cos_dark_path, d).unwrap() {
-        HotPixelMapOutcome::Map(m) => m,
-        HotPixelMapOutcome::Refused(why) => panic!("the cosmetic fixture's dark was refused: {why}"),
-    };
-    let corrected_count = apply_hot_pixel_correction(&mut cos_light, 64, 64, &map, None);
+    let (map, corrected_count) = pool.install(|| {
+        let map = match hot_pixel_map_from_dark(&cos_dark_path, d).unwrap() {
+            HotPixelMapOutcome::Map(m) => m,
+            HotPixelMapOutcome::Refused(why) => panic!("the cosmetic fixture's dark was refused: {why}"),
+        };
+        let corrected_count = apply_hot_pixel_correction(&mut cos_light, 64, 64, &map, None);
+        (map, corrected_count)
+    });
     rows.push(Computed {
         stage: "cosmetic",
         versions: &["LIGHT_CAL_VERSION"],

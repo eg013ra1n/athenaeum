@@ -2066,28 +2066,42 @@ mod tests {
     }
 
     /// Starloom phase 1 (P1-R1): `MEASURE_STAGE_VERSION` enters the three fit-reading subtrees only past 1, so no pinned
-    /// hash moves at 1 and a bump moves each of the three.
+    /// hash moves at 1 and a bump moves each of the three. The shipped subtrees are judged against the unfolded
+    /// helpers, so a future bump of the constant moves no assert here.
     #[test]
     fn measure_stage_version_folds_only_past_1() {
         let cfg = StackingConfig::default();
-        for (name, shipped) in [
-            ("measurement", measurement_subtree(&cfg)),
-            ("registration", registration_subtree(&cfg)),
-            ("normalization", normalization_subtree(&cfg)),
+        let mut measurement = measurement_subtree_with_measure_version(&cfg, MEASURE_VERSION);
+        measurement["fitsArtifactVersion"] = serde_json::json!(FITS_ARTIFACT_VERSION);
+        for (name, shipped, unfolded) in [
+            ("measurement", measurement_subtree(&cfg), measurement),
+            (
+                "registration",
+                registration_subtree(&cfg),
+                registration_subtree_with_versions(&cfg, MEASURE_VERSION, ALIGN_VERSION),
+            ),
+            (
+                "normalization",
+                normalization_subtree(&cfg),
+                normalization_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+            ),
         ] {
             assert!(
-                shipped.get("measureStageVersion").is_none(),
-                "{name}: the key is absent at version 1"
+                unfolded.get("measureStageVersion").is_none(),
+                "{name}: the unfolded helper holds no measure-stage key"
             );
-            let mut at_one = shipped.clone();
+            let mut expected = unfolded.clone();
+            fold_measure_stage_version(&mut expected, MEASURE_STAGE_VERSION);
+            assert_eq!(shipped, expected, "{name}: the shipped subtree is the unfolded one with the fold");
+            let mut at_one = unfolded.clone();
             fold_measure_stage_version(&mut at_one, 1);
-            assert_eq!(at_one, shipped, "{name}: folding 1 changes nothing");
-            let mut at_two = shipped.clone();
+            assert_eq!(at_one, unfolded, "{name}: folding 1 changes nothing");
+            let mut at_two = unfolded.clone();
             fold_measure_stage_version(&mut at_two, 2);
             assert_eq!(at_two["measureStageVersion"], serde_json::json!(2), "{name}");
             assert_ne!(
                 stage_hash(&at_two, &[], &[]),
-                stage_hash(&shipped, &[], &[]),
+                stage_hash(&unfolded, &[], &[]),
                 "{name}: folding 2 moves the stage hash"
             );
         }

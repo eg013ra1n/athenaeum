@@ -1938,9 +1938,12 @@ impl FramePass1 {
 
     /// Test-only: makes this first pass's stored bytes deterministic. The identity's modification time becomes the Unix
     /// epoch (its length, the file's own, stays), and every wall-clock field the artifact writes becomes zero.
+    ///
+    /// The fixed first pass equals one read back from disk: the postcard round trip resets the unstored `population` and
+    /// `sub`, which a stored prep never holds.
     #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
     // doc(hidden): an SL-17 test hook (test-support)
+    #[doc(hidden)]
     pub fn fix_stamp_and_zero_timings(&mut self) {
         if let Some(id) = self.identity.as_mut() {
             id.modified = Some(std::time::UNIX_EPOCH);
