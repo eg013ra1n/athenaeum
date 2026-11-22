@@ -38,7 +38,12 @@ const THIRD_PARTY_ERROR_ONLY: [&str; 2] = ["net_report", "iroh::net_report"];
 const MODULE_TARGETS: [(&str, &[&str]); 5] = [
     ("scanner", &["athenaeum_core::scanner"]),
     ("solver", &["athenaeum_core::plate_solve", "solvemyastro"]),
-    ("calibration", &["athenaeum_core::calibration"]),
+    // `calibration_library` is the master-calibration kernel that moves into the starloom crate
+    // (its events then carry `starloom::calibration_library::…`), so both spellings ride the switch.
+    (
+        "calibration",
+        &["athenaeum_core::calibration", "starloom::calibration_library"],
+    ),
     (
         "archive",
         &["athenaeum_core::archive", "athenaeum_core::file_op"],
@@ -214,6 +219,17 @@ mod tests {
                 quiet_suffix()
             )
         );
+    }
+    #[test]
+    fn calibration_category_covers_starloom_targets() {
+        // Code that moves into the starloom crate logs under `starloom::<module path>`;
+        // the calibration category must switch both spellings together.
+        let mut cfg = LoggingConfig::default();
+        cfg.modules.insert("calibration".into(), "debug".into());
+        let d = cfg.to_directives();
+        assert!(d.contains("athenaeum_core::calibration=debug"), "{d:?}");
+        assert!(d.contains("starloom::calibration_library=debug"), "{d:?}");
+        assert!(d.parse::<tracing_subscriber::EnvFilter>().is_ok());
     }
     #[test]
     fn transport_module_overrides_the_third_party_quiet_baseline() {

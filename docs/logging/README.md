@@ -32,7 +32,16 @@ syntax):
 ATHENAEUM_LOG=debug                                    # everything at debug
 ATHENAEUM_LOG=info,athenaeum_core::scanner=trace       # per-item scanner detail
 ATHENAEUM_LOG=warn,solvemyastro=debug                  # quiet app, chatty solver
+ATHENAEUM_LOG=info,athenaeum_core::stacking=debug,starloom::stacking=debug   # the stacking kernel, before and after its move
+ATHENAEUM_LOG=info,athenaeum_core::calibration_library=debug,starloom::calibration_library=debug
 ```
+
+Code that moves to the starloom crate logs under `starloom::<module path>` (for
+example `starloom::stacking::run`, `starloom::integration`,
+`starloom::calibration_library`), so a filter or a log-MCP target query for
+`stacking`, `integration` or `calibration_library` names both prefixes; the UI's
+`calibration` category switches `athenaeum_core::calibration` and
+`starloom::calibration_library` together.
 
 The UI shows a banner ("Log level is overridden by ATHENAEUM_LOG on this
 server") while `ATHENAEUM_LOG` is set; UI changes still persist but stay
