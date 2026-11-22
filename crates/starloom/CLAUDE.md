@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in `starloom`, the stacking kernel crate. The crate is standalone-publishable: keep it free of Athenaeum items (no catalog, Settings or `ATH_*` vocabulary).
+Guidance for Claude Code working in `starloom`, the stacking kernel crate. The crate is standalone-publishable: keep it free of Athenaeum items (no catalog or Settings; it writes and reads no `ATH_*` card of its own, though a few log strings and doc comments still name Athenaeum cards until phase 1).
 
 ## Layers
 

@@ -413,6 +413,30 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **No "manual block" for calibration auto-links.** | `unlink_calibration_for_frames`, Find Calibration | Owner, 2026-10-31: not needed. An unlinked auto link may come back on the next Find Calibration, while a manual choice sticks. |
 | **Perseus 0.5.1 Library behaviour.** | The Perseus Library | Owner, 2026-10-31. Ratified: selection across directories; the in-flight gate that blocks a divert while a sibling batch is Delivered or Waiting; the chip naming the original batch after a re-send. Not ratified: a file deleted by hand is found only on restart (see Owner rulings, To do). |
 
+## Deferred to starloom phase 1 (2026-11-22)
+
+Not smokes: work the phase-0 move left on purpose (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`).
+
+- **Renames and hidden items.** `write_xisf_f32_with_with_creator` and `write_image_f32_with_with_creator` get their
+  final names; the `#[doc(hidden)] pub` items made public by the move (`FitsInfo`, `probe_fits`, `fits_info_from_reader`,
+  `release_ln_row_buffers`, `check_pass1_head`, `common_psf_snr`, `included_after_min_weight`, `large_scale_passes`,
+  `positions_in_crop`, `low_inlier_frames`, `PREFIX_LEN`, `median_f64`, `clamp_configured_mb`, `per_job_budget`) are
+  either given a designed API or made private; the `ATH_*` names kept verbatim in starloom's `tracing` message strings
+  (`calibration_library/light_cal.rs`, about lines 667, 734 and 741) lose them together with a log-text change that is
+  accepted on purpose.
+- **Shim globs can expose future fact-less starloom entry points** under `athenaeum_core::` paths
+  (`stacking/measure.rs`, `calibration_library/light_cal.rs`, `stacking/ln/reference.rs`, `fits_writer/mod.rs`). Before
+  phase 2's CLI: explicit re-export lists, or a core test pinning the fact-bearing names.
+- **Duplicate copies.** `sync_best_effort` (starloom `fs_util.rs` vs core `zip_store/fs.rs`), the memory-probe helpers and
+  the two effective-memory rules: one copy in starloom, re-exported by core.
+- **Core `solver` without `render` pulls rustafits** (`crates/athenaeum-core/Cargo.toml`, lines 193-196): a `cargo tree` CI
+  line, or accept it in the spec.
+- **The base layer carries stack-only dependencies** (`postcard`; `serde_json` and `chrono` are non-optional).
+- **Comments pointing into the Athenaeum repo** (for example `integration/combine.rs` lines 3 and 2424, `stats.rs` lines
+  56-57): clean at the phase-3 squash.
+- **Optional: direct evidence that no user cache is recomputed.** Run a stacking plan with the branch build on the
+  `tierA-starloom-main` catalog copy and confirm zero stale stages, before the rulers are deleted.
+
 ---
 
 ## Unverified by hand
@@ -427,13 +451,6 @@ through the web host (set 204 masters, registration rows, LN files, calibrated f
 - **A stack run in the desktop window.** In `npm run tauri dev` on the dev catalog, stack one small set (a few lights, one
   group): the run completes and the master opens in the viewer. The same core path ran end to end through `athenaeum-web`
   byte-identical; this is the desktop-only check.
-- **Phase-1 renames and hidden items (deferred, not smokes).** `write_xisf_f32_with_with_creator` and
-  `write_image_f32_with_with_creator` get their final names; the `#[doc(hidden)] pub` items made public by the move
-  (`FitsInfo`, `probe_fits`, `fits_info_from_reader`, `release_ln_row_buffers`, `check_pass1_head`, `common_psf_snr`,
-  `included_after_min_weight`, `large_scale_passes`, `positions_in_crop`, `low_inlier_frames`, `PREFIX_LEN`, `median_f64`,
-  `clamp_configured_mb`, `per_job_budget`) are either given a designed API or made private; the `ATH_*` names kept
-  verbatim in starloom's `tracing` message strings (`calibration_library/light_cal.rs`, about lines 667, 734 and 741) lose
-  them together with a log-text change that is accepted on purpose.
 
 ### Move removes the folders it empties (2026-11-21)
 

@@ -6,8 +6,6 @@
 
 use std::sync::OnceLock;
 
-
-
 /// One `Key:   123 kB` line of `/proc/meminfo` or `/proc/self/status`, in bytes.
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub(crate) fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
@@ -62,7 +60,6 @@ fn cgroup_limit(v2: Option<&str>, v1: Option<&str>) -> Option<u64> {
 // macOS
 // ---------------------------------------------------------------------------
 
-
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn sysctl_raw<T: Copy>(name: &str, out: &mut T) -> bool {
     let cname = match std::ffi::CString::new(name) {
@@ -101,7 +98,6 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 // Linux
 // ---------------------------------------------------------------------------
 
-
 #[cfg(target_os = "linux")]
 fn read_trimmed(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
@@ -124,7 +120,6 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 // ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
-
 
 #[cfg(windows)]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
@@ -172,7 +167,6 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 // ---------------------------------------------------------------------------
 // Anything else
 // ---------------------------------------------------------------------------
-
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {

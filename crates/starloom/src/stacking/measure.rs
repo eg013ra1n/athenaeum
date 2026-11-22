@@ -516,9 +516,9 @@ pub struct PlaneMeasurement {
     /// structure seeds dropped, the extended flags; the probe's `sigmaF`, `sigmaFMeasured`, `noiseGain`,
     /// `structureDropped`, `extendedSeeds`); `None` for the other detectors. Reported, not persisted.
     pub detection: Option<sm::DetectionReport>,
-    /// The gain the stars' SNR used, e- per ADU of the working-unit plane (Plan A Task 11, ruling R11-6: the header's
-    /// the caller's gain, e- per calibrated unit, over 65535; the probe's `snrGain`); `None` = no gain, the shot term was omitted. Reported,
-    /// not persisted (not in [`ChannelMeasurement`], so no cached `metrics` payload changes).
+    /// The gain the stars' SNR used, e- per ADU of the working-unit plane (Plan A Task 11, ruling R11-6: the caller's
+    /// gain, e- per calibrated unit, over 65535; the probe's `snrGain`); `None` = no gain, the shot term was omitted.
+    /// Reported, not persisted (not in [`ChannelMeasurement`], so no cached `metrics` payload changes).
     pub snr_gain: Option<f64>,
     /// The accepted fits without an SNR (no ring sky; the probe's `snrMissing`). Reported, not persisted.
     pub snr_missing: usize,

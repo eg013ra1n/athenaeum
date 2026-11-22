@@ -2,7 +2,6 @@
 //! constants. A starloom bump changes output bits, so Athenaeum accepts it on purpose: this test names each value
 //! the application was last checked against.
 
-#[cfg(feature = "render")]
 use starloom::calibration_library::LIGHT_CAL_VERSION;
 #[cfg(feature = "solver")]
 use starloom::stacking::config::DRIZZLE_KERNEL_VERSION;
@@ -29,8 +28,8 @@ fn starloom_versions_are_the_accepted_ones() {
     assert_eq!(LN_GRID_VERSION, 1, "LN_GRID_VERSION (the .athln version): {accepted}");
 }
 
-// Light calibration lives under `engine`, so these two stay checked in a `render`-only build.
-#[cfg(feature = "render")]
+// `LIGHT_CAL_VERSION` is a base-layer starloom constant and `LIGHT_CAL_ENGINE_VERSION` is ungated in core, so these
+// two are checked in every build, headless included.
 #[test]
 fn starloom_light_cal_versions_are_the_accepted_ones() {
     let accepted = "a starloom bump changed this version: accept it on purpose (spec SL-19)";

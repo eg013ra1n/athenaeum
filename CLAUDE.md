@@ -15,7 +15,7 @@ Cargo workspace + git submodule:
 - `crates/athenaeum-tauri/` — desktop shell. `commands/` modules thinly wrap `athenaeum-core`.
 - `crates/athenaeum-web/` — Axum HTTP/SSE server for the Docker/web build. `routes/` modules mirror Tauri commands one-for-one.
 - `rustafits/` — git submodule (FITS image rendering); path dep of `core` + `tauri`.
-- `crates/starloom/` — the stacking kernel (geometry, resampling, integration engine, light-calibration math, FITS/XISF writer core, registration, measurement, rejection, drizzle, weighting); a standalone crate (own `CLAUDE.md`, no `ATH_*` vocabulary) with features base / `engine` / `stack` / `ts` / `test-support`. Core re-exports it at the old paths.
+- `crates/starloom/` — the stacking kernel (geometry, resampling, integration engine, light-calibration math, FITS/XISF writer core, registration, measurement, rejection, drizzle, weighting); a standalone crate (own `CLAUDE.md`; writes and reads no `ATH_*` card of its own, though a few log strings and doc comments still name Athenaeum cards until phase 1) with features base / `engine` / `stack` / `ts` / `test-support`. Core re-exports it at the old paths.
 - `src/` — React/TS frontend. `src/api/` abstracts Tauri IPC vs HTTP/SSE behind a single `api` object selected by `VITE_TARGET`.
 
 ## Critical Rules
