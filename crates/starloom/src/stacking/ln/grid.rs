@@ -49,6 +49,8 @@ use crate::resample::kernels::Interpolation;
 
 const MAGIC: &[u8; 8] = b"ATHLN\0\0\0";
 const VERSION: u32 = 1;
+/// The `.athln` sidecar version, public for the dependent crate's version tripwire.
+pub const LN_GRID_VERSION: u32 = VERSION;
 /// Header size up to and including the channel count (magic + version +
 /// ref_width + ref_height + scale + channels), all `u32`/8-byte magic.
 const HEADER_LEN: usize = 8 + 4 * 5;
