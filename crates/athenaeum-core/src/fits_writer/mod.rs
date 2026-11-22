@@ -10,7 +10,7 @@ pub mod xisf_patch;
 /// The XISF writers under their old paths: the library's items, with the three plain writers that reach the
 /// `CreatorApplication` property replaced by wrappers that pass [`athenaeum_creator`].
 pub mod xisf_writer {
-    pub use starloom::fits_writer::xisf_writer::*;
+    pub use starloom::fits_writer::xisf_writer::{escape_xml, xisf_keyword_value};
     use starloom::fits_writer::xisf_writer as lib;
     use starloom::fits_writer::{Card, FitsWriteError};
     use super::{athenaeum_creator, Durability, XisfBounds};
@@ -27,7 +27,17 @@ pub mod xisf_writer {
         data: &[f32],
         cards: &[Card],
     ) -> Result<(), FitsWriteError> {
-        lib::write_xisf_f32_with_creator(path, width, height, channels, data, cards, &athenaeum_creator())
+        lib::write_xisf_f32_full(
+            path,
+            width,
+            height,
+            channels,
+            data,
+            cards,
+            XisfBounds::Unit,
+            Durability::Durable,
+            &athenaeum_creator(),
+        )
     }
 
     /// [`lib::write_xisf_f32_with`] with Athenaeum's `CreatorApplication`.
@@ -41,7 +51,7 @@ pub mod xisf_writer {
         bounds: XisfBounds,
         durability: Durability,
     ) -> Result<(), FitsWriteError> {
-        lib::write_xisf_f32_with_with_creator(
+        lib::write_xisf_f32_full(
             path,
             width,
             height,
@@ -64,7 +74,7 @@ pub mod xisf_writer {
         cards: &[Card],
         bounds: XisfBounds,
     ) -> Result<(), FitsWriteError> {
-        lib::write_xisf_f32_to_with_creator(w, width, height, channels, data, cards, bounds, &athenaeum_creator())
+        lib::write_xisf_f32_to_full(w, width, height, channels, data, cards, bounds, &athenaeum_creator())
     }
 }
 // Consumes plate_solve::storage::PlateSolveRecord, which is itself gated —
@@ -99,7 +109,7 @@ pub fn write_image_f32(
     format: OutputFormat,
     bounds: XisfBounds,
 ) -> Result<(), card::FitsWriteError> {
-    starloom::fits_writer::write_image_f32_with_creator(
+    starloom::fits_writer::write_image_f32_full(
         path,
         width,
         height,
@@ -108,6 +118,7 @@ pub fn write_image_f32(
         cards,
         format,
         bounds,
+        Durability::Durable,
         &athenaeum_creator(),
     )
 }
@@ -127,7 +138,7 @@ pub fn write_image_f32_with(
     bounds: XisfBounds,
     durability: Durability,
 ) -> Result<(), card::FitsWriteError> {
-    starloom::fits_writer::write_image_f32_with_with_creator(
+    starloom::fits_writer::write_image_f32_full(
         path,
         width,
         height,
@@ -190,5 +201,41 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned();
         assert!(text.contains(&want), "write_image_f32_with: {text}");
+    }
+
+    /// Core's container switch passes its caller's `bounds` through (starloom phase 1): a file written with
+    /// `XisfBounds::Adu16` carries `bounds="0:65535"` and equals the direct call to starloom's full form, both with
+    /// Athenaeum's creator, once the wall-clock `XISF:CreationTime` line is dropped.
+    #[test]
+    fn core_write_image_f32_keeps_the_callers_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<f32> = (0..16).map(|i| i as f32 / 16.0).collect();
+        let via_core = dir.path().join("core.xisf");
+        write_image_f32(&via_core, 4, 4, 1, &data, &[], OutputFormat::Xisf, XisfBounds::Adu16).unwrap();
+        let direct = dir.path().join("direct.xisf");
+        starloom::fits_writer::write_image_f32_full(
+            &direct,
+            4,
+            4,
+            1,
+            &data,
+            &[],
+            OutputFormat::Xisf,
+            XisfBounds::Adu16,
+            Durability::Durable,
+            &athenaeum_creator(),
+        )
+        .unwrap();
+        let without_clock = |p: &std::path::Path| -> String {
+            String::from_utf8_lossy(&std::fs::read(p).unwrap())
+                .lines()
+                .filter(|l| !l.contains("XISF:CreationTime"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (a, b) = (without_clock(&via_core), without_clock(&direct));
+        assert!(a.contains("bounds=\"0:65535\""), "{a}");
+        assert!(b.contains("bounds=\"0:65535\""), "{b}");
+        assert_eq!(a, b);
     }
 }

@@ -8,7 +8,12 @@ use crate::fits_writer::{Card, CardValue};
 use crate::stacking::master_cards::ATH_STK_VERSION;
 use starloom::stacking::ln::SaturationMask;
 
-pub use starloom::stacking::ln::reference::*;
+// By name: the kernel's own writers (`write_reference`, `write_reference_saturation`) add no scanner-skip pair; the two
+// wrappers below do.
+pub use starloom::stacking::ln::reference::{
+    accumulate_reference_saturation, build_reference, build_reference_saturation, read_reference,
+    read_reference_saturation, read_reference_saturation_masks, reference_saturation_mask, LnReference,
+};
 
 /// The scanner-skip pair `ATH_STK` / `ATH_STKV` — the identical cards (same keywords, same version constant) a master
 /// light stamps — followed by `caller_cards` (e.g. `ATH_STKI`, the run id; `ATH_STKG`, the group key). The kernel puts

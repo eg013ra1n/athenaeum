@@ -376,29 +376,6 @@ pub fn write_xisf_f32(
     write_xisf_f32_with(path, width, height, channels, data, cards, XisfBounds::Unit, Durability::Durable)
 }
 
-/// [`write_xisf_f32`] with the `XISF:CreatorApplication` string as a parameter.
-pub fn write_xisf_f32_with_creator(
-    path: &Path,
-    width: usize,
-    height: usize,
-    channels: usize,
-    data: &[f32],
-    cards: &[Card],
-    creator: &str,
-) -> Result<(), FitsWriteError> {
-    write_xisf_f32_with_with_creator(
-        path,
-        width,
-        height,
-        channels,
-        data,
-        cards,
-        XisfBounds::Unit,
-        Durability::Durable,
-        creator,
-    )
-}
-
 /// Write an XISF file at `path`, replacing any existing file only after the
 /// write fully succeeds — [`super::writer::write_fits_f32`]'s contract and
 /// mechanism exactly: validate first (so a bad call never touches `path`),
@@ -418,7 +395,7 @@ pub fn write_xisf_f32_with(
     bounds: XisfBounds,
     durability: Durability,
 ) -> Result<(), FitsWriteError> {
-    write_xisf_f32_with_with_creator(
+    write_xisf_f32_full(
         path,
         width,
         height,
@@ -431,8 +408,9 @@ pub fn write_xisf_f32_with(
     )
 }
 
-/// [`write_xisf_f32_with`] with the `XISF:CreatorApplication` string as a parameter.
-pub fn write_xisf_f32_with_with_creator(
+/// The one full form of the XISF file writer: [`write_xisf_f32_with`] with the `XISF:CreatorApplication` string as a
+/// parameter, every other parameter explicit.
+pub fn write_xisf_f32_full(
     path: &Path,
     width: usize,
     height: usize,
@@ -454,7 +432,7 @@ pub fn write_xisf_f32_with_with_creator(
     let write_result = (|| -> Result<(), FitsWriteError> {
         let f = std::fs::File::create(&tmp)?;
         let mut w = std::io::BufWriter::new(f);
-        write_xisf_f32_to_with_creator(&mut w, width, height, channels, data, cards, bounds, creator)?;
+        write_xisf_f32_to_full(&mut w, width, height, channels, data, cards, bounds, creator)?;
         w.flush()?;
         if durability == Durability::Durable {
             // Power-loss durability: data must be on disk before the rename
@@ -487,11 +465,12 @@ pub fn write_xisf_f32_to<W: Write>(
     cards: &[Card],
     bounds: XisfBounds,
 ) -> Result<(), FitsWriteError> {
-    write_xisf_f32_to_with_creator(w, width, height, channels, data, cards, bounds, STARLOOM_CREATOR)
+    write_xisf_f32_to_full(w, width, height, channels, data, cards, bounds, STARLOOM_CREATOR)
 }
 
-/// [`write_xisf_f32_to`] with the `XISF:CreatorApplication` string as a parameter.
-pub fn write_xisf_f32_to_with_creator<W: Write>(
+/// The one full form of the XISF streaming writer: [`write_xisf_f32_to`] with the `XISF:CreatorApplication` string as
+/// a parameter.
+pub fn write_xisf_f32_to_full<W: Write>(
     mut w: W,
     width: usize,
     height: usize,
@@ -990,7 +969,7 @@ mod tests {
         text[start..start + text[start..].find('"').expect("the property value is closed")].to_string()
     }
 
-    /// The plain writer names the library; a `_with_creator` writer names its caller's string.
+    /// The plain writer names the library; the full form names its caller's string.
     #[test]
     fn starloom_xisf_creator_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -1000,7 +979,7 @@ mod tests {
         assert_eq!(creator_of(&plain), STARLOOM_CREATOR);
         assert!(creator_of(&plain).starts_with("starloom "));
         let custom = dir.path().join("custom.xisf");
-        write_xisf_f32_with_creator(&custom, 4, 4, 1, &data, &[], "x 1").unwrap();
+        write_xisf_f32_full(&custom, 4, 4, 1, &data, &[], XisfBounds::Unit, Durability::Durable, "x 1").unwrap();
         assert_eq!(creator_of(&custom), "x 1");
     }
 }

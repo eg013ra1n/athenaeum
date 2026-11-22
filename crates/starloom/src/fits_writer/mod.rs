@@ -1,7 +1,7 @@
 //! The FITS/XISF writer core: `Durability`, `XisfBounds`, `OutputFormat` and `write_image_f32(_with)`.
 //!
-//! Every writer that reaches the XISF `CREATOR` has a `_with_creator` sibling taking the application string as a
-//! trailing `creator: &str`; the plain names write [`STARLOOM_CREATOR`].
+//! Every writer family that reaches the XISF `CreatorApplication` has plain forms with defaults, which write
+//! [`STARLOOM_CREATOR`], and one `_full` form that takes every parameter, the creator string last.
 
 pub mod bayer;
 pub mod card;
@@ -13,12 +13,11 @@ pub use writer::{
     write_fits_f32_with,
 };
 pub use xisf_writer::{
-    write_xisf_f32, write_xisf_f32_to, write_xisf_f32_to_with_creator, write_xisf_f32_with_creator,
-    write_xisf_f32_with_with_creator, xisf_keyword_value,
+    write_xisf_f32, write_xisf_f32_full, write_xisf_f32_to, write_xisf_f32_to_full, xisf_keyword_value,
 };
 
 /// The default `XISF:CreatorApplication` of a file this crate writes (ruling R-M4d-3). A caller that has its own
-/// application name passes it to a `_with_creator` writer instead.
+/// application name passes it to a `_full` writer instead.
 pub const STARLOOM_CREATOR: &str = concat!("starloom ", env!("CARGO_PKG_VERSION"));
 
 /// Whether a write must survive power loss before its rename makes it
@@ -131,7 +130,7 @@ pub fn write_image_f32_with(
     bounds: XisfBounds,
     durability: Durability,
 ) -> Result<(), card::FitsWriteError> {
-    write_image_f32_with_with_creator(
+    write_image_f32_full(
         path,
         width,
         height,
@@ -145,34 +144,9 @@ pub fn write_image_f32_with(
     )
 }
 
-/// [`write_image_f32`] with the `XISF:CreatorApplication` string as a parameter (a FITS file has no such field).
-pub fn write_image_f32_with_creator(
-    path: &std::path::Path,
-    width: usize,
-    height: usize,
-    channels: usize,
-    data: &[f32],
-    cards: &[card::Card],
-    format: OutputFormat,
-    bounds: XisfBounds,
-    creator: &str,
-) -> Result<(), card::FitsWriteError> {
-    write_image_f32_with_with_creator(
-        path,
-        width,
-        height,
-        channels,
-        data,
-        cards,
-        format,
-        bounds,
-        Durability::Durable,
-        creator,
-    )
-}
-
-/// [`write_image_f32_with`] with the `XISF:CreatorApplication` string as a parameter.
-pub fn write_image_f32_with_with_creator(
+/// The one full form of the container switch: [`write_image_f32_with`] with the `XISF:CreatorApplication` string as a
+/// parameter (a FITS file has no such field).
+pub fn write_image_f32_full(
     path: &std::path::Path,
     width: usize,
     height: usize,
@@ -188,7 +162,7 @@ pub fn write_image_f32_with_with_creator(
         OutputFormat::Fits => {
             writer::write_fits_f32_with(path, width, height, channels, data, cards, durability)
         }
-        OutputFormat::Xisf => xisf_writer::write_xisf_f32_with_with_creator(
+        OutputFormat::Xisf => xisf_writer::write_xisf_f32_full(
             path, width, height, channels, data, cards, bounds, durability, creator,
         ),
     }

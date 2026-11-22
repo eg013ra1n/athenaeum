@@ -10,9 +10,23 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::psf_signal::StarFit;
+// The two gain-taking kernel entries, imported privately: the wrappers below are the only way in.
+use starloom::stacking::measure::{measure_frame_full, measure_frame_pass1_gain};
 use crate::integration::IntegrationError;
 
-pub use starloom::stacking::measure::*;
+// The kernel's names, listed one by one: `measure_frame_full` and `measure_frame_pass1_gain` take the gain as a
+// parameter and stay out, so no entry point without Athenaeum's gain resolves under this path. The four `measure_frame*`
+// wrappers below carry it. The SL-17 test hooks sit on their own line.
+pub use starloom::stacking::measure::{
+    channel_c_inputs, channel_c_summary, check_pass1_head, measure_frame_pass2, measure_plane, measure_plane_detailed,
+    measure_plane_diagnosed, measure_plane_with_seeds, measure_planes_diagnosed, measure_planes_pass1,
+    measure_planes_pass2, measure_planes_with_width_hints, substitute_group_c, ChannelCSummary, ChannelMeasurement,
+    FrameMeasurement, FramePass1, MeasureOptions, MeasureTimings, MeasuredPlane, NoiseSource, PlaneMeasurement,
+    PlanesPass1, SeedOverride, StarPopulation, ADU_SCALE, COLOUR_LIST_STARS, DEFAULT_DETECTION_SIGMA,
+    DEFAULT_SEED_PREFILTER, MONO_LIST_PER_REGISTRATION_STAR,
+};
+#[cfg(feature = "test-support")]
+pub use starloom::stacking::measure::{pass1_peak, PASS1_CANCEL_AFTER, PASS1_LOG, PASS1_TOUCH_AFTER};
 
 /// The calibrated frame's gain in e- per CALIBRATED unit, read from its header (Plan A Task 11, ruling R11-6, PA-22):
 /// `EGAIN` (e- per ADU of the raw sensor) times `ATH_CSCL` (the calibrated light's unit divisor, ADU per unit). `ATH_CFNM`
