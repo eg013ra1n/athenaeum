@@ -26,6 +26,8 @@ byteorder = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
+# The pass-1 artifact's wire encoding.
+postcard = { version = "1", features = ["use-std"] }
 
 # The platform memory probe (`sys::platform_memory`): GlobalMemoryStatusEx and the job-object limits.
 [target.'cfg(windows)'.dependencies]
@@ -49,3 +51,4 @@ unexpected_cfgs = "deny"
 rustafits = { path = "../../rustafits", default-features = false, features = ["serde", "test-support"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+walkdir = "2"

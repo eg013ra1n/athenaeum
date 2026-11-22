@@ -998,6 +998,7 @@ mod tests {
         let plain = dir.path().join("plain.xisf");
         write_xisf_f32(&plain, 4, 4, 1, &data, &[]).unwrap();
         assert_eq!(creator_of(&plain), STARLOOM_CREATOR);
+        assert!(creator_of(&plain).starts_with("starloom "));
         let custom = dir.path().join("custom.xisf");
         write_xisf_f32_with_creator(&custom, 4, 4, 1, &data, &[], "x 1").unwrap();
         assert_eq!(creator_of(&custom), "x 1");

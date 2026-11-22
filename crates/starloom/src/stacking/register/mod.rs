@@ -1,0 +1,519 @@
+//! Registration v2 (spec §3): star detection on calibrated frames, a
+//! quad-seeded correspondence search, RANSAC on the configured linear model,
+//! a σ-weighted refit, optional polynomial distortion, per-frame QA and the
+//! optional registered-frame writer. Per-frame services only — grouping,
+//! reference selection, fan-out and persistence of a whole set belong to
+//! the run orchestration. Coordinates are 0-based pixel centres;
+//! `PixelMap::forward` maps subject → reference.
+
+pub mod align;
+pub mod detect;
+pub mod frame;
+pub mod local_loop;
+pub mod wcs_seed;
+
+use serde::{Deserialize, Serialize};
+
+use crate::resample::Interpolation;
+
+/// A linear scale outside `[1 / SCALE_TOLERANCE, SCALE_TOLERANCE]` of the
+/// reference fails a frame's registration (spec §3.6, `align::SCALE_RANGE`).
+/// M4b (rulings R-M4b-1/7) shares this same tolerance for the plan-time
+/// pixel-scale warning (`stacking::plan::build_plan`) — a group the warning
+/// flags as "far from the reference" is, by construction, the same
+/// situation the per-frame registration gate would refuse a frame over, so
+/// both read one constant rather than risking two numbers drifting apart.
+pub const SCALE_TOLERANCE: f64 = 1.25;
+
+/// The acceptance window one frame's fitted linear scale must land in
+/// (M4b Task 2, ruling R-M4b-2). M1 compared every frame against a fixed
+/// `[0.8, 1.25]`, which silently assumed the whole set shares one pixel
+/// scale; a set that genuinely mixes scales expects a RATIO, so the window
+/// is centred on the frame's own implied ratio to the reference and keeps
+/// the same [`SCALE_TOLERANCE`] either side of it.
+///
+/// The ratio is `frame / reference` when both scales are known, finite and
+/// positive — otherwise 1.0, which reproduces `align::SCALE_RANGE` bit for
+/// bit, so a set whose frames carry no pixel scale at all behaves exactly
+/// as it did before M4b.
+pub fn scale_gate_for(frame_scale: Option<f64>, reference_scale: Option<f64>) -> (f64, f64) {
+    let ratio = scale_ratio_for(frame_scale, reference_scale);
+    (ratio / SCALE_TOLERANCE, ratio * SCALE_TOLERANCE)
+}
+
+/// The scale ratio [`scale_gate_for`] centres its window on: `frame /
+/// reference` when both scales are known, finite and positive, else 1.0.
+///
+/// It is public because the WCS-seed trigger (rulings R-T2-1, R-T6-4) has
+/// to read the SAME number the gate is built from — deciding "is a scale
+/// step expected here?" by comparing the resulting window against
+/// `align::SCALE_RANGE` would be exact float equality on a quotient of two
+/// measured quantities, and two plate solves of one rig disagree by
+/// anything from a part in ten thousand to well over a percent. One rule,
+/// two readers, no way for them to disagree; see
+/// `wcs_seed::ratio_wants_seed` for the tolerance the trigger applies.
+pub fn scale_ratio_for(frame_scale: Option<f64>, reference_scale: Option<f64>) -> f64 {
+    match (frame_scale, reference_scale) {
+        (Some(frame), Some(reference))
+            if frame.is_finite() && reference.is_finite() && frame > 0.0 && reference > 0.0 =>
+        {
+            frame / reference
+        }
+        _ => 1.0,
+    }
+}
+
+/// A registration that kept fewer refit inliers than this share of its
+/// group's median is flagged by [`low_inlier_frames`] (robust quad seed RQ-6).
+const LOW_INLIER_SHARE: f64 = 0.5;
+
+/// A group needs this many aligned non-reference frames before its median
+/// means anything.
+const LOW_INLIER_MIN_FRAMES: usize = 3;
+
+/// The frames of one group whose registration kept under half the group's
+/// median refit inliers (robust quad seed RQ-6). `rows` is `(frame_id,
+/// inliers)` of the group's aligned non-reference frames. Returns `None` under
+/// [`LOW_INLIER_MIN_FRAMES`] rows, else `(median, flagged)`: the numpy median
+/// and the rows with `inliers < 0.5 * median`, in input order.
+#[doc(hidden)]
+pub fn low_inlier_frames(rows: &[(i64, usize)]) -> Option<(f64, Vec<(i64, usize)>)> {
+    if rows.len() < LOW_INLIER_MIN_FRAMES {
+        return None;
+    }
+    let mut counts: Vec<f64> = rows.iter().map(|r| r.1 as f64).collect();
+    let median = crate::stacking::groups::median_f64(&mut counts);
+    let flagged = rows
+        .iter()
+        .copied()
+        .filter(|r| (r.1 as f64) < LOW_INLIER_SHARE * median)
+        .collect();
+    Some((median, flagged))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelChoice {
+    /// Homography from 30 correspondences, affine from 12, similarity below.
+    #[default]
+    Auto,
+    Similarity,
+    Affine,
+    Homography,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum DistortionChoice {
+    #[default]
+    Off,
+    Polynomial2,
+    Polynomial3,
+    Polynomial4,
+    /// A regularized thin-plate spline over the refit inliers (M4c,
+    /// ruling R-M4c-5): local by construction, so it follows a residual
+    /// field a global polynomial of order 2..=4 cannot. `Auto` never
+    /// picks it; it is always a deliberate user choice.
+    ///
+    /// **What it costs** (ruling R-T4-6e, numbers corrected in fix round
+    /// 3). A spline cannot be evaluated per pixel — 600 logarithms per
+    /// query — so every stage that RESAMPLES a frame builds an 8-px
+    /// displacement grid for it first and hands it back when that frame
+    /// is done.
+    ///
+    /// Size, from `TpsGrid::build`'s own formula (`ceil(span / 8) + 2`
+    /// samples per axis over the node box inflated by `DOMAIN_MARGIN`):
+    /// at 6224×4168 that is 936 × 628 × 8 B ≈ **4.5 MB per DIRECTION**,
+    /// and ≈ 1 s to build.
+    ///
+    /// Builds per frame, for a run with local normalization on:
+    ///
+    /// | stage | grids per frame |
+    /// | ---- | ---- |
+    /// | registration writer | 1 (unconditional since perf tier A Task 6a — see below) |
+    /// | local normalization | 0 (reads the materialized registered artifact — no warp); 1 per PLANE on the Task 6a fallback (the artifact is missing/stale for this frame) |
+    /// | integration | 0 (same materialized read; one source per group when it falls back, ruling R-T4-7) |
+    /// | drizzle | 1 per PLANE (the plane loop is the outer one; drizzle still reads the calibrated frame through the forward map, untouched by Task 6a) |
+    ///
+    /// The table above (and the "3 by default"/"7 by default"/"≈ 19
+    /// minutes" totals a v0.6.3 acceptance run measured from it) predates
+    /// perf tier A Task 6a, which made the registered artifact a REQUIRED
+    /// output — Normalize and Integrate now read it verbatim instead of
+    /// re-warping the calibrated frame, so in the ordinary case (the
+    /// artifact is fresh) they build NO grid at all; only the registration
+    /// writer's own build and drizzle's still apply. A frame whose
+    /// materialized artifact is missing or stale falls back to warping on
+    /// the fly for that one stage, at which point its grid cost reverts to
+    /// this table's original count. The resident-grid ceiling this doc goes
+    /// on to describe (one inverse grid per frame for the length of a
+    /// group's integration) still holds — Task 6a changes how many grids
+    /// get BUILT, not how many are held at once.
+    ///
+    /// Registration itself pays nothing extra: its residual statistics,
+    /// its star re-pairing and the local distortion loop all evaluate the
+    /// spline exactly and build no grid at all.
+    Tps,
+    /// Order 3 for a subject whose geometry differs from the reference's,
+    /// when the refit keeps at least `align::AUTO_DISTORTION_MIN_INLIERS`
+    /// inliers whose overlap and regularity indices both reach
+    /// `align::AUTO_DISTORTION_MIN_OVERLAP` / `align::AUTO_DISTORTION_MIN_REGULARITY`.
+    Auto,
+}
+
+impl DistortionChoice {
+    pub fn order(self) -> Option<u8> {
+        match self {
+            DistortionChoice::Polynomial2 => Some(2),
+            DistortionChoice::Polynomial3 => Some(3),
+            DistortionChoice::Polynomial4 => Some(4),
+            DistortionChoice::Off | DistortionChoice::Tps | DistortionChoice::Auto => None,
+        }
+    }
+}
+
+/// Which geometry a run's masters are delivered in (spec §3.8, M4b ruling
+/// R-M4b-4).
+///
+/// `CoRegistered` is M1–M4a's behaviour generalized: ONE reference for the
+/// whole set, every group resampled into its geometry, so every master of
+/// the run shares one pixel grid (and one WCS) whatever pixel scale its own
+/// frames were shot at.
+///
+/// `Native` gives each group its own reference — the group's best-weighted
+/// member, two-pass re-picked per group — and therefore its own geometry
+/// for local normalization, integration, drizzle, the master's WCS and the
+/// rejection bitmaps. No cross-group registration happens at all: a set
+/// mixing a bin-1 and a bin-2 train delivers one master per train at its
+/// own sampling instead of resampling one into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum RegistrationGeometry {
+    #[default]
+    CoRegistered,
+    Native,
+}
+
+/// Detection cuts. There is no detection sigma: the fast detector's
+/// adaptive ladder is threshold-free (it targets `maxStars`), so `minSnr`
+/// is the sensitivity dial.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DetectionConfig {
+    pub min_snr: f32,
+    pub max_eccentricity: f32,
+}
+
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        DetectionConfig {
+            min_snr: 10.0,
+            max_eccentricity: 0.8,
+        }
+    }
+}
+
+/// Spec §9.2 `registration` block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RegistrationConfig {
+    /// M4b (ruling R-M4b-4): co-registered (the default — one reference and
+    /// one geometry for the whole set) or native (a reference and a
+    /// geometry per group). `#[serde(default)]` rides the struct-level
+    /// `default`, so every stored config written before M4b decodes as
+    /// co-registered and no `STACKING_CONFIG_VERSION` bump is needed.
+    pub geometry: RegistrationGeometry,
+    pub model: ModelChoice,
+    pub distortion: DistortionChoice,
+    /// The thin-plate spline's regularization weight `λ` (M4c, ruling
+    /// R-M4c-5) — `0.0` is the interpolating spline, which lands on every
+    /// inlier exactly, and a larger value trades node fidelity for a
+    /// smoother surface that generalizes between them.
+    ///
+    /// Unit: px² of the NORMALIZED frame. The kernel is evaluated on
+    /// coordinates divided by the node cloud's own diagonal, so `|φ|` is
+    /// bounded by 0.184 whatever the sensor, and `λ` is the weight of the
+    /// `λ · wᵀw` penalty against displacements measured in pixels. The
+    /// useful range therefore depends on the node count (the kernel
+    /// block's eigenvalues grow with it): around 0.01 for a few dozen
+    /// nodes, roughly an order of magnitude higher at the 600-node cap.
+    /// Read only by [`DistortionChoice::Tps`]; ignored by every other
+    /// choice.
+    ///
+    /// **The shipped default is `0.5`** (ruling R-T7-1), measured rather
+    /// than guessed: at the 600-node cap on the acceptance set's real
+    /// 26 Mpx frames the hold-out rms was 0.145 / 0.203 px (mono / OSC)
+    /// at `λ = 0`, **0.099 / 0.156 px at `λ = 0.5`** and 0.102 / 0.165 px
+    /// at `λ = 2`. `λ = 0` interpolates the star-position noise — it
+    /// lands every inlier exactly and generalizes worst of the three — so
+    /// the interpolating spline is a deliberate choice now, not what a
+    /// default run gets.
+    pub tps_smoothing: f64,
+    /// The local distortion loop (M4c, ruling R-M4c-7): after the first
+    /// map, up to `align::LOCAL_DISTORTION_ROUNDS` rounds of re-pairing
+    /// every subject star THROUGH the current map at a widening
+    /// tolerance, fitting a corrector homography on what is left and
+    /// refitting the distortion around it. Needs a distortion model to
+    /// refit, so it is a no-op with `distortion: off`.
+    pub local_distortion: bool,
+    pub interpolation: Interpolation,
+    pub clamping_threshold: f32,
+    pub max_stars: usize,
+    pub ransac_tolerance_px: f64,
+    pub ransac_max_iterations: usize,
+    pub max_rms_px: f64,
+    pub fail_on_max_rms: bool,
+    pub detection: DetectionConfig,
+    /// Vestigial since perf tier A Task 6a: the registered artifact became
+    /// the run's REQUIRED per-frame output (Normalize/Integrate read it in
+    /// place of re-warping) and is now written unconditionally — this
+    /// field no longer gates that write. Kept in the schema/UI (the
+    /// `RegisterPanel` "Write registered frames" toggle) only because
+    /// removing it is a command-surface change out of that task's scope; it
+    /// has no observable effect any more.
+    pub write_registered_frames: bool,
+}
+
+impl Default for RegistrationConfig {
+    fn default() -> Self {
+        RegistrationConfig {
+            geometry: RegistrationGeometry::CoRegistered,
+            model: ModelChoice::Auto,
+            distortion: DistortionChoice::Off,
+            // Ruling R-T7-1: the acceptance run's own measurement, not the
+            // interpolating spline — see `tps_smoothing`'s doc.
+            tps_smoothing: 0.5,
+            local_distortion: false,
+            interpolation: Interpolation::BicubicBSpline,
+            clamping_threshold: 0.30,
+            max_stars: 2000,
+            ransac_tolerance_px: 1.9,
+            ransac_max_iterations: 2000,
+            max_rms_px: 2.0,
+            fail_on_max_rms: false,
+            detection: DetectionConfig::default(),
+            write_registered_frames: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M4b ruling R-M4b-2: the gate is a window around the frame's own
+    /// implied scale ratio, and collapses to the M1 fixed window whenever
+    /// that ratio is unknown or 1.
+    #[test]
+    fn the_scale_gate_is_centred_on_the_frames_own_ratio() {
+        let fixed = (1.0 / SCALE_TOLERANCE, SCALE_TOLERANCE);
+        assert_eq!(scale_gate_for(None, None), fixed);
+        assert_eq!(scale_gate_for(Some(0.78), None), fixed);
+        assert_eq!(scale_gate_for(None, Some(0.78)), fixed);
+        assert_eq!(scale_gate_for(Some(0.78), Some(0.78)), fixed);
+
+        // A software-binned frame against a native-scale reference.
+        assert_eq!(scale_gate_for(Some(1.56), Some(0.78)), (1.6, 2.5));
+        // … and the other way round.
+        let (lo, hi) = scale_gate_for(Some(0.78), Some(1.56));
+        assert!(
+            (lo - 0.4).abs() < 1e-12 && (hi - 0.625).abs() < 1e-12,
+            "{lo} {hi}"
+        );
+
+        // Nonsense scales fall back to the fixed window rather than
+        // producing a gate nothing can satisfy.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(scale_gate_for(Some(bad), Some(0.78)), fixed, "{bad}");
+            assert_eq!(scale_gate_for(Some(0.78), Some(bad)), fixed, "{bad}");
+        }
+    }
+
+    /// Ruling R-T2-1: the gate and the WCS-seed trigger read ONE ratio, so
+    /// they cannot disagree about whether a scale step is expected.
+    #[test]
+    fn the_gate_is_built_from_the_shared_ratio() {
+        for (frame, reference) in [
+            (None, None),
+            (Some(0.78), None),
+            (None, Some(0.78)),
+            (Some(0.78), Some(0.78)),
+            (Some(1.56), Some(0.78)),
+            (Some(0.78), Some(1.56)),
+            (Some(0.7800), Some(0.7803)),
+            (Some(f64::NAN), Some(0.78)),
+            (Some(0.0), Some(0.78)),
+        ] {
+            let r = scale_ratio_for(frame, reference);
+            assert_eq!(
+                scale_gate_for(frame, reference),
+                (r / SCALE_TOLERANCE, r * SCALE_TOLERANCE),
+                "{frame:?} / {reference:?}"
+            );
+        }
+        assert_eq!(scale_ratio_for(Some(1.56), Some(0.78)), 2.0);
+        assert_eq!(scale_ratio_for(None, None), 1.0);
+    }
+
+    /// M4b ruling R-M4b-4: the geometry mode is one config field, default
+    /// co-registered — a stored document written before M4b decodes to
+    /// today's behaviour, and the serde spelling is the spec §9.2 one.
+    #[test]
+    fn geometry_defaults_to_co_registered_and_spells_itself_in_camel_case() {
+        assert_eq!(
+            RegistrationGeometry::default(),
+            RegistrationGeometry::CoRegistered
+        );
+        assert_eq!(
+            serde_json::to_string(&RegistrationGeometry::CoRegistered).unwrap(),
+            "\"coRegistered\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RegistrationGeometry::Native).unwrap(),
+            "\"native\""
+        );
+        let native: RegistrationConfig = serde_json::from_str("{\"geometry\":\"native\"}").unwrap();
+        assert_eq!(native.geometry, RegistrationGeometry::Native);
+        // … and every other field still carries its own default.
+        assert_eq!(native.model, ModelChoice::Auto);
+        assert_eq!(native.max_stars, 2000);
+    }
+
+    /// M4c rulings R-M4c-5/7: two fields, both `#[serde(default)]`
+    /// through the struct-level `default`, so a config document written
+    /// before M4c decodes to exactly today's behaviour for the loop (off)
+    /// and to the measured smoothing default for the spline — neither is
+    /// read at all by a default run, whose `distortion` is `off`, so no
+    /// `STACKING_CONFIG_VERSION` bump is needed. `tps` is a valid
+    /// `distortion`, and `Auto` never resolves to it.
+    ///
+    /// Ruling R-T7-1 moved the smoothing default from the interpolating
+    /// `0.0` to `0.5`; the local loop stays off. A stored document that
+    /// spells `tpsSmoothing` out keeps its own value — serde's default
+    /// fills a MISSING field only — so the change reaches exactly the
+    /// documents that omit it.
+    #[test]
+    fn tps_smoothing_defaults_to_the_measured_lambda_and_the_local_loop_to_off() {
+        let d = RegistrationConfig::default();
+        assert_eq!(d.tps_smoothing, 0.5);
+        assert!(!d.local_distortion);
+
+        let pre_m4c: RegistrationConfig =
+            serde_json::from_str("{\"distortion\":\"polynomial3\"}").unwrap();
+        assert_eq!(pre_m4c.tps_smoothing, 0.5);
+        assert!(!pre_m4c.local_distortion);
+
+        // An explicit `0.0` is a choice and survives untouched.
+        let interpolating: RegistrationConfig =
+            serde_json::from_str("{\"distortion\":\"tps\",\"tpsSmoothing\":0.0}").unwrap();
+        assert_eq!(interpolating.tps_smoothing, 0.0);
+
+        let tps: RegistrationConfig = serde_json::from_str(
+            "{\"distortion\":\"tps\",\"tpsSmoothing\":2.5,\"localDistortion\":true}",
+        )
+        .unwrap();
+        assert_eq!(tps.distortion, DistortionChoice::Tps);
+        assert_eq!(tps.tps_smoothing, 2.5);
+        assert!(tps.local_distortion);
+
+        assert_eq!(
+            serde_json::to_string(&DistortionChoice::Tps).unwrap(),
+            "\"tps\""
+        );
+        assert_eq!(DistortionChoice::Tps.order(), None, "a spline has no order");
+    }
+
+    #[test]
+    fn defaults_match_the_spec() {
+        let d = RegistrationConfig::default();
+        assert_eq!(d.geometry, RegistrationGeometry::CoRegistered);
+        assert_eq!(d.model, ModelChoice::Auto);
+        assert_eq!(d.distortion, DistortionChoice::Off);
+        assert_eq!(d.tps_smoothing, 0.5);
+        assert!(!d.local_distortion);
+        assert_eq!(d.interpolation, Interpolation::BicubicBSpline);
+        assert_eq!(d.clamping_threshold, 0.30);
+        assert_eq!(d.max_stars, 2000);
+        assert_eq!(d.ransac_tolerance_px, 1.9);
+        assert_eq!(d.ransac_max_iterations, 2000);
+        assert_eq!(d.max_rms_px, 2.0);
+        assert!(!d.fail_on_max_rms && !d.write_registered_frames);
+        assert_eq!(
+            (d.detection.min_snr, d.detection.max_eccentricity),
+            (10.0, 0.8)
+        );
+    }
+
+    #[test]
+    fn serde_names_and_partial_json() {
+        let json = serde_json::to_string(&RegistrationConfig::default()).unwrap();
+        for needle in [
+            "\"geometry\":\"coRegistered\"",
+            "\"model\":\"auto\"",
+            "\"distortion\":\"off\"",
+            "\"tpsSmoothing\":0.5",
+            "\"localDistortion\":false",
+            "\"interpolation\":\"bicubicBSpline\"",
+            "\"clampingThreshold\":0.3",
+            "\"maxStars\":2000",
+            "\"ransacTolerancePx\":1.9",
+            "\"ransacMaxIterations\":2000",
+            "\"maxRmsPx\":2.0",
+            "\"failOnMaxRms\":false",
+            "\"detection\":{\"minSnr\":10.0,\"maxEccentricity\":0.8}",
+            "\"writeRegisteredFrames\":false",
+        ] {
+            assert!(json.contains(needle), "{needle} missing in {json}");
+        }
+        assert!(
+            !json.contains("sigma"),
+            "no detection sigma: the detector is threshold-free"
+        );
+        let partial: RegistrationConfig = serde_json::from_str("{\"model\":\"homography\",\"distortion\":\"polynomial3\",\"detection\":{\"minSnr\":7.5}}").unwrap();
+        assert_eq!(partial.model, ModelChoice::Homography);
+        assert_eq!(partial.distortion, DistortionChoice::Polynomial3);
+        assert_eq!(partial.detection.min_snr, 7.5);
+        assert_eq!(partial.detection.max_eccentricity, 0.8);
+        assert_eq!(partial.max_stars, 2000);
+        let empty: RegistrationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, RegistrationConfig::default());
+        assert_eq!(
+            serde_json::to_string(&DistortionChoice::Polynomial4).unwrap(),
+            "\"polynomial4\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelChoice::Similarity).unwrap(),
+            "\"similarity\""
+        );
+        assert_eq!(DistortionChoice::Polynomial2.order(), Some(2));
+        assert_eq!(DistortionChoice::Auto.order(), None);
+    }
+
+    /// Robust quad seed RQ-6: a frame whose registration kept under half its group's median inliers is the defect
+    /// that stood through three catalog stages (162: 159 of ~1 600). The median is numpy's, over the group's aligned
+    /// non-reference frames; the flagged frames come back in input order.
+    #[test]
+    fn low_inlier_frames_flags_frames_under_half_the_median() {
+        let rows = [
+            (1, 1_700),
+            (2, 1_745),
+            (3, 1_800),
+            (4, 87),
+            (5, 214),
+            (6, 900),
+        ];
+        let (median, flagged) = low_inlier_frames(&rows).expect("six frames");
+        assert_eq!(median, 1_300.0);
+        assert_eq!(flagged, vec![(4, 87), (5, 214)]);
+        // Exactly half the median is not under it.
+        let (median, flagged) = low_inlier_frames(&[(1, 100), (2, 200), (3, 300)]).unwrap();
+        assert_eq!(median, 200.0);
+        assert!(flagged.is_empty(), "{flagged:?}");
+    }
+
+    /// Two frames carry no median worth judging against.
+    #[test]
+    fn low_inlier_frames_needs_three_frames() {
+        assert_eq!(low_inlier_frames(&[(1, 1_700), (2, 5)]), None);
+        assert_eq!(low_inlier_frames(&[]), None);
+    }
+}

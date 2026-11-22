@@ -6833,6 +6833,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "libc",
+ "postcard",
  "rayon",
  "rustafits",
  "serde",
@@ -6842,6 +6843,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-rs",
+ "walkdir",
  "windows-sys 0.59.0",
  "xxhash-rust",
 ]

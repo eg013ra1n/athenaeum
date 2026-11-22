@@ -1,5 +1,6 @@
 //! Field and photometry helpers for tests (moved from Athenaeum core's `test_support`; core keeps its own whole copy).
-//! Task 6 adds the synthetic star field and the log captures.
+//! The synthetic star field and the log captures (the captures are `cfg(test)` only: they need `tracing-subscriber`,
+//! a dev-dependency).
 
 /// Row-major float plane with Gaussian stars `(x, y, amplitude)` of common
 /// `sigma` on a flat `background`. Pixel centres at integer coordinates.
@@ -387,4 +388,112 @@ pub fn add_donut_gain(data: &mut [f32], w: usize, cx: usize, cy: usize, gain: f6
             data[y * w + x] += (gain * 0.3 * acc / 2000.0) as f32;
         }
     }
+}
+
+/// Sigma-to-FWHM factor of a Gaussian: `2 sqrt(2 ln 2)`.
+const GAUSSIAN_FWHM_FACTOR: f64 = 2.354_820_045_030_949_3;
+
+/// A synthetic star field: a `w x h` plane with one Gaussian per `(x, y, amplitude)` star, each of `fwhm` pixels, on a
+/// background of 0.08, with Gaussian `noise` (`0.0` = none, reproducible via `seed`). Lifted out of `measure.rs`'s own
+/// private `field()` test helper so `ln::scale`'s tests build the same kind of field without duplicating the rendering
+/// step.
+pub fn synthetic_star_field(
+    w: usize,
+    h: usize,
+    stars: &[(f64, f64, f64)],
+    fwhm: f64,
+    noise: f32,
+    seed: u64,
+) -> Vec<f32> {
+    let sigma = fwhm / GAUSSIAN_FWHM_FACTOR;
+    let mut data = gaussian_field(w, h, stars, sigma, 0.08);
+    if noise > 0.0 {
+        add_noise(&mut data, noise, seed);
+    }
+    data
+}
+
+/// A scoped log capture: everything `debug!` and above writes while `f` runs on this thread, with `f`'s result.
+#[cfg(test)]
+pub fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    // tracing-core shortcuts interest to the registering thread's default while only ONE
+    // dispatcher exists; a second, permanent no-op dispatcher turns that off for the binary.
+    static SECOND_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND_DISPATCH
+        .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, f);
+    let bytes = buf.0.lock().unwrap().clone();
+    (out, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Everything `warn!` and below writes while `f` runs on this thread.
+#[cfg(test)]
+pub fn captured_logs(f: impl FnOnce()) -> String {
+    capture_logs(f).1
+}
+
+/// No fixture may seed a raw `canonicalize()` result (a copy of Athenaeum core's guard, walking this crate's `src`).
+///
+/// On Windows `canonicalize` returns a `\\?\` verbatim path, which neither compares equal to the spelling a catalog
+/// stores nor accepts a forward slash as a separator. Deliberately narrow: it walks only `crates/starloom/src` and
+/// matches the `.canonicalize().unwrap()` / `.canonicalize().expect(` method-call spelling only.
+#[cfg(test)]
+#[test]
+fn starloom_fixtures_never_seed_a_raw_canonicalized_path() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders: Vec<String> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&src).into_iter().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        // This file spells the forbidden call in its own guard. Exact-path compare (not a bare filename match) so a
+        // future src/**/test_support.rs elsewhere in the tree is not silently exempt too.
+        if path == src.join("test_support.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("read source");
+        // Drop comment lines so prose about the rule never trips it, then drop all whitespace so a multi-line
+        // builder chain cannot hide.
+        let squashed: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if squashed.contains("canonicalize().unwrap()") || squashed.contains("canonicalize().expect(") {
+            offenders.push(path.strip_prefix(&src).unwrap_or(path).display().to_string());
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these files seed a raw `canonicalize()` result: {offenders:?}"
+    );
 }
