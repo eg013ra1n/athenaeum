@@ -2,6 +2,8 @@ workflow:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/
     - if: $CI_COMMIT_BRANCH == "main"
+    # A wintest/<name> branch: test:windows alone, the Windows tests before main.
+    - if: $CI_COMMIT_BRANCH =~ /^wintest\//
     - when: never
 
 stages:
@@ -97,8 +99,13 @@ build:windows:
     # `npx tauri build`, never `npm run tauri build -- ...`: PowerShell can eat the bare `--`,
     # so the overlay would be dropped and the installers would ship with no bridge. There is no
     # cheap bundle check on this job; the npx form is the guard.
+    # tauri.local-tools.json: the WiX and NSIS tools the bundler downloads go to
+    # target/, not the user's cache. The runner service is LocalSystem, whose
+    # cache sits under C:\Windows\System32\config\systemprofile; the 32-bit WiX
+    # tools are redirected to SysWOW64 there, find no such folder and fail to
+    # start (`failed to run ...\WixTools314\candle.exe`).
     - node scripts/release/build-mcp-bridge.mjs
-    - npx tauri build --config crates/athenaeum-tauri/tauri.mcp-bridge.json
+    - npx tauri build --config crates/athenaeum-tauri/tauri.mcp-bridge.json --config crates/athenaeum-tauri/tauri.local-tools.json
   artifacts:
     name: "athenaeum-windows-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -165,11 +172,13 @@ build:linux:
 # C-toolchain dep crept in.
 #
 # Runs on every main commit + tag (not `only: tags`) so a regression is caught
-# before release.
+# before release; not on a wintest/* branch, whose pipeline is test:windows.
 check:headless-core:
   stage: build
   tags:
     - linux
+  except:
+    - /^wintest\//
   before_script:
     - source "$HOME/.cargo/env"
   # No cache — see the comment in build:windows for why this pipeline has none.
@@ -327,6 +336,23 @@ smoke:windows:
   tags: [windows]
   script:
     - Write-Output "runner ok on $env:COMPUTERNAME"; Get-Location
+
+# --- Windows tests before main (wintest/* branches) ---
+# GitHub CI tests main on Windows after the push; this is the same run before
+# it. Push a commit as wintest/<name> and this job is the whole pipeline, on
+# the runner tagged windows-test. The script reads the commands and env from
+# that commit's .github/workflows/ci.yml (job build-and-test-windows), so the
+# two runs cannot drift. interruptible: a newer push of the branch cancels the
+# older run. The build directory's target/ stays warm (GIT_CLEAN_FLAGS above).
+test:windows:
+  stage: build
+  tags: [windows-test]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^wintest\//
+  interruptible: true
+  timeout: 90m
+  script:
+    - pwsh -NoProfile -ExecutionPolicy Bypass -File .gitlab/ci/scripts/windows_tests.ps1
 
 # --- Perseus (headless sync agent) — desktop installers (tags only) ---
 # Perseus ships as its own set of installers alongside Athenaeum. What each job
