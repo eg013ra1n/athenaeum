@@ -27,7 +27,6 @@ pub use starloom::stacking::ln::{
 #[cfg(feature = "test-support")]
 pub use starloom::stacking::ln::fallback_counters;
 
-// The shim rule: a glob import is shadowed only by an item of the same name in this module, and the kernel's `ln`
-// re-exports its own `reference::{write_reference, write_reference_saturation}`. These two names are Athenaeum's
-// (`reference.rs`), so they are named explicitly here; an explicit import beats the glob.
+// The shim rule: the list above leaves out the kernel's own `write_reference` and `write_reference_saturation`, since
+// they write no Athenaeum cards. These two names are Athenaeum's (`reference.rs`), so they are named explicitly here.
 pub use reference::{write_reference, write_reference_saturation};

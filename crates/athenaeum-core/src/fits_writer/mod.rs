@@ -7,8 +7,9 @@ pub use starloom::fits_writer::{card, writer};
 pub mod header_patch;
 pub mod keywords;
 pub mod xisf_patch;
-/// The XISF writers under their old paths: the library's items, with the three plain writers that reach the
-/// `CreatorApplication` property replaced by wrappers that pass [`athenaeum_creator`].
+/// The XISF writers under their old paths: the library's helpers by name (`escape_xml`, `xisf_keyword_value`), with
+/// the three plain writers that reach the `CreatorApplication` property replaced by wrappers that pass
+/// [`athenaeum_creator`].
 pub mod xisf_writer {
     pub use starloom::fits_writer::xisf_writer::{escape_xml, xisf_keyword_value};
     use starloom::fits_writer::xisf_writer as lib;

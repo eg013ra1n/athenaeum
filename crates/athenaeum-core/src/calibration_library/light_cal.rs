@@ -27,7 +27,7 @@ pub use starloom::calibration_library::light_cal::{
     FlatNormMode, LightCalInputs, LightCalOutcome, LightCalParams, PreloadedMasters, PreloadedPlane, FLAT_DENOM_FLOOR,
     OUTPUT_SCALE_DIVISOR, TRIMMED_MEAN_TAIL_FRACTION,
 };
-// The engine version stays in `models` (spec SL-19); the shared parameter types come through the glob above.
+// The engine version stays in `models` (spec SL-19); the shared parameter types come through the list above.
 pub use crate::models::LIGHT_CAL_ENGINE_VERSION;
 
 /// Reads a master flat's stamped normalization constants from Athenaeum's own cards. Handed to starloom's math,
