@@ -354,6 +354,61 @@ pub async fn apply_header_fallbacks(
     .map_err(api_err)
 }
 
+/// Request body for `export_header_fallbacks`. A path is refused on the web host (D15): the
+/// browser downloads the returned text.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportHeaderFallbacksArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// POST /api/export_header_fallbacks
+///
+/// The rules as the JSON file of the spec's section 5.7; a `path` answers 403.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn export_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(args): Json<ExportHeaderFallbacksArgs>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::export_header_fallbacks(
+        &state.ctx,
+        args.path,
+        &athenaeum_core::api::PathPolicy::AllowedRoots(Vec::new()),
+    )
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// Request body for `plan_header_fallbacks_import`: the file's `text` (the browser reads the
+/// file); a `path` answers 403 (D15).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanHeaderFallbacksImportArgs {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// POST /api/plan_header_fallbacks_import
+///
+/// What importing the file would change; stores nothing. A file that breaks a rule is a 400.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn plan_header_fallbacks_import(
+    State(state): State<WebAppState>,
+    Json(args): Json<PlanHeaderFallbacksImportArgs>,
+) -> Result<Json<athenaeum_core::header_fallbacks::transfer::HeaderFallbackImportPlan>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::plan_header_fallbacks_import(
+        &state.ctx,
+        args.text,
+        args.path,
+        &athenaeum_core::api::PathPolicy::AllowedRoots(Vec::new()),
+    )
+    .map(Json)
+    .map_err(api_err)
+}
+
 #[cfg(test)]
 mod logging_config_tests {
     use super::*;
@@ -627,5 +682,71 @@ mod header_fallbacks_tests {
     fn bare_header_fallbacks_body_fails_to_deserialize_into_wrapped_args() {
         let bare = serde_json::to_value(athenaeum_core::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         assert!(serde_json::from_value::<SetHeaderFallbacksArgs>(bare).is_err());
+    }
+
+    #[tokio::test]
+    async fn export_then_plan_import_round_trips_over_the_routes() {
+        use athenaeum_core::header_fallbacks::{HeaderField, HeaderFallbackConfig};
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.get_mut(&HeaderField::Gain).unwrap().order = vec!["G2".into(), "GAIN".into()];
+        let _ = set_header_fallbacks(State(state.clone()), Json(SetHeaderFallbacksArgs { config: cfg }))
+            .await
+            .unwrap();
+        let text = export_header_fallbacks(State(state.clone()), Json(ExportHeaderFallbacksArgs { path: None }))
+            .await
+            .unwrap()
+            .0;
+        assert!(text.contains("\"gain\""), "{text}");
+        let plan = plan_header_fallbacks_import(
+            State(state),
+            Json(PlanHeaderFallbacksImportArgs { text: Some(text), path: None }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.config.order(HeaderField::Gain), ["G2", "GAIN"]);
+    }
+
+    #[tokio::test]
+    async fn export_and_import_refuse_a_path_with_403_and_a_bad_file_with_400() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let file = tmp.path().join("rules.json");
+        let path = Some(file.to_string_lossy().into_owned());
+        let err = export_header_fallbacks(State(state.clone()), Json(ExportHeaderFallbacksArgs { path: path.clone() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(!file.exists());
+        let err = plan_header_fallbacks_import(
+            State(state.clone()),
+            Json(PlanHeaderFallbacksImportArgs { text: None, path }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let err = plan_header_fallbacks_import(
+            State(state),
+            Json(PlanHeaderFallbacksImportArgs { text: Some("not json".into()), path: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The frontend omits an absent argument; the body `{}` must still deserialize.
+    #[test]
+    fn export_and_import_args_accept_missing_members() {
+        let a: ExportHeaderFallbacksArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(a.path.is_none());
+        let b: PlanHeaderFallbacksImportArgs =
+            serde_json::from_value(serde_json::json!({ "text": "x" })).unwrap();
+        assert_eq!(b.text.as_deref(), Some("x"));
+        assert!(b.path.is_none());
     }
 }

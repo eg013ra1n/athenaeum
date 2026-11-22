@@ -318,6 +318,8 @@ pub fn run() {
             commands::reset_header_fallbacks,
             commands::preview_header_fallbacks,
             commands::apply_header_fallbacks,
+            commands::export_header_fallbacks,
+            commands::plan_header_fallbacks_import,
             commands::get_logging_config,
             commands::set_logging_config,
             commands::set_blink_threads,

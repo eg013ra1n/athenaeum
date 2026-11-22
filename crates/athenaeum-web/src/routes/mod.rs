@@ -112,6 +112,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/reset_header_fallbacks", post(settings::reset_header_fallbacks))
         .route("/api/preview_header_fallbacks", post(settings::preview_header_fallbacks))
         .route("/api/apply_header_fallbacks", post(settings::apply_header_fallbacks))
+        .route("/api/export_header_fallbacks", post(settings::export_header_fallbacks))
+        .route("/api/plan_header_fallbacks_import", post(settings::plan_header_fallbacks_import))
         .route("/api/get_logging_config", post(settings::get_logging_config))
         .route("/api/set_logging_config", post(settings::set_logging_config))
         // Cache & blink (Category C — modified behavior in web mode)

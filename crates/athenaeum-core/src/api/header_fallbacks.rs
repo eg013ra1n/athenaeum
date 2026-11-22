@@ -5,9 +5,10 @@
 //! The server owns `retired`: the frontend never shows it, so `set` and `reset` merge it from
 //! the stored document (D12) and every keyword dropped from an order ends up retired.
 
-use crate::api::{db, ApiError};
+use crate::api::{db, ApiError, PathPolicy};
 use crate::header_fallbacks::apply::HeaderFallbackCounts;
 use crate::events::ProgressEmitter;
+use crate::header_fallbacks::transfer::{self, HeaderFallbackImportPlan, ImportError};
 use crate::header_fallbacks::{self, HeaderFallbackConfig};
 use crate::services::ServiceContext;
 
@@ -135,6 +136,83 @@ pub fn apply_header_fallbacks(
         ));
     }
     Ok(report.counts)
+}
+
+/// The file name of a path, for messages (never the whole path).
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(|| "the file".to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// The stored rules as the JSON file of the spec's §5.7 (only the fields whose order differs
+/// from the default; never `retired`). With `path` the text is also written there, after
+/// `policy` has checked it; the text is returned either way (the web host downloads it).
+pub fn export_header_fallbacks(
+    ctx: &ServiceContext,
+    path: Option<String>,
+    policy: &PathPolicy,
+) -> Result<String, ApiError> {
+    let rules = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        header_fallbacks::load(&conn)
+            .map_err(|e| internal("cannot read the FITS keyword rules", format!("{e:#}")))?
+    };
+    let text = transfer::export_text(&rules);
+    if let Some(path) = path {
+        let path = std::path::PathBuf::from(path);
+        policy.check(&path)?;
+        std::fs::write(&path, &text)
+            .map_err(|e| internal(&format!("cannot write {}", file_name_of(&path)), e))?;
+    }
+    tracing::info!("FITS keyword rules exported");
+    Ok(text)
+}
+
+fn refuse_import(e: ImportError) -> ApiError {
+    tracing::warn!(reason = %e, "header fallbacks import refused");
+    ApiError::Invalid(e.to_string())
+}
+
+/// Read a rules file (its `text`, or a file at `path`; exactly one of them) against the stored
+/// rules and say what importing it would change. Nothing is stored: the frontend saves
+/// `plan.config` through the normal set once the user confirms. A file that breaks a rule is
+/// refused as a whole (`ApiError::Invalid`, the reason logged).
+pub fn plan_header_fallbacks_import(
+    ctx: &ServiceContext,
+    text: Option<String>,
+    path: Option<String>,
+    policy: &PathPolicy,
+) -> Result<HeaderFallbackImportPlan, ApiError> {
+    let text = match (text, path) {
+        (Some(text), None) => text,
+        (None, Some(path)) => {
+            let path = std::path::PathBuf::from(path);
+            policy.check(&path)?;
+            let name = file_name_of(&path);
+            let len = std::fs::metadata(&path).map_err(|e| {
+                tracing::warn!(error = %e, "header fallbacks import file unreadable");
+                ApiError::Invalid(format!("cannot read {name}: {e}"))
+            })?.len();
+            if len > transfer::MAX_IMPORT_BYTES as u64 {
+                return Err(refuse_import(ImportError::TooLarge(usize::try_from(len).unwrap_or(usize::MAX))));
+            }
+            std::fs::read_to_string(&path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    refuse_import(ImportError::NotJson("the file is not UTF-8 text".to_string()))
+                } else {
+                    tracing::warn!(error = %e, "header fallbacks import file unreadable");
+                    ApiError::Invalid(format!("cannot read {name}: {e}"))
+                }
+            })?
+        }
+        _ => return Err(ApiError::Invalid("give the file's text or its path".to_string())),
+    };
+    let current = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        previous_for_merge(&conn)
+    };
+    transfer::plan_import(&current, &text).map_err(refuse_import)
 }
 
 #[cfg(test)]
@@ -375,5 +453,190 @@ mod tests {
         write_garbage(&ctx);
         assert!(matches!(apply_header_fallbacks(&ctx, &crate::events::NullEmitter), Err(ApiError::Internal(_))));
         assert!(!ctx.apply_running.load(Ordering::SeqCst));
+    }
+
+    fn transfer_file(fields: &str) -> String {
+        format!(r#"{{"format":"athenaeum.header-fallbacks","version":1,"fields":{fields}}}"#)
+    }
+
+    #[test]
+    fn export_of_a_fresh_catalog_names_no_field_and_matches_the_core_text() {
+        let (_tmp, ctx) = test_ctx();
+        let text = export_header_fallbacks(&ctx, None, &PathPolicy::AllowAll).unwrap();
+        assert_eq!(text, transfer::export_text(&HeaderFallbackConfig::default()));
+    }
+
+    #[test]
+    fn export_to_a_path_writes_the_same_text() {
+        let (tmp, ctx) = test_ctx();
+        set_header_fallbacks(&ctx, doc(HeaderField::Gain, &["G2", "GAIN"])).unwrap();
+        let file = tmp.path().join("rules.json");
+        let text = export_header_fallbacks(
+            &ctx,
+            Some(file.to_string_lossy().into_owned()),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert!(text.contains("\"gain\""), "{text}");
+    }
+
+    #[test]
+    fn export_to_a_path_is_refused_on_a_restricted_policy() {
+        let (tmp, ctx) = test_ctx();
+        let file = tmp.path().join("rules.json");
+        let err = export_header_fallbacks(
+            &ctx,
+            Some(file.to_string_lossy().into_owned()),
+            &PathPolicy::AllowedRoots(Vec::new()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err}");
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn export_to_an_unwritable_path_names_the_file() {
+        let (tmp, ctx) = test_ctx();
+        let file = tmp.path().join("no-such-dir").join("rules.json");
+        let err = export_header_fallbacks(
+            &ctx,
+            Some(file.to_string_lossy().into_owned()),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Internal(ref m) if m.contains("rules.json")), "{err}");
+    }
+
+    #[test]
+    fn import_by_path_is_refused_on_a_restricted_policy() {
+        let (tmp, ctx) = test_ctx();
+        let file = tmp.path().join("rules.json");
+        std::fs::write(&file, transfer_file("{}")).unwrap();
+        let err = plan_header_fallbacks_import(
+            &ctx,
+            None,
+            Some(file.to_string_lossy().into_owned()),
+            &PathPolicy::AllowedRoots(Vec::new()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err}");
+    }
+
+    #[test]
+    fn import_by_path_and_by_text_give_the_same_plan() {
+        let (tmp, ctx) = test_ctx();
+        let body = transfer_file(r#"{"gain":["MY-G","GAIN"]}"#);
+        let file = tmp.path().join("rules.json");
+        std::fs::write(&file, &body).unwrap();
+        let by_path = plan_header_fallbacks_import(
+            &ctx,
+            None,
+            Some(file.to_string_lossy().into_owned()),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+        let by_text =
+            plan_header_fallbacks_import(&ctx, Some(body), None, &PathPolicy::AllowedRoots(Vec::new()))
+                .unwrap();
+        assert_eq!(by_path, by_text);
+        assert_eq!(by_text.config.order(HeaderField::Gain), ["MY-G", "GAIN"]);
+        assert_eq!(by_text.changes.len(), 1);
+    }
+
+    #[test]
+    fn import_needs_exactly_one_of_text_and_path() {
+        let (_tmp, ctx) = test_ctx();
+        let neither = plan_header_fallbacks_import(&ctx, None, None, &PathPolicy::AllowAll).unwrap_err();
+        assert!(matches!(neither, ApiError::Invalid(ref m) if m.contains("text or its path")), "{neither}");
+        let both = plan_header_fallbacks_import(
+            &ctx,
+            Some(transfer_file("{}")),
+            Some("rules.json".to_string()),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap_err();
+        assert!(matches!(both, ApiError::Invalid(_)), "{both}");
+    }
+
+    #[test]
+    fn import_by_path_refuses_a_file_over_one_mib_and_one_that_is_not_text() {
+        let (tmp, ctx) = test_ctx();
+        let big = tmp.path().join("big.json");
+        std::fs::write(&big, vec![b' '; transfer::MAX_IMPORT_BYTES + 1]).unwrap();
+        let err = plan_header_fallbacks_import(
+            &ctx,
+            None,
+            Some(big.to_string_lossy().into_owned()),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(ref m) if m.contains("larger than 1 MB")), "{err}");
+        let bin = tmp.path().join("bin.json");
+        std::fs::write(&bin, [0xff_u8, 0xfe, 0x00, 0x50, 0x4b]).unwrap();
+        let err = plan_header_fallbacks_import(
+            &ctx,
+            None,
+            Some(bin.to_string_lossy().into_owned()),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(ref m) if m.contains("not a JSON file")), "{err}");
+    }
+
+    #[test]
+    fn import_of_a_missing_file_is_invalid_and_names_the_file() {
+        let (tmp, ctx) = test_ctx();
+        let err = plan_header_fallbacks_import(
+            &ctx,
+            None,
+            Some(tmp.path().join("absent.json").to_string_lossy().into_owned()),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(ref m) if m.contains("absent.json")), "{err}");
+    }
+
+    #[test]
+    fn a_plan_reads_the_stored_rules_and_stores_nothing() {
+        let (_tmp, ctx) = test_ctx();
+        set_header_fallbacks(&ctx, doc(HeaderField::CcdTemp, &["CCD-TEMP", "DET-TEMP", "X"])).unwrap();
+        let before = raw_row(&ctx);
+        let plan = plan_header_fallbacks_import(
+            &ctx,
+            Some(transfer_file(r#"{"ccdTemp":["DET-TEMP","CCD-TEMP"]}"#)),
+            None,
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].before, ["CCD-TEMP", "DET-TEMP", "X"]);
+        assert_eq!(plan.config.retired(HeaderField::CcdTemp), ["X"]);
+        assert_eq!(raw_row(&ctx), before);
+    }
+
+    #[test]
+    fn refused_import_changes_nothing() {
+        let (_tmp, ctx) = test_ctx();
+        set_header_fallbacks(&ctx, doc(HeaderField::Gain, &["MY-G", "GAIN"])).unwrap();
+        let row = raw_row(&ctx);
+        let loaded = get_header_fallbacks(&ctx).unwrap();
+        for body in [
+            "\u{0}PK\u{3}".to_string(),
+            r#"{"format":"x","version":1,"fields":{}}"#.to_string(),
+            r#"{"format":"athenaeum.header-fallbacks","version":2,"fields":{}}"#.to_string(),
+            r#"{"format":"athenaeum.header-fallbacks","version":1}"#.to_string(),
+            transfer_file(r#"{"nope":[]}"#),
+            transfer_file(r#"{"gain":"GAIN"}"#),
+            transfer_file(r#"{"gain":["GAIN",3]}"#),
+            transfer_file(r#"{"gain":["GAIN","A=B"]}"#),
+            transfer_file(r#"{"ccdTemp":["CCD-TEMP","DET-TEMP","ccd-temp"]}"#),
+        ] {
+            let err = plan_header_fallbacks_import(&ctx, Some(body.clone()), None, &PathPolicy::AllowAll)
+                .unwrap_err();
+            assert!(matches!(err, ApiError::Invalid(_)), "{body}: {err}");
+            assert_eq!(raw_row(&ctx), row, "{body}");
+            assert_eq!(get_header_fallbacks(&ctx).unwrap(), loaded, "{body}");
+        }
     }
 }
