@@ -15,7 +15,8 @@ pub const TRIMMED_MEAN_TAIL_FRACTION: f64 = 0.05;
 /// (spec §2, "Normalization statistic is selectable"). Applies only when
 /// `flat_norm` is on; recorded in the tracking row so a mode change makes a
 /// flat-applied frame stale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum FlatNormMode {
     /// Athenaeum convention (default): the flat's central-third mean, read from
@@ -50,7 +51,8 @@ impl FlatNormMode {
 
 /// What to do for a LIGHT frame that has NO dark master (spec §2 "Advanced
 /// parameters"). Default = current behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum BiasFallback {
     /// Current behavior: subtract the linked master bias (`(L − B)`).
@@ -82,7 +84,8 @@ fn default_true() -> bool {
 /// parameters"). Every field is optional on the wire (`#[serde(default)]`) with
 /// a default equal to the current behavior, so an omitted field — or a
 /// pre-feature `'{}'` — decodes to [`LightCalParams::default`].
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LightCalParams {
     /// Per-tail discard fraction for the `TrimmedMeanWhole` statistic

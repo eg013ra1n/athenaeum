@@ -52,7 +52,8 @@ impl Sample for (f32, u16) {
 const MAX_REJECTION_ITERS: usize = 20;
 
 /// A master-integration recipe: reject first, then combine the survivors.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationRecipe {
     pub combination: Combination,
@@ -80,7 +81,8 @@ impl IntegrationRecipe {
 
 /// How the surviving samples are collapsed into the output pixel. `Average`
 /// is the reference's name for our historical `Mean`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Combination {
     Average,
@@ -98,7 +100,8 @@ impl Combination {
 
 /// Which samples get excluded before combination. Same internal-tag serde
 /// shape (`tag = "method"`) as the legacy `CombineMethod` it replaces.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case", tag = "method")]
 pub enum Rejection {
     /// Keep every sample.

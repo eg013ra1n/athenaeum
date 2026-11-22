@@ -71,7 +71,8 @@ use crate::integration::stats::{self, MAD_TO_SIGMA};
 
 /// Which detector produces the quality measurement's PSF-fit seeds
 /// (spec §9.2 `measurement.seedDetector`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum SeedDetector {
     /// The peak-threshold detector: two noise-relative levels, one answer

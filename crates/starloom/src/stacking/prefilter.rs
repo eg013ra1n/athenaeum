@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 /// What the seed detection runs on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum SeedPrefilter {
     /// Detect on the plane as it is.

@@ -23,8 +23,8 @@ pub use crate::star_measure::{
 // here): the wire's two names (`Fixed` is internal, never on the wire), exported as `PsfModel`; the config fields that
 // hold one point their `#[ts(as = …)]` at it. No `///` doc on purpose — ts-rs would copy it into `src/types`, which
 // must stay unchanged.
-#[derive(ts_rs::TS)]
-#[ts(rename = "PsfModel", rename_all = "camelCase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(rename = "PsfModel", rename_all = "camelCase"))]
 pub enum PsfModelTs {
     Auto,
     Moffat4,

@@ -43,7 +43,8 @@ use crate::stacking::rej::{process_large_scale, RejBitmap, RejBitmapSet, RejForc
 use crate::stacking::weights::{best_by_weight, FrameWeight};
 
 /// spec §9.2 `integration:`; every field defaulted, camelCase on the wire.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct IntegrationConfig {
     /// The master builder's `Combination` — one enum, one spelling
@@ -92,7 +93,8 @@ impl Default for IntegrationConfig {
 /// a rejection fell on, and processing the two sides separately is not a
 /// distinction this data can express. A format bump to carry it would buy a
 /// difference no acceptance test can see.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct LargeScaleRejection {
     pub enabled: bool,
@@ -128,7 +130,8 @@ impl Default for LargeScaleRejection {
 /// separate field left to fall back to — `stats::rejection_pair` resolves
 /// `Local` to the same pair `ScaleZeroOffset` would give it, by construction
 /// rather than by a fallback field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct NormalizationConfig {
     pub output: OutputNormalization,
@@ -136,7 +139,7 @@ pub struct NormalizationConfig {
     /// Informational at this layer: the estimator that produced the
     /// stage-3 location/scale is `MeasureOptions::scale_estimator` — the
     /// orchestrator (Plan 5) keeps the two equal.
-    #[ts(as = "crate::integration::stats::ScaleEstimatorTs")]
+    #[cfg_attr(feature = "ts", ts(as = "crate::integration::stats::ScaleEstimatorTs"))]
     pub scale_estimator: ScaleEstimator,
     /// Local (small-scale) normalization settings (spec §5.2, M2).
     #[serde(default)]
@@ -145,7 +148,8 @@ pub struct NormalizationConfig {
 
 /// How the LN scale is chosen (spec 2026-10-04 §2): derived from the LN
 /// geometry (`auto`, the default) or the stored `scale` (`fixed`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum LnScaleMode {
     Auto,
@@ -162,7 +166,8 @@ impl LnScaleMode {
 }
 
 /// The star selection for the LN scale (spec 2026-10-04 §3, L-11).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct LnStarSelection {
     // Both sides' (peak − background) / σ_local must reach this (5–200).
@@ -196,7 +201,8 @@ impl LnStarSelection {
 
 /// The LN scale's flux definition (spec 2026-10-04 §4): the PSF fit's own
 /// signal, or a common circular aperture (F1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum LnFluxEstimator {
     PsfSignal,
@@ -216,7 +222,8 @@ impl LnFluxEstimator {
 
 /// F1's circle (spec 2026-10-04 §4.1): 2 or 3 x FWHM, or 2 x FWHM with the
 /// growth-curve correction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum LnAperture {
     Fwhm2,
@@ -243,7 +250,8 @@ impl LnAperture {
 /// `false` by default — it only means anything while `enabled` is on;
 /// every other field is carried so the block round-trips through a stored
 /// config unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalNormalizationConfig {
     pub enabled: bool,
@@ -258,7 +266,7 @@ pub struct LocalNormalizationConfig {
     // Auto scale = the short side of the LN geometry / gridSize, snapped (2-8).
     pub grid_size: u32,
     pub reference_frames: u32,
-    #[ts(as = "crate::stacking::psf_signal::PsfModelTs")]
+    #[cfg_attr(feature = "ts", ts(as = "crate::stacking::psf_signal::PsfModelTs"))]
     pub psf_model: crate::stacking::psf_signal::PsfModel,
     pub local_scale: bool,
     // Which matched stars set the scale (spec §3).
@@ -291,7 +299,8 @@ impl Default for LocalNormalizationConfig {
 /// [`Rejection`] once the group size is known.
 /// camelCase on the wire; the resolved `Rejection` persisted in master recipes
 /// stays snake_case — the two JSON shapes are not interchangeable.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
@@ -535,7 +544,8 @@ pub const MIN_STATS_RECT_PX: usize = 16;
 // `runs/run-<id>.json` document) must serialize as a whole — the derive is a
 // compile-time necessity now, not a design choice made early. Task 9 still
 // owns registering the type into `ts_export.rs`'s `stacking.ts`.
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct GroupStats {
     /// The group's total frame count, before the min-weight drop.

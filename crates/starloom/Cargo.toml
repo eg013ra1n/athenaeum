@@ -13,9 +13,8 @@ license = "Apache-2.0"
 rustafits = { path = "../../rustafits", default-features = false, features = ["serde"], optional = true }
 # `stack`: the registration quad matcher.
 solvemyastro = { path = "../../solvemyastro", optional = true }
-# Not optional until Task 9: the moved code derives `TS` unconditionally.
 # no-serde-warnings: ts-rs cannot parse type-irrelevant serde attrs and warns on every build.
-ts-rs = { version = "12", features = ["chrono-impl", "no-serde-warnings"] }
+ts-rs = { version = "12", features = ["chrono-impl", "no-serde-warnings"], optional = true }
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip` only (core's spec): never `preserve_order` or `arbitrary_precision`.
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -39,8 +38,8 @@ default = ["stack", "ts"]
 engine = ["dep:rustafits"]
 # Layer 3: registration, measurement, rejection, drizzle, weighting. Needs the quad matcher.
 stack = ["engine", "dep:solvemyastro"]
-# ts-rs derives; Task 9 makes this `["dep:ts-rs"]`.
-ts = []
+# ts-rs derives (the TypeScript types the app generates).
+ts = ["dep:ts-rs"]
 # Test hooks and fixtures that tests in dependent crates read (SL-17); never in default.
 test-support = []
 

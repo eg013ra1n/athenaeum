@@ -12,11 +12,12 @@ use crate::stacking::weights::{FormulaWeights, WeightMode};
 
 /// spec §9.2 `measurement:` — Plan 2's weighting/selection inputs, chosen
 /// once per run.
-#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct MeasurementConfig {
     pub weight_mode: WeightMode,
-    #[ts(as = "crate::stacking::psf_signal::PsfModelTs")]
+    #[cfg_attr(feature = "ts", ts(as = "crate::stacking::psf_signal::PsfModelTs"))]
     pub psf_model: PsfModel,
     /// Detection cap (spec §9.2 `maxStars`).
     pub max_stars: usize,
@@ -54,12 +55,13 @@ pub struct MeasurementConfig {
     /// `measurement.maxStars` by [`resolve_config`]. Absent from the document at `None`, so every All-mode hash is
     /// the one before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub fit_stars: Option<u32>,
 }
 
 /// Where the Measure stage takes its seeds from (spec §2.2, ruling R-OSP-2; R-M4c-11 for the other two).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum SeedSource {
     /// The module's two-pass matched filter ([`crate::star_measure::seeds::detect`]) at `seedThreshold`.
@@ -202,7 +204,8 @@ impl MeasurementConfig {
 
 /// spec §9.2 `drizzle:` (M3 — carried here, defaulted off, so a stored
 /// config round-trips before the stage exists).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct DrizzleConfig {
     pub enabled: bool,
@@ -254,7 +257,9 @@ impl Default for DrizzleConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum DrizzleKernel {
     #[default]

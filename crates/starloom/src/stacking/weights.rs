@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use super::measure::{ChannelMeasurement, FrameMeasurement};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum WeightMode {
     #[default]
@@ -24,7 +26,9 @@ pub enum WeightMode {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct FormulaWeights {
     pub fwhm: f64,
@@ -270,7 +274,9 @@ pub fn compute_weights(
     out
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct SelectionConfig {
     /// Frames below this fraction of the group's maximum weight are excluded.

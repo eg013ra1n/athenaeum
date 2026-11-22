@@ -41,9 +41,8 @@ pub enum Durability {
 /// The container an output image is written in. One enum for every writer
 /// in the app — stacking masters, calibration masters, calibrated lights —
 /// so no two features can disagree about what "xisf" means.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default, ts_rs::TS,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum OutputFormat {
     #[default]

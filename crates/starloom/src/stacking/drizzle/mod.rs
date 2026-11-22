@@ -176,7 +176,8 @@ pub struct DrizzleInput<'a> {
 /// Per-group drizzle statistics — the `stacking_run_groups` / provenance
 /// facing summary (a later task writes this into the run's persisted
 /// record; `ts_export.rs` registration is that task's, not this one's).
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct DrizzleStats {
     pub scale: u32,

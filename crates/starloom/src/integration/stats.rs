@@ -19,8 +19,8 @@ pub use astroimage::stats::{
 // The TypeScript face of `ScaleEstimator` (a rustafits type, which cannot derive `ts_rs::TS` here): the same names,
 // exported as `ScaleEstimator`; the config fields that hold one point their `#[ts(as = …)]` at it. No `///` doc on
 // purpose — ts-rs would copy it into `src/types`, which must stay unchanged.
-#[derive(ts_rs::TS)]
-#[ts(rename = "ScaleEstimator", rename_all = "camelCase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(rename = "ScaleEstimator", rename_all = "camelCase"))]
 pub enum ScaleEstimatorTs {
     Bwmv,
     Mad,
@@ -28,7 +28,8 @@ pub enum ScaleEstimatorTs {
 }
 
 /// Output normalization modes (spec §5.1, math reference §3.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum OutputNormalization {
     None,
@@ -54,7 +55,8 @@ pub enum OutputNormalization {
 /// `ScaleZeroOffset` (no Normalize stage, a preview's promise is speed).
 /// Diagnosis: `docs/superpowers/research/2026-11-01-project-master-star-cores.md`;
 /// the plan: `docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum RejectionNormalization {
     None,
