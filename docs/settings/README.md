@@ -55,7 +55,7 @@ value, a default or render code. Two consumers read it: the search index
 
 | Tab | Section ids (`SETTINGS_SECTIONS`) |
 | ---- | ---- |
-| General | `general.updates` `general.grouping` `general.sessions` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.compute` `general.dataLocations` `general.assistantAccess` `general.logging` |
+| General | `general.updates` `general.grouping` `general.sessions` `general.headerKeywords` `general.monitoring` `general.autoMerge` `general.contentIndex` `general.archive` `general.compute` `general.dataLocations` `general.assistantAccess` `general.logging` |
 | Blink | `blink.viewer` `blink.flatContour` `blink.annotations` |
 | Analysis | `analysis.detection` `analysis.measurement` `analysis.batch` `analysis.rejection` |
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
@@ -70,6 +70,17 @@ under `analysis.measurement`) and `batch_concurrency`; the old detection / PSF-f
 `analysis.psf` section are gone. `analysis.rejection`'s `trailed` field reads "Reject unusable frames" (the stored
 threshold key stays `trail`). `plateSolving.inputGate` is the one switch `input_gate_enabled` — a frame whose own
 analysis marks it Trailed is refused before solving; the eccentricity / R² pair was removed with C7.
+
+`general.headerKeywords` (FITS keyword fallbacks, 0.7.2) is "FITS keywords": a typed config, `HeaderFallbackConfig`
+(`catalog.header_fallbacks`; `get/set/reset_header_fallbacks`), bound by `useAutosaveDocument` in
+`HeaderKeywordsSection`. One row per `HeaderField` (`src/settings/headerFields.ts` holds the order, labels and built-in
+chains the registry's search terms use): `KeywordChain` chips reorder by native drag and by the arrow keys (focus follows
+the chip), a user keyword has a ×, the add input commits on Enter or blur and refuses an empty keyword, one with `=` and a
+repeat inline (the server's `validate` stays the authority). `useHeaderFallbackPreview` asks `preview_header_fallbacks`
+once the document loads and 800 ms after each save (one call in flight, a stale answer dropped); Reset all and a finished
+Apply call `refresh()` themselves, because only a save sets `savedAt`. Apply (`apply_header_fallbacks`) confirms through
+`ConfirmDialog`, shows `header-fallbacks-progress` on the button and ends in one `notify()`. The registry's section
+`keywords` (an optional `SettingsSectionMeta` field, read by the search index) carry the search terms of a whole section.
 
 `general.compute` (owner, 2026-11-13) is one KV number, `compute.max_concurrent` ("Heavy jobs at the same time",
 `ComputeQueueSection`, `SettingNumber` with `intCodec(1, 8)`, default `"1"` in `defaults::all()`). It is read through
