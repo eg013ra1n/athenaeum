@@ -1966,12 +1966,13 @@ mod tests {
         assert!(cards.is_empty(), "no blob + no columns -> no cards");
     }
 
-    /// A blank stored value is not a declaration. The XISF stored-header parser
-    /// has no empty-value check, so `<FITSKeyword name="BAYERPAT" value=""/>`
-    /// lands as an empty-string card — it must NOT out-rank a real
-    /// `frames.bayerpat`, and it must be replaced rather than left beside the
-    /// derived card (two cards for one keyword would contradict each other in
-    /// the output header).
+    /// A blank stored value is not a declaration. The stored XISF key reader
+    /// drops a `<FITSKeyword name="BAYERPAT" value=""/>` before it becomes a
+    /// card, so the blank never reaches the cards; the outcome pinned here is
+    /// that it must NOT out-rank a real `frames.bayerpat`, and the derived
+    /// card is neither left beside a blank one nor duplicated (two cards for
+    /// one keyword would contradict each other in the output header). The
+    /// builder's own blank-card branch stays as a defence.
     #[test]
     fn blank_stored_header_value_loses_to_catalog_column() {
         let conn = seed_db();

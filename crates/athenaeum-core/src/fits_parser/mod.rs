@@ -247,8 +247,9 @@ fn xisf_keyword_element(e: &quick_xml::events::BytesStart) -> Option<(String, St
 }
 
 /// Every `FITSKeyword` element of an XISF XML block, in document order (duplicates kept).
-/// `label` only names the file in logs. A malformed tail yields the keywords read so far.
-pub(crate) fn xisf_keyword_pairs(content: &[u8], label: &Path) -> Result<Vec<(String, String)>> {
+/// `label` only names the file in logs (`None` for text read back from the catalog, which has no
+/// file). A malformed tail yields the keywords read so far.
+pub(crate) fn xisf_keyword_pairs(content: &[u8], label: Option<&Path>) -> Result<Vec<(String, String)>> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
@@ -274,12 +275,20 @@ pub(crate) fn xisf_keyword_pairs(content: &[u8], label: &Path) -> Result<Vec<(St
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                tracing::error!(
-                    path = %label.display(),
-                    position = reader.buffer_position(),
-                    error = %e,
-                    "error parsing XISF XML header; using partial result"
-                );
+                if let Some(label) = label {
+                    tracing::error!(
+                        path = %label.display(),
+                        position = reader.buffer_position(),
+                        error = %e,
+                        "error parsing XISF XML header; using partial result"
+                    );
+                } else {
+                    tracing::warn!(
+                        position = reader.buffer_position(),
+                        error = %e,
+                        "error parsing stored XISF XML header; using partial result"
+                    );
+                }
                 break;
             }
             _ => {}
@@ -292,7 +301,7 @@ pub(crate) fn xisf_keyword_pairs(content: &[u8], label: &Path) -> Result<Vec<(St
 /// Header text of an XISF XML block (`NAME = value` lines). `path` only labels logs and the
 /// no-keywords fallback text.
 fn xisf_header_text(content: &[u8], path: &Path) -> Result<String> {
-    let pairs = xisf_keyword_pairs(content, path)?;
+    let pairs = xisf_keyword_pairs(content, Some(path))?;
 
     let mut header_text = String::from(XISF_DUMP_BANNER);
     for (name, value) in pairs {

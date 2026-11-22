@@ -17,7 +17,6 @@
 use super::fits_header_reader::FitsHeader;
 use crate::models::FileFormat;
 use std::collections::HashMap;
-use std::path::Path;
 
 /// First line of the XISF keyword dump `xisf_header_text` writes: title, rule and a blank line.
 pub(crate) const XISF_DUMP_BANNER: &str = "XISF FITS Keywords:\n==================\n\n";
@@ -116,11 +115,17 @@ pub fn stored_header_key_map(format: FileFormat, text: &str) -> HeaderKeyMap {
                 return HeaderKeyMap::from_last_wins(xisf_dump_pairs(rest));
             }
             if text.contains("<?xml") {
-                if let Ok(pairs) = super::xisf_keyword_pairs(text.as_bytes(), Path::new("")) {
-                    let keys = HeaderKeyMap::from_last_wins(pairs);
-                    if keys.has_keywords() {
-                        return keys;
+                match super::xisf_keyword_pairs(text.as_bytes(), None) {
+                    Ok(pairs) => {
+                        let keys = HeaderKeyMap::from_last_wins(pairs);
+                        if keys.has_keywords() {
+                            return keys;
+                        }
                     }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "stored XISF header xml unreadable; reading as text"
+                    ),
                 }
             }
             HeaderKeyMap::from_first_wins(legacy_eq_text_pairs(text))

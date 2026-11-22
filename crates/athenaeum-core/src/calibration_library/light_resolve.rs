@@ -202,10 +202,10 @@ fn sort_cards_by_keyword(cards: &mut [Card]) {
 ///
 /// Rules, in order:
 /// - a card parsed from the blob wins — but only if it actually carries a
-///   value. A BLANK card does not: the XISF stored-header parser has no
-///   empty-value check, so `<FITSKeyword name="BAYERPAT" value=""/>` lands as
-///   `Str("")`, which says nothing and must not out-rank a real column value.
-///   Such a card is REPLACED in place (never left beside the derived one — two
+///   value. A BLANK card does not: the stored XISF key reader already drops a
+///   `<FITSKeyword name="BAYERPAT" value=""/>`, but a blank `Str("")` from any
+///   other source says nothing and must not out-rank a real column value
+///   (this branch is kept as a defence). Such a card is REPLACED in place (never left beside the derived one — two
 ///   cards for one keyword would contradict each other in the output header);
 /// - a NULL/blank column adds nothing — absent beats fabricated, exactly as in
 ///   `headers.rs::load_bayer_consensus`;

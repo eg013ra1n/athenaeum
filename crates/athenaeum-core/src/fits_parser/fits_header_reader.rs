@@ -472,8 +472,16 @@ mod tests {
 
     #[test]
     fn from_header_text_pads_short_lines_and_strips_crlf() {
-        let h = FitsHeader::from_header_text("EXPTIME = 300.0\r\nEND");
+        // The last line is a short `END` with a bare `\r` and no `\n`: `str::lines` leaves that
+        // `\r` on, so only our own strip lets the line read as the END card.
+        let h = FitsHeader::from_header_text("EXPTIME = 300.0\r\nEND\r\nGAIN2   = 2");
         assert_eq!(h.get_f64("EXPTIME"), Some(300.0));
+        assert_eq!(h.get_f64("GAIN2"), None, "END\\r still ends the header");
+        let h = FitsHeader::from_header_text("EXPTIME = 300.0\r\nEND\r");
+        assert_eq!(
+            h.keywords_in_order().collect::<Vec<_>>(),
+            vec![("EXPTIME", "300.0")]
+        );
     }
 
     #[test]
