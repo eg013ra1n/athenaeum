@@ -19,6 +19,7 @@ import type {
   HeaderField,
   HeaderFallbackConfig,
   HeaderFallbackCounts,
+  HeaderFallbackImportPlan,
   HeaderFallbackProgress,
 } from '../../../types/models';
 import { ConfirmDialog } from '../../ConfirmDialog';
@@ -265,6 +266,18 @@ export function HeaderKeywordsSection() {
       fields: { ...prev.fields, [f]: { order, retired: prev.fields[f]?.retired ?? [] } },
     }));
 
+  // The plan was computed from the stored rules some time ago: only the fields it changes are taken from the file,
+  // every other field stays as the screen has it now (an edit made while the plan was computed is kept).
+  const importFields = (plan: HeaderFallbackImportPlan) =>
+    patch((prev) => {
+      const fields = { ...prev.fields };
+      for (const c of plan.changes) {
+        const rule = plan.config.fields[c.field];
+        if (rule) fields[c.field] = rule;
+      }
+      return { ...prev, fields };
+    });
+
   const line = applying ? confirmed : counts;
   const showLine = line !== null && line.framesChanged > 0;
   const progressLabel =
@@ -279,7 +292,7 @@ export function HeaderKeywordsSection() {
       id="general.headerKeywords"
       onResetAll={onResetAll}
       resetScopeLabel={RESET_ALL_SCOPE}
-      actions={<HeaderKeywordsTransfer onImport={(config) => patch(() => config)} />}
+      actions={<HeaderKeywordsTransfer onImport={importFields} />}
     >
       <div className="space-y-2.5">
         {HEADER_FIELDS.map((f) => (

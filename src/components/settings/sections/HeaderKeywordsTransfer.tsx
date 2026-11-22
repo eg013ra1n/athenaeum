@@ -8,7 +8,7 @@ import { api } from '../../../api';
 import { pickFile, pickSaveFile } from '../../../api/desktop';
 import { useNotifications } from '../../../contexts/NotificationContext';
 import { HEADER_FIELD_LABELS } from '../../../settings/headerFields';
-import type { HeaderFallbackConfig, HeaderFallbackImportPlan } from '../../../types/models';
+import type { HeaderFallbackImportPlan } from '../../../types/models';
 import { downloadTextFile, readFileText } from '../../../utils/browserFile';
 import { isTauri } from '../../../utils/platform';
 import { ConfirmDialog } from '../../ConfirmDialog';
@@ -16,6 +16,8 @@ import { Button } from '../../ui';
 
 const FILE_NAME = 'athenaeum-fits-keywords.json';
 const JSON_FILTERS = [{ name: 'JSON', extensions: ['json'] }];
+// The server's own limit for an import file (`TooLarge`): a larger file is refused before it is read into memory.
+const MAX_IMPORT_BYTES = 1_048_576;
 const NO_CHANGE = 'This file matches your current keywords.';
 const CATALOG_NOTE = 'Catalog values change only when you apply.';
 
@@ -33,7 +35,9 @@ function confirmMessage(plan: HeaderFallbackImportPlan): string {
 }
 
 interface HeaderKeywordsTransferProps {
-  onImport(config: HeaderFallbackConfig): void;
+  /** The plan the user confirmed (never called for a plan with no change). The receiver applies only `plan.changes`'
+   *  fields onto the document as it is by then: the plan was computed earlier, and an edit made meanwhile stays. */
+  onImport(plan: HeaderFallbackImportPlan): void;
 }
 
 export function HeaderKeywordsTransfer({ onImport }: HeaderKeywordsTransferProps) {
@@ -112,6 +116,17 @@ export function HeaderKeywordsTransfer({ onImport }: HeaderKeywordsTransferProps
     // Cleared so choosing the same file again fires another change.
     input.value = '';
     if (!file) return;
+    if (file.size > MAX_IMPORT_BYTES) {
+      console.error('[HeaderKeywords] import file too large:', file.size);
+      notify({
+        kind: 'generic',
+        tone: 'warning',
+        hasErrors: true,
+        title: 'FITS keywords not imported',
+        detail: 'the file is larger than 1 MB',
+      });
+      return;
+    }
     let text: string;
     try {
       text = await readFileText(file);
@@ -132,7 +147,7 @@ export function HeaderKeywordsTransfer({ onImport }: HeaderKeywordsTransferProps
   const confirm = () => {
     const chosen = plan;
     setPlan(null);
-    if (chosen && chosen.changes.length > 0) onImport(chosen.config);
+    if (chosen && chosen.changes.length > 0) onImport(chosen);
   };
 
   return (

@@ -5,9 +5,18 @@ import { SettingsDefaultsProvider } from '../../../settings/SettingsDefaultsCont
 import { DEFAULT_HEADER_CHAINS, HEADER_FIELDS } from '../../../settings/headerFields';
 import { api } from '../../../api';
 import { routeInvoke } from '../../../test/apiMock';
-import type { HeaderFallbackConfig, HeaderFallbackCounts, HeaderFallbackProgress } from '../../../types/models';
+import type {
+  HeaderFallbackConfig,
+  HeaderFallbackCounts,
+  HeaderFallbackImportPlan,
+  HeaderFallbackProgress,
+} from '../../../types/models';
 
 vi.mock('../../../api');
+// The web build: Import… reads a file chosen in the section's file input.
+vi.mock('../../../utils/platform', () => ({ isTauri: false }));
+// The suite runs on fake timers, which a FileReader never finishes under; the read itself is tested in browserFile.test.ts.
+vi.mock('../../../utils/browserFile', () => ({ readFileText: async () => '{}', downloadTextFile: vi.fn() }));
 
 const { notifyMock } = vi.hoisted(() => ({ notifyMock: vi.fn() }));
 vi.mock('../../../contexts/NotificationContext', () => ({
@@ -390,6 +399,85 @@ describe('HeaderKeywordsSection', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
     await settle();
     expect(callsOf('apply_header_fallbacks')).toHaveLength(1);
+  });
+
+  it('imports a file: the imported order is saved, and Apply stays shut until the save and the preview land', async () => {
+    preview = SOME_CHANGE;
+    const imported = defaultDoc();
+    imported.fields.ccdTemp = { order: ['DET-TEMP', 'CCD-TEMP'], retired: [] };
+    const second = deferred<HeaderFallbackCounts>();
+    let previews = 0;
+    routeInvoke({
+      get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+      get_header_fallbacks: () => defaultDoc(),
+      set_header_fallbacks: undefined,
+      preview_header_fallbacks: () => (previews++ === 0 ? SOME_CHANGE : second.promise),
+      plan_header_fallbacks_import: () => ({
+        config: imported,
+        changes: [{ field: 'ccdTemp', before: ['CCD-TEMP', 'DET-TEMP'], after: ['DET-TEMP', 'CCD-TEMP'] }],
+      }),
+    });
+    await renderSection();
+    expect(applyButton().disabled).toBe(false);
+
+    const input = screen.getByTestId('header-keywords-file') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [new File(['{}'], 'rules.json')] } });
+    await settle();
+    expect(screen.getByText('Import FITS keywords?')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+
+    // The imported order shows at once, and Apply is shut before anything is saved.
+    expect(screen.getAllByRole('listitem')[0]!.getAttribute('data-keyword')).toBe('DET-TEMP');
+    expect(applyButton().disabled).toBe(true);
+    expect(callsOf('set_header_fallbacks')).toHaveLength(0);
+
+    await advance(500);
+    expect(callsOf('set_header_fallbacks')).toHaveLength(1);
+    expect(savedOrder(0, 'ccdTemp')).toEqual(['DET-TEMP', 'CCD-TEMP']);
+    expect(applyButton().disabled).toBe(true);
+
+    await advance(800);
+    expect(callsOf('preview_header_fallbacks')).toHaveLength(2);
+    expect(applyButton().disabled).toBe(true);
+    await act(async () => {
+      second.resolve(SOME_CHANGE);
+    });
+    await settle();
+    expect(applyButton().disabled).toBe(false);
+  });
+
+  it('keeps an edit made while the import plan was computed; only the file\'s fields are taken', async () => {
+    const imported = defaultDoc();
+    imported.fields.ccdTemp = { order: ['DET-TEMP', 'CCD-TEMP'], retired: [] };
+    // The file's document also carries gain as the stored rules had it: it is not a changed field.
+    const plan = deferred<HeaderFallbackImportPlan>();
+    routeInvoke({
+      get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+      get_header_fallbacks: () => defaultDoc(),
+      set_header_fallbacks: undefined,
+      preview_header_fallbacks: () => NO_CHANGE,
+      plan_header_fallbacks_import: () => plan.promise,
+    });
+    await renderSection();
+    const input = screen.getByTestId('header-keywords-file') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [new File(['{}'], 'rules.json')] } });
+    await settle();
+
+    // While the plan is being computed the user edits another field.
+    typeKeyword('Gain', 'egain');
+    await act(async () => {
+      plan.resolve({
+        config: imported,
+        changes: [{ field: 'ccdTemp', before: ['CCD-TEMP', 'DET-TEMP'], after: ['DET-TEMP', 'CCD-TEMP'] }],
+      });
+    });
+    await settle();
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+    await advance(500);
+
+    expect(callsOf('set_header_fallbacks')).toHaveLength(1);
+    expect(savedOrder(0, 'ccdTemp')).toEqual(['DET-TEMP', 'CCD-TEMP']);
+    expect(savedOrder(0, 'gain')).toEqual(['GAIN', 'EGAIN']);
   });
 
   it('closes an open confirm when an edit follows, rather than applying other rules', async () => {

@@ -28,6 +28,7 @@ http.createServer((req, res) => {
     let out;
     if (h) {
       try { out = h(args); } catch (e) {
+        console.error(`[harness] handler ${cmd} threw`, e);
         // A handler that throws answers like the real server's refusal: an error status with the text.
         res.writeHead(500, { ...CORS, 'Content-Type': 'text/plain' });
         res.end(e instanceof Error ? e.message : String(e));

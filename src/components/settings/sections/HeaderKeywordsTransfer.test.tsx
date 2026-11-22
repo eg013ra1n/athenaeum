@@ -90,8 +90,43 @@ describe('HeaderKeywordsTransfer', () => {
     expect(onImport).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Import' }));
     expect(onImport).toHaveBeenCalledTimes(1);
-    expect(onImport).toHaveBeenCalledWith(CHANGED.config);
+    expect(onImport).toHaveBeenCalledWith(CHANGED);
     expect(screen.queryByText('Import FITS keywords?')).toBeNull();
+  });
+
+  it('picking the same file twice runs the import twice', async () => {
+    routeInvoke({ plan_header_fallbacks_import: () => CHANGED });
+    render(<HeaderKeywordsTransfer onImport={onImport} />);
+    const input = screen.getByTestId('header-keywords-file') as HTMLInputElement;
+    const file = new File([FILE_TEXT], 'rules.json', { type: 'application/json' });
+    fireEvent.change(input, { target: { files: [file] } });
+    await screen.findByText('Import FITS keywords?');
+    // The input is emptied as soon as the file is taken, or a second pick of it would fire no change.
+    expect(input.value).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.change(input, { target: { files: [file] } });
+    await screen.findByText('Import FITS keywords?');
+    expect(callsOf('plan_header_fallbacks_import')).toHaveLength(2);
+  });
+
+  it('refuses a file over 1 MB before reading it', async () => {
+    routeInvoke({ plan_header_fallbacks_import: () => CHANGED });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(<HeaderKeywordsTransfer onImport={onImport} />);
+    const input = screen.getByTestId('header-keywords-file') as HTMLInputElement;
+    const file = new File(['x'], 'big.json', { type: 'application/json' });
+    Object.defineProperty(file, 'size', { value: 1_048_577 });
+    fireEvent.change(input, { target: { files: [file] } });
+    await waitFor(() => expect(notifyMock).toHaveBeenCalledTimes(1));
+    expect(notifyMock).toHaveBeenCalledWith({
+      kind: 'generic',
+      tone: 'warning',
+      hasErrors: true,
+      title: 'FITS keywords not imported',
+      detail: 'the file is larger than 1 MB',
+    });
+    expect(callsOf('plan_header_fallbacks_import')).toHaveLength(0);
+    expect(onImport).not.toHaveBeenCalled();
   });
 
   it('cancelling the confirm applies nothing', async () => {
