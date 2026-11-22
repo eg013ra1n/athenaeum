@@ -98,47 +98,67 @@ fn text_at(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<Strin
     })
 }
 
-/// The next `limit` frames after `after_frame_id`, by frame id. The header is the file's newest
-/// stored one (`latest_header_subquery`, the choice the metadata pane and the override recompute
-/// make).
-pub fn read_rows(conn: &Connection, after_frame_id: i64, limit: usize) -> anyhow::Result<Vec<CatalogRow>> {
-    let sql = format!(
+/// The select list and join every frame read of this module shares; `tail` is the `WHERE` and
+/// what follows. The header is the file's newest stored one (`latest_header_subquery`, the choice
+/// the metadata pane and the override recompute make).
+fn rows_sql(tail: &str) -> String {
+    format!(
         "SELECT fr.id, fi.path, fi.format, fr.imagetyp,
                 fr.ccd_temp, fr.set_temp, fr.gain, fr.offset, fr.exptime, fr.focallen,
                 fr.xpixsz, fr.ypixsz, fr.object, fr.filter, fr.instrume, fr.telescop,
                 {header}
            FROM frames fr
            JOIN files fi ON fi.id = fr.file_id
-          WHERE fr.id > ?1
-          ORDER BY fr.id
-          LIMIT ?2",
+          {tail}",
         header = crate::db::latest_header_subquery("fr.file_id"),
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![after_frame_id, limit as i64], |row| {
-        Ok(CatalogRow {
-            frame_id: row.get(0)?,
-            file_path: row.get(1)?,
-            format: row.get(2)?,
-            imagetyp: text_at(row, 3)?,
-            values: ResolvedFields {
-                ccd_temp: number_at(row, 4)?,
-                set_temp: number_at(row, 5)?,
-                gain: number_at(row, 6)?,
-                offset: number_at(row, 7)?,
-                exptime: number_at(row, 8)?,
-                focallen: number_at(row, 9)?,
-                xpixsz: number_at(row, 10)?,
-                ypixsz: number_at(row, 11)?,
-                object: text_at(row, 12)?,
-                filter: text_at(row, 13)?,
-                instrume: text_at(row, 14)?,
-                telescop: text_at(row, 15)?,
-            },
-            header: text_at(row, 16)?,
-        })
-    })?;
+    )
+}
+
+fn catalog_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogRow> {
+    Ok(CatalogRow {
+        frame_id: row.get(0)?,
+        file_path: row.get(1)?,
+        format: row.get(2)?,
+        imagetyp: text_at(row, 3)?,
+        values: ResolvedFields {
+            ccd_temp: number_at(row, 4)?,
+            set_temp: number_at(row, 5)?,
+            gain: number_at(row, 6)?,
+            offset: number_at(row, 7)?,
+            exptime: number_at(row, 8)?,
+            focallen: number_at(row, 9)?,
+            xpixsz: number_at(row, 10)?,
+            ypixsz: number_at(row, 11)?,
+            object: text_at(row, 12)?,
+            filter: text_at(row, 13)?,
+            instrume: text_at(row, 14)?,
+            telescop: text_at(row, 15)?,
+        },
+        header: text_at(row, 16)?,
+    })
+}
+
+/// The next `limit` frames after `after_frame_id`, by frame id.
+pub fn read_rows(conn: &Connection, after_frame_id: i64, limit: usize) -> anyhow::Result<Vec<CatalogRow>> {
+    let mut stmt = conn.prepare(&rows_sql("WHERE fr.id > ?1 ORDER BY fr.id LIMIT ?2"))?;
+    let rows = stmt.query_map(rusqlite::params![after_frame_id, limit as i64], catalog_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The frames among `frame_ids` that still exist, by frame id: the columns and the header
+/// [`read_rows`] reads, so a frame can be planned again from what the catalog holds now.
+pub(super) fn read_rows_by_ids(conn: &Connection, frame_ids: &[i64]) -> anyhow::Result<Vec<CatalogRow>> {
+    let mut out = Vec::with_capacity(frame_ids.len());
+    for chunk in frame_ids.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&rows_sql(&format!("WHERE fr.id IN ({placeholders}) ORDER BY fr.id")))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), catalog_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    out.sort_by_key(|r| r.frame_id);
+    Ok(out)
 }
 
 /// The scan roots, to say which root (and whether it keeps cameras apart) a frame's file is under.
@@ -397,6 +417,33 @@ pub(super) fn write_columns(
     Ok(())
 }
 
+/// Plans the deferred frames again from the catalog as it is now (R7). A frame whose fresh plan
+/// is empty is skipped (a value typed, or a file re-parsed, since its page wins); one whose fresh
+/// plan has changes but no longer waits for the regroup is written here as a plain column write;
+/// the rest come back for [`regroup`], with the type and the changes the fresh plan gives.
+fn replan_deferred(conn: &Connection, rules: &HeaderFallbackConfig, frame_ids: &[i64]) -> anyhow::Result<Vec<Deferred>> {
+    use anyhow::Context;
+    let roots = ScanRoots::load(conn)?;
+    let mut out = Vec::new();
+    for row in read_rows_by_ids(conn, frame_ids)? {
+        let plan = plan_frame(rules, &row, &roots);
+        if plan.changes.is_empty() {
+            continue;
+        }
+        if is_deferred(row.imagetyp.as_deref(), &row.values, &plan.changes) {
+            out.push(Deferred {
+                frame_id: row.frame_id,
+                imagetyp: row.imagetyp.clone().unwrap_or_default(),
+                changes: plan.changes,
+            });
+        } else {
+            write_columns(conn, row.frame_id, &plan.changes)
+                .with_context(|| format!("cannot write frame {}", row.frame_id))?;
+        }
+    }
+    Ok(out)
+}
+
 /// Apply the rules to the catalog: [`PAGE_SIZE`] frames per write transaction.
 pub fn apply(
     conn: &Connection,
@@ -413,9 +460,10 @@ pub fn apply(
 ///    scan or a monitor cycle interleaves between pages. Raw calibration frames that must be
 ///    regrouped, and master frames with a change in a set column, wait for step 3.
 /// 2. After the last page, the nights of every frame set with an `instrume` or `exptime` change
-///    are re-derived, once per set.
-/// 3. One transaction writes the deferred frames, regroups the raw ones and updates the
-///    master-library sets ([`regroup`]).
+///    are re-derived, once per set. A set that fails is logged and the rest go on; the error comes
+///    back after step 3.
+/// 3. One transaction plans the deferred frames again from the catalog as it is then, writes them,
+///    regroups the raw ones and updates the master-library sets ([`regroup`]).
 pub(crate) fn apply_in_pages(
     conn: &Connection,
     rules: &HeaderFallbackConfig,
@@ -431,7 +479,8 @@ pub(crate) fn apply_in_pages(
 
     let mut by_field: BTreeMap<HeaderField, usize> = BTreeMap::new();
     let mut counts = HeaderFallbackCounts::default();
-    let mut deferred: Vec<Deferred> = Vec::new();
+    // Only the ids: a deferred frame is planned again from what the catalog holds when its step runs.
+    let mut deferred: Vec<i64> = Vec::new();
     let mut frame_sets: BTreeSet<i64> = BTreeSet::new();
     let mut night_sets: BTreeSet<i64> = BTreeSet::new();
     let mut after = 0i64;
@@ -458,11 +507,7 @@ pub(crate) fn apply_in_pages(
                 night_ids.push(row.frame_id);
             }
             if is_deferred(row.imagetyp.as_deref(), &row.values, &plan.changes) {
-                deferred.push(Deferred {
-                    frame_id: row.frame_id,
-                    imagetyp: row.imagetyp.clone().unwrap_or_default(),
-                    changes: plan.changes,
-                });
+                deferred.push(row.frame_id);
             } else {
                 write_columns(conn, row.frame_id, &plan.changes)
                     .with_context(|| format!("cannot write frame {}", row.frame_id))?;
@@ -472,26 +517,45 @@ pub(crate) fn apply_in_pages(
         done += page_len;
         frame_sets.extend(crate::db::calibration_links::frame_set_ids_for_frames(conn, &changed_ids)?);
         night_sets.extend(crate::db::calibration_links::frame_set_ids_for_frames(conn, &night_ids)?);
+        // Frames a scan inserted meanwhile are read by the later pages: the bar never passes 100%.
+        let total = total.max(done);
         emit_event(emitter, PROGRESS_EVENT, &HeaderFallbackProgress { phase: "frames".into(), done, total });
         if page_len < page_size {
             break;
         }
     }
 
+    // A set that fails is logged and left; the rest and the calibration step still run, and the
+    // failure is returned at the end (the frames are written, so a second Apply would not retry it).
+    let mut failed_nights: Vec<i64> = Vec::new();
     for set_id in &night_sets {
-        let sp = crate::db::SavepointGuard::new(conn, "header_fallbacks_nights")?;
-        crate::sessions::rederive_for_frame_set(conn, *set_id, &[], gap_hours)
-            .with_context(|| format!("cannot re-derive the nights of frame set {set_id}"))?;
-        sp.commit()?;
+        let result = (|| -> anyhow::Result<()> {
+            let sp = crate::db::SavepointGuard::new(conn, "header_fallbacks_nights")?;
+            crate::sessions::rederive_for_frame_set(conn, *set_id, &[], gap_hours)?;
+            sp.commit()?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::error!(frame_set_id = *set_id, error = %format!("{e:#}"), "re-deriving the nights of a frame set failed");
+            failed_nights.push(*set_id);
+        }
     }
 
+    // The deferred frames are planned again inside the transaction that writes them: pages let
+    // other writers in, and what they typed or re-parsed in the meantime wins over the old plan.
     let report = {
         let sp = crate::db::SavepointGuard::new(conn, "header_fallbacks_calibration")?;
+        let deferred = replan_deferred(conn, rules, &deferred)?;
         let report = regroup(conn, &deferred).context("cannot regroup the calibration sets")?;
         sp.commit()?;
         report
     };
+    let total = total.max(done);
     emit_event(emitter, PROGRESS_EVENT, &HeaderFallbackProgress { phase: "calibration".into(), done: total, total });
+    if !failed_nights.is_empty() {
+        let ids = failed_nights.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+        anyhow::bail!("the nights of frame set(s) {ids} could not be re-derived; the frames and calibration sets are updated");
+    }
 
     counts.sets_regrouped = report.sets_regrouped;
     let by_field_text = finish_by_field(&mut counts, by_field);
@@ -1022,6 +1086,31 @@ mod tests {
             &[("IMAGETYP", quoted("Light")), ("INSTRUME", quoted("Cam")), ("CAMERA", quoted("Cam N3"))],
         );
         write_fits(dir, "d.fits", &[("IMAGETYP", quoted("Light")), ("INSTRUME", quoted("Cam"))]);
+        // A second dark of b's group, and a flat: raw calibration frames whose sets are regrouped.
+        write_fits(
+            dir,
+            "b2.fits",
+            &[
+                ("IMAGETYP", quoted("Dark")),
+                ("DET-TEMP", real("-10")),
+                ("EXPTIME", real("300")),
+                ("INSTRUME", quoted("Cam N3")),
+                ("CAMERA", quoted("Other")),
+            ],
+        );
+        write_fits(
+            dir,
+            "f.fits",
+            &[
+                ("IMAGETYP", quoted("Flat")),
+                ("DET-TEMP", real("-10")),
+                ("EXPTIME", real("3")),
+                ("INSTRUME", quoted("Cam")),
+                ("CAMERA", quoted("Other")),
+                ("FILTER", quoted("Ha")),
+                ("FOCALLEN", real("530")),
+            ],
+        );
         let cards = vec![
             Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
             Card::new("EXPOSURE", CardValue::Real(60.0)).unwrap(),
@@ -1064,7 +1153,7 @@ mod tests {
             let rules = custom_rules();
             let conn = scan_root_under(dir.path(), unique, &rules);
             let stored = stored_by_name(&conn);
-            assert_eq!(stored.len(), 5);
+            assert_eq!(stored.len(), 7);
             // The scan really read the custom order: the first keyword of each moved field.
             assert_eq!(stored["a.fits"].ccd_temp, Some(-5.5));
             assert_eq!(stored["a.fits"].exptime, Some(60.0));
@@ -1079,6 +1168,50 @@ mod tests {
         }
     }
 
+    /// For each raw calibration frame, by file name: the values of the set holding it (the
+    /// floats at six decimals) and the file names that share that set. Set ids differ between
+    /// catalogs, so they are not part of it.
+    fn raw_sets_by_file(conn: &Connection) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
+        let f = |v: Option<f64>| v.map_or("-".to_string(), |x| format!("{x:.6}"));
+        let mut stmt = conn
+            .prepare(
+                "SELECT cs.id, fi.filename, cs.imagetyp, cs.instrume, cs.exptime, cs.gain, cs.offset,
+                        cs.ccd_temp, cs.temp_min, cs.temp_max, cs.frame_count
+                   FROM calibration_set_frames csf
+                   JOIN calibration_set cs ON cs.id = csf.set_id
+                   JOIN frames fr ON fr.id = csf.frame_id
+                   JOIN files fi ON fi.id = fr.file_id
+                  WHERE COALESCE(cs.is_master_library, 0) = 0",
+            )
+            .unwrap();
+        let rows: Vec<(i64, String, Vec<String>)> = stmt
+            .query_map([], |r| {
+                let values = vec![
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "-".into()),
+                    f(r.get(4)?),
+                    f(r.get(5)?),
+                    f(r.get(6)?),
+                    f(r.get(7)?),
+                    f(r.get(8)?),
+                    f(r.get(9)?),
+                    r.get::<_, i64>(10)?.to_string(),
+                ];
+                Ok((r.get(0)?, r.get(1)?, values))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut by_set: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for (set_id, name, _) in &rows {
+            by_set.entry(*set_id).or_default().push(name.clone());
+        }
+        for names in by_set.values_mut() {
+            names.sort();
+        }
+        rows.into_iter().map(|(set_id, name, values)| (name, (values, by_set[&set_id].clone()))).collect()
+    }
+
     /// Scan under `a`, Apply `b` (two frames a page, so the pages and the calibration pass are
     /// the real write path), and compare all twelve fields with a fresh scan of the same files
     /// under `b`.
@@ -1089,6 +1222,11 @@ mod tests {
         apply_in_pages(&applied, b, 6.0, &crate::events::NullEmitter, 2).unwrap();
         let scanned = scan_root_under(dir.path(), unique, b);
         assert_eq!(stored_by_name(&applied), stored_by_name(&scanned), "unique camera root: {unique}");
+        // The raw calibration frames are grouped again like newly scanned ones (O7): the set's
+        // values and which files share it.
+        let sets = raw_sets_by_file(&applied);
+        assert_eq!(sets.len(), 3, "b, b2 and f are in a set: {sets:?}");
+        assert_eq!(sets, raw_sets_by_file(&scanned), "unique camera root: {unique}");
         assert_eq!(preview(&applied, b).unwrap(), HeaderFallbackCounts::default(), "unique: {unique}");
     }
 
@@ -1633,5 +1771,233 @@ mod tests {
         assert_eq!(column(&conn, "frames", "focallen", ids[0]), Some(530.0));
         assert_eq!(raw_dark_sets(&conn).iter().map(|s| s.0).collect::<Vec<_>>(), vec![set_id]);
         assert_eq!(column(&conn, "calibration_set", "focallen", set_id), None, "the set's own copy is not rewritten");
+    }
+
+    /// An emitter that runs `hook` on a second connection to the catalog file once, at the first
+    /// "frames" event: between the pages, with no transaction of Apply's open.
+    struct HookEmitter {
+        path: std::path::PathBuf,
+        hook: Box<dyn Fn(&Connection) + Send + Sync>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl ProgressEmitter for HookEmitter {
+        fn emit_json(&self, _event_name: &str, payload: serde_json::Value) {
+            if payload["phase"].as_str() != Some("frames") || self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let other = Connection::open(&self.path).unwrap();
+            other.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+            (self.hook)(&other);
+        }
+    }
+
+    /// Four darks (60 s, gain 100) in one set in a catalog file, the temperature NULL in the
+    /// columns and -10 in the headers, two frames a page: the first page holds `ids[0]` and `ids[1]`.
+    fn darks_in_a_file(dir: &std::path::Path) -> (Connection, std::path::PathBuf, Vec<i64>) {
+        let path = dir.join("catalog.db");
+        let conn = Connection::open(&path).unwrap();
+        init_db(&conn).unwrap();
+        let ids = four_darks(&conn, ["-10", "-10", "-10", "-10"]);
+        group_darks(&conn, ids.clone());
+        assert_eq!(raw_dark_sets(&conn).len(), 1);
+        (conn, path, ids)
+    }
+
+    fn apply_with_hook(
+        conn: &Connection,
+        path: &std::path::Path,
+        hook: impl Fn(&Connection) + Send + Sync + 'static,
+    ) -> anyhow::Result<ApplyReport> {
+        let emitter = HookEmitter { path: path.to_path_buf(), hook: Box::new(hook), fired: Default::default() };
+        apply_in_pages(conn, &HeaderFallbackConfig::default(), 6.0, &emitter, 2)
+    }
+
+    fn set_count_of(conn: &Connection, frame_id: i64) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM calibration_set_frames WHERE frame_id = ?1", params![frame_id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_value_typed_while_apply_runs_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path, ids) = darks_in_a_file(dir.path());
+        let typed = ids[0];
+        apply_with_hook(&conn, &path, move |other| {
+            let edits = crate::models::FrameMetadataEdits { ccd_temp: Some(Some(-15.0)), ..Default::default() };
+            crate::db::bulk_update_frame_metadata(other, &[typed], &edits).unwrap();
+        })
+        .unwrap();
+        assert_eq!(column(&conn, "frames", "ccd_temp", typed), Some(-15.0), "the typed value stays");
+        assert_eq!(set_count_of(&conn, typed), 0, "the edit unlinked the dark and Apply did not regroup it");
+        for id in &ids[1..] {
+            assert_eq!(column(&conn, "frames", "ccd_temp", *id), Some(-10.0));
+        }
+        let sets = raw_dark_sets(&conn);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!(members(&conn, sets[0].0), ids[1..]);
+    }
+
+    #[test]
+    fn a_dark_made_a_flat_while_apply_runs_is_never_put_in_a_dark_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path, ids) = darks_in_a_file(dir.path());
+        let changed = ids[0];
+        apply_with_hook(&conn, &path, move |other| {
+            let edits = crate::models::FrameMetadataEdits { imagetyp: Some(Some("FLAT".into())), ..Default::default() };
+            crate::db::bulk_update_frame_metadata(other, &[changed], &edits).unwrap();
+        })
+        .unwrap();
+        let imagetyp: String =
+            conn.query_row("SELECT imagetyp FROM frames WHERE id = ?1", params![changed], |r| r.get(0)).unwrap();
+        assert_eq!(imagetyp, "Flat");
+        let dark_memberships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames csf JOIN calibration_set cs ON cs.id = csf.set_id
+                  WHERE csf.frame_id = ?1 AND cs.imagetyp = 'Dark'",
+                params![changed],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dark_memberships, 0);
+        let sets = raw_dark_sets(&conn);
+        assert_eq!(members(&conn, sets[0].0), ids[1..]);
+    }
+
+    #[test]
+    fn a_dark_made_a_light_while_apply_runs_is_written_as_a_plain_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path, ids) = darks_in_a_file(dir.path());
+        let changed = ids[0];
+        apply_with_hook(&conn, &path, move |other| {
+            let edits = crate::models::FrameMetadataEdits { imagetyp: Some(Some("LIGHT".into())), ..Default::default() };
+            crate::db::bulk_update_frame_metadata(other, &[changed], &edits).unwrap();
+        })
+        .unwrap();
+        // The fresh plan still fills the temperature, but a light has no group to regroup.
+        assert_eq!(column(&conn, "frames", "ccd_temp", changed), Some(-10.0));
+        assert_eq!(set_count_of(&conn, changed), 0);
+        assert_eq!(members(&conn, raw_dark_sets(&conn)[0].0), ids[1..]);
+    }
+
+    #[test]
+    fn an_empty_set_apply_did_not_empty_survives() {
+        let conn = catalog();
+        let ids = four_darks(&conn, ["-10", "-10", "-20", "-20"]);
+        group_darks(&conn, ids.clone());
+        // What a scan that is filling a new set looks like between two statements.
+        let stray = calibration_set(&conn, "Dark");
+        let report = apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(report.counts.sets_regrouped, 1);
+        let sets = raw_dark_sets(&conn);
+        assert_eq!(sets.len(), 3, "the two regrouped sets and the stray one: {sets:?}");
+        assert!(sets.iter().any(|(id, _, _)| *id == stray), "the stray set survives");
+    }
+
+    #[test]
+    fn a_regroup_that_leaves_a_frame_in_no_set_rolls_back() {
+        let conn = catalog();
+        let ids = four_darks(&conn, ["-10", "-10", "-20", "-20"]);
+        group_darks(&conn, ids.clone());
+        let before = raw_dark_sets(&conn);
+        // Every membership insert fails: the scanner's creation logs the error and goes on.
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_members BEFORE INSERT ON calibration_set_frames
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .unwrap();
+        let err = apply_in_pages(&conn, &HeaderFallbackConfig::default(), 6.0, &NullEmitter, 2).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("left in no calibration set"), "{text}");
+        conn.execute_batch("DROP TRIGGER refuse_members").unwrap();
+        // The calibration step rolled back whole: the columns are as they were, the frames pending.
+        for id in &ids {
+            assert_eq!(column(&conn, "frames", "ccd_temp", *id), None);
+        }
+        assert_eq!(raw_dark_sets(&conn), before);
+        assert_eq!(members(&conn, before[0].0), ids);
+        assert_eq!(preview(&conn, &HeaderFallbackConfig::default()).unwrap().frames_changed, 4);
+    }
+
+    #[test]
+    fn a_frame_set_whose_nights_fail_does_not_stop_the_rest() {
+        let conn = catalog();
+        let h = fits_text(&[("EXPTIME", "30")]);
+        let mut lights = Vec::new();
+        for i in 0..4 {
+            let id = add_frame(&conn, &format!("l{i}.fits"), "FITS", "Light", &ResolvedFields::default(), Some(&h));
+            set_date(&conn, id, &format!("2026-01-01T22:{:02}:00Z", i * 5));
+            lights.push(id);
+        }
+        for (set_id, ids) in [(1i64, &lights[..2]), (2, &lights[2..])] {
+            conn.execute("INSERT INTO frames_set (id, name) VALUES (?1, 'M31')", params![set_id]).unwrap();
+            crate::sessions::rederive_for_frame_set(&conn, set_id, ids, 6.0).unwrap();
+        }
+        let nights_of = |c: &Connection, set_id: i64| -> Vec<i64> {
+            c.prepare("SELECT id FROM imaging_nights WHERE frames_set_id = ?1")
+                .unwrap()
+                .query_map(params![set_id], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let second_before = nights_of(&conn, 2);
+        // A dark that waits for the calibration step.
+        let darks = four_darks(&conn, ["-10", "-10", "-10", "-10"]);
+        group_darks(&conn, darks.clone());
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_night BEFORE INSERT ON imaging_nights WHEN NEW.frames_set_id = 1
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .unwrap();
+
+        let err = apply_in_pages(&conn, &HeaderFallbackConfig::default(), 6.0, &NullEmitter, 2).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("frame set(s) 1 "), "{text}");
+        assert_ne!(nights_of(&conn, 2), second_before, "the other frame set was re-derived");
+        assert_eq!(column(&conn, "frames", "ccd_temp", darks[0]), Some(-10.0), "the calibration step ran");
+    }
+
+    #[test]
+    fn the_progress_total_never_falls_below_what_is_done() {
+        struct Totals(std::sync::Mutex<Vec<(usize, usize)>>);
+        impl ProgressEmitter for Totals {
+            fn emit_json(&self, _event_name: &str, payload: serde_json::Value) {
+                let p: HeaderFallbackProgress = serde_json::from_value(payload).unwrap();
+                self.0.lock().unwrap().push((p.done, p.total));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let conn = Connection::open(&path).unwrap();
+        init_db(&conn).unwrap();
+        let h = fits_text(&[("DET-TEMP", "-5")]);
+        for i in 0..2 {
+            add_frame(&conn, &format!("l{i}.fits"), "FITS", "Light", &ResolvedFields::default(), Some(&h));
+        }
+        // A scan inserts frames after the count was taken.
+        let hook = HookEmitter {
+            path: path.clone(),
+            hook: Box::new(|other| {
+                let h = fits_text(&[("DET-TEMP", "-5")]);
+                for i in 0..3 {
+                    add_frame(other, &format!("n{i}.fits"), "FITS", "Light", &ResolvedFields::default(), Some(&h));
+                }
+            }),
+            fired: Default::default(),
+        };
+        let totals = Totals(Default::default());
+        struct Both<'a>(&'a HookEmitter, &'a Totals);
+        impl ProgressEmitter for Both<'_> {
+            fn emit_json(&self, name: &str, payload: serde_json::Value) {
+                self.1.emit_json(name, payload.clone());
+                self.0.emit_json(name, payload);
+            }
+        }
+        apply_in_pages(&conn, &HeaderFallbackConfig::default(), 6.0, &Both(&hook, &totals), 2).unwrap();
+        let seen = totals.0.lock().unwrap().clone();
+        assert!(seen.len() >= 2 && seen.iter().all(|(done, total)| total >= done), "{seen:?}");
+        assert_eq!(seen.last().unwrap().0, seen.last().unwrap().1, "{seen:?}");
     }
 }

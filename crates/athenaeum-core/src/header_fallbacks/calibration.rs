@@ -143,12 +143,27 @@ fn sql_value(v: &Option<FieldValue>) -> Value {
     }
 }
 
+/// How many of `frame_ids` are a member of no calibration set.
+fn frames_without_set(conn: &Connection, frame_ids: &[i64]) -> anyhow::Result<usize> {
+    let mut missing = 0usize;
+    for chunk in frame_ids.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let with_set: i64 = conn.query_row(
+            &format!("SELECT COUNT(DISTINCT frame_id) FROM calibration_set_frames WHERE frame_id IN ({placeholders})"),
+            rusqlite::params_from_iter(chunk.iter()),
+            |r| r.get(0),
+        )?;
+        missing += chunk.len().saturating_sub(with_set as usize);
+    }
+    Ok(missing)
+}
+
 /// The calibration transaction's work (spec §5.5); the caller holds one `BEGIN IMMEDIATE`.
 ///
 /// 1. Writes the columns of every deferred frame.
-/// 2. Raw calibration frames: takes each out of the movable sets that hold it, prunes the sets
-///    this emptied, and groups the moved frames again through the scanner's own path as if newly
-///    scanned. A frame of a frozen set keeps its membership (D11).
+/// 2. Raw calibration frames: takes each out of the movable sets that hold it (the empty-set
+///    trigger prunes the sets this emptied), and groups the moved frames again through the
+///    scanner's own path as if newly scanned. A frame of a frozen set keeps its membership (D11).
 /// 3. Master frames: the `is_master_library` set holding the frame takes the changed values.
 ///
 /// A set that keeps other members is left as it is (the bulk edit leaves it so too): its
@@ -203,7 +218,8 @@ pub(crate) fn regroup(conn: &Connection, deferred: &[Deferred]) -> anyhow::Resul
                 }
             }
         }
-        crate::db::schema::prune_orphaned_calibration_sets(conn)?;
+        // No whole-table prune: the `calibration_set_empty_prune` trigger removes every set this
+        // emptied, with the same filter as `movable_sets_of`, and leaves a concurrent scan's new set alone.
 
         let mut by_type: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
         for d in &raw {
@@ -212,6 +228,7 @@ pub(crate) fn regroup(conn: &Connection, deferred: &[Deferred]) -> anyhow::Resul
             }
         }
         if !by_type.is_empty() {
+            let regrouped: Vec<i64> = by_type.values().flatten().copied().collect();
             let mut take = |t: &str| by_type.remove(t).unwrap_or_default();
             let (flats, darks, bias, darkflats) = (take("Flat"), take("Dark"), take("Bias"), take("DarkFlat"));
             create_calibration_sets_from_scan_with_masters(
@@ -222,6 +239,12 @@ pub(crate) fn regroup(conn: &Connection, deferred: &[Deferred]) -> anyhow::Resul
                 darkflats,
                 MasterFrameIds::default(),
             )?;
+            // The creation logs and swallows a per-set error, so a frame can be left in no set,
+            // and the next preview would read 0 for it. Failing here rolls the transaction back.
+            let homeless = frames_without_set(conn, &regrouped)?;
+            if homeless > 0 {
+                anyhow::bail!("{homeless} regrouped calibration frame(s) were left in no calibration set");
+            }
         }
     }
 
