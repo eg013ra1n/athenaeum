@@ -23,7 +23,7 @@ pub use starloom::stacking::measure::{
     measure_planes_pass2, measure_planes_with_width_hints, substitute_group_c, ChannelCSummary, ChannelMeasurement,
     FrameMeasurement, FramePass1, MeasureOptions, MeasureTimings, MeasuredPlane, NoiseSource, PlaneMeasurement,
     PlanesPass1, SeedOverride, StarPopulation, ADU_SCALE, COLOUR_LIST_STARS, DEFAULT_DETECTION_SIGMA,
-    DEFAULT_SEED_PREFILTER, MONO_LIST_PER_REGISTRATION_STAR,
+    DEFAULT_SEED_PREFILTER, MEASURE_STAGE_VERSION, MONO_LIST_PER_REGISTRATION_STAR,
 };
 #[cfg(feature = "test-support")]
 pub use starloom::stacking::measure::{pass1_peak, PASS1_CANCEL_AFTER, PASS1_LOG, PASS1_TOUCH_AFTER};

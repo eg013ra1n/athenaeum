@@ -159,6 +159,16 @@ impl Default for MeasureOptions {
 /// more than a quarter of their stars.
 pub const DEFAULT_DETECTION_SIGMA: f32 = 20.0;
 
+/// The version of starloom's own measure numerics: the detection adapter, the seed hand-over and the mapping of the
+/// module's records onto a [`PlaneMeasurement`]. rustafits' `MEASURE_VERSION` stays the version of the star fit.
+///
+/// A change to the numbers this stage produces that is not a star-fit change bumps this constant, so the caches see it
+/// without a rustafits bump. Athenaeum's core folds it into the measurement, registration and normalization hashes
+/// only when it is not 1 (so no hash changes at 1), and a bump raises `PASS1_ARTIFACT_VERSION` with it, because the
+/// pass-1 header checks only rustafits' version. The golden test `stage_goldens` keys the measure, pass-1, register,
+/// normalization and integrate rows on it.
+pub const MEASURE_STAGE_VERSION: u32 = 1;
+
 /// Default for [`MeasureOptions::seed_prefilter`] and
 /// [`crate::stacking::config::MeasurementConfig::seed_prefilter`].
 pub const DEFAULT_SEED_PREFILTER: SeedPrefilter = SeedPrefilter::None;
@@ -1876,6 +1886,43 @@ pub fn pass1_peak(dir: &Path) -> usize {
         .map_or(0, |(_, _, peak)| *peak)
 }
 
+/// Test-only (ruling C4): zeroes the two wall-clock fields of a rustafits `PlanePrep` that no public setter reaches,
+/// its `PhaseTimings` (four `u64` ms) and its `verdict_time`. They are the LAST two fields postcard stores for a prep
+/// (`population` and `sub` are `serde(skip)`), so the bytes are rewritten at the tail: the prefix stays, the four
+/// varints become zero and the `Duration` becomes zero, and the prep is read back from the new bytes. A rustafits test
+/// hook that zeroes them replaces this at the next rustafits bump.
+///
+/// # Panics
+///
+/// When the stored layout is no longer "timings, then verdict_time, last".
+#[cfg(any(test, feature = "test-support"))]
+fn zero_prep_timings(prep: &mut sm::PlanePrep) {
+    const LAYOUT: &str = "rustafits PlanePrep's stored layout changed (timings and verdict_time are no longer its \
+                          last stored fields): add a rustafits test hook that zeroes them instead (starloom phase 1, \
+                          ruling C4)";
+    let bytes = postcard::to_allocvec(prep).unwrap_or_else(|e| panic!("{LAYOUT}: {e}"));
+    let time_tail = postcard::to_allocvec(&prep.verdict_time()).unwrap_or_else(|e| panic!("{LAYOUT}: {e}"));
+    assert!(bytes.ends_with(&time_tail), "{LAYOUT}");
+    let mut end = bytes.len() - time_tail.len();
+    // Four varints, parsed backward: a varint is bytes with the high bit set and one last byte with it clear, so from
+    // a terminal byte the run of high-bit-set bytes before it is that varint's body.
+    for _ in 0..4 {
+        assert!(end > 0 && bytes[end - 1] & 0x80 == 0, "{LAYOUT}");
+        end -= 1;
+        while end > 0 && bytes[end - 1] & 0x80 != 0 {
+            end -= 1;
+        }
+    }
+    let mut new = bytes[..end].to_vec();
+    new.extend(postcard::to_allocvec(&sm::PhaseTimings::default()).unwrap_or_else(|e| panic!("{LAYOUT}: {e}")));
+    new.extend(postcard::to_allocvec(&Duration::ZERO).unwrap_or_else(|e| panic!("{LAYOUT}: {e}")));
+    *prep = postcard::from_bytes(&new).unwrap_or_else(|e| panic!("{LAYOUT}: {e}"));
+    assert!(
+        prep.verdict_time() == Duration::ZERO && postcard::to_allocvec(prep).is_ok_and(|b| b == new),
+        "{LAYOUT}"
+    );
+}
+
 impl FramePass1 {
     /// Every plane's own β, in plane order.
     pub fn beta_own(&self) -> &[f64] {
@@ -1887,6 +1934,29 @@ impl FramePass1 {
     /// ([`check_stamp_len`]).
     pub(crate) fn source(&self) -> Option<SourceStamp> {
         self.identity.map(stamp_of)
+    }
+
+    /// Test-only: makes this first pass's stored bytes deterministic. The identity's modification time becomes the Unix
+    /// epoch (its length, the file's own, stays), and every wall-clock field the artifact writes becomes zero.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    // doc(hidden): an SL-17 test hook (test-support)
+    pub fn fix_stamp_and_zero_timings(&mut self) {
+        if let Some(id) = self.identity.as_mut() {
+            id.modified = Some(std::time::UNIX_EPOCH);
+        }
+        self.read_ms.iter_mut().for_each(|ms| *ms = 0);
+        self.elapsed = Duration::ZERO;
+        for head in &mut self.planes.heads {
+            head.adapter_detect_ms = 0;
+            if head.own_phases.is_some() {
+                head.own_phases = Some(sm::PhaseTimings::default());
+            }
+        }
+        self.planes.walls.iter_mut().for_each(|w| *w = Duration::ZERO);
+        for prep in &mut self.planes.preps {
+            zero_prep_timings(prep);
+        }
     }
 
     /// What a controller reads without the body (Task 11c, R11c-2).
@@ -2317,6 +2387,25 @@ pub(crate) mod tests {
         let path = dir.join(name);
         write_fits_f32(&path, w, h, planes.len(), &all, &[]).unwrap();
         path
+    }
+
+    /// Ruling C4: a first pass measured twice and fixed gives the same stored bytes, so the timings inside every
+    /// `PlanePrep` (which no public setter reaches) are zeroed by the tail rewrite.
+    #[test]
+    fn a_fixed_first_pass_stores_the_same_bytes_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let path = write(dir.path(), "frame.fits", &[&data], w, h);
+        let opts = MeasureOptions::default();
+        let mut stored = Vec::new();
+        for run in 0..2 {
+            let mut pass1 = measure_frame_pass1_gain(&path, &opts, None, &AtomicBool::new(false), Some(1.0)).unwrap();
+            pass1.fix_stamp_and_zero_timings();
+            let out = dir.path().join(format!("run{run}.athm"));
+            crate::stacking::pass1_artifact::write_pass1(&out, &pass1).unwrap();
+            stored.push(std::fs::read(&out).unwrap());
+        }
+        assert_eq!(stored[0], stored[1]);
     }
 
     /// Zeroes wall-clock timings before a structural equality check — two

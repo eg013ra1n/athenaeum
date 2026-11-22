@@ -527,6 +527,11 @@ pub struct GroupInput<'a> {
 /// formula changes again, and teach `src/components/stacking/snrGain.ts` the new value.
 pub const SNR_GAIN_VERSION: u32 = 2;
 
+/// The version of the master light's combine, rejection and weighting ([`integrate_group`]). A signal version: it enters
+/// no hash, and no cache keys this stage. Bump it when a change moves the output numbers; the `stage_goldens` test fails
+/// until it does, and Athenaeum's tripwire pins it so the bump is accepted on purpose (spec SL-19).
+pub const INTEGRATE_VERSION: u32 = 1;
+
 /// The `reason` of the gain's and the master figure's warns names "under 20 paired"; the count it names is the module's.
 const _: () = assert!(COMMON_MIN_STARS == 20);
 

@@ -6,7 +6,11 @@ use starloom::calibration_library::LIGHT_CAL_VERSION;
 #[cfg(feature = "solver")]
 use starloom::stacking::config::DRIZZLE_KERNEL_VERSION;
 #[cfg(feature = "solver")]
-use starloom::stacking::integrate::SNR_GAIN_VERSION;
+use starloom::integration::engine::ENGINE_VERSION;
+#[cfg(feature = "solver")]
+use starloom::stacking::integrate::{INTEGRATE_VERSION, SNR_GAIN_VERSION};
+#[cfg(feature = "solver")]
+use starloom::stacking::measure::MEASURE_STAGE_VERSION;
 #[cfg(feature = "solver")]
 use starloom::stacking::ln::grid::LN_GRID_VERSION;
 #[cfg(feature = "solver")]
@@ -26,6 +30,27 @@ fn starloom_versions_are_the_accepted_ones() {
     assert_eq!(DRIZZLE_KERNEL_VERSION, 2, "DRIZZLE_KERNEL_VERSION: {accepted}");
     assert_eq!(PASS1_ARTIFACT_VERSION, 1, "PASS1_ARTIFACT_VERSION: {accepted}");
     assert_eq!(LN_GRID_VERSION, 1, "LN_GRID_VERSION (the .athln version): {accepted}");
+}
+
+/// The two version-less stages' signal versions enter no hash: a bump recomputes nothing, so it is accepted here.
+#[cfg(feature = "solver")]
+#[test]
+fn starloom_signal_versions_are_the_accepted_ones() {
+    let accepted =
+        "a starloom bump changed this signal version: accept it on purpose (spec SL-19); no cache keys this stage";
+    assert_eq!(INTEGRATE_VERSION, 1, "INTEGRATE_VERSION: {accepted}");
+    assert_eq!(ENGINE_VERSION, 1, "ENGINE_VERSION: {accepted}");
+}
+
+#[cfg(feature = "solver")]
+#[test]
+fn starloom_measure_stage_version_is_the_accepted_one() {
+    assert_eq!(
+        MEASURE_STAGE_VERSION, 1,
+        "MEASURE_STAGE_VERSION: caches key this stage: a bump recomputes measurement, registration and \
+         normalization artifacts; raise PASS1_ARTIFACT_VERSION with it \u{2014} the pass-1 header checks only \
+         rustafits' version, pass1_artifact.rs:140,163"
+    );
 }
 
 // `LIGHT_CAL_VERSION` is a base-layer starloom constant and `LIGHT_CAL_ENGINE_VERSION` is ungated in core, so these

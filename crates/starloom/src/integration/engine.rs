@@ -15,6 +15,12 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// The version of the engine's per-pixel combine (banded streaming, rejection and the flat's normalization), used by
+/// calibration masters and master lights alike. A signal version: it enters no hash, and no cache keys this stage. Bump
+/// it when a change moves the output numbers; the `stage_goldens` test fails until it does, and Athenaeum's tripwire
+/// pins it so the bump is accepted on purpose (spec SL-19).
+pub const ENGINE_VERSION: u32 = 1;
+
 pub struct IntegrationOutput {
     pub width: usize,
     pub height: usize,
