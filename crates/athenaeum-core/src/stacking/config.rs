@@ -2480,4 +2480,12 @@ mod tests {
         );
         assert_eq!(warns, 0);
     }
+
+    /// The canonical config text sorts every object's keys because `serde_json` keeps its default map. A crate
+    /// anywhere in the build that turns on `preserve_order` would reorder them and change every `config_hash`.
+    #[test]
+    fn serde_json_keys_stay_sorted() {
+        let text = serde_json::to_string(&serde_json::json!({"b": 1, "a": 2})).unwrap();
+        assert_eq!(text, r#"{"a":2,"b":1}"#, "a crate in the build turned on serde_json preserve_order");
+    }
 }

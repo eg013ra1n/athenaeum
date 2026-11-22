@@ -5,14 +5,13 @@
 //! relink, and supersede.
 
 pub mod headers;
-// Hot-pixel cosmetic correction reads a master dark through the render-gated
-// `integration` module, same as the light-calibration engine below.
+// Hot-pixel cosmetic correction lives in `starloom` (its `engine` layer); the old path stays.
 #[cfg(feature = "render")]
-pub mod cosmetic;
-// The light-calibration engine streams raw pixels via the render-gated
-// `integration` module. Its shared data types (FlatNormMode, BiasFallback,
-// LightCalParams, LIGHT_CAL_ENGINE_VERSION, TRIMMED_MEAN_TAIL_FRACTION) live in `models`
-// so ungated consumers (scanner, export) keep working.
+pub use starloom::calibration_library::cosmetic;
+// The light-calibration pixel math lives in `starloom` (its `engine` layer); `light_cal` re-exports it and keeps
+// the reading of Athenaeum's own flat cards. Its shared data types (FlatNormMode, BiasFallback, LightCalParams,
+// LIGHT_CAL_ENGINE_VERSION, TRIMMED_MEAN_TAIL_FRACTION) live in `models` so ungated consumers (scanner, export)
+// keep working.
 #[cfg(feature = "render")]
 pub mod light_cal;
 pub mod light_headers;

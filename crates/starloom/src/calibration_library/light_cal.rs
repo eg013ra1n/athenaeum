@@ -347,7 +347,7 @@ pub fn calibrate_light_compute_with(
 ) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
     // Same reasoning as `calibrate_light`: one frame, 1-2 bands regardless of
     // budget, so the floor is not the bottleneck here (spec §8).
-    calibrate_light_compute_inner(inputs, preloaded, cancel, MIN_BUDGET_BYTES, &NoFlatCards)
+    calibrate_light_compute_budgeted(inputs, preloaded, cancel, MIN_BUDGET_BYTES, &NoFlatCards)
 }
 
 /// [`calibrate_light_compute_with`] with the reader of the master flat's stamped constants as a parameter: the
@@ -359,13 +359,13 @@ pub fn calibrate_light_compute_with_cards(
     cards: &dyn FlatCardReader,
     cancel: &AtomicBool,
 ) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
-    calibrate_light_compute_inner(inputs, preloaded, cancel, MIN_BUDGET_BYTES, cards)
+    calibrate_light_compute_budgeted(inputs, preloaded, cancel, MIN_BUDGET_BYTES, cards)
 }
 
 /// [`calibrate_light_compute_with_cards`] with the band-memory budget as a
 /// parameter, so a caller can force a multi-band run on a small fixture.
 #[doc(hidden)]
-pub fn calibrate_light_compute_inner(
+pub fn calibrate_light_compute_budgeted(
     inputs: &LightCalInputs,
     preloaded: Option<&PreloadedMasters>,
     cancel: &AtomicBool,
