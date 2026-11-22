@@ -249,12 +249,18 @@ pub fn validate(cfg: &HeaderFallbackConfig) -> Result<HeaderFallbackConfig, Rule
                 return Err(RulesError::MissingDefault { field, keyword: (*d).to_string() });
             }
         }
-        let retired = dedupe_keep_last(
-            cfg.retired(field).iter().filter_map(|r| normalize_keyword(r)).collect(),
-        )
-        .into_iter()
-        .filter(|k| !order.contains(k))
-        .collect();
+        let mut retired_in: Vec<String> = Vec::new();
+        for raw in cfg.retired(field) {
+            match normalize_keyword(raw) {
+                Some(k) => retired_in.push(k),
+                None => tracing::warn!(
+                    key = SETTINGS_KEY,
+                    reason = %raw,
+                    "invalid retired keyword in FITS keyword rules; dropped"
+                ),
+            }
+        }
+        let retired = dedupe_keep_last(retired_in).into_iter().filter(|k| !order.contains(k)).collect();
         fields.insert(field, FieldRule { order, retired });
     }
     Ok(HeaderFallbackConfig { fields })
@@ -519,6 +525,17 @@ mod tests {
         assert_eq!(merged.retired(HeaderField::CcdTemp), ["OLD", "A", "B"]);
         assert_eq!(merged.order(HeaderField::CcdTemp), ["CCD-TEMP", "DET-TEMP", "A2"]);
         assert_eq!(merged.fields.len(), 12);
+    }
+
+    #[test]
+    fn with_retirements_keeps_the_last_occurrence_of_a_repeated_keyword() {
+        let mut prev = cfg_with(HeaderField::CcdTemp, &["CCD-TEMP", "DET-TEMP"]);
+        prev.fields.get_mut(&HeaderField::CcdTemp).unwrap().retired = vec!["OLD".into(), "X".into()];
+        let mut inc = cfg_with(HeaderField::CcdTemp, &["CCD-TEMP", "DET-TEMP"]);
+        inc.fields.get_mut(&HeaderField::CcdTemp).unwrap().retired = vec!["OLD".into()];
+        let merged = inc.with_retirements_from(&prev);
+        // OLD is seen first in prev and again in the incoming list: it keeps the newer place.
+        assert_eq!(merged.retired(HeaderField::CcdTemp), ["X", "OLD"]);
     }
 
     #[test]

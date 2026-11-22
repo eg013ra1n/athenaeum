@@ -16,6 +16,19 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(format!("{what}: {e}"))
 }
 
+/// The stored rules for a merge. A row that does not decode is logged and read as the default,
+/// so the write that follows replaces it (its `retired` list is unreadable and lost).
+fn previous_for_merge(conn: &rusqlite::Connection) -> HeaderFallbackConfig {
+    header_fallbacks::load(conn).unwrap_or_else(|e| {
+        tracing::error!(
+            key = crate::settings::keys::CATALOG_HEADER_FALLBACKS,
+            error = %format!("{e:#}"),
+            "stored FITS keyword rules do not decode; replacing them without their retired keywords"
+        );
+        HeaderFallbackConfig::default()
+    })
+}
+
 /// The stored rules, expanded: all twelve fields, `retired` included. No stored row reads the
 /// default document. A stored document that cannot be decoded is an error (Settings shows it).
 pub fn get_header_fallbacks(ctx: &ServiceContext) -> Result<HeaderFallbackConfig, ApiError> {
@@ -26,7 +39,8 @@ pub fn get_header_fallbacks(ctx: &ServiceContext) -> Result<HeaderFallbackConfig
 
 /// Replace the rules. A document that breaks a rule is refused (`ApiError::Invalid`, nothing
 /// stored); `retired` is merged from the stored document, so the keywords this call removes
-/// from an order are retired.
+/// from an order are retired. A stored row that does not decode is logged and replaced (the
+/// way out of a broken row).
 pub fn set_header_fallbacks(ctx: &ServiceContext, config: HeaderFallbackConfig) -> Result<(), ApiError> {
     let validated = header_fallbacks::validate(&config).map_err(|e| {
         tracing::warn!(reason = %e, "FITS keyword rules refused");
@@ -36,8 +50,7 @@ pub fn set_header_fallbacks(ctx: &ServiceContext, config: HeaderFallbackConfig) 
     let conn = db.conn();
     let tx = crate::db::SavepointGuard::new(&conn, SAVEPOINT)
         .map_err(|e| internal("cannot start the FITS keyword rules write", e))?;
-    let previous = header_fallbacks::load(&conn)
-        .map_err(|e| internal("cannot read the stored FITS keyword rules", format!("{e:#}")))?;
+    let previous = previous_for_merge(&conn);
     let merged = validated.with_retirements_from(&previous);
     header_fallbacks::store(&conn, &merged)
         .map_err(|e| internal("cannot store the FITS keyword rules", format!("{e:#}")))?;
@@ -47,14 +60,14 @@ pub fn set_header_fallbacks(ctx: &ServiceContext, config: HeaderFallbackConfig) 
 }
 
 /// Every field back to its default chain. What the orders held beyond the defaults is retired.
-/// Returns the stored, expanded document.
+/// Returns the stored, expanded document. A stored row that does not decode is logged and
+/// replaced by the defaults.
 pub fn reset_header_fallbacks(ctx: &ServiceContext) -> Result<HeaderFallbackConfig, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     let tx = crate::db::SavepointGuard::new(&conn, SAVEPOINT)
         .map_err(|e| internal("cannot start the FITS keyword rules reset", e))?;
-    let previous = header_fallbacks::load(&conn)
-        .map_err(|e| internal("cannot read the stored FITS keyword rules", format!("{e:#}")))?;
+    let previous = previous_for_merge(&conn);
     let reset = previous.reset_orders();
     header_fallbacks::store(&conn, &reset)
         .map_err(|e| internal("cannot store the FITS keyword rules", format!("{e:#}")))?;
@@ -163,5 +176,29 @@ mod tests {
             crate::db::set_setting(&conn, crate::settings::keys::CATALOG_HEADER_FALLBACKS, "not json").unwrap();
         }
         assert!(matches!(get_header_fallbacks(&ctx), Err(ApiError::Internal(_))));
+    }
+
+    fn write_garbage(ctx: &ServiceContext) {
+        let conn = ctx.db.get().unwrap().conn();
+        crate::db::set_setting(&conn, crate::settings::keys::CATALOG_HEADER_FALLBACKS, "not json").unwrap();
+    }
+
+    #[test]
+    fn set_recovers_from_a_stored_document_that_does_not_decode() {
+        let (_tmp, ctx) = test_ctx();
+        write_garbage(&ctx);
+        set_header_fallbacks(&ctx, doc(HeaderField::Gain, &["G2", "GAIN"])).unwrap();
+        let got = get_header_fallbacks(&ctx).unwrap();
+        assert_eq!(got.order(HeaderField::Gain), ["G2", "GAIN"]);
+        assert!(got.retired(HeaderField::Gain).is_empty());
+    }
+
+    #[test]
+    fn reset_recovers_from_a_stored_document_that_does_not_decode() {
+        let (_tmp, ctx) = test_ctx();
+        write_garbage(&ctx);
+        assert_eq!(reset_header_fallbacks(&ctx).unwrap(), HeaderFallbackConfig::default());
+        assert_eq!(raw_row(&ctx), None);
+        assert_eq!(get_header_fallbacks(&ctx).unwrap(), HeaderFallbackConfig::default());
     }
 }

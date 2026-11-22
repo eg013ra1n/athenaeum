@@ -331,7 +331,7 @@ mod logging_config_tests {
     /// `routes::tests::test_state` in `routes/mod.rs`, which leaves `ctx.db`
     /// unset to test only the auth layer). Mirrors
     /// `scan_roots::relink_tests::test_state`.
-    fn test_state(db: Database) -> WebAppState {
+    pub(super) fn test_state(db: Database) -> WebAppState {
         let db_cell = OnceLock::new();
         let _ = db_cell.set(db);
         let ctx = Arc::new(ServiceContext {
@@ -508,6 +508,14 @@ mod logging_config_tests {
             .expect("in range");
         assert_eq!(state.image_semaphore.read().unwrap().available_permits(), 1);
     }
+}
+
+#[cfg(test)]
+mod header_fallbacks_tests {
+    use super::logging_config_tests::test_state;
+    use super::*;
+    use athenaeum_core::db::Database;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn set_header_fallbacks_then_get_reflects_change() {
