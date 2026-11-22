@@ -220,16 +220,22 @@ pub async fn export_header_fallbacks(
     path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    athenaeum_core::api::header_fallbacks::export_header_fallbacks(
-        &state.ctx,
-        path,
-        &athenaeum_core::api::PathPolicy::AllowAll,
-    )
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        athenaeum_core::api::header_fallbacks::export_header_fallbacks(
+            &ctx,
+            path,
+            &athenaeum_core::api::PathPolicy::AllowAll,
+        )
+    })
+    .await
+    .map_err(|e| format!("FITS keyword export task panicked: {e}"))?
     .map_err(|e| e.to_string())
 }
 
 /// What importing a keyword-rules file (its `text`, or a `path`) would change. Stores nothing;
-/// the frontend saves `plan.config` after the user confirms.
+/// the frontend saves `plan.config` after the user confirms. Runs on a blocking thread: it reads
+/// the file.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn plan_header_fallbacks_import(
@@ -237,11 +243,16 @@ pub async fn plan_header_fallbacks_import(
     path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<athenaeum_core::header_fallbacks::transfer::HeaderFallbackImportPlan, String> {
-    athenaeum_core::api::header_fallbacks::plan_header_fallbacks_import(
-        &state.ctx,
-        text,
-        path,
-        &athenaeum_core::api::PathPolicy::AllowAll,
-    )
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        athenaeum_core::api::header_fallbacks::plan_header_fallbacks_import(
+            &ctx,
+            text,
+            path,
+            &athenaeum_core::api::PathPolicy::AllowAll,
+        )
+    })
+    .await
+    .map_err(|e| format!("FITS keyword import task panicked: {e}"))?
     .map_err(|e| e.to_string())
 }

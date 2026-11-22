@@ -194,6 +194,21 @@ pub enum RulesError {
     Duplicate { field: HeaderField, keyword: String },
     /// A default keyword of the field that the order lacks.
     MissingDefault { field: HeaderField, keyword: String },
+    /// An order longer than [`MAX_KEYWORDS_PER_FIELD`].
+    TooManyKeywords { field: HeaderField, max: usize },
+}
+
+/// The most keywords one field's `order` may hold (the rules are read for every frame of every
+/// scan, so a crafted file or document must not make them arbitrarily long).
+pub const MAX_KEYWORDS_PER_FIELD: usize = 32;
+
+/// A value copied from a file or document into a message, cut to 64 characters plus `…`.
+pub(crate) fn clip_echo(s: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    match s.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
 }
 
 impl std::fmt::Display for RulesError {
@@ -203,17 +218,20 @@ impl std::fmt::Display for RulesError {
                 f,
                 "{}: \"{}\" is not a valid keyword (empty or contains '=')",
                 field.id(),
-                keyword
+                clip_echo(keyword)
             ),
             RulesError::Duplicate { field, keyword } => {
-                write!(f, "{}: {} appears twice", field.id(), keyword)
+                write!(f, "{}: {} appears twice", field.id(), clip_echo(keyword))
             }
             RulesError::MissingDefault { field, keyword } => write!(
                 f,
                 "{}: the standard keyword {} cannot be removed",
                 field.id(),
-                keyword
+                clip_echo(keyword)
             ),
+            RulesError::TooManyKeywords { field, max } => {
+                write!(f, "{}: at most {} keywords", field.id(), max)
+            }
         }
     }
 }
@@ -237,12 +255,16 @@ pub fn validate(cfg: &HeaderFallbackConfig) -> Result<HeaderFallbackConfig, Rule
     let mut fields = BTreeMap::new();
     for field in HeaderField::ALL {
         let order_in = cfg.order(field);
+        if order_in.len() > MAX_KEYWORDS_PER_FIELD {
+            return Err(RulesError::TooManyKeywords { field, max: MAX_KEYWORDS_PER_FIELD });
+        }
         let mut order: Vec<String> = Vec::with_capacity(order_in.len());
+        let mut seen: HashSet<String> = HashSet::with_capacity(order_in.len());
         for raw in order_in {
             let Some(k) = normalize_keyword(raw) else {
                 return Err(RulesError::InvalidKeyword { field, keyword: raw.clone() });
             };
-            if order.contains(&k) {
+            if !seen.insert(k.clone()) {
                 return Err(RulesError::Duplicate { field, keyword: k });
             }
             order.push(k);
@@ -459,6 +481,32 @@ mod tests {
             RulesError::MissingDefault { field: HeaderField::CcdTemp, keyword: "DET-TEMP".into() }
         );
         assert_eq!(err.to_string(), "ccdTemp: the standard keyword DET-TEMP cannot be removed");
+    }
+
+    #[test]
+    fn validate_caps_a_field_at_32_keywords() {
+        let many = |n: usize| {
+            let mut order = vec!["GAIN".to_string()];
+            order.extend((1..n).map(|i| format!("G{i}")));
+            let mut c = HeaderFallbackConfig::default();
+            c.fields.insert(HeaderField::Gain, FieldRule { order, retired: vec![] });
+            c
+        };
+        assert_eq!(validate(&many(32)).unwrap().order(HeaderField::Gain).len(), 32);
+        let err = validate(&many(33)).unwrap_err();
+        assert_eq!(err, RulesError::TooManyKeywords { field: HeaderField::Gain, max: 32 });
+        assert_eq!(err.to_string(), "gain: at most 32 keywords");
+    }
+
+    #[test]
+    fn clip_echo_cuts_a_long_value_at_64_characters() {
+        assert_eq!(clip_echo("short"), "short");
+        let exact = "é".repeat(64);
+        assert_eq!(clip_echo(&exact), exact);
+        let long = "é".repeat(65);
+        assert_eq!(clip_echo(&long), format!("{}…", "é".repeat(64)));
+        let err = RulesError::InvalidKeyword { field: HeaderField::Gain, keyword: "A=".repeat(500) };
+        assert!(err.to_string().chars().count() < 150, "{err}");
     }
 
     #[test]

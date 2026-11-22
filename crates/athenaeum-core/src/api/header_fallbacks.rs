@@ -6,6 +6,7 @@
 //! the stored document (D12) and every keyword dropped from an order ends up retired.
 
 use crate::api::{db, ApiError, PathPolicy};
+use std::io::Read;
 use crate::header_fallbacks::apply::HeaderFallbackCounts;
 use crate::events::ProgressEmitter;
 use crate::header_fallbacks::transfer::{self, HeaderFallbackImportPlan, ImportError};
@@ -157,7 +158,8 @@ pub fn export_header_fallbacks(
         header_fallbacks::load(&conn)
             .map_err(|e| internal("cannot read the FITS keyword rules", format!("{e:#}")))?
     };
-    let text = transfer::export_text(&rules);
+    let text = transfer::export_text(&rules)
+        .map_err(|e| internal("cannot write the FITS keyword rules file", e))?;
     if let Some(path) = path {
         let path = std::path::PathBuf::from(path);
         policy.check(&path)?;
@@ -189,20 +191,23 @@ pub fn plan_header_fallbacks_import(
             let path = std::path::PathBuf::from(path);
             policy.check(&path)?;
             let name = file_name_of(&path);
-            let len = std::fs::metadata(&path).map_err(|e| {
+            let unreadable = |e: std::io::Error| {
                 tracing::warn!(error = %e, "header fallbacks import file unreadable");
                 ApiError::Invalid(format!("cannot read {name}: {e}"))
-            })?.len();
-            if len > transfer::MAX_IMPORT_BYTES as u64 {
-                return Err(refuse_import(ImportError::TooLarge(usize::try_from(len).unwrap_or(usize::MAX))));
+            };
+            // Bounded read: a file whose length is not what `metadata` says (a pipe, a device)
+            // still stops one byte past the cap.
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .map_err(unreadable)?
+                .take(transfer::MAX_IMPORT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(unreadable)?;
+            if bytes.len() > transfer::MAX_IMPORT_BYTES {
+                return Err(refuse_import(ImportError::TooLarge(bytes.len())));
             }
-            std::fs::read_to_string(&path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidData {
-                    refuse_import(ImportError::NotJson("the file is not UTF-8 text".to_string()))
-                } else {
-                    tracing::warn!(error = %e, "header fallbacks import file unreadable");
-                    ApiError::Invalid(format!("cannot read {name}: {e}"))
-                }
+            String::from_utf8(bytes).map_err(|_| {
+                refuse_import(ImportError::NotJson("the file is not UTF-8 text".to_string()))
             })?
         }
         _ => return Err(ApiError::Invalid("give the file's text or its path".to_string())),
@@ -210,7 +215,14 @@ pub fn plan_header_fallbacks_import(
     let current = {
         let db = db(ctx)?;
         let conn = db.conn();
-        previous_for_merge(&conn)
+        header_fallbacks::load(&conn).unwrap_or_else(|e| {
+            tracing::error!(
+                key = crate::settings::keys::CATALOG_HEADER_FALLBACKS,
+                error = %format!("{e:#}"),
+                "stored FITS keyword rules could not be read; planning the import against the defaults"
+            );
+            HeaderFallbackConfig::default()
+        })
     };
     transfer::plan_import(&current, &text).map_err(refuse_import)
 }
@@ -463,7 +475,7 @@ mod tests {
     fn export_of_a_fresh_catalog_names_no_field_and_matches_the_core_text() {
         let (_tmp, ctx) = test_ctx();
         let text = export_header_fallbacks(&ctx, None, &PathPolicy::AllowAll).unwrap();
-        assert_eq!(text, transfer::export_text(&HeaderFallbackConfig::default()));
+        assert_eq!(text, transfer::export_text(&HeaderFallbackConfig::default()).unwrap());
     }
 
     #[test]
@@ -638,5 +650,39 @@ mod tests {
             assert_eq!(raw_row(&ctx), row, "{body}");
             assert_eq!(get_header_fallbacks(&ctx).unwrap(), loaded, "{body}");
         }
+    }
+
+    #[test]
+    fn a_plan_on_an_undecodable_row_plans_against_the_defaults() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            crate::db::set_setting(&conn, crate::settings::keys::CATALOG_HEADER_FALLBACKS, "not json")
+                .unwrap();
+        }
+        let plan = plan_header_fallbacks_import(
+            &ctx,
+            Some(transfer_file(r#"{"gain":["MY-G","GAIN"]}"#)),
+            None,
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+        assert_eq!(plan.config.order(HeaderField::Gain), ["MY-G", "GAIN"]);
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].before, ["GAIN"]);
+        // A plan stores nothing: the row is still the broken one.
+        assert_eq!(raw_row(&ctx).as_deref(), Some("not json"));
+    }
+
+    #[test]
+    fn export_on_an_undecodable_row_is_an_internal_error() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            crate::db::set_setting(&conn, crate::settings::keys::CATALOG_HEADER_FALLBACKS, "not json")
+                .unwrap();
+        }
+        let err = export_header_fallbacks(&ctx, None, &PathPolicy::AllowAll).unwrap_err();
+        assert!(matches!(err, ApiError::Internal(_)), "{err}");
     }
 }

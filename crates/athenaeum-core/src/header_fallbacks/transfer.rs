@@ -6,7 +6,8 @@
 //! nothing reaches the settings until the user confirms and the frontend saves `config`.
 
 use super::{
-    fill_missing_defaults, validate, FieldRule, HeaderField, HeaderFallbackConfig, RulesError,
+    clip_echo, fill_missing_defaults, validate, FieldRule, HeaderField, HeaderFallbackConfig,
+    RulesError,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -29,17 +30,19 @@ struct ExportFile<'a> {
 
 /// The rules as pretty JSON: the fields whose order differs from the default chain, nothing
 /// else (no `retired`, no paths, no catalog data).
-pub fn export_text(cfg: &HeaderFallbackConfig) -> String {
+pub fn export_text(cfg: &HeaderFallbackConfig) -> Result<String, serde_json::Error> {
     let fields = HeaderField::ALL
         .iter()
         .filter(|f| cfg.order(**f) != f.default_chain())
         .map(|&f| (f, cfg.order(f)))
         .collect();
     let file = ExportFile { format: FILE_FORMAT, version: FILE_VERSION, fields };
-    // Serializing strings and a string-keyed map cannot fail.
-    let mut text = serde_json::to_string_pretty(&file).unwrap_or_default();
+    let mut text = serde_json::to_string_pretty(&file).map_err(|e| {
+        tracing::error!(error = %e, "cannot serialize the FITS keyword rules file");
+        e
+    })?;
     text.push('\n');
-    text
+    Ok(text)
 }
 
 // One field whose order an import changes, as the confirmation lists it.
@@ -64,8 +67,17 @@ pub struct HeaderFallbackImportPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportError {
     TooLarge(usize),
+    /// The text is not JSON (the parser's message), or the file is not UTF-8 text.
     NotJson(String),
+    /// The top level is JSON but not an object.
+    NotAnObject,
+    /// No `format` member.
+    NoFormat,
+    /// A `format` member that is not this file's format (its value as text).
     UnknownFormat(String),
+    /// A `version` member that is missing or is not an integer (`1.0`, `"1"`, `null`, ...).
+    BadVersion,
+    /// An integer `version` other than 1 (its value as text).
     UnsupportedVersion(String),
     NoFields,
     UnknownField(String),
@@ -80,15 +92,22 @@ impl std::fmt::Display for ImportError {
         match self {
             ImportError::TooLarge(_) => write!(f, "the file is larger than 1 MB"),
             ImportError::NotJson(e) => write!(f, "not a JSON file: {e}"),
-            ImportError::UnknownFormat(x) => write!(f, "not a FITS keyword file (format \"{x}\")"),
+            ImportError::NotAnObject => write!(f, "the file is not a JSON object"),
+            ImportError::NoFormat => write!(f, "the file has no \"format\""),
+            ImportError::UnknownFormat(x) => {
+                write!(f, "not a FITS keyword file (format \"{}\")", clip_echo(x))
+            }
+            ImportError::BadVersion => write!(f, "\"version\" must be the number 1"),
             ImportError::UnsupportedVersion(x) => {
-                write!(f, "version {x} is not supported (this Athenaeum reads version 1)")
+                write!(f, "version {} is not supported (this Athenaeum reads version 1)", clip_echo(x))
             }
             ImportError::NoFields => write!(f, "the file has no \"fields\" object"),
-            ImportError::UnknownField(id) => write!(f, "unknown field \"{id}\""),
-            ImportError::NotAList(id) => write!(f, "{id}: expected a list of keywords"),
+            ImportError::UnknownField(id) => write!(f, "unknown field \"{}\"", clip_echo(id)),
+            ImportError::NotAList(id) => {
+                write!(f, "{}: expected a list of keywords", clip_echo(id))
+            }
             ImportError::NotAString { field, index } => {
-                write!(f, "{field}: entry {} is not text", index + 1)
+                write!(f, "{}: entry {} is not text", clip_echo(field), index + 1)
             }
             ImportError::Rules(e) => write!(f, "{e}"),
         }
@@ -118,18 +137,20 @@ pub fn plan_import(
     let doc: serde_json::Value =
         serde_json::from_str(text).map_err(|e| ImportError::NotJson(e.to_string()))?;
     let serde_json::Value::Object(root) = doc else {
-        return Err(ImportError::NotJson("the top level is not an object".to_string()));
+        return Err(ImportError::NotAnObject);
     };
     match root.get("format") {
         Some(serde_json::Value::String(s)) if s == FILE_FORMAT => {}
         Some(serde_json::Value::String(s)) => return Err(ImportError::UnknownFormat(s.clone())),
         Some(other) => return Err(ImportError::UnknownFormat(other.to_string())),
-        None => return Err(ImportError::UnknownFormat("missing".to_string())),
+        None => return Err(ImportError::NoFormat),
     }
     match root.get("version") {
         Some(v) if v.as_u64() == Some(FILE_VERSION) => {}
-        Some(v) => return Err(ImportError::UnsupportedVersion(v.to_string())),
-        None => return Err(ImportError::UnsupportedVersion("missing".to_string())),
+        Some(v) if v.is_i64() || v.is_u64() => {
+            return Err(ImportError::UnsupportedVersion(v.to_string()))
+        }
+        _ => return Err(ImportError::BadVersion),
     }
     let Some(serde_json::Value::Object(fields)) = root.get("fields") else {
         return Err(ImportError::NoFields);
@@ -194,7 +215,7 @@ mod tests {
     #[test]
     fn export_writes_only_changed_fields_and_never_retired() {
         let c = cfg_with(HeaderField::CcdTemp, &["DET-TEMP", "CCD-TEMP", "MY-TEMP"], &["OLD"]);
-        let text = export_text(&c);
+        let text = export_text(&c).unwrap();
         let got: serde_json::Value = serde_json::from_str(&text).unwrap();
         let want = serde_json::json!({
             "format": "athenaeum.header-fallbacks",
@@ -208,7 +229,7 @@ mod tests {
     #[test]
     fn export_of_the_default_rules_names_no_field() {
         let got: serde_json::Value =
-            serde_json::from_str(&export_text(&HeaderFallbackConfig::default())).unwrap();
+            serde_json::from_str(&export_text(&HeaderFallbackConfig::default()).unwrap()).unwrap();
         assert_eq!(got["fields"], serde_json::json!({}));
     }
 
@@ -219,7 +240,7 @@ mod tests {
             HeaderField::Object,
             FieldRule { order: vec!["MY-OBJ".into(), "OBJECT".into()], retired: vec![] },
         );
-        let plan = plan_import(&HeaderFallbackConfig::default(), &export_text(&c)).unwrap();
+        let plan = plan_import(&HeaderFallbackConfig::default(), &export_text(&c).unwrap()).unwrap();
         for f in HeaderField::ALL {
             assert_eq!(plan.config.order(f), c.order(f), "{}", f.id());
         }
@@ -293,7 +314,8 @@ mod tests {
         assert!(matches!(e, ImportError::NotJson(_)), "{e:?}");
         assert!(e.to_string().starts_with("not a JSON file: "), "{e}");
         let e = refused(&HeaderFallbackConfig::default(), "[1, 2]");
-        assert!(matches!(e, ImportError::NotJson(_)), "{e:?}");
+        assert_eq!(e, ImportError::NotAnObject);
+        assert_eq!(e.to_string(), "the file is not a JSON object");
     }
 
     #[test]
@@ -303,7 +325,11 @@ mod tests {
         assert_eq!(e, ImportError::UnknownFormat("something.else".into()));
         assert!(e.to_string().contains("something.else"), "{e}");
         let e = refused(&d, r#"{"version":1,"fields":{}}"#);
-        assert!(matches!(e, ImportError::UnknownFormat(_)), "{e:?}");
+        assert_eq!(e, ImportError::NoFormat);
+        assert_eq!(e.to_string(), "the file has no \"format\"");
+        let e = refused(&d, r#"{"format":7,"version":1,"fields":{}}"#);
+        assert_eq!(e, ImportError::UnknownFormat("7".into()));
+        assert_eq!(e.to_string(), "not a FITS keyword file (format \"7\")");
     }
 
     #[test]
@@ -311,7 +337,9 @@ mod tests {
         let d = HeaderFallbackConfig::default();
         let e = refused(&d, r#"{"format":"athenaeum.header-fallbacks","version":2,"fields":{}}"#);
         assert_eq!(e, ImportError::UnsupportedVersion("2".into()));
-        assert!(e.to_string().contains("version 2"), "{e}");
+        assert_eq!(e.to_string(), "version 2 is not supported (this Athenaeum reads version 1)");
+        let e = refused(&d, r#"{"format":"athenaeum.header-fallbacks","version":0,"fields":{}}"#);
+        assert_eq!(e, ImportError::UnsupportedVersion("0".into()));
     }
 
     #[test]
@@ -320,11 +348,14 @@ mod tests {
         for body in [
             r#"{"format":"athenaeum.header-fallbacks","fields":{}}"#,
             r#"{"format":"athenaeum.header-fallbacks","version":"1","fields":{}}"#,
+            r#"{"format":"athenaeum.header-fallbacks","version":1.0,"fields":{}}"#,
             r#"{"format":"athenaeum.header-fallbacks","version":1.5,"fields":{}}"#,
             r#"{"format":"athenaeum.header-fallbacks","version":null,"fields":{}}"#,
+            r#"{"format":"athenaeum.header-fallbacks","version":[1],"fields":{}}"#,
         ] {
             let e = refused(&d, body);
-            assert!(matches!(e, ImportError::UnsupportedVersion(_)), "{body}: {e:?}");
+            assert_eq!(e, ImportError::BadVersion, "{body}");
+            assert_eq!(e.to_string(), "\"version\" must be the number 1", "{body}");
         }
     }
 
@@ -392,12 +423,52 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_carries_no_part_of_the_file() {
+    fn a_later_bad_field_refuses_the_whole_file() {
         // The first field is fine, the second is bad: the whole file is refused.
         let e = refused(
             &HeaderFallbackConfig::default(),
             &file(r#"{"ccdTemp":["DET-TEMP","CCD-TEMP"],"gain":["GAIN","A=B"]}"#),
         );
         assert!(matches!(e, ImportError::Rules(_)), "{e:?}");
+    }
+
+    #[test]
+    fn import_refuses_a_file_over_one_mib_counted_in_bytes() {
+        // 524_289 two-byte characters: 524_289 chars but 1_048_578 bytes.
+        let text = "é".repeat(524_289);
+        assert_eq!(text.len(), MAX_IMPORT_BYTES + 2);
+        assert_eq!(refused(&HeaderFallbackConfig::default(), &text), ImportError::TooLarge(MAX_IMPORT_BYTES + 2));
+    }
+
+    #[test]
+    fn import_caps_a_field_at_32_keywords() {
+        let list = |n: usize| {
+            let mut v = vec!["\"GAIN\"".to_string()];
+            v.extend((1..n).map(|i| format!("\"G{i}\"")));
+            format!("{{\"gain\":[{}]}}", v.join(","))
+        };
+        let plan = plan_import(&HeaderFallbackConfig::default(), &file(&list(32))).unwrap();
+        assert_eq!(plan.config.order(HeaderField::Gain).len(), 32);
+        let e = refused(&HeaderFallbackConfig::default(), &file(&list(33)));
+        assert_eq!(
+            e,
+            ImportError::Rules(RulesError::TooManyKeywords { field: HeaderField::Gain, max: 32 })
+        );
+        assert_eq!(e.to_string(), "gain: at most 32 keywords");
+    }
+
+    #[test]
+    fn a_refusal_echoes_at_most_64_characters_of_the_file() {
+        let d = HeaderFallbackConfig::default();
+        let long = "Z".repeat(5000);
+        let clipped = format!("{}…", "Z".repeat(64));
+        let e = refused(&d, &format!(r#"{{"format":"{long}","version":1,"fields":{{}}}}"#));
+        assert!(e.to_string().contains(&clipped) && e.to_string().len() < 200, "{e}");
+        let e = refused(&d, &file(&format!(r#"{{"{long}":[]}}"#)));
+        assert!(e.to_string().contains(&clipped) && e.to_string().len() < 200, "{e}");
+        let e = refused(&d, &file(&format!(r#"{{"gain":["GAIN","{long}="]}}"#)));
+        assert!(e.to_string().contains(&clipped) && e.to_string().len() < 200, "{e}");
+        let e = refused(&d, r#"{"format":"athenaeum.header-fallbacks","version":12345678901234567890123,"fields":{}}"#);
+        assert!(matches!(e, ImportError::BadVersion | ImportError::UnsupportedVersion(_)), "{e:?}");
     }
 }
