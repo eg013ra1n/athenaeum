@@ -25,6 +25,9 @@ use crate::db::stacking::StackSubject;
 use crate::stacking::config::{ExposureMode, GroupingConfig, StackingConfig};
 use crate::stacking::origin::{FrameOrigin, FrameOrigins};
 
+// The plain median is the kernel's (`starloom`); re-exported at today's visibility.
+pub(crate) use starloom::stacking::groups::median_f64;
+
 /// Mono vs colour (CFA) sensor, decided from `frames.bayerpat` (spec §2:
 /// "colour mode ... from the Bayer cards"). A non-empty, trimmed `bayerpat`
 /// is OSC; anything else — `NULL`, empty, or whitespace-only — is mono.
@@ -392,22 +395,6 @@ fn load_solved_scales(conn: &Connection, frame_ids: &[i64]) -> Result<HashMap<i6
         }
     }
     Ok(out)
-}
-
-/// The plain median of `values` (sorted in place) — the SAME odd/even
-/// convention `weights.rs::median_of` uses, a separate copy rather than a
-/// shared one since the two operate on unrelated quantities. `pub(crate)`
-/// (M4b R-T6-7): `plan.rs::build_plan` reuses this SAME function to derive
-/// a group's INCLUDED-only median pixel scale, rather than adding a third
-/// copy of the same six lines.
-pub(crate) fn median_f64(values: &mut [f64]) -> f64 {
-    values.sort_by(f64::total_cmp);
-    let n = values.len();
-    if n % 2 == 1 {
-        values[n / 2]
-    } else {
-        0.5 * (values[n / 2 - 1] + values[n / 2])
-    }
 }
 
 pub(crate) fn color_mode_of(bayerpat: &Option<String>) -> ColorMode {

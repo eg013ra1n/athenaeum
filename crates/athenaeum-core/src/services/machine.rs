@@ -1001,6 +1001,13 @@ fn platform_proc_sample() -> ProcSample {
 mod tests {
     use super::*;
 
+    /// Core's effective memory (`MachineProfile::effective_mem`, on the memory pair `probe_profile` takes from
+    /// starloom) and starloom's own (`sys::total_ram_bytes`) are the same number: two implementations of one rule.
+    #[test]
+    fn starloom_and_core_agree_on_effective_memory() {
+        assert_eq!(total_ram_bytes(), starloom::sys::total_ram_bytes());
+    }
+
     fn prof(
         logical: usize,
         quota: Option<f64>,

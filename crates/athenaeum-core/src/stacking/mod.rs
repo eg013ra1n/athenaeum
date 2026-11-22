@@ -59,40 +59,35 @@
 
 pub use crate::db::stacking::StackSubject;
 
-pub mod common_set;
+// The kernel modules come from starloom, under their old paths.
+pub use starloom::stacking::{
+    common_set, drizzle, integrate, pass1_artifact, prefilter, psf_signal, rej, structure,
+};
+
 pub mod config;
 pub mod crop;
-pub mod drizzle;
 pub mod fits_artifact;
 pub mod grid_map;
 pub mod groups;
-pub mod integrate;
 pub mod ln;
 pub mod master_cards;
 pub mod measure;
 pub mod origin;
-pub mod pass1_artifact;
 pub mod paths;
 pub mod plan;
-pub mod prefilter;
-pub mod prepare;
 pub mod project_source;
 pub mod provenance;
-pub mod psf_signal;
-pub(crate) mod rebase;
 pub mod register;
-pub mod rej;
+pub mod weights;
+pub(crate) mod rebase;
 // Robust Chauvenet Rejection moved to the star-measurement module with the
 // PSF-signal totals that use it (one star-measurement path, Plan A Task 2);
 // re-exported so `stacking::robust::…` callers are unchanged.
 pub use crate::star_measure::robust;
+pub mod prepare;
 pub mod run;
 pub mod solve;
 pub(crate) mod source_identity;
-#[cfg(test)]
-mod star_measure_identity;
-pub mod structure;
 pub(crate) mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
-pub mod weights;
