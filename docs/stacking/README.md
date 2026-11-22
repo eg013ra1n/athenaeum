@@ -4235,8 +4235,8 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       10.5 % even at infinite speed, below SG6's 15 % (FM-31). No `gpu` feature, `compute.gpu` or module exists.
     - **Per-core levers, bit-identical per platform, scalar oracle kept:** S1 (Integrate selection, NEON / AVX2; combine
       0.655x / 0.633x), S1c (Median combination 0.68-0.71), S2b-1 (rustafits LM pass monomorphized + NEON; 1-thread 0.57-0.69x),
-      S2b-2 (point-model columns two per vector; 0.95-0.97x). `ATHENAEUM_SCALAR_SELECTION` forces the scalar kernel and
-      `ATHENAEUM_REQUIRE_VECTOR_KERNEL` makes the tests fail when no vector kernel ran (`docs/logging/README.md`).
+      S2b-2 (point-model columns two per vector; 0.95-0.97x). `STARLOOM_SCALAR_SELECTION` forces the scalar kernel and
+      `STARLOOM_REQUIRE_VECTOR_KERNEL` makes the tests fail when no vector kernel ran (`docs/logging/README.md`).
     - **Measured out, do not re-propose:** K at 4 000 / 5 000 / 8 000; Kernel 2 on the GPU; the GPU star-fit path at All;
       percentile / sigma / winsorized internals on the vector selection; caching u / v / base from the cost pass; the
       target-rank pivot. **Next levers** (number-changing, truth-gated): a vectorized `pow` (about 31 % of the fit thread),

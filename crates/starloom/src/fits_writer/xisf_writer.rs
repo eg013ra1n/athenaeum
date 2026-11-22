@@ -981,4 +981,25 @@ mod tests {
         );
         assert!(xml.contains("comment=\"1 &lt; 2 &amp; 3 &gt; 2\""), "{xml}");
     }
+
+    /// The `XISF:CreatorApplication` value of a written file.
+    fn creator_of(path: &std::path::Path) -> String {
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+        let marker = "<Property id=\"XISF:CreatorApplication\" type=\"String\" value=\"";
+        let start = text.find(marker).expect("the CreatorApplication property is written") + marker.len();
+        text[start..start + text[start..].find('"').expect("the property value is closed")].to_string()
+    }
+
+    /// The plain writer names the library; a `_with_creator` writer names its caller's string.
+    #[test]
+    fn starloom_xisf_creator_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = ramp(4, 4, 1);
+        let plain = dir.path().join("plain.xisf");
+        write_xisf_f32(&plain, 4, 4, 1, &data, &[]).unwrap();
+        assert_eq!(creator_of(&plain), STARLOOM_CREATOR);
+        let custom = dir.path().join("custom.xisf");
+        write_xisf_f32_with_creator(&custom, 4, 4, 1, &data, &[], "x 1").unwrap();
+        assert_eq!(creator_of(&custom), "x 1");
+    }
 }

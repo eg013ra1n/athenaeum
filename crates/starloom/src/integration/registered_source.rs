@@ -98,8 +98,9 @@ pub struct RegisteredSource {
 /// concurrently-measuring Pin 3's count. Nothing else in this codebase
 /// deliberately breaks a registered artifact mid-run, so the contention
 /// risk the lock adds is not exercised in practice.
-#[cfg(test)]
-pub(crate) mod fallback_counters {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fallback_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
@@ -234,7 +235,7 @@ impl RegisteredSource {
                             src = %f.fallback.path.display(),
                             "registered frame unavailable; warping on the fly"
                         );
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         fallback_counters::on_fallback();
                     }
                     let r = PlaneReader::open(&f.fallback.path)?;

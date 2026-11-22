@@ -166,4 +166,29 @@ mod tests {
         let text2 = String::from_utf8_lossy(&std::fs::read(&path2).unwrap()).into_owned();
         assert!(text2.contains(&format!("{marker}Athenaeum {}\"", env!("CARGO_PKG_VERSION"))), "{text2}");
     }
+
+    /// Every other XISF writer reachable from core names Athenaeum too: the durability and sink variants, and the
+    /// container switch with its durability parameter.
+    #[test]
+    fn athenaeum_xisf_creator_reaches_every_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<f32> = (0..16).map(|i| i as f32 / 16.0).collect();
+        let want = format!("<Property id=\"XISF:CreatorApplication\" type=\"String\" value=\"Athenaeum {}\"", env!("CARGO_PKG_VERSION"));
+
+        let p = dir.path().join("with.xisf");
+        xisf_writer::write_xisf_f32_with(&p, 4, 4, 1, &data, &[], XisfBounds::Unit, Durability::Volatile).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned();
+        assert!(text.contains(&want), "write_xisf_f32_with: {text}");
+
+        let mut buf: Vec<u8> = Vec::new();
+        xisf_writer::write_xisf_f32_to(&mut buf, 4, 4, 1, &data, &[], XisfBounds::Unit).unwrap();
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        assert!(text.contains(&want), "write_xisf_f32_to: {text}");
+
+        let p = dir.path().join("image_with.xisf");
+        write_image_f32_with(&p, 4, 4, 1, &data, &[], OutputFormat::Xisf, XisfBounds::Unit, Durability::Volatile)
+            .unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned();
+        assert!(text.contains(&want), "write_image_f32_with: {text}");
+    }
 }

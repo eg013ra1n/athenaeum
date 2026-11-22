@@ -239,7 +239,8 @@ pub struct BandSource {
     height: usize,
 }
 
-pub(crate) struct FitsInfo { pub(crate) data_offset: u64, pub(crate) bitpix: i32, pub(crate) naxis: i32, pub(crate) w: usize, pub(crate) h: usize, pub(crate) naxis3: usize, pub(crate) bzero: f64, pub(crate) bscale: f64 }
+#[doc(hidden)]
+pub struct FitsInfo { pub data_offset: u64, pub bitpix: i32, pub naxis: i32, pub w: usize, pub h: usize, pub naxis3: usize, pub bzero: f64, pub bscale: f64 }
 
 /// Scan primary-header blocks for END; harvest the handful of numeric cards
 /// the direct reader needs. Returns the open handle alongside the info so the
@@ -249,7 +250,8 @@ pub(crate) struct FitsInfo { pub(crate) data_offset: u64, pub(crate) bitpix: i32
 /// header read leaves the cursor past the header; every read a `FrameReader`
 /// makes is positional, so that never matters. Returns None for anything that
 /// should take the decode-and-spill fallback (never errors on odd files).
-pub(crate) fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
+#[doc(hidden)]
+pub fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
     let mut f = File::open(path).ok()?;
     let info = fits_info_from_reader(&mut f)?;
     Some((f, info))
@@ -257,7 +259,8 @@ pub(crate) fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
 
 /// [`probe_fits`]' header scan over any reader positioned at the start of a FITS primary header (a file,
 /// or the header bytes read out of a zip entry): the same cards, the same shape rules, the same `None`.
-pub(crate) fn fits_info_from_reader(f: &mut impl Read) -> Option<FitsInfo> {
+#[doc(hidden)]
+pub fn fits_info_from_reader(f: &mut impl Read) -> Option<FitsInfo> {
     let mut info = FitsInfo { data_offset: 0, bitpix: 0, naxis: 0, w: 0, h: 0, naxis3: 1, bzero: 0.0, bscale: 1.0 };
     let mut block = [0u8; BLOCK as usize];
     let mut blocks = 0u64;

@@ -1,41 +1,9 @@
-//! Master-frame integration engine (spec §4): banded streaming reads,
-//! per-pixel robust combination, recipe orchestration. Never holds
-//! N full frames in RAM — the working set is N × one band.
+//! Master-frame integration engine. The engine lives in `starloom` (`starloom::integration`); this module
+//! re-exports it under the old path and keeps the two modules that read Athenaeum's settings, plus `storage_class`
+//! (which also carries the platform detection `classify*`).
+
+pub use starloom::integration::*;
 
 pub mod band_budget;
-pub mod banded;
-pub mod cfa;
-pub mod combine;
-pub mod engine;
 pub mod io_policy;
-pub mod plane_reader;
-pub mod registered_source;
-pub mod source;
-pub mod stats;
 pub mod storage_class;
-pub mod student_t;
-
-#[derive(Debug)]
-pub enum IntegrationError {
-    Io(std::io::Error),
-    BadInput(String),
-    Decode(String),
-    Cancelled,
-}
-
-impl std::fmt::Display for IntegrationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "io: {e}"),
-            Self::BadInput(m) => write!(f, "bad input: {m}"),
-            Self::Decode(m) => write!(f, "decode: {m}"),
-            Self::Cancelled => write!(f, "cancelled"),
-        }
-    }
-}
-impl std::error::Error for IntegrationError {}
-impl From<std::io::Error> for IntegrationError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}

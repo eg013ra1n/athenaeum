@@ -180,22 +180,6 @@ pub(crate) fn centroid(
     (sx / sw, sy / sw)
 }
 
-/// Background-subtracted flux in the same box (NaN skipped).
-pub(crate) fn flux(data: &[f32], w: usize, x0: f64, y0: f64, r: usize, background: f32) -> f64 {
-    let (cx, cy) = (x0.round() as i64, y0.round() as i64);
-    let h = data.len() / w;
-    let mut sum = 0.0f64;
-    for y in (cy - r as i64).max(0)..=(cy + r as i64).min(h as i64 - 1) {
-        for x in (cx - r as i64).max(0)..=(cx + r as i64).min(w as i64 - 1) {
-            let v = data[y as usize * w + x as usize];
-            if v.is_finite() {
-                sum += (v - background) as f64;
-            }
-        }
-    }
-    sum
-}
-
 /// Adds zero-mean Gaussian noise of `sigma` in place (Box–Muller over a
 /// SplitMix64 stream seeded by `seed`), so a fixture's noise is reproducible.
 pub(crate) fn add_noise(data: &mut [f32], sigma: f32, seed: u64) {
