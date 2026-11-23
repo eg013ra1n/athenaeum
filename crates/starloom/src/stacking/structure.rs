@@ -59,7 +59,7 @@
 //!   neighbours and below `0.75·upper_limit` — for a few per mille of the
 //!   work, since structures cover a tiny fraction of a frame.
 //! * The noise estimator, the high-pass width and the missing rescale: see
-//!   [`map_noise`], [`FILTER_EPSILON`] and [`structure_map`].
+//!   `map_noise`, `FILTER_EPSILON` and `structure_map`.
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -223,6 +223,8 @@ const XY_STRETCH: f64 = 1.5;
 /// half-maximum widths give [`super::psf_signal::fit_stars`] its field width,
 /// so a sky pedestal would blur that order; before Plan A Task 6b both also
 /// sized the fitter's starting width).
+///
+/// Runs on the caller's current rayon pool.
 pub fn detect_structures(plane: &[f32], w: usize, h: usize, p: &StructureParams) -> Vec<Seed> {
     if w < 3 || h < 3 || plane.len() < w * h {
         return Vec::new();

@@ -8,9 +8,10 @@
 //! isolation test; Measure marks the kept fits within that test's radius of it (`StarFlags::BLEND_NEIGHBOUR`, PD-36) and
 //! [`candidates`] reads the mark as "not isolated", so the set is the one the unrefused fits gave.
 //!
-//! Pure logic, no I/O and no weights. The caller (`run/reweigh.rs::reweigh_groups`, D1w) reads one member's `.athf` fits at a
-//! time and hands the module their [`MemberPlane`]. On a THREE-plane image (PD-32: [`APERTURE_SUM_PLANES`], the gate of the
-//! sibling rescue) the flux the paired ratios read is each fit's aperture sum `S`
+//! Pure logic, no I/O and no weights. The caller (`run/reweigh.rs::reweigh_groups`, D1w) reads one member's `.athf`
+//! fits (the per-frame star-fit file; `.athf` is its historical name) at a time and hands the module their
+//! [`MemberPlane`]. On a THREE-plane image (PD-32: [`APERTURE_SUM_PLANES`], the gate of the sibling rescue) the flux
+//! the paired ratios read is each fit's aperture sum `S`
 //! (`StarFit::ap_sum`, Plan D D2b, PD-26; its aperture Plan D D2c, PD-30): the sum of `v - B_i` over the pixels within
 //! 3 x the frame's ring FWHM of the star, one radius for the frame and none from the fit, read in Measure's HFR walk and
 //! persisted, never a second estimate. It is the pixels' sum, so it carries neither the model's bias nor `c` (the model
@@ -20,7 +21,7 @@
 //! the one the master's PSF SNR is read on. A fit is eligible when it is not clipped and not extended, an extended one
 //! only where a point-like seed of another plane sits at it (`StarFlags::in_common_set`, PD-30). Any other plane count
 //! reads what the module read before D2b (971606c8): the model flux times `c` (`signal`, `signal / area`), `in_statistic()` as
-//! the flag rule, no condition on `S` ([`common_flux_model`]); `S` fixes the beta-floor plane of a colour image and was
+//! the flag rule, no condition on `S` (`common_flux_model`); `S` fixes the beta-floor plane of a colour image and was
 //! measured there only (PD-26, PD-30).
 //!
 //! Steps, in order:
@@ -83,13 +84,18 @@ pub struct MemberPlane<'a> {
 /// `ap_mean` are what the paired ratios read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Candidate {
+    /// Column in the group's pixel grid, in pixels (0-based, integer values at pixel centres).
     pub x: f64,
+    /// Row in the group's pixel grid, in pixels.
     pub y: f64,
+    /// The star's model flux times the stand-in `c`, in DN (normalized value x 65535, summed over the star).
     pub signal: f64,
+    /// `signal` divided by the star's FWTM area: the mean flux per pixel, in DN.
     pub mean: f64,
     /// The fit's aperture sum `S` and `S / area`, native units, no `c` (Plan D D2b, PD-26); finite on every candidate of a
     /// three-plane image, NaN where the fit has none on any other (PD-32: nothing reads it there).
     pub ap_sum: f64,
+    /// The aperture sum divided by the star's FWTM area: the mean flux per pixel, in DN (no `c`).
     pub ap_mean: f64,
     /// The anchor plane's field FWHM, px: the match radius of every member reads it ([`match_member`]).
     pub anchor_fwhm_px: f64,
@@ -99,11 +105,15 @@ pub struct Candidate {
 /// model flux, which D1b's paired gain and PSF SNRs read) and not to the aperture sum, which the weight reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Usable {
+    /// The member's model flux for the candidate with the stand-in `c` applied, in DN.
     pub signal: f64,
+    /// `signal` divided by the star's FWTM area: the mean flux per pixel, in DN.
     pub mean: f64,
     /// The fit's aperture sum `S` and `S / area`, native units, no `c` (Plan D D2b, PD-26); NaN where `S` is not finite
     /// and positive: the fit is then not usable for the weight ([`common_flux`]), though its model flux still is.
     pub ap_sum: f64,
+    /// The aperture sum divided by the star's FWTM area: the mean flux per pixel, in DN (no `c`); NaN under the same
+    /// rule as `ap_sum`.
     pub ap_mean: f64,
 }
 
@@ -112,24 +122,37 @@ pub struct Usable {
 /// how many set stars the member has with a usable `S`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CommonFlux {
+    /// The member's total flux over the common set, in DN.
     pub tflux: f64,
+    /// The member's total of the per-pixel mean flux over the common set, in DN.
     pub tmean_flux: f64,
+    /// How many of the set's stars the member has with a usable aperture sum (a count of stars).
     pub paired: usize,
 }
 
+/// What the common-set step found for one (group, plane): the set and every member's flux over it, or the reason there
+/// is none.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommonOutcome {
     /// `positions` are the set's stars in group coordinates; `per_member` is in the order of `usable`.
     Measured {
+        /// The set's stars as (column, row) in the group's pixel grid, in pixels.
         positions: Vec<(f64, f64)>,
+        /// Each member's flux over the set, in the order of the `usable` argument.
         per_member: Vec<CommonFlux>,
     },
     /// Fewer than [`COMMON_MIN_STARS`] stars are common: no common flux for this (group, plane).
-    TooFewStars { stars: usize },
+    TooFewStars {
+        /// How many stars were common (a count, under [`COMMON_MIN_STARS`]).
+        stars: usize
+    },
     /// The set holds [`COMMON_MIN_STARS`] stars or more but the anchor's aperture sums `S` over it, or its `S / area` over it,
     /// add to zero or less (Plan D D2c, PD-30: an `S` at or under the sky is noise and is summed, not dropped): there is no
     /// flux for the members' ratios to scale, so no common flux for this (group, plane), like [`CommonOutcome::TooFewStars`].
-    NoAnchorFlux { stars: usize },
+    NoAnchorFlux {
+        /// How many stars the set holds (a count, at least [`COMMON_MIN_STARS`]).
+        stars: usize
+    },
     /// The match table does not fit the candidates or the anchor: a wiring bug of the caller, never a property of the
     /// sky. A caller must not read it as "under 20 stars" (PD-6's fallback reason).
     MalformedTable,
@@ -216,14 +239,14 @@ fn usable_ap(s: f64) -> bool {
     s.is_finite()
 }
 
-/// The anchor's candidate stars in group coordinates: a [`flux_fit`] (on a three-plane image `in_common_set()`: not clipped,
+/// The anchor's candidate stars in group coordinates: a `flux_fit` (on a three-plane image `in_common_set()`: not clipped,
 /// not extended unless rescued by a point-like sibling seed; on any other count `in_statistic()`), finite positive `signal`
 /// and `area`, no other anchor fit (of any flag) within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`] x the plane's `fwhm_px`, no
 /// [`crate::star_measure::StarFlags::BLEND_NEIGHBOUR`] mark (on every plane count: a fit the blend refusal removed from the
 /// list lay within that same radius, and Measure set the mark from the same width, PD-36), and the
 /// background-limited aperture SNR `signal / (noise * sqrt(area))` at least [`CORRECTION_MIN_SNR`] (the `.athf` stores no SNR;
 /// the screen stays on the model flux, as before D2b), and, on a three-plane image only, since its ratios divide by it, a
-/// finite aperture sum ([`aperture_sum`]: one at or under the sky is a candidate too). On any other count the candidate carries
+/// finite aperture sum (`aperture_sum`: one at or under the sky is a candidate too). On any other count the candidate carries
 /// the fit's `S` when it has one and NaN when it has none, and nothing reads it ([`common_flux`]). Candidates keep the anchor's
 /// fit order.
 pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
@@ -282,7 +305,7 @@ pub fn candidates(anchor: &MemberPlane<'_>) -> Vec<Candidate> {
 }
 
 /// For each candidate, the member's fit if there is exactly one within the match radius in group coordinates (two
-/// within the radius leave the candidate unmatched in this member) and it is a [`flux_fit`]: on a three-plane image
+/// within the radius leave the candidate unmatched in this member) and it is a `flux_fit`: on a three-plane image
 /// `in_common_set()` (not saturated, and not extended unless `SIBLING_POINT` rescued it; `in_statistic()` is the narrower rule
 /// the frame statistic reads), on any other count `in_statistic()`, with a finite positive `signal` and `area`. The radius is
 /// `max(POINT_SOURCE_MATCH_PX, POINT_SOURCE_MATCH_PER_FIELD_FWHM x max(F_anchor, F_member))`. Every member fit with a position
@@ -351,7 +374,7 @@ pub fn match_member(cands: &[Candidate], member: &MemberPlane<'_>) -> Vec<Option
 /// caller: an `error!`, a `debug_assert!`, and [`CommonOutcome::MalformedTable`] in a release build.
 ///
 /// All of the above is a three-plane image (`planes`, PD-32). Any other count reads the model flux times `c` as the module
-/// did at 971606c8 ([`common_flux_model`]): present means a matched fit, the ratios are of `signal` and `signal / area`, a
+/// did at 971606c8 (`common_flux_model`): present means a matched fit, the ratios are of `signal` and `signal / area`, a
 /// member whose paired sums are not positive reads 0 with no star paired, and the anchor's sums are never tested
 /// ([`CommonOutcome::NoAnchorFlux`] is a three-plane outcome).
 pub fn common_flux(

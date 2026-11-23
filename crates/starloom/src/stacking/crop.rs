@@ -9,17 +9,21 @@
 //! `(u, v) = p − CRPIX`, so they hold unchanged, and the WCS refers to array
 //! coordinates, so the row order needs no special case.
 //!
-//! Copied from Athenaeum core's `stacking/crop.rs`: the rectangle and the plane operations. The header and file
-//! operations (`restate_crpix`, `crop_file`) stay there.
+//! This module holds the rectangle and the plane operations only; rewriting a file's header and cropping a file on
+//! disk belong to the caller.
 
 use serde::{Deserialize, Serialize};
 
 /// Columns `x0 .. x0 + width`, rows `y0 .. y0 + height`, in array pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CropRect {
+    /// First kept column, in array pixels (0-based).
     pub x0: usize,
+    /// First kept row, in array pixels (0-based).
     pub y0: usize,
+    /// Number of kept columns, in pixels.
     pub width: usize,
+    /// Number of kept rows, in pixels.
     pub height: usize,
 }
 
@@ -35,6 +39,7 @@ impl CropRect {
         }
     }
 
+    /// Whether this rectangle is exactly the whole `width × height` image (nothing is cropped).
     pub fn is_full(&self, width: usize, height: usize) -> bool {
         *self == Self::full(width, height)
     }

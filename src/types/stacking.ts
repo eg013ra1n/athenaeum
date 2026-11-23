@@ -15,13 +15,46 @@ export type PsfModel = "auto" | "moffat4";
 
 export type WeightMode = "psfSignalWeight" | "psfSnr" | "noise" | "formula" | "exposure" | "keyword" | "none";
 
-export type FormulaWeights = { fwhm: number, eccentricity: number, snr: number, stars: number, pedestal: number, };
+export type FormulaWeights = { 
+/**
+ * Points for the sharpest FWHM in the group (the term scales down to 0 at the widest FWHM).
+ */
+fwhm: number, 
+/**
+ * Points for the roundest stars in the group (0 at the most eccentric).
+ */
+eccentricity: number, 
+/**
+ * Points for the highest SNR weight in the group (0 at the lowest).
+ */
+snr: number, 
+/**
+ * Points for the most fitted stars in the group (0 at the fewest).
+ */
+stars: number, 
+/**
+ * Points every frame earns regardless of its measurements.
+ */
+pedestal: number, };
 
 export type SelectionConfig = { 
 /**
  * Frames below this fraction of the group's maximum weight are excluded.
  */
-minWeightFraction: number, maxFwhmPx: number | null, maxEccentricity: number | null, minStars: number | null, 
+minWeightFraction: number, 
+/**
+ * Exclude a frame whose mean FWHM over its channels exceeds this, in pixels; `None` = no limit.
+ */
+maxFwhmPx: number | null, 
+/**
+ * Exclude a frame whose mean eccentricity over its channels exceeds this (0 = round, towards 1 = elongated);
+ * `None` = no limit.
+ */
+maxEccentricity: number | null, 
+/**
+ * Exclude a frame whose lowest per-channel fitted-star count is below this; `None` = no limit.
+ */
+minStars: number | null, 
 /**
  * A frame whose registration failed is dropped from its group (spec
  * §9.2). Read by the run orchestration, not by [`select_frames`] —
@@ -101,15 +134,81 @@ export type ScaleEstimator = "bwmv" | "mad" | "avgDev";
 
 export type LnScaleMode = "auto" | "fixed";
 
-export type LnStarSelection = { minPeakSnr: number, maxStars: number, saturation: number, };
+export type LnStarSelection = { 
+/**
+ * The least (peak − background) / σ_local a star must reach in both frames to be used (dimensionless, 5–200).
+ */
+minPeakSnr: number, 
+/**
+ * The most matched star pairs used, brightest first (a count of pairs, 20–5000).
+ */
+maxStars: number, 
+/**
+ * The fraction of a plane's maximum above which a star pair is left out: a pixel within max(2, FWHM) pixels of
+ * either centroid above it removes the pair (dimensionless, 0.5–1.0).
+ */
+saturation: number, };
 
 export type LnFluxEstimator = "psfSignal" | "commonAperture";
 
 export type LnAperture = "fwhm2" | "fwhm3" | "growthCurve";
 
-export type LocalNormalizationConfig = { enabled: boolean, scale: number, scaleMode: LnScaleMode | null, gridSize: number, referenceFrames: number, psfModel: PsfModel, localScale: boolean, starSelection: LnStarSelection, fluxEstimator: LnFluxEstimator, aperture: LnAperture, };
+export type LocalNormalizationConfig = { 
+/**
+ * Whether local normalization is the OUTPUT normalization of the group (default off).
+ */
+enabled: boolean, 
+/**
+ * The local-normalization scale, in pixels, used when `scaleMode` is `fixed`; snapped to the supported list by
+ * `resolve_config`. Read only by `ln::resolve_scale`.
+ */
+scale: number, 
+/**
+ * How the scale is chosen: derived from the geometry or taken from `scale`. `None` only on a document stored
+ * before 2026-10 (field-level default, so the struct's own default cannot fill it): `resolve_config` turns it
+ * into `Some` by the legacy rule L-9.
+ */
+scaleMode: LnScaleMode | null, 
+/**
+ * The automatic scale is the short side of the normalization geometry divided by this (2-8), snapped to the
+ * supported list.
+ */
+gridSize: number, 
+/**
+ * How many of the group's best frames build the local-normalization reference (a count of frames).
+ */
+referenceFrames: number, 
+/**
+ * The star profile the local-normalization fits use.
+ */
+psfModel: PsfModel, 
+/**
+ * Whether the scale is a spline over the stride grid instead of one frame-global value (default off; only read
+ * while `enabled`).
+ */
+localScale: boolean, 
+/**
+ * Which matched stars set the scale (spec §3).
+ */
+starSelection: LnStarSelection, 
+/**
+ * Which flux the scale ratios use (spec 2026-10-04 §4.1).
+ */
+fluxEstimator: LnFluxEstimator, 
+/**
+ * The common aperture's circle; read only under `commonAperture` (§4.1).
+ */
+aperture: LnAperture, };
 
-export type NormalizationConfig = { output: OutputNormalization, rejection: RejectionNormalization, 
+export type NormalizationConfig = { 
+/**
+ * How each frame is matched to the reference for the final combine.
+ */
+output: OutputNormalization, 
+/**
+ * How each frame is matched to the reference for the rejection tests (default `local`).
+ */
+rejection: RejectionNormalization, 
 /**
  * Informational at this layer: the estimator that produced the
  * stage-3 location/scale is `MeasureOptions::scale_estimator` — the
@@ -123,9 +222,70 @@ local: LocalNormalizationConfig, };
 
 export type Combination = "average" | "median";
 
-export type RejectionChoice = { "method": "auto" } | { "method": "none" } | { "method": "percentileClip", low: number, high: number, } | { "method": "sigmaClip", sigmaLow: number, sigmaHigh: number, } | { "method": "winsorizedSigma", sigmaLow: number, sigmaHigh: number, } | { "method": "linearFitClip", sigmaLow: number, sigmaHigh: number, } | { "method": "minMax", low: number, high: number, } | { "method": "esd", outliersFraction: number, alpha: number, lowRelaxation: number, } | { "method": "rcr", limit: number, };
+export type RejectionChoice = { "method": "auto" } | { "method": "none" } | { "method": "percentileClip", 
+/**
+ * Reject a sample this fraction of the median's magnitude below the median (dimensionless, e.g. 0.2 = 20 %).
+ */
+low: number, 
+/**
+ * Reject a sample this fraction of the median's magnitude above the median (dimensionless).
+ */
+high: number, } | { "method": "sigmaClip", 
+/**
+ * Standard deviations below the centre at which a sample is rejected.
+ */
+sigmaLow: number, 
+/**
+ * Standard deviations above the centre at which a sample is rejected.
+ */
+sigmaHigh: number, } | { "method": "winsorizedSigma", 
+/**
+ * Winsorized standard deviations below the centre at which a sample is rejected.
+ */
+sigmaLow: number, 
+/**
+ * Winsorized standard deviations above the centre at which a sample is rejected.
+ */
+sigmaHigh: number, } | { "method": "linearFitClip", 
+/**
+ * Deviation units below the fitted line at which a sample is rejected.
+ */
+sigmaLow: number, 
+/**
+ * Deviation units above the fitted line at which a sample is rejected.
+ */
+sigmaHigh: number, } | { "method": "minMax", 
+/**
+ * How many of the smallest samples to drop (a count).
+ */
+low: number, 
+/**
+ * How many of the largest samples to drop (a count).
+ */
+high: number, } | { "method": "esd", 
+/**
+ * The largest share of the samples that may be removed as outliers, in [0, 1].
+ */
+outliersFraction: number, 
+/**
+ * The significance level of each test (dimensionless, e.g. 0.05).
+ */
+alpha: number, 
+/**
+ * The factor that inflates the scale below the centre, so faint samples are rejected less eagerly.
+ */
+lowRelaxation: number, } | { "method": "rcr", 
+/**
+ * The expected number of samples at least as extreme as the candidate below which it is rejected (0.5 is
+ * Chauvenet's criterion).
+ */
+limit: number, };
 
-export type LargeScaleRejection = { enabled: boolean, 
+export type LargeScaleRejection = { 
+/**
+ * Whether large-scale rejection runs (default off); integration then runs twice.
+ */
+enabled: boolean, 
 /**
  * The scale selector: structures thinner than roughly `2^layers / 2`
  * pixels are erased (see [`process_large_scale`]'s own doc for the
@@ -144,7 +304,11 @@ export type IntegrationConfig = {
  * The master builder's `Combination` — one enum, one spelling
  * (`"average"`/`"median"`, snake_case per `combine.rs`'s own attribute).
  */
-combination: Combination, rejection: RejectionChoice, 
+combination: Combination, 
+/**
+ * Which pixel-rejection method the master uses; `Auto` picks one by the group's frame count.
+ */
+rejection: RejectionChoice, 
 /**
  * The weight floor (spec §6.2): a frame whose lowest per-channel
  * normalized weight falls below this is dropped from the group.
@@ -157,7 +321,11 @@ rangeLow: number | null,
 /**
  * Reject `raw >= range_high`; `None` until the user turns it on.
  */
-rangeHigh: number | null, writeRejectionMaps: boolean, 
+rangeHigh: number | null, 
+/**
+ * Also return per-pixel rejection maps (counts of rejected samples) with the master (default off).
+ */
+writeRejectionMaps: boolean, 
 /**
  * Large-scale (structure-aware) pixel rejection, M4c (spec §6.2,
  * ruling R-M4c-4).
@@ -207,11 +375,23 @@ export type GroupingConfig = {
  */
 exposureToleranceSec: number, exposureMode: ExposureMode, stopsWidth: number, };
 
-export type MeasurementConfig = { weightMode: WeightMode, psfModel: PsfModel, 
+export type MeasurementConfig = { 
 /**
- * Detection cap (spec §9.2 `maxStars`).
+ * How a frame's measurement becomes its stacking weight.
  */
-maxStars: number, formula: FormulaWeights, 
+weightMode: WeightMode, 
+/**
+ * The star profile fitted to each detected star.
+ */
+psfModel: PsfModel, 
+/**
+ * Detection cap: the most stars kept per frame (spec §9.2 `maxStars`; stars, not pixels).
+ */
+maxStars: number, 
+/**
+ * The coefficients of the user formula weight; read only by `WeightMode::Formula`.
+ */
+formula: FormulaWeights, 
 /**
  * FITS keyword `WeightMode::Keyword` reads its value from.
  */
@@ -242,7 +422,7 @@ seedDetector: SeedDetector,
 /**
  * The seed source (spec §2.2): the star-measurement module's matched filter (default), the peak threshold
  * (reads `detectionSigma` and `seedPrefilter`), or the structure map. A document without it is decoded by
- * [`legacy_seed_source`]; one that carries it uses it as is.
+ * `legacy_seed_source`; one that carries it uses it as is.
  */
 seedSource: SeedSource, 
 /**
@@ -282,8 +462,35 @@ twoPass: boolean, };
 
 export type DrizzleKernel = "square" | "circle" | "gaussian";
 
-export type DrizzleConfig = { enabled: boolean, scale: number, dropShrink: number, kernel: DrizzleKernel, useRejection: boolean, useWeights: boolean, 
+export type DrizzleConfig = { 
 /**
+ * Whether the run also produces a drizzled master (default off).
+ */
+enabled: boolean, 
+/**
+ * Output pixels per input pixel along each axis: 2 gives an image twice as wide and as tall (default 2).
+ */
+scale: number, 
+/**
+ * The drop's side as a fraction of an input pixel, the drizzle `pixfrac`: 1 deposits the whole pixel, smaller
+ * values a smaller drop (default 0.9; dimensionless).
+ */
+dropShrink: number, 
+/**
+ * The shape each drop deposits its flux with.
+ */
+kernel: DrizzleKernel, 
+/**
+ * Leave out the pixels the rejection stage flagged in each frame's rejection bitmap (default on).
+ */
+useRejection: boolean, 
+/**
+ * Weight each frame's deposit by its stacking weight (default on).
+ */
+useWeights: boolean, 
+/**
+ * Whether the drizzle follows local output normalization (default on).
+ *
  * B8 (M3 final fix wave, M5 ruling): the drizzle follows the plain
  * master's OUTPUT normalization, so this toggle only has an effect when
  * local normalization drives output normalization
@@ -294,8 +501,16 @@ export type DrizzleConfig = { enabled: boolean, scale: number, dropShrink: numbe
  * (`normalization.rejection == "local"`, the default): those grids never
  * drive the drizzle's output (pcores review r1, I1).
  */
-useLocalNormalization: boolean, writeWeightMap: boolean, 
+useLocalNormalization: boolean, 
 /**
+ * Also keep the drizzle's weight map, the accumulated deposit weight per output pixel divided by its maximum, so
+ * it lies in [0, 1] (default off).
+ */
+writeWeightMap: boolean, 
+/**
+ * Bayer drizzle: whether each colour is deposited from its own samples of the calibrated mosaic instead of the
+ * debayered planes (default off).
+ *
  * M4d Task 1 (ruling R-M4d-2): deposit each colour's OWN samples from
  * the calibrated CFA mosaic instead of the debayered planes'
  * interpolated ones. Ignored for a mono group (silently — there is no
@@ -681,7 +896,15 @@ export type GroupStats = {
 /**
  * The group's total frame count, before the min-weight drop.
  */
-frames: number, included: number, droppedBelowMinWeight: number, 
+frames: number, 
+/**
+ * How many frames were integrated, after the min-weight drop.
+ */
+included: number, 
+/**
+ * How many frames the min-weight floor removed.
+ */
+droppedBelowMinWeight: number, 
 /**
  * `IntegrationRecipe::describe()` of the resolved recipe.
  */
@@ -692,7 +915,11 @@ recipe: string,
  * see `StackOutput`'s doc — NOT `base.rejected_fraction`'s, which
  * counts algorithm rejections only).
  */
-rejectedLowFraction: number, rejectedHighFraction: number, 
+rejectedLowFraction: number, 
+/**
+ * The same as `rejected_low_fraction` for samples rejected on the high side.
+ */
+rejectedHighFraction: number, 
 /**
  * Per included frame (engine order), `Σ rejected / Σ samples` over
  * every plane — the same range-plus-algorithm rejection the group
@@ -707,7 +934,15 @@ rejectedFractionPerFrame: Array<number>,
  * `measure::ADU_SCALE` internally, see `measure_plane`'s own code) —
  * no further conversion happens here.
  */
-masterNoise: Array<number>, masterLocation: Array<number>, masterScale: Array<number>, 
+masterNoise: Array<number>, 
+/**
+ * The master's normalization location (median) per plane, in normalized units.
+ */
+masterLocation: Array<number>, 
+/**
+ * The master's two-sided scale per plane, in normalized units.
+ */
+masterScale: Array<number>, 
 /**
  * Per plane, of the included frame with the highest `weight.normalized_mean`.
  */
@@ -720,19 +955,23 @@ bestSubNoise: Array<number>,
  * on the set there (PD-19 b).
  *
  * These two are NOT a ratio pair, and nothing divides them to get [`GroupStats::snr_gain`] (that is
- * [`paired_snr_gain`], on the stars matched in BOTH crops): `master_psf_snr` is a sum over the stars the master
+ * `paired_snr_gain`, on the stars matched in BOTH crops): `master_psf_snr` is a sum over the stars the master
  * matched in its rectangle on a plane that has a set, and the whole-field figure (unmarked) on a plane that fell
  * back or matched under 20; `best_sub_psf_snr` is the frame's own `psf_snr`, whose flux under the PSF family after D1w
  * is the paired ratio `r_f` times the anchor's whole-set sum (the stars the frame lacks are extrapolated, not summed),
  * or its Measure-time figure on a fallback. Under the PSF family they agree only where one set is whole in both images; outside
  * the family they never agree (the best sub is Measure-time there, the master reads the set).
  */
-masterPsfSnr: Array<number>, bestSubPsfSnr: Array<number>, 
+masterPsfSnr: Array<number>, 
+/**
+ * The best sub's own PSF SNR per plane (see `master_psf_snr`; dimensionless).
+ */
+bestSubPsfSnr: Array<number>, 
 /**
  * How many times the master's star SNR beats the best sub's, per
  * plane — an SNR (amplitude) factor, `√(PSF SNR master / PSF SNR best
  * sub)`, since PSF SNR is TFlux²/σ² (a power ratio). The two PSF SNRs
- * are a PAIRED measurement ([`paired_snr_gain`]): the best sub read
+ * are a PAIRED measurement (`paired_snr_gain`): the best sub read
  * through the same registration warp the master was built from, both
  * measured with the same options on the same rectangle — a smoothing
  * interpolation lowers a warped image's noise, so a raw sub against
@@ -743,7 +982,7 @@ masterPsfSnr: Array<number>, bestSubPsfSnr: Array<number>,
  * and usable in BOTH images: a bright clipped star, or a wider PSF's
  * extra flux, no longer moves the figure. Both sides also read on ONE
  * aperture correction `c` (v2, Plan D D1 fix r4): a side at floor (i), which
- * has none, reads with the other side's ([`paired_c_stand_ins`]), warned.
+ * has none, reads with the other side's (`paired_c_stand_ins`), warned.
  * They are not
  * `master_psf_snr` / `best_sub_psf_snr` above, which stay each image's
  * own measurement. `0.0` (with a warn naming its reason) when the pair
@@ -760,12 +999,36 @@ snrGain: Array<number>,
  * Results panel shows "—" for it instead of passing it off as the same
  * metric; a `1` shows "—" too, "measured with an older formula".
  */
-snrGainVersion: number, masterFwhmPx: Array<number>, masterEccentricity: Array<number>, 
+snrGainVersion: number, 
+/**
+ * The master's star FWHM per plane, in pixels.
+ */
+masterFwhmPx: Array<number>, 
+/**
+ * The master's mean star eccentricity per plane (0 is round, towards 1 is elongated).
+ */
+masterEccentricity: Array<number>, 
 /**
  * `Σ exposure_i · weight_i` over included frames, `weight_i` the mean
  * over planes of frame i's normalized weight (`FrameWeight::normalized_mean`).
  */
-weightedExposureS: number, totalExposureS: number, readMs: number, combineMs: number, bytesRead: number, 
+weightedExposureS: number, 
+/**
+ * The summed exposure time of the included frames, in seconds.
+ */
+totalExposureS: number, 
+/**
+ * Time spent reading the frames, in milliseconds (summed over planes and passes).
+ */
+readMs: number, 
+/**
+ * Time spent combining samples, in milliseconds (summed over planes and passes).
+ */
+combineMs: number, 
+/**
+ * Bytes read from the frame files (summed over planes and passes).
+ */
+bytesRead: number, 
 /**
  * Included frames integrated with an LN grid (M2 Task 7) — `0` when the
  * caller passes no grids at all (`GroupInput.ln: None`: local
@@ -775,6 +1038,8 @@ weightedExposureS: number, totalExposureS: number, readMs: number, combineMs: nu
  */
 lnFrames: number, 
 /**
+ * The share of all samples that large-scale rejection forced out before the second pass (a fraction, 0 to 1).
+ *
  * M4c Task 3: the fraction of all (frame, plane, pixel) samples the
  * PROCESSED bitmaps forced out before the second pass's algorithm ran
  * — `None` when large-scale rejection did not run for this group at

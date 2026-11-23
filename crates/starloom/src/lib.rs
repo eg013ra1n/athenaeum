@@ -50,7 +50,6 @@ pub use astroimage::star_measure;
 
 // `stack` layer.
 #[cfg(feature = "stack")]
-#[allow(missing_docs)] // debt: Task 5b/5c
 pub mod stacking;
 
 #[cfg(any(test, feature = "test-support"))]

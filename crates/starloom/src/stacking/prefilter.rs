@@ -57,7 +57,7 @@ impl SeedPrefilter {
 /// NaN neighbour sorts to the top and cannot displace the median of a
 /// full 9-pixel window.
 ///
-/// One rayon task per output row; the window lives in a stack array, so
+/// One rayon task per output row on the caller's current rayon pool; the window lives in a stack array, so
 /// there is no per-pixel allocation.
 pub fn median3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
     if w == 0 || h == 0 {

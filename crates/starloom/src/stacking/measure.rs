@@ -32,6 +32,8 @@ use crate::star_measure as sm;
 // untouched.
 pub use crate::star_measure::domain::{NoiseSource, ADU_SCALE};
 
+/// The dials of one plane's star measurement: the star profile, the detection cap, the scale estimator and the seed
+/// detector with its thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MeasureOptions {
@@ -41,6 +43,7 @@ pub struct MeasureOptions {
     pub psf_model: PsfModel,
     /// Detection cap (spec §9.2 `maxStars`).
     pub max_stars: usize,
+    /// The scale (dispersion) estimator behind the plane's normalization location and scale (`location`, `scale`).
     pub scale_estimator: ScaleEstimator,
     /// The sensitivity dial — a flux-SNR floor on the detections the fitter
     /// is seeded with (the detector's own `flux / sqrt(flux + pi*r_ap^2*sigma^2)`).
@@ -98,7 +101,9 @@ pub struct MeasureOptions {
 pub struct StarPopulation {
     /// N, the frame-statistic stars (population (a)).
     pub statistic: usize,
+    /// Size of list (b) for a mono plane: the first this many seeds, a count of stars.
     pub list_mono: usize,
+    /// Size of list (b) for a colour plane: the first this many seeds, a count of stars.
     pub list_colour: usize,
 }
 
@@ -178,10 +183,15 @@ pub const DEFAULT_SEED_PREFILTER: SeedPrefilter = SeedPrefilter::None;
 /// shape, and a timing is not a measurement.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MeasureTimings {
+    /// Milliseconds spent reading the plane.
     pub read_ms: u64,
+    /// Milliseconds spent building the large-scale background model.
     pub background_ms: u64,
+    /// Milliseconds spent estimating the noise.
     pub noise_ms: u64,
+    /// Milliseconds spent detecting seeds.
     pub detect_ms: u64,
+    /// Milliseconds spent on the profile fits.
     pub fit_ms: u64,
 }
 
@@ -189,7 +199,9 @@ pub struct MeasureTimings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelMeasurement {
+    /// Seeds the detector found, a count of stars.
     pub stars_detected: usize,
+    /// Seeds whose profile fit was accepted, a count of stars.
     pub stars_fitted: usize,
     /// Seeds the PSF fitter refused, each for a counted reason (F-0, Plan A
     /// Task 4): `stars_fitted + stars_refused == stars_detected` (plus the not-selected seeds under `fitStars`). `0` in a
@@ -244,6 +256,9 @@ pub struct ChannelMeasurement {
     /// ratios it found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_stars: Option<usize>,
+    /// The aperture correction `c` this plane borrowed from the group's other planes of the same channel because it had
+    /// none of its own (dimensionless).
+    ///
     /// Plan B B4 (R-PB4-5): the group channel's median kept `c` a plane at floor (i) took as its stand-in, set by the
     /// group fold ([`ChannelMeasurement::take_group_c`]) after the plane was measured and persisted: `tflux`,
     /// `tmean_flux` carry it once, `psf_signal_weight`, `psf_snr` twice. `aperture_correction` itself stays `None`
@@ -251,6 +266,8 @@ pub struct ChannelMeasurement {
     /// run), so `None` and never serialized wherever the fold did not substitute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_correction_group: Option<f64>,
+    /// This plane's total star flux over the group's frame-common star set, in normalized units.
+    ///
     /// Plan D D1w (PD-3): this member's flux over the (group, plane)'s frame-common star set - the paired ratio to the
     /// group's anchor (of the fits' aperture sums, Plan D D2b / PD-26) times the anchor's sums over the whole set (model
     /// flux times the plane's `c`; [`crate::stacking::common_set::CommonFlux`]), native units. `psf_signal_weight` /
@@ -269,27 +286,54 @@ pub struct ChannelMeasurement {
     /// `"frame reweighed"`'s `paired_stars`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub common_stars: Option<usize>,
+    /// The plane's star FWHM, in pixels, measured over the unsaturated fits; 0.0 when there are none
+    /// (`stars_unsaturated == 0`).
     pub fwhm_px: f64,
+    /// The plane's mean star eccentricity (0 is round, towards 1 is elongated), over the unsaturated fits; 0.0 when
+    /// there are none.
     pub eccentricity: f64,
+    /// TFlux: the total flux of the plane's accepted stars (model flux times the aperture correction `c`), in
+    /// normalized units; one input of the PSF Signal Weight.
     pub tflux: f64,
+    /// TMeanFlux: the total of the stars' mean flux per pixel over their FWTM area, in normalized units; one input of
+    /// the PSF Signal Weight.
     pub tmean_flux: f64,
     /// Mean fluxes RCR flagged in the PSF-signal totals (spec §1.1).
     pub mean_flux_rejected: usize,
+    /// M*: the median of the large-scale background residual, in normalized units; 0 when the background model was
+    /// unavailable.
     pub m_star: f64,
+    /// N*: the large-scale background residual's noise, 2.48308 times its MAD, in normalized units; 0 when the
+    /// background model was unavailable. It stands in for `noise` when the multi-resolution estimate was refused.
     pub n_star: f64,
+    /// The plane's noise sigma (standard deviation), in normalized units; `noise_source` says which estimator produced
+    /// it.
     pub noise: f64,
+    /// Which estimator produced `noise`.
     pub noise_source: NoiseSource,
+    /// The sky median of the plane's stratified, range-clipped pixel sample, in normalized units.
     pub median: f64,
+    /// The median absolute deviation of that sample about `median`, in normalized units.
     pub mad: f64,
+    /// The mean absolute deviation of that sample about `median`, in normalized units.
     pub median_mean_dev: f64,
     /// Classic `MedianMeanDev² / Noise²`.
     pub snr_weight: f64,
+    /// The standard deviation, in normalized units, of the sample's side below the median (restricted to the median
+    /// minus 4 sigma); the low noise-scale factor of the Noise weight mode. 0 when the sample was too small or a side
+    /// emptied.
     pub noise_scale_low: f64,
+    /// The standard deviation, in normalized units, of the sample's side above the median (restricted to the median
+    /// plus 4 sigma); the high noise-scale factor. 0 under the same conditions as `noise_scale_low`.
     pub noise_scale_high: f64,
     /// Normalization location (median) and two-sided scale.
     pub location: f64,
+    /// The two-sided scale (dispersion) of the plane, in normalized units, by the configured scale estimator.
     pub scale: f64,
+    /// PSF Signal Weight of the plane (see [`psf_signal::psf_signal_weight`]); dimensionless, 0 when it cannot be
+    /// computed.
     pub psf_signal_weight: f64,
+    /// PSF SNR of the plane (see [`psf_signal::psf_snr`]); dimensionless, 0 when it cannot be computed.
     pub psf_snr: f64,
     /// Per-phase wall time of this plane's measurement (perf tier 1 Task 0).
     /// Not part of the cached `metrics` artifact payload — a timing, not a
@@ -299,6 +343,7 @@ pub struct ChannelMeasurement {
 }
 
 impl ChannelMeasurement {
+    /// The plane's normalization location and scale as a [`LocationScale`], in normalized units.
     pub fn location_scale(&self) -> LocationScale {
         LocationScale {
             location: self.location as f32,
@@ -314,6 +359,8 @@ impl ChannelMeasurement {
         self.aperture_correction.is_none() && self.stars_fitted > 0
     }
 
+    /// Substitutes the channel's group-median aperture correction `c` for this plane's missing one.
+    ///
     /// Plan B B4 (R-PB4-5): take the group channel's median kept `c` `m` as this plane's stand-in. `tflux` and
     /// `tmean_flux` scale by `m`, `psf_signal_weight` (TFlux x TMeanFlux) and `psf_snr` (TFlux squared) by `m * m` -
     /// exactly the effect of `c`, no refit. `aperture_correction` stays `None`; `m` is recorded in
@@ -327,6 +374,9 @@ impl ChannelMeasurement {
     }
 }
 
+/// Gives every plane of one colour channel that has no measured aperture correction the median `c` of the planes that
+/// do.
+///
 /// Plan B B4 (R-PB4-5), one channel of a group: when at least two planes carry a measured `c`, every plane at floor (i)
 /// takes the median of those `c`s ([`ChannelMeasurement::take_group_c`]). Returns `Some((m, planes substituted))`, or
 /// `None` when nothing was substituted (under two peers, or no plane at floor). Pure: the caller logs.
@@ -358,6 +408,7 @@ pub struct ChannelCSummary {
     pub median: Option<f64>,
     /// The lowest and the highest measured `c`; `None` when `planes` is 0.
     pub min: Option<f64>,
+    /// The highest measured `c`; `None` when `planes` is 0.
     pub max: Option<f64>,
 }
 
@@ -408,12 +459,17 @@ pub fn channel_c_summary(planes: &[Option<(f64, f64, usize)>]) -> ChannelCSummar
     }
 }
 
+/// One frame's measurement: its size and one [`ChannelMeasurement`] per plane (colour channel).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameMeasurement {
+    /// Frame width, in pixels.
     pub width: usize,
+    /// Frame height, in pixels.
     pub height: usize,
+    /// One measurement per plane (1 for mono, 3 for colour).
     pub channels: Vec<ChannelMeasurement>,
+    /// Wall time of the whole frame's measurement, in milliseconds.
     pub duration_ms: u64,
 }
 
@@ -425,9 +481,11 @@ impl FrameMeasurement {
             self.channels.iter().map(f).sum::<f64>() / self.channels.len() as f64
         }
     }
+    /// The mean over planes of the star FWHM, in pixels.
     pub fn mean_fwhm_px(&self) -> f64 {
         self.mean_of(|c| c.fwhm_px)
     }
+    /// The mean over planes of the star eccentricity (0 is round, towards 1 is elongated).
     pub fn mean_eccentricity(&self) -> f64 {
         self.mean_of(|c| c.eccentricity)
     }
@@ -439,9 +497,11 @@ impl FrameMeasurement {
     pub fn mean_median(&self) -> f64 {
         self.mean_of(|c| c.median)
     }
+    /// The mean over planes of the PSF Signal Weight.
     pub fn mean_psf_signal_weight(&self) -> f64 {
         self.mean_of(|c| c.psf_signal_weight)
     }
+    /// The lowest per-plane fitted-star count (0 for a frame with no planes).
     pub fn min_stars(&self) -> usize {
         self.channels
             .iter()
@@ -460,7 +520,9 @@ impl FrameMeasurement {
 /// (`stacking::fits_artifact`) beside `metrics`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaneMeasurement {
+    /// The plane's measurement.
     pub channel: ChannelMeasurement,
+    /// The accepted star fits behind it (empty when the plane was defocused).
     pub fits: Vec<StarFit>,
     /// The plane's sub-step wall and thread-CPU timers (Plan A Task 13b, 13-P), reported in `"frame plane substeps"`
     /// only. Never compared, never persisted.
@@ -548,6 +610,7 @@ pub struct PlaneMeasurement {
 /// One plane's result from [`measure_planes_diagnosed`].
 #[derive(Debug, Clone)]
 pub struct MeasuredPlane {
+    /// The plane's measurement, with the fits behind it.
     pub measurement: PlaneMeasurement,
     /// The seeds the fits were made from, as [`measure_plane_detailed`] returns them.
     pub seeds: Vec<Seed>,
@@ -569,6 +632,8 @@ pub enum SeedOverride {
     /// Whatever `MeasureOptions::seed_source` says: the matched filter at `seed_threshold`, the peak detector
     /// (`ImageAnalyzer::detect_fast_data` at `detection_sigma` and `seed_prefilter`) or the structure map.
     Fast,
+    /// Seeds from the analyzer's full two-pass detect-and-measure pipeline.
+    ///
     /// `ImageAnalyzer::analyze_data` — the full two-pass detect+measure
     /// pipeline; its per-star metrics become the seeds instead.
     Full,
@@ -581,7 +646,10 @@ pub enum SeedOverride {
     /// width ([`crate::star_measure::seeds::detect`], Plan A Task 6a), its
     /// `threshold` in units of the filtered plane's measured noise, whatever
     /// the options say.
-    MatchedFilter { threshold: f64 },
+    MatchedFilter {
+        /// The filter's threshold, in units of the filtered plane's measured noise (dimensionless).
+        threshold: f64
+    },
 }
 
 /// Measure one plane. Detection, fitting, the background model and MRS run
@@ -590,6 +658,8 @@ pub enum SeedOverride {
 /// star-measurement module's ([`crate::star_measure::measure_plane`], Plan A
 /// Task 2); this adapter reads the plane, runs the configured seed detector
 /// and maps the module's result onto `ChannelMeasurement`.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_plane(
     data: &[f32],
     w: usize,
@@ -604,6 +674,8 @@ pub fn measure_plane(
 /// chosen detector instead of always `detect_fast_data`, and the fitter's
 /// accepted [`StarFit`]s ride alongside the measurement (Tier C Task 1)
 /// instead of being dropped after `signal_totals`/`frame_shape` read them.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_plane_with_seeds(
     data: &[f32],
     w: usize,
@@ -618,6 +690,8 @@ pub fn measure_plane_with_seeds(
 /// [`measure_plane_with_seeds`], also returning the seeds the fits were made
 /// from (star measurement part 1: the lab's `star_probe` dumps them). Same
 /// call, same numbers; the run never reads the seeds.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_plane_detailed(
     data: &[f32],
     w: usize,
@@ -658,6 +732,8 @@ pub fn measure_plane_detailed(
 /// `gain_e_per_unit` (Task 11, ruling R11-6): e- per calibrated unit (the caller's value for the frame), the
 /// SNR's shot term; `None` omits it. `cfa_site_share` (ruling R11-1): the plane's share of its own colour's CFA sites
 /// (0.25 / 0.5 / 0.25 on a debayered RGGB plane), `None` = 1. Neither moves anything but the new SNR / HFR values.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_plane_diagnosed(
     data: &[f32],
@@ -739,6 +815,8 @@ fn measure_plane_hinted(
 /// half, so a caller reading from disk holds one plane at a time (`stacking::run`'s `MEASURE_PLANES_RESIDENT` stays
 /// one plane's working set); the second half runs the planes last to first, so the last plane's data passes straight
 /// from its first half to its second. An `Err` from `plane` ends the call with it (the frame adapter's cancel).
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_planes_diagnosed<'a, E>(
     n_planes: usize,
@@ -772,6 +850,8 @@ pub fn measure_planes_diagnosed<'a, E>(
 /// empty slice (exactly [`measure_planes_diagnosed`]) read the plane's own width. Plan D D1 r2: the gain's re-read of
 /// the best sub, a resampled image the detection median does not suit, passes the sub's Measure-time width. Not a
 /// field of [`MeasureOptions`], which is a serialized config.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_planes_with_width_hints<'a, E>(
     n_planes: usize,
@@ -918,6 +998,8 @@ impl PlanesPass1 {
         self.beta_own.len()
     }
 
+    /// The point-like seeds of each plane's sibling planes, one entry per plane (`None` where there are none).
+    ///
     /// Plan D D2 (PD-9): each plane's entry of [`sm::point_like_sibling_seeds`], read through the options each plane is
     /// finished with (the ONE extended slice its fits use). The one gather [`measure_planes_pass2`] makes; the lab
     /// probe reads it to follow the colour sample's taking-back without a copy of the rule.
@@ -931,6 +1013,8 @@ impl PlanesPass1 {
 /// the same arguments, then each plane's own β. `plane(p)` as there: one plane is read once (its β reads the copy
 /// its verdict pass read), a plane of a multi-plane image twice (after every plane's verdict pass, the cross-plane
 /// rule, last to first so the last plane passes straight through).
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_planes_pass1<'a, E>(
     n_planes: usize,
@@ -1014,6 +1098,8 @@ pub fn measure_planes_pass1<'a, E>(
 /// here; `channel.beta` is `betas[p]` and `channel.beta_own` the plane's own β. `plane(p)` must hand the same bytes
 /// the first pass read (the frame adapter's read guard spans both passes). `betas` must hold one β per plane
 /// (`debug_assert!`; [`measure_frame_pass2`], the only production caller, refuses a mismatch with an error).
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_planes_pass2<'a, E>(
     pass1: PlanesPass1,
     betas: &[f64],
@@ -1496,6 +1582,8 @@ fn adapter_tail(
 
 /// Measure every plane of a calibrated frame; checks `cancel` before each
 /// plane.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_frame(
     path: &Path,
     opts: &MeasureOptions,
@@ -1506,6 +1594,8 @@ pub fn measure_frame(
 }
 
 /// As `measure_frame`, but every plane is seeded via `measure_plane_with_seeds`.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_frame_with_seeds(
     path: &Path,
     opts: &MeasureOptions,
@@ -1523,6 +1613,8 @@ pub fn measure_frame_with_seeds(
 /// list as the on-disk `fits` artifact beside `metrics`; every other
 /// `measure_frame`/`measure_frame_with_seeds` caller is untouched by this
 /// function's existence.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_frame_with_fits(
     path: &Path,
     opts: &MeasureOptions,
@@ -1598,6 +1690,8 @@ impl<'a> ReadGuard<'a> {
 /// The measurement every `measure_frame*` entry point runs, with the frame's gain given by the caller: `gain` is the
 /// frame's e- per calibrated unit, or `None` (the SNR then omits its shot term). The `measure_frame*` entries without
 /// a gain argument pass `None`; a caller that reads the gain from its own header convention passes it here.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_frame_full(
     path: &Path,
     opts: &MeasureOptions,
@@ -2130,8 +2224,8 @@ impl Pass1Body {
 
 /// Checks whether a stored first-pass head still describes the calibrated frame as it is now, so a cached measurement
 /// is not trusted for a file that changed (the controller's check in step (0), Plan A Task 11c, R11c-5): the stamp's
-/// length equals the file's now ([`Pass1ArtifactError::Stale`] otherwise; [`check_stamp_len`]) and the geometry (pixels)
-/// and the plane count are the file's own (a header probe, no pixel read).
+/// length (in bytes) equals the file's size now ([`Pass1ArtifactError::Stale`] otherwise; `check_stamp_len`) and the
+/// geometry (pixels) and the plane count are the file's own (a header probe, no pixel read).
 pub fn check_pass1_head(
     head: &Pass1Head,
     calibrated: &Path,
@@ -2188,6 +2282,8 @@ fn stamp_of(id: FileIdentity) -> SourceStamp {
 }
 
 /// [`measure_frame_with_fits`]'s first half for the group measure (Task 11b): every plane's verdict pass and own β.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_frame_pass1(
     path: &Path,
     opts: &MeasureOptions,
@@ -2199,6 +2295,8 @@ pub fn measure_frame_pass1(
 
 /// [`measure_frame_pass1`] with the frame's gain (e- per calibrated unit) given by the caller; `None` omits the SNR's
 /// shot term.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_frame_pass1_gain(
     path: &Path,
     opts: &MeasureOptions,
@@ -2280,6 +2378,8 @@ pub fn measure_frame_pass1_gain(
 /// `betas[p]` ([`measure_planes_pass2`]), the same frame result and log lines; the read guard carries the first
 /// pass's identity, so a file that changed since is refused (logged), never measured half-and-half. `opts` are the
 /// first pass's. `duration_ms` is both passes' own time.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn measure_frame_pass2(
     path: &Path,
     pass1: FramePass1,

@@ -1,5 +1,5 @@
-//! Stacking configuration: the measurement and drizzle sections (the pure items Athenaeum's whole `StackingConfig`
-//! tree is built from). Copied from Athenaeum core's `stacking/config.rs`; the rest of that file stays there.
+//! Stacking configuration: the measurement and drizzle sections, the pure items a caller's whole stacking
+//! configuration tree is built from (the caller owns the tree itself and its hashing).
 
 use serde::{Deserialize, Serialize};
 
@@ -10,17 +10,20 @@ use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::structure::SeedDetector;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
 
-/// spec §9.2 `measurement:` — Plan 2's weighting/selection inputs, chosen
-/// once per run.
+/// The measurement settings of a stacking run, chosen once per run: how frames are weighted, which star profile is
+/// fitted and how stars are found (spec §9.2 `measurement:`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct MeasurementConfig {
+    /// How a frame's measurement becomes its stacking weight.
     pub weight_mode: WeightMode,
+    /// The star profile fitted to each detected star.
     #[cfg_attr(feature = "ts", ts(as = "crate::stacking::psf_signal::PsfModelTs"))]
     pub psf_model: PsfModel,
-    /// Detection cap (spec §9.2 `maxStars`).
+    /// Detection cap: the most stars kept per frame (spec §9.2 `maxStars`; stars, not pixels).
     pub max_stars: usize,
+    /// The coefficients of the user formula weight; read only by `WeightMode::Formula`.
     pub formula: FormulaWeights,
     /// FITS keyword `WeightMode::Keyword` reads its value from.
     pub keyword: String,
@@ -43,7 +46,7 @@ pub struct MeasurementConfig {
     pub seed_detector: SeedDetector,
     /// The seed source (spec §2.2): the star-measurement module's matched filter (default), the peak threshold
     /// (reads `detectionSigma` and `seedPrefilter`), or the structure map. A document without it is decoded by
-    /// [`legacy_seed_source`]; one that carries it uses it as is.
+    /// `legacy_seed_source`; one that carries it uses it as is.
     pub seed_source: SeedSource,
     /// The matched filter's threshold in units of the filtered plane's noise (ruling R-OSP-2). Clamped to
     /// `MIN_SEED_THRESHOLD`..=`MAX_SEED_THRESHOLD` by `resolve_config`.
@@ -59,7 +62,8 @@ pub struct MeasurementConfig {
     pub fit_stars: Option<u32>,
 }
 
-/// Where the Measure stage takes its seeds from (spec §2.2, ruling R-OSP-2; R-M4c-11 for the other two).
+/// Where the Measure stage takes its star seeds from, the starting points the profile fits refine (spec §2.2, ruling
+/// R-OSP-2; R-M4c-11 for the other two).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -202,18 +206,27 @@ impl MeasurementConfig {
     }
 }
 
-/// spec §9.2 `drizzle:` (M3 — carried here, defaulted off, so a stored
-/// config round-trips before the stage exists).
+/// The drizzle settings of a stacking run (spec §9.2 `drizzle:`): whether it runs, the output scale, the drop size,
+/// the kernel and which maps feed it. Off by default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct DrizzleConfig {
+    /// Whether the run also produces a drizzled master (default off).
     pub enabled: bool,
+    /// Output pixels per input pixel along each axis: 2 gives an image twice as wide and as tall (default 2).
     pub scale: u32,
+    /// The drop's side as a fraction of an input pixel, the drizzle `pixfrac`: 1 deposits the whole pixel, smaller
+    /// values a smaller drop (default 0.9; dimensionless).
     pub drop_shrink: f64,
+    /// The shape each drop deposits its flux with.
     pub kernel: DrizzleKernel,
+    /// Leave out the pixels the rejection stage flagged in each frame's rejection bitmap (default on).
     pub use_rejection: bool,
+    /// Weight each frame's deposit by its stacking weight (default on).
     pub use_weights: bool,
+    /// Whether the drizzle follows local output normalization (default on).
+    ///
     /// B8 (M3 final fix wave, M5 ruling): the drizzle follows the plain
     /// master's OUTPUT normalization, so this toggle only has an effect when
     /// local normalization drives output normalization
@@ -224,7 +237,12 @@ pub struct DrizzleConfig {
     /// (`normalization.rejection == "local"`, the default): those grids never
     /// drive the drizzle's output (pcores review r1, I1).
     pub use_local_normalization: bool,
+    /// Also keep the drizzle's weight map, the accumulated deposit weight per output pixel divided by its maximum, so
+    /// it lies in [0, 1] (default off).
     pub write_weight_map: bool,
+    /// Bayer drizzle: whether each colour is deposited from its own samples of the calibrated mosaic instead of the
+    /// debayered planes (default off).
+    ///
     /// M4d Task 1 (ruling R-M4d-2): deposit each colour's OWN samples from
     /// the calibrated CFA mosaic instead of the debayered planes'
     /// interpolated ones. Ignored for a mono group (silently — there is no
@@ -257,13 +275,17 @@ impl Default for DrizzleConfig {
     }
 }
 
+/// The shape of the drop a drizzle deposits: how an input pixel's flux is spread over the output pixels it covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum DrizzleKernel {
+    /// A uniform square drop, clipped exactly against each output pixel (the default).
     #[default]
     Square,
+    /// A uniform disc inscribed in the drop's square.
     Circle,
+    /// A Gaussian falling off from the drop's centre, truncated at the drop's edge.
     Gaussian,
 }
 
@@ -272,6 +294,7 @@ pub enum DrizzleKernel {
 /// (window 65, effective support ≈ 127 px) — the range the Integrate
 /// panel's field offers.
 pub const MIN_PROTECTED_LAYERS: u8 = 1;
+/// The largest `protected_layers` the Integrate panel offers (window 65 pixels, support about 127 pixels).
 pub const MAX_PROTECTED_LAYERS: u8 = 6;
 /// [`crate::stacking::integrate::LargeScaleRejection::growth`]'s maximum
 /// (0 — no dilation — is legitimate).

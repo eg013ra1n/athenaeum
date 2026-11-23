@@ -8,7 +8,7 @@
 //! run removes `rej/run-<id>` at its single exit path (success, failure or
 //! cancel) unless the user asked to keep everything, and `stacking::paths`'
 //! `cleanup_work` sweeps any that survive a crash. There is no checksum
-//! trailer (contrast `stacking::ln::grid`'s `.athln` sidecars, which persist
+//! trailer (contrast `stacking::ln::grid`'s `.athln` sidecars, `.athln` being their historical name, which persist
 //! across runs and are read back into a later run's cache) — a truncated or
 //! foreign `.rej` file is simply refused on read, never silently trusted.
 //!
@@ -40,6 +40,7 @@ use crate::integration::band_budget::total_ram_bytes;
 use crate::integration::source::{RejectionBitSink, RejectionBitSource};
 use crate::integration::IntegrationError;
 
+/// The 8 bytes every `.rej` file starts with (`ATHREJ01`, a historical name kept for the format).
 pub const REJ_MAGIC: &[u8; 8] = b"ATHREJ01";
 /// The forced-rejection budget when this machine's RAM cannot be read
 /// (M4c Task 3) — a conservative absolute cap rather than "no cap", so an
@@ -254,6 +255,7 @@ impl RejBitmapSet {
         RejPlaneSink { set: self, plane }
     }
 
+    /// Frame `frame`'s `.rej` file (0-based index into the set's frames).
     pub fn path(&self, frame: usize) -> &Path {
         &self.paths[frame]
     }
@@ -328,14 +330,17 @@ impl RejBitmapSet {
         self.width
     }
 
+    /// The set's frame height, in pixels.
     pub fn height(&self) -> usize {
         self.height
     }
 
+    /// The set's plane (colour channel) count.
     pub fn channels(&self) -> usize {
         self.channels
     }
 
+    /// The directory holding the set's `.rej` files.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -345,6 +350,8 @@ impl RejBitmapSet {
         self.file_len.saturating_mul(self.paths.len() as u64)
     }
 
+    /// The first write failure any plane sink recorded for this set, or `None` when every write succeeded.
+    ///
     /// B3 (M3 final fix wave, I3): the FIRST write failure any
     /// [`RejPlaneSink::record_band`] call for this set has latched, if any
     /// — `Some` means every band this set was asked to write past the
@@ -509,6 +516,8 @@ pub struct RejBitmap {
 }
 
 impl RejBitmap {
+    /// Reads and validates a `.rej` file against the expected geometry (`width` x `height` pixels, `channels` planes);
+    /// a wrong length, magic or geometry is an error.
     pub fn read(path: &Path, width: usize, height: usize, channels: usize) -> Result<RejBitmap> {
         let words = words_per_row(width);
         let expected_len = HEADER_LEN + body_len(height, channels, words)?;
@@ -588,6 +597,7 @@ impl RejBitmap {
         }
     }
 
+    /// Marks the source pixel `(x, y)` of plane `plane` as rejected (panics outside the geometry).
     #[inline]
     pub fn set(&mut self, plane: usize, x: usize, y: usize) {
         debug_assert!(plane < self.channels && x < self.width && y < self.height);
@@ -595,14 +605,17 @@ impl RejBitmap {
         self.bits[word_idx] |= 1u64 << (x % 64);
     }
 
+    /// The bitmap's width, in pixels.
     pub fn width(&self) -> usize {
         self.width
     }
 
+    /// The bitmap's height, in pixels.
     pub fn height(&self) -> usize {
         self.height
     }
 
+    /// The bitmap's plane (colour channel) count.
     pub fn channels(&self) -> usize {
         self.channels
     }
@@ -912,6 +925,7 @@ impl RejForcedSource {
         self.forced_bits as f64 / total as f64
     }
 
+    /// The number of frames this source covers.
     pub fn frames(&self) -> usize {
         self.frames
     }

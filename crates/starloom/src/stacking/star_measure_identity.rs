@@ -1,6 +1,6 @@
-//! Tests that hold Athenaeum's own code to `star_measure`, which lives in rustafits (`astroimage::star_measure`)
-//! since its port plan's phase 3. They were in the module's own tests while it was Athenaeum's; they need the
-//! stacking adapter and the integration engine, so they stayed here when the module moved (bodies unchanged).
+//! Tests that hold the stacking adapter to `star_measure`, the star-measurement module that lives in rustafits
+//! (`astroimage::star_measure`): the adapter and the module must give the same answer on the same plane. They need the
+//! stacking adapter and the integration engine, so they sit here and not in the module's own tests.
 
 use crate::star_measure::{
     measure_plane, seeds, MeasureOptions, PixelNoise, SeedSpec, ADU_SCALE, DEFAULT_THRESHOLD,
