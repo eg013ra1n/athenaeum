@@ -75,8 +75,8 @@ const LOW_INLIER_MIN_FRAMES: usize = 3;
 /// median refit inliers (robust quad seed RQ-6), a sign of a poor star match.
 /// `rows` is `(frame_id, inliers)` of the group's aligned non-reference frames,
 /// the inlier count being a number of matched stars. Returns `None` under
-/// `LOW_INLIER_MIN_FRAMES` rows, else `(median, flagged)`: the numpy median
-/// and the rows with `inliers < 0.5 * median`, in input order.
+/// `LOW_INLIER_MIN_FRAMES` rows, else `(median, flagged)`: the median (the mean
+/// of the two middle values for an even count) and the rows with `inliers < 0.5 * median`, in input order.
 pub fn low_inlier_frames(rows: &[(i64, usize)]) -> Option<(f64, Vec<(i64, usize)>)> {
     if rows.len() < LOW_INLIER_MIN_FRAMES {
         return None;
@@ -533,7 +533,7 @@ mod tests {
     }
 
     /// Robust quad seed RQ-6: a frame whose registration kept under half its group's median inliers is the defect
-    /// that stood through three catalog stages (162: 159 of ~1 600). The median is numpy's, over the group's aligned
+    /// that stood through three catalog stages (162: 159 of ~1 600). The median (the mean of the two middle values for an even count) is over the group's aligned
     /// non-reference frames; the flagged frames come back in input order.
     #[test]
     fn low_inlier_frames_flags_frames_under_half_the_median() {

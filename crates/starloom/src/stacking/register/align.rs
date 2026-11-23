@@ -470,7 +470,7 @@ fn quad_residuals(
         .collect()
 }
 
-/// The numpy median (the mean of the two middle values for an even count).
+/// The median (the mean of the two middle values for an even count).
 fn median(values: &[f64]) -> f64 {
     let mut v = values.to_vec();
     v.sort_by(|a, b| a.total_cmp(b));
@@ -3441,7 +3441,7 @@ pub(super) mod tests {
         [a.a1, a.b1, a.c1, a.a2, a.b2, a.c2].map(f64::to_bits)
     }
 
-    /// The numpy median of a copy of `values`.
+    /// The median of a copy of `values` (the mean of the two middle values for an even count).
     fn median_of(values: &[f64]) -> f64 {
         let mut v = values.to_vec();
         v.sort_by(|a, b| a.total_cmp(b));
