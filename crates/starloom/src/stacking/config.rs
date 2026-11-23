@@ -54,7 +54,7 @@ pub struct MeasurementConfig {
     /// Fast measurement (FM-2, FM-3): the first K seeds in detection order (filter flux descending) get the PSF
     /// fits, the rest keep their detection record and are not fitted; `None` = all (the shipped behaviour). No
     /// imputation: the frame aggregates, `c` and the F-6 medians are over the fitted set. Clamped up to
-    /// `max(``MIN_FIT_STARS``, registration.maxStars)` and canonicalized to `None` at or above
+    /// `max(MIN_FIT_STARS, registration.maxStars)` and canonicalized to `None` at or above
     /// `measurement.maxStars` by `resolve_config`. Absent from the document at `None`, so every All-mode hash is
     /// the one before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

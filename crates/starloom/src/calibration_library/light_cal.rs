@@ -389,8 +389,9 @@ pub fn calibrate_light_compute_with_cards(
 /// Calibrates one light frame like [`calibrate_light_compute_with_cards`], with the band-memory budget as a
 /// parameter (`band_budget_bytes`, in bytes), so a caller can force a multi-band run on a small fixture.
 ///
-/// Runs on the calling thread and takes no pool: it uses no rayon parallel iterators, and the band reads spawn their
-/// own scoped OS threads, so it is safe to call from inside the caller's rayon pool.
+/// Runs on the calling thread, takes no pool and spawns no thread (its band reads run at concurrency 1). A source
+/// that must be decoded first (XISF, or a FITS with more than one plane) is decoded with rayon iterators on the
+/// caller's current rayon pool, so it is safe to call from inside that pool.
 pub fn calibrate_light_compute_budgeted(
     inputs: &LightCalInputs,
     preloaded: Option<&PreloadedMasters>,

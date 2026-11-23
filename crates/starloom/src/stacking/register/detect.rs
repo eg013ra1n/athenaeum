@@ -23,9 +23,10 @@ pub const NATIVE_UNITS_MAX: f32 = 1.5;
 /// One registration star: a detected, centroid-refined point source on a luminance plane.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Star {
-    /// Centroid column in pixels, as the detector reports it (`x` grows to the right).
+    /// Centroid column in pixels: the detector's weighted mean of pixel column indices, so 0-based with integers at
+    /// pixel centres, the crate's convention.
     pub x: f64,
-    /// Centroid row in pixels, as the detector reports it (`y` grows downward).
+    /// Centroid row in pixels: the weighted mean of pixel row indices, in the same convention as `x`.
     pub y: f64,
     /// Star flux in the plane's native normalized units (the detector's flux divided back by `ADU_SCALE`);
     /// the brightest-first sort key.

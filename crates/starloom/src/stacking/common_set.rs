@@ -88,14 +88,14 @@ pub struct Candidate {
     pub x: f64,
     /// Row in the group's pixel grid, in pixels.
     pub y: f64,
-    /// The star's model flux times the stand-in `c`, in DN (normalized value x 65535, summed over the star).
+    /// The star's model flux times the stand-in `c`, in normalized units (summed over the star).
     pub signal: f64,
-    /// `signal` divided by the star's FWTM area: the mean flux per pixel, in DN.
+    /// `signal` divided by the star's FWTM area: the mean flux per pixel, in normalized units.
     pub mean: f64,
     /// The fit's aperture sum `S` and `S / area`, native units, no `c` (Plan D D2b, PD-26); finite on every candidate of a
     /// three-plane image, NaN where the fit has none on any other (PD-32: nothing reads it there).
     pub ap_sum: f64,
-    /// The aperture sum divided by the star's FWTM area: the mean flux per pixel, in DN (no `c`).
+    /// The aperture sum divided by the star's FWTM area: the mean flux per pixel, in normalized units (no `c`).
     pub ap_mean: f64,
     /// The anchor plane's field FWHM, px: the match radius of every member reads it ([`match_member`]).
     pub anchor_fwhm_px: f64,
@@ -105,15 +105,15 @@ pub struct Candidate {
 /// model flux, which D1b's paired gain and PSF SNRs read) and not to the aperture sum, which the weight reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Usable {
-    /// The member's model flux for the candidate with the stand-in `c` applied, in DN.
+    /// The member's model flux for the candidate with the stand-in `c` applied, in normalized units.
     pub signal: f64,
-    /// `signal` divided by the star's FWTM area: the mean flux per pixel, in DN.
+    /// `signal` divided by the star's FWTM area: the mean flux per pixel, in normalized units.
     pub mean: f64,
     /// The fit's aperture sum `S` and `S / area`, native units, no `c` (Plan D D2b, PD-26); NaN where `S` is not finite
     /// and positive: the fit is then not usable for the weight ([`common_flux`]), though its model flux still is.
     pub ap_sum: f64,
-    /// The aperture sum divided by the star's FWTM area: the mean flux per pixel, in DN (no `c`); NaN under the same
-    /// rule as `ap_sum`.
+    /// The aperture sum divided by the star's FWTM area: the mean flux per pixel, in normalized units (no `c`); NaN under
+    /// the same rule as `ap_sum`.
     pub ap_mean: f64,
 }
 
@@ -122,9 +122,9 @@ pub struct Usable {
 /// how many set stars the member has with a usable `S`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CommonFlux {
-    /// The member's total flux over the common set, in DN.
+    /// The member's total flux over the common set, in normalized units.
     pub tflux: f64,
-    /// The member's total of the per-pixel mean flux over the common set, in DN.
+    /// The member's total of the per-pixel mean flux over the common set, in normalized units.
     pub tmean_flux: f64,
     /// How many of the set's stars the member has with a usable aperture sum (a count of stars).
     pub paired: usize,

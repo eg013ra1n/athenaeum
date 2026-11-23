@@ -104,8 +104,8 @@ fn read_trimmed(path: &str) -> Option<String> {
 /// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
 /// per platform family.
 ///
-/// Linux: physical memory is `MemTotal` from `/proc/meminfo` (`None`, with a warning, when the file cannot be read or
-/// has no `MemTotal`). The limit is the cgroup v2 `memory.max`, else the cgroup v1 `memory.limit_in_bytes`; `None`
+/// Linux: physical memory is `MemTotal` from `/proc/meminfo` (`None`, with a warning, when the file cannot be read;
+/// `None` without one when it has no `MemTotal`). The limit is the cgroup v2 `memory.max`, else the cgroup v1 `memory.limit_in_bytes`; `None`
 /// when neither file exists or names a real limit.
 #[cfg(target_os = "linux")]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {

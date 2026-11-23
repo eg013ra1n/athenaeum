@@ -286,11 +286,11 @@ pub struct ChannelMeasurement {
     /// `"frame reweighed"`'s `paired_stars`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub common_stars: Option<usize>,
-    /// The plane's star FWHM, in pixels, measured over the unsaturated fits; 0.0 when there are none
-    /// (`stars_unsaturated == 0`).
+    /// The plane's star FWHM, in pixels: the residual-weighted mean over the fits that are neither saturated nor
+    /// extended; 0.0 when there are none (`stars_unsaturated == 0`, or every unsaturated fit extended).
     pub fwhm_px: f64,
-    /// The plane's mean star eccentricity (0 is round, towards 1 is elongated), over the unsaturated fits; 0.0 when
-    /// there are none.
+    /// The plane's star eccentricity (0 is round, towards 1 is elongated): the residual-weighted mean over the fits
+    /// that are neither saturated nor extended; 0.0 when there are none.
     pub eccentricity: f64,
     /// TFlux: the total flux of the plane's accepted stars (model flux times the aperture correction `c`), in
     /// normalized units; one input of the PSF Signal Weight.
@@ -406,7 +406,7 @@ pub struct ChannelCSummary {
     /// The median of the measured planes' `c` (the mean of the two middle values over an even number); `None` when
     /// `planes` is 0.
     pub median: Option<f64>,
-    /// The lowest and the highest measured `c`; `None` when `planes` is 0.
+    /// The lowest measured `c`; `None` when `planes` is 0.
     pub min: Option<f64>,
     /// The highest measured `c`; `None` when `planes` is 0.
     pub max: Option<f64>,

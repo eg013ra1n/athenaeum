@@ -597,7 +597,9 @@ impl RejBitmap {
         }
     }
 
-    /// Marks the source pixel `(x, y)` of plane `plane` as rejected (panics outside the geometry).
+    /// Marks the source pixel `(x, y)` of plane `plane` as rejected. Debug builds assert that `(plane, x, y)` lie inside
+    /// the geometry; release builds do not check, so the caller must (an `x` past the width sets a padding bit or a
+    /// bit of the next row, and only an index past the buffer panics).
     #[inline]
     pub fn set(&mut self, plane: usize, x: usize, y: usize) {
         debug_assert!(plane < self.channels && x < self.width && y < self.height);

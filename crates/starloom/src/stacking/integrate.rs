@@ -246,12 +246,12 @@ impl LnFluxEstimator {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum LnAperture {
-    /// An aperture of 2 x FWHM.
+    /// An aperture of radius 2 x FWHM.
     Fwhm2,
-    /// An aperture of 3 x FWHM.
+    /// An aperture of radius 3 x FWHM.
     Fwhm3,
     // 2026-10-06: F1 growth curve is the default (L-24).
-    /// An aperture of 2 x FWHM with the growth-curve correction (the default).
+    /// An aperture of radius 2 x FWHM with the growth-curve correction (the default).
     #[default]
     GrowthCurve,
 }

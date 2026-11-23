@@ -7,10 +7,10 @@ use crate::stacking::integrate::{LnScaleMode, LocalNormalizationConfig};
 /// The supported LN scales (L-7): the reference pipeline's list from 256 up.
 /// Below 256 a knot interval would hold fewer than 8 tiles.
 pub const LN_SCALES: [u32; 11] = [256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192];
-/// Smallest grid size (tiles across the shorter side) the auto scale rule divides by; a configured
+/// Smallest grid size (LN scales across the shorter side) the auto scale rule divides by; a configured
 /// `grid_size` is clamped up to this.
 pub const MIN_GRID_SIZE: u32 = 2;
-/// Largest grid size (tiles across the shorter side) the auto scale rule divides by; a configured `grid_size`
+/// Largest grid size (LN scales across the shorter side) the auto scale rule divides by; a configured `grid_size`
 /// is clamped down to this.
 pub const MAX_GRID_SIZE: u32 = 8;
 /// The pre-2026-10 default `scale`; a legacy document carrying it reads as

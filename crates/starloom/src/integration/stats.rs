@@ -33,7 +33,7 @@ pub enum ScaleEstimatorTs {
 }
 
 /// Output normalization modes (spec §5.1, math reference §3.6): how each frame's samples are brought onto the reference
-/// frame's level before the survivors are averaged. In the variants, `m` is a frame's background level, `s` its
+/// frame's level before the survivors are combined. In the variants, `m` is a frame's background level, `s` its
 /// dispersion, index 0 the reference frame and `i` the frame being normalized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

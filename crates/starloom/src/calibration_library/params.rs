@@ -1,6 +1,7 @@
 //! The light-calibration parameter types: `LightCalParams`, `FlatNormMode`, `BiasFallback` and
 //! `TRIMMED_MEAN_TAIL_FRACTION`. Plain data, ungated; the calibration math that reads them is the `engine` layer
-//! (`calibration_library::light_cal`). Every type serializes to the camelCase JSON the app stores and sends.
+//! (`calibration_library::light_cal`). Every type serializes to the camelCase JSON the caller stores and sends (one variant keeps its pre-rename wire
+//! string).
 
 /// Fraction of pixels discarded from EACH tail by the whole-frame trimmed mean
 /// (`FlatNormMode::TrimmedMeanWhole`). Matches the ERP's image-calibration flat

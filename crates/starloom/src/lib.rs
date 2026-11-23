@@ -1,6 +1,6 @@
 //! Starloom: the astrophotography stacking kernel.
 //!
-//! It turns calibrated astro frames into a stacked master: it aligns frames (geometry and resampling), calibrates
+//! It turns light frames into a stacked master: it aligns frames (geometry and resampling), calibrates
 //! lights against master darks, biases and flats, measures stars, registers, rejects outlier pixels, integrates,
 //! drizzles and weights, and writes FITS and XISF files. The crate is built in three layers, each a cargo feature:
 //! - base (no feature): geometry, resampling, the FITS/XISF writer core and small platform helpers;

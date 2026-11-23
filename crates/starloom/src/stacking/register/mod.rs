@@ -215,7 +215,9 @@ pub enum RegistrationGeometry {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct DetectionConfig {
-    /// Smallest peak signal-to-noise ratio (unitless) a detected star must reach to be kept.
+    /// Smallest signal-to-noise ratio (unitless) a detected star must reach to be kept. On the detector path it is the
+    /// detector's aperture-photometry SNR, `flux / sqrt(flux + pi r^2 sigma^2)` (not a peak SNR); on the PSF-fit
+    /// path it is compared with `1 / residual` of the fit.
     pub min_snr: f32,
     /// Largest eccentricity a detected star may have to be kept: 0 is round, values toward 1 are elongated
     /// (unitless).
@@ -284,9 +286,11 @@ pub struct RegistrationConfig {
     pub local_distortion: bool,
     /// The resampling kernel used when a frame is warped into the reference geometry.
     pub interpolation: Interpolation,
-    /// Deringing threshold of the sharpening kernels, unitless: when the outer taps' negative contribution
-    /// reaches this fraction of the inner taps' contribution, the interpolation falls back to a linear
-    /// estimate (default 0.30).
+    /// Deringing threshold of the sharpening kernels, unitless (default 0.30). Keys cubic: when the outer taps'
+    /// negative contribution reaches this fraction of the inner taps' contribution, the interpolation falls back to
+    /// the inner-tap linear estimate. Lanczos3 and Lanczos4: with `r` the negative lobes' contribution over the
+    /// positive lobes', above the threshold the negative lobes are reduced by `1 - ((r - t) / (1 - t))^2`, and
+    /// dropped only at `r >= 1`; there is no linear fallback.
     pub clamping_threshold: f32,
     /// Most registration stars kept per frame, brightest first.
     pub max_stars: usize,

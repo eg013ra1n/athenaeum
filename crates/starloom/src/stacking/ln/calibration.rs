@@ -280,7 +280,7 @@ pub fn calibration_k(ratios: &[Vec<f64>]) -> Vec<ChannelCalibration> {
 /// What [`measure_seeds_calibration`] found, before the caller turns it
 /// into a [`SeedsCalibration`] and logs it.
 pub struct CalibrationMeasurement {
-    /// Catalog ids of the frames the measurement was taken over, reference first.
+    /// The caller's ids of the frames the measurement was taken over, reference first.
     pub frame_ids: Vec<i64>,
     /// One verdict per channel (mono: one entry; colour: R, G, B).
     pub channels: Vec<ChannelCalibration>,

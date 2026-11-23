@@ -16,7 +16,7 @@ pub const MIN_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// that the budget buys nothing an integration can spend.
 pub const MAX_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
-/// The budget, in bytes (1 GiB), the budget policy takes when [`total_ram_bytes`] returns `None`. Measured at
+/// The budget, in bytes (1 GiB), the caller's budget policy takes when [`total_ram_bytes`] returns `None`. Measured at
 /// 101.2 s against the old constant's 241.6 s on the profiled set, and safe on any machine with the 8 GB a 26 Mpx
 /// pipeline already needs.
 pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;

@@ -648,7 +648,8 @@ fn run_banded<S: FrameSource + ?Sized>(
 }
 
 /// Integrates bias-like frames (bias, dark, dark flat) into one master by the recipe. Runs the per-pixel combine on
-/// `pool`, reads each band through scoped reader threads, and checks `cancel` between bands and frames.
+/// `pool`, reads each band through scoped reader threads when `io.read_concurrency` is above 1 (on the calling thread
+/// otherwise), and checks `cancel` between bands and frames.
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_bias_like(
     paths: &[PathBuf],

@@ -71,7 +71,9 @@ export type DistortionChoice = "off" | "polynomial2" | "polynomial3" | "polynomi
 
 export type DetectionConfig = { 
 /**
- * Smallest peak signal-to-noise ratio (unitless) a detected star must reach to be kept.
+ * Smallest signal-to-noise ratio (unitless) a detected star must reach to be kept. On the detector path it is the
+ * detector's aperture-photometry SNR, `flux / sqrt(flux + pi r^2 sigma^2)` (not a peak SNR); on the PSF-fit
+ * path it is compared with `1 / residual` of the fit.
  */
 minSnr: number, 
 /**
@@ -141,9 +143,11 @@ localDistortion: boolean,
  */
 interpolation: Interpolation, 
 /**
- * Deringing threshold of the sharpening kernels, unitless: when the outer taps' negative contribution
- * reaches this fraction of the inner taps' contribution, the interpolation falls back to a linear
- * estimate (default 0.30).
+ * Deringing threshold of the sharpening kernels, unitless (default 0.30). Keys cubic: when the outer taps'
+ * negative contribution reaches this fraction of the inner taps' contribution, the interpolation falls back to
+ * the inner-tap linear estimate. Lanczos3 and Lanczos4: with `r` the negative lobes' contribution over the
+ * positive lobes', above the threshold the negative lobes are reduced by `1 - ((r - t) / (1 - t))^2`, and
+ * dropped only at `r >= 1`; there is no linear fallback.
  */
 clampingThreshold: number, 
 /**
@@ -492,7 +496,7 @@ seedThreshold: number,
  * Fast measurement (FM-2, FM-3): the first K seeds in detection order (filter flux descending) get the PSF
  * fits, the rest keep their detection record and are not fitted; `None` = all (the shipped behaviour). No
  * imputation: the frame aggregates, `c` and the F-6 medians are over the fitted set. Clamped up to
- * `max(``MIN_FIT_STARS``, registration.maxStars)` and canonicalized to `None` at or above
+ * `max(MIN_FIT_STARS, registration.maxStars)` and canonicalized to `None` at or above
  * `measurement.maxStars` by `resolve_config`. Absent from the document at `None`, so every All-mode hash is
  * the one before the field existed.
  */
