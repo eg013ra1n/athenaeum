@@ -81,7 +81,12 @@ repeat inline (the server's `validate` stays the authority). `useHeaderFallbackP
 once the document loads and 800 ms after each save (one call in flight, a stale answer dropped); Reset all and a finished
 Apply call `refresh()` themselves, because only a save sets `savedAt`. Apply (`apply_header_fallbacks`) waits until the edit is saved and the preview of the saved rules has answered
 (`dirty` from `useAutosaveDocument`, `current` from the preview hook), confirms through `ConfirmDialog`, shows `header-fallbacks-progress` on the button and ends in one `notify()`. The registry's section
-`keywords` (an optional `SettingsSectionMeta` field, read by the search index) carry the search terms of a whole section.
+`keywords` (an optional `SettingsSectionMeta` field, read by the search index) carry the search terms of a whole section. Export… and Import… (`export_header_fallbacks`,
+`plan_header_fallbacks_import`; the desktop passes a path to core and the web passes the text, `src/utils/browserFile.ts`) change the rules only: an import is
+planned first, confirmed per field, and refused whole when any field is invalid; a keyword a replaced field loses goes to `retired`. The server keeps `retired`
+(D12), a field holds at most 32 keywords (R8), and Reset all keeps the retired keywords so Apply can undo what they filled. Apply's count lines may be singular
+(R10); a preview failure clears the counts and notifies once per mount. Leaving Settings during an Apply and coming back shows an enabled Apply button; a click is
+answered with the 409 text "FITS keyword rules are already being applied" (known limitation).
 
 `general.compute` (owner, 2026-11-13) is one KV number, `compute.max_concurrent` ("Heavy jobs at the same time",
 `ComputeQueueSection`, `SettingNumber` with `intCodec(1, 8)`, default `"1"` in `defaults::all()`). It is read through

@@ -80,7 +80,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 `athenaeum-core` (`crates/athenaeum-core/src/`, canonical list in `lib.rs`): `models`, `coordinates`, `paths`, `disk`, `fingerprint`, `db`, `fits_parser`, `fits_writer`, `clustering`, `settings`, `sessions`, `scanner`, `monitor`, `duplicates`, `calibration`, `calibration_library`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `registration`, `catalog`, `scope` (one filter over the catalog), `catalog_query` (read-side questions over a scope), `mcp` (the MCP server: host, answers, tools), `services` (`ServiceContext` + `ProgressEmitter`), `events`, `logging`, `rustafits_processor`, `integration`, `star_measure` (a re-export of rustafits' `astroimage::star_measure`, R-OSP-19), `stacking`, `sync`, `sharing`, `collab`, `updates`, `ts_export`, `zip_store`, `api/` (command-facing layer both hosts call), and more. `integration`, `star_measure` (`render`) and `stacking` (`render + solver`) are feature-gated: `cargo check --no-default-features` does not compile them.
 
-Tauri commands: 330 in 27 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
+Tauri commands: 337 in 27 modules under `crates/athenaeum-tauri/src/commands/`, each mirrored in `crates/athenaeum-web/src/routes/`; count history and recount command in `docs/architecture/commands.md`. Frontend pages: `src/pages/`; routing `src/App.tsx` (React Router v7, `/` → `/files`).
 
 ## Adding a Tauri Command
 
@@ -113,7 +113,7 @@ useEffect(() => {
 
 **Logging** — `tracing` only; message = short stable phrase, data in snake_case fields (new field names need a spec update); every command boundary wears `#[tracing::instrument(skip_all, err)]`; zero `println!`/`eprintln!` in production code; `ProgressEmitter` events are UI data, not logs; use the `athenaeum-logs` MCP to inspect behavior. `docs/logging/README.md`.
 
-**Catalog** — schema in `db/schema.rs::init_db()`; frame sets are global; a night is the grouping unit and nights are derived, never stitched; scanner re-parse is non-destructive and `frames.override = 1` is never undone by it; FITS parsing is hand-rolled; the three duplicate hashes are not interchangeable. `docs/catalog/README.md`.
+**Catalog** — schema in `db/schema.rs::init_db()`; header fields are read through the catalog's FITS keyword rules (`header_fallbacks`), passed explicitly to every parser and applied to stored frames only by an explicit Apply, which never writes `override`; frame sets are global; a night is the grouping unit and nights are derived, never stitched; scanner re-parse is non-destructive and `frames.override = 1` is never undone by it; FITS parsing is hand-rolled; the three duplicate hashes are not interchangeable. `docs/catalog/README.md`.
 
 **Calibration matching** — one `CalibrationMatchingConfig` JSON (`calibration.matching_config`) drives matching via `calibration/configurable_matcher.rs`; per-pair parameters are `Exact`/`Warning`/`Ignore`; frame size is a hard rule, never a parameter; another sub-frame origin is never auto-linked, a manual link only warns (`calibration::geometry`). `docs/calibration/matching.md`.
 

@@ -388,7 +388,9 @@ The file:
    - frames cataloged before 0.7.1 with only `DET-TEMP`;
    - XISF frames with `EXPOSURE` but no `EXPTIME`;
    - XISF text with padding or blanks;
-   - values changed by the aligned stored-header reader.
+   - values changed by the aligned stored-header reader, among them (review of Task 1, 2026-11-22): an XISF
+     `FITSKeyword` name in lower case or padded now matches its default keyword, and a FITS
+     `HIERARCH <default keyword>` card now counts (the first card of a name wins).
 
    Anything else is a parity bug to fix before merge.
 3. **Same catalog, temperature order reversed** (`DET-TEMP` first).

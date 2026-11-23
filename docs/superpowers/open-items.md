@@ -321,6 +321,13 @@ contain forward slashes.
 
 ## Known flaky test
 
+- **`export::project_organizer::tests::a_patched_copy_older_than_its_source_is_rewritten` (2026-11-22, Windows EVO-X2,
+  once in a full core run; passes alone on the task branch and on main).** A modification-time assert. Not investigated;
+  if it recurs, look at the file-system timestamp resolution the test relies on, not at the organizer.
+- **rustafits `analysis::fitting::tests::fit_moffat_2d_is_byte_identical_to_before` (2026-11-22, full EVO-X2 run; red on
+  main's pin a8e6b79 as well, and on GitHub).** Last-digit f64 differences against a stored baseline: a floating-point
+  platform flake of a rustafits lib test, which cannot depend on core. The owner ignores it; never fixed from this repo.
+
 - **`api::collab_exchange::tests::a_dropped_project_export_frees_the_slot` (2026-11-21, GitHub Linux, once; passed on the
   next run).** It polls the export future once with `timeout(Duration::ZERO)` and asserts the first poll does not finish
   it ("the first poll must not finish the export"); on a fast runner the one-frame export finished in that poll. A
@@ -376,6 +383,35 @@ copied into the MCP nor fixed by its plan; each is a small fix of its own. Delet
 - **Autofind (slot key 1) has no guard against a second run.** A second object autofind replaces the first's handle;
   the batch slot (key 0) refuses a second batch since MCP v1.
 
+## FITS keyword fallbacks — what it leaves (2026-11-23)
+
+Spec `docs/superpowers/specs/2026-11-22-header-fallbacks-design.md`, plan `plans/2026-11-22-header-fallbacks.md`, reference
+`docs/catalog/README.md` "FITS keyword fallbacks". Found while building it; none is fixed by it. Delete an entry when its fix lands.
+
+- **S4: the dark / dark-flat set reuse query ignores temperature** (`calibration/scan_integration.rs:711-805`). When only
+  some darks of a set change temperature and their time window overlaps the surviving set, the scanner's own path puts
+  them back into it; Apply regroups through that path, so it inherits this. Pre-existing.
+- **A raw set that keeps other members after a regroup keeps stale `temp_min` / `temp_max` / `ccd_temp`** (spec §5.5
+  step 2; Task 5's tests). `frame_count` and the triggers are right. The same happens after `bulk_update_frame_metadata`.
+  A set's `focallen` is not stale: the scanner never writes one for a dark set (`scan_integration.rs:840-843`).
+- **`bulk_update_frame_metadata` (`db/operations.rs` ~2110) calls the whole-table `prune_orphaned_calibration_sets`**, so
+  it races with a concurrent scan's brand-new empty set. Apply does not (R6, a trigger removes the sets it empties).
+- **Nights that failed to re-derive are not retried by a re-Apply** (D3): Apply logs `error!` per set and returns the
+  ids; `reconcile_frame_set_nights` heals a set when its page opens.
+- **A doubled pre-0.7.2 unique-camera suffix (`Cam N3 N5`) stays "kept" forever.** The scanner no longer writes one
+  (R4), Apply compares bases and keeps the column's own suffix, so the old row is neither fixed nor counted as a change.
+- **A FITS long string split by `&` loses the space before it**: `'NGC 7000 North &'` + `CONTINUE 'America'` is stored as
+  `NGC 7000 NorthAmerica` (`parse_quoted_string` trims it; the scan and the stored reader agree).
+- **Leaving Settings during an Apply and coming back shows an enabled Apply button**; a click gets the 409 text "FITS
+  keyword rules are already being applied". The button state does not follow the running Apply across a remount.
+- **A rule that gives a field more than 32 keywords by import** (31 user keywords and a missing default put back) is
+  refused by the cap (R8); a stored row over 32 (a direct DB edit) fails `load` loudly like an undecodable row. Edge only.
+- **XISF pixel size from a `<Property>` is invisible to Apply** (D10): the stored dump holds `<FITSKeyword>` lines only, so
+  such a column is left as it is and is not counted as kept.
+- **rustafits `formats::stored_keys` is no longer a verbatim copy** of Athenaeum's XISF stored-header reader
+  (`docs/stacking/README.md` R-P4-C1): last duplicate, no `" / "` cut and blank values dropped here; rustafits unchanged by
+  ruling, so no Analysis number moves.
+
 ## Standing decisions — do not re-flag these
 
 Each of these has been raised by an audit or a review at least once and answered.
@@ -414,6 +450,19 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### FITS keyword fallbacks (2026-11-23)
+
+Branch `header-fallbacks` (issue #21, 0.7.2). Code-complete; the acceptance probe ran on a copy of the dev catalog (numbers
+in the cycle's Task 9 report). What no test or probe could do:
+
+- Spec §9.4, in `npm run tauri dev` on the dev DB: add a keyword (for example `MY-TEMP` under Sensor temperature), see
+  the counter, Apply, see the values in the file browser and the metadata pane, Export… and Import… the rules (the
+  download or save dialog, the per-field confirm lines, the notify on a refused file), on desktop and on the web build.
+- Chip drag with a real pointer on the macOS and the Windows desktop builds (the pointer-capture drag, R9; Escape
+  cancels, one save on release, the arrow keys move a focused chip). Tests drive pointer events synthetically only.
+- The Apply progress line on the real catalog (about 40k frames: 81 pages of 500, one `header-fallbacks-progress` per page).
+- Delete this entry when it passes.
 
 ### Move removes the folders it empties (2026-11-21)
 
