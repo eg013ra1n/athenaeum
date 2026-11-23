@@ -391,6 +391,12 @@ Spec `docs/superpowers/specs/2026-11-22-header-fallbacks-design.md`, plan `plans
 - **S4: the dark / dark-flat set reuse query ignores temperature** (`calibration/scan_integration.rs:711-805`). When only
   some darks of a set change temperature and their time window overlaps the surviving set, the scanner's own path puts
   them back into it; Apply regroups through that path, so it inherits this. Pre-existing.
+- **Apply drops the light links of every raw set it empties, and nothing re-matches them** (owner O8; final review I1). On
+  the Task 9 supplement (SET-TEMP first, 497 sets regrouped) 2098 of 5846 light links went; the user runs Find calibration
+  on those frame sets. The preview and the confirm say how many (`light_links_dropped`, of them `manual_links_dropped`).
+  Also lost and not counted: a flat's links to a dark-flat or bias set (`calibration_set_subcal_cleanup`; 55 on the copy).
+  Fix when wanted: Apply keeps the set ids, as `refresh_calibration_library_inner` does (`api/calibration.rs:931-938`), and
+  refreshes a reused set's temperature columns (the reuse path updates `frame_count` only, `scan_integration.rs:808-820`).
 - **A raw set that keeps other members after a regroup keeps stale `temp_min` / `temp_max` / `ccd_temp`** (spec §5.5
   step 2; Task 5's tests). `frame_count` and the triggers are right. The same happens after `bulk_update_frame_metadata`.
   A set's `focallen` is not stale: the scanner never writes one for a dark set (`scan_integration.rs:840-843`).
@@ -461,6 +467,9 @@ in the cycle's Task 9 report). What no test or probe could do:
   download or save dialog, the per-field confirm lines, the notify on a refused file), on desktop and on the web build.
 - Chip drag with a real pointer on the macOS and the Windows desktop builds (the pointer-capture drag, R9; Escape
   cancels, one save on release, the arrow keys move a focused chip). Tests drive pointer events synthetically only.
+- Add a keyword to Exposure or Camera once on the real catalog (for example `EXPOSURE` ahead of `EXPTIME`, or a second
+  camera keyword) and Apply: the acceptance changed no `instrume` or `exptime`, so the night re-derivation and the INSTRUME
+  forms (R5) have run on unit tests only. Look at the frame sets' nights and the camera names afterwards.
 - The Apply progress line on the real catalog (about 40k frames: 81 pages of 500, one `header-fallbacks-progress` per page).
 - Delete this entry when it passes.
 

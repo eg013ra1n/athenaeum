@@ -36,6 +36,8 @@ const NO_CHANGE: HeaderFallbackCounts = {
   framesChanged: 0,
   valuesKept: 0,
   setsRegrouped: 0,
+  lightLinksDropped: 0,
+  manualLinksDropped: 0,
   framesWithoutHeader: 0,
 };
 
@@ -47,6 +49,8 @@ const SOME_CHANGE: HeaderFallbackCounts = {
   framesChanged: 312,
   valuesKept: 9,
   setsRegrouped: 3,
+  lightLinksDropped: 0,
+  manualLinksDropped: 0,
   framesWithoutHeader: 2,
 };
 
@@ -302,11 +306,10 @@ describe('HeaderKeywordsSection', () => {
     expect(screen.getByText(/Sensor temperature: 290 frames/)).toBeTruthy();
     expect(screen.getByText(/Exposure: 22 frames/)).toBeTruthy();
     expect(screen.getByText(/Values you set yourself stay as they are \(9\)\./)).toBeTruthy();
-    expect(
-      screen.getByText(
-        /Darks, flats and bias in 3 calibration sets will be grouped again\. Lights linked to them are matched again at the next matching\./,
-      ),
-    ).toBeTruthy();
+    expect(screen.getByText(/Darks, flats and bias in 3 calibration sets will be grouped again\./)).toBeTruthy();
+    // No link goes with these sets: neither the removal sentence nor the false re-match promise.
+    expect(screen.queryByText(/light links? to those sets/)).toBeNull();
+    expect(screen.queryByText(/matched again/)).toBeNull();
     expect(screen.getByText(/2 frames have no stored header and are not changed\./)).toBeTruthy();
     expect(callsOf('apply_header_fallbacks')).toHaveLength(0);
   });
@@ -324,6 +327,8 @@ describe('HeaderKeywordsSection', () => {
       framesChanged: 1,
       valuesKept: 0,
       setsRegrouped: 1,
+      lightLinksDropped: 0,
+      manualLinksDropped: 0,
       framesWithoutHeader: 1,
     };
     routeInvoke({
@@ -344,6 +349,37 @@ describe('HeaderKeywordsSection', () => {
     );
   });
 
+  it('says how many light links the regroup removes, and how many were made by hand', async () => {
+    preview = { ...SOME_CHANGE, lightLinksDropped: 2098, manualLinksDropped: 12 };
+    await renderSection();
+    fireEvent.click(screen.getByText('Apply to catalog'));
+    expect(
+      screen.getByText(
+        /Darks, flats and bias in 3 calibration sets will be grouped again\. 2098 light links to those sets will be removed \(12 made by hand\)\. Run Find calibration on their frame sets afterwards\./,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/matched again/)).toBeNull();
+  });
+
+  it('drops the by-hand parenthesis when no removed link was made by hand, and says one link in the singular', async () => {
+    preview = { ...SOME_CHANGE, lightLinksDropped: 1, manualLinksDropped: 0 };
+    await renderSection();
+    fireEvent.click(screen.getByText('Apply to catalog'));
+    const text = screen.getByText(/1 light link to those sets will be removed\./).textContent ?? '';
+    expect(text).toContain('Run Find calibration on their frame sets afterwards.');
+    expect(text).not.toContain('made by hand');
+    expect(text).not.toContain('light links');
+  });
+
+  it('says nothing about links when the regroup removes none', async () => {
+    preview = { ...SOME_CHANGE, lightLinksDropped: 0, manualLinksDropped: 0 };
+    await renderSection();
+    fireEvent.click(screen.getByText('Apply to catalog'));
+    const text = screen.getByText(/Darks, flats and bias in 3 calibration sets will be grouped again\./).textContent ?? '';
+    expect(text).not.toContain('light link');
+    expect(text).not.toContain('Find calibration');
+  });
+
   it('keeps Apply shut until the edit is saved and its preview has landed (the confirm never shows old rules)', async () => {
     preview = SOME_CHANGE;
     const NEW_COUNTS: HeaderFallbackCounts = {
@@ -351,6 +387,8 @@ describe('HeaderKeywordsSection', () => {
       framesChanged: 7,
       valuesKept: 0,
       setsRegrouped: 0,
+      lightLinksDropped: 0,
+      manualLinksDropped: 0,
       framesWithoutHeader: 0,
     };
     const second = deferred<HeaderFallbackCounts>();
@@ -558,6 +596,26 @@ describe('HeaderKeywordsSection', () => {
       detail: 'FITS keyword rules are already being applied',
     });
     expect(screen.getByText('Apply to catalog')).toBeTruthy();
+  });
+
+  it('refreshes the preview when an Apply fails, so the line follows what the catalog holds', async () => {
+    preview = SOME_CHANGE;
+    routeInvoke({
+      get_settings_defaults: () => ({ kv: {}, headerFallbacks: defaultDoc() }),
+      get_header_fallbacks: () => defaultDoc(),
+      preview_header_fallbacks: () => preview,
+      apply_header_fallbacks: () => Promise.reject('the nights of frame set(s) 4 could not be re-derived'),
+    });
+    await renderSection();
+    expect(callsOf('preview_header_fallbacks')).toHaveLength(1);
+    fireEvent.click(screen.getByText('Apply to catalog'));
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    // The frames were written before the failure: the second preview reads nothing left to change.
+    preview = NO_CHANGE;
+    await settle();
+    expect(notifyMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'FITS keywords not applied' }));
+    expect(callsOf('preview_header_fallbacks')).toHaveLength(2);
+    expect(screen.queryByText('Apply to catalog')).toBeNull();
   });
 
   it('warns once when the preview fails', async () => {

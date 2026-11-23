@@ -129,6 +129,8 @@ routeInvoke({
     framesChanged: 0,
     valuesKept: 0,
     setsRegrouped: 0,
+    lightLinksDropped: 0,
+    manualLinksDropped: 0,
     framesWithoutHeader: 0,
   },
   get_setting: '',

@@ -129,9 +129,13 @@ function confirmMessage(counts: HeaderFallbackCounts): string {
     .map((c) => `${HEADER_FIELD_LABELS[c.field]}: ${c.frames} ${plural(c.frames, 'frame', 'frames')}`);
   if (counts.valuesKept > 0) lines.push(`Values you set yourself stay as they are (${counts.valuesKept}).`);
   if (counts.setsRegrouped > 0) {
-    lines.push(
-      `Darks, flats and bias in ${counts.setsRegrouped} ${plural(counts.setsRegrouped, 'calibration set', 'calibration sets')} will be grouped again. Lights linked to them are matched again at the next matching.`,
-    );
+    let line = `Darks, flats and bias in ${counts.setsRegrouped} ${plural(counts.setsRegrouped, 'calibration set', 'calibration sets')} will be grouped again.`;
+    // Nothing re-matches the lights afterwards: say how many links go, and what to do about it.
+    if (counts.lightLinksDropped > 0) {
+      const by = counts.manualLinksDropped > 0 ? ` (${counts.manualLinksDropped} made by hand)` : '';
+      line += ` ${counts.lightLinksDropped} ${plural(counts.lightLinksDropped, 'light link', 'light links')} to those sets will be removed${by}. Run Find calibration on their frame sets afterwards.`;
+    }
+    lines.push(line);
   }
   if (counts.framesWithoutHeader > 0) {
     lines.push(
@@ -226,7 +230,6 @@ export function HeaderKeywordsSection() {
         title: 'FITS keywords applied',
         detail: `${done.framesChanged} ${plural(done.framesChanged, 'frame', 'frames')} changed, ${done.setsRegrouped} ${plural(done.setsRegrouped, 'calibration set', 'calibration sets')} grouped again.`,
       });
-      refresh();
     } catch (err) {
       console.error('[HeaderKeywords] apply failed:', err);
       notify({
@@ -239,6 +242,9 @@ export function HeaderKeywordsSection() {
     } finally {
       applyingRef.current = false;
       setApplying(false);
+      // A failed Apply can have written the frames and the sets before it failed: the line and
+      // the title must follow what the catalog holds now, as after a success.
+      refresh();
     }
   };
 

@@ -10,7 +10,10 @@
 //!   gives the new value) the number of changes and up to `--samples` (5) samples
 //!   `frame_id  file name  folder  old -> new`; then the number of FITS rows whose stored header
 //!   has a line that is not an 80-column card.
-//! - `apply`: runs `apply(..)` with a `NullEmitter` and prints the counts.
+//!   It also prints `values_kept` per field, split by `frames.override` (a typed value is expected to
+//!   be kept; a kept value on an `override = 0` frame is the one to look at).
+//! - `apply`: runs `apply(..)` with a `NullEmitter` and prints the counts. The session gap is the
+//!   catalog's own setting, as the api handler reads it.
 //! - `both <field> <KW1> <KW2>`: the frames whose stored header resolves both keywords to different
 //!   values.
 //! - `snapshot <out.tsv>`: the typed values (`frames.override = 1`) and the light memberships, as
@@ -24,7 +27,7 @@ use athenaeum_core::header_fallbacks::{
     resolve_keyword, validate, FieldValue, HeaderField, HeaderFallbackConfig,
 };
 use athenaeum_core::models::FileFormat;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -39,13 +42,20 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("rules refused: {e:?}"))?,
         None => HeaderFallbackConfig::default(),
     };
+    // `Database::new` creates and migrates any path: a mistyped one would preview an empty catalog as 0.
+    if !Path::new(&db_path).is_file() {
+        anyhow::bail!("--db {db_path} does not exist");
+    }
     let db = Database::new(PathBuf::from(&db_path))?;
     let conn = db.conn();
     match args.first().map(String::as_str) {
         Some("preview") => run_preview(&conn, &rules, samples),
         Some("apply") => {
             let started = Instant::now();
-            let gap_hours = 8.0;
+            let gap_hours = athenaeum_core::settings::SettingsManager::new()
+                .get_session_gap_threshold_hours(&conn)
+                .map_err(|e| anyhow::anyhow!("cannot read the session gap threshold: {e:#}"))?;
+            println!("session gap {gap_hours} h");
             let report = apply(&conn, &rules, gap_hours, &NullEmitter)?;
             println!("apply took {} ms", started.elapsed().as_millis());
             println!("{:?}", report.counts);
@@ -114,6 +124,9 @@ fn run_preview(conn: &rusqlite::Connection, rules: &HeaderFallbackConfig, sample
     let mut fits_rows = 0usize;
     let mut fits_non80 = 0usize;
     let mut fits_no_card = 0usize;
+    // values_kept per field, split by frames.override (0 = scanned value, 1 = typed or solved).
+    let overridden = overridden_frames(conn)?;
+    let mut kept: BTreeMap<(&'static str, bool), usize> = BTreeMap::new();
     let mut after = 0i64;
     loop {
         let rows = read_rows(conn, after, PAGE_SIZE)?;
@@ -138,6 +151,11 @@ fn run_preview(conn: &rusqlite::Connection, rules: &HeaderFallbackConfig, sample
                 }
             }
             let plan = plan_frame(rules, row, &roots);
+            if !plan.no_header {
+                for field in &plan.kept_fields {
+                    *kept.entry((field.id(), overridden.contains(&row.frame_id))).or_default() += 1;
+                }
+            }
             if plan.no_header || plan.changes.is_empty() {
                 continue;
             }
@@ -173,6 +191,16 @@ fn run_preview(conn: &rusqlite::Connection, rules: &HeaderFallbackConfig, sample
             break;
         }
     }
+    println!("values_kept {} (per field; override 0 / override 1):", counts.values_kept);
+    for field in HeaderField::ALL {
+        let (a, b) = (
+            kept.get(&(field.id(), false)).copied().unwrap_or(0),
+            kept.get(&(field.id(), true)).copied().unwrap_or(0),
+        );
+        if a + b > 0 {
+            println!("  {}: {a} / {b}", field.id());
+        }
+    }
     println!("classes: {}", classes.len());
     for (key, class) in &classes {
         println!("[{}] {}", class.count, key);
@@ -184,6 +212,12 @@ fn run_preview(conn: &rusqlite::Connection, rules: &HeaderFallbackConfig, sample
         "FITS rows with a stored header: {fits_rows}; with a line that is not an 80-column card: {fits_non80}; with no 80-column card at all (hand dump): {fits_no_card}"
     );
     Ok(())
+}
+
+fn overridden_frames(conn: &rusqlite::Connection) -> anyhow::Result<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM frames WHERE override = 1")?;
+    let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(ids)
 }
 
 fn run_both(conn: &rusqlite::Connection, field: HeaderField, k1: &str, k2: &str) -> anyhow::Result<()> {

@@ -38,7 +38,8 @@ Success means:
 - Value transforms (units, scale, offset). A keyword's value is taken as it is.
 - A warning about look-alike keywords such as `EGAIN`.
 - Changing the scanner's whole-row `frames.override` rule for modified files. It stays exactly as it is.
-- Re-matching lights automatically after Apply. The next matching run does that.
+- Re-matching lights automatically after Apply. The confirm counts the light links a regroup removes and asks the
+  user to run Find calibration on those frame sets (owner, 2026-11-23, O8).
 - Rebuilding masters or stacking results.
 - An MCP tool.
 
@@ -249,13 +250,13 @@ After the frame writes, in the same Apply:
 1. **Raw calibration frames** (non-master dark, flat, bias, dark-flat) whose value changed in a field their set
    is grouped by:
    - they leave their set (`calibration_set_frames`);
-   - emptied sets are pruned with the shared helper the bulk edit uses, which spares master-library,
-     superseded and provenance-anchor sets;
+   - emptied sets are pruned by the `calibration_set_empty_prune` trigger, which spares master-library,
+     superseded and provenance-anchor sets (R6: no whole-table prune);
    - the frames are then grouped again through the scanner's own path,
      `calibration::scan_integration::create_calibration_sets_from_scan_with_masters`, as if newly scanned.
 
-   Consumer links from lights to a pruned set go with it, as they do after a bulk edit. Those lights are matched
-   again by the next matching run.
+   Consumer links from lights to a pruned set go with it, as they do after a bulk edit, manual links included.
+   Nothing re-matches them: the preview counts these links and the confirm asks for Find calibration (O8).
 2. **A set that keeps other members** is treated exactly as `bulk_update_frame_metadata` treats a set that lost
    members. If that leaves its stored aggregates (`frame_count`, `temp_min` / `temp_max`) stale, that is a
    pre-existing finding to report, not to fix silently in this change.
@@ -264,11 +265,12 @@ After the frame writes, in the same Apply:
    keeps "a built master gets rows identical to scanner ingestion".
 4. **Built-master provenance.** The builder checks that the supersede/relink chain of masters built by Athenaeum
    is unaffected (`docs/masters/README.md`).
-5. **Lights** keep their frame sets, nights membership and consumer links. Their new values are seen by the
-   next matching run.
+5. **Lights** keep their frame sets and nights membership, and their consumer links except links to a pruned set
+   (step 1). Their new values are seen the next time the user runs Find calibration.
 
 The confirmation dialog states what will happen: "Darks, flats and bias in K calibration sets will be grouped
-again. Lights linked to them are matched again at the next matching."
+again." and, when links go, "N light links to those sets will be removed (M made by hand). Run Find calibration
+on their frame sets afterwards." (O8, amended 2026-11-23 after the final review found no automatic matching.)
 
 ### 5.6 Settings UI
 

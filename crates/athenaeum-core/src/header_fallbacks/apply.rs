@@ -11,7 +11,7 @@
 //! equals none of them and is kept, and `frames.override` plays no part: a plate-solved frame is
 //! filled and corrected like any other.
 
-use super::calibration::{is_deferred, movable_sets_of, needs_regroup, regroup, Deferred};
+use super::calibration::{is_deferred, light_links_dropped, movable_sets_of, needs_regroup, regroup, Deferred};
 use super::resolve::{resolve_field, resolve_keyword, same_value, FieldValue, ResolvedFields};
 use super::{HeaderField, HeaderFallbackConfig};
 use crate::events::{emit_event, ProgressEmitter};
@@ -45,6 +45,8 @@ pub struct HeaderFallbackCounts {
     pub frames_changed: usize,
     pub values_kept: usize,
     pub sets_regrouped: usize,
+    pub light_links_dropped: usize,
+    pub manual_links_dropped: usize,
     pub frames_without_header: usize,
 }
 
@@ -197,6 +199,8 @@ pub struct FramePlan {
     pub changes: Vec<(HeaderField, Option<FieldValue>)>,
     /// Fields whose value was not from the header and so was left alone.
     pub kept: usize,
+    /// Which fields those are (the acceptance probe breaks `kept` down by field).
+    pub kept_fields: Vec<HeaderField>,
     /// The frame has no usable stored header: nothing was tested.
     pub no_header: bool,
 }
@@ -317,6 +321,7 @@ pub fn plan_frame(rules: &HeaderFallbackConfig, row: &CatalogRow, roots: &ScanRo
         };
         let Some(new) = new else {
             plan.kept += 1;
+            plan.kept_fields.push(field);
             continue;
         };
         let differs = match (&raw, &new) {
@@ -381,13 +386,17 @@ pub fn preview(conn: &Connection, rules: &HeaderFallbackConfig) -> anyhow::Resul
         }
     }
 
-    counts.sets_regrouped = movable_sets_of(conn, &regroup_ids)?.len();
+    let movable = movable_sets_of(conn, &regroup_ids)?;
+    counts.sets_regrouped = movable.len();
+    (counts.light_links_dropped, counts.manual_links_dropped) = light_links_dropped(conn, &movable, &regroup_ids)?;
     let by_field_text = finish_by_field(&mut counts, by_field);
     tracing::debug!(
         count = counts.frames_changed,
         kept = counts.values_kept,
         no_header = counts.frames_without_header,
         sets_regrouped = counts.sets_regrouped,
+        light_links_dropped = counts.light_links_dropped,
+        manual_links_dropped = counts.manual_links_dropped,
         by_field = %by_field_text,
         duration_ms = started.elapsed().as_millis() as u64,
         "header fallbacks previewed"
@@ -557,12 +566,16 @@ pub(crate) fn apply_in_pages(
     emit_event(emitter, PROGRESS_EVENT, &HeaderFallbackProgress { phase: "calibration".into(), done: total, total });
 
     counts.sets_regrouped = report.sets_regrouped;
+    counts.light_links_dropped = report.light_links_dropped;
+    counts.manual_links_dropped = report.manual_links_dropped;
     let by_field_text = finish_by_field(&mut counts, by_field);
     tracing::info!(
         count = counts.frames_changed,
         kept = counts.values_kept,
         no_header = counts.frames_without_header,
         sets_regrouped = report.sets_regrouped,
+        light_links_dropped = report.light_links_dropped,
+        manual_links_dropped = report.manual_links_dropped,
         master_sets = report.master_sets,
         lineage_kept = report.lineage_kept,
         by_field = %by_field_text,
@@ -903,6 +916,8 @@ mod tests {
                 frames_changed: 4,
                 values_kept: 1,
                 sets_regrouped: 1,
+                light_links_dropped: 0,
+                manual_links_dropped: 0,
                 frames_without_header: 0,
             }
         );
@@ -1464,6 +1479,67 @@ mod tests {
         assert_eq!(preview(&conn, &HeaderFallbackConfig::default()).unwrap(), HeaderFallbackCounts::default());
     }
 
+    /// Links a light frame (or, with `source_type` `calibration_set`, a set) to `set_id`.
+    fn link(conn: &Connection, source_id: i64, source_type: &str, set_id: i64, manual: bool) {
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+                 (source_id, source_type, calibration_set_id, calibration_type, is_manual_override)
+             VALUES (?1, ?2, ?3, 'Dark', ?4)",
+            params![source_id, source_type, set_id, manual as i64],
+        )
+        .unwrap();
+    }
+
+    fn link_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM calibration_set_to_frames", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn light_links_to_an_emptied_set_are_counted_and_dropped() {
+        let conn = catalog();
+        let ids = four_darks(&conn, ["-10", "-10", "-20", "-20"]);
+        group_darks(&conn, ids);
+        let old_set = raw_dark_sets(&conn)[0].0;
+        let l1 = add_frame(&conn, "l1.fits", "FITS", "Light", &ResolvedFields::default(), None);
+        let l2 = add_frame(&conn, "l2.fits", "FITS", "Light", &ResolvedFields::default(), None);
+        link(&conn, l1, "frame", old_set, false);
+        link(&conn, l2, "frame", old_set, true);
+        // A set's own pre-calibration link is not a light link.
+        let flat_set = calibration_set(&conn, "Flat");
+        link(&conn, flat_set, "calibration_set", old_set, false);
+
+        let counts = preview(&conn, &HeaderFallbackConfig::default()).unwrap();
+        assert_eq!((counts.light_links_dropped, counts.manual_links_dropped), (2, 1));
+        let report = apply_default(&conn, &HeaderFallbackConfig::default());
+        assert_eq!(report.counts, counts);
+        assert_eq!(link_count(&conn), 0, "the cascade took the light links; the set link went with its target");
+    }
+
+    #[test]
+    fn light_links_to_a_set_that_keeps_a_member_are_not_dropped() {
+        let conn = catalog();
+        let ids = four_darks(&conn, ["-10", "-10", "-20", "-20"]);
+        group_darks(&conn, ids);
+        let set = raw_dark_sets(&conn)[0].0;
+        // A fifth member whose value does not change keeps the set alive.
+        let values = ResolvedFields {
+            gain: Some(100.0),
+            exptime: Some(60.0),
+            ccd_temp: Some(-10.0),
+            ..ResolvedFields::default()
+        };
+        let stay = add_frame(&conn, "stay.fits", "FITS", "Dark", &values, Some(&fits_text(&[("DET-TEMP", "-10")])));
+        put_in_set(&conn, set, stay);
+        let l = add_frame(&conn, "l.fits", "FITS", "Light", &ResolvedFields::default(), None);
+        link(&conn, l, "frame", set, true);
+
+        let counts = preview(&conn, &HeaderFallbackConfig::default()).unwrap();
+        assert_eq!(counts.sets_regrouped, 1);
+        assert_eq!((counts.light_links_dropped, counts.manual_links_dropped), (0, 0));
+        assert_eq!(apply_default(&conn, &HeaderFallbackConfig::default()).counts, counts);
+        assert_eq!(link_count(&conn), 1, "the surviving set keeps its link");
+    }
+
     #[test]
     fn master_library_set_takes_its_masters_new_values() {
         let conn = catalog();
@@ -1655,6 +1731,9 @@ mod tests {
         // Darks to regroup, a typed value to keep, a camera to rename, a frame without a header.
         let ids = four_darks(&conn, ["-10", "-10", "-20", "-20"]);
         group_darks(&conn, ids);
+        let old_set = raw_dark_sets(&conn)[0].0;
+        let linked = add_frame(&conn, "/cams/three/l.fits", "FITS", "Light", &ResolvedFields::default(), None);
+        link(&conn, linked, "frame", old_set, true);
         let typed = ResolvedFields { gain: Some(7.0), ..ResolvedFields::default() };
         add_frame(&conn, "/cams/three/t.fits", "FITS", "Light", &typed, Some(&fits_text(&[("GAIN", "100")])));
         let cam = ResolvedFields { instrume: Some("Old N3".into()), ..ResolvedFields::default() };
@@ -1663,7 +1742,8 @@ mod tests {
         let rules = rules_with(HeaderField::Instrume, &["CAMERA", "INSTRUME"], &[]);
 
         let expected = preview(&conn, &rules).unwrap();
-        assert!(expected.sets_regrouped == 1 && expected.frames_without_header == 1 && expected.values_kept >= 1);
+        assert!(expected.sets_regrouped == 1 && expected.frames_without_header == 2 && expected.values_kept >= 1);
+        assert_eq!((expected.light_links_dropped, expected.manual_links_dropped), (1, 1));
         assert_eq!(apply_default(&conn, &rules).counts, expected);
         // Nothing is left to change; the kept value and the headerless frame stay counted.
         let again = preview(&conn, &rules).unwrap();

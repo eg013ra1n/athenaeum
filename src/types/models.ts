@@ -2567,7 +2567,7 @@ export type HeaderFallbackConfig = { fields: { [key in HeaderField]?: FieldRule 
 
 export type FieldCount = { field: HeaderField, frames: number, };
 
-export type HeaderFallbackCounts = { byField: Array<FieldCount>, framesChanged: number, valuesKept: number, setsRegrouped: number, framesWithoutHeader: number, };
+export type HeaderFallbackCounts = { byField: Array<FieldCount>, framesChanged: number, valuesKept: number, setsRegrouped: number, lightLinksDropped: number, manualLinksDropped: number, framesWithoutHeader: number, };
 
 export type HeaderFallbackProgress = { phase: string, done: number, total: number, };
 

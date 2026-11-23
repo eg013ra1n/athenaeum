@@ -100,6 +100,59 @@ pub(crate) fn movable_sets_of(conn: &Connection, frame_ids: &[i64]) -> anyhow::R
     Ok(sets)
 }
 
+/// The light links that go with the movable sets every member of which leaves (O8): such a set
+/// is emptied, the prune trigger deletes it and its `calibration_set_to_frames` rows cascade
+/// (`db/schema.rs`). Returns `(light links dropped, of them made by hand)`; only links whose
+/// source is a light frame count (a calibration set's own pre-calibration links are not lights).
+///
+/// `movable` is [`movable_sets_of`] of `leaving`, the raw calibration frames that would leave
+/// their sets. The preview and Apply both call this with the same plan, so their numbers agree.
+pub(crate) fn light_links_dropped(
+    conn: &Connection,
+    movable: &BTreeSet<i64>,
+    leaving: &[i64],
+) -> anyhow::Result<(usize, usize)> {
+    if movable.is_empty() {
+        return Ok((0, 0));
+    }
+    let leaving: BTreeSet<i64> = leaving.iter().copied().collect();
+    let movable_ids: Vec<i64> = movable.iter().copied().collect();
+    // A set stays when one of its members does not leave.
+    let mut stays: BTreeSet<i64> = BTreeSet::new();
+    for chunk in movable_ids.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT set_id, frame_id FROM calibration_set_frames WHERE set_id IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (set_id, frame_id) = row?;
+            if !leaving.contains(&frame_id) {
+                stays.insert(set_id);
+            }
+        }
+    }
+    let emptied: Vec<i64> = movable_ids.into_iter().filter(|id| !stays.contains(id)).collect();
+    let (mut links, mut manual) = (0usize, 0usize);
+    for chunk in emptied.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let (n, m): (i64, i64) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(is_manual_override), 0)
+                   FROM calibration_set_to_frames
+                  WHERE source_type = 'frame' AND calibration_set_id IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(chunk.iter()),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        links += n as usize;
+        manual += m as usize;
+    }
+    Ok((links, manual))
+}
+
 /// A frame whose columns Apply writes in its calibration transaction instead of in a page: a raw
 /// calibration frame that has to be regrouped, or a master frame with a change in
 /// [`MASTER_SET_FIELDS`].
@@ -128,6 +181,10 @@ pub(crate) fn is_deferred(
 pub(crate) struct RegroupReport {
     /// Raw calibration sets that lost frames.
     pub sets_regrouped: usize,
+    /// Light links that went with the sets this emptied (O8).
+    pub light_links_dropped: usize,
+    /// Of those, the links made by hand.
+    pub manual_links_dropped: usize,
     /// Master-library sets whose own columns were updated.
     pub master_sets: usize,
     /// Raw frames that sit in a frozen (superseded or provenance) set: their values were written
@@ -179,6 +236,7 @@ pub(crate) fn regroup(conn: &Connection, deferred: &[Deferred]) -> anyhow::Resul
         let raw_ids: Vec<i64> = raw.iter().map(|d| d.frame_id).collect();
         let movable = movable_sets_of(conn, &raw_ids)?;
         report.sets_regrouped = movable.len();
+        (report.light_links_dropped, report.manual_links_dropped) = light_links_dropped(conn, &movable, &raw_ids)?;
 
         let mut moved: BTreeSet<i64> = BTreeSet::new();
         let mut frozen: BTreeSet<i64> = BTreeSet::new();
