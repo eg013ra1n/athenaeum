@@ -454,18 +454,23 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **No "manual block" for calibration auto-links.** | `unlink_calibration_for_frames`, Find Calibration | Owner, 2026-10-31: not needed. An unlinked auto link may come back on the next Find Calibration, while a manual choice sticks. |
 | **Perseus 0.5.1 Library behaviour.** | The Perseus Library | Owner, 2026-10-31. Ratified: selection across directories; the in-flight gate that blocks a divert while a sibling batch is Delivered or Waiting; the chip naming the original batch after a re-send. Not ratified: a file deleted by hand is found only on restart (see Owner rulings, To do). |
 
-## Starloom: left after phase 1 (2026-11-23)
+## Starloom: left after phase 3 (2026-11-23)
 
-Not smokes: work the starloom extraction left on purpose (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`).
-Phase 1 merged into main on 2026-11-23; what it did is deleted from this list; what is left:
+Not smokes unless marked: work the starloom extraction left on purpose (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`).
+Phase 3 (2026-11-23): starloom is its own repository, `github.com/eg013ra1n/starloom` (v0.1.0), and the submodule
+`starloom/` here; what phases 1-3 did is deleted from this list; what is left:
 
 - **The `ATH_*` names in starloom's `light_cal` debug messages** (`calibration_library/light_cal.rs`, about lines 694,
   761 and 768) lose them together with a log-text change that is accepted on purpose (plan note 8).
-- **Comments pointing into the Athenaeum repo** (for example `integration/combine.rs` lines 3 and 2424, `stats.rs` lines
-  56-57): clean at the phase-3 squash.
-- **x86_64 golden rows (P2-6).** The stage goldens have float rows for `aarch64-macos` only; other platforms check
-  determinism and the `"*"` row. Rows for x86_64 Linux and Windows wait for public CI (P2-6); record them by hand from
-  the printed literal.
+- **x86_64 golden rows (P2-6).** The stage goldens have float rows for `aarch64-macos` only (GitHub's macOS runner
+  matches them, 2026-11-23); other platforms check determinism and the `"*"` row. Starloom's own CI prints the rows
+  for x86_64 Linux and Windows (`no golden rows for …`): record them by hand in a starloom release.
+- **The measured FWHM depends on the optimization level by one ulp** (2026-11-23, phase 3): at opt-level 0 the
+  measure and pass-1 rows go red, at opt-level 2 they hold, so starloom's `[profile.dev]` sets 2 for a standalone build
+  and Athenaeum's root sets it in the workspace. Release builds (opt-level 3, no debug assertions) were never compared
+  with the dev rows. Not a defect of the guard; a fact to know before reading a release-build number against a row.
+- **Owed smoke (spec §8 acceptance):** a no-op starloom release (`v0.1.1`) arrives in Athenaeum as a Dependabot bump
+  PR with CI green. Possible only once Athenaeum `main` with `.github/dependabot.yml` is on GitHub.
 
 ---
 
