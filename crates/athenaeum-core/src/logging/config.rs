@@ -44,9 +44,15 @@ const MODULE_TARGETS: [(&str, &[&str]); 5] = [
         "calibration",
         &["athenaeum_core::calibration", "starloom::calibration_library"],
     ),
+    // `starloom::fs_util` holds the `sync_best_effort` that every durable write calls (archive, zip, export, header
+    // patch and starloom's own FITS, XISF and LN-grid writers).
     (
         "archive",
-        &["athenaeum_core::archive", "athenaeum_core::file_op"],
+        &[
+            "athenaeum_core::archive",
+            "athenaeum_core::file_op",
+            "starloom::fs_util",
+        ],
     ),
     // The one switch that lifts the iroh transport back out of the
     // `THIRD_PARTY_QUIET` baseline: that baseline is appended BEFORE the module
@@ -229,6 +235,17 @@ mod tests {
         let d = cfg.to_directives();
         assert!(d.contains("athenaeum_core::calibration=debug"), "{d:?}");
         assert!(d.contains("starloom::calibration_library=debug"), "{d:?}");
+        assert!(d.parse::<tracing_subscriber::EnvFilter>().is_ok());
+    }
+    #[test]
+    fn archive_category_covers_starloom_fs_util() {
+        // `sync_best_effort` lives in starloom and logs under `starloom::fs_util`;
+        // the archive category must switch it together with core's archive targets.
+        let mut cfg = LoggingConfig::default();
+        cfg.modules.insert("archive".into(), "debug".into());
+        let d = cfg.to_directives();
+        assert!(d.contains("athenaeum_core::archive=debug"), "{d:?}");
+        assert!(d.contains("starloom::fs_util=debug"), "{d:?}");
         assert!(d.parse::<tracing_subscriber::EnvFilter>().is_ok());
     }
     #[test]

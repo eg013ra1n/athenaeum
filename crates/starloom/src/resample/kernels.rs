@@ -10,17 +10,23 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The interpolation kernel a registered frame is resampled with: how a sample between source pixels is computed
+/// from its neighbours. Each kernel is separable and its weights sum to one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum Interpolation {
+    /// Nearest neighbour: copies the closest source pixel (1 tap per axis); no smoothing, no ringing.
     Nearest,
+    /// Bilinear: a distance-weighted mean of the 2 x 2 neighbours (2 taps per axis); smooths, never rings.
     Bilinear,
     /// Keys cubic convolution, a = -0.5 — interpolating, mild ringing.
     BicubicSpline,
     /// Cubic B-spline — smoothing (1/6, 4/6, 1/6 at integer positions).
     BicubicBSpline,
+    /// Lanczos with a = 3, a windowed sinc (6 taps per axis); sharp, with mild ringing.
     Lanczos3,
+    /// Lanczos with a = 4, a windowed sinc (8 taps per axis); the sharpest, with the most ringing.
     Lanczos4,
     /// Mitchell–Netravali cubic filter, B = C = 1/3.
     MitchellNetravali,
@@ -33,7 +39,9 @@ pub enum Interpolation {
 /// longer returns (and the caller no longer copies) a 48-byte value.
 #[derive(Clone, Copy, Debug)]
 pub struct Taps {
+    /// The source index of the first tap of this axis.
     pub first: isize,
+    /// The number of taps on this axis.
     pub n: usize,
 }
 

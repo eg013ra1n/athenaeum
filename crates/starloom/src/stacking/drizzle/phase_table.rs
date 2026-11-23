@@ -1,8 +1,8 @@
 //! The per-phase drop-overlap table (Tier C item C2, spec
 //! `2026-09-20-stacking-compute-tierC-design.md` §3, ruling C-3).
 //!
-//! What it replaces: [`super::deposit_band`] used to map each source
-//! pixel's four drop corners through the frame's [`ForwardEval`]
+//! What it replaces: `super::deposit_band` used to map each source
+//! pixel's four drop corners through the frame's `ForwardEval`
 //! ([`super::geom::map_drop`]) and then run one Sutherland–Hodgman clip
 //! ([`super::geom::clip_area`], ≈ 100–120 `f64` operations with ≈ 8
 //! divisions) per overlapped output pixel — ≈ 422 ns per source pixel.
@@ -53,7 +53,7 @@
 //! to ([`super::geom::cfa_plane_of`], M4d ruling R-M4d-2), the local
 //! normalization grid, the frame weight and the output pair are all
 //! exactly the exact path's and are applied by the SAME shared code —
-//! [`super::deposit_band`] resolves `(cells, areas)` from one arm or the
+//! `super::deposit_band` resolves `(cells, areas)` from one arm or the
 //! other and then runs ONE accumulation loop.
 
 use super::geom::{self, Quad};
@@ -158,7 +158,7 @@ impl PhaseTable {
     /// quad would silently tabulate a drop `scale` times too small).
     ///
     /// Returns `None` for a quad that is not finite, has no area, or is so
-    /// large that it would blow [`MAX_CELL_OFFSET`] / [`MAX_CELLS_PER_PHASE`]
+    /// large that it would blow `MAX_CELL_OFFSET` / `MAX_CELLS_PER_PHASE`
     /// — every one a degenerate local mapping the caller answers by
     /// falling back to the exact clip.
     pub fn build(quad_at_origin: &Quad, scale: u32, phases: usize) -> Option<PhaseTable> {

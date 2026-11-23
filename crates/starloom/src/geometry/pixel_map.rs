@@ -17,6 +17,7 @@ use super::tps::{ThinPlateSpline, TPS_GRID_PX};
 /// Reference → subject mapping, the only direction a gather-style resampler
 /// needs.
 pub trait InverseMap: Sync {
+    /// Maps the reference-frame pixel `(x, y)` to the subject-frame pixel `(x, y)` it samples, in pixels.
     fn inverse(&self, x: f64, y: f64) -> (f64, f64);
 
     /// An evaluator for a BURST of queries — one band, one row, one
@@ -106,7 +107,7 @@ impl TpsGrid {
     /// domain's lower corner and running two samples past `ceil(extent /
     /// step)` on the far side (the `+ 2` below, as `build` has always done),
     /// so the last cell is complete. Rows are independent, so the build runs
-    /// over `rayon`; it is a pure function of its inputs.
+    /// on the caller's current rayon pool; it is a pure function of its inputs.
     pub fn sample(domain: [f64; 4], f: impl Fn(f64, f64) -> (f64, f64) + Sync) -> TpsGrid {
         let step = TPS_GRID_PX as f64;
         let [x0, y0, x1, y1] = domain;
@@ -184,6 +185,7 @@ impl TpsGrid {
 /// [`PixelMap::release_grids`], or the last handle simply falling out of
 /// scope.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub mod grid_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -425,9 +427,13 @@ impl InverseEval<'_> {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum DistortionModel {
+    /// A SIP-style polynomial distortion layer.
     Polynomial(Distortion),
+    /// A thin-plate-spline distortion layer, fitted from star correspondences.
     Tps {
+        /// The spline giving the forward displacement, in pixels, in the linear model's output space.
         forward: ThinPlateSpline,
+        /// The spline giving the inverse displacement, in pixels, at a reference pixel.
         inverse: ThinPlateSpline,
         /// Reference-pixel box `[x0, y0, x1, y1]` the splines were fitted
         /// over (the nodes' bounding box, each side inflated by
@@ -450,10 +456,12 @@ pub enum DistortionModel {
     /// composed from, and the layer is re-derived from it.
     #[serde(skip)]
     Sampled {
+        /// The displacement field the layer samples.
         field: Arc<dyn DisplacementField>,
         /// Output-space box `[x0, y0, x1, y1]` the field is sampled over;
         /// queries clamp into it, as a spline's do.
         domain: [f64; 4],
+        /// The lazily built displacement grids, shared by every clone and never serialized.
         grids: Arc<TpsGrids>,
     },
 }
@@ -791,15 +799,21 @@ impl DistortionModel {
     }
 }
 
+/// The complete mapping between a subject frame and the reference frame, in pixels: a linear model, its inverse and
+/// an optional distortion layer. `forward` goes subject to reference, `inverse` reference to subject.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PixelMap {
+    /// The linear model, subject pixel to reference pixel.
     pub linear: Linear,
+    /// The inverse of [`PixelMap::linear`], cached.
     pub linear_inv: Linear,
+    /// The distortion layer on top of the linear model, if any.
     pub distortion: Option<DistortionModel>,
 }
 
 impl PixelMap {
+    /// A map with no distortion; `None` when `linear` is singular and cannot be inverted.
     pub fn linear(linear: Linear) -> Option<PixelMap> {
         let linear_inv = linear.inverse()?;
         Some(PixelMap {
@@ -809,10 +823,12 @@ impl PixelMap {
         })
     }
 
+    /// A map with a polynomial distortion layer; `None` when `linear` is singular.
     pub fn with_distortion(linear: Linear, distortion: Distortion) -> Option<PixelMap> {
         PixelMap::with_distortion_model(linear, DistortionModel::Polynomial(distortion))
     }
 
+    /// A map with any [`DistortionModel`] layer; `None` when `linear` is singular.
     pub fn with_distortion_model(linear: Linear, distortion: DistortionModel) -> Option<PixelMap> {
         let linear_inv = linear.inverse()?;
         Some(PixelMap {
@@ -930,6 +946,7 @@ impl PixelMap {
         self.linear_inv.apply(rx, ry)
     }
 
+    /// Whether the map mirrors the image: the linear model has a negative determinant.
     pub fn is_flipped(&self) -> bool {
         self.linear.is_flipped()
     }
@@ -942,6 +959,8 @@ impl PixelMap {
             .expect("PixelMap is serializable unless it carries a sampled layer, which no caller serializes")
     }
 
+    /// Parses a map from the JSON [`PixelMap::to_json`] writes (the stored `transform_json`), checking it. A
+    /// malformed distortion layer or a singular linear model is an error, as is invalid JSON.
     pub fn from_json(s: &str) -> Result<PixelMap, serde_json::Error> {
         let map: PixelMap = serde_json::from_str(s)?;
         if let Some(d) = &map.distortion {

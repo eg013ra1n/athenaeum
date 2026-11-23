@@ -81,6 +81,8 @@ pub struct DrizzleFrame<'a> {
     /// This frame's `.rej` rejection bitmap, when
     /// [`DrizzleInput::use_rejection`] is on and one was written for it.
     pub rej: Option<&'a Path>,
+    /// The calibrated CFA mosaic this frame deposits from under Bayer drizzle, when set.
+    ///
     /// M4d Task 1 (ruling R-M4d-2): Bayer drizzle. When set, EVERY output
     /// plane is deposited from this ONE single-plane calibrated CFA mosaic
     /// instead of from `path`'s interpolated planes, and a source pixel
@@ -104,7 +106,9 @@ pub struct DrizzleFrame<'a> {
 /// red).
 #[derive(Debug, Clone, Copy)]
 pub struct CfaSource<'a> {
+    /// Path of the calibrated CFA mosaic file (single plane).
     pub path: &'a Path,
+    /// The mosaic's Bayer pattern after the phase correction the debayer was given.
     pub pattern: BayerPattern,
 }
 
@@ -120,27 +124,40 @@ pub struct DrizzleInput<'a> {
     /// own `channels` must match `channels` below; its own native geometry
     /// is read from the file (see [`DrizzleFrame::path`]'s doc).
     pub width: usize,
+    /// Reference height in pixels.
     pub height: usize,
+    /// Number of planes (1 mono, 3 colour).
     pub channels: usize,
     /// Output-grid multiplier (ruling R-M3-10: 1, 2 or 3 — not enforced
     /// here, the plan gate is the range check).
     pub scale: u32,
+    /// The drop's side as a fraction of an input pixel (the drizzle `pixfrac`; dimensionless).
     pub drop_shrink: f64,
+    /// The drop shape: square, circle or gaussian.
     pub kernel: DrizzleKernel,
+    /// Whether each frame's per-plane weight multiplies its deposits (otherwise every frame counts as 1).
     pub use_weights: bool,
+    /// Whether each frame's `.rej` rejection bitmap is applied, leaving rejected pixels out of the deposit.
     pub use_rejection: bool,
+    /// Whether each frame's local-normalization grids are applied (frames without them use their global
+    /// pair).
     pub use_local_normalization: bool,
     /// Whether to materialize the normalized `W / max(W)` weight-map plane
     /// in the output (`DrizzleOutput::weight`) — the raw `W` accumulator
     /// itself is always used for `coverage`, this only controls whether the
     /// normalized copy is kept.
     pub write_weight_map: bool,
+    /// Whether to count, per output pixel and plane, the frames that contributed there.
+    ///
     /// Plan 6b-3 D9 (spec §5.8): count, per output pixel and plane, the
     /// frames whose deposit raised `W` there, into [`DrizzleOutput::coverage`].
     /// Counted by comparing each band's `W` before and after the frame's
     /// deposit, so `deposit_band` is untouched; a drop whose weight is below
     /// `W`'s f32 resolution at that pixel is not counted.
     pub write_coverage: bool,
+    /// Whether the master's statistics are measured on the covered rectangle only (a grid drizzle) instead of
+    /// the whole plane.
+    ///
     /// Plan 6b-3 ruling (b), fix round 1: a grid drizzle. When set, every
     /// plane's [`DrizzleStats`] fwhm/eccentricity/noise are measured on
     /// [`Self::stats_rect`] scaled by the drizzle factor (the master's own,
@@ -155,12 +172,15 @@ pub struct DrizzleInput<'a> {
     /// ([`crate::stacking::integrate::GroupOutput::measure_rect`]); read only
     /// when [`Self::stats_on_covered`] is set.
     pub stats_rect: Option<crate::stacking::crop::CropRect>,
+    /// How the drizzled master's FWHM, eccentricity and noise are measured.
     pub measure: &'a MeasureOptions,
-    /// Injected total system RAM for the memory refusal (ruling R-M3-7,
+    /// Injected total system RAM, in bytes, for the memory refusal (ruling R-M3-7,
     /// ruling R-M3-12): `None` probes
     /// [`crate::integration::band_budget::total_ram_bytes`] — the run
     /// always passes `None`; tests inject a small value to exercise the
-    /// refusal without needing a huge geometry.
+    /// refusal without needing a huge geometry. The run is allowed half of the
+    /// total; when the total is unknown (the probe returns `None` too) it is
+    /// allowed a flat 4 GiB (4,294,967,296 bytes).
     pub ram_total_bytes: Option<u64>,
     /// Forces the exact per-pixel clip everywhere, even where Tier C item
     /// C2's phase table would apply (ruling C-3). **The run never sets
@@ -180,23 +200,32 @@ pub struct DrizzleInput<'a> {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct DrizzleStats {
+    /// Output pixels per input pixel along each axis.
     pub scale: u32,
+    /// Output width in pixels (reference width times `scale`).
     pub out_width: usize,
+    /// Output height in pixels (reference height times `scale`).
     pub out_height: usize,
     /// Included frames this pass drizzled (whether or not every one
     /// actually contributed — a frame skipped for zero weight still counts,
     /// mirroring `DrizzleInput::frames`'s own length).
     pub frames: usize,
+    /// The drop shape used.
     pub kernel: DrizzleKernel,
+    /// The drop's side as a fraction of an input pixel (dimensionless).
     pub drop_shrink: f64,
+    /// Whether per-frame weights were applied.
     pub used_weights: bool,
+    /// Whether `.rej` rejection bitmaps were applied.
     pub used_rejection: bool,
     /// Of `frames`, how many actually had their LN grids applied (`0` when
     /// local normalization was off for the run).
     pub ln_frames: usize,
     /// Per plane, measured on the drizzled (output-grid) planes.
     pub fwhm_px: Vec<f64>,
+    /// Per plane, the eccentricity of the drizzled planes' stars (0 round, toward 1 elongated; unitless).
     pub eccentricity: Vec<f64>,
+    /// Per plane, the noise sigma of the drizzled plane, in normalized units.
     pub noise: Vec<f64>,
     /// Per plane, the fraction of output pixels with `W > 0`.
     pub coverage: Vec<f64>,
@@ -205,15 +234,20 @@ pub struct DrizzleStats {
     /// thread while the current one deposits, so this is the part of the
     /// read the overlap did not hide, not the read's full duration.
     pub read_ms: u64,
+    /// Time spent depositing frames into the output grid, in milliseconds.
     pub deposit_ms: u64,
+    /// Source bytes read from disk during the pass.
     pub bytes_read: u64,
 }
 
 /// The drizzled master's pixel data (+ optional weight map) plus its stats.
 #[derive(Debug)]
 pub struct DrizzleOutput {
+    /// Output width in pixels.
     pub width: usize,
+    /// Output height in pixels.
     pub height: usize,
+    /// Number of planes (1 mono, 3 colour).
     pub channels: usize,
     /// `width * height * channels`, plane-major (channel 0's rows, then
     /// channel 1's, …) — the same layout `write_fits_f32` expects.
@@ -224,6 +258,7 @@ pub struct DrizzleOutput {
     /// Same layout as `data`, present only when
     /// [`DrizzleInput::write_coverage`] was set.
     pub coverage: Option<Vec<f32>>,
+    /// The pass's statistics.
     pub stats: DrizzleStats,
 }
 
@@ -231,6 +266,7 @@ pub struct DrizzleOutput {
 /// per included frame per plane, whether or not that frame actually
 /// contributed (a zero-weight frame is still "done").
 pub struct DrizzleProgress<'a> {
+    /// Called with `(done, total)` after each included frame of each plane.
     pub on_frame: &'a (dyn Fn(usize, usize) + Sync),
 }
 
@@ -238,16 +274,24 @@ pub struct DrizzleProgress<'a> {
 /// [`drizzle_group`] returns one of these).
 #[derive(Debug)]
 pub enum DrizzleError {
+    /// The run's cancel flag was set; the pass stopped.
     Cancelled,
+    /// The pass would need more memory than it is allowed.
+    ///
     /// Ruling R-M3-7: `need` bytes estimated, `have` the refusal threshold
     /// (half of a probed total, or the 4 GiB floor when the total is
     /// unknown) — the caller (a later task) formats the user-facing
     /// message and leaves the group's `master_path` alone.
     Memory {
+        /// Bytes the pass estimates it needs.
         need: u64,
+        /// Bytes the pass is allowed (half of the total RAM, or 4 GiB when the total is unknown).
         have: u64,
     },
+    /// A file read, write or decode failed; the message says which.
     Io(String),
+    /// The input is unusable (for example no channels, a scale below 1, a channel-count mismatch or an
+    /// undecodable frame); the message says why.
     BadInput(String),
 }
 
@@ -656,7 +700,7 @@ fn deposit_tabulated(
 /// R-M3-1..R-M3-7): allocates the `I`/`W` output-geometry accumulators,
 /// reads each frame's plane once, resolves its rejection bitmap and/or LN
 /// grids, and deposits every source pixel's drop through
-/// [`deposit_band`] — banded over [`DRIZZLE_BAND_ROWS`] output rows in
+/// `deposit_band` — banded over [`DRIZZLE_BAND_ROWS`] output rows in
 /// parallel on `pool`. Refuses up front (ruling R-M3-7) before any
 /// output-geometry allocation happens.
 pub fn drizzle_group(

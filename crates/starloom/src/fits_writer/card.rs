@@ -1,28 +1,51 @@
 //! FITS 4.0 header cards: grammar validation + 80-byte record serialization.
 //! Fixed-format values (FITS 4.0 §4.2); long strings via the CONTINUE convention (§4.2.1.2).
 
+/// The size of one FITS header card, in bytes (80 ASCII characters).
 pub const CARD_SIZE: usize = 80;
+/// The FITS block size, in bytes (2880): a header and a data unit are each padded to a whole number of blocks.
 pub const BLOCK_SIZE: usize = 2880;
 // M10 (final fix wave): `pub(crate)`, not private — `stacking::master_cards`
 // used to hard-code its own `ATH_STKC_MAX_CHARS = 68` copy of this same
 // number (with a comment naming this constant, which it could not actually
 // reference) so the two would silently drift if this one ever changed.
-#[doc(hidden)]
-pub const MAX_STR_CONTENT: usize = 68; // printable chars inside the quotes of one card
+/// The most bytes one card's quoted string value holds (the 80-byte card leaves 68 inside the quotes). The limit is on
+/// the escaped length, so an embedded `'` (written as `''`) counts twice. A longer value continues on CONTINUE cards,
+/// each carrying 67 characters plus a trailing `&` except the last.
+pub const MAX_STR_CONTENT: usize = 68;
 
+/// Why a FITS file could not be written: a refused card or geometry, or an I/O failure. The path-based writers write a
+/// temporary file and rename it, so a failed write leaves an existing destination file untouched.
 #[derive(Debug)]
 pub enum FitsWriteError {
+    /// The keyword is empty, longer than 8 characters, or has a character other than `A-Z`, `0-9`, `-` and `_`
+    /// (after upper-casing). Carries the keyword as given.
     InvalidKeyword(String),
+    /// The keyword is one the writer owns (`SIMPLE`, `BITPIX`, `END`, `BZERO`, `BSCALE`, `CONTINUE` or any `NAXIS*`)
+    /// and cannot appear in a user card. Carries the upper-cased keyword.
     ReservedKeyword(String),
+    /// The card's comment does not fit in the 80-byte card beside its value. Carries the keyword.
     CommentTooLong(String),
+    /// A real value needs more than 20 characters even in exponent form. Carries the keyword.
     ValueTooLong(String),
+    /// A real value is NaN or infinite, which FITS cannot represent. Carries the keyword.
     NonFiniteReal(String),
-    DataSizeMismatch { expected: usize, got: usize },
+    /// The sample slice length is not `width * height * channels`.
+    DataSizeMismatch {
+        /// The sample count the dimensions call for.
+        expected: usize,
+        /// The sample count actually passed.
+        got: usize
+    },
+    /// The channel count is neither 1 (mono) nor 3 (color planes). Carries the count given.
     BadChannels(usize),
+    /// A width or height is zero, or the sample count overflows `usize`. Carries a text describing the dimensions.
     BadDimensions(String),
+    /// A card has neither a value nor COMMENT/HISTORY text. Carries the keyword.
     MissingValue(String),
     /// Input the writer cannot represent (a malformed header block, an unparsable SIP table).
     Malformed(String),
+    /// A file-system or stream error from the underlying write.
     Io(std::io::Error),
 }
 
@@ -48,18 +71,30 @@ impl From<std::io::Error> for FitsWriteError {
     fn from(e: std::io::Error) -> Self { Self::Io(e) }
 }
 
+/// The value of a FITS header card.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CardValue {
+    /// A logical value, written as `T` or `F`.
     Logical(bool),
+    /// An integer value.
     Integer(i64),
+    /// A real value, written in fixed format (or exponent form when it would not fit in 20 characters); it must be
+    /// finite.
     Real(f64),
+    /// A string value. Characters outside printable ASCII become `?`; a string longer than [`MAX_STR_CONTENT`]
+    /// continues on CONTINUE cards.
     Str(String),
 }
 
+/// One FITS header card: a keyword with a value and an optional comment, or a COMMENT/HISTORY text card. The writer
+/// adds the structural cards (`SIMPLE`, `BITPIX`, `NAXIS*`, `END`) itself.
 #[derive(Debug, Clone)]
 pub struct Card {
+    /// The card keyword, upper-case, at most 8 characters.
     pub keyword: String,
+    /// The card value; `None` marks a COMMENT/HISTORY-style text card.
     pub value: Option<CardValue>, // None => COMMENT/HISTORY-style text card
+    /// The comment written after the value (`/ comment`); it must fit in the 80-byte card.
     pub comment: Option<String>,
     pub(crate) text: Option<String>, // COMMENT/HISTORY payload
     /// Capability token: true only for writer-owned structural cards built via
@@ -84,10 +119,13 @@ fn validate_keyword(kw: &str) -> Result<String, FitsWriteError> {
 }
 
 impl Card {
+    /// Builds a card from a keyword and a value. The keyword is upper-cased and checked; a keyword that is invalid
+    /// or reserved for the writer's own structural cards is an error.
     pub fn new(keyword: &str, value: CardValue) -> Result<Card, FitsWriteError> {
         Ok(Card { keyword: validate_keyword(keyword)?, value: Some(value), comment: None, text: None, structural: false })
     }
 
+    /// Returns the card with `comment` as its trailing comment.
     pub fn with_comment(mut self, comment: &str) -> Card {
         self.comment = Some(comment.to_string());
         self
@@ -108,12 +146,17 @@ impl Card {
             })
             .collect())
     }
+    /// Builds the COMMENT cards that carry `text`, cut into 72-byte chunks, one card per chunk; characters outside
+    /// printable ASCII become `?`.
     pub fn comment_cards(text: &str) -> Result<Vec<Card>, FitsWriteError> { Self::text_cards("COMMENT", text) }
+    /// Builds the HISTORY cards that carry `text`, cut into 72-byte chunks, one card per chunk; characters outside
+    /// printable ASCII become `?`.
     pub fn history_cards(text: &str) -> Result<Vec<Card>, FitsWriteError> { Self::text_cards("HISTORY", text) }
 
     /// Internal constructor for writer-owned structural cards.
     /// Bypasses only the RESERVED-keyword check (SIMPLE/BITPIX/END/etc. are legitimate here);
     /// charset/length validation still applies via a debug assertion.
+    // doc(hidden): the writer's own structural cards, built by hand only in Athenaeum's tests
     #[doc(hidden)]
     pub fn structural(keyword: &str, value: CardValue, comment: &str) -> Card {
         debug_assert!(
@@ -173,6 +216,9 @@ fn pack(line: &str) -> [u8; 80] {
     rec
 }
 
+/// Serializes one card into its 80-byte records: normally one, or a CONTINUE chain when a string value is longer
+/// than [`MAX_STR_CONTENT`] characters. The keyword grammar is checked again here, so a hand-built [`Card`] cannot
+/// bypass it.
 pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
     // Re-validate: Card fields are pub, so constructor-only validation is
     // bypassable. Only writer-owned cards built via `Card::structural` carry

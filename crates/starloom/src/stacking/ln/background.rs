@@ -108,11 +108,16 @@ const MAD_TO_SIGMA_F64: f64 = 1.4826;
 /// 2026-09-10 ruling that 0.85 is 0.85 of full scale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CleaningParams {
+    /// Radius, in pixels, of the neighbourhood the hot-pixel rescue looks at.
     pub hot_radius: usize,
+    /// Pixels below this value are clipped out of the tile, in normalized units.
     pub low_clip: f32,
+    /// Pixels above this fraction of full scale (1.0 normalized) are clipped out of the tile.
     pub high_clip_rel: f32,
 }
 
+/// The cleaning both background models use: hot-pixel radius 2 px, low clip 4.5e-5 and high clip 0.85 of full
+/// scale (normalized units).
 pub const CLEANING: CleaningParams = CleaningParams {
     hot_radius: 2,
     low_clip: 4.5e-5,
@@ -125,17 +130,29 @@ pub const CLEANING: CleaningParams = CleaningParams {
 /// the star selection compares with (L-14).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TileStat {
+    /// Tile left edge, in pixels (inclusive).
     pub x0: u32,
+    /// Tile top edge, in pixels (inclusive).
     pub y0: u32,
+    /// Tile right edge, in pixels (exclusive).
     pub x1: u32,
+    /// Tile bottom edge, in pixels (exclusive).
     pub y1: u32,
+    /// How many of the tile's pixels are present (finite data).
     pub present: u32,
+    /// The tile's background level: the median after clipping, in normalized units; NaN when the tile is not
+    /// a sample.
     pub value: f32,
+    /// The tile's noise: the MAD-based sigma of the clipped pixels, in normalized units; NaN when the tile is
+    /// not a sample.
     pub sigma: f32,
+    /// The largest hot-pixel-corrected finite pixel of the tile before clipping, in normalized units; NaN
+    /// when none.
     pub max: f32,
 }
 
 impl TileStat {
+    /// Whether the tile has enough present pixels to be a background sample.
     pub fn is_sample(&self) -> bool {
         self.present as usize >= MIN_TILE_PRESENT
     }
@@ -152,10 +169,15 @@ impl TileStat {
 /// Every tile of one plane, row-major (`tiles[v * tw + u]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileTable {
+    /// Plane width in pixels.
     pub width: usize,
+    /// Plane height in pixels.
     pub height: usize,
+    /// Tile columns.
     pub tw: usize,
+    /// Tile rows.
     pub th: usize,
+    /// The tiles, row-major (`tiles[v * tw + u]`).
     pub tiles: Vec<TileStat>,
 }
 
@@ -173,6 +195,8 @@ impl TileTable {
     /// (`tile_statistics_match_the_full_plane_cleaning`) with no full-plane
     /// copy. A tile is a pure function of `plane`, so the parallel collect
     /// (index order) is bit-identical to a serial loop.
+    ///
+    /// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
     pub fn measure(
         plane: &[f32],
         width: usize,
@@ -186,6 +210,8 @@ impl TileTable {
     /// As [`Self::measure`], with every pixel outside `mask` absent —
     /// including inside the hot-pixel window. Equal to `measure` on a copy
     /// of `plane` with NaN outside `mask`.
+    ///
+    /// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
     pub fn measure_masked(
         plane: &[f32],
         width: usize,
@@ -258,6 +284,8 @@ impl TileTable {
     /// bit for bit; a tile with no pixel inside is absent; any other tile is
     /// recomputed on its masked pixels. Identical to
     /// [`Self::measure_masked`] (`restricted_tiles_equal_measuring_the_masked_plane`).
+    ///
+    /// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
     pub fn restricted(
         &self,
         plane: &[f32],
@@ -449,11 +477,17 @@ fn measure_tile(
 /// row-major (`coeffs[j * nx + i]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Surface {
+    /// Plane width in pixels.
     pub width: usize,
+    /// Plane height in pixels.
     pub height: usize,
+    /// Knot spacing in pixels (the LN scale).
     pub knot: f64,
+    /// Coefficient columns.
     pub nx: usize,
+    /// Coefficient rows.
     pub ny: usize,
+    /// The B-spline coefficients, row-major (`coeffs[j * nx + i]`), in normalized units.
     pub coeffs: Vec<f64>,
 }
 
@@ -486,6 +520,8 @@ impl Surface {
         )
     }
 
+    /// The surface value at pixel position `(x, y)`, in normalized units; a position outside the plane is
+    /// clamped to its edge.
     pub fn eval(&self, x: f64, y: f64) -> f64 {
         let x = x.clamp(0.0, (self.width - 1) as f64);
         let y = y.clamp(0.0, (self.height - 1) as f64);
@@ -549,17 +585,27 @@ impl std::error::Error for BackgroundRefusal {}
 /// cells and `cells_unsupported` those under the floor.
 #[derive(Debug, Clone)]
 pub struct BackgroundModel {
+    /// The tiles the model was fitted to.
     pub table: TileTable,
+    /// The LN scale in pixels; the knot spacing of the surface.
     pub scale: u32,
+    /// The fitted background surface.
     pub surface: Surface,
+    /// Per tile, whether it belongs to the final fit.
     pub accepted: Vec<bool>,
+    /// Tiles in the final fit.
     pub samples: usize,
+    /// Samples the rejection rounds left out.
     pub samples_rejected: usize,
+    /// Knot cells with fewer accepted samples than the floor.
     pub cells_unsupported: usize,
+    /// Knot cells in all.
     pub cells: usize,
 }
 
 impl BackgroundModel {
+    /// Fits the surface to the table's tiles at the given LN scale (pixels), with two sample-rejection
+    /// rounds, or says why the plane has no model.
     pub fn fit(table: TileTable, scale: u32) -> Result<BackgroundModel, BackgroundRefusal> {
         let (width, height) = (table.width, table.height);
         if width < 2 || height < 2 || table.tiles.is_empty() {
@@ -686,6 +732,7 @@ pub struct TileNoise {
 }
 
 impl TileNoise {
+    /// The noise reading of a fitted model: each tile's sigma where the final fit accepted it.
     pub fn from_model(m: &BackgroundModel) -> TileNoise {
         Self::build(&m.table, |k| m.accepted[k])
     }
@@ -696,6 +743,8 @@ impl TileNoise {
         Self::build(t, |k| t.tiles[k].is_sample())
     }
 
+    /// A noise reading with one sigma (normalized units) for the whole plane and a given plane maximum, and
+    /// no per-tile detail.
     pub fn uniform(sigma: f64, plane_max: f32) -> TileNoise {
         TileNoise {
             tw: 0,
@@ -735,6 +784,8 @@ impl TileNoise {
         }
     }
 
+    /// The background noise sigma near pixel position `(x, y)`, in normalized units.
+    ///
     /// L-12: the median σ of the accepted samples in the 3 × 3 tile block
     /// around the tile holding (x, y); the plane median when that block has
     /// none.
@@ -760,6 +811,7 @@ impl TileNoise {
         }
     }
 
+    /// The hot-pixel-corrected plane maximum, in normalized units.
     pub fn plane_max(&self) -> f32 {
         self.plane_max
     }
@@ -894,9 +946,13 @@ fn cholesky_solve(l: &[f64], n: usize, mut b: Vec<f64>) -> Vec<f64> {
 /// surfaces are then kept and the caller logs one `warn!` per frame.
 #[derive(Debug, Clone)]
 pub struct PairSurfaces<'a> {
+    /// The reference's background surface.
     pub reference: Cow<'a, Surface>,
+    /// The target's background surface.
     pub target: Cow<'a, Surface>,
+    /// Tiles both final fits kept (the refit's sample count).
     pub shared: usize,
+    /// Whether the surfaces are the shared refit (`true`) or each side's own fit (`false`).
     pub refit: bool,
 }
 

@@ -42,6 +42,9 @@ use crate::star_measure::StarFit;
 use crate::stacking::rej::{process_large_scale, RejBitmap, RejBitmapSet, RejForcedSource};
 use crate::stacking::weights::{best_by_weight, FrameWeight};
 
+/// The integration settings of a stacking run: how samples are combined and rejected, the weight floor and the range
+/// limits.
+///
 /// spec §9.2 `integration:`; every field defaulted, camelCase on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -50,6 +53,7 @@ pub struct IntegrationConfig {
     /// The master builder's `Combination` — one enum, one spelling
     /// (`"average"`/`"median"`, snake_case per `combine.rs`'s own attribute).
     pub combination: Combination,
+    /// Which pixel-rejection method the master uses; `Auto` picks one by the group's frame count.
     pub rejection: RejectionChoice,
     /// The weight floor (spec §6.2): a frame whose lowest per-channel
     /// normalized weight falls below this is dropped from the group.
@@ -58,6 +62,7 @@ pub struct IntegrationConfig {
     pub range_low: Option<f64>,
     /// Reject `raw >= range_high`; `None` until the user turns it on.
     pub range_high: Option<f64>,
+    /// Also return per-pixel rejection maps (counts of rejected samples) with the master (default off).
     pub write_rejection_maps: bool,
     /// Large-scale (structure-aware) pixel rejection, M4c (spec §6.2,
     /// ruling R-M4c-4).
@@ -79,6 +84,9 @@ impl Default for IntegrationConfig {
     }
 }
 
+/// Large-scale (structure-aware) pixel rejection: removes a satellite trail or similar structure as a whole instead of
+/// leaving per-pixel speckle.
+///
 /// spec §9.2 `integration.largeScale:` (M4c, ruling R-M4c-4). When
 /// `enabled`, integration runs TWICE: the first pass writes every included
 /// frame's per-pixel rejection bitmap, those bitmaps are filtered to the
@@ -97,6 +105,7 @@ impl Default for IntegrationConfig {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct LargeScaleRejection {
+    /// Whether large-scale rejection runs (default off); integration then runs twice.
     pub enabled: bool,
     /// The scale selector: structures thinner than roughly `2^layers / 2`
     /// pixels are erased (see [`process_large_scale`]'s own doc for the
@@ -118,6 +127,9 @@ impl Default for LargeScaleRejection {
     }
 }
 
+/// The normalization settings of a stacking run: how frames are matched to the reference for the final combine and for
+/// the rejection tests, plus the local-normalization block.
+///
 /// spec §9.2 `normalization:` — `rejection == `[`RejectionNormalization::Local`]`
 /// (M2) means `integrate_group` applies the per-frame LN grids
 /// (`GroupInput.ln`) as the rejection-normalization pair instead of a
@@ -134,7 +146,9 @@ impl Default for LargeScaleRejection {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct NormalizationConfig {
+    /// How each frame is matched to the reference for the final combine.
     pub output: OutputNormalization,
+    /// How each frame is matched to the reference for the rejection tests (default `local`).
     pub rejection: RejectionNormalization,
     /// Informational at this layer: the estimator that produced the
     /// stage-3 location/scale is `MeasureOptions::scale_estimator` — the
@@ -152,11 +166,14 @@ pub struct NormalizationConfig {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum LnScaleMode {
+    /// The scale is derived from the normalization geometry.
     Auto,
+    /// The scale is the stored `scale` value.
     Fixed,
 }
 
 impl LnScaleMode {
+    /// The serde name, for logs: `"auto"` or `"fixed"`.
     pub fn as_str(self) -> &'static str {
         match self {
             LnScaleMode::Auto => "auto",
@@ -170,12 +187,12 @@ impl LnScaleMode {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct LnStarSelection {
-    // Both sides' (peak − background) / σ_local must reach this (5–200).
+    /// The least (peak − background) / σ_local a star must reach in both frames to be used (dimensionless, 5–200).
     pub min_peak_snr: f64,
-    // At most this many matched PAIRS, brightest first (20–5000).
+    /// The most matched star pairs used, brightest first (a count of pairs, 20–5000).
     pub max_stars: u32,
-    // A pixel within max(2, FWHM) of either centroid above this fraction of
-    // that plane's maximum leaves the pair out (0.5–1.0).
+    /// The fraction of a plane's maximum above which a star pair is left out: a pixel within max(2, FWHM) pixels of
+    /// either centroid above it removes the pair (dimensionless, 0.5–1.0).
     pub saturation: f64,
 }
 
@@ -205,13 +222,16 @@ impl LnStarSelection {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum LnFluxEstimator {
+    /// The PSF fit's own model flux.
     PsfSignal,
     // 2026-10-06: F1 growth curve is the default (L-24).
+    /// The flux inside one common circular aperture (the default).
     #[default]
     CommonAperture,
 }
 
 impl LnFluxEstimator {
+    /// The serde name, for logs: `"psfSignal"` or `"commonAperture"`.
     pub fn as_str(self) -> &'static str {
         match self {
             LnFluxEstimator::PsfSignal => "psfSignal",
@@ -226,14 +246,18 @@ impl LnFluxEstimator {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum LnAperture {
+    /// An aperture of radius 2 x FWHM.
     Fwhm2,
+    /// An aperture of radius 3 x FWHM.
     Fwhm3,
     // 2026-10-06: F1 growth curve is the default (L-24).
+    /// An aperture of radius 2 x FWHM with the growth-curve correction (the default).
     #[default]
     GrowthCurve,
 }
 
 impl LnAperture {
+    /// The serde name, for logs: `"fwhm2"`, `"fwhm3"` or `"growthCurve"`.
     pub fn as_str(self) -> &'static str {
         match self {
             LnAperture::Fwhm2 => "fwhm2",
@@ -243,6 +267,9 @@ impl LnAperture {
     }
 }
 
+/// The local-normalization settings: whether each frame is matched to the reference region by region (not only by one
+/// global level and scale), and how that scale and its stars are chosen.
+///
 /// spec §9.2 `normalization.local:` (M2). `enabled` turns LN into the
 /// OUTPUT normalization for a group; `local_scale` (a scale SPLINE over
 /// the stride grid, not just the frame-global `A`) went live in M4c
@@ -254,26 +281,32 @@ impl LnAperture {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalNormalizationConfig {
+    /// Whether local normalization is the OUTPUT normalization of the group (default off).
     pub enabled: bool,
-    // The LN scale in pixels when `scaleMode` is `fixed`; snapped to the
-    // supported list by `resolve_config`. Read only by `ln::resolve_scale`.
+    /// The local-normalization scale, in pixels, used when `scaleMode` is `fixed`; snapped to the supported list by
+    /// `resolve_config`. Read only by `ln::resolve_scale`.
     pub scale: u32,
-    // `None` only on a document stored before 2026-10 (field-level default,
-    // so the struct's own default cannot fill it): `resolve_config` turns it
-    // into `Some` by the legacy rule L-9.
+    /// How the scale is chosen: derived from the geometry or taken from `scale`. `None` only on a document stored
+    /// before 2026-10 (field-level default, so the struct's own default cannot fill it): `resolve_config` turns it
+    /// into `Some` by the legacy rule L-9.
     #[serde(default)]
     pub scale_mode: Option<LnScaleMode>,
-    // Auto scale = the short side of the LN geometry / gridSize, snapped (2-8).
+    /// The automatic scale is the short side of the normalization geometry divided by this (2-8), snapped to the
+    /// supported list.
     pub grid_size: u32,
+    /// How many of the group's best frames build the local-normalization reference (a count of frames).
     pub reference_frames: u32,
+    /// The star profile the local-normalization fits use.
     #[cfg_attr(feature = "ts", ts(as = "crate::stacking::psf_signal::PsfModelTs"))]
     pub psf_model: crate::stacking::psf_signal::PsfModel,
+    /// Whether the scale is a spline over the stride grid instead of one frame-global value (default off; only read
+    /// while `enabled`).
     pub local_scale: bool,
-    // Which matched stars set the scale (spec §3).
+    /// Which matched stars set the scale (spec §3).
     pub star_selection: LnStarSelection,
-    // Which flux the scale ratios use (spec 2026-10-04 §4.1).
+    /// Which flux the scale ratios use (spec 2026-10-04 §4.1).
     pub flux_estimator: LnFluxEstimator,
-    // The common aperture's circle; read only under `commonAperture` (§4.1).
+    /// The common aperture's circle; read only under `commonAperture` (§4.1).
     pub aperture: LnAperture,
 }
 
@@ -295,6 +328,8 @@ impl Default for LocalNormalizationConfig {
     }
 }
 
+/// The user's pixel-rejection choice: `auto` or one method with its thresholds.
+///
 /// spec §6.3: the user's rejection choice, resolved to a concrete
 /// [`Rejection`] once the group size is known.
 /// camelCase on the wire; the resolved `Rejection` persisted in master recipes
@@ -307,42 +342,63 @@ impl Default for LocalNormalizationConfig {
     tag = "method"
 )]
 pub enum RejectionChoice {
+    /// Pick the method from the group size (see [`RejectionChoice::resolve`]).
     #[default]
     Auto,
+    /// Keep every sample.
     None,
+    /// Percentile clipping around the median.
     PercentileClip {
+        /// Reject a sample this fraction of the median's magnitude below the median (dimensionless, e.g. 0.2 = 20 %).
         low: f64,
+        /// Reject a sample this fraction of the median's magnitude above the median (dimensionless).
         high: f64,
     },
+    /// Plain sigma clipping, repeated until stable.
     SigmaClip {
+        /// Standard deviations below the centre at which a sample is rejected.
         sigma_low: f64,
+        /// Standard deviations above the centre at which a sample is rejected.
         sigma_high: f64,
     },
+    /// Winsorized sigma clipping, repeated until stable.
     WinsorizedSigma {
+        /// Winsorized standard deviations below the centre at which a sample is rejected.
         sigma_low: f64,
+        /// Winsorized standard deviations above the centre at which a sample is rejected.
         sigma_high: f64,
     },
+    /// Linear-fit clipping against a line fitted over the sample ranks, repeated until stable.
     LinearFitClip {
+        /// Deviation units below the fitted line at which a sample is rejected.
         sigma_low: f64,
+        /// Deviation units above the fitted line at which a sample is rejected.
         sigma_high: f64,
     },
     /// Min/max clipping (M4c, ruling R-M4c-1). Defaults when chosen:
     /// `low = 1`, `high = 1`.
     MinMax {
+        /// How many of the smallest samples to drop (a count).
         low: usize,
+        /// How many of the largest samples to drop (a count).
         high: usize,
     },
     /// Generalized extreme studentized deviate test (M4c, ruling R-M4c-1).
     /// Defaults when chosen: `outliersFraction = 0.3`, `alpha = 0.05`,
     /// `lowRelaxation = 1.5`.
     Esd {
+        /// The largest share of the samples that may be removed as outliers, in [0, 1].
         outliers_fraction: f64,
+        /// The significance level of each test (dimensionless, e.g. 0.05).
         alpha: f64,
+        /// The factor that inflates the scale below the centre, so faint samples are rejected less eagerly.
         low_relaxation: f64,
     },
     /// Robust Chauvenet Rejection (M4c, ruling R-M4c-1). Default when
     /// chosen: `limit = 0.5` (Chauvenet's criterion).
     Rcr {
+        /// The expected number of samples at least as extreme as the candidate below which it is rejected (0.5 is
+        /// Chauvenet's criterion).
         limit: f64,
     },
 }
@@ -419,16 +475,20 @@ impl RejectionChoice {
 /// measurement and weight, and the bookkeeping the group-level header
 /// (`DATE-OBS` span, exposure) needs.
 pub struct StackFrame {
+    /// The frame's file (a calibrated light).
     pub path: PathBuf,
     /// Subject → reference (identity for the reference frame).
     pub map: PixelMap,
+    /// The frame's star and noise measurement, one entry per plane.
     pub measurement: FrameMeasurement,
+    /// The frame's weight, per plane and as a mean.
     pub weight: FrameWeight,
+    /// The frame's exposure time, in seconds.
     pub exposure_s: f64,
     /// `DATE-OBS` as stored (ISO-8601 text), for the header's earliest/latest.
     pub date_obs: Option<String>,
     /// The catalog frame id, for the Task 6a fallback warning only — no
-    /// other field on this type carries identity. [`integrate_planes`]
+    /// other field on this type carries identity. `integrate_planes`
     /// carries it into the `frame_id` [`MaterializedFrame`] builds, so
     /// `RegisteredSource::open_materialized`'s fallback `warn!` (fix round
     /// 2, ruling R-TA-6 I1) can name the frame it warped instead of
@@ -436,7 +496,7 @@ pub struct StackFrame {
     pub frame_id: i64,
     /// The materialized registered artifact (Task 6a, spec §3.7) — already
     /// warped into the group's reference geometry, read verbatim by
-    /// [`integrate_planes`]/`normalize_frame` in place of re-warping `path`
+    /// `integrate_planes`/`normalize_frame` in place of re-warping `path`
     /// through `map`. `None` when no fresh artifact was on disk at snapshot
     /// time (`stacking::run::GroupMember` resolves this once, the same
     /// `is_fresh` rule every other cached stage uses) — every reader then
@@ -445,17 +505,28 @@ pub struct StackFrame {
     pub registered_path: Option<PathBuf>,
 }
 
+/// One group's frames and the settings its integration runs with.
 pub struct GroupInput<'a> {
+    /// The group's frames; the registration maps carry each onto the reference geometry.
     pub frames: &'a [StackFrame],
     /// Index into `frames` of the reference (its measurement normalizes the others).
     pub reference: usize,
+    /// The output (reference grid) width, in pixels.
     pub width: usize,
+    /// The output (reference grid) height, in pixels.
     pub height: usize,
+    /// The number of planes (1 for mono, 3 for colour).
     pub channels: usize,
+    /// The resampling kernel used to warp frames onto the reference grid.
     pub interpolation: Interpolation,
+    /// The deringing threshold of the cubic and Lanczos kernels (dimensionless, 0 to 1).
     pub clamping: f32,
+    /// The integration settings (combine, rejection, weight floor, range limits).
     pub integration: &'a IntegrationConfig,
+    /// The normalization settings (output and rejection normalization, local normalization).
     pub normalization: &'a NormalizationConfig,
+    /// Per-frame local-normalization grids, one entry per frame (`None` for a frame that has none).
+    ///
     /// M2 Task 7: per-frame local-normalization grids, indexed like `frames`
     /// (not like a group's `included`/`frame_indices` subset) — `stacking::run`
     /// reads these back from cached `.athln` artifacts once stage 6 has run
@@ -465,9 +536,11 @@ pub struct GroupInput<'a> {
     /// and keeps global normalization — plan 6b-3 D7). The whole field is `None` when local normalization never ran
     /// for this group at all (disabled, or a ruling-R3-shaped fallback to
     /// global normalization) — `integrate_group` forwards it verbatim to
-    /// [`integrate_planes`], which already treats `None` the same way for
+    /// `integrate_planes`, which already treats `None` the same way for
     /// every M1 caller.
     pub ln: Option<&'a [Option<LnFrameGrids>]>,
+    /// The run's rejection-bitmap set for this group, present when drizzle needs the survivor mask.
+    ///
     /// M3 Task 2 (spec §6.2, ruling R-M3-8): the run's per-run rejection-
     /// bitmap set for this group, when drizzle wants the survivor mask
     /// (`drizzle.enabled && drizzle.useRejection`) — `stacking::run` (Task
@@ -496,10 +569,14 @@ pub struct GroupInput<'a> {
     /// and the tests never pass a `rej` set at all, so the flag has nothing
     /// to gate.
     pub second_pass_bitmaps: bool,
+    /// Whether to count, per output pixel, how many frames cover it (plane 0).
+    ///
     /// Plan 6b-3 D4, spec §5.7: keep plane 0's geometric coverage in
     /// [`GroupOutput::coverage`] — the coverage map, and the crop's
     /// rectangle. `false` for every caller that wants neither.
     pub coverage_map: bool,
+    /// Whether to measure the master's statistics on covered pixels only (for a grid master).
+    ///
     /// Plan 6b-3 D4 refinement (review I1): measure the master's statistics
     /// (`master_location`, `_scale`, `_noise`, `_psf_snr`, `snr_gain`, FWHM,
     /// eccentricity) on covered pixels only — a grid master's uncovered
@@ -509,23 +586,30 @@ pub struct GroupInput<'a> {
     /// under [`MIN_STATS_RECT_PX`] (final review A1).
     /// `false` for a frame set, whose statistics never move.
     pub stats_on_covered: bool,
+    /// The group's frame-common star set per plane, as (column, row) positions in the master's pixel grid.
+    ///
     /// Plan D D1b (PD-3): the group's frame-common star set, one entry per plane, in the DELIVERED grid's pixel
     /// coordinates (`GroupInput::width` x `height`: the grid the registered frames and the master live on, which
     /// `stacking::run::reweigh_groups` reaches by each member's own registration map). `None` entry = the plane fell
     /// back (PD-6); the whole field is `None` when the group was never reweighed (no aligned member, the LN reference
     /// builder, the probes; every weight mode builds the set, PD-19 b). The master's PSF SNR and
-    /// [`GroupStats::snr_gain`] read only these stars (see [`common_psf_snr`], [`paired_snr_gain`]); how the integrate
-    /// side tells the two apart is [`log_no_positions`].
+    /// [`GroupStats::snr_gain`] read only these stars (see [`common_psf_snr`], `paired_snr_gain`); how the integrate
+    /// side tells the two apart is `log_no_positions`.
     pub common_stars: Option<&'a [Option<Vec<(f64, f64)>>]>,
 }
 
 /// [`GroupStats::snr_gain_version`] of a gain measured now: `2` = the paired SNR factor `√(PSF SNR master / PSF SNR
 /// best sub)` read over the group's frame-common star set only (Plan D D1b, PD-3, PD-7), both sides on one aperture
-/// correction `c`: a side at floor (i), which carries no `c`, reads with the other side's ([`paired_c_stand_ins`]; Plan D
+/// correction `c`: a side at floor (i), which carries no `c`, reads with the other side's (`paired_c_stand_ins`; Plan D
 /// D1 fix r4 joined v2 before v2 shipped, so it did not bump). `1` = the same paired factor over every star of the two
 /// images (v0.7.0), each side on its own `c`. Absent (`0`) = the pre-v0.7.0 unpaired power ratio. Bump it when the
 /// formula changes again, and teach `src/components/stacking/snrGain.ts` the new value.
 pub const SNR_GAIN_VERSION: u32 = 2;
+
+/// The version of the master light's combine, rejection and weighting ([`integrate_group`]). A signal version: it enters
+/// no hash, and no cache keys this stage. Bump it when a change moves the output numbers; the `stage_goldens` test fails
+/// until it does, and Athenaeum's tripwire pins it so the bump is accepted on purpose (spec SL-19).
+pub const INTEGRATE_VERSION: u32 = 1;
 
 /// The `reason` of the gain's and the master figure's warns names "under 20 paired"; the count it names is the module's.
 const _: () = assert!(COMMON_MIN_STARS == 20);
@@ -544,13 +628,17 @@ pub const MIN_STATS_RECT_PX: usize = 16;
 // `runs/run-<id>.json` document) must serialize as a whole — the derive is a
 // compile-time necessity now, not a design choice made early. Task 9 still
 // owns registering the type into `ts_export.rs`'s `stacking.ts`.
+/// The group's integration summary: frame counts, rejection fractions, the master's noise and star figures, the SNR
+/// gain, exposure totals and timings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct GroupStats {
     /// The group's total frame count, before the min-weight drop.
     pub frames: usize,
+    /// How many frames were integrated, after the min-weight drop.
     pub included: usize,
+    /// How many frames the min-weight floor removed.
     pub dropped_below_min_weight: usize,
     /// `IntegrationRecipe::describe()` of the resolved recipe.
     pub recipe: String,
@@ -559,6 +647,7 @@ pub struct GroupStats {
     /// see `StackOutput`'s doc — NOT `base.rejected_fraction`'s, which
     /// counts algorithm rejections only).
     pub rejected_low_fraction: f64,
+    /// The same as `rejected_low_fraction` for samples rejected on the high side.
     pub rejected_high_fraction: f64,
     /// Per included frame (engine order), `Σ rejected / Σ samples` over
     /// every plane — the same range-plus-algorithm rejection the group
@@ -571,7 +660,9 @@ pub struct GroupStats {
     /// `measure::ADU_SCALE` internally, see `measure_plane`'s own code) —
     /// no further conversion happens here.
     pub master_noise: Vec<f64>,
+    /// The master's normalization location (median) per plane, in normalized units.
     pub master_location: Vec<f64>,
+    /// The master's two-sided scale per plane, in normalized units.
     pub master_scale: Vec<f64>,
     /// Per plane, of the included frame with the highest `weight.normalized_mean`.
     pub best_sub_noise: Vec<f64>,
@@ -582,18 +673,19 @@ pub struct GroupStats {
     /// on the set there (PD-19 b).
     ///
     /// These two are NOT a ratio pair, and nothing divides them to get [`GroupStats::snr_gain`] (that is
-    /// [`paired_snr_gain`], on the stars matched in BOTH crops): `master_psf_snr` is a sum over the stars the master
+    /// `paired_snr_gain`, on the stars matched in BOTH crops): `master_psf_snr` is a sum over the stars the master
     /// matched in its rectangle on a plane that has a set, and the whole-field figure (unmarked) on a plane that fell
     /// back or matched under 20; `best_sub_psf_snr` is the frame's own `psf_snr`, whose flux under the PSF family after D1w
     /// is the paired ratio `r_f` times the anchor's whole-set sum (the stars the frame lacks are extrapolated, not summed),
     /// or its Measure-time figure on a fallback. Under the PSF family they agree only where one set is whole in both images; outside
     /// the family they never agree (the best sub is Measure-time there, the master reads the set).
     pub master_psf_snr: Vec<f64>,
+    /// The best sub's own PSF SNR per plane (see `master_psf_snr`; dimensionless).
     pub best_sub_psf_snr: Vec<f64>,
     /// How many times the master's star SNR beats the best sub's, per
     /// plane — an SNR (amplitude) factor, `√(PSF SNR master / PSF SNR best
     /// sub)`, since PSF SNR is TFlux²/σ² (a power ratio). The two PSF SNRs
-    /// are a PAIRED measurement ([`paired_snr_gain`]): the best sub read
+    /// are a PAIRED measurement (`paired_snr_gain`): the best sub read
     /// through the same registration warp the master was built from, both
     /// measured with the same options on the same rectangle — a smoothing
     /// interpolation lowers a warped image's noise, so a raw sub against
@@ -604,7 +696,7 @@ pub struct GroupStats {
     /// and usable in BOTH images: a bright clipped star, or a wider PSF's
     /// extra flux, no longer moves the figure. Both sides also read on ONE
     /// aperture correction `c` (v2, Plan D D1 fix r4): a side at floor (i), which
-    /// has none, reads with the other side's ([`paired_c_stand_ins`]), warned.
+    /// has none, reads with the other side's (`paired_c_stand_ins`), warned.
     /// They are not
     /// `master_psf_snr` / `best_sub_psf_snr` above, which stay each image's
     /// own measurement. `0.0` (with a warn naming its reason) when the pair
@@ -620,14 +712,20 @@ pub struct GroupStats {
     /// metric; a `1` shows "—" too, "measured with an older formula".
     #[serde(default)]
     pub snr_gain_version: u32,
+    /// The master's star FWHM per plane, in pixels.
     pub master_fwhm_px: Vec<f64>,
+    /// The master's mean star eccentricity per plane (0 is round, towards 1 is elongated).
     pub master_eccentricity: Vec<f64>,
     /// `Σ exposure_i · weight_i` over included frames, `weight_i` the mean
     /// over planes of frame i's normalized weight (`FrameWeight::normalized_mean`).
     pub weighted_exposure_s: f64,
+    /// The summed exposure time of the included frames, in seconds.
     pub total_exposure_s: f64,
+    /// Time spent reading the frames, in milliseconds (summed over planes and passes).
     pub read_ms: u64,
+    /// Time spent combining samples, in milliseconds (summed over planes and passes).
     pub combine_ms: u64,
+    /// Bytes read from the frame files (summed over planes and passes).
     pub bytes_read: u64,
     /// Included frames integrated with an LN grid (M2 Task 7) — `0` when the
     /// caller passes no grids at all (`GroupInput.ln: None`: local
@@ -635,6 +733,8 @@ pub struct GroupStats {
     /// any), otherwise the count of included frames whose own `ln[i]` was
     /// `Some`.
     pub ln_frames: usize,
+    /// The share of all samples that large-scale rejection forced out before the second pass (a fraction, 0 to 1).
+    ///
     /// M4c Task 3: the fraction of all (frame, plane, pixel) samples the
     /// PROCESSED bitmaps forced out before the second pass's algorithm ran
     /// — `None` when large-scale rejection did not run for this group at
@@ -644,24 +744,37 @@ pub struct GroupStats {
     pub large_scale_rejected_fraction: Option<f64>,
 }
 
+/// The result of integrating one group: the master pixels, the optional rejection maps and the summary.
 #[derive(Debug)]
 pub struct GroupOutput {
+    /// Master width, in pixels.
     pub width: usize,
+    /// Master height, in pixels.
     pub height: usize,
+    /// The number of planes (1 for mono, 3 for colour).
     pub channels: usize,
     /// Planar, `channels × width × height`.
     pub data: Vec<f32>,
+    /// Per-pixel counts of low-side rejections, in the master's planar layout (`Some` when rejection maps were
+    /// requested).
     pub rejection_low: Option<Vec<f32>>,
+    /// Per-pixel counts of high-side rejections, in the master's planar layout (`Some` when rejection maps were
+    /// requested).
     pub rejection_high: Option<Vec<f32>>,
     /// Indices into the input `frames` that were integrated (after the min-weight drop), in engine order.
     pub included: Vec<usize>,
+    /// The group's integration summary.
     pub stats: GroupStats,
+    /// The output normalization (scale, offset) each included frame received, per plane.
+    ///
     /// M3 Task 2: per plane (outer, `channels` long), per included frame
     /// (inner, engine order — same order as `included`), the OUTPUT
     /// normalization pair `integrate_planes` computed for it (the same
     /// values it fed `StackParams::output`). Task 3's drizzle driver uses
     /// this as the ruling-R-M3-5 fallback pair for a frame with no LN grid.
     pub output_pairs: Vec<Vec<NormalizationPair>>,
+    /// Whether the large-scale second pass wrote a complete rejection-bitmap set of its own.
+    ///
     /// M4c Task 3, fix round 1 (ruling R-T3-1): the large-scale SECOND pass
     /// ran AND wrote a complete rejection-bitmap set of its own
     /// ([`RejBitmapSet::second_pass_path`]). `true` is the ONLY state in
@@ -686,9 +799,11 @@ pub struct GroupOutput {
     pub measure_rect: Option<crate::stacking::crop::CropRect>,
 }
 
+/// Progress callbacks of one group's integration.
 pub struct GroupProgress<'a> {
     /// `(plane_index, planes_total)` at the start of each plane.
     pub on_plane: &'a (dyn Fn(usize, usize) + Sync),
+    /// The weighted engine's own band-level progress callbacks.
     pub engine: EngineProgress<'a>,
 }
 
@@ -812,6 +927,7 @@ fn common_signals(
 
 /// The positions of the set inside an image of `size` whose origin in the grid is `origin`. A star outside the image
 /// is not asked for: a fit cut by the image's rim could otherwise answer for it.
+// doc(hidden): Athenaeum's run tests call it to derive a crop's star positions (`output_tests.rs`)
 #[doc(hidden)]
 pub fn positions_in_crop(
     positions: &[(f64, f64)],
@@ -833,6 +949,7 @@ pub fn positions_in_crop(
 /// channel's `noise`), so the master's figure and the best sub's `ChannelMeasurement::psf_snr` (the common-set value
 /// after D1w) are on one scale. Returns the figure and how many stars were matched; `Err(matched)` under
 /// [`COMMON_MIN_STARS`] of them.
+// doc(hidden): read by Athenaeum's run tests, which compare a master's figure with the best sub's
 #[doc(hidden)]
 pub fn common_psf_snr(
     fits: &[StarFit],
@@ -1279,6 +1396,8 @@ pub(crate) fn materialized_frame(frame: &StackFrame) -> MaterializedFrame {
 /// [`GroupOutput::output_pairs`] (Task 3's drizzle driver reads them back as
 /// its ruling-R-M3-5 fallback pair). No stats/accumulation/writing beyond
 /// that: the rest of the tail is the caller's job.
+///
+/// Runs on `pool`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn integrate_planes<'g>(
     input: &GroupInput<'_>,
@@ -1479,8 +1598,8 @@ pub(crate) fn integrate_planes<'g>(
     Ok((outputs, output_pairs_out))
 }
 
-/// The min-weight drop's DECISION (spec §6.2): a frame whose lowest
-/// per-channel normalized weight sits below `min_weight` never joins the
+/// Which frames join the stack once the min-weight floor is applied, the drop's DECISION (spec §6.2): a frame whose
+/// lowest per-channel normalized weight sits below `min_weight` never joins the
 /// stack; the reference is exempt (dropping it would leave nothing to
 /// normalize the rest against). Returns the included frame indices into
 /// `frames`, in `frames`' own order.
@@ -1491,7 +1610,6 @@ pub(crate) fn integrate_planes<'g>(
 /// must never disagree about which frames survive the floor, so this is the
 /// only place the rule itself is expressed; both callers pass identical
 /// inputs and get an identical answer, deterministically.
-#[doc(hidden)]
 pub fn included_after_min_weight(
     frames: &[StackFrame],
     reference: usize,
@@ -1512,7 +1630,7 @@ pub fn included_after_min_weight(
         .collect()
 }
 
-/// How many times [`integrate_planes`] runs for a group (M4c Task 3,
+/// How many integration passes a group makes: how many times `integrate_planes` runs for it (M4c Task 3,
 /// ruling R-M4c-4): twice when large-scale rejection is on AND the run
 /// created a rejection-bitmap set for the group to derive the structures
 /// from (without one there is nothing to filter), once otherwise.
@@ -1521,7 +1639,6 @@ pub fn included_after_min_weight(
 /// size the Integrate stage's own progress space before `integrate_group`
 /// runs, so the two can never disagree about how many plane-slots a group's
 /// integration will report.
-#[doc(hidden)]
 pub fn large_scale_passes(integration: &IntegrationConfig, has_rej: bool) -> usize {
     if integration.large_scale.enabled && has_rej {
         2
@@ -1586,6 +1703,8 @@ fn build_forced_source(
 /// rejection/output normalization pairs from the reference frame's
 /// measurement, and runs the weighted engine once per plane through a
 /// `RegisteredSource`. `frames.len() ≥ 3` after the drop, or this refuses.
+///
+/// Runs on `pool`.
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_group(
     input: &GroupInput<'_>,

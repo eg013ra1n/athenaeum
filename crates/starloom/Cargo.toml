@@ -25,8 +25,8 @@ byteorder = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
-# The pass-1 artifact's wire encoding.
-postcard = { version = "1", features = ["use-std"] }
+# The pass-1 artifact's wire encoding (the `stack` layer only).
+postcard = { version = "1", features = ["use-std"], optional = true }
 
 # The platform memory probe (`sys::platform_memory`): GlobalMemoryStatusEx and the job-object limits.
 [target.'cfg(windows)'.dependencies]
@@ -37,7 +37,7 @@ default = ["stack", "ts"]
 # Layer 2: needs the rustafits image pipeline (integration, light calibration, cosmetic correction).
 engine = ["dep:rustafits"]
 # Layer 3: registration, measurement, rejection, drizzle, weighting. Needs the quad matcher.
-stack = ["engine", "dep:solvemyastro"]
+stack = ["engine", "dep:solvemyastro", "dep:postcard"]
 # ts-rs derives (the TypeScript types the app generates).
 ts = ["dep:ts-rs"]
 # Test hooks and fixtures that tests in dependent crates read (SL-17); never in default.
@@ -47,6 +47,9 @@ test-support = []
 unexpected_cfgs = "deny"
 
 [dev-dependencies]
+# The integration tests read the SL-17 test hooks. A path dev-dependency on the crate itself is allowed (publishing
+# strips it).
+starloom = { path = ".", default-features = false, features = ["test-support"] }
 rustafits = { path = "../../rustafits", default-features = false, features = ["serde", "test-support"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

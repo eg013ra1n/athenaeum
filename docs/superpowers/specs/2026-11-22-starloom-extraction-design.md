@@ -514,7 +514,7 @@ Acceptance: `run` makes a master from raw frames of one corpus set in the lab, a
 | ---- | ---- | ---- |
 | serde attribute or feature drift changes hash bytes | every user's cache | §5 pinned tests unedited; the `preserve_order` guard |
 | `env!` evaluated inside starloom | XISF `CREATOR` bytes | creator parameter; grep in P0-2 |
-| headless builds pull rustafits | Perseus, MCP, GitLab guard | layered features; `cargo tree` check in P0-1 |
+| headless builds pull rustafits | Perseus, MCP, GitLab guard | layered features; `cargo tree` check in P0-1. `solver` without `render` pulls rustafits through solvemyastro itself (`solvemyastro/Cargo.toml:28`), so that combination was never rustafits-free; it is accepted, and only `--no-default-features` is guarded |
 | test hooks compiled into probe builds | lab timing | §4.9 per-pixel check |
 | a shim drifts from starloom's entry point | examples and the app read the gain or RAM differently | shims are thin wrappers that only read and forward; §6 runs through the shims |
 | tracing target rename | lab parsers, log-MCP filters, the in-app calibration switch, target-filtered test captures | P0-7 in the same cycle |

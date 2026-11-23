@@ -33,7 +33,7 @@ one file per stage, each with its tests beside it in `<file>_tests.rs` (a child 
 | `frames.rs` | the frame rows, the exclusion of a frame that changed during the run, the frame-level file names |
 | `tests.rs` | the rig every stage's tests use, and the tests of a run as a whole |
 
-**Where the kernel lives** (2026-11-22, starloom phase 0): the run above is the Athenaeum half and stays in `crates/athenaeum-core/src/stacking/run/`; every stage calls the kernel in `crates/starloom/src/` (`stacking/{measure,register,ln,drizzle,integrate,rej,weights,config,common_set,psf_signal,structure,prefilter,pass1_artifact,crop,groups}`, `integration/`, `geometry/`, `resample/`, `calibration_library/{light_cal,cosmetic}`, `fits_writer/` writer core), which core re-exports at the old `crate::stacking::…` / `crate::integration::…` paths. Path names in the history sections below are the old core ones: read `stacking/X` as `crates/starloom/src/stacking/X` when X is a kernel file.
+**Where the kernel lives** (2026-11-22, starloom phase 0): the run above is the Athenaeum half and stays in `crates/athenaeum-core/src/stacking/run/`; every stage calls the kernel in `crates/starloom/src/` (`stacking/{measure,register,ln,drizzle,integrate,rej,weights,config,common_set,psf_signal,structure,prefilter,pass1_artifact,crop,groups}`, `integration/`, `geometry/`, `resample/`, `calibration_library/{light_cal,cosmetic}`, `fits_writer/` writer core), which core re-exports at the old `crate::stacking::…` / `crate::integration::…` paths; a shim that adds an Athenaeum fact re-exports the rest of starloom's module by name, never by glob (`crates/athenaeum-core/tests/starloom_shims.rs` pins it), and `crates/starloom/tests/stage_goldens.rs` ties each stage's output bytes to its version. Path names in the history sections below are the old core ones: read `stacking/X` as `crates/starloom/src/stacking/X` when X is a kernel file.
 
 A type nearly every stage reads (`RunContext`, `MeasuredFrame`) stays in `mod.rs` with its fields private; an item, a
 field or a method one stage owns and a neighbour reads is `pub(super)`. The funnel test in `origin.rs` scans every production file of the folder, so a new file needs no entry.
@@ -5400,7 +5400,7 @@ every frame by hash (172 GB of calibrated files written, pass 1 and pass 2 re-ru
   copied or deleted: the only write is one `BEGIN IMMEDIATE` transaction of path updates, and the old folder is left as it was.
   A working or output folder may sit on a network share that refuses a full sync (SMB: `fcntl(F_FULLFSYNC)` answers `ENOTSUP`, which is
   what `File::sync_all` asks for on macOS): every writer of the FITS/XISF/`.athln` family and the header patchers flush through
-  `zip_store::fs::sync_best_effort`, which falls back to a plain `fsync` and, failing that, leaves the file to the file system, one `debug!`
+  `starloom::fs_util::sync_best_effort` (re-exported as `zip_store::fs::sync_best_effort`), which falls back to a plain `fsync` and, failing that, leaves the file to the file system, one `debug!`
   each; any other sync error (EIO, ENOSPC) is still an error. Found on the first real-share acceptance, when the LN reference was never written.
   Who does it: the run's trigger (`rebase_working_rows`) rebases once at the top of stage 1, before the inputs are sampled; the plan gate and
   Blink write nothing and read through `rebase::RebaseView` instead (candidates read under their connection and judged with the same

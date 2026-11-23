@@ -6,9 +6,13 @@
 
 use super::storage_class::StorageClass;
 
+/// The two I/O settings of an integration run: the memory one band may use and the number of reads kept in flight,
+/// with the storage class they were derived from.
 #[derive(Clone, Copy, Debug)]
 pub struct IoPolicy {
+    /// The most memory the band buffers may use, in bytes, across all frames of the set.
     pub band_budget_bytes: usize,
+    /// The number of frame reads kept in flight at once (a count of reads, not of threads of the rayon pool).
     pub read_concurrency: usize,
     /// Reported in the build's log line so a later measurement on a NAS or an
     /// SSD can be read against the policy that produced it.

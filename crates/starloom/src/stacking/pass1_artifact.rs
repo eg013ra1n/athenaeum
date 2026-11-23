@@ -4,14 +4,14 @@
 //! by pass 2 and by every later run whose key and source stamp still match. A second pass over the same pixels then
 //! costs a read and the fits, never the detection and the verdict pass again.
 //!
-//! Layout (all integers little-endian), in the style of the `.athf` file ([`super::fits_artifact`]):
+//! Layout (all integers little-endian), in the style of the `.athf` file (`super::fits_artifact`):
 //!
 //! ```text
 //! b"ATHM" | u16 PASS1_ARTIFACT_VERSION | u32 MEASURE_VERSION | u32 head length | u64 xxh3(head) | head
 //!         | u64 body length | body | u64 xxh3(every byte before this one)
 //! ```
 //!
-//! The head ([`Pass1Head`]: the source stamp, the geometry, every plane's own beta) and the body ([`Pass1Body`]: the
+//! The head ([`Pass1Head`]: the source stamp, the geometry, every plane's own beta) and the body (`Pass1Body`: the
 //! per-plane `PlanePrep` records and the timings) are postcard. postcard writes every f64 as eight raw bytes, so NaN,
 //! +-inf and every value round-trip exactly (JSON would refuse the first two, which the records do hold:
 //! `SaturationPlane::UNTESTED`, `top3x3 = -inf`, a failed verdict's NaNs). postcard is not self-describing: a layout
@@ -21,6 +21,9 @@
 //! [`PASS1_ARTIFACT_VERSION`] versions the bytes, `MEASURE_VERSION` the numbers (it is in the measurement subtree, so
 //! in the key, and in the header as a loud second check). A refused decode is a typed error the caller logs; the
 //! caller re-runs pass 1, never mis-decodes.
+//!
+//! The extension `.athm` and the `ATHM` magic are historical names, kept so that artifacts already on disk keep
+//! reading; they are not renamed.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -35,6 +38,7 @@ pub const PASS1_ARTIFACT_VERSION: u16 = 1;
 
 const MAGIC: [u8; 4] = *b"ATHM";
 /// Magic, version, measure version, head length, head checksum.
+// doc(hidden): Athenaeum's measure tests flip a byte past it; the format is documented in P2-3
 #[doc(hidden)]
 pub const PREFIX_LEN: usize = 4 + 2 + 4 + 4 + 8;
 /// The head is a few dozen bytes; a declared length past this is a damaged file, not a head.
@@ -43,33 +47,45 @@ const MAX_HEAD_LEN: usize = 1 << 20;
 /// The calibrated file's identity at pass 1's first plane read (the read guard's identity, stored): its size and its
 /// modification time as signed nanoseconds since the Unix epoch (`None` where the filesystem has none). Validity
 /// follows the calibration hash in the artifact's key (frame-level cache spec §5.3); on a read only `len` is compared
-/// for a file Athenaeum writes (so a recalibration that reproduces the pixels, a new file with a new mtime, keeps the
-/// first pass), and `modified_ns` too for any other file (an attested light used in place: ruling R12 (a)).
+/// for a file the caller writes itself (so a recalibration that reproduces the pixels, a new file with a new mtime,
+/// keeps the first pass), and `modified_ns` too for any other file (an attested light used in place: ruling R12 (a)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceStamp {
+    /// The file's size, in bytes.
     pub len: u64,
+    /// The file's modification time, in signed nanoseconds since the Unix epoch; `None` where the filesystem has none.
     pub modified_ns: Option<i128>,
 }
 
 /// What the controller reads without the body: the stamp, the geometry and every plane's own beta.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pass1Head {
+    /// The calibrated file's identity when pass 1 first read it; `None` when no stamp was taken.
     pub source: Option<SourceStamp>,
+    /// Frame width, in pixels.
     pub width: u32,
+    /// Frame height, in pixels.
     pub height: u32,
+    /// Each plane's own Moffat beta (dimensionless), one entry per plane.
     pub beta_own: Vec<f64>,
 }
 
 /// Why a first-pass artifact is not usable. Every arm is a re-run of pass 1 at the call site, never a measurement.
 #[derive(Debug)]
 pub enum Pass1ArtifactError {
+    /// The file does not start with the artifact's magic: it is not a first-pass artifact.
     BadMagic {
+        /// The four bytes found where the magic belongs.
         found: [u8; 4],
     },
+    /// The artifact was written by another `PASS1_ARTIFACT_VERSION` than this build reads.
     BadVersion {
+        /// The version stored in the file.
         found: u16,
     },
+    /// The artifact was measured at another star-fit version (`MEASURE_VERSION`) than this build's.
     BadMeasureVersion {
+        /// The measure version stored in the file.
         found: u32,
     },
     /// A stored checksum (the head's or the whole file's) does not match its bytes.
@@ -78,12 +94,16 @@ pub enum Pass1ArtifactError {
     Truncated(String),
     /// The head describes a different frame geometry or plane count than the calibrated file has now.
     Mismatch(String),
+    /// The head or body bytes do not decode as the expected records.
     Decode(postcard::Error),
     /// The calibrated file is not the one the first pass read.
     Stale {
+        /// The identity stored in the artifact.
         stored: Option<SourceStamp>,
+        /// The calibrated file's identity now.
         now: Option<SourceStamp>,
     },
+    /// Reading or writing the file failed.
     Io(std::io::Error),
 }
 
@@ -234,7 +254,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Pass1Head, Pass1Body), Pass1Artifa
     Ok((head, body))
 }
 
-/// Writes `pass1` to `path` as `.athf` is written ([`super::fits_artifact::write_fits`]): the bytes to a temporary
+/// Writes `pass1` to `path` as `.athf` is written (`super::fits_artifact::write_fits`): the bytes to a temporary
 /// file beside it, then [`crate::fits_writer::writer::rename_replace`] (no fsync: a write a crash loses or truncates
 /// reads back as a refused artifact, never a wrong answer). The records are serialised through a borrowed view, never
 /// cloned. Returns the bytes written.
@@ -293,7 +313,7 @@ pub fn read_pass1_head(path: &Path) -> Result<Pass1Head, Pass1ArtifactError> {
 }
 
 /// The whole record: the checksum, the stamp's length against `calibrated` now ([`Pass1ArtifactError::Stale`]), the
-/// heads rebuilt from `opts` ([`FramePass1::from_record`]).
+/// heads rebuilt from `opts` (`FramePass1::from_record`).
 pub fn read_pass1(
     path: &Path,
     calibrated: &Path,

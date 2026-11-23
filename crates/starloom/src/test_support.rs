@@ -1,4 +1,4 @@
-//! Field and photometry helpers for tests (moved from Athenaeum core's `test_support`; core keeps its own whole copy).
+//! Field and photometry helpers for tests: synthetic star fields, noise, centroids and log captures.
 //! The synthetic star field and the log captures (the captures are `cfg(test)` only: they need `tracing-subscriber`,
 //! a dev-dependency).
 
@@ -121,11 +121,17 @@ pub fn add_noise(data: &mut [f32], sigma: f32, seed: u64) {
 /// One elliptical Moffat star for [`moffat_field`].
 #[derive(Clone, Copy, Debug)]
 pub struct MoffatStar {
+    /// Star centre, x, in pixels.
     pub x: f64,
+    /// Star centre, y, in pixels.
     pub y: f64,
+    /// Peak height above the background, in the plane's units.
     pub amp: f64,
+    /// Moffat core radius along the star's own x axis, in pixels.
     pub alpha_x: f64,
+    /// Moffat core radius along the star's own y axis, in pixels.
     pub alpha_y: f64,
+    /// Rotation of the star's axes, in radians.
     pub theta: f64,
 }
 
@@ -165,8 +171,18 @@ pub fn moffat_field(
 #[cfg(feature = "engine")]
 #[derive(Clone, Copy, Debug)]
 pub enum IntegratedProfile {
-    Moffat { fwhm: f64, beta: f64 },
-    Gaussian { fwhm: f64 },
+    /// A round Moffat star.
+    Moffat {
+        /// Full width at half maximum, in pixels.
+        fwhm: f64,
+        /// The Moffat exponent (dimensionless; larger is closer to a Gaussian).
+        beta: f64
+    },
+    /// A round Gaussian star.
+    Gaussian {
+        /// Full width at half maximum, in pixels.
+        fwhm: f64
+    },
 }
 
 #[cfg(feature = "engine")]
@@ -204,7 +220,8 @@ impl IntegratedProfile {
 /// light it COLLECTS: the mean of the profile over `sub × sub` midpoint sub-samples of the pixel (offsets
 /// `(i + 0.5)/sub − 0.5` px), where [`moffat_field`] and [`gaussian_field`] sample the profile at the pixel centre.
 /// Each star is rendered out to `max(6·FWHM, 6) + 2` px — beyond the largest region the fitter grows (6·`F_start`,
-/// at least 6 px) — and its wings past that are dropped. Pixel centres at integer coordinates; rows in parallel.
+/// at least 6 px) — and its wings past that are dropped. Pixel centres at integer coordinates; rows run in parallel on
+/// the caller's current rayon pool.
 #[cfg(feature = "engine")]
 pub fn integrated_field(
     w: usize,
@@ -457,7 +474,7 @@ pub fn captured_logs(f: impl FnOnce()) -> String {
     capture_logs(f).1
 }
 
-/// No fixture may seed a raw `canonicalize()` result (a copy of Athenaeum core's guard, walking this crate's `src`).
+/// No fixture may seed a raw `canonicalize()` result (the guard walks this crate's `src`).
 ///
 /// On Windows `canonicalize` returns a `\\?\` verbatim path, which neither compares equal to the spelling a catalog
 /// stores nor accepts a forward slash as a separator. Deliberately narrow: it walks only `crates/starloom/src` and

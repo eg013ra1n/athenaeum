@@ -11,6 +11,9 @@ use std::sync::OnceLock;
 // The memory probe moved to `starloom::sys`; these two parsers keep their old path for `integration::band_budget`'s tests.
 #[cfg(test)]
 pub(crate) use starloom::sys::{linux_total_ram_from, parse_cgroup_limit};
+// The `/proc` line parser is starloom's too; core reads it on Linux and in the parser tests.
+#[cfg(any(target_os = "linux", test))]
+use starloom::sys::parse_kb_field;
 
 /// The static facts about the machine. `Option` fields are `None` when the
 /// platform cannot say (non-hybrid x86 has no P / E split; no cgroup quota).
@@ -31,11 +34,7 @@ pub struct MachineProfile {
 impl MachineProfile {
     /// Memory this process may actually use: the limit when set, else physical.
     pub fn effective_mem(&self) -> Option<u64> {
-        match (self.mem_total, self.mem_limit) {
-            (Some(t), Some(l)) => Some(t.min(l)),
-            (Some(t), None) => Some(t),
-            (None, l) => l,
-        }
+        starloom::sys::effective_memory(self.mem_total, self.mem_limit)
     }
 }
 
@@ -67,11 +66,7 @@ fn probe_profile() -> MachineProfile {
     let (perf_cores, eff_cores) = platform_core_split();
     let cpu_quota = platform_cpu_quota(logical_cpus);
     let (mem_total, mem_limit) = starloom::sys::platform_memory();
-    let mem_limit = match (mem_total, mem_limit) {
-        (Some(t), Some(l)) if l < t => Some(l),
-        (None, Some(l)) => Some(l),
-        _ => None,
-    };
+    let mem_limit = starloom::sys::binding_limit(mem_total, mem_limit);
     MachineProfile {
         logical_cpus,
         perf_cores,
@@ -206,18 +201,6 @@ fn warn_once(flag: &std::sync::atomic::AtomicBool, f: impl FnOnce()) {
     if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
         f();
     }
-}
-
-/// One `Key:   123 kB` line of `/proc/meminfo` or `/proc/self/status`, in bytes.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-pub(crate) fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix(key) {
-            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-            return Some(kb.saturating_mul(1024));
-        }
-    }
-    None
 }
 
 /// `/proc/self/io` -> (read_bytes, write_bytes).

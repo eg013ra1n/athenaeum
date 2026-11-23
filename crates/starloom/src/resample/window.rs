@@ -6,14 +6,18 @@
 
 use crate::geometry::InverseMap;
 
+/// The source rows a band of output rows reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceWindow {
     /// Source rows `[y0, y1)`; empty (`y0 == y1`) when the band maps
     /// entirely outside the source.
     Rows {
+        /// The first source row (inclusive).
         y0: usize,
+        /// The end of the span: one past the last source row.
         y1: usize,
     },
+    /// Every source row: the band's span is so long a window would save nothing.
     Whole,
 }
 

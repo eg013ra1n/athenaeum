@@ -2,6 +2,8 @@
 //! replaces the O(N·M) scan in frame-to-frame correspondence. Built once
 //! per reference star list (≤ a few thousand points); queries are O(log n).
 
+/// A static 2-D KD-tree over a fixed list of points (a frame's star positions, in pixels), for nearest-neighbour
+/// searches within a radius.
 pub struct KdTree2 {
     /// Points in tree order; `idx[i]` is the original index of `pts[i]`.
     pts: Vec<(f64, f64)>,
@@ -9,6 +11,7 @@ pub struct KdTree2 {
 }
 
 impl KdTree2 {
+    /// Builds the tree from `points` (pixel coordinates); a query returns indices into this same slice.
     pub fn build(points: &[(f64, f64)]) -> KdTree2 {
         let mut idx: Vec<usize> = (0..points.len()).collect();
         let mut pts: Vec<(f64, f64)> = points.to_vec();
@@ -16,10 +19,12 @@ impl KdTree2 {
         KdTree2 { pts, idx }
     }
 
+    /// The number of points in the tree.
     pub fn len(&self) -> usize {
         self.pts.len()
     }
 
+    /// Whether the tree holds no points.
     pub fn is_empty(&self) -> bool {
         self.pts.is_empty()
     }

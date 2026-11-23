@@ -8,11 +8,18 @@
 use crate::integration::stats::median_in_place;
 use crate::stacking::integrate::LnAperture;
 
+/// Inner radius of the sky annulus, in units of the common FWHM (so `6 × F` pixels).
 pub const SKY_INNER_FWHM: f64 = 6.0;
+/// Outer radius of the sky annulus, in units of the common FWHM (so `8 × F` pixels).
 pub const SKY_OUTER_FWHM: f64 = 8.0;
+/// Radius of the growth-curve outer circle, in units of the common FWHM (so `5 × F` pixels).
 pub const GROWTH_OUTER_FWHM: f64 = 5.0;
+/// Most pairs the growth-curve correction is taken over: the first 100 pairs whose outer circle is valid on
+/// both frames.
 pub const GROWTH_PAIRS: usize = 100;
 
+/// The photometry circle radius, in units of the common FWHM, for an aperture setting: 2 for `Fwhm2` and
+/// `GrowthCurve` (which measures at 2 and corrects to 5), 3 for `Fwhm3`.
 pub fn aperture_multiple(a: LnAperture) -> f64 {
     match a {
         LnAperture::Fwhm2 | LnAperture::GrowthCurve => 2.0,
@@ -29,16 +36,20 @@ pub struct FiniteMask {
 }
 
 impl FiniteMask {
+    /// The mask of a plane: set where the pixel is finite (not NaN, not infinite). `plane` is row-major,
+    /// `width × height` pixels.
     pub fn from_plane(plane: &[f32], width: usize, height: usize) -> FiniteMask {
         debug_assert_eq!(plane.len(), width * height);
         Self::from_fn(width, height, |k| plane[k].is_finite())
     }
 
+    /// The mask from an explicit per-pixel flag list (`true` = data), row-major, `width × height` pixels.
     pub fn from_bools(mask: &[bool], width: usize, height: usize) -> FiniteMask {
         debug_assert_eq!(mask.len(), width * height);
         Self::from_fn(width, height, |k| mask[k])
     }
 
+    /// A mask with every pixel of a `width × height` plane set (no gaps).
     pub fn all(width: usize, height: usize) -> FiniteMask {
         Self::from_fn(width, height, |_| true)
     }
@@ -60,10 +71,12 @@ impl FiniteMask {
         }
     }
 
+    /// Plane width in pixels.
     pub fn width(&self) -> usize {
         self.width
     }
 
+    /// Plane height in pixels.
     pub fn height(&self) -> usize {
         self.height
     }
@@ -81,7 +94,9 @@ impl FiniteMask {
 /// One frame's plane (values are read where `present` is set) and its mask.
 #[derive(Clone, Copy)]
 pub struct ApertureSide<'a> {
+    /// The frame's plane, row-major, in normalized units.
     pub plane: &'a [f32],
+    /// Which pixels of `plane` are data; a pixel outside it is never read.
     pub present: &'a FiniteMask,
 }
 

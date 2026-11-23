@@ -24,10 +24,10 @@
 //! covered fewer than [`LN_BARYCENTRE_PASS_THRESHOLD`] of the TARGET's own
 //! accepted fits, the same nearest-within query runs again over the
 //! DETECTION barycentres each fit came from and the larger of the two
-//! pairings wins ([`choose_pairing`]) — and an optional LOCAL SCALE model:
+//! pairings wins (`choose_pairing`) — and an optional LOCAL SCALE model:
 //! with `normalization.local.localScale` on, the surviving ratios'
 //! residuals `z_k − s` are fitted with an approximating thin-plate spline
-//! ([`fit_local_scale`]) that `ln::normalize_frame` samples on the stride
+//! (`fit_local_scale`) that `ln::normalize_frame` samples on the stride
 //! grid as `A(x, y) = s + spline(x, y)`.
 
 use std::borrow::Cow;
@@ -78,6 +78,9 @@ pub fn ln_fit_options(allowed: Option<&[bool]>) -> FitStarsOptions<'_> {
     }
 }
 
+/// Which ring geometry the star-flux fits read their sky and aperture correction at: each plane's own FWHM or
+/// the pair's common one.
+///
 /// Plan A Task 10b, ruling B3: the ring geometry of LN's two fits — the ring
 /// width `F` at which each side's ring sky B_i (`[10F, 12F]` outside every
 /// seed's `3F` disc) and its aperture correction `c` (growth radius `5F`)
@@ -194,13 +197,18 @@ fn ring_matched_reference<'p>(
 /// this is logged with a `warn!` (the value itself is never changed).
 const GROWTH_PAIRS_WARN_BELOW: usize = 5;
 
+/// Share (0 to 1) of the target's accepted fits a first pairing must cover to avoid the second, barycentre
+/// pass (0.8).
+///
 /// Ruling R-M4c-9: a pass-1 pairing covering less than this FRACTION of
 /// the TARGET plane's own accepted fits triggers the barycentre second
 /// pass. `0.8` is math §4.3 step 2's "a second pass using barycentres runs
 /// when < 80 % matched"; the denominator is the target's, not the
-/// reference's — see [`choose_pairing`] and review finding R-T5-2.
+/// reference's — see `choose_pairing` and review finding R-T5-2.
 pub const LN_BARYCENTRE_PASS_THRESHOLD: f64 = 0.8;
 
+/// Fewest distinct reference stars (40) that must survive the robust fit for a local scale to be fitted.
+///
 /// Ruling R-M4c-8: fewer DISTINCT reference stars than this among the
 /// pairs surviving RCR and no local scale spline is fitted at all — `A`
 /// stays the constant RCR location and the frame is logged as such. A
@@ -210,6 +218,8 @@ pub const LN_BARYCENTRE_PASS_THRESHOLD: f64 = 0.8;
 /// happened to claim the same few stars.
 pub const LN_LOCAL_SCALE_MIN_STARS: usize = 40;
 
+/// Smoothing weight of the local-scale spline, in units of the ratio sample's robust dispersion (5 sigma).
+///
 /// Ruling R-M4c-8 / math §4.3 step 5: the local-scale spline's smoothing
 /// `λ` is this many RCR dispersions of the ratio sample (`5·σ_z`). A scale
 /// field is smooth by physics — it is a flat-field residual — so a `λ`
@@ -220,11 +230,13 @@ pub const LN_LOCAL_SCALE_MIN_STARS: usize = 40;
 /// they carry.
 pub const LN_LOCAL_SCALE_SMOOTHING_SIGMAS: f64 = 5.0;
 
+/// Wall time inside each phase of one relative-scale call, in milliseconds.
+///
 /// Perf tier A Task 0 (audit §3.1): wall time (ms) inside each phase of one
-/// [`relative_scale_against`] call — `detect_ms` ([`detect_seeds`] on the
-/// TARGET), `fit_ms` ([`psf_signal::fit_stars_with_beta`] on the target),
-/// `match_ms` (pairing — [`choose_pairing`]/[`measured_sample`] — plus RCR and,
-/// when asked for, [`fit_local_scale`], all together). `refine_ms` is
+/// [`relative_scale_against`] call — `detect_ms` (`detect_seeds` on the
+/// TARGET), `fit_ms` (`psf_signal::fit_stars_with_beta` on the target),
+/// `match_ms` (pairing — `choose_pairing`/`measured_sample` — plus RCR and,
+/// when asked for, `fit_local_scale`, all together). `refine_ms` is
 /// reserved for the centroid-refine LM step Task 3 splits out of
 /// `detect_seeds`'s own detector call; it stays `0` until then. The four
 /// never exceed the caller's own wall-clock measurement of the whole call —
@@ -233,9 +245,14 @@ pub const LN_LOCAL_SCALE_SMOOTHING_SIGMAS: f64 = 5.0;
 /// `MIN_MATCHES` check).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScaleTimings {
+    /// Wall time spent detecting seed stars on the target, in milliseconds.
     pub detect_ms: u64,
+    /// Reserved for the centroid-refine step; `0` for now (milliseconds).
     pub refine_ms: u64,
+    /// Wall time spent fitting the target's stars, in milliseconds.
     pub fit_ms: u64,
+    /// Wall time spent pairing stars, running the robust ratio fit and (when asked) the local scale fit, in
+    /// milliseconds.
     pub match_ms: u64,
 }
 
@@ -244,12 +261,15 @@ pub struct ScaleTimings {
 /// by `normalize_frame` (the reference side from the group's, or on a
 /// project member the restricted, background model — P-7).
 pub struct ScaleInputs<'a> {
+    /// The star selection: relative saturation, peak signal-to-noise cut and star cap.
     pub selection: LnStarSelection,
     /// Which flux the ratios use (spec 2026-10-04 §4.1).
     pub estimator: LnFluxEstimator,
     /// The common aperture's circle; read only under `CommonAperture`.
     pub aperture: LnAperture,
+    /// The reference side: its plane, size and background noise.
     pub reference: SelectionSide<'a>,
+    /// The target side: this frame's plane, size and background noise.
     pub target: SelectionSide<'a>,
     /// Which reference pixels are data (P-8): the raw plane's finite pixels,
     /// or on a project member the member's overlap. Read only under
@@ -260,6 +280,8 @@ pub struct ScaleInputs<'a> {
     pub target_present: &'a FiniteMask,
 }
 
+/// One frame channel's relative scale against the LN reference: the robust global ratio of matched star
+/// fluxes, the sample it came from, and optional local-scale and aperture diagnostics.
 #[derive(Debug, Clone)]
 pub struct ScaleResult {
     /// RCR location of the matched flux ratios — the global relative scale.
@@ -277,6 +299,8 @@ pub struct ScaleResult {
     pub selected: usize,
     /// Which selection rule produced the sample (`ln_selection`, P-15).
     pub selection: SelectionRule,
+    /// Pairs dropped only by the reference-frames saturation mask.
+    ///
     /// L-23: pairs only the reference-frames saturation mask dropped (they
     /// passed both planes' own test) — `ln_ref_frames_saturated`.
     pub ref_frames_saturated: usize,
@@ -295,7 +319,7 @@ pub struct ScaleResult {
     /// surface is the
     /// RESIDUAL around [`Self::scale`]: `A(x, y) = scale +
     /// local.displacement(x, y).0` (the y channel is fitted on zeros and
-    /// carries nothing — see [`fit_local_scale`]).
+    /// carries nothing — see `fit_local_scale`).
     pub local: Option<ThinPlateSpline>,
     /// The common aperture's radius in pixels (`a · common_fwhm_px`); `None`
     /// under PSF signal.
@@ -306,20 +330,29 @@ pub struct ScaleResult {
     /// The growth-curve correction `c` multiplied into every ratio; `Some`
     /// only for `LnAperture::GrowthCurve` (1.0 when no pair qualified, P-10).
     pub growth_factor: Option<f64>,
+    /// How many pairs the growth-curve correction was taken over (log only).
+    ///
     /// Final review I-2, log-only: how many pairs the growth curve's median
     /// `c` was taken over (up to `aperture::GROWTH_PAIRS`); `Some` exactly
     /// when `growth_factor` is. It moves no scale and no hash.
     pub growth_pairs: Option<usize>,
+    /// The target plane's aperture correction `c` (unitless), kept for the run summary.
+    ///
     /// Plan B B0 (PB-2), kept for the run summary: the TARGET plane's aperture correction `c` as the ring geometry of
     /// this call left it (`FitOutcome::aperture_correction`, measured under both flux estimators). `None` when the
     /// target plane measured none (floor (i): fewer than 5 ratios, `c = 1` was applied). It moves no scale and no hash.
     pub target_aperture_correction: Option<f64>,
+    /// How crowded the sky annulus was: the share (0 to 1) of present annulus pixels above the annulus median
+    /// plus 3 sigma (log only).
+    ///
     /// Spec §10 / L-26, log-only: the median over the ratio's pairs of the
     /// larger of the two sides' fractions of present sky-annulus pixels above
     /// the annulus median + 3 sigma. `Some` exactly when `aperture_px` is;
     /// `Some(NaN)` when no pair had a usable sigma on both sides. It moves
     /// no scale and no hash.
     pub annulus_crowding: Option<f64>,
+    /// Where this call's wall time went.
+    ///
     /// Perf tier A Task 0: where this call's own wall time went — see
     /// [`ScaleTimings`]'s own doc.
     pub timings: ScaleTimings,
@@ -887,7 +920,7 @@ fn log_relative_scale(e: &RelativeScaleLog) {
 /// Diagnostic-only match record (Tier C Task 2 diagnostics round, ruling
 /// C-11) — never read by `normalize_frame` or any other production caller.
 /// One entry per pair `measured_sample` kept (`flux_ref > 0 && flux_tgt >
-/// 0`), in the pairing's own order — exactly [`RatioSample`]'s own rows,
+/// 0`), in the pairing's own order — exactly `RatioSample`'s own rows,
 /// plus the matching [`crate::stacking::robust::RcrResult::kept`] flag.
 #[derive(Debug, Clone, Copy)]
 pub struct ScaleMatchDiag {
@@ -898,6 +931,7 @@ pub struct ScaleMatchDiag {
     /// index equality is not guaranteed even when the physical star is the
     /// same one).
     pub ref_x: f64,
+    /// The reference star's centroid row in the reference plane, in pixels.
     pub ref_y: f64,
     /// The reference fit's own `signal` (background-subtracted flux) — a
     /// stand-in for the star's brightness, for flux-decile binning.
@@ -1099,6 +1133,8 @@ impl PreparedReferenceChannel {
     /// The masked preparation (plan 6b-3 D6): the reference's own seeds are
     /// kept only where `allowed` holds (the coverage eroded by the PSF fit
     /// region), so no reference star is fitted across the coverage edge.
+    ///
+    /// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
     pub fn build_masked(
         reference: &[f32],
         width: usize,
@@ -1126,8 +1162,10 @@ impl PreparedReferenceChannel {
     /// product keeps the per-side default until the joint cycle's decision):
     /// the channel keeps a copy of `reference`, its seeds and `allowed`, and
     /// every scale call against it reads both sides' ring skies and aperture
-    /// corrections at `max(F_R, F_T)` ([`RingGeometry`]). The fits are the
+    /// corrections at `max(F_R, F_T)` (`RingGeometry`). The fits are the
     /// per-side build's.
+    ///
+    /// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
     #[allow(clippy::too_many_arguments)]
     pub fn build_pair_common(
         reference: &[f32],
@@ -1239,7 +1277,7 @@ impl PreparedReferenceChannel {
 /// straight into the scale.
 ///
 /// The TARGET always fits at the reference's OWN resolved β
-/// ([`psf_signal::fit_stars_with_beta`], never a second, independent
+/// (`psf_signal::fit_stars_with_beta`, never a second, independent
 /// `Auto` search) — because β changes the FWTM-enclosed flux fraction
 /// (math §1.4), fitting the two planes at two different β values would
 /// bias the ratio systematically even though `signal` itself is
@@ -1253,9 +1291,11 @@ impl PreparedReferenceChannel {
 ///
 /// `local_scale` is `normalization.local.localScale`: with it on, the
 /// returned [`ScaleResult::local`] carries the local scale spline of
-/// ruling R-M4c-8 (when enough pairs survived — see [`fit_local_scale`]);
+/// ruling R-M4c-8 (when enough pairs survived — see `fit_local_scale`);
 /// with it off that field is `None` and every number this function returns
 /// is what M2/M3/M4a produced, unchanged.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_against(
     prepared: &PreparedReferenceChannel,
@@ -1287,6 +1327,8 @@ pub fn relative_scale_against(
 
 /// [`relative_scale_against`] fitted on `allowed` only (plan 6b-3 D6): the
 /// target's seeds outside it are dropped before they are fitted.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_against_masked(
     prepared: &PreparedReferenceChannel,
@@ -1319,11 +1361,13 @@ pub fn relative_scale_against_masked(
 
 /// Diagnostic-only (Tier C Task 2 diagnostics round, ruling C-11): exactly
 /// [`relative_scale_against`]'s own computation — this and it share ONE
-/// body ([`relative_scale_against_core`]) — but also returning the
+/// body (`relative_scale_against_core`) — but also returning the
 /// per-match [`ScaleMatchDiag`] records, so an external caller (the C-11
 /// probe extension) can compare which pairs two different calls kept
 /// without re-implementing the detect/fit/pairing/RCR chain. Never called
 /// by `normalize_frame` or any other production path.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_against_with_diag(
     prepared: &PreparedReferenceChannel,
@@ -1356,6 +1400,8 @@ pub fn relative_scale_against_with_diag(
 /// records, the masked twin of [`relative_scale_against_with_diag`] (one
 /// shared body). Acceptance probes only (the project-member arm); never
 /// called by `normalize_frame`.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_against_masked_with_diag(
     prepared: &PreparedReferenceChannel,
@@ -1610,11 +1656,11 @@ fn choose_pairing_widened(
 /// checked against.
 ///
 /// **What this function does instead**: it keeps Measure's cheap per-plane
-/// detection (skipping [`detect_seeds`]'s own expensive full-frame search)
+/// detection (skipping `detect_seeds`'s own expensive full-frame search)
 /// but discards every FITTED VALUE, using only the accepted stars'
-/// POSITIONS as seeds for a fresh [`fit_stars_with_beta`] call on the
+/// POSITIONS as seeds for a fresh `fit_stars_with_beta` call on the
 /// WARPED TARGET PLANE — exactly [`relative_scale_against`]'s own fit
-/// call, fed a pre-selected seed list instead of [`detect_seeds`]'s
+/// call, fed a pre-selected seed list instead of `detect_seeds`'s
 /// full-frame one. The expensive full-frame detection disappears; the PSF
 /// fit itself (now over a much smaller, pre-matched list) and the
 /// pairing/RCR/local-scale tail are the SAME code [`relative_scale_against`]
@@ -1627,13 +1673,13 @@ fn choose_pairing_widened(
 /// plane the caller is about to fit on) that both the saturation guard and
 /// the PSF fit itself read; `ref_width`/`ref_height` are its dimensions.
 ///
-/// Per fit: (1) [`map_seed_position`] — map the centroid through
+/// Per fit: (1) `map_seed_position` — map the centroid through
 /// [`PixelMap::forward_exact`] (ruling R-T4-3), dropping one whose mapped,
 /// rounded position falls outside `[0, ref_width) × [0, ref_height)`; (2)
-/// [`warped_pixel_is_saturated`] — a saturation guard on the WARPED
+/// `warped_pixel_is_saturated` — a saturation guard on the WARPED
 /// plane's own pixel value at that position (native `[0, 1]` units) —
 /// this is the one piece of the OLD design's
-/// [`register::detect::passes_register_cuts`] this path still needs
+/// `register::detect::passes_register_cuts` this path still needs
 /// (Measure's own acceptance already covers eccentricity/SNR on the
 /// NATIVE frame, but says nothing about the WARPED pixel the fresh fit is
 /// about to sample); (3) PRE-SELECT — keep only seeds with a reference
@@ -1644,7 +1690,7 @@ fn choose_pairing_widened(
 /// on real frames (24-44% of Measure's own in-coverage, unsaturated
 /// seeds) — but ALSO measured that relaxing it (widening to `2 ×
 /// match_radius_px`) or removing it (fitting every in-coverage,
-/// unsaturated seed and letting [`choose_pairing_widened`] decide) leaves
+/// unsaturated seed and letting `choose_pairing_widened` decide) leaves
 /// `matched` and `scale` UNCHANGED while costing real time — the lost
 /// stars have no reference counterpart within either radius at all, so
 /// this filter is kept at `match_radius_px`, the cheapest of the three
@@ -1652,22 +1698,24 @@ fn choose_pairing_widened(
 ///
 /// Survivors become [`Seed`]s (`peak`/`flux` copied from the Measure fit's
 /// own `amplitude`/`signal` — `peak` used only to order the seeds whose
-/// half-maximum widths give [`fit_stars_with_beta`] its field width, an
+/// half-maximum widths give `fit_stars_with_beta` its field width, an
 /// ORDER any unit difference between Measure's ADU-scaled fits and this
 /// native plane leaves unchanged; before Plan A Task 6b the field-level
 /// `initial_sigma` ratio of the two sized the fit stamp), sorted brightest-first (the convention
-/// [`detect_seeds`]'s own `to_seed` documents), capped at `max_stars`, then
-/// fitted with [`fit_stars_with_beta`] at the reference's DEFAULT β —
+/// `detect_seeds`'s own `to_seed` documents), capped at `max_stars`, then
+/// fitted with `fit_stars_with_beta` at the reference's DEFAULT β —
 /// never a seed's own original Measure β, which no longer matters: this is
 /// a FRESH fit on the warped plane, at whatever β makes it comparable to
 /// the reference's own fit, exactly like [`relative_scale_against`].
 /// `Err(TooFewMatches)` when fewer than [`MIN_MATCHES`] pairs survive —
 /// the caller falls back to full detection.
 ///
-/// Pairing is [`choose_pairing_widened`] (ruling C-2 — there is still no
+/// Pairing is `choose_pairing_widened` (ruling C-2 — there is still no
 /// detection barycentre to fall back on: the seeds are Measure's own
-/// positions, not a fresh detection's). [`measured_sample`] /
-/// [`crate::stacking::robust::rcr`] / [`fit_local_scale`] run UNCHANGED.
+/// positions, not a fresh detection's). `measured_sample` /
+/// [`crate::stacking::robust::rcr`] / `fit_local_scale` run UNCHANGED.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_from_seeds(
     prepared: &PreparedReferenceChannel,
@@ -1703,6 +1751,8 @@ pub fn relative_scale_from_seeds(
 
 /// [`relative_scale_from_seeds`] on `allowed` only (plan 6b-3 D6): a seed
 /// whose mapped position lies outside it is counted as out of coverage.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_from_seeds_masked(
     prepared: &PreparedReferenceChannel,
@@ -1737,6 +1787,8 @@ pub fn relative_scale_from_seeds_masked(
     .map(|(r, _diag, _breakdown)| r)
 }
 
+/// Counts of seeds surviving each step of the seeds-based scale estimate, for diagnostics.
+///
 /// Fix round 3, ruling C-13, LEVER 1's own instrument: a per-STAGE count of
 /// [`relative_scale_from_seeds`]'s filter chain, so a caller can see WHICH
 /// step is responsible for the gap between Measure's own fit count and the
@@ -1762,17 +1814,25 @@ pub fn relative_scale_from_seeds_masked(
 /// this number).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeedFilterBreakdown {
+    /// Seeds supplied (the length of the fit list).
     pub available: usize,
+    /// Seeds whose mapped, rounded position falls inside the reference canvas.
     pub in_coverage: usize,
+    /// Of those, seeds whose warped-plane pixel value stays below the saturation level.
     pub past_saturation: usize,
+    /// Of those, seeds with a reference star within the match radius of the mapped, not yet fitted position.
     pub past_preselect: usize,
+    /// Of those, seeds for which the star fit succeeded on the warped plane.
     pub fit_accepted: usize,
+    /// Pairs kept by the pairing and sampling step; equals [`ScaleResult::matches`].
     pub matched: usize,
 }
 
 /// Diagnostic-only (ruling C-13, LEVER 1): exactly
 /// [`relative_scale_from_seeds`]'s own computation, plus the
 /// [`SeedFilterBreakdown`] the `_core` body already tallies for free.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_from_seeds_with_breakdown(
     prepared: &PreparedReferenceChannel,
@@ -1808,9 +1868,11 @@ pub fn relative_scale_from_seeds_with_breakdown(
 
 /// Diagnostic-only (mirrors [`relative_scale_against_with_diag`]'s own
 /// contract): exactly [`relative_scale_from_seeds`]'s own computation —
-/// this and it share ONE body ([`relative_scale_from_seeds_core`]) — but
+/// this and it share ONE body (`relative_scale_from_seeds_core`) — but
 /// also returning the per-match [`ScaleMatchDiag`] records. Never called
 /// by `normalize_frame` or any other production path.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_from_seeds_with_diag(
     prepared: &PreparedReferenceChannel,

@@ -190,8 +190,9 @@ windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", 
 # Default keeps today's full behavior for the desktop/web builds. Headless
 # consumers build with `--no-default-features` to omit both native-heavy deps.
 default = ["render", "solver"]
-# `render` and `solver` also switch on starloom's `engine` and `stack` layers. Today nothing builds `solver`
-# without `render`: `solver` alone would pull starloom's `engine` (and so rustafits) through `starloom/stack`.
+# `render` and `solver` also switch on starloom's `engine` and `stack` layers. `solver` without `render` pulls
+# rustafits through solvemyastro itself (`solvemyastro/Cargo.toml:28`), so that combination was never rustafits-free;
+# it is accepted, and only `--no-default-features` is guarded.
 render = ["dep:rustafits", "starloom/engine"]
 solver = ["dep:solvemyastro", "starloom/stack"]
 # Debug-only Moffat LM solve counters (rustafits `lm-counters`), printed by the star_probe example as one `lmCounters` line;

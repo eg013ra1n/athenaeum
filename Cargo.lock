@@ -6839,6 +6839,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solvemyastro",
+ "starloom",
  "tempfile",
  "tracing",
  "tracing-subscriber",

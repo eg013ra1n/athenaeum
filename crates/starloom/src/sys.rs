@@ -1,14 +1,14 @@
 //! The platform memory probe: `platform_memory()` with its four platform variants and its helpers, and
-//! `total_ram_bytes`. Moved from Athenaeum core's `services::machine`; core keeps the rest of its machine profile.
+//! `total_ram_bytes`, the one answer to "how much RAM may this process use" that the stacking budgets read.
 //!
 //! Every parser is a pure function on a `&str` so it is unit-tested on every platform; only the file / syscall
 //! read is `cfg`-gated. An unknown value is `None`, never a guess.
 
 use std::sync::OnceLock;
 
-/// One `Key:   123 kB` line of `/proc/meminfo` or `/proc/self/status`, in bytes.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-pub(crate) fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
+/// One `Key:   123 kB` line of `/proc/meminfo` or `/proc/self/status`, in bytes. `key` includes the colon
+/// (`"MemTotal:"`); `None` when the key is absent or its value is not a number.
+pub fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix(key) {
             let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
@@ -21,8 +21,6 @@ pub(crate) fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
 /// Parse one cgroup memory-limit file. `None` means "no limit here": cgroup v2
 /// writes the literal `max`, and v1 writes a sentinel near `u64::MAX` — a
 /// number that large is not a container limit, it is the absence of one.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-#[doc(hidden)]
 pub fn parse_cgroup_limit(text: &str) -> Option<u64> {
     const UNLIMITED_FLOOR: u64 = 1 << 62;
     let v: u64 = text.trim().parse().ok()?;
@@ -35,9 +33,7 @@ pub fn parse_cgroup_limit(text: &str) -> Option<u64> {
 
 /// Pure computation over `/proc/meminfo`'s content plus the two possible
 /// cgroup limit-file contents: `min(MemTotal, container limit)`. cgroup v2
-/// wins when it names a real limit; `max` (or absent) falls through to v1.
-#[cfg_attr(not(test), allow(dead_code))]
-#[doc(hidden)]
+/// wins when it names a real limit; `max` (or absent) falls through to v1. `None` when `MemTotal:` is absent.
 pub fn linux_total_ram_from(
     meminfo: &str,
     v2: Option<&str>,
@@ -50,7 +46,6 @@ pub fn linux_total_ram_from(
     })
 }
 
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn cgroup_limit(v2: Option<&str>, v1: Option<&str>) -> Option<u64> {
     v2.and_then(parse_cgroup_limit)
         .or_else(|| v1.and_then(parse_cgroup_limit))
@@ -83,6 +78,9 @@ fn sysctl_raw<T: Copy>(name: &str, out: &mut T) -> bool {
 
 /// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
 /// per platform family below; the limit is whatever the platform reports, not yet checked against the physical total.
+///
+/// macOS and iOS: physical memory from `sysctl hw.memsize`; there is no container limit, so the second value is
+/// always `None`. Both are `None` (and a warning is logged) when the sysctl fails.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     let mut size: u64 = 0;
@@ -103,6 +101,12 @@ fn read_trimmed(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
+/// per platform family.
+///
+/// Linux: physical memory is `MemTotal` from `/proc/meminfo` (`None`, with a warning, when the file cannot be read;
+/// `None` without one when it has no `MemTotal`). The limit is the cgroup v2 `memory.max`, else the cgroup v1 `memory.limit_in_bytes`; `None`
+/// when neither file exists or names a real limit.
 #[cfg(target_os = "linux")]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     let total = match read_trimmed("/proc/meminfo") {
@@ -121,6 +125,12 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 // Windows
 // ---------------------------------------------------------------------------
 
+/// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
+/// per platform family.
+///
+/// Windows: physical memory from `GlobalMemoryStatusEx` (`None`, with a warning, when the call fails). The limit is
+/// the calling process's job-object memory limit: the smaller of the job limit and the per-process limit when both
+/// are set, `None` when the process is in no job or the job sets neither.
 #[cfg(windows)]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     use windows_sys::Win32::System::JobObjects::{
@@ -168,6 +178,10 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 // Anything else
 // ---------------------------------------------------------------------------
 
+/// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
+/// per platform family.
+///
+/// Any other platform: nothing is probed, so both values are always `None` and [`total_ram_bytes`] is `None`.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     (None, None)
@@ -177,8 +191,11 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 static MEMORY: OnceLock<(Option<u64>, Option<u64>)> = OnceLock::new();
 
 /// Physical RAM this process may actually use, in bytes: the container / job limit when one is set below physical
-/// memory, else physical memory. `None` when the platform cannot say. The same rule as Athenaeum core's
-/// `MachineProfile::effective_mem`, over this crate's own probe.
+/// memory, else physical memory. Probed once per process.
+///
+/// `None` when the platform cannot say: the physical total and the limit are both unknown (an unreadable
+/// `/proc/meminfo`, a failed `sysctl` or `GlobalMemoryStatusEx`, a platform with no probe). The caller must pick its
+/// own fallback; none is applied here. Each consumer documents the one it takes.
 ///
 /// On Linux this is `min(MemTotal, container limit)`: `/proc/meminfo` reports the HOST's RAM inside a container,
 /// so without the cgroup read a 2 GB container would size an 8 GiB budget and be OOM-killed.
@@ -187,15 +204,21 @@ pub fn total_ram_bytes() -> Option<u64> {
     effective_memory(total, limit)
 }
 
-/// The effective-memory rule over a probed pair: a limit counts only when it is below physical memory (or physical
-/// memory is unknown); the result is then the limit when set, else physical memory.
-fn effective_memory(total: Option<u64>, limit: Option<u64>) -> Option<u64> {
-    let limit = match (total, limit) {
+/// The container or job memory limit of a probed pair, kept only when it binds: a limit counts when it is below
+/// physical memory, or when physical memory is unknown. A limit equal to or above physical memory is no limit
+/// (`None`).
+pub fn binding_limit(total: Option<u64>, limit: Option<u64>) -> Option<u64> {
+    match (total, limit) {
         (Some(t), Some(l)) if l < t => Some(l),
         (None, Some(l)) => Some(l),
         _ => None,
-    };
-    match (total, limit) {
+    }
+}
+
+/// The effective-memory rule over a probed pair: the minimum of the physical total and the [`binding_limit`]; the
+/// limit alone when the total is unknown; `None` when neither is known.
+pub fn effective_memory(total: Option<u64>, limit: Option<u64>) -> Option<u64> {
+    match (total, binding_limit(total, limit)) {
         (Some(t), Some(l)) => Some(t.min(l)),
         (Some(t), None) => Some(t),
         (None, l) => l,
@@ -214,6 +237,16 @@ mod tests {
         assert_eq!(effective_memory(Some(16), None), Some(16));
         assert_eq!(effective_memory(None, Some(4)), Some(4));
         assert_eq!(effective_memory(None, None), None);
+    }
+
+    #[test]
+    fn binding_limit_keeps_only_a_limit_below_physical_memory() {
+        assert_eq!(binding_limit(Some(16), Some(4)), Some(4));
+        assert_eq!(binding_limit(Some(16), Some(16)), None);
+        assert_eq!(binding_limit(Some(16), Some(64)), None);
+        assert_eq!(binding_limit(Some(16), None), None);
+        assert_eq!(binding_limit(None, Some(4)), Some(4));
+        assert_eq!(binding_limit(None, None), None);
     }
 
     #[test]

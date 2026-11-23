@@ -1,4 +1,5 @@
-//! File-system helpers: a copy of `sync_best_effort` and its classification (Athenaeum core keeps its own for archive and export).
+//! File-system helpers: `sync_best_effort` and its classification, the one copy every durable write uses
+//! (starloom's own FITS, XISF and LN-grid writers, and the application's archive, zip, export and header-patch writes).
 
 use std::fs::File;
 use std::io;
@@ -71,7 +72,7 @@ fn sync_with(
 /// On macOS `sync_all` issues `F_FULLFSYNC`, which an SMB mount refuses with `ENOTSUP` while a plain
 /// `fsync(2)` still flushes to the server, so the plain call is tried before the sync is given up. Every
 /// other error (EIO, ENOSPC, ...) is returned.
-pub(crate) fn sync_best_effort(file: &File, path: &Path) -> io::Result<()> {
+pub fn sync_best_effort(file: &File, path: &Path) -> io::Result<()> {
     sync_with(|| file.sync_all(), || plain_fsync(file), path)
 }
 

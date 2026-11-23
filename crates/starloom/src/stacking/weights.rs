@@ -2,37 +2,54 @@
 //! reference §1.2, §1.5, §2.5, §3.7). Weights are per channel and
 //! normalized by the group maximum per channel; the frame-level weight is
 //! the mean over channels.
-//! Copied from Athenaeum core's `stacking/weights.rs`: the weight modes, formulas, selection and `best_by_weight`;
-//! the two-pass reference pick, the sky-penalized order and the LN field stay there.
+//! This module holds the weight modes, the formulas, frame selection and `best_by_weight`; the two-pass reference
+//! pick, the sky-penalized order and the local-normalization field belong to the caller.
 
 use serde::{Deserialize, Serialize};
 
 use super::measure::{ChannelMeasurement, FrameMeasurement};
 
+/// How a frame's quality becomes its stacking weight: a star-based estimator, the noise, a user formula, the exposure
+/// time, a FITS keyword's value, or no weighting at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum WeightMode {
+    /// PSF Signal Weight: the frame's star flux over its noise and background (see `psf_signal::psf_signal_weight`);
+    /// the default.
     #[default]
     PsfSignalWeight,
+    /// PSF SNR: the star flux squared over the noise variance (see `psf_signal::psf_snr`).
     PsfSnr,
     /// `(noiseScale / σ_N)²` with `noiseScale` the mean of the two noise-scale factors.
     Noise,
     /// The classic formula with the user's `FormulaWeights`.
     Formula,
+    /// The exposure time in seconds (a frame with no exposure time has no weight).
     Exposure,
+    /// The numeric value of the FITS keyword named by `MeasurementConfig::keyword` (a frame without a finite value has
+    /// no weight).
     Keyword,
+    /// Every frame weighs 1.
     None,
 }
 
+/// The coefficients of the user formula weight (`WeightMode::Formula`): how many points a sharp, round, high-SNR,
+/// star-rich frame earns, plus a flat pedestal. The terms are in the same arbitrary weight points; only their ratios
+/// matter.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct FormulaWeights {
+    /// Points for the sharpest FWHM in the group (the term scales down to 0 at the widest FWHM).
     pub fwhm: f64,
+    /// Points for the roundest stars in the group (0 at the most eccentric).
     pub eccentricity: f64,
+    /// Points for the highest SNR weight in the group (0 at the lowest).
     pub snr: f64,
+    /// Points for the most fitted stars in the group (0 at the fewest).
     pub stars: f64,
+    /// Points every frame earns regardless of its measurements.
     pub pedestal: f64,
 }
 
@@ -48,7 +65,9 @@ impl Default for FormulaWeights {
     }
 }
 
+/// One frame's inputs to the weight computation: its measurement plus the optional exposure time and keyword value.
 pub struct WeightInput<'a> {
+    /// The frame's star and noise measurement (one entry per colour channel).
     pub measurement: &'a FrameMeasurement,
     /// `EXPTIME`, for `WeightMode::Exposure`.
     pub exposure_s: Option<f64>,
@@ -56,6 +75,7 @@ pub struct WeightInput<'a> {
     pub keyword_value: Option<f64>,
 }
 
+/// A frame's stacking weight: per colour channel, raw and divided by the group's best, plus the channel mean.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameWeight {
@@ -63,7 +83,9 @@ pub struct FrameWeight {
     pub channels: Vec<f64>,
     /// `channels / max over the group's non-excluded frames`, per channel.
     pub normalized: Vec<f64>,
+    /// The mean of `channels` (raw weight units of the mode).
     pub mean: f64,
+    /// The mean of `normalized` over the channels (at most 1; 0 for a frame without a weight).
     pub normalized_mean: f64,
     /// Why this frame has no usable weight (a missing exposure or keyword).
     pub missing: Option<String>,
@@ -272,14 +294,20 @@ pub fn compute_weights(
     out
 }
 
+/// The thresholds that exclude a frame from its group: a weight floor and optional limits on FWHM, eccentricity and
+/// star count.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct SelectionConfig {
     /// Frames below this fraction of the group's maximum weight are excluded.
     pub min_weight_fraction: f64,
+    /// Exclude a frame whose mean FWHM over its channels exceeds this, in pixels; `None` = no limit.
     pub max_fwhm_px: Option<f64>,
+    /// Exclude a frame whose mean eccentricity over its channels exceeds this (0 = round, towards 1 = elongated);
+    /// `None` = no limit.
     pub max_eccentricity: Option<f64>,
+    /// Exclude a frame whose lowest per-channel fitted-star count is below this; `None` = no limit.
     pub min_stars: Option<usize>,
     /// A frame whose registration failed is dropped from its group (spec
     /// §9.2). Read by the run orchestration, not by [`select_frames`] —

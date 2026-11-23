@@ -24,12 +24,12 @@
 //! plane reads the same value — a heavily stacked integer-BITPIX master dark
 //! whose read noise quantizes to whole ADU does this routinely, and there is
 //! no spread left to measure sigmas against), and a map flagging more than
-//! [`MAX_HOT_FRACTION`] of the plane is thrown away whole. Neither case can be
+//! `MAX_HOT_FRACTION` of the plane is thrown away whole. Neither case can be
 //! rescued by clamping the threshold to something small: `median + ε` on a
 //! quantized dark flags every pixel one ADU above the median, which is a large
 //! fraction of the sensor. A refusal is not an empty map: it comes back as
 //! [`HotPixelMapOutcome::Refused`] carrying its reason, so the caller can leave
-//! the `ATH_CHPX` card off the output (a count of zero would claim a correction
+//! the hot-pixel count off the output (a count of zero would claim a correction
 //! that never ran) and tell the operator which dark was skipped and why.
 //!
 //! **Replacement is a neighbourhood median, and the neighbourhood is
@@ -101,9 +101,9 @@ impl HotPixelMap {
 /// [`Refused`](HotPixelMapOutcome::Refused) are NOT the same answer, and the
 /// difference is what the output header says. An empty map means the dark was
 /// measured and held no outlier: the correction ran and replaced nothing, which
-/// is honestly `ATH_CHPX = 0`. A refusal means it was never measured — stamping
+/// is honestly a count of zero. A refusal means it was never measured — stamping
 /// a count there would claim a correction that did not happen, so the caller
-/// leaves the card off and reports the reason instead.
+/// leaves the count off and reports the reason instead.
 #[derive(Debug, Clone)]
 pub enum HotPixelMapOutcome {
     /// The dark's statistics held up; these are its hot pixels (possibly none).
@@ -118,7 +118,7 @@ pub enum HotPixelMapOutcome {
 ///
 /// Returns [`HotPixelMapOutcome::Refused`] — never an error — for the three
 /// degenerate cases a dark can present: a MAD of zero, a non-finite threshold,
-/// and a result over [`MAX_HOT_FRACTION`] of the plane. All three are logged at
+/// and a result over `MAX_HOT_FRACTION` of the plane. All three are logged at
 /// `warn!`; see the module docs for why refusing beats correcting on a threshold
 /// that cannot be trusted.
 ///
@@ -651,7 +651,7 @@ mod tests {
 
     /// A dark with a real spread but nothing above the threshold is NOT a
     /// refusal: it was measured, and the honest answer is a map of zero
-    /// pixels. This is the case the caller stamps `ATH_CHPX = 0` for, and the
+    /// pixels. This is the case the caller stamps a hot-pixel count of 0 for, and the
     /// one a refusal must never be confused with.
     ///
     /// Alternating 300/302 over 128 pixels: the sorted plane's two middle

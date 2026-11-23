@@ -21,17 +21,26 @@ pub use crate::star_measure::{
 
 // The TypeScript face of `PsfModel` (a rustafits type since the star_measure port, which cannot derive `ts_rs::TS`
 // here): the wire's two names (`Fixed` is internal, never on the wire), exported as `PsfModel`; the config fields that
-// hold one point their `#[ts(as = …)]` at it. No `///` doc on purpose — ts-rs would copy it into `src/types`, which
-// must stay unchanged.
+// hold one point their `#[ts(as = …)]` at it. Its `///` docs are copied by ts-rs into the generated `PsfModel` type,
+// which is the intent.
+/// The star profile a measurement fits: a Moffat profile whose shape parameter (beta) is either chosen per frame from
+/// the frame's own stars or fixed at 4.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(rename = "PsfModel", rename_all = "camelCase"))]
 pub enum PsfModelTs {
+    /// One beta per frame: the median of the free-beta fits of the 64 brightest unsaturated stars (4 when fewer than 8
+    /// of those fits are accepted).
     Auto,
+    /// Fit a Moffat profile with beta fixed at 4.
     Moffat4,
 }
 
+/// Fits the star profile to every seed of a plane and returns the accepted fits.
+///
 /// [`crate::star_measure::fit::fit_stars`] (Plan A Task 2: the fit moved;
 /// this wrapper keeps every LN and probe call site unchanged).
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn fit_stars(
     data: &[f32],
     w: usize,
@@ -44,8 +53,12 @@ pub fn fit_stars(
     crate::star_measure::fit::fit_stars(data, w, h, seeds, model, p, pool)
 }
 
+/// Fits the star profile to every seed of a plane with the Moffat beta fixed at `beta`.
+///
 /// [`crate::star_measure::fit::fit_stars_with_beta`] (Plan A Task 2: the fit
 /// moved; this wrapper keeps every LN and probe call site unchanged).
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn fit_stars_with_beta(
     data: &[f32],
     w: usize,
@@ -82,9 +95,13 @@ pub fn group_beta(betas: &[f64]) -> f64 {
     sorted[(sorted.len() - 1) / 2]
 }
 
+/// Numerator constant of the PSF Signal Weight formula (see [`psf_signal_weight`]); dimensionless.
 pub const PSFSW_NUM: f64 = 5.326e-6;
+/// Denominator constant of the PSF Signal Weight formula (see [`psf_signal_weight`]); dimensionless.
 pub const PSFSW_DEN: f64 = 9.0e6;
+/// Numerator constant of the PSF SNR formula (see [`psf_snr`]); dimensionless.
 pub const PSFSNR_NUM: f64 = 1.316e-7;
+/// Denominator constant of the PSF SNR formula (see [`psf_snr`]); dimensionless.
 pub const PSFSNR_DEN: f64 = 4.987e6;
 
 /// `PSFSW = (5.326e-6 · TFlux · TMeanFlux) / (9.0e6 · σ_N · M*)`; 0 when

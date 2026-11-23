@@ -24,11 +24,16 @@ pub fn term_exponents(order: u8) -> Vec<(u8, u8)> {
     out
 }
 
+/// The two coefficient lists of a 2-D polynomial in normalized coordinates, one for each output axis; it returns a
+/// displacement in pixels.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Polynomial2D {
+    /// The highest total degree of a term (2 to 4).
     pub order: u8,
+    /// The x-axis coefficients, one per term of [`term_exponents`] in that order.
     pub ax: Vec<f64>,
+    /// The y-axis coefficients, one per term of [`term_exponents`] in that order.
     pub ay: Vec<f64>,
 }
 
@@ -231,8 +236,11 @@ pub const DOMAIN_MARGIN: f64 = 0.1;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Distortion {
+    /// The highest total degree of any term in either polynomial (2 to 4).
     pub order: u8,
+    /// The reference-pixel `(x, y)` the coordinates are measured from.
     pub center: (f64, f64),
+    /// The divisor that turns a pixel distance from `center` into the normalized coordinate, in pixels.
     pub scale: f64,
     /// Normalized-coordinate box `[u_min, v_min, u_max, v_max]` the
     /// polynomials were fitted over (the samples' bounding box, each side
@@ -244,11 +252,16 @@ pub struct Distortion {
     /// what a `transform_json` written before this field carried.
     #[serde(default)]
     pub domain: Option<[f64; 4]>,
+    /// The correction added after the linear model (reference space); its output is a displacement in pixels.
     pub forward: Polynomial2D,
+    /// The correction applied to a reference position on the way back to the subject; its output is a displacement
+    /// in pixels.
     pub inverse: Polynomial2D,
 }
 
 impl Distortion {
+    /// Whether this distortion is safe to evaluate: matching orders, finite coefficients, a positive finite `scale`,
+    /// a finite `center` and an ordered finite domain.
     pub fn is_well_formed(&self) -> bool {
         self.scale.is_finite()
             && self.scale > 0.0
@@ -263,6 +276,7 @@ impl Distortion {
             })
     }
 
+    /// Normalizes a reference pixel `(x, y)` to `((x - cx) / scale, (y - cy) / scale)`.
     #[inline]
     pub fn norm(&self, x: f64, y: f64) -> (f64, f64) {
         (

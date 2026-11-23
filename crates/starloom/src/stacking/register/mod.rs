@@ -71,12 +71,12 @@ const LOW_INLIER_SHARE: f64 = 0.5;
 /// means anything.
 const LOW_INLIER_MIN_FRAMES: usize = 3;
 
-/// The frames of one group whose registration kept under half the group's
-/// median refit inliers (robust quad seed RQ-6). `rows` is `(frame_id,
-/// inliers)` of the group's aligned non-reference frames. Returns `None` under
-/// [`LOW_INLIER_MIN_FRAMES`] rows, else `(median, flagged)`: the numpy median
+/// Finds the frames of one group whose registration kept under half the group's
+/// median refit inliers (robust quad seed RQ-6), a sign of a poor star match.
+/// `rows` is `(frame_id, inliers)` of the group's aligned non-reference frames,
+/// the inlier count being a number of matched stars. Returns `None` under
+/// `LOW_INLIER_MIN_FRAMES` rows, else `(median, flagged)`: the numpy median
 /// and the rows with `inliers < 0.5 * median`, in input order.
-#[doc(hidden)]
 pub fn low_inlier_frames(rows: &[(i64, usize)]) -> Option<(f64, Vec<(i64, usize)>)> {
     if rows.len() < LOW_INLIER_MIN_FRAMES {
         return None;
@@ -91,6 +91,7 @@ pub fn low_inlier_frames(rows: &[(i64, usize)]) -> Option<(f64, Vec<(i64, usize)
     Some((median, flagged))
 }
 
+/// Which linear transform registration fits between a frame and the reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -98,19 +99,27 @@ pub enum ModelChoice {
     /// Homography from 30 correspondences, affine from 12, similarity below.
     #[default]
     Auto,
+    /// Rotation, uniform scale and shift (4 parameters).
     Similarity,
+    /// Rotation, independent axis scales, shear and shift (6 parameters).
     Affine,
+    /// A full projective transform (8 parameters).
     Homography,
 }
 
+/// Which non-linear distortion correction registration fits on top of the linear model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum DistortionChoice {
+    /// No distortion model: the linear model alone.
     #[default]
     Off,
+    /// A global polynomial distortion of order 2 over the refit inliers.
     Polynomial2,
+    /// A global polynomial distortion of order 3 over the refit inliers.
     Polynomial3,
+    /// A global polynomial distortion of order 4 over the refit inliers.
     Polynomial4,
     /// A regularized thin-plate spline over the refit inliers (M4c,
     /// ruling R-M4c-5): local by construction, so it follows a residual
@@ -163,6 +172,7 @@ pub enum DistortionChoice {
 }
 
 impl DistortionChoice {
+    /// The polynomial order (2, 3 or 4) of a polynomial choice; `None` for off, thin-plate spline and auto.
     pub fn order(self) -> Option<u8> {
         match self {
             DistortionChoice::Polynomial2 => Some(2),
@@ -191,8 +201,10 @@ impl DistortionChoice {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum RegistrationGeometry {
+    /// One reference and one pixel grid for the whole set; every master shares one geometry.
     #[default]
     CoRegistered,
+    /// A reference and a geometry per group; masters come out at each group's own sampling.
     Native,
 }
 
@@ -203,7 +215,12 @@ pub enum RegistrationGeometry {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct DetectionConfig {
+    /// Smallest signal-to-noise ratio (unitless) a detected star must reach to be kept. On the detector path it is the
+    /// detector's aperture-photometry SNR, `flux / sqrt(flux + pi r^2 sigma^2)` (not a peak SNR); on the PSF-fit
+    /// path it is compared with `1 / residual` of the fit.
     pub min_snr: f32,
+    /// Largest eccentricity a detected star may have to be kept: 0 is round, values toward 1 are elongated
+    /// (unitless).
     pub max_eccentricity: f32,
 }
 
@@ -216,18 +233,25 @@ impl Default for DetectionConfig {
     }
 }
 
-/// Spec §9.2 `registration` block.
+/// The registration settings of a stacking config: the models, the resampling kernel and the acceptance
+/// gates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", default)]
 pub struct RegistrationConfig {
+    /// Whether the whole set shares one reference geometry (co-registered, the default) or each group gets
+    /// its own (native).
+    ///
     /// M4b (ruling R-M4b-4): co-registered (the default — one reference and
     /// one geometry for the whole set) or native (a reference and a
     /// geometry per group). `#[serde(default)]` rides the struct-level
     /// `default`, so every stored config written before M4b decodes as
     /// co-registered and no `STACKING_CONFIG_VERSION` bump is needed.
     pub geometry: RegistrationGeometry,
+    /// The linear model fitted between a frame and the reference; auto picks it from the number of
+    /// correspondences.
     pub model: ModelChoice,
+    /// The non-linear distortion fitted on top of the linear model.
     pub distortion: DistortionChoice,
     /// The thin-plate spline's regularization weight `λ` (M4c, ruling
     /// R-M4c-5) — `0.0` is the interpolating spline, which lands on every
@@ -260,13 +284,28 @@ pub struct RegistrationConfig {
     /// refitting the distortion around it. Needs a distortion model to
     /// refit, so it is a no-op with `distortion: off`.
     pub local_distortion: bool,
+    /// The resampling kernel used when a frame is warped into the reference geometry.
     pub interpolation: Interpolation,
+    /// Deringing threshold of the sharpening kernels, unitless (default 0.30). Keys cubic: when the outer taps'
+    /// negative contribution reaches this fraction of the inner taps' contribution, the interpolation falls back to
+    /// the inner-tap linear estimate. Lanczos3 and Lanczos4: with `r` the negative lobes' contribution over the
+    /// positive lobes', above the threshold the negative lobes are reduced by `1 - ((r - t) / (1 - t))^2`, and
+    /// dropped only at `r >= 1`; there is no linear fallback.
     pub clamping_threshold: f32,
+    /// Most registration stars kept per frame, brightest first.
     pub max_stars: usize,
+    /// Distance in pixels within which a star pair counts as an inlier of the RANSAC fit (the pairing radii
+    /// of the later rounds scale from it).
     pub ransac_tolerance_px: f64,
+    /// Most RANSAC iterations per fit.
     pub ransac_max_iterations: usize,
+    /// Residual RMS in pixels above which a frame's registration is flagged; it fails the frame only when
+    /// `fail_on_max_rms` is set.
     pub max_rms_px: f64,
+    /// Whether a frame whose residual RMS exceeds `max_rms_px` fails registration (`true`) or only carries a
+    /// warning (`false`).
     pub fail_on_max_rms: bool,
+    /// The star detection cuts.
     pub detection: DetectionConfig,
     /// Vestigial since perf tier A Task 6a: the registered artifact became
     /// the run's REQUIRED per-frame output (Normalize/Integrate read it in

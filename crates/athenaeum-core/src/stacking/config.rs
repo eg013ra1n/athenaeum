@@ -17,6 +17,7 @@ use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::register::align::ALIGN_VERSION;
 use crate::stacking::register::DistortionChoice;
 use crate::star_measure::MEASURE_VERSION;
+use starloom::stacking::measure::MEASURE_STAGE_VERSION;
 
 // The measurement and drizzle configs, the seed source and the kernel's bounds are the kernel's; this file keeps the
 // resolution, the presets and every stage hash.
@@ -764,7 +765,18 @@ pub(crate) fn measurement_subtree_with_fits_artifact_version(
 ) -> serde_json::Value {
     let mut subtree = measurement_subtree_with_measure_version(cfg, MEASURE_VERSION);
     subtree["fitsArtifactVersion"] = serde_json::json!(fits_artifact_version);
+    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
     subtree
+}
+
+/// Folds starloom's [`MEASURE_STAGE_VERSION`] into a subtree that reads the measure stage's numbers, as
+/// `measureStageVersion`, only when it is not 1: at 1 the key is absent, so every hash keeps the bytes it had before
+/// the version existed (starloom phase 1, P1-R1). A bump recomputes the measurement, registration and normalization
+/// artifacts, and is raised together with `PASS1_ARTIFACT_VERSION`.
+pub(crate) fn fold_measure_stage_version(subtree: &mut serde_json::Value, version: u32) {
+    if version != 1 {
+        subtree["measureStageVersion"] = serde_json::json!(version);
+    }
 }
 
 /// [`measurement_subtree`] with the measure version supplied, so a test can
@@ -809,7 +821,9 @@ fn measurement_subtree_with_measure_version(
 /// either, so a change in it moves this hash the way a fitter change does —
 /// every set re-registers once, and Calibrate and Measure stay cached.
 pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    registration_subtree_with_versions(cfg, MEASURE_VERSION, ALIGN_VERSION)
+    let mut subtree = registration_subtree_with_versions(cfg, MEASURE_VERSION, ALIGN_VERSION);
+    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
+    subtree
 }
 
 /// [`registration_subtree`] with both versions supplied, so a test can prove
@@ -859,7 +873,9 @@ fn registration_subtree_with_measure_version(
 /// [`crate::stacking::ln::LN_MODEL_VERSION`] (`lnModelVersion`): a change in
 /// what an existing config's LN model produces moves the hashes the same way.
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    normalization_subtree_with_measure_version(cfg, MEASURE_VERSION)
+    let mut subtree = normalization_subtree_with_measure_version(cfg, MEASURE_VERSION);
+    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
+    subtree
 }
 
 /// [`normalization_subtree`] with the measure version supplied — see
@@ -2045,6 +2061,48 @@ mod tests {
                     MIN_DETECTION_SIGMA
                 },
                 "clamping {bad}"
+            );
+        }
+    }
+
+    /// Starloom phase 1 (P1-R1): `MEASURE_STAGE_VERSION` enters the three fit-reading subtrees only past 1, so no pinned
+    /// hash moves at 1 and a bump moves each of the three. The shipped subtrees are judged against the unfolded
+    /// helpers, so a future bump of the constant moves no assert here.
+    #[test]
+    fn measure_stage_version_folds_only_past_1() {
+        let cfg = StackingConfig::default();
+        let mut measurement = measurement_subtree_with_measure_version(&cfg, MEASURE_VERSION);
+        measurement["fitsArtifactVersion"] = serde_json::json!(FITS_ARTIFACT_VERSION);
+        for (name, shipped, unfolded) in [
+            ("measurement", measurement_subtree(&cfg), measurement),
+            (
+                "registration",
+                registration_subtree(&cfg),
+                registration_subtree_with_versions(&cfg, MEASURE_VERSION, ALIGN_VERSION),
+            ),
+            (
+                "normalization",
+                normalization_subtree(&cfg),
+                normalization_subtree_with_measure_version(&cfg, MEASURE_VERSION),
+            ),
+        ] {
+            assert!(
+                unfolded.get("measureStageVersion").is_none(),
+                "{name}: the unfolded helper holds no measure-stage key"
+            );
+            let mut expected = unfolded.clone();
+            fold_measure_stage_version(&mut expected, MEASURE_STAGE_VERSION);
+            assert_eq!(shipped, expected, "{name}: the shipped subtree is the unfolded one with the fold");
+            let mut at_one = unfolded.clone();
+            fold_measure_stage_version(&mut at_one, 1);
+            assert_eq!(at_one, unfolded, "{name}: folding 1 changes nothing");
+            let mut at_two = unfolded.clone();
+            fold_measure_stage_version(&mut at_two, 2);
+            assert_eq!(at_two["measureStageVersion"], serde_json::json!(2), "{name}");
+            assert_ne!(
+                stage_hash(&at_two, &[], &[]),
+                stage_hash(&unfolded, &[], &[]),
+                "{name}: folding 2 moves the stage hash"
             );
         }
     }

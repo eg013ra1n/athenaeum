@@ -16,8 +16,11 @@ use crate::fits_writer::bayer::Bayer;
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CfaChannel {
+    /// Red.
     R = 0,
+    /// Green.
     G = 1,
+    /// Blue.
     B = 2,
 }
 
@@ -49,8 +52,11 @@ impl CfaChannel {
 /// odd) — `h - 1 - y` and `h - 1 + y` are congruent modulo 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CfaGeometry {
+    /// The 2x2 Bayer pattern the sensor declares.
     pub pattern: Bayer,
+    /// The horizontal offset of the pattern in pixels (from `XBAYROFF`); only its value modulo 2 matters.
     pub xoff: i64,
+    /// The vertical offset of the pattern in pixels (from `YBAYROFF`); only its value modulo 2 matters.
     pub yoff: i64,
 }
 

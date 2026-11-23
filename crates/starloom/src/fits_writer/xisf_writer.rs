@@ -20,7 +20,7 @@
 //! computes the data position as `16 + headerLength` lands exactly on the
 //! attachment instead of having to trust the `location` attribute alone.
 //! The attachment itself starts on a 4096-byte boundary: nothing in the
-//! format requires it and the reader this crate ships does not care, but a
+//! format requires it and rustafits' reader does not care, but a
 //! block-aligned attachment is what other readers (and memory mapping) like,
 //! so the header is padded up to the next multiple.
 //!
@@ -41,11 +41,11 @@
 //! that `0:1` was the format's default; that was only OUR reader's
 //! default. The declared range is now the CALLER's own knowledge, passed
 //! in as [`super::XisfBounds`] rather than assumed here: a stacking master
-//! and a calibrated light are unit-scaled (`ATH_CSCL`, `XisfBounds::Unit`,
+//! and a calibrated light are unit-scaled (`XisfBounds::Unit`,
 //! `"0:1"`), while a built calibration master is raw ADU
 //! (`XisfBounds::Adu16`, `"0:65535"`) — the u16 domain the calibration
-//! engine and the scanner both expect back. Either way the reader this
-//! crate ships treats the declared bounds as the identity mapping the
+//! engine and the scanner both expect back. Either way rustafits'
+//! reader treats the declared bounds as the identity mapping the
 //! writer already applied. The range is a REPRESENTABLE range, not a
 //! clip: a saturated star core above the white point is a sample beyond
 //! it, which the format allows. Declaring the array's true min/max
@@ -171,10 +171,9 @@ pub fn xisf_keyword_value(card: &Card) -> (String, String) {
     (value, comment)
 }
 
-/// XML attribute escaping. `'` is deliberately left alone — every attribute
-/// here is delimited by `"`, and FITS string values are full of single
+/// Escapes a string for use as an XML attribute value in an XISF header (`&`, `<`, `>` and `"`). `'` is
+/// deliberately left alone — every attribute here is delimited by `"`, and FITS string values are full of single
 /// quotes, so escaping them would only make the header unreadable.
-#[doc(hidden)]
 pub fn escape_xml(s: &str) -> Cow<'_, str> {
     if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
         return Cow::Borrowed(s);
@@ -230,7 +229,7 @@ fn with_explicit_row_order(cards: &[Card]) -> Result<Cow<'_, [Card]>, FitsWriteE
 /// `MasterDark` rather than being left unmapped: its own `IMAGETYP` parser
 /// reads "Master Dark Flat" as unknown and then guesses FLAT from the file
 /// name, which is wrong for a dark flat. The `IMAGETYP` keyword itself keeps
-/// Athenaeum's own value either way — only this attribute changes what the
+/// the caller's own value either way — only this attribute changes what the
 /// external tool believes.
 fn image_type_for(cards: &[Card]) -> Option<&'static str> {
     let imagetyp = cards.iter().find(|c| c.keyword == "IMAGETYP")?;
@@ -362,7 +361,7 @@ fn header_prefix(
     ))
 }
 
-/// The stacking convention: unit-scaled samples (`ATH_CSCL`), `bounds="0:1"`.
+/// The stacking convention: unit-scaled (normalized) samples, `bounds="0:1"`.
 /// Always [`Durability::Durable`] — see [`write_xisf_f32_with`] for a caller
 /// that can afford to skip the fsync.
 pub fn write_xisf_f32(
@@ -374,29 +373,6 @@ pub fn write_xisf_f32(
     cards: &[Card],
 ) -> Result<(), FitsWriteError> {
     write_xisf_f32_with(path, width, height, channels, data, cards, XisfBounds::Unit, Durability::Durable)
-}
-
-/// [`write_xisf_f32`] with the `XISF:CreatorApplication` string as a parameter.
-pub fn write_xisf_f32_with_creator(
-    path: &Path,
-    width: usize,
-    height: usize,
-    channels: usize,
-    data: &[f32],
-    cards: &[Card],
-    creator: &str,
-) -> Result<(), FitsWriteError> {
-    write_xisf_f32_with_with_creator(
-        path,
-        width,
-        height,
-        channels,
-        data,
-        cards,
-        XisfBounds::Unit,
-        Durability::Durable,
-        creator,
-    )
 }
 
 /// Write an XISF file at `path`, replacing any existing file only after the
@@ -418,7 +394,7 @@ pub fn write_xisf_f32_with(
     bounds: XisfBounds,
     durability: Durability,
 ) -> Result<(), FitsWriteError> {
-    write_xisf_f32_with_with_creator(
+    write_xisf_f32_full(
         path,
         width,
         height,
@@ -431,8 +407,9 @@ pub fn write_xisf_f32_with(
     )
 }
 
-/// [`write_xisf_f32_with`] with the `XISF:CreatorApplication` string as a parameter.
-pub fn write_xisf_f32_with_with_creator(
+/// The one full form of the XISF file writer: [`write_xisf_f32_with`] with the `XISF:CreatorApplication` string as a
+/// parameter, every other parameter explicit.
+pub fn write_xisf_f32_full(
     path: &Path,
     width: usize,
     height: usize,
@@ -454,7 +431,7 @@ pub fn write_xisf_f32_with_with_creator(
     let write_result = (|| -> Result<(), FitsWriteError> {
         let f = std::fs::File::create(&tmp)?;
         let mut w = std::io::BufWriter::new(f);
-        write_xisf_f32_to_with_creator(&mut w, width, height, channels, data, cards, bounds, creator)?;
+        write_xisf_f32_to_full(&mut w, width, height, channels, data, cards, bounds, creator)?;
         w.flush()?;
         if durability == Durability::Durable {
             // Power-loss durability: data must be on disk before the rename
@@ -487,11 +464,12 @@ pub fn write_xisf_f32_to<W: Write>(
     cards: &[Card],
     bounds: XisfBounds,
 ) -> Result<(), FitsWriteError> {
-    write_xisf_f32_to_with_creator(w, width, height, channels, data, cards, bounds, STARLOOM_CREATOR)
+    write_xisf_f32_to_full(w, width, height, channels, data, cards, bounds, STARLOOM_CREATOR)
 }
 
-/// [`write_xisf_f32_to`] with the `XISF:CreatorApplication` string as a parameter.
-pub fn write_xisf_f32_to_with_creator<W: Write>(
+/// The one full form of the XISF streaming writer: [`write_xisf_f32_to`] with the `XISF:CreatorApplication` string as
+/// a parameter.
+pub fn write_xisf_f32_to_full<W: Write>(
     mut w: W,
     width: usize,
     height: usize,
@@ -544,7 +522,7 @@ mod tests {
     use super::*;
 
     /// The brief's four card shapes: a string, a real, an integer and a
-    /// logical (`SIMPLE` itself is reserved, so the logical is `ATH_TEST`).
+    /// logical (`SIMPLE` itself is reserved, so the logical is a test keyword).
     fn sample_cards() -> Vec<Card> {
         vec![
             Card::new("OBJECT", CardValue::Str("LDN 1272".into()))
@@ -990,7 +968,7 @@ mod tests {
         text[start..start + text[start..].find('"').expect("the property value is closed")].to_string()
     }
 
-    /// The plain writer names the library; a `_with_creator` writer names its caller's string.
+    /// The plain writer names the library; the full form names its caller's string.
     #[test]
     fn starloom_xisf_creator_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -1000,7 +978,7 @@ mod tests {
         assert_eq!(creator_of(&plain), STARLOOM_CREATOR);
         assert!(creator_of(&plain).starts_with("starloom "));
         let custom = dir.path().join("custom.xisf");
-        write_xisf_f32_with_creator(&custom, 4, 4, 1, &data, &[], "x 1").unwrap();
+        write_xisf_f32_full(&custom, 4, 4, 1, &data, &[], XisfBounds::Unit, Durability::Durable, "x 1").unwrap();
         assert_eq!(creator_of(&custom), "x 1");
     }
 }

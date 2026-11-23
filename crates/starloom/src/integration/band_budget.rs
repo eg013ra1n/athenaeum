@@ -16,9 +16,9 @@ pub const MIN_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// that the budget buys nothing an integration can spend.
 pub const MAX_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
-/// Used when the RAM probe fails. Measured at 101.2 s against the old
-/// constant's 241.6 s on the profiled set, and safe on any machine with the
-/// 8 GB a 26 Mpx pipeline already needs.
+/// The budget, in bytes (1 GiB), the caller's budget policy takes when [`total_ram_bytes`] returns `None`. Measured at
+/// 101.2 s against the old constant's 241.6 s on the profiled set, and safe on any machine with the 8 GB a 26 Mpx
+/// pipeline already needs.
 pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Bounds for an explicitly configured `integration.band_budget_mb`. The
@@ -41,15 +41,15 @@ const CONFIGURED_MAX_MB: usize = 16384;
 /// re-exported so every caller compiles as is.
 pub use crate::sys::total_ram_bytes;
 
-/// `0` is the auto sentinel; anything else is clamped to a sane window.
-#[doc(hidden)]
+/// Clamps the configured integration memory budget, in MB (1 MB = 1,048,576 bytes), to 256..=16384 MB; `0` means
+/// auto and returns `None`. The result is the window the backend honours, in MB.
 pub fn clamp_configured_mb(mb: usize) -> Option<usize> {
     if mb == 0 { None } else { Some(mb.clamp(CONFIGURED_MIN_MB, CONFIGURED_MAX_MB)) }
 }
 
-/// Split the machine-wide budget across the builds the compute queue may admit
-/// at once, never below the old constant.
-#[doc(hidden)]
+/// Splits the machine-wide memory budget across the builds the compute queue may admit
+/// at once, never below [`MIN_BUDGET_BYTES`] (256 MiB). `total` is in bytes, `max_concurrent` a count of builds
+/// (0 counts as 1), and the answer is in bytes.
 pub fn per_job_budget(total: usize, max_concurrent: usize) -> usize {
     (total / max_concurrent.max(1)).max(MIN_BUDGET_BYTES)
 }

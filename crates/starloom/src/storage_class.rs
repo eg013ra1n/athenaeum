@@ -1,12 +1,7 @@
 //! Which kind of storage a set of frames lives on, and how many reads to keep
 //! in flight against it.
 //!
-//! Ungated (wave-3 fold-in, collab Task 8 fix round 1): originally lived at
-//! `integration::storage_class`, but `integration` is behind the `render`
-//! feature and `collab::storage::sweep` — ungated — needs the same,
-//! already-tested platform detection for its network-volume sweep cadence
-//! rather than a second, weaker copy. `integration::storage_class` re-exports
-//! from here so every existing caller keeps compiling unchanged.
+//! Part of the base layer (no feature needed): `integration::storage_class` re-exports it for the engine's callers.
 //!
 //! **Two classes, not three.** The obvious third — rotational vs solid state —
 //! is deliberately absent. The profiled 7200 rpm SATA drive got *faster* with
@@ -21,6 +16,7 @@
 //! probe: a probe is non-deterministic, spends its first bands on a knowingly
 //! wrong setting, and would be auto-tuning the smaller of the two levers.
 
+/// The kind of storage a set of frames lives on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageClass {
     /// Anything the OS calls local: internal or attached, rotating or solid.

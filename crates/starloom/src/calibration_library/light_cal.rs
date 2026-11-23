@@ -16,7 +16,7 @@
 //! `scale_divisor` is the SOURCE's bit-depth maximum
 //! ([`scale_divisor_for_bitpix`], resolved by the caller — `65535.0` for the
 //! common 16-bit case, `1.0` for an already-physical float source) so the
-//! output lands in ~[0,1] whatever the light was stored as; and
+//! output lands in about 0 to 1 whatever the light was stored as; and
 //! `pedestal_dn` (advanced param, default 0 = off) is a DN offset added AFTER
 //! the scale divide for consumers that clip negatives.
 //!
@@ -33,7 +33,7 @@
 //! [`IntegrationError::BadInput`].
 //!
 //! This module owns only the pixel math + file write. The header card list is
-//! built by `light_headers` (Task 5) and handed
+//! built by the caller and handed
 //! in via [`LightCalInputs::cards`]; the output path is resolved by the
 //! orchestration layer.
 
@@ -103,7 +103,7 @@ pub fn scale_divisor_for_bitpix(bitpix: Option<i32>) -> f64 {
 /// stacking tools floor this division the same way and count the hits.
 ///
 /// The floor's reach is mode-dependent: with flat normalization ON the
-/// denominator is `flat / ATH_FNRM` (values around 1.0, so the floor only
+/// denominator is `flat / <global normalization constant>` (values around 1.0, so the floor only
 /// catches genuinely dead/negative pixels), while with normalization OFF the
 /// denominator is the RAW flat value — at typical flat levels nothing but a
 /// zero, negative, or non-finite pixel can reach it. So
@@ -118,14 +118,18 @@ pub const FLAT_DENOM_FLOOR: f64 = 2.0e-5;
 /// `dark_path`/`bias_path` are the master subtrahend candidates — a dark is
 /// preferred when both are present (raw-master-dark convention removes bias
 /// and dark in one subtraction). `flat_path` is the illumination master.
-/// `cards` is the fully-built output header (from Task 5's header builder);
+/// `cards` is the fully-built output header (from the caller's header builder);
 /// the engine writes it through verbatim and makes no assumptions about it.
 pub struct LightCalInputs {
+    /// The light frame to calibrate (FITS or XISF).
     pub light_path: PathBuf,
+    /// The master dark, in raw sensor DN, subtracted when present; preferred over the bias when both are given.
     pub dark_path: Option<PathBuf>,
+    /// The master bias, in raw sensor DN, subtracted only when there is no dark.
     pub bias_path: Option<PathBuf>,
+    /// The master flat (DN) that corrects the light's illumination; `None` skips the flat division.
     pub flat_path: Option<PathBuf>,
-    /// Normalize the master flat by its `ATH_FNRM` constant (spec §2 toggle,
+    /// Normalize the master flat by its global normalization constant (spec §2 toggle,
     /// default on). `false` → plain division by the flat as stored.
     pub flat_norm: bool,
     /// Which statistic computes the normalization divisor when `flat_norm` is on
@@ -149,13 +153,16 @@ pub struct LightCalInputs {
     /// agnostic to it.
     pub params: LightCalParams,
     /// Divisor applied AFTER the calibration arithmetic to bring the output to
-    /// ~[0,1] — the light source's own bit-depth maximum, resolved by the
+    /// about 0 to 1 — the light source's own bit-depth maximum, resolved by the
     /// caller via [`scale_divisor_for_bitpix`] (the engine never re-reads the
-    /// source header for it) and stamped as `ATH_CSCL` by the header builder,
+    /// source header for it) and recorded in the output header by the caller's header builder,
     /// so the written card and the applied value are the same number.
     pub scale_divisor: f64,
+    /// Where the calibrated file is written (by the write phase; the compute phase never touches it).
     pub output_path: PathBuf,
+    /// The complete output header, written through verbatim.
     pub cards: Vec<Card>,
+    /// A folder for the spill files of source formats that must be decoded to disk before they can be band-read.
     pub scratch_dir: PathBuf,
 }
 
@@ -171,20 +178,27 @@ pub struct LightCalInputs {
 /// back to `Global`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FlatNormDivisor {
+    /// One constant for the whole plane, in the flat's own units (DN for a raw flat).
     Global(f64),
-    PerChannel { geom: CfaGeometry, k: [f64; 3] },
+    /// One constant per mosaic color, in the flat's own units (DN for a raw flat).
+    PerChannel {
+        /// The light's mosaic phase the constants were measured under.
+        geom: CfaGeometry,
+        /// The constants for red, green and blue, in that order.
+        k: [f64; 3]
+    },
 }
 
 impl FlatNormDivisor {
     /// The single number that describes this divisor for the tracking row and
-    /// the `ATH_CFNM` card: the constant itself in `Global` mode, and in
+    /// the caller's header stamp of the applied divisor: the constant itself in `Global` mode, and in
     /// `PerChannel` mode the constants blended **by their share of the mosaic** —
     /// `(R + 2G + B) / 4`, since a Bayer cell is half green. That weighting is
     /// what makes the number continuous with the global constant it stands in
     /// for: the global central-third mean averages the window's pixels, which
     /// are green half the time, so an unweighted `(R+G+B)/3` would sit somewhere
     /// the global path never produces. Per-channel runs also stamp the three
-    /// constants individually (`ATH_CFNR`/`ATH_CFNG`/`ATH_CFNB`), so this
+    /// constants individually, so this
     /// remains a continuity value, not the whole story.
     pub fn global_value(self) -> f64 {
         match self {
@@ -201,6 +215,7 @@ impl FlatNormDivisor {
         }
     }
 
+    /// Whether this divisor holds one constant per CFA color rather than one for the whole plane.
     pub fn is_per_channel(self) -> bool {
         matches!(self, FlatNormDivisor::PerChannel { .. })
     }
@@ -211,11 +226,11 @@ impl FlatNormDivisor {
 pub struct LightCalOutcome {
     /// Applied-state flags (`"BDF"`, `"BF"`, `"BD"`, `"B"`, `"F"`).
     pub calstat: String,
-    /// Divisor actually used for flat normalization: the `ATH_FNRM` value when
+    /// Divisor actually used for flat normalization: the flat's global normalization constant when
     /// normalization was on, else `1.0` (also `1.0` when no flat was applied).
     /// In per-channel mode this is the mosaic-weighted blend of the three
     /// channel constants ([`FlatNormDivisor::global_value`]) — the
-    /// global-equivalent number, kept so the row column and the `ATH_CFNM` card
+    /// global-equivalent number, kept so the row column and the caller's header stamp
     /// mean the same thing in both modes.
     pub flat_norm_divisor: f64,
     /// The `[R, G, B]` constants when the flat was normalized per CFA channel,
@@ -255,8 +270,12 @@ pub struct LightCalOutcome {
 /// several hands its own buffer straight to `write_calibrated_output`, which
 /// takes the channel count as a parameter for exactly that reason.
 pub struct CalibratedFrame {
+    /// Frame width, in pixels.
     pub width: usize,
+    /// Frame height, in pixels.
     pub height: usize,
+    /// The calibrated samples, normalized (DN over the scale divisor, negatives kept), row-major, `width * height`
+    /// long.
     pub data: Vec<f32>,
 }
 
@@ -267,8 +286,12 @@ pub struct CalibratedFrame {
 /// now fails the geometry check below instead of passing a length-only
 /// comparison.
 pub struct PreloadedPlane {
+    /// The master's decoded plane, in DN, row-major, `width * height` long; shared so every frame of a group reads
+    /// one copy.
     pub data: Arc<Vec<f32>>,
+    /// Width of the decoded plane, in pixels.
     pub width: usize,
+    /// Height of the decoded plane, in pixels.
     pub height: usize,
 }
 
@@ -279,6 +302,7 @@ pub struct PreloadedPlane {
 /// `(width, height)` matches the light's own, and reads the file itself
 /// otherwise.
 pub struct PreloadedMasters {
+    /// The decoded master planes, keyed by the master's file path.
     pub planes: HashMap<PathBuf, PreloadedPlane>,
 }
 
@@ -362,9 +386,12 @@ pub fn calibrate_light_compute_with_cards(
     calibrate_light_compute_budgeted(inputs, preloaded, cancel, MIN_BUDGET_BYTES, cards)
 }
 
-/// [`calibrate_light_compute_with_cards`] with the band-memory budget as a
-/// parameter, so a caller can force a multi-band run on a small fixture.
-#[doc(hidden)]
+/// Calibrates one light frame like [`calibrate_light_compute_with_cards`], with the band-memory budget as a
+/// parameter (`band_budget_bytes`, in bytes), so a caller can force a multi-band run on a small fixture.
+///
+/// Runs on the calling thread, takes no pool and spawns no thread (its band reads run at concurrency 1). A source
+/// that must be decoded first (XISF, or a FITS with more than one plane) is decoded with rayon iterators on the
+/// caller's current rayon pool, so it is safe to call from inside that pool.
 pub fn calibrate_light_compute_budgeted(
     inputs: &LightCalInputs,
     preloaded: Option<&PreloadedMasters>,
@@ -605,7 +632,7 @@ pub fn calibrate_light_compute_budgeted(
 /// 3. the mode is [`FlatNormMode::CentralThird`] — `TrimmedMeanWhole` is a
 ///    whole-frame tool-parity statistic and is left alone (`debug!`),
 /// 4. the three constants hold up as divisors, resolved in this order:
-///    a. the master flat's stamped `ATH_FNR`/`ATH_FNG`/`ATH_FNB` cards — all
+///    a. the master flat's stamped per-channel constants (R, G and B) — all
 ///       three finite and > 0, AND the flat's own declared mosaic phase (the
 ///       phase they were measured under) agreeing with the light's, else
 ///    b. recomputed from the flat's own pixels over the same central-third
@@ -617,10 +644,10 @@ pub fn calibrate_light_compute_budgeted(
 /// a master flat can be hundreds of megabytes. The card path reads no pixels at
 /// all, and the recompute path reads the plane exactly once — the same cost the
 /// global constant already paid for a card-less flat. One case does get slower
-/// than before: an Athenaeum master built BEFORE the per-channel cards existed
-/// carries `ATH_FNRM` but not `ATH_FNR/G/B`, so a CFA run recomputes from its
-/// pixels for every light instead of reading one card. Rebuilding that master
-/// stamps the cards and the reads go away; a master built since always has them.
+/// than before: a master flat built BEFORE the per-channel constants were stamped
+/// carries only the global constant, so a CFA run recomputes from its
+/// pixels for every light instead of reading a stamped value. Rebuilding that master
+/// stamps the constants and the reads go away; a master built since always has them.
 pub fn resolve_flat_norm_divisor(
     flat_path: &Path,
     scratch_dir: &Path,
@@ -691,13 +718,13 @@ pub fn resolve_flat_norm_divisor_with(
 
 /// The flat-normalization divisor for `flat_path` under `mode` (spec §2):
 ///
-/// - [`FlatNormMode::CentralThird`] (default, Athenaeum convention): read the
-///   `ATH_FNRM` card an Athenaeum-built master stamps, or — for a flat imported
-///   without it — recompute the central-third mean on the fly.
+/// - [`FlatNormMode::CentralThird`] (default): read the global normalization
+///   constant stamped on the master flat, or — for a flat imported
+///   without one — recompute the central-third mean on the fly.
 /// - [`FlatNormMode::TrimmedMeanWhole`] (whole-frame parity statistic): a
 ///   two-sided trimmed mean over the WHOLE frame (`trim_fraction` per tail, default
-///   [`TRIMMED_MEAN_TAIL_FRACTION`]). ALWAYS computed from the flat file; the `ATH_FNRM`
-///   card is ignored.
+///   [`TRIMMED_MEAN_TAIL_FRACTION`]). ALWAYS computed from the flat file; a stamped
+///   constant is ignored.
 ///
 /// `trim_fraction` is only consulted in `TrimmedMeanWhole` mode (the
 /// central-third path never trims); callers in central-third mode may pass
@@ -705,7 +732,7 @@ pub fn resolve_flat_norm_divisor_with(
 ///
 /// Whatever the mode, the resolved constant must be finite and strictly
 /// positive to serve as a divisor — anything else is
-/// [`IntegrationError::BadInput`]. An `ATH_FNRM` card that fails that test
+/// [`IntegrationError::BadInput`]. A stamped constant that fails that test
 /// counts as absent and falls through to recomputation.
 ///
 /// Both paths band-read the flat one row-band at a time, so memory stays

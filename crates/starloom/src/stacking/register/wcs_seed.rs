@@ -1,5 +1,5 @@
-//! The constants and the pure radius rule of the plate-solve seed (Athenaeum core keeps `seed_from_solves`, which
-//! reads a stored plate solve).
+//! The constants and the pure radius rule of the plate-solve seed (`seed_from_solves`, which reads a stored plate
+//! solve, belongs to the caller).
 
 /// The seed samples a `WCS_SEED_GRID` x `WCS_SEED_GRID` grid of subject
 /// pixels. 25 points over-determine the 6 affine parameters comfortably

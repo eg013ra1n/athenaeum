@@ -19,8 +19,15 @@ use crate::integration::cfa::CfaGeometry;
 use crate::integration::IntegrationError;
 use crate::models::FileFormat;
 
-pub use starloom::calibration_library::light_cal::*;
-// The engine version stays in `models` (spec SL-19); the shared parameter types come through the glob above.
+// By name: the flat-card reader seam and its card-less forms (`FlatCardReader`, `NoFlatCards`, the `_with` and
+// `_with_cards` entry points, the budgeted compute) stay out, so no light-calibration entry point without Athenaeum's flat
+// cards resolves under this path. The wrappers below carry the cards.
+pub use starloom::calibration_library::light_cal::{
+    flat_corner_ratio, preload_master_plane, scale_divisor_for_bitpix, BiasFallback, CalibratedFrame, FlatNormDivisor,
+    FlatNormMode, LightCalInputs, LightCalOutcome, LightCalParams, PreloadedMasters, PreloadedPlane, FLAT_DENOM_FLOOR,
+    OUTPUT_SCALE_DIVISOR, TRIMMED_MEAN_TAIL_FRACTION,
+};
+// The engine version stays in `models` (spec SL-19); the shared parameter types come through the list above.
 pub use crate::models::LIGHT_CAL_ENGINE_VERSION;
 
 /// Reads a master flat's stamped normalization constants from Athenaeum's own cards. Handed to starloom's math,

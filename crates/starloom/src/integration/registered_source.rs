@@ -21,7 +21,10 @@ use super::IntegrationError;
 use crate::geometry::PixelMap;
 use crate::resample::{source_window, warp_rows, Interpolation, Plane, SourceWindow};
 
+/// A calibrated frame and the mapping that registers it: it is warped into the reference geometry on the fly as it
+/// is read.
 pub struct RegisteredFrame {
+    /// The calibrated frame's file.
     pub path: PathBuf,
     /// Subject → reference mapping (its inverse is what the warp uses).
     pub map: PixelMap,
@@ -50,10 +53,14 @@ pub struct RegisteredFrame {
 /// any other corrupt input; the Register stage's own freshness check is
 /// what keeps a truncated artifact from reaching this source at all.
 pub struct MaterializedFrame {
+    /// The materialized registered file (already warped into the reference geometry); `None` when none is expected,
+    /// so the frame is warped from `fallback` instead.
     pub registered_path: Option<PathBuf>,
     /// The frame's catalog id, carried only for the fallback `warn!`
     /// below — never used to key the read itself.
     pub frame_id: Option<i64>,
+    /// The calibrated frame in its own geometry and its mapping, used when the registered file is absent, unreadable
+    /// or of the wrong size.
     pub fallback: RegisteredFrame,
 }
 
@@ -66,6 +73,8 @@ enum FrameKind {
     Warped(PixelMap),
 }
 
+/// A set of calibrated frames served as one band source in the reference geometry, each either read verbatim from
+/// its materialized registered file or warped on the fly. Reads one plane at a time.
 pub struct RegisteredSource {
     frames: Vec<(PlaneReader, FrameKind)>,
     width: usize,
@@ -99,6 +108,7 @@ pub struct RegisteredSource {
 /// deliberately breaks a registered artifact mid-run, so the contention
 /// risk the lock adds is not exercised in practice.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub mod fallback_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -322,7 +332,7 @@ impl RegisteredSource {
     /// drizzle's forward grids on the acceptance run.
     ///
     /// A no-op for linear and polynomial maps, which have no grids, and for
-    /// a [`FrameKind::Materialized`] entry, which has no map to release at
+    /// a `FrameKind::Materialized` entry, which has no map to release at
     /// all (it never warps).
     pub fn release_grids(&self) -> usize {
         self.frames
@@ -334,9 +344,11 @@ impl RegisteredSource {
             .sum()
     }
 
+    /// The number of planes the frames have: 1 for mono, 3 for color.
     pub fn channels(&self) -> usize {
         self.channels
     }
+    /// The plane of the frames this source currently serves.
     pub fn plane(&self) -> usize {
         self.plane
     }

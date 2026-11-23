@@ -314,7 +314,7 @@ fn drop_half_diag_at(
 
 /// The half-diagonal, in OUTPUT pixels, of ONE source pixel's mapped
 /// drop under `map` — a PER-FRAME constant (the drop's mapped SHAPE, not
-/// its position) [`crate::stacking::drizzle::deposit_band`]'s early skip
+/// its position) `crate::stacking::drizzle::deposit_band`'s early skip
 /// (Tier A task 11, Z1) uses to reject a source pixel whose mapped drop
 /// cannot possibly touch the current output band, before doing any of
 /// the per-pixel work that follows (the rejection-bitmap lookup, the LN
@@ -334,14 +334,14 @@ fn drop_half_diag_at(
 ///
 /// This now SAMPLES the drop's mapped half-diagonal at 29 points spread
 /// across the frame's own `[0, width) x [0, height)` extent — a 5x5 grid
-/// at [`HALF_DIAG_SAMPLE_FRACS`]'s fractional positions of
+/// at `HALF_DIAG_SAMPLE_FRACS`'s fractional positions of
 /// `(width - 1, height - 1)` (25 points, deliberately INSIDE the exact
 /// edges) plus the four EXACT corners (4 points) — through
 /// [`PixelMap::forward_exact`] (never the grid-cached [`ForwardEval`]
 /// this same drop math still uses for the real per-pixel deposit — this
 /// runs once per frame, not once per pixel, so the O(nodes) exact path
 /// costs nothing measurable; see the task report for the measured µs),
-/// and takes the MAX over all 29, padded by [`DEPOSIT_SKIP_MARGIN_PX`].
+/// and takes the MAX over all 29, padded by `DEPOSIT_SKIP_MARGIN_PX`.
 ///
 /// **Exact for Similarity/Affine.** `map.forward_exact(x, y) =
 /// linear.apply(x, y) + displacement(...)`; with no distortion layer and
@@ -359,7 +359,7 @@ fn drop_half_diag_at(
 /// distortion layer.** The drop's mapped shape can vary smoothly between
 /// the 29 sample points, so the TRUE max over the whole frame could in
 /// principle exceed the sampled max by an amount related to the map's
-/// second derivative between samples. [`DEPOSIT_SKIP_MARGIN_PX`] covers
+/// second derivative between samples. `DEPOSIT_SKIP_MARGIN_PX` covers
 /// that gap for every real registration this crate has measured — see
 /// its own doc for the numbers, and the exhaustive skip-safety test for
 /// two stress cases (a homography with a projective row two orders of
@@ -378,7 +378,7 @@ fn drop_half_diag_at(
 /// affordable at 29-samples-per-frame, not width x height-per-frame). The
 /// two can disagree by the displacement grid's own interpolation error
 /// against the exact evaluator, which is ≪ 0.1 px (the TPS hold-out rms
-/// cited above) — well inside [`DEPOSIT_SKIP_MARGIN_PX`], so the bound
+/// cited above) — well inside `DEPOSIT_SKIP_MARGIN_PX`, so the bound
 /// measured here still covers the drop shape `deposit_band` actually
 /// evaluates.
 pub fn drop_bound_half_diag(
@@ -420,7 +420,7 @@ pub fn drop_bound_half_diag(
 }
 
 /// The Tier A task 11 (Z1) band-skip predicate
-/// [`crate::stacking::drizzle::deposit_band`] uses: true when a drop
+/// `crate::stacking::drizzle::deposit_band` uses: true when a drop
 /// whose mapped centroid is at output row `oy` and whose half-diagonal
 /// is `half_diag` CANNOT touch the band's own continuous row extent
 /// `[band_y_lo, band_y_hi]` at all — see `deposit_band`'s own comment at
@@ -600,7 +600,10 @@ fn clip_half_plane(
 /// weights summing to `drop_shrink²`.
 #[derive(Debug, Clone)]
 pub struct KernelTable {
+    /// Sub-drop centre offsets from the pixel centre, in source pixels, one `(dx, dy)` per micro-drop (256
+    /// entries).
     pub offsets: Vec<(f64, f64)>,
+    /// Micro-drop weights, unitless, parallel to `offsets`; they sum to `drop_shrink²` (source-pixel area).
     pub weights: Vec<f64>,
 }
 

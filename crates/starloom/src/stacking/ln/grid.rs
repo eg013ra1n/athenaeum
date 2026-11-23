@@ -5,6 +5,8 @@
 //! for image resampling, reused here rather than re-derived. `LnFrameGrids`
 //! is one frame's grids (one per channel) and the `.athln` binary sidecar
 //! they round-trip through.
+//! The extension `.athln` and the `ATHLN` magic are historical names, kept so
+//! that sidecars already on disk keep reading.
 //!
 //! Boundary handling: a tap that falls outside `[0, gw-1]`/`[0, gh-1]` is
 //! NOT the last real node's value repeated — it is linearly extrapolated
@@ -47,6 +49,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::resample::kernels::Interpolation;
 
+/// The 8 bytes every sidecar starts with (`ATHLN`, a historical name kept for the format).
 const MAGIC: &[u8; 8] = b"ATHLN\0\0\0";
 const VERSION: u32 = 1;
 /// The `.athln` sidecar version, public for the dependent crate's version tripwire.
@@ -73,19 +76,30 @@ const MAX_CHANNELS: u32 = 8;
 /// own pixel; it does not, by design.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LnGrid {
+    /// Width of the reference plane the grid covers, in pixels.
     pub ref_width: usize, // reference geometry the grid covers
+    /// Height of the reference plane the grid covers, in pixels.
     pub ref_height: usize,
+    /// The LN scale in pixels (for example 1024); the node spacing is `scale / 8` pixels.
     pub scale: u32,        // the LN scale (1024); stride = scale / 8
+    /// Node columns: `ceil((ref_width - 1) / stride) + 1`.
     pub gw: usize,         // grid columns = ceil((ref_width - 1) / stride) + 1 (Self::node_count)
+    /// Node rows: `ceil((ref_height - 1) / stride) + 1`.
     pub gh: usize,         // grid rows = ceil((ref_height - 1) / stride) + 1 (Self::node_count)
+    /// Local scale at each node, unitless, `gw × gh` row-major; a pixel becomes `a · v + b`.
     pub a: Vec<f32>,       // gw × gh, row-major — local scale
+    /// Local zero offset at each node, in normalized units, `gw × gh` row-major.
     pub b: Vec<f32>,       // gw × gh — local zero offset
+    /// The frame's global relative scale from the star-flux method, unitless.
     pub global_scale: f64, // s from the PSF method
+    /// Median of the reference plane, in normalized units.
     pub location_ref: f64, // median of the reference plane
+    /// Median of the target (this frame's) plane, in normalized units.
     pub location_tgt: f64, // median of the target plane
 }
 
 impl LnGrid {
+    /// Spacing between grid nodes in pixels: `scale / 8`, never below 2.
     pub fn stride(&self) -> usize {
         (self.scale / 8).max(2) as usize
     }
@@ -109,6 +123,8 @@ impl LnGrid {
         )
     }
 
+    /// A grid over a `ref_width × ref_height` reference with every node set to scale `a` and offset `b`
+    /// (normalized units), global scale 1 and both locations 0.
     pub fn constant(ref_width: usize, ref_height: usize, scale: u32, a: f32, b: f32) -> LnGrid {
         let stride = (scale / 8).max(2) as usize;
         let gw = Self::node_count(ref_width, stride);
@@ -282,6 +298,7 @@ impl LnGrid {
         }
     }
 
+    /// Applies one node's correction to a pixel value `v` in normalized units: `a · v + b`.
     #[inline]
     pub fn apply(a: f32, b: f32, v: f32) -> f32 {
         a * v + b
@@ -336,6 +353,7 @@ impl LnScratch {
 /// rather than silently taking the first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LnFrameGrids {
+    /// One grid per channel (mono: one, colour: R, G, B); all share one reference geometry and scale.
     pub channels: Vec<LnGrid>,
 }
 
@@ -460,7 +478,7 @@ impl LnFrameGrids {
     /// trailer is checked BEFORE any field is interpreted, so any single
     /// flipped byte anywhere in the payload is refused rather than
     /// silently parsed into a wrong value. Every error path is logged
-    /// (path + error) before returning — see [`Self::read_inner`] for the
+    /// (path + error) before returning — see `Self::read_inner` for the
     /// actual parse.
     pub fn read(path: &Path) -> Result<LnFrameGrids> {
         Self::read_inner(path).map_err(|e| {
