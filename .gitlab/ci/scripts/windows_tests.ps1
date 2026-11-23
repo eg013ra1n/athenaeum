@@ -1,5 +1,6 @@
-# test:windows (.gitlab-ci.yml): the Windows test run of GitHub CI's
-# "Build and test (Windows)" job, on a wintest/<name> branch, before main.
+# test:windows (.gitlab-ci.yml): GitHub CI's "Build and test (Windows)" job,
+# run on EVO-X2: test/<name> and wintest/<name> branches, and release tags
+# (deploy needs it). GitHub itself runs that job by hand only.
 #
 # The commands are read from this commit's own .github/workflows/ci.yml, never
 # restated here, so the two runs cannot drift: every top-level `env:` entry,

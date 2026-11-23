@@ -7,10 +7,12 @@
 
 The procedure is the `release` skill (`.claude/skills/release/SKILL.md`): notes
 (`RELEASE_NOTES.md` is the blog post), `scripts/release/bump.sh`, a release
-commit that holds only notes + the seven version files + `Cargo.lock`, push, green
-GitHub run, tag. The tag pipeline (`.gitlab-ci.yml`) runs
-`gate → build → deploy → publish → verify → announce`: it refuses a tag whose
-versions or GitHub checks are not green, uploads to `artfrom.space/builds/<tag>/`
+commit that holds only notes + the seven version files + `Cargo.lock`, a green
+`test/<version>` pipeline on our own runners, push, tag. The tag pipeline
+(`.gitlab-ci.yml`) runs `gate → build → deploy → publish → verify → announce`:
+it refuses a tag whose versions disagree, runs the tests again (`test:linux` on
+the Linux VM, `test:windows` on EVO-X2) and uploads nothing until they and
+`check:headless-core` are green, uploads to `artfrom.space/builds/<tag>/`
 under the one naming scheme (`.gitlab/ci/scripts/artifact_names.sh`), publishes
 Docker Hub and the docs site (post + download page generated from the notes),
 fetches all of it back, and only then creates the GitLab Release, `version.json`

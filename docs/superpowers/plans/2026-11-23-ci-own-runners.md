@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (the owner runs this natively). The `lean-execution` skill overrides it wherever the two conflict. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Athenaeum's tests run on our own hardware: Linux on the astrodb VM (GitLab runner), Windows on EVO-X2. A `test/<name>` branch runs both before `main`, a release tag runs both again and the release waits for them; GitHub Actions runs only on pull requests.
+**Goal:** Athenaeum's tests run on our own hardware: Linux on the astrodb VM (GitLab runner), Windows on EVO-X2. A `test/<name>` branch runs both before `main`, a release tag runs both again and the release waits for them; GitHub Actions runs only by hand.
 
 **Architecture:**
 - **One source of commands.** `.github/workflows/ci.yml` stays the only place the test commands are written. GitHub runs it on `pull_request` only; the GitLab jobs read their commands from it, as `test:windows` already does (`.gitlab/ci/scripts/windows_tests.ps1`), so the runs cannot drift.
@@ -19,7 +19,7 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 
 | ID | Ruling | Task |
 | ---- | ---- | ---- |
-| CI-R1 | `ci.yml` triggers on `pull_request` only (`paths-ignore` kept). It no longer runs on a `push` to `main` or on a tag. Its two jobs stay, so PRs and the GitLab readers share one command list. The `rust` paths filter gains `'starloom'`, `'rustafits'`, `'solvemyastro'` and `.gitmodules`, so a gitlink-only Dependabot PR runs the Rust jobs. | 2 |
+| CI-R1 | **Owner, 2026-11-23: option A.** `ci.yml` triggers on `workflow_dispatch` only, so GitHub runs nothing by itself, PRs included. Its two jobs stay as the one command list the GitLab readers use. An outside PR is read first, then pushed to GitLab as `test/pr-<number>`: unread code never runs on our runners, which sit on the home network and hold deploy keys on tags. A Dependabot bump PR is a signal; it is tested as a `test/*` branch like any change. The `rust` paths filter additions stay for a PR trigger restored later. | 2, 5 |
 | CI-R2 | A `test/<name>` branch pipeline is `test:linux` plus `test:windows`, in parallel on our runners, and nothing else (`check:headless-core` gains `except: /^test\//`; `test:linux` runs the same check). `wintest/<name>` stays a Windows-only alias. | 3 |
 | CI-R3 | On a `v*` tag, the pipeline also runs `test:linux` and `test:windows`. `deploy` `needs` both, plus `check:headless-core` (today it gates only through `gate:tests`). `gate:tests`, `github_checks_gate.sh`, its `run_tests.sh` section and fixtures are deleted. The release green-check rule: the tagged commit's `test/<name>` pipeline was green before tagging, and the tag pipeline's own tests gate the deploy. A red test job on a tag is retried, never bypassed: no `allow_failure`, no `optional: true`. The `GATE_REQUIRED_CHECKS` override that v0.7.1 used disappears. Whether a deliberate bypass variable should exist is the owner's call; default: none. | 4, 5 |
 | CI-R4 | **Owner, 2026-11-23: one runner, two tags.** The VM has 8 vCPU and 12 GB, too little for a test run beside a release compile (v0.7.1's `build:linux` already OOM'd on 3.9 GB). The existing runner (GitLab runner 2, `ubuntu24-linux`) gets the tag `linux-test` beside `linux` and keeps running one job at a time. `test:linux` keeps its own tag, so a later second runner needs no YAML change. A `test/*` pipeline runs the Linux tests alone; on a tag they queue with the release builds, and the release gets longer by their time. | owner, 3 |
@@ -31,7 +31,8 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 ## Owner tasks (before Task 1)
 
 1. **Done 2026-11-23.** The VM (astrolinux-runner1, 192.168.31.173, SSH `astrolinux`) has 8 vCPU, 12 GB RAM and 300 GB disk. `/` is grown to 294 GB with 232 GB free. Checked: `ulimit -u` is 41466 and PyYAML is installed.
-2. **Tag `linux-test` on runner 2** (`ubuntu24-linux`): in GitLab, Admin → CI/CD → Runners → edit → Tags `linux, linux-test`. Or the controller does it through the API on the owner's yes: `PUT /api/v4/runners/2` with `tag_list=linux,linux-test`. Nothing else changes on the VM: `concurrent` stays 1.
+2. **Tag `linux-test` on runner 2** (`ubuntu24-linux`): in GitLab, Admin → CI/CD → Runners → edit → Tags `linux, linux-test`. Or the controller does it through the API on the owner's yes: `PUT /api/v4/runners/2` with `tag_list=linux,linux-test`. `concurrent` stays 1.
+3. **`output_limit = 65536` in runner 2's `[[runners]]` block** of `/etc/gitlab-runner/config.toml` (the runner reloads the file itself). The first `test:linux` run hit the default 4 MB log cap inside the core suite, as EVO-X2's `test:windows` once did: without it a failing run shows no `test result:` lines. (Dropped by mistake when owner task 2 became one runner; restored 2026-11-23.)
 
 ## Global Constraints
 
@@ -46,14 +47,14 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 2. **The Linux run reads the same commands as GitHub's job** (CI-R5; Task 3 step 4 compares the log with `ci.yml`).
 3. **Ceilings on the VM:** `ulimit -u` ≥ 4 096 (the core suite peaks at about 1 650 threads), PyYAML present (Task 1 probe).
 4. **Runner contention:** the one Linux runner never runs two jobs, so a test run and a release compile never share the 12 GB (Task 3 step 5).
-5. **Dependabot and outside PRs** still get the GitHub checks, gitlink-only ones included (CI-R1, Task 2 step 3).
+5. **Outside and Dependabot PRs** get no automatic check (CI-R1): the skills say how to test one (`test/pr-<number>` after reading it).
 
 ## File structure
 
 | Path | Change | Task |
 | ---- | ---- | ---- |
 | `.gitlab-ci.yml` | `workflow:` rule `test/*`; `probe:linux-test` (Task 1 only); `test:linux`; `test:windows` rules; `check:headless-core` `except`; `gate:tests` deleted; `deploy` needs; comments at about 11, 46-48, 343-349, 533-544 | 1, 3, 4 |
-| `.gitlab/ci/scripts/linux_tests.sh` | new: the Linux reader of `ci.yml` | 3 |
+| `.gitlab/ci/scripts/linux_tests.py` | new: the Linux reader of `ci.yml` | 3 |
 | `.gitlab/ci/scripts/windows_tests.ps1` | header comment only (GitHub runs on PRs) | 5 |
 | `.gitlab/ci/scripts/github_checks_gate.sh`; its section in `.gitlab/ci/scripts/test/run_tests.sh` (about lines 765-815); `fixtures/github_checks_*` (5 files) and its `mock_bin/curl` cases | deleted | 4 |
 | `scripts/ci/lock_guard.sh`, `scripts/ci/headless_check.sh` | new, mode 755 (`git update-index --chmod=+x`) | 2 |
@@ -80,15 +81,15 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 
 - [ ] **Step 1:** Move the bodies of the steps "One copy of rustafits and solvemyastro" and "Headless core builds without rustafits or solvemyastro" verbatim into the two scripts (`#!/usr/bin/env bash`, `set -euo pipefail`). The steps become `run: scripts/ci/lock_guard.sh` and `run: scripts/ci/headless_check.sh`. Apply CI-R1 and CI-R6, comments included.
 - [ ] **Step 2: Verify locally.** Both scripts exit 0 on the dev Mac. The lock guard's negative check reproduces non-zero (starloom-p3 plan, Task 1 step 5). `yaml.safe_load` parses `ci.yml`.
-- [ ] **Step 3: GitHub reading (owner's word: a branch and a draft PR on the public repo).** `gh pr create --draft` from a throwaway branch: both jobs start. Cancel the runs (`gh run cancel`), close the PR, delete the branch.
+- [x] **Step 3: GitHub reading.** Done 2026-11-23 under the PR trigger (draft PR #27: both jobs started; cancelled, closed, branch deleted). Option A then replaced the trigger with `workflow_dispatch`; no second PR is needed.
 
 ### Task 3: `test:linux` and the `test/*` pipeline
 
-**Files:** `.gitlab-ci.yml`, `.gitlab/ci/scripts/linux_tests.sh`.
+**Files:** `.gitlab-ci.yml`, `.gitlab/ci/scripts/linux_tests.py`.
 
-**Interfaces:** `linux_tests.sh` reads `.github/workflows/ci.yml` with `yaml.safe_load` (PyYAML, proven by the probe) and follows CI-R5. It prints `+ <command>` before each step, runs it with `bash -c`, and exits with the first failing step's code. Exit 2 means `ci.yml` has a step the reader does not know.
+**Interfaces:** `linux_tests.py` reads `.github/workflows/ci.yml` with `yaml.safe_load` (PyYAML, proven by the probe) and follows CI-R5. It prints `+ <command>` before each step, runs it with `bash -c`, and exits with the first failing step's code. Exit 2 means `ci.yml` has a step the reader does not know.
 
-- [ ] **Step 1:** Write `linux_tests.sh`; mode 755.
+- [ ] **Step 1:** Write `linux_tests.py`; mode 755.
 - [ ] **Step 2:** `.gitlab-ci.yml`: replace `probe:linux-test` with `test:linux`:
   - `stage: build`, `tags: [linux-test]`, rules `test/*` and `$CI_COMMIT_TAG =~ /^v/`;
   - `before_script: source "$HOME/.cargo/env"`, `interruptible: true` (harmless on a tag: say so in the comment), `timeout: 90m`;

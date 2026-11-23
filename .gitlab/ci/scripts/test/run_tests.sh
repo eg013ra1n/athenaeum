@@ -762,62 +762,6 @@ fi
 assert_not_contains "publish: token never appears in the output" "SECRET-TOKEN-XYZ" "$out"
 
 echo
-echo "-- github_checks_gate.sh --"
-
-rc=0
-out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_BODY_FILE="$FIXTURES_DIR/github_checks_success.json" \
-  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
-assert_eq "gate: all green exits 0" "0" "$rc"
-assert_contains "gate: reports both checks" "ok: Build and test (Windows) — success" "$out"
-
-rc=0
-out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_BODY_FILE="$FIXTURES_DIR/github_checks_failure.json" \
-  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
-assert_eq "gate: a failed check exits 1" "1" "$rc"
-assert_contains "gate: names the failed check" "ERROR: Build and test (Windows) concluded failure" "$out"
-
-# pending, then success — the gate polls and passes.
-SEQ_TMP=$(mktemp -d -t gate_seq.XXXXXX)
-cp "$FIXTURES_DIR/github_checks_pending.json" "$SEQ_TMP/1.json"
-cp "$FIXTURES_DIR/github_checks_success.json" "$SEQ_TMP/2.json"
-rc=0
-out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_SEQUENCE_DIR="$SEQ_TMP" MOCK_CURL_COUNTER_FILE="$SEQ_TMP/count" \
-  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
-assert_eq "gate: pending then green exits 0" "0" "$rc"
-assert_contains "gate: says it waited" "waiting: Build and test (Windows) is in_progress" "$out"
-assert_eq "gate: polled exactly twice" "2" "$(cat "$SEQ_TMP/count")"
-rm -rf "$SEQ_TMP"
-
-# no check runs at all and the initial wait exhausted → fail, name the sha.
-rc=0
-out=$(PATH="$MOCK_BIN:$PATH" CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 GATE_INITIAL_WAIT_SECONDS=0 \
-  "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
-assert_eq "gate: no runs exits 1" "1" "$rc"
-assert_contains "gate: no-runs message" "ERROR: no GitHub check runs for deadbeef" "$out"
-
-# failure + pending: the gate must fail on the same poll when one check fails,
-# regardless of what its siblings are doing. Regression test for verdict aggregation.
-SEQ_TMP=$(mktemp -d -t gate_fail_regress.XXXXXX)
-cp "$FIXTURES_DIR/github_checks_failure_then_pending.json" "$SEQ_TMP/1.json"
-cp "$FIXTURES_DIR/github_checks_success.json" "$SEQ_TMP/2.json"
-rc=0
-out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_SEQUENCE_DIR="$SEQ_TMP" MOCK_CURL_COUNTER_FILE="$SEQ_TMP/count" \
-  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
-assert_eq "gate: failure beats pending, exits 1 on first poll" "1" "$rc"
-assert_contains "gate: names the failed check on first poll" "ERROR: Build, test and typecheck concluded failure" "$out"
-assert_eq "gate: does not poll again after failure" "1" "$(cat "$SEQ_TMP/count")"
-rm -rf "$SEQ_TMP"
-
-# A malformed 200 body (rate-limit HTML served as 200) must warn and retry,
-# never crash the script with a Python traceback under `set -e`.
-rc=0
-out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_BODY_FILE="$FIXTURES_DIR/github_checks_notjson.txt" \
-  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 GATE_TIMEOUT_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
-assert_eq "gate: non-JSON 200 body times out" "1" "$rc"
-assert_contains "gate: non-JSON 200 body warns" "warning: GitHub answered 200 with a body that is not JSON" "$out"
-assert_not_contains "gate: non-JSON 200 body has no traceback" "Traceback" "$out"
-
-echo
 echo "-- verify_release.sh --"
 
 # Pin the mock rsign's own argv contract before trusting it to stand in for

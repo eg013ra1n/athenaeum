@@ -4,11 +4,13 @@ workflow:
     - if: $CI_COMMIT_BRANCH == "main"
     # A wintest/<name> branch: test:windows alone, the Windows tests before main.
     - if: $CI_COMMIT_BRANCH =~ /^wintest\//
+    # A test/<name> branch: the tests before main on our own runners (Linux VM, EVO-X2).
+    - if: $CI_COMMIT_BRANCH =~ /^test\//
     - when: never
 
 stages:
   - gate      # check:versions — refuse a tag that cannot be a release
-  - build     # the seven installers + check:headless-core + gate:tests
+  - build     # the seven installers + check:headless-core + test:linux + test:windows
   - deploy    # rename + upload to artfrom.space/builds/<tag>/
   - publish   # Docker Hub (3 jobs) + the docs site
   - verify    # fetch everything back; Gatekeeper on the real DMGs; BLOCKING
@@ -43,9 +45,9 @@ variables:
 # --- Gate (tags only) ---
 # One refusal before a single build minute is spent: the seven version files
 # must equal the tag (bump.sh's job to make them so). The other half of the
-# gate, gate:tests — the tagged commit's GitHub check-suite, the only place
-# tests actually run — lives down in the `build` stage, not here (see its
-# own comment below for why); the `gate` stage itself holds only this job.
+# gate is the tests: test:linux and test:windows run in the `build` stage of
+# the tag pipeline on our own runners, and deploy needs both, with
+# check:headless-core (see deploy). The `gate` stage itself holds only this job.
 check:versions:
   stage: gate
   tags: [linux]
@@ -182,6 +184,7 @@ check:headless-core:
     - linux
   except:
     - /^wintest\//
+    - /^test\//
   before_script:
     - source "$HOME/.cargo/env"
   # No cache — see the comment in build:windows for why this pipeline has none.
@@ -340,18 +343,39 @@ smoke:windows:
   script:
     - Write-Output "runner ok on $env:COMPUTERNAME"; Get-Location
 
-# --- Windows tests before main (wintest/* branches) ---
-# GitHub CI tests main on Windows after the push; this is the same run before
-# it. Push a commit as wintest/<name> and this job is the whole pipeline, on
-# the runner tagged windows-test. The script reads the commands and env from
-# that commit's .github/workflows/ci.yml (job build-and-test-windows), so the
-# two runs cannot drift. interruptible: a newer push of the branch cancels the
-# older run. The build directory's target/ stays warm (GIT_CLEAN_FLAGS above).
+# --- Tests on our own runners (test/* and wintest/* branches, release tags) ---
+# The tests run here, not on GitHub (owner, 2026-11-23): a test/<name> branch is
+# test:linux + test:windows before main; a wintest/<name> branch is test:windows
+# alone; on a release tag both run again and deploy needs them. Each script
+# reads the commands and env from that commit's .github/workflows/ci.yml (jobs
+# build-and-test and build-and-test-windows), so the runs cannot drift from
+# that one list. interruptible: a newer push of a branch cancels the older run;
+# on a tag no newer pipeline of the same ref exists, so it changes nothing
+# there. The build directories' target/ stays warm (GIT_CLEAN_FLAGS above).
+#
+# test:linux runs on the Linux release runner under its own tag linux-test:
+# one job at a time there, because 12 GB does not hold a test run beside a
+# release compile. A second runner later takes the tag with no YAML change.
+test:linux:
+  stage: build
+  tags: [linux-test]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^test\//
+    - if: $CI_COMMIT_TAG =~ /^v/
+  interruptible: true
+  timeout: 90m
+  before_script:
+    - source "$HOME/.cargo/env"
+  script:
+    - python3 .gitlab/ci/scripts/linux_tests.py
+
 test:windows:
   stage: build
   tags: [windows-test]
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^wintest\//
+    - if: $CI_COMMIT_BRANCH =~ /^test\//
+    - if: $CI_COMMIT_TAG =~ /^v/
   interruptible: true
   timeout: 90m
   script:
@@ -530,33 +554,6 @@ build:perseus:linux-arm64:
       - target/debian/*.tar.gz
     expire_in: 30 days
 
-# --- Test gate (tags only) ---
-# Answers "did the tagged commit's tests pass?" by polling the tagged
-# commit's GitHub check-suite — the only place tests actually run (GitHub
-# Actions, .github/workflows/ci.yml). It sits in the `build` stage, not
-# `gate`, on purpose: the linux runner runs one job at a time, so a
-# gate-stage job here — which can poll for up to 50 minutes — would hold
-# the runner and delay every linux build behind it. Anchored on `needs:`
-# instead of the stage boundary, it only starts once build:linux,
-# build:perseus:linux and check:headless-core have cleared the linux
-# runner (~30 min into a normal release, well inside the macOS build's own
-# critical path), so its poll costs no wall clock — deploy (stage `deploy`)
-# still `needs` it before uploading anything.
-gate:tests:
-  stage: build
-  tags: [linux]
-  only: [tags]
-  needs:
-    - job: build:linux
-      artifacts: false
-    - job: build:perseus:linux
-      artifacts: false
-    - job: check:headless-core
-      artifacts: false
-  timeout: 55m
-  script:
-    - .gitlab/ci/scripts/github_checks_gate.sh
-
 # --- Shared SSH deploy setup (hidden template job) ---
 # Single source of truth for the pinned-host-key ssh-agent dance shared by
 # deploy, publish_version and publish:channel-link. before_script starts the
@@ -620,7 +617,13 @@ deploy:
       artifacts: true
     - job: build:perseus:linux-arm64
       artifacts: true
-    - job: gate:tests
+    # The tests and the headless check gate the release: nothing is uploaded until they are green. A red one is
+    # retried, never bypassed (no allow_failure, no optional: true).
+    - job: test:linux
+      artifacts: false
+    - job: test:windows
+      artifacts: false
+    - job: check:headless-core
       artifacts: false
   script:
     - . .gitlab/ci/scripts/artifact_names.sh
