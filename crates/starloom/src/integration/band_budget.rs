@@ -1,7 +1,7 @@
 //! Resolves the working-memory budget for banded integration.
 //!
 //! Until 2026-09-06 this was a compile-time `256 * 1024 * 1024`. Profiling
-//! (`docs/superpowers/research/2026-09-06-master-integration-io-profiling.md`)
+//! (<https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/research/2026-09-06-master-integration-io-profiling.md>)
 //! measured that constant costing 5.3x on a 100-frame set: it yields 105-row
 //! bands, so the reader crosses all 100 files forty times and gets 22 MB/s off
 //! a drive that sustains 243 MB/s. The budget is a property of the machine,

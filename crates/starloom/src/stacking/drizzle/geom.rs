@@ -255,8 +255,8 @@ pub fn map_drop_at(map: &PixelMap, x: f64, y: f64, drop_shrink: f64, scale: u32)
 /// LOCAL drop shape between the 29 sample points — not with a proven
 /// analytic bound, but because real registrations measure that variation
 /// small: M4c's own `tpsSmoothing` acceptance found hold-out rms
-/// 0.1–0.2 px on real 26 Mpx frames (`docs/superpowers/research/
-/// 2026-09-12-m4c-acceptance-run.md`), and a homography's own projective
+/// 0.1–0.2 px on real 26 Mpx frames
+/// (<https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/research/2026-09-12-m4c-acceptance-run.md>), and a homography's own projective
 /// row on the LDN 1272 checkpoint's real fits stays around 1e-8..1e-7 —
 /// both orders of magnitude below what would make one whole output pixel
 /// insufficient. The exhaustive skip-safety test below stress-cases this

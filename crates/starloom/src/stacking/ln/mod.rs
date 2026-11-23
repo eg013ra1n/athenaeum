@@ -539,7 +539,7 @@ fn median_of_finite(plane: &[f32]) -> f64 {
 /// (`LnGrid::node_count` makes the mesh REACH the last pixel, so its last
 /// address can sit up to `stride − 1` past it) and is **clamped into the
 /// plane before the spline is evaluated** — the identical rule
-/// [`background::Surface::nodes`] applies to that same node, and the one `examples/ln_probe.rs` reads the mesh back with
+/// [`background::Surface::nodes`] applies to that same node, and the one Athenaeum's `ln_probe` example reads the mesh back with
 /// (review m7). `A` and `B` are therefore measured at the same pixel at
 /// every node, including the trailing one, and the spline is never asked
 /// for a position its own node cloud could not have covered.

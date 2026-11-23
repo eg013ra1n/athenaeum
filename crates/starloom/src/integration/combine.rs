@@ -1,6 +1,6 @@
 //! Per-pixel robust integration recipes — the reference's two-axis model
 //! (Combination × Rejection). Spec:
-//! `docs/superpowers/specs/2026-07-06-master-integration-model-design.md`.
+//! <https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/specs/2026-07-06-master-integration-model-design.md>.
 //!
 //! An [`IntegrationRecipe`] pairs a [`Combination`] (Average or Median of the
 //! surviving samples) with a [`Rejection`] algorithm that decides which
@@ -1227,8 +1227,7 @@ enum WindowMedian {
 ///
 /// The tolerance itself is not the lever either: loosening it was C4's I9,
 /// dropped on purpose because the R-M4a-17 dispersion calibration rests on
-/// it. The measurement lives in
-/// `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-6-report.md`.
+/// it (measured in perf tier C, Task 6).
 ///
 /// # The residual median: windowed, bit-identical (perf tier 13c, item 4d)
 ///
@@ -2465,7 +2464,7 @@ mod tests {
 
     /// Copied verbatim (module-level helpers substituted, generic `T: Sample`
     /// specialized to `f32`) from the pre-Task-3 `reject_linear_fit`
-    /// (`git show d6361615:crates/athenaeum-core/src/integration/combine.rs`)
+    /// (Athenaeum commit `d6361615`, `crates/athenaeum-core/src/integration/combine.rs`)
     /// — the least-squares routine this task replaced. Test-only: proves the
     /// discrimination in the test below is real, not assumed (fix round 1
     /// review, ruling R-M4a-16, finding 2).

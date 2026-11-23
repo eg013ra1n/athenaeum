@@ -234,7 +234,7 @@ const FWHM_TO_SIGMA: f64 = 2.354_820_045_030_949_3;
 /// wrong for any caller that reads `Star.flux` absolutely rather than as a
 /// same-list ranking key (`ln::scale::to_seed` does exactly that).
 ///
-/// `pub` for the star measurement lab's probe (`examples/star_probe.rs`); the
+/// `pub` for the star measurement lab's probe (Athenaeum's `star_probe` example); the
 /// run calls it from inside the crate.
 pub fn stars_from_fits(
     fits: &[StarFit],
@@ -393,7 +393,7 @@ mod tests {
     /// keep returning exactly the same `Vec<Star>` after the `luminance`
     /// borrow + fused max/ADU-scale pass. The expected values were captured
     /// from this SAME field/seed run through the pre-refactor implementation
-    /// (`git show df219c49:crates/athenaeum-core/src/stacking/register/
+    /// (Athenaeum commit `df219c49`, `crates/athenaeum-core/src/stacking/register/
     /// detect.rs`, before this task's own commit) — see the Task 3 report
     /// for the exact command. A change to detection, the ADU scale, or the
     /// max-fold semantics would move these numbers.

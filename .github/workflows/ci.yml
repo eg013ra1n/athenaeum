@@ -161,6 +161,19 @@ jobs:
       # ~3 200 tests. It did earn its keep once: giving that test its own
       # process stretched it from 60 s to 7 minutes and made it impossible to
       # miss.
+      # One copy of rustafits and solvemyastro: members name them by version or git rev (solvemyastro, starloom) and
+      # the root [patch] points them at the submodules. A patch that stops applying is silent (cargo just builds a
+      # second copy), so re-resolve the lock first (a gitlink-only bump changes nothing committed) and look.
+      - name: One copy of rustafits and solvemyastro
+        run: |
+          cargo metadata --format-version 1 >/dev/null
+          python3 - <<'EOF'
+          import re, sys
+          lock = open("Cargo.lock").read()
+          bad = [b for b in lock.split("[[package]]") if re.search(r'^name = "(rustafits|solvemyastro)"$', b, re.M) and "source = " in b]
+          sys.exit("a second rustafits or solvemyastro in Cargo.lock: a [patch] no longer applies" if bad else 0)
+          EOF
+
       - name: Test workspace
         # The three rustafits skips are bit pins recorded on aarch64 (the dev
         # Mac); x86_64 libm rounds powf/exp 1 ulp differently (measured

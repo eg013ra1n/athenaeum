@@ -2105,7 +2105,7 @@ fn relative_scale_from_seeds_core(
 ///
 /// A PSF-signal TEST/FIXTURE helper (final review M-2): it hard-codes
 /// `LnFluxEstimator::PsfSignal`, and builds its own tile tables. Only this
-/// module's tests and `examples/ln_probe.rs` call it, so it stays `pub` under
+/// module's tests and Athenaeum's `ln_probe` example call it, so it stays `pub` under
 /// this name; production code goes through [`relative_scale_against`].
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale(

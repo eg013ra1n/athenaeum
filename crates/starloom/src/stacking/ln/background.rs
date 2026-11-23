@@ -50,8 +50,8 @@
 //! median of a 128-px cell lives in the MEDIAN of the distribution on a
 //! crowded sky (binning smears star flux *below* the per-cell rejection
 //! bound instead of letting the clip remove it), not only in the tail. The
-//! whole item was worth ≈ 0.4 min of a 14-minute run. Full measurement:
-//! `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-7-report.md`.
+//! whole item was worth ≈ 0.4 min of a 14-minute run (measured in perf tier C,
+//! Task 7).
 
 use std::borrow::Cow;
 use std::sync::Arc;
