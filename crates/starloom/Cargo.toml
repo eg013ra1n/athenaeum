@@ -40,8 +40,9 @@ engine = ["dep:rustafits"]
 stack = ["engine", "dep:solvemyastro", "dep:postcard"]
 # ts-rs derives (the TypeScript types the app generates).
 ts = ["dep:ts-rs"]
-# Test hooks and fixtures that tests in dependent crates read (SL-17); never in default.
-test-support = []
+# Test hooks and fixtures that tests in dependent crates read (SL-17); never in default. It forwards rustafits' hooks
+# (`PlanePrep::zero_timings`) when the `engine` layer is on.
+test-support = ["rustafits?/test-support"]
 
 [lints.rust]
 unexpected_cfgs = "deny"

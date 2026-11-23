@@ -5961,7 +5961,7 @@ dependencies = [
 
 [[package]]
 name = "rustafits"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
