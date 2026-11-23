@@ -51,6 +51,7 @@ jobs:
               - 'crates/**'
               - 'rustafits/**'
               - 'solvemyastro/**'
+              - 'starloom/**'
               - 'Cargo.*'
               - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
