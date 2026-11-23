@@ -1,18 +1,11 @@
 name: CI
 
 on:
-  # Documentation-only changes cannot break the build, and a cold run costs
-  # over twenty minutes of runner time.
+  # Pull requests only (owner, 2026-11-23). The tests of a commit before main and of a release tag run on our own
+  # GitLab runners (test:linux on the Linux VM, test:windows on EVO-X2; .gitlab-ci.yml), which read their commands
+  # from this file's two build-and-test jobs, so this file stays the one list of them. This workflow is the check a
+  # pull request gets, an outside one or Dependabot's. Documentation-only changes cannot break the build.
   pull_request:
-    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
-  # Tags too: the GitLab tag pipeline builds and publishes the release without
-  # running a single test (it has no test stage at all), and the release commit's
-  # own main run is a different ref, so nothing otherwise gates a tag on green
-  # tests. This run is concurrent with the release build rather than upstream of
-  # it — it cannot block a bad publish, but it names one within ten minutes.
-  push:
-    branches: [main]
-    tags: ['v*']
     paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
 
 concurrency:
@@ -29,11 +22,9 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  # PR-only: a push to main/tags always runs the full Rust + typecheck jobs
-  # below (the GitLab release gate depends on that), so this job only exists
-  # to let a PR touching nothing but the frontend (or nothing but docs, though
-  # paths-ignore above already drops those entirely) skip the ~4-6 minute
-  # Rust build-and-test jobs and run a fast typecheck instead.
+  # Lets a PR touching nothing but the frontend (or nothing but docs, though
+  # paths-ignore above already drops those entirely) skip the Rust
+  # build-and-test jobs and run a fast typecheck instead.
   changes:
     name: What changed
     runs-on: ubuntu-latest
@@ -42,7 +33,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -52,6 +43,12 @@ jobs:
               - 'rustafits/**'
               - 'solvemyastro/**'
               - 'starloom/**'
+              # A submodule bump changes only its gitlink, which these exact paths match (a Dependabot bump PR).
+              - 'rustafits'
+              - 'solvemyastro'
+              - 'starloom'
+              - '.gitmodules'
+              - 'scripts/ci/**'
               - 'Cargo.*'
               - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
@@ -65,17 +62,15 @@ jobs:
     name: Build, test and typecheck
     runs-on: ubuntu-latest
     needs: [changes]
-    # `!cancelled()` is load-bearing: `changes` only runs on pull_request (see
-    # above), so on a push to main/tags it reports "skipped" rather than
-    # "success" — without it a skipped dependency would skip this job too,
-    # and a push would never run its own tests. Unlike `always()`, it still
-    # lets `concurrency: cancel-in-progress` actually cancel a job that has
-    # not started yet instead of starting it anyway.
+    # `!cancelled()`: a run whose `changes` job was skipped (any event but a
+    # pull request; none triggers this workflow today) still runs its tests.
+    # Unlike `always()`, it lets `concurrency: cancel-in-progress` cancel a job
+    # that has not started yet instead of starting it anyway.
     if: "!cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true')"
     # A hung test must not sit on a runner for the default six hours.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -106,7 +101,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -162,18 +157,9 @@ jobs:
       # ~3 200 tests. It did earn its keep once: giving that test its own
       # process stretched it from 60 s to 7 minutes and made it impossible to
       # miss.
-      # One copy of rustafits and solvemyastro: members name them by version or git rev (solvemyastro, starloom) and
-      # the root [patch] points them at the submodules. A patch that stops applying is silent (cargo just builds a
-      # second copy), so re-resolve the lock first (a gitlink-only bump changes nothing committed) and look.
+      # The why is in the script.
       - name: One copy of rustafits and solvemyastro
-        run: |
-          cargo metadata --format-version 1 >/dev/null
-          python3 - <<'EOF'
-          import re, sys
-          lock = open("Cargo.lock").read()
-          bad = [b for b in lock.split("[[package]]") if re.search(r'^name = "(rustafits|solvemyastro)"$', b, re.M) and "source = " in b]
-          sys.exit("a second rustafits or solvemyastro in Cargo.lock: a [patch] no longer applies" if bad else 0)
-          EOF
+        run: scripts/ci/lock_guard.sh
 
       - name: Test workspace
         # The three rustafits skips are bit pins recorded on aarch64 (the dev
@@ -182,13 +168,9 @@ jobs:
         # side gates them by target_arch with its next release.
         run: cargo test --workspace --no-fail-fast -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip hedge_cancels_the_loser_and_bounds_duplicate_bytes --skip the_legacy_entry_points_are_output_identical_to_1_3_0 --skip the_bounded_fit_at_one_sample_per_pixel_is_byte_identical_to_before --skip fit_moffat_2d_is_byte_identical_to_before
 
-      # Headless stays headless: core without its default features compiles, and
-      # neither native-heavy dependency (rustafits, solvemyastro) is in its
-      # normal dependency tree, starloom's layers included.
+      # The why is in the script.
       - name: Headless core builds without rustafits or solvemyastro
-        run: |
-          cargo check -p athenaeum-core --no-default-features
-          cargo tree -p athenaeum-core --no-default-features -e normal --prefix none | grep -E '^(rustafits|solvemyastro) ' && exit 1 || true
+        run: scripts/ci/headless_check.sh
 
       - name: Typecheck frontend
         run: npx tsc --noEmit
@@ -203,8 +185,8 @@ jobs:
     if: github.event_name == 'pull_request' && needs.changes.outputs.rust != 'true' && needs.changes.outputs.frontend == 'true'
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -213,6 +195,8 @@ jobs:
       - name: Typecheck frontend
         run: npx tsc --noEmit
 
+  # Since 2026-11-23 GitHub runs this job for pull requests only; the same commands run on EVO-X2 as GitLab's
+  # test:windows (test/* and wintest/* branches, release tags), read from this job. History:
   # The Rust suite has only ever run on Linux: this workflow was ubuntu-only and
   # .gitlab-ci.yml contains `cargo test` zero times (its build:windows job is
   # `only: tags` and builds the bundle without testing). A Windows run on
@@ -251,13 +235,11 @@ jobs:
     name: Build and test (Windows)
     runs-on: windows-latest
     needs: [changes]
-    # See build-and-test above: !cancelled() so a push (where `changes` never
-    # runs) is not skipped along with its skipped dependency, while still
-    # honouring a cancel-in-progress from `concurrency`.
+    # See build-and-test above for `!cancelled()`.
     if: "!cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true')"
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
