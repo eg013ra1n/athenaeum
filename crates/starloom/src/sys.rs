@@ -1,5 +1,5 @@
 //! The platform memory probe: `platform_memory()` with its four platform variants and its helpers, and
-//! `total_ram_bytes`. Moved from Athenaeum core's `services::machine`; core keeps the rest of its machine profile.
+//! `total_ram_bytes`, the one answer to "how much RAM may this process use" that the stacking budgets read.
 //!
 //! Every parser is a pure function on a `&str` so it is unit-tested on every platform; only the file / syscall
 //! read is `cfg`-gated. An unknown value is `None`, never a guess.
@@ -78,6 +78,9 @@ fn sysctl_raw<T: Copy>(name: &str, out: &mut T) -> bool {
 
 /// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
 /// per platform family below; the limit is whatever the platform reports, not yet checked against the physical total.
+///
+/// macOS and iOS: physical memory from `sysctl hw.memsize`; there is no container limit, so the second value is
+/// always `None`. Both are `None` (and a warning is logged) when the sysctl fails.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     let mut size: u64 = 0;
@@ -98,6 +101,12 @@ fn read_trimmed(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
+/// per platform family.
+///
+/// Linux: physical memory is `MemTotal` from `/proc/meminfo` (`None`, with a warning, when the file cannot be read or
+/// has no `MemTotal`). The limit is the cgroup v2 `memory.max`, else the cgroup v1 `memory.limit_in_bytes`; `None`
+/// when neither file exists or names a real limit.
 #[cfg(target_os = "linux")]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     let total = match read_trimmed("/proc/meminfo") {
@@ -116,6 +125,12 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 // Windows
 // ---------------------------------------------------------------------------
 
+/// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
+/// per platform family.
+///
+/// Windows: physical memory from `GlobalMemoryStatusEx` (`None`, with a warning, when the call fails). The limit is
+/// the calling process's job-object memory limit: the smaller of the job limit and the per-process limit when both
+/// are set, `None` when the process is in no job or the job sets neither.
 #[cfg(windows)]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     use windows_sys::Win32::System::JobObjects::{
@@ -163,6 +178,10 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 // Anything else
 // ---------------------------------------------------------------------------
 
+/// `(physical memory, container / job memory limit)` in bytes; `None` where the platform cannot say. One variant
+/// per platform family.
+///
+/// Any other platform: nothing is probed, so both values are always `None` and [`total_ram_bytes`] is `None`.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 pub fn platform_memory() -> (Option<u64>, Option<u64>) {
     (None, None)
@@ -172,8 +191,11 @@ pub fn platform_memory() -> (Option<u64>, Option<u64>) {
 static MEMORY: OnceLock<(Option<u64>, Option<u64>)> = OnceLock::new();
 
 /// Physical RAM this process may actually use, in bytes: the container / job limit when one is set below physical
-/// memory, else physical memory. `None` when the platform cannot say. The same rule as Athenaeum core's
-/// `MachineProfile::effective_mem`, over this crate's own probe.
+/// memory, else physical memory. Probed once per process.
+///
+/// `None` when the platform cannot say: the physical total and the limit are both unknown (an unreadable
+/// `/proc/meminfo`, a failed `sysctl` or `GlobalMemoryStatusEx`, a platform with no probe). The caller must pick its
+/// own fallback; none is applied here. Each consumer documents the one it takes.
 ///
 /// On Linux this is `min(MemTotal, container limit)`: `/proc/meminfo` reports the HOST's RAM inside a container,
 /// so without the cgroup read a 2 GB container would size an 8 GiB budget and be OOM-killed.

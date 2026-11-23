@@ -9,24 +9,32 @@ use serde::{Deserialize, Serialize};
 
 use super::eigen::smallest_eigenvector_sym;
 
+/// Which family of linear model fits star correspondences between two frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LinearKind {
+    /// Rotation, one isotropic scale and a translation; mirror images are not representable.
     Similarity,
+    /// Any 2x3 affine (rotation, scale, shear, mirror, translation); parallel lines stay parallel.
     Affine,
+    /// A full projective map, which also models perspective; the only kind with a non-trivial bottom matrix row.
     Homography,
 }
 
 /// `(subject, reference)` correspondence.
 pub type Pair = ((f64, f64), (f64, f64));
 
+/// A linear model of the pixel mapping between two frames: a 3x3 homogeneous matrix and the family it was fitted as.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Linear {
+    /// The family this transform belongs to.
     pub kind: LinearKind,
+    /// The 3x3 matrix, row-major, mapping `(x, y, 1)` in the subject frame to the reference frame, in pixels.
     pub m: [[f64; 3]; 3],
 }
 
 impl Linear {
+    /// The identity: a similarity that moves nothing.
     pub fn identity() -> Linear {
         Linear {
             kind: LinearKind::Similarity,
@@ -34,6 +42,7 @@ impl Linear {
         }
     }
 
+    /// Builds a transform of `kind` from the nine matrix entries in row-major order.
     pub fn from_flat(kind: LinearKind, f: [f64; 9]) -> Linear {
         Linear {
             kind,
@@ -41,6 +50,7 @@ impl Linear {
         }
     }
 
+    /// The nine matrix entries in row-major order (the inverse of [`Linear::from_flat`]).
     pub fn to_flat(&self) -> [f64; 9] {
         let m = &self.m;
         [
@@ -153,14 +163,18 @@ impl Linear {
         self.m[0][0] * self.m[1][1] - self.m[0][1] * self.m[1][0]
     }
 
+    /// The linear scale of the transform: the square root of the absolute 2x2 determinant, the factor by which
+    /// lengths change (1.0 when frames are at the same plane scale).
     pub fn scale(&self) -> f64 {
         self.det2().abs().sqrt()
     }
 
+    /// The rotation of the transform in degrees, `atan2(m10, m00)`.
     pub fn rotation_deg(&self) -> f64 {
         self.m[1][0].atan2(self.m[0][0]).to_degrees()
     }
 
+    /// The translation `(m02, m12)` in pixels.
     pub fn translation(&self) -> (f64, f64) {
         (self.m[0][2], self.m[1][2])
     }
@@ -436,6 +450,8 @@ pub fn fit_homography(pairs: &[Pair], weights: Option<&[f64]>) -> Option<Linear>
     Some(t)
 }
 
+/// Fits a linear model of `kind` to the `(subject, reference)` pairs by least squares, with optional per-pair
+/// weights; `None` when the pairs are too few or degenerate to determine that kind.
 pub fn fit_linear(kind: LinearKind, pairs: &[Pair], weights: Option<&[f64]>) -> Option<Linear> {
     match kind {
         LinearKind::Similarity => fit_similarity(pairs, weights),
@@ -455,6 +471,8 @@ pub fn residuals(t: &Linear, pairs: &[Pair]) -> Vec<f64> {
         .collect()
 }
 
+/// The root-mean-square of the residuals, in the residuals' own unit (pixels for [`residuals`]); 0 for an empty
+/// slice.
 pub fn rms(residuals: &[f64]) -> f64 {
     if residuals.is_empty() {
         return 0.0;

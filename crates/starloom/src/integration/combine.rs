@@ -9,14 +9,14 @@
 //! combination (the reference semantics).
 //!
 //! The pre-2026-07-06 flat `CombineMethod` enum is retained only as a private,
-//! deserialize-only [`LegacyCombineMethod`] so old `recipe_json` blobs still
+//! deserialize-only `LegacyCombineMethod` so old `recipe_json` blobs still
 //! parse (spec §3). Its equivalences: `Mean` = Average+None, `Median` =
 //! Median+None, `WinsorizedSigmaClip` = Average+WinsorizedSigma,
 //! `PercentileClip` = Average+PercentileClip. `Mean` and `PercentileClip`
 //! are still pinned bit-for-bit by the tests; `WinsorizedSigmaClip` maps to
 //! the same recipe but no longer to the same NUMBERS — ruling R-M4c-3 moved
 //! the winsorized fixed point onto the reference loop (see
-//! [`reject_winsorized`]).
+//! `reject_winsorized`).
 
 use super::student_t;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ mod simd;
 /// sample for master builds, a `(value, frame index)` pair for the
 /// stacking engine, which needs to know WHICH frames survived.
 pub trait Sample: Copy {
+    /// The sample's value as a float, in the units of the frame it came from.
     fn value(self) -> f32;
 }
 
@@ -56,7 +57,9 @@ const MAX_REJECTION_ITERS: usize = 20;
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationRecipe {
+    /// How the surviving samples are collapsed into one pixel.
     pub combination: Combination,
+    /// Which samples are excluded before that.
     pub rejection: Rejection,
 }
 
@@ -72,7 +75,7 @@ impl IntegrationRecipe {
     }
 
     /// Human summary — "Average | Winsorized sigma (3.0/3.0)" style (spec §4).
-    /// Printable-ASCII only: this string is written into the ATH_REJ FITS
+    /// Printable-ASCII only: the caller writes this string into a FITS header
     /// card, whose values are restricted to 0x20–0x7E.
     pub fn describe(&self) -> String {
         format!("{} | {}", self.combination.label(), self.rejection.label())
@@ -85,7 +88,9 @@ impl IntegrationRecipe {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Combination {
+    /// The mean of the survivors.
     Average,
+    /// The median of the survivors.
     Median,
 }
 
@@ -109,41 +114,77 @@ pub enum Rejection {
     /// Reference-style percentile clipping around the median m: reject x when
     /// (m - x)/|m| > low or (x - m)/|m| > high. Deviations normalized by |m|
     /// so thresholds are sign-agnostic.
-    PercentileClip { low: f64, high: f64 },
+    PercentileClip {
+        /// Reject when the sample lies this fraction of |m| below the median (dimensionless, e.g. 0.2 = 20 %).
+        low: f64,
+        /// Reject when the sample lies this fraction of |m| above the median (dimensionless).
+        high: f64
+    },
     /// Plain (non-winsorized) sigma clip: iteratively reject samples outside
     /// [m − sigma_low·σ, m + sigma_high·σ] of the current survivor set until
     /// stable. Zero-dispersion sets converge immediately with no rejection.
-    SigmaClip { sigma_low: f64, sigma_high: f64 },
+    SigmaClip {
+        /// How many standard deviations below the centre a sample may lie before it is rejected.
+        sigma_low: f64,
+        /// How many standard deviations above the centre a sample may lie before it is rejected.
+        sigma_high: f64
+    },
     /// Huber-style winsorized sigma clip, the reference loop (math reference
     /// §3.4, ruling R-M4c-3): a winsorized location/scale estimate from the
     /// median and the MAD, then reject original samples outside
     /// [m − sigma_low·s, m + sigma_high·s], repeated until stable. Not the
-    /// pre-M4c fixed point — see [`reject_winsorized`].
-    WinsorizedSigma { sigma_low: f64, sigma_high: f64 },
+    /// pre-M4c fixed point — see `reject_winsorized`.
+    WinsorizedSigma {
+        /// How many winsorized standard deviations below the centre a sample may lie before it is rejected.
+        sigma_low: f64,
+        /// How many winsorized standard deviations above the centre a sample may lie before it is rejected.
+        sigma_high: f64
+    },
     /// Minimum-absolute-deviation ("robust") line fit over (rank, value);
     /// reject samples whose residual falls outside [−sigma_low·d,
     /// +sigma_high·d] where d is [`LINEAR_FIT_SIGMA_SCALE`] times twice the
     /// mean absolute deviation of the residuals from that line; refit and
     /// repeat until stable. The reference's recommended choice for larger
     /// sets with drifting illumination.
-    LinearFitClip { sigma_low: f64, sigma_high: f64 },
+    LinearFitClip {
+        /// How many deviation units below the fitted line a sample may lie before it is rejected.
+        sigma_low: f64,
+        /// How many deviation units above the fitted line a sample may lie before it is rejected.
+        sigma_high: f64
+    },
     /// Min/max clipping (math reference §3.4): drop the `low` smallest and
     /// `high` largest samples outright, no statistics involved. The counts
     /// are clamped so at least one sample always survives.
-    MinMax { low: usize, high: usize },
+    MinMax {
+        /// How many of the smallest samples to drop.
+        low: usize,
+        /// How many of the largest samples to drop.
+        high: usize
+    },
     /// Generalized extreme studentized deviate test (Rosner 1983, math
     /// reference §3.4): up to `k = clamp(trunc(outliers_fraction·n), 1, n-2)`
     /// sequential tests of the most extreme studentized residual against the
     /// critical value `lambda_i` for significance `alpha`, each removing that
     /// one sample; `low_relaxation` inflates the scale used below the centre,
     /// so faint samples are rejected less eagerly than bright ones.
-    Esd { outliers_fraction: f64, alpha: f64, low_relaxation: f64 },
+    Esd {
+        /// The largest share of the samples that may be removed as outliers, in `[0, 1]`.
+        outliers_fraction: f64,
+        /// The significance level of each test (dimensionless, e.g. 0.05).
+        alpha: f64,
+        /// The factor that inflates the scale below the centre, so faint samples are rejected less eagerly.
+        low_relaxation: f64
+    },
     /// Robust Chauvenet Rejection (Maples et al. 2018, math reference §3.4):
     /// three phases of decreasing robustness, each rejecting the single most
     /// extreme sample while the expected number of samples at least that
     /// extreme, `n·Q(|x - mu|/sigma)`, stays below `limit` (0.5 is
     /// Chauvenet's criterion).
-    Rcr { limit: f64 },
+    Rcr {
+        /// The expected number of samples at least as extreme as the candidate below which it is rejected (0.5 is
+        /// Chauvenet's criterion).
+        limit: f64
+    },
 }
 
 /// Format a rejection parameter for a describe/label string (spec §4). Integer
@@ -383,16 +424,19 @@ pub fn mask_words(n: usize) -> usize {
     n.div_ceil(64)
 }
 
+/// Clears every bit of a survivor mask (no frame is marked).
 #[inline]
 pub fn mask_clear(mask: &mut [u64]) {
     mask.iter_mut().for_each(|w| *w = 0);
 }
 
+/// Marks frame `i` in a survivor mask; `i` must be below `mask.len() * 64`.
 #[inline]
 pub fn mask_set(mask: &mut [u64], i: usize) {
     mask[i / 64] |= 1u64 << (i % 64);
 }
 
+/// Whether frame `i` is marked in a survivor mask; `i` must be below `mask.len() * 64`.
 #[inline]
 pub fn mask_get(mask: &[u64], i: usize) -> bool {
     mask[i / 64] & (1u64 << (i % 64)) != 0
@@ -2028,7 +2072,7 @@ mod tests {
 
     // ── Combination basics ──────────────────────────────────────────────────
 
-    /// `describe()` feeds the ATH_REJ FITS card, whose string values must be
+    /// `describe()` feeds a FITS header card, whose string values must be
     /// printable ASCII (0x20–0x7E) — a single non-ASCII char (the old ` · `
     /// separator) failed EVERY master build at the final header write.
     #[test]

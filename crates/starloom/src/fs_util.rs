@@ -1,5 +1,5 @@
-//! File-system helpers: `sync_best_effort` and its classification, the one copy Athenaeum core's archive, zip and export
-//! writes also use.
+//! File-system helpers: `sync_best_effort` and its classification, the one copy every durable write uses
+//! (starloom's own FITS, XISF and LN-grid writers, and the application's archive, zip, export and header-patch writes).
 
 use std::fs::File;
 use std::io;

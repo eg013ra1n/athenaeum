@@ -12,14 +12,20 @@ use crate::geometry::InverseMap;
 /// A window of rows of a larger plane. `data` holds rows
 /// `[y_offset, y_offset + height)` of an image `width × full_height`.
 pub struct Plane<'a> {
+    /// The samples of rows `[y_offset, y_offset + height)`, row-major, `width * height` values, in the image's units.
     pub data: &'a [f32],
+    /// Plane width, in pixels.
     pub width: usize,
+    /// The number of rows held in `data`, in pixels.
     pub height: usize,
+    /// The index, in the full image, of the first row held in `data`.
     pub y_offset: usize,
+    /// The height of the full image, in pixels.
     pub full_height: usize,
 }
 
 impl<'a> Plane<'a> {
+    /// A plane that holds the whole image: `width * height` samples, row-major.
     pub fn full(data: &'a [f32], width: usize, height: usize) -> Plane<'a> {
         Plane {
             data,
@@ -294,8 +300,8 @@ fn sample_border(
 
 /// One interpolated sample at source coordinates `(x, y)`; NaN outside
 /// `[0, w−1] × [0, h−1]`. Picks the interior fast path
-/// ([`sample_interior`]) when every tap the generic path would read is in
-/// bounds without clamping, else falls back to [`sample_border`] — the two
+/// (`sample_interior`) when every tap the generic path would read is in
+/// bounds without clamping, else falls back to `sample_border` — the two
 /// share the same weight formula, tap order and renormalisation branch
 /// (only [`taps_for`] computes weights; Task 6 (W1) does not touch that
 /// arithmetic), so the choice of path can only change how fast the answer
@@ -400,7 +406,8 @@ fn sample_at_oracle(src: &Plane, x: f64, y: f64, interp: Interpolation, clamping
     }
 }
 
-/// Fills `out` (`rows × out_width`) with output rows `[y0, y0 + rows)`.
+/// Fills `out` (`rows × out_width`) with output rows `[y0, y0 + rows)`. The rows are computed in parallel on the
+/// caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn warp_rows(
     src: &Plane,

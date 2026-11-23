@@ -10,6 +10,7 @@ use super::linear::{fit_linear, residuals, rms, Linear, LinearKind, Pair};
 pub struct SplitMix64(pub u64);
 
 impl SplitMix64 {
+    /// The next 64 random bits of the stream.
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -19,29 +20,41 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
+    /// The next number in `[0, 1)` with 53 random bits.
     #[inline]
     pub fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// A number in `0..n` (`n` of 0 is treated as 1, so the answer is then 0).
     #[inline]
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n.max(1) as u64) as usize
     }
 }
 
+/// Settings of one RANSAC run over star correspondences.
 #[derive(Clone, Debug)]
 pub struct RansacConfig {
+    /// The family of linear model to fit.
     pub kind: LinearKind,
+    /// The largest residual, in reference pixels, that still counts a pair as an inlier.
     pub tolerance_px: f64,
+    /// The most random samples to draw.
     pub max_iterations: usize,
+    /// The seed of the sample generator; a run is deterministic for a fixed seed.
     pub seed: u64,
+    /// The fewest inliers a result may have; fewer is a failed fit.
     pub min_inliers: usize,
+    /// The reference frame's width, in pixels (sizes the regularity grid).
     pub frame_width: f64,
+    /// The reference frame's height, in pixels (sizes the regularity grid).
     pub frame_height: f64,
 }
 
 impl RansacConfig {
+    /// The defaults for `kind` over a `frame_width` x `frame_height` frame in pixels: a 1.9 pixel tolerance, 2000
+    /// iterations, a fixed seed and at least 8 inliers.
     pub fn new(kind: LinearKind, frame_width: f64, frame_height: f64) -> RansacConfig {
         RansacConfig {
             kind,
@@ -63,20 +76,31 @@ impl RansacConfig {
     }
 }
 
+/// Four indexes of how trustworthy a fitted model is, each in `[0, 1]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quality {
+    /// The share of the pairs that are inliers.
     pub inlier_ratio: f64,
+    /// The area of the convex hull of the inliers' reference positions over that of all pairs'.
     pub overlap: f64,
+    /// The share of cells of a 4x4 grid over the frame that hold at least one inlier.
     pub regularity: f64,
+    /// The combined score, `inlier_ratio * overlap * regularity / (1 + rms_px)`.
     pub score: f64,
 }
 
+/// A successful RANSAC fit.
 #[derive(Clone, Debug)]
 pub struct RansacResult {
+    /// The model fitted on all inliers.
     pub linear: Linear,
+    /// Indices into the input pairs of the pairs within tolerance of the model, ascending.
     pub inliers: Vec<usize>,
+    /// The root-mean-square residual of the inliers, in reference pixels.
     pub rms_px: f64,
+    /// The quality indexes of the fit.
     pub quality: Quality,
+    /// How many random samples were drawn.
     pub iterations: usize,
 }
 
@@ -263,15 +287,20 @@ pub fn ransac_fit(pairs: &[Pair], cfg: &RansacConfig) -> Option<RansacResult> {
     })
 }
 
+/// The result of the weighted refit.
 #[derive(Clone, Debug)]
 pub struct RefitResult {
+    /// The refitted model.
     pub linear: Linear,
+    /// Indices into the input pairs that survived the sigma clipping, ascending.
     pub inliers: Vec<usize>,
+    /// The root-mean-square residual of those inliers, in reference pixels.
     pub rms_px: f64,
     /// Standard deviation of the per-pair residuals.
     pub sigma_rms_px: f64,
     /// Largest |Δx|, |Δy| over the final inliers.
     pub peak_px: (f64, f64),
+    /// How many clipping rounds ran.
     pub rounds: usize,
 }
 

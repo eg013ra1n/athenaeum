@@ -15,11 +15,17 @@ pub mod stats;
 pub mod storage_class;
 pub mod student_t;
 
+/// Why an integration or calibration read failed.
 #[derive(Debug)]
 pub enum IntegrationError {
+    /// A file-system error while opening or reading a frame.
     Io(std::io::Error),
+    /// The inputs cannot be combined as given (mixed frame sizes, a plane that does not exist, bad parameters);
+    /// carries the reason.
     BadInput(String),
+    /// A frame file could not be decoded; carries the reason.
     Decode(String),
+    /// The caller raised its cancel flag; no output was produced.
     Cancelled,
 }
 

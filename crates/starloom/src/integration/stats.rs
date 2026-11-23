@@ -17,26 +17,38 @@ pub use astroimage::stats::{
 };
 
 // The TypeScript face of `ScaleEstimator` (a rustafits type, which cannot derive `ts_rs::TS` here): the same names,
-// exported as `ScaleEstimator`; the config fields that hold one point their `#[ts(as = …)]` at it. No `///` doc on
-// purpose — ts-rs would copy it into `src/types`, which must stay unchanged.
+// exported as `ScaleEstimator`; the config fields that hold one point their `#[ts(as = …)]` at it. Its `///` docs are
+// copied by ts-rs into the generated `ScaleEstimator` type, which is the intent.
+/// The scale (dispersion) estimators that can be chosen in a stacking configuration: biweight midvariance, median
+/// absolute deviation or average deviation.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(rename = "ScaleEstimator", rename_all = "camelCase"))]
 pub enum ScaleEstimatorTs {
+    /// Biweight midvariance, a robust estimate of the standard deviation.
     Bwmv,
+    /// Median absolute deviation, scaled to a standard deviation.
     Mad,
+    /// Average absolute deviation about the median, scaled to a standard deviation.
     AvgDev,
 }
 
-/// Output normalization modes (spec §5.1, math reference §3.6).
+/// Output normalization modes (spec §5.1, math reference §3.6): how each frame's samples are brought onto the reference
+/// frame's level before the survivors are averaged. In the variants, `m` is a frame's background level, `s` its
+/// dispersion, index 0 the reference frame and `i` the frame being normalized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum OutputNormalization {
+    /// No output normalization: every frame keeps its own level.
     None,
+    /// Shifts each frame's background level to the reference frame's: `x + (m0 - mi)`.
     Additive,
+    /// Shifts and scales each frame to the reference's level and dispersion: `(x - mi) * (s0 / si) + m0`.
     #[default]
     AdditiveWithScaling,
+    /// Scales each frame by the ratio of the reference's background level to its own: `x * m0 / mi`.
     Multiplicative,
+    /// Multiplicative, plus the dispersion ratio: `(x / mi) * (s0 / si) * m0`.
     MultiplicativeWithScaling,
 }
 
@@ -59,9 +71,16 @@ pub enum OutputNormalization {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum RejectionNormalization {
+    /// No rejection normalization: samples are compared as stored.
     None,
+    /// Each frame is shifted and scaled onto the reference's background level and dispersion, as in
+    /// [`OutputNormalization::AdditiveWithScaling`].
     ScaleZeroOffset,
+    /// Each frame is scaled by the ratio of the reference's level to its own, as in
+    /// [`OutputNormalization::Multiplicative`].
     EqualizeFluxes,
+    /// Per-pixel local normalization by star flux (see the type's doc); a frame with no grid falls back to the
+    /// global pair of `ScaleZeroOffset`.
     #[default]
     Local,
 }
@@ -70,16 +89,20 @@ pub enum RejectionNormalization {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizationPair {
+    /// The factor the sample is multiplied by (dimensionless).
     pub scale: f32,
+    /// The offset added after scaling, in the sample's own unit.
     pub offset: f32,
 }
 
 impl NormalizationPair {
+    /// The identity pair: scale 1, offset 0.
     pub const IDENTITY: NormalizationPair = NormalizationPair {
         scale: 1.0,
         offset: 0.0,
     };
 
+    /// Applies the pair to one sample: `v * scale + offset`.
     #[inline]
     pub fn apply(&self, v: f32) -> f32 {
         v * self.scale + self.offset

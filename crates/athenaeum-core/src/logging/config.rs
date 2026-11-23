@@ -44,7 +44,8 @@ const MODULE_TARGETS: [(&str, &[&str]); 5] = [
         "calibration",
         &["athenaeum_core::calibration", "starloom::calibration_library"],
     ),
-    // `starloom::fs_util` holds the `sync_best_effort` that archive, zip and export writes call.
+    // `starloom::fs_util` holds the `sync_best_effort` that every durable write calls (archive, zip, export, header
+    // patch and starloom's own FITS, XISF and LN-grid writers).
     (
         "archive",
         &[

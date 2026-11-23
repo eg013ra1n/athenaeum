@@ -9,6 +9,7 @@ use std::path::Path;
 use super::banded::{plane_kind_for_bitpix, pread_exact, probe_fits, PlaneKind};
 use super::IntegrationError;
 
+/// A reader of rows of one plane of one uncompressed FITS file: a mono frame has 1 plane, a debayered color frame 3.
 pub struct PlaneReader {
     file: File,
     width: usize,
@@ -19,6 +20,8 @@ pub struct PlaneReader {
 }
 
 impl PlaneReader {
+    /// Opens `path` and reads its header; fails with [`IntegrationError::BadInput`] when it is not an uncompressed
+    /// 1- or 3-plane FITS image.
     pub fn open(path: &Path) -> Result<PlaneReader, IntegrationError> {
         let (file, info) = probe_fits(path).ok_or_else(|| {
             IntegrationError::BadInput(format!(
@@ -36,15 +39,19 @@ impl PlaneReader {
         })
     }
 
+    /// Image width, in pixels.
     pub fn width(&self) -> usize {
         self.width
     }
+    /// Image height, in pixels.
     pub fn height(&self) -> usize {
         self.height
     }
+    /// Number of planes: 1 for a mono frame, 3 for a color one.
     pub fn channels(&self) -> usize {
         self.channels
     }
+    /// How the stored samples decode to physical values.
     pub fn kind(&self) -> PlaneKind {
         self.kind
     }
@@ -113,6 +120,8 @@ impl PlaneReader {
         Ok(())
     }
 
+    /// Reads and decodes one whole plane, `width * height` samples, row-major, in the file's physical unit; `plane`
+    /// must be below [`PlaneReader::channels`].
     pub fn read_plane(&self, plane: usize) -> Result<Vec<f32>, IntegrationError> {
         let mut out = vec![0f32; self.width * self.height];
         self.read_rows(plane, 0, self.height, &mut out)?;

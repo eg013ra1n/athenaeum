@@ -14,7 +14,7 @@
 //! incomplete beta, and a 26 Mpx plane hands the rejection routine tens of
 //! millions of pixel stacks that all share the same frame count, the `λ`
 //! vector is memoised per `(n, alpha)` in a thread-local (R-M4c-2) —
-//! [`with_esd_lambdas`] is the only way the hot path reads it.
+//! `with_esd_lambdas` is the only way the hot path reads it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

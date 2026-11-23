@@ -29,11 +29,41 @@ static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 /// decode-and-spill fallback produces little-endian f32 while FITS is big.
 #[derive(Clone, Copy, Debug)]
 pub enum PlaneKind {
-    U8 { bzero: f32, bscale: f32 },
-    I16Be { bzero: f32, bscale: f32 },
-    I32Be { bzero: f32, bscale: f32 },
-    F32Be { bzero: f32, bscale: f32 },
-    F64Be { bzero: f64, bscale: f64 },
+    /// Unsigned 8-bit integers; the physical value is `stored * bscale + bzero`.
+    U8 {
+        /// The FITS `BZERO` offset, in the sample's own unit (DN for raw data).
+        bzero: f32,
+        /// The FITS `BSCALE` factor; 1 when the header has none.
+        bscale: f32
+    },
+    /// Signed 16-bit big-endian integers; the physical value is `stored * bscale + bzero`.
+    I16Be {
+        /// The FITS `BZERO` offset, in the sample's own unit (DN for raw data).
+        bzero: f32,
+        /// The FITS `BSCALE` factor; 1 when the header has none.
+        bscale: f32
+    },
+    /// Signed 32-bit big-endian integers; the physical value is `stored * bscale + bzero`.
+    I32Be {
+        /// The FITS `BZERO` offset, in the sample's own unit (DN for raw data).
+        bzero: f32,
+        /// The FITS `BSCALE` factor; 1 when the header has none.
+        bscale: f32
+    },
+    /// 32-bit big-endian floats; the physical value is `stored * bscale + bzero`.
+    F32Be {
+        /// The FITS `BZERO` offset, in the sample's own unit (DN for raw data).
+        bzero: f32,
+        /// The FITS `BSCALE` factor; 1 when the header has none.
+        bscale: f32
+    },
+    /// 64-bit big-endian floats; the physical value is `stored * bscale + bzero`, computed in f64 and returned as f32.
+    F64Be {
+        /// The FITS `BZERO` offset, in the sample's own unit (DN for raw data).
+        bzero: f64,
+        /// The FITS `BSCALE` factor; 1 when the header has none.
+        bscale: f64
+    },
     /// Decode-and-spill scratch: little-endian f32, already physical.
     F32Le,
 }
@@ -233,6 +263,8 @@ impl FrameReader {
     }
 }
 
+/// A set of frame files read together, one row band at a time, so a stack never holds more than one band of every
+/// frame in RAM. All frames must have the same width and height.
 pub struct BandSource {
     readers: Vec<FrameReader>,
     width: usize,
@@ -247,7 +279,8 @@ pub struct FitsInfo {
     pub data_offset: u64,
     /// Bits per stored sample (8, 16, 32, -32 or -64; negative means floating point).
     pub bitpix: i32,
-    /// Number of axes (2 for a mono plane, 3 for a stack of planes).
+    /// Number of axes (2 for a mono plane, 3 for a colour or single-plane 3-D image; the probe accepts 3 only with a
+    /// third axis of length 1 or 3).
     pub naxis: i32,
     /// Image width in pixels.
     pub w: usize,
@@ -469,7 +502,7 @@ impl BandSource {
     /// even locally. Probing across `concurrency` scoped threads amortizes
     /// that latency the same way `read_band` amortizes the per-band reads.
     /// The decode-and-spill fallback is deliberately NOT part of that
-    /// parallel work — see [`ProbeOutcome`]'s doc comment.
+    /// parallel work — see `ProbeOutcome`'s doc comment.
     ///
     /// Readers are assembled back in the caller's `paths` order regardless of
     /// which worker finished first or last: every path has a fixed slot
@@ -596,8 +629,11 @@ impl BandSource {
         Ok(BandSource { readers, width, height })
     }
 
+    /// Width of every frame, in pixels.
     pub fn width(&self) -> usize { self.width }
+    /// Height of every frame, in pixels.
     pub fn height(&self) -> usize { self.height }
+    /// The number of frames, in the order the paths were given to `open`.
     pub fn frame_count(&self) -> usize { self.readers.len() }
 
     pub(crate) fn plane_kinds(&self) -> Vec<PlaneKind> {
@@ -903,11 +939,14 @@ pub struct BandPlanes {
 }
 
 impl BandPlanes {
+    /// Allocates the band buffers for `src`'s frames, each decoded according to its [`PlaneKind`].
     pub fn new<S: super::source::FrameSource + ?Sized>(src: &S) -> BandPlanes {
         BandPlanes::with_kinds(src.plane_kinds(), src.width())
     }
 
+    /// The number of frames in the band.
     pub fn frame_count(&self) -> usize { self.kinds.len() }
+    /// The number of rows currently held per frame.
     pub fn rows(&self) -> usize { self.rows }
 
     /// One decoded sample. `idx` is `row_in_band * width + x`.

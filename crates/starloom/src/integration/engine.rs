@@ -21,11 +21,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// pins it so the bump is accepted on purpose (spec SL-19).
 pub const ENGINE_VERSION: u32 = 1;
 
+/// One integrated plane and the accounting of the run that made it. Samples are in the units of the input frames (DN
+/// for raw calibration frames, normalized for calibrated lights).
 pub struct IntegrationOutput {
+    /// Plane width, in pixels.
     pub width: usize,
+    /// Plane height, in pixels.
     pub height: usize,
+    /// The combined plane, row-major, `width * height` samples.
     pub data: Vec<f32>,
+    /// The fraction of all input samples that rejection dropped, in `[0, 1]`.
     pub rejected_fraction: f64,
+    /// For a flat master, the mean of the plane's central third (in the output's own unit), the constant that
+    /// normalizes the flat; `None` for every other build.
     pub flat_norm: Option<f64>,
     /// How many samples of frame i were dropped as non-finite (NaN/±Inf after
     /// pre-calibration and scaling). Indexed by the caller's `paths` order —
@@ -56,6 +64,7 @@ pub struct IntegrationOutput {
     /// [`EngineProgress::on_band`] for what that asymmetry does to a flat's
     /// live progress numbers.
     pub band_rows: usize,
+    /// How many bands the run used.
     pub bands: usize,
     /// Pixel bytes actually read (sum of `rows * width * bytes_per_sample`
     /// over every band and frame). Not the files' size on disk: headers and
@@ -88,6 +97,7 @@ pub struct IntegrationOutput {
     pub medfit_evals_total: u64,
 }
 
+/// The progress callbacks of an integration run; both must be callable from any worker thread.
 pub struct EngineProgress<'a> {
     /// `(band_index_1based, bands_total, bytes_read_so_far, bytes_total)`.
     ///
@@ -156,12 +166,25 @@ pub struct EngineProgress<'a> {
     pub on_combine: &'a (dyn Fn(usize, usize, u64, u64) + Sync),
 }
 
+/// What is subtracted from each flat frame before it is normalized and combined.
 pub enum FlatPrecal {
-    MasterFrame { data: Vec<f32>, width: usize, height: usize },
+    /// A master bias or dark frame of the flats' size (`data` is `width * height` samples, row-major).
+    MasterFrame {
+        /// The master's samples, row-major, `width * height` of them.
+        data: Vec<f32>,
+        /// Master width, in pixels; must equal the flats' width.
+        width: usize,
+        /// Master height, in pixels; must equal the flats' height.
+        height: usize
+    },
+    /// One constant, in the flats' own unit, subtracted from every pixel.
     SyntheticBias(f32),
+    /// Nothing is subtracted.
     None,
 }
 
+/// The mean of the central third of a plane (the middle third of the rows and of the columns), in the plane's own
+/// unit; 0 for an empty region.
 pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64 {
     let (x0, x1) = (width / 3, (2 * width) / 3);
     let (y0, y1) = (height / 3, (2 * height) / 3);
@@ -624,6 +647,8 @@ fn run_banded<S: FrameSource + ?Sized>(
     })
 }
 
+/// Integrates bias-like frames (bias, dark, dark flat) into one master by the recipe. Runs the per-pixel combine on
+/// `pool`, reads each band through scoped reader threads, and checks `cancel` between bands and frames.
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_bias_like(
     paths: &[PathBuf],
@@ -796,6 +821,7 @@ pub struct StackParams<'a, 'f> {
     pub weights: &'a [f32],
     /// Range rejection on RAW values: reject `raw <= range_low` (when Some) and `raw >= range_high` (when Some).
     pub range_low: Option<f32>,
+    /// Range rejection on raw values: a sample at or above this is rejected, when `Some`.
     pub range_high: Option<f32>,
     /// Accumulate per-pixel low/high rejection counts.
     pub rejection_maps: bool,
@@ -868,9 +894,11 @@ pub struct StackParams<'a, 'f> {
 /// divide by the sum of `samples_per_frame` for that fraction, not by
 /// `base.rejected_fraction`'s denominator.
 pub struct StackOutput {
+    /// The integrated plane and its overall accounting.
     pub base: IntegrationOutput,
     /// Per-pixel rejected-sample counts, low and high sides (`Some` when requested).
     pub rejection_low: Option<Vec<f32>>,
+    /// Per-pixel counts of high-side rejections (`Some` when `rejection_maps` was requested).
     pub rejection_high: Option<Vec<f32>>,
     /// Rejected samples per frame (range + algorithm), indexed by frame.
     pub rejected_per_frame: Vec<u64>,
@@ -878,7 +906,9 @@ pub struct StackOutput {
     /// before range and algorithm rejection (a range-rejected sample is a
     /// sample, then a rejection).
     pub samples_per_frame: Vec<u64>,
+    /// Samples rejected on the low side across the run (range and algorithm).
     pub rejected_low: u64,
+    /// Samples rejected on the high side across the run (range and algorithm).
     pub rejected_high: u64,
     /// Per output pixel, the frames whose raw sample was finite (`Some`
     /// when [`StackParams::coverage`] or [`StackParams::empty_as_nan`] was
@@ -1728,6 +1758,8 @@ pub fn integrate_registered(
     Ok(integrate_stack(src, &params, recipe, pool, cancel, progress, io)?.base)
 }
 
+/// Integrates flat frames into one master flat: each frame is first reduced by `precal`, scaled to the mean of the
+/// frames' central-third means, then combined by the recipe. Runs on `pool`; checks `cancel` between bands.
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_flat(
     paths: &[PathBuf],

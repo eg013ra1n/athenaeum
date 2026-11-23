@@ -433,7 +433,7 @@ impl FrameMeasurement {
     }
     /// Mean over planes of `ChannelMeasurement::median` — the frame's sky
     /// background level, native `[0, 1]` units. This is the `sky[i]`
-    /// [`crate::stacking::weights::sky_penalized_order`] penalizes the
+    /// `crate::stacking::weights::sky_penalized_order` penalizes the
     /// normalization anchor / LN-reference-member ranking on (spec §4.4,
     /// ruling R-M3-17 v2).
     pub fn mean_median(&self) -> f64 {

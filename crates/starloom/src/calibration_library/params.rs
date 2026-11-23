@@ -1,6 +1,6 @@
 //! The light-calibration parameter types: `LightCalParams`, `FlatNormMode`, `BiasFallback` and
 //! `TRIMMED_MEAN_TAIL_FRACTION`. Plain data, ungated; the calibration math that reads them is the `engine` layer
-//! (`calibration_library::light_cal`). Athenaeum core re-exports them from `models`.
+//! (`calibration_library::light_cal`). Every type serializes to the camelCase JSON the app stores and sends.
 
 /// Fraction of pixels discarded from EACH tail by the whole-frame trimmed mean
 /// (`FlatNormMode::TrimmedMeanWhole`). Matches the ERP's image-calibration flat
@@ -19,13 +19,13 @@ pub const TRIMMED_MEAN_TAIL_FRACTION: f64 = 0.05;
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum FlatNormMode {
-    /// Athenaeum convention (default): the flat's central-third mean, read from
-    /// the master's `ATH_FNRM` card and recomputed on the fly when absent.
+    /// The default: the mean of the flat's central third, read from the normalization constant stamped on the
+    /// master flat and recomputed on the fly when no constant is stamped.
     #[default]
     CentralThird,
     /// ERP-compatible: a two-sided trimmed mean over the WHOLE frame,
     /// discarding [`TRIMMED_MEAN_TAIL_FRACTION`] of the pixels from each tail.
-    /// Always computed from the flat file — the `ATH_FNRM` card is ignored.
+    /// Always computed from the flat file; a stamped normalization constant is ignored.
     ///
     /// Wire/storage compatibility: the persisted string stays the pre-rename
     /// one (stacking configs in the catalog, the `flat_norm_mode` DB column,
@@ -75,7 +75,7 @@ fn default_trim_fraction() -> f64 {
 /// asymmetry with the other defaults: a stored/stamped `'{}'` written before
 /// this field existed also decodes to `true`, which is NOT what it was
 /// calibrated with. `cal_params` therefore records what was REQUESTED; what was
-/// APPLIED is reported separately (`ATH_CCFA` on the output).
+/// APPLIED is reported separately (a stamp on the calibrated output).
 fn default_true() -> bool {
     true
 }
@@ -90,13 +90,13 @@ fn default_true() -> bool {
 pub struct LightCalParams {
     /// Per-tail discard fraction for the `TrimmedMeanWhole` statistic
     /// (default [`TRIMMED_MEAN_TAIL_FRACTION`] = 0.05). Only meaningful when the flat is
-    /// normalized in `TrimmedMeanWhole` mode; stamped as `ATH_CTRM` then.
+    /// normalized in `TrimmedMeanWhole` mode; the caller stamps it on the output then.
     #[serde(default = "default_trim_fraction")]
     pub trim_fraction: f64,
     /// DN added to the output AFTER the scale divide (`out += pedestal_dn /
     /// OUTPUT_SCALE_DIVISOR`, default 0 = off), for consumers that clip
-    /// negatives. Stamped as `ATH_CPED` (the DN value) always; `CALSTAT`
-    /// unchanged — a pedestal is not a calibration step.
+    /// negatives. The caller always stamps the DN value on the output; the calibration status
+    /// is unchanged — a pedestal is not a calibration step.
     #[serde(default)]
     pub pedestal_dn: f64,
     /// What to do for a light with no dark master (default `subtractBias`).

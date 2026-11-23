@@ -46,13 +46,13 @@ pub struct MeasurementConfig {
     /// [`legacy_seed_source`]; one that carries it uses it as is.
     pub seed_source: SeedSource,
     /// The matched filter's threshold in units of the filtered plane's noise (ruling R-OSP-2). Clamped to
-    /// [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`] by [`resolve_config`].
+    /// `MIN_SEED_THRESHOLD`..=`MAX_SEED_THRESHOLD` by `resolve_config`.
     pub seed_threshold: f64,
     /// Fast measurement (FM-2, FM-3): the first K seeds in detection order (filter flux descending) get the PSF
     /// fits, the rest keep their detection record and are not fitted; `None` = all (the shipped behaviour). No
     /// imputation: the frame aggregates, `c` and the F-6 medians are over the fitted set. Clamped up to
-    /// `max(`[`MIN_FIT_STARS`]`, registration.maxStars)` and canonicalized to `None` at or above
-    /// `measurement.maxStars` by [`resolve_config`]. Absent from the document at `None`, so every All-mode hash is
+    /// `max(``MIN_FIT_STARS``, registration.maxStars)` and canonicalized to `None` at or above
+    /// `measurement.maxStars` by `resolve_config`. Absent from the document at `None`, so every All-mode hash is
     /// the one before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -234,7 +234,7 @@ pub struct DrizzleConfig {
     /// `#[serde(default)]` rides the struct-level `default`, so every stored
     /// config written before M4d decodes as `false` and no
     /// `STACKING_CONFIG_VERSION` bump is needed. It deliberately does NOT
-    /// enter [`calibration_subtree`]: the debayered artifact is
+    /// enter `calibration_subtree`: the debayered artifact is
     /// byte-identical either way, so flipping this must not invalidate a
     /// set's whole calibrated cache — the missing `calibrated_mosaic`
     /// artifact is what makes the run regenerate the pair (`stacking::run`).
@@ -293,7 +293,7 @@ pub const MAX_GROWTH: u8 = 4;
 ///   generation of its own — a generation marks a change in what a
 ///   RELEASED run produces.
 ///
-/// **Why it rides [`config_hash`] and no [`stage_hash`].** The drizzle
+/// **Why it rides `config_hash` and no `stage_hash`.** The drizzle
 /// stage has no cache: it re-runs from the calibrated frames on every run,
 /// so there is no stored artifact for a version bump to invalidate and no
 /// per-stage subtree that folds in `drizzle` at all (the four are

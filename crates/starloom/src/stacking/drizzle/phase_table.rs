@@ -2,7 +2,7 @@
 //! `2026-09-20-stacking-compute-tierC-design.md` §3, ruling C-3).
 //!
 //! What it replaces: [`super::deposit_band`] used to map each source
-//! pixel's four drop corners through the frame's [`ForwardEval`]
+//! pixel's four drop corners through the frame's `ForwardEval`
 //! ([`super::geom::map_drop`]) and then run one Sutherland–Hodgman clip
 //! ([`super::geom::clip_area`], ≈ 100–120 `f64` operations with ≈ 8
 //! divisions) per overlapped output pixel — ≈ 422 ns per source pixel.

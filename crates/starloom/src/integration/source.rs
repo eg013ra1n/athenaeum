@@ -27,6 +27,8 @@ pub trait RejectionBitSink: Sync {
     fn words_per_row(&self) -> usize;
     /// `== n`, the frame source's own frame count.
     fn frames(&self) -> usize;
+    /// Records one band's rejection bits: rows `[y0, y0 + rows)`, laid out `[row_in_band][frame][word]` as described
+    /// on the trait.
     fn record_band(&self, y0: usize, rows: usize, bits: &[u64]) -> Result<(), IntegrationError>;
 }
 
@@ -71,13 +73,19 @@ pub trait RejectionBitSource: Sync {
     }
 }
 
+/// A set of equal-sized frames the banded engine can read one row band at a time.
 pub trait FrameSource: Sync {
+    /// Frame width, in pixels.
     fn width(&self) -> usize;
+    /// Frame height, in pixels.
     fn height(&self) -> usize;
+    /// The number of frames.
     fn frame_count(&self) -> usize;
+    /// How each frame's stored bytes decode, one [`PlaneKind`] per frame.
     fn plane_kinds(&self) -> Vec<PlaneKind>;
     /// Source bytes one row of every frame costs (drives the band budget).
     fn bytes_per_row(&self) -> usize;
+    /// How many rows of every frame fit in `budget_bytes` of memory, at least one.
     fn band_rows_for_budget(&self, budget_bytes: usize) -> usize;
     /// Fill rows `[y0, y0 + rows)` of every frame into `out`, calling
     /// `on_bytes` once per frame with that frame's accounted share of the

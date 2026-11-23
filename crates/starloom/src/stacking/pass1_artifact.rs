@@ -4,7 +4,7 @@
 //! by pass 2 and by every later run whose key and source stamp still match. A second pass over the same pixels then
 //! costs a read and the fits, never the detection and the verdict pass again.
 //!
-//! Layout (all integers little-endian), in the style of the `.athf` file ([`super::fits_artifact`]):
+//! Layout (all integers little-endian), in the style of the `.athf` file (`super::fits_artifact`):
 //!
 //! ```text
 //! b"ATHM" | u16 PASS1_ARTIFACT_VERSION | u32 MEASURE_VERSION | u32 head length | u64 xxh3(head) | head
@@ -235,7 +235,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Pass1Head, Pass1Body), Pass1Artifa
     Ok((head, body))
 }
 
-/// Writes `pass1` to `path` as `.athf` is written ([`super::fits_artifact::write_fits`]): the bytes to a temporary
+/// Writes `pass1` to `path` as `.athf` is written (`super::fits_artifact::write_fits`): the bytes to a temporary
 /// file beside it, then [`crate::fits_writer::writer::rename_replace`] (no fsync: a write a crash loses or truncates
 /// reads back as a refused artifact, never a wrong answer). The records are serialised through a borrowed view, never
 /// cloned. Returns the bytes written.

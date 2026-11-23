@@ -222,7 +222,7 @@ pub const LN_LOCAL_SCALE_SMOOTHING_SIGMAS: f64 = 5.0;
 
 /// Perf tier A Task 0 (audit §3.1): wall time (ms) inside each phase of one
 /// [`relative_scale_against`] call — `detect_ms` ([`detect_seeds`] on the
-/// TARGET), `fit_ms` ([`psf_signal::fit_stars_with_beta`] on the target),
+/// TARGET), `fit_ms` (`psf_signal::fit_stars_with_beta` on the target),
 /// `match_ms` (pairing — [`choose_pairing`]/[`measured_sample`] — plus RCR and,
 /// when asked for, [`fit_local_scale`], all together). `refine_ms` is
 /// reserved for the centroid-refine LM step Task 3 splits out of
@@ -1239,7 +1239,7 @@ impl PreparedReferenceChannel {
 /// straight into the scale.
 ///
 /// The TARGET always fits at the reference's OWN resolved β
-/// ([`psf_signal::fit_stars_with_beta`], never a second, independent
+/// (`psf_signal::fit_stars_with_beta`, never a second, independent
 /// `Auto` search) — because β changes the FWTM-enclosed flux fraction
 /// (math §1.4), fitting the two planes at two different β values would
 /// bias the ratio systematically even though `signal` itself is
@@ -1612,7 +1612,7 @@ fn choose_pairing_widened(
 /// **What this function does instead**: it keeps Measure's cheap per-plane
 /// detection (skipping [`detect_seeds`]'s own expensive full-frame search)
 /// but discards every FITTED VALUE, using only the accepted stars'
-/// POSITIONS as seeds for a fresh [`fit_stars_with_beta`] call on the
+/// POSITIONS as seeds for a fresh `fit_stars_with_beta` call on the
 /// WARPED TARGET PLANE — exactly [`relative_scale_against`]'s own fit
 /// call, fed a pre-selected seed list instead of [`detect_seeds`]'s
 /// full-frame one. The expensive full-frame detection disappears; the PSF
@@ -1633,7 +1633,7 @@ fn choose_pairing_widened(
 /// [`warped_pixel_is_saturated`] — a saturation guard on the WARPED
 /// plane's own pixel value at that position (native `[0, 1]` units) —
 /// this is the one piece of the OLD design's
-/// [`register::detect::passes_register_cuts`] this path still needs
+/// `register::detect::passes_register_cuts` this path still needs
 /// (Measure's own acceptance already covers eccentricity/SNR on the
 /// NATIVE frame, but says nothing about the WARPED pixel the fresh fit is
 /// about to sample); (3) PRE-SELECT — keep only seeds with a reference
@@ -1652,12 +1652,12 @@ fn choose_pairing_widened(
 ///
 /// Survivors become [`Seed`]s (`peak`/`flux` copied from the Measure fit's
 /// own `amplitude`/`signal` — `peak` used only to order the seeds whose
-/// half-maximum widths give [`fit_stars_with_beta`] its field width, an
+/// half-maximum widths give `fit_stars_with_beta` its field width, an
 /// ORDER any unit difference between Measure's ADU-scaled fits and this
 /// native plane leaves unchanged; before Plan A Task 6b the field-level
 /// `initial_sigma` ratio of the two sized the fit stamp), sorted brightest-first (the convention
 /// [`detect_seeds`]'s own `to_seed` documents), capped at `max_stars`, then
-/// fitted with [`fit_stars_with_beta`] at the reference's DEFAULT β —
+/// fitted with `fit_stars_with_beta` at the reference's DEFAULT β —
 /// never a seed's own original Measure β, which no longer matters: this is
 /// a FRESH fit on the warped plane, at whatever β makes it comparable to
 /// the reference's own fit, exactly like [`relative_scale_against`].

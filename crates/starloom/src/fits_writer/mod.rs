@@ -33,7 +33,11 @@ pub const STARLOOM_CREATOR: &str = concat!("starloom ", env!("CARGO_PKG_VERSION"
 /// wrong answer" claim actually rests on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
+    /// Fsyncs the temporary file (`sync_all`) before the rename makes the write visible. Used for every master and
+    /// every export.
     Durable,
+    /// Flushes only and skips the fsync; the rename is still atomic. Used for the run's own regenerable
+    /// intermediates.
     Volatile,
 }
 
@@ -44,6 +48,7 @@ pub enum Durability {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub enum OutputFormat {
+    /// FITS, one primary HDU with 32-bit IEEE float samples (BITPIX -32), written by [`writer`].
     #[default]
     Fits,
     /// Monolithic XISF 1.0, one uncompressed Float32 image, the same cards
@@ -52,6 +57,7 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
+    /// The file extension for this container, without the dot: `"fits"` or `"xisf"`.
     pub fn extension(self) -> &'static str {
         match self {
             OutputFormat::Fits => "fits",
@@ -70,16 +76,21 @@ impl OutputFormat {
 
 /// The representable range an XISF Float32 image declares (XISF 1.0
 /// §11.5.1, mandatory). Which one applies is the CALLER's knowledge: a
-/// stacking master and a calibrated light are unit-scaled (`ATH_CSCL`), a
+/// stacking master and a calibrated light are unit-scaled (normalized), a
 /// calibration master is raw ADU. rustafits' reader normalizes by these
 /// bounds and multiplies by 65535, so both come back in the ADU domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XisfBounds {
+    /// Declares the range `0:1`: samples are normalized (DN divided by the unit divisor), as in a stacking master or
+    /// a calibrated light.
     Unit,
+    /// Declares the range `0:65535`: samples are raw sensor DN, as in a calibration master.
     Adu16,
 }
 
 impl XisfBounds {
+    /// The XISF `bounds` attribute text for this range: `"0:1"` for [`XisfBounds::Unit`], `"0:65535"` for
+    /// [`XisfBounds::Adu16`].
     pub fn attr(self) -> &'static str {
         match self {
             XisfBounds::Unit => "0:1",

@@ -40,7 +40,7 @@ impl From<&DetectedStars> for ReferenceStars {
 /// `register_frame`'s split half). Detection depends only on the frame's
 /// own plane(s) and `cfg.registration` — never on a reference — so this
 /// value is reusable verbatim for as many registration attempts as a
-/// caller likes; [`crate::stacking::run`]'s two-pass dry pass caches one
+/// caller likes; `crate::stacking::run`'s two-pass dry pass caches one
 /// of these per frame instead of re-reading and re-detecting the same
 /// pixels for the persisting pass that follows it.
 ///
@@ -274,7 +274,7 @@ pub fn detect_frame_stars(
 /// UNCONDITIONALLY `0` — this function never reads or detects, whether
 /// `detected` was produced moments ago (a fresh [`register_frame`] call)
 /// or reused from an earlier detection (a cache hit in
-/// [`crate::stacking::run`]'s two-pass dry pass); that cost is captured
+/// `crate::stacking::run`'s two-pass dry pass); that cost is captured
 /// once, on [`detect_frame_stars`]'s own `"frame stars detected"` event,
 /// wherever it was actually paid. `FrameRegistration::duration_ms` here is
 /// align time only — [`register_frame`] adds the detect+read time back on

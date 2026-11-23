@@ -1,13 +1,21 @@
-//! The CFA pattern enum and its one parser (moved from Athenaeum core's `fits_writer::keywords`).
+//! The Bayer color-filter-array pattern enum and its one parser of stored pattern text.
 
+/// The 2x2 Bayer color filter array of a one-shot-color sensor, named by the filter colors of the top-left 2x2 block
+/// read row by row (R red, G green, B blue).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bayer {
+    /// Red, green on the first row; green, blue on the second.
     Rggb,
+    /// Blue, green on the first row; green, red on the second.
     Bggr,
+    /// Green, blue on the first row; red, green on the second.
     Gbrg,
+    /// Green, red on the first row; blue, green on the second.
     Grbg,
 }
 impl Bayer {
+    /// The canonical upper-case spelling of the pattern (`"RGGB"`, `"BGGR"`, `"GBRG"` or `"GRBG"`), the text of a
+    /// `BAYERPAT` card.
     pub fn as_str(&self) -> &'static str {
         match self {
             Bayer::Rggb => "RGGB",

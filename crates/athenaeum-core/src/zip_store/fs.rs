@@ -3,7 +3,8 @@
 use std::io;
 use std::path::Path;
 
-// The one copy lives in starloom; archive, zip and export writes reach it through this path.
+// The one copy lives in starloom; every durable write (archive, zip, export, header patch and starloom's own
+// FITS, XISF and LN-grid writers) reaches it.
 pub(crate) use starloom::fs_util::sync_best_effort;
 
 /// Lets a rename replace `target` when Windows marks it read-only. There a rename refuses to replace a file

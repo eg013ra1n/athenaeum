@@ -835,9 +835,74 @@ syncConfigured: boolean, };
 
 export type Combination = "average" | "median";
 
-export type Rejection = { "method": "none" } | { "method": "percentile_clip", low: number, high: number, } | { "method": "sigma_clip", sigma_low: number, sigma_high: number, } | { "method": "winsorized_sigma", sigma_low: number, sigma_high: number, } | { "method": "linear_fit_clip", sigma_low: number, sigma_high: number, } | { "method": "min_max", low: number, high: number, } | { "method": "esd", outliers_fraction: number, alpha: number, low_relaxation: number, } | { "method": "rcr", limit: number, };
+export type Rejection = { "method": "none" } | { "method": "percentile_clip", 
+/**
+ * Reject when the sample lies this fraction of |m| below the median (dimensionless, e.g. 0.2 = 20 %).
+ */
+low: number, 
+/**
+ * Reject when the sample lies this fraction of |m| above the median (dimensionless).
+ */
+high: number, } | { "method": "sigma_clip", 
+/**
+ * How many standard deviations below the centre a sample may lie before it is rejected.
+ */
+sigma_low: number, 
+/**
+ * How many standard deviations above the centre a sample may lie before it is rejected.
+ */
+sigma_high: number, } | { "method": "winsorized_sigma", 
+/**
+ * How many winsorized standard deviations below the centre a sample may lie before it is rejected.
+ */
+sigma_low: number, 
+/**
+ * How many winsorized standard deviations above the centre a sample may lie before it is rejected.
+ */
+sigma_high: number, } | { "method": "linear_fit_clip", 
+/**
+ * How many deviation units below the fitted line a sample may lie before it is rejected.
+ */
+sigma_low: number, 
+/**
+ * How many deviation units above the fitted line a sample may lie before it is rejected.
+ */
+sigma_high: number, } | { "method": "min_max", 
+/**
+ * How many of the smallest samples to drop.
+ */
+low: number, 
+/**
+ * How many of the largest samples to drop.
+ */
+high: number, } | { "method": "esd", 
+/**
+ * The largest share of the samples that may be removed as outliers, in `[0, 1]`.
+ */
+outliers_fraction: number, 
+/**
+ * The significance level of each test (dimensionless, e.g. 0.05).
+ */
+alpha: number, 
+/**
+ * The factor that inflates the scale below the centre, so faint samples are rejected less eagerly.
+ */
+low_relaxation: number, } | { "method": "rcr", 
+/**
+ * The expected number of samples at least as extreme as the candidate below which it is rejected (0.5 is
+ * Chauvenet's criterion).
+ */
+limit: number, };
 
-export type IntegrationRecipe = { combination: Combination, rejection: Rejection, };
+export type IntegrationRecipe = { 
+/**
+ * How the surviving samples are collapsed into one pixel.
+ */
+combination: Combination, 
+/**
+ * Which samples are excluded before that.
+ */
+rejection: Rejection, };
 
 export type MasterRecipe = { 
 /**
@@ -1055,14 +1120,14 @@ export type LightCalParams = {
 /**
  * Per-tail discard fraction for the `TrimmedMeanWhole` statistic
  * (default [`TRIMMED_MEAN_TAIL_FRACTION`] = 0.05). Only meaningful when the flat is
- * normalized in `TrimmedMeanWhole` mode; stamped as `ATH_CTRM` then.
+ * normalized in `TrimmedMeanWhole` mode; the caller stamps it on the output then.
  */
 trimFraction: number, 
 /**
  * DN added to the output AFTER the scale divide (`out += pedestal_dn /
  * OUTPUT_SCALE_DIVISOR`, default 0 = off), for consumers that clip
- * negatives. Stamped as `ATH_CPED` (the DN value) always; `CALSTAT`
- * unchanged — a pedestal is not a calibration step.
+ * negatives. The caller always stamps the DN value on the output; the calibration status
+ * is unchanged — a pedestal is not a calibration step.
  */
 pedestalDn: number, 
 /**

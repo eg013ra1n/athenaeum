@@ -156,11 +156,13 @@ pub struct DrizzleInput<'a> {
     /// when [`Self::stats_on_covered`] is set.
     pub stats_rect: Option<crate::stacking::crop::CropRect>,
     pub measure: &'a MeasureOptions,
-    /// Injected total system RAM for the memory refusal (ruling R-M3-7,
+    /// Injected total system RAM, in bytes, for the memory refusal (ruling R-M3-7,
     /// ruling R-M3-12): `None` probes
     /// [`crate::integration::band_budget::total_ram_bytes`] — the run
     /// always passes `None`; tests inject a small value to exercise the
-    /// refusal without needing a huge geometry.
+    /// refusal without needing a huge geometry. The run is allowed half of the
+    /// total; when the total is unknown (the probe returns `None` too) it is
+    /// allowed a flat 4 GiB (4,294,967,296 bytes).
     pub ram_total_bytes: Option<u64>,
     /// Forces the exact per-pixel clip everywhere, even where Tier C item
     /// C2's phase table would apply (ruling C-3). **The run never sets

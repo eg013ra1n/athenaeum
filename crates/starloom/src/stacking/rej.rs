@@ -829,6 +829,10 @@ impl RejForcedSource {
     /// [`RejBitmap::write`]) against the caller's expected geometry —
     /// [`RejBitmap::read`] refuses a truncated, foreign or wrong-geometry
     /// file outright, so a stale sibling can never be silently trusted.
+    ///
+    /// The planes kept in RAM are limited to a quarter of [`total_ram_bytes`]; when the RAM probe returns `None` the
+    /// limit is `UNKNOWN_RAM_FORCED_BUDGET_BYTES`, 2,000,000,000 bytes. Over the limit `load` returns an error
+    /// instead of allocating.
     pub fn load(
         paths: &[PathBuf],
         width: usize,
