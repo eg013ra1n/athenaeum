@@ -37,7 +37,7 @@ rustafits = { path = "../../rustafits", default-features = false, features = ["s
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.
 solvemyastro = { path = "../../solvemyastro", optional = true }
 # The stacking kernel. Base layer and `ts` always; `render` / `solver` add its `engine` / `stack` layers.
-starloom = { path = "../starloom", default-features = false, features = ["ts"] }
+starloom = { path = "../../starloom", default-features = false, features = ["ts"] }
 sha2 = "0.11"
 md-5 = "0.11"
 byteorder = "1"

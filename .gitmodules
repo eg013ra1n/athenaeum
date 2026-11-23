@@ -4,3 +4,6 @@
 [submodule "solvemyastro"]
 	path = solvemyastro
 	url = https://github.com/eg013ra1n/solvemyastro.git
+[submodule "starloom"]
+	path = starloom
+	url = https://github.com/eg013ra1n/starloom.git

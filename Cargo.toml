@@ -8,7 +8,7 @@ members = [
     "crates/catalog-builder",
     "crates/log-mcp",
     "crates/perseus",
-    "crates/starloom",
+    "starloom",
     "rustafits",
     "solvemyastro",
 ]

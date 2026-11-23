@@ -1,0 +1,11 @@
+# Starloom bump PRs (spec SL-14, plan 2026-11-23-starloom-p3 P3-R11). Dependabot proposes the submodule's branch head:
+# a PR whose SHA is not a starloom v* tag waits or is closed (.claude/skills/starloom-release). Merge locally and push
+# to `all`, so GitLab and GitHub keep the same SHAs.
+version: 2
+updates:
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    allow:
+      - dependency-name: "starloom"

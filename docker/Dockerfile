@@ -17,7 +17,7 @@ WORKDIR /build
 # Copy workspace manifests first for layer caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/athenaeum-core/Cargo.toml crates/athenaeum-core/Cargo.toml
-COPY crates/starloom/Cargo.toml crates/starloom/Cargo.toml
+COPY starloom/Cargo.toml starloom/Cargo.toml
 COPY crates/athenaeum-web/Cargo.toml crates/athenaeum-web/Cargo.toml
 
 # Copy rustafits submodule in full — it's a path dep workspace member.
@@ -34,7 +34,7 @@ COPY solvemyastro/ solvemyastro/
 
 # Create dummy lib/main to cache dependency compilation
 RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/athenaeum-core/src/lib.rs \
-    && mkdir -p crates/starloom/src && echo "pub fn _dummy() {}" > crates/starloom/src/lib.rs \
+    && mkdir -p starloom/src && echo "pub fn _dummy() {}" > starloom/src/lib.rs \
     && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs
 
 # Stub every explicit [[example]] target of athenaeum-core. Cargo refuses to
@@ -76,7 +76,7 @@ RUN cargo build --release --package athenaeum-web 2>/dev/null || true
 
 # Copy real source and build
 COPY crates/athenaeum-core/ crates/athenaeum-core/
-COPY crates/starloom/ crates/starloom/
+COPY starloom/ starloom/
 COPY crates/athenaeum-web/ crates/athenaeum-web/
 
 # athenaeum-core embeds this at compile time (in-app "What's new" — see
@@ -86,7 +86,7 @@ COPY crates/athenaeum-web/ crates/athenaeum-web/
 COPY RELEASE_NOTES.md ./
 
 # Touch source files to invalidate the dummy build cache
-RUN touch crates/starloom/src/lib.rs crates/athenaeum-core/src/lib.rs crates/athenaeum-web/src/main.rs
+RUN touch starloom/src/lib.rs crates/athenaeum-core/src/lib.rs crates/athenaeum-web/src/main.rs
 
 RUN cargo build --release --package athenaeum-web
 
