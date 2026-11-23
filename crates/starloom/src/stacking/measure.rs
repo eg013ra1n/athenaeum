@@ -1819,6 +1819,7 @@ pub struct FramePass1 {
 /// Test-only: one entry per [`measure_frame_pass1`] call — the one entry of all first-pass work (Task 11c, bar 2). A
 /// test reads the entries under its own temp tree, as `FITS_WRITE_FAILURE_LOG` is read.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub static PASS1_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
     std::sync::Mutex::new(Vec::new());
@@ -1827,6 +1828,7 @@ pub static PASS1_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
 /// the run's cancel flag is set (a deterministic mid-phase-1 cancel; Task 11c review I2). The artifact is written by
 /// the caller after `measure_frame_pass1` returns, so the cancel lands between that write and the next frame.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub static PASS1_CANCEL_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
     std::sync::Mutex::new(Vec::new());
@@ -1835,6 +1837,7 @@ pub static PASS1_CANCEL_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>
 /// frame's file gets a modification time ten seconds ahead, so the read guard refuses its pass 2 (a deterministic
 /// pass-2 failure after a successful, written first pass; ruling R10 M3). Fires once.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub static PASS1_TOUCH_AFTER: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
     std::sync::Mutex::new(Vec::new());
@@ -1876,6 +1879,7 @@ impl Drop for Pass1Live {
 
 /// Test-only: the most [`FramePass1`] values of `dir` (a calibrated directory) ever alive at once.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub fn pass1_peak(dir: &Path) -> usize {
     PASS1_LIVE
@@ -2124,10 +2128,10 @@ impl Pass1Body {
     }
 }
 
-/// Whether a stored head describes `calibrated` as it is now (the controller's check in step (0), Plan A Task 11c,
-/// R11c-5): the stamp's length equals the file's now ([`Pass1ArtifactError::Stale`] otherwise; [`check_stamp_len`]) and
-/// the geometry and the plane count are the file's own (a header probe, no pixel read).
-#[doc(hidden)]
+/// Checks whether a stored first-pass head still describes the calibrated frame as it is now, so a cached measurement
+/// is not trusted for a file that changed (the controller's check in step (0), Plan A Task 11c, R11c-5): the stamp's
+/// length equals the file's now ([`Pass1ArtifactError::Stale`] otherwise; [`check_stamp_len`]) and the geometry (pixels)
+/// and the plane count are the file's own (a header probe, no pixel read).
 pub fn check_pass1_head(
     head: &Pass1Head,
     calibrated: &Path,

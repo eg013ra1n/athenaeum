@@ -756,8 +756,7 @@ thread_local! {
 /// is fully overwritten before `process_row` reads it back), so dropping it
 /// only changes whether the NEXT `init_row_state` call on that thread has to
 /// reallocate, never what it computes.
-#[doc(hidden)]
-pub fn release_ln_row_buffers() {
+pub(crate) fn release_ln_row_buffers() {
     LN_ROW_BUFFERS.with(|cell| {
         let mut pool = cell.borrow_mut();
         pool.clear();

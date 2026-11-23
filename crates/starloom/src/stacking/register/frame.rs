@@ -90,6 +90,7 @@ pub struct DetectedStars {
 /// provably its own, immune to how many other tests happen to be
 /// registering frames at the same wall-clock moment.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub static DETECT_FRAME_STARS_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
     std::sync::Mutex::new(Vec::new());

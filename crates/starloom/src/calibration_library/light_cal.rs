@@ -362,9 +362,8 @@ pub fn calibrate_light_compute_with_cards(
     calibrate_light_compute_budgeted(inputs, preloaded, cancel, MIN_BUDGET_BYTES, cards)
 }
 
-/// [`calibrate_light_compute_with_cards`] with the band-memory budget as a
-/// parameter, so a caller can force a multi-band run on a small fixture.
-#[doc(hidden)]
+/// Calibrates one light frame like [`calibrate_light_compute_with_cards`], with the band-memory budget as a
+/// parameter (`band_budget_bytes`, in bytes), so a caller can force a multi-band run on a small fixture.
 pub fn calibrate_light_compute_budgeted(
     inputs: &LightCalInputs,
     preloaded: Option<&PreloadedMasters>,

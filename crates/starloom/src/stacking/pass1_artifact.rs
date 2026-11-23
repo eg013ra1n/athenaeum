@@ -35,6 +35,7 @@ pub const PASS1_ARTIFACT_VERSION: u16 = 1;
 
 const MAGIC: [u8; 4] = *b"ATHM";
 /// Magic, version, measure version, head length, head checksum.
+// doc(hidden): Athenaeum's measure tests flip a byte past it; the format is documented in P2-3
 #[doc(hidden)]
 pub const PREFIX_LEN: usize = 4 + 2 + 4 + 4 + 8;
 /// The head is a few dozen bytes; a declared length past this is a damaged file, not a head.

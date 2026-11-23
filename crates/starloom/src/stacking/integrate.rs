@@ -817,6 +817,7 @@ fn common_signals(
 
 /// The positions of the set inside an image of `size` whose origin in the grid is `origin`. A star outside the image
 /// is not asked for: a fit cut by the image's rim could otherwise answer for it.
+// doc(hidden): read by Athenaeum's run tests, which build a crop's star positions by hand
 #[doc(hidden)]
 pub fn positions_in_crop(
     positions: &[(f64, f64)],
@@ -838,6 +839,7 @@ pub fn positions_in_crop(
 /// channel's `noise`), so the master's figure and the best sub's `ChannelMeasurement::psf_snr` (the common-set value
 /// after D1w) are on one scale. Returns the figure and how many stars were matched; `Err(matched)` under
 /// [`COMMON_MIN_STARS`] of them.
+// doc(hidden): read by Athenaeum's run tests, which compare a master's figure with the best sub's
 #[doc(hidden)]
 pub fn common_psf_snr(
     fits: &[StarFit],
@@ -1484,7 +1486,7 @@ pub(crate) fn integrate_planes<'g>(
     Ok((outputs, output_pairs_out))
 }
 
-/// The min-weight drop's DECISION (spec §6.2): a frame whose lowest
+/// Which frames join the stack once the min-weight floor is applied, the drop's DECISION (spec §6.2): a frame whose lowest
 /// per-channel normalized weight sits below `min_weight` never joins the
 /// stack; the reference is exempt (dropping it would leave nothing to
 /// normalize the rest against). Returns the included frame indices into
@@ -1496,7 +1498,6 @@ pub(crate) fn integrate_planes<'g>(
 /// must never disagree about which frames survive the floor, so this is the
 /// only place the rule itself is expressed; both callers pass identical
 /// inputs and get an identical answer, deterministically.
-#[doc(hidden)]
 pub fn included_after_min_weight(
     frames: &[StackFrame],
     reference: usize,
@@ -1517,7 +1518,7 @@ pub fn included_after_min_weight(
         .collect()
 }
 
-/// How many times [`integrate_planes`] runs for a group (M4c Task 3,
+/// How many integration passes a group makes: how many times [`integrate_planes`] runs for it (M4c Task 3,
 /// ruling R-M4c-4): twice when large-scale rejection is on AND the run
 /// created a rejection-bitmap set for the group to derive the structures
 /// from (without one there is nothing to filter), once otherwise.
@@ -1526,7 +1527,6 @@ pub fn included_after_min_weight(
 /// size the Integrate stage's own progress space before `integrate_group`
 /// runs, so the two can never disagree about how many plane-slots a group's
 /// integration will report.
-#[doc(hidden)]
 pub fn large_scale_passes(integration: &IntegrationConfig, has_rej: bool) -> usize {
     if integration.large_scale.enabled && has_rej {
         2

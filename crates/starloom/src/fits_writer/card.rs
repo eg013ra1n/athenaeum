@@ -7,8 +7,9 @@ pub const BLOCK_SIZE: usize = 2880;
 // used to hard-code its own `ATH_STKC_MAX_CHARS = 68` copy of this same
 // number (with a comment naming this constant, which it could not actually
 // reference) so the two would silently drift if this one ever changed.
-#[doc(hidden)]
-pub const MAX_STR_CONTENT: usize = 68; // printable chars inside the quotes of one card
+/// The most printable characters one card's quoted string value holds, in characters (the 80-byte card leaves 68
+/// inside the quotes); a longer string continues on CONTINUE cards.
+pub const MAX_STR_CONTENT: usize = 68;
 
 #[derive(Debug)]
 pub enum FitsWriteError {
@@ -114,6 +115,7 @@ impl Card {
     /// Internal constructor for writer-owned structural cards.
     /// Bypasses only the RESERVED-keyword check (SIMPLE/BITPIX/END/etc. are legitimate here);
     /// charset/length validation still applies via a debug assertion.
+    // doc(hidden): the writer's own structural cards, built by hand only in Athenaeum's tests
     #[doc(hidden)]
     pub fn structural(keyword: &str, value: CardValue, comment: &str) -> Card {
         debug_assert!(

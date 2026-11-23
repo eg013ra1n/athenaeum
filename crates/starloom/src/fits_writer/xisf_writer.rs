@@ -171,10 +171,9 @@ pub fn xisf_keyword_value(card: &Card) -> (String, String) {
     (value, comment)
 }
 
-/// XML attribute escaping. `'` is deliberately left alone — every attribute
+/// Escapes a string for use as an XML attribute value in an XISF header (`&`, `<`, `>` and `"`). `'` is deliberately left alone — every attribute
 /// here is delimited by `"`, and FITS string values are full of single
 /// quotes, so escaping them would only make the header unreadable.
-#[doc(hidden)]
 pub fn escape_xml(s: &str) -> Cow<'_, str> {
     if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
         return Cow::Borrowed(s);

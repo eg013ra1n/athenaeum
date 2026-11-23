@@ -239,27 +239,44 @@ pub struct BandSource {
     height: usize,
 }
 
-#[doc(hidden)]
-pub struct FitsInfo { pub data_offset: u64, pub bitpix: i32, pub naxis: i32, pub w: usize, pub h: usize, pub naxis3: usize, pub bzero: f64, pub bscale: f64 }
+/// What a FITS primary header says about the image behind it: where the pixel data starts and how the stored numbers
+/// map to values. Read by [`probe_fits`] and [`fits_info_from_reader`] from the handful of numeric cards a direct
+/// reader needs.
+pub struct FitsInfo {
+    /// Bytes from the start of the file to the first data byte (a whole number of 2880-byte header blocks).
+    pub data_offset: u64,
+    /// Bits per stored sample (8, 16, 32, -32 or -64; negative means floating point).
+    pub bitpix: i32,
+    /// Number of axes (2 for a mono plane, 3 for a stack of planes).
+    pub naxis: i32,
+    /// Image width in pixels.
+    pub w: usize,
+    /// Image height in pixels.
+    pub h: usize,
+    /// Number of planes; 1 when the header has no third axis.
+    pub naxis3: usize,
+    /// Offset added to a stored sample to get its physical value (the sample's own unit, DN for raw data).
+    pub bzero: f64,
+    /// Factor a stored sample is multiplied by before the offset; 1.0 when the header has none.
+    pub bscale: f64,
+}
 
-/// Scan primary-header blocks for END; harvest the handful of numeric cards
-/// the direct reader needs. Returns the open handle alongside the info so the
+/// Reads the FITS primary header of the file at `path`: scans header blocks for END and harvests the handful of numeric
+/// cards the direct reader needs. Returns the open handle alongside the info so the
 /// caller can build its reader on it instead of opening the path a second
 /// time (review 2026-09-06 F6: one open per frame is exactly the per-file
 /// latency the parallel probe exists to amortize on a network mount). The
 /// header read leaves the cursor past the header; every read a `FrameReader`
 /// makes is positional, so that never matters. Returns None for anything that
 /// should take the decode-and-spill fallback (never errors on odd files).
-#[doc(hidden)]
 pub fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
     let mut f = File::open(path).ok()?;
     let info = fits_info_from_reader(&mut f)?;
     Some((f, info))
 }
 
-/// [`probe_fits`]' header scan over any reader positioned at the start of a FITS primary header (a file,
-/// or the header bytes read out of a zip entry): the same cards, the same shape rules, the same `None`.
-#[doc(hidden)]
+/// Reads a FITS primary header from any reader positioned at its first byte (a file, or the header bytes read out of a
+/// zip entry): [`probe_fits`]' header scan with the same cards, the same shape rules and the same `None`.
 pub fn fits_info_from_reader(f: &mut impl Read) -> Option<FitsInfo> {
     let mut info = FitsInfo { data_offset: 0, bitpix: 0, naxis: 0, w: 0, h: 0, naxis3: 1, bzero: 0.0, bscale: 1.0 };
     let mut block = [0u8; BLOCK as usize];

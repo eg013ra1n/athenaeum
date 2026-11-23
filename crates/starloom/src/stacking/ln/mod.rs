@@ -152,6 +152,7 @@ impl LnScaleSeeds<'_> {
 /// need to own a global tracing subscriber exclusively, which this test
 /// binary's parallel run cannot guarantee (Task 6a Pin 3's own doc).
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub mod fallback_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};

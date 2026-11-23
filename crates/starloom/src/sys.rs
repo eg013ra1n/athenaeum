@@ -46,7 +46,6 @@ pub fn linux_total_ram_from(
     })
 }
 
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn cgroup_limit(v2: Option<&str>, v1: Option<&str>) -> Option<u64> {
     v2.and_then(parse_cgroup_limit)
         .or_else(|| v1.and_then(parse_cgroup_limit))

@@ -71,12 +71,12 @@ const LOW_INLIER_SHARE: f64 = 0.5;
 /// means anything.
 const LOW_INLIER_MIN_FRAMES: usize = 3;
 
-/// The frames of one group whose registration kept under half the group's
-/// median refit inliers (robust quad seed RQ-6). `rows` is `(frame_id,
-/// inliers)` of the group's aligned non-reference frames. Returns `None` under
+/// Finds the frames of one group whose registration kept under half the group's
+/// median refit inliers (robust quad seed RQ-6), a sign of a poor star match.
+/// `rows` is `(frame_id, inliers)` of the group's aligned non-reference frames,
+/// the inlier count being a number of matched stars. Returns `None` under
 /// [`LOW_INLIER_MIN_FRAMES`] rows, else `(median, flagged)`: the numpy median
 /// and the rows with `inliers < 0.5 * median`, in input order.
-#[doc(hidden)]
 pub fn low_inlier_frames(rows: &[(i64, usize)]) -> Option<(f64, Vec<(i64, usize)>)> {
     if rows.len() < LOW_INLIER_MIN_FRAMES {
         return None;

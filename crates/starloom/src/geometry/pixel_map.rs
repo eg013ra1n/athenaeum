@@ -184,6 +184,7 @@ impl TpsGrid {
 /// [`PixelMap::release_grids`], or the last handle simply falling out of
 /// scope.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub mod grid_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};

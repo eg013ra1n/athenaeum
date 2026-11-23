@@ -99,6 +99,7 @@ pub struct RegisteredSource {
 /// deliberately breaks a registered artifact mid-run, so the contention
 /// risk the lock adds is not exercised in practice.
 #[cfg(any(test, feature = "test-support"))]
+// doc(hidden): an SL-17 test hook (test-support)
 #[doc(hidden)]
 pub mod fallback_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};
