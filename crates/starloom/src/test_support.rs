@@ -477,7 +477,7 @@ pub fn captured_logs(f: impl FnOnce()) -> String {
 /// No fixture may seed a raw `canonicalize()` result (the guard walks this crate's `src`).
 ///
 /// On Windows `canonicalize` returns a `\\?\` verbatim path, which neither compares equal to the spelling a catalog
-/// stores nor accepts a forward slash as a separator. Deliberately narrow: it walks only `crates/starloom/src` and
+/// stores nor accepts a forward slash as a separator. Deliberately narrow: it walks only this crate's `src` and
 /// matches the `.canonicalize().unwrap()` / `.canonicalize().expect(` method-call spelling only.
 #[cfg(test)]
 #[test]

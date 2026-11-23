@@ -6,7 +6,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 # Standalone manifest (SL-12): no [workspace] table and no `workspace = true` keys, so the crate
-# publishes on its own. Versions and features below are copied from athenaeum-core's manifest. Dependencies
+# publishes on its own. Versions and features below are copied from Athenaeum's core manifest. Dependencies
 # resolve by version (SL-18): rustafits from crates.io, solvemyastro by git revision; Athenaeum's workspace
 # [patch]es both back to its submodules, so it builds one copy of each.
 

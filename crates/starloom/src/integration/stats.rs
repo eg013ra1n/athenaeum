@@ -65,8 +65,8 @@ pub enum OutputNormalization {
 /// stored documents that still carry the old default are rewritten once by
 /// `db::schema::migrate_rejection_normalization_local`; the Fast preview pins
 /// `ScaleZeroOffset` (no Normalize stage, a preview's promise is speed).
-/// Diagnosis: `docs/superpowers/research/2026-11-01-project-master-star-cores.md`;
-/// the plan: `docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md`.
+/// Diagnosis: <https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/research/2026-11-01-project-master-star-cores.md>;
+/// the plan: <https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

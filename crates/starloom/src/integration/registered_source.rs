@@ -99,7 +99,7 @@ pub struct RegisteredSource {
 /// right geometry) — the run pin's way to confirm the fallback path itself
 /// executed, since asserting the paired `warn!` line would need a global
 /// tracing subscriber shared with the whole (parallel) test binary, which
-/// `docs/logging/README.md` documents as impractical per-test. Process-
+/// Athenaeum's logging reference (<https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/logging/README.md>) documents as impractical per-test. Process-
 /// global like [`crate::geometry::pixel_map::grid_counters`], and (fix
 /// round 2, ruling R-TA-6 M7) guarded by the same `exclusive()` pattern:
 /// the counter is process-wide and the harness runs tests in parallel, so

@@ -4445,12 +4445,12 @@ mod tests {
     /// prefetch's. This double makes band 0's combine and band 1's
     /// prefetch fail concurrently on every run, regardless of scheduling,
     /// so the `tracing::warn!` call site this pins is genuinely exercised
-    /// — engine.rs has no log-capture harness (`docs/logging/README.md`'s
-    /// pattern lives in `logging/mod.rs` and needs a process-global
+    /// — engine.rs has no log-capture harness (Athenaeum's logging pattern,
+    /// <https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/logging/README.md>, lives in its `logging/mod.rs` and needs a process-global
     /// subscriber + env lock this module's parallel tests would fight
     /// over), so this test asserts the returned error only and leaves the
     /// warn line to manual inspection (`RUST_LOG=warn cargo test -p
-    /// athenaeum-core --lib band_prefetch_error_is_not_swallowed -- \
+    /// starloom --lib band_prefetch_error_is_not_swallowed -- \
     /// --nocapture`).
     #[test]
     fn band_prefetch_error_is_not_swallowed_when_the_combine_also_fails() {
