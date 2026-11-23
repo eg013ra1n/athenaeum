@@ -1966,12 +1966,13 @@ mod tests {
         assert!(cards.is_empty(), "no blob + no columns -> no cards");
     }
 
-    /// A blank stored value is not a declaration. The XISF stored-header parser
-    /// has no empty-value check, so `<FITSKeyword name="BAYERPAT" value=""/>`
-    /// lands as an empty-string card — it must NOT out-rank a real
-    /// `frames.bayerpat`, and it must be replaced rather than left beside the
-    /// derived card (two cards for one keyword would contradict each other in
-    /// the output header).
+    /// A blank stored value is not a declaration. The stored XISF key reader
+    /// drops a `<FITSKeyword name="BAYERPAT" value=""/>` before it becomes a
+    /// card, so the blank never reaches the cards; the outcome pinned here is
+    /// that it must NOT out-rank a real `frames.bayerpat`, and the derived
+    /// card is neither left beside a blank one nor duplicated (two cards for
+    /// one keyword would contradict each other in the output header). The
+    /// builder's own blank-card branch stays as a defence.
     #[test]
     fn blank_stored_header_value_loses_to_catalog_column() {
         let conn = seed_db();
@@ -1981,7 +1982,8 @@ mod tests {
         seed_header_and_bayer(
             &conn,
             file_id,
-            "<xisf><FITSKeyword name=\"BAYERPAT\" value=\"\"/>\
+            // The XML declaration is what the scanner's extraction (and now this reader) looks for.
+            "<?xml version=\"1.0\"?><xisf><FITSKeyword name=\"BAYERPAT\" value=\"\"/>\
              <FITSKeyword name=\"ROWORDER\" value=\"'  '\"/>\
              <FITSKeyword name=\"INSTRUME\" value=\"'TestCam'\"/></xisf>",
             Some("RGGB"),
@@ -1990,8 +1992,9 @@ mod tests {
             Some("TOP-DOWN"),
         );
 
-        // Sanity: the parser really does hand back a blank BAYERPAT card here —
-        // if that ever changes, this test's premise is gone, not just its assert.
+        // Sanity: the stored-header map drops a blank value (the scanner reads a blank keyword
+        // as absent, C4), so no blank BAYERPAT card reaches the cards below; the catalog column
+        // fills the card either way.
         let raw: HashMap<String, String> = parse_stored_header_keys(
             FileFormat::XISF,
             &conn
@@ -2002,7 +2005,7 @@ mod tests {
                 )
                 .unwrap(),
         );
-        assert_eq!(raw.get("BAYERPAT").map(String::as_str), Some(""));
+        assert_eq!(raw.get("BAYERPAT"), None);
 
         let cards = source_cards_for_file(&conn, 1, file_id, FileFormat::XISF).unwrap();
         assert_eq!(card_str(&cards, "BAYERPAT").as_deref(), Some("RGGB"));
@@ -3354,6 +3357,7 @@ mod real_data_e2e {
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         })
     }
 
@@ -3378,7 +3382,7 @@ mod real_data_e2e {
             (w, h, data)
         }
         fn header_keys(path: &Path) -> std::collections::HashMap<String, String> {
-            let (_f, text) = crate::fits_parser::parse_fits_with_header(path, 0).unwrap();
+            let (_f, text) = crate::fits_parser::parse_fits_with_header(path, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
             parse_stored_header_keys(FileFormat::FITS, &text)
         }
         let files_count = |conn: &Connection, path: &str| -> i64 {

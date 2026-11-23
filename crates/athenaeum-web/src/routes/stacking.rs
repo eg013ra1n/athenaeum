@@ -947,6 +947,7 @@ mod tests {
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(athenaeum_core::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<crate::events::SseEvent>(16);
         WebAppState {

@@ -14,6 +14,8 @@
 use crate::db::{insert_file, insert_fits_header, insert_frame, SavepointGuard};
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_parser::{calibrated_light_identity, parse_fits_header_bytes, parse_xisf_header_bytes};
+use crate::header_fallbacks::HeaderFallbackConfig;
+use crate::scanner::{instrume_for_root, instrume_for_scan};
 use crate::models::{File, FileFormat, Frame, ImageType};
 use crate::scanner::{path_to_utf8, path_under_unavailable_scan_root};
 use crate::zip_store::reader::{self, ZipEntryInfo};
@@ -291,25 +293,6 @@ pub(crate) fn reconcile_hand_restored_row(conn: &Connection, file_id: i64, path:
     Ok(HandRestore::BecameDiskRow)
 }
 
-/// `INSTRUME` as stored for a frame living under `root_id`: the base name (any previous
-/// ` N<digits>` suffix removed), plus ` N<root_id>` when the root keeps cameras apart.
-fn instrume_for_root(stored: Option<String>, unique_camera: bool, root_id: i64) -> Option<String> {
-    let base = stored.map(|i| {
-        if let Some(pos) = i.rfind(" N") {
-            let suffix = &i[pos + 2..];
-            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                return i[..pos].to_string();
-            }
-        }
-        i
-    });
-    if unique_camera {
-        base.map(|i| format!("{i} N{root_id}"))
-    } else {
-        base
-    }
-}
-
 /// A catalog row that takes over a zip entry.
 #[derive(Clone, Copy)]
 struct ZipAdoption<'a> {
@@ -435,12 +418,13 @@ fn stage_entry(
     zip_modified: DateTime<Utc>,
     root_id: i64,
     unique_camera: bool,
+    rules: &HeaderFallbackConfig,
 ) -> Result<Staged> {
     let vpath = virtual_path(zip, &entry.path);
     let format = if entry.path.to_ascii_lowercase().ends_with(".xisf") { FileFormat::XISF } else { FileFormat::FITS };
     let (frame, header) = match format {
-        FileFormat::FITS => parse_fits_header_bytes(header_bytes, 0, Path::new(&vpath)),
-        FileFormat::XISF => parse_xisf_header_bytes(header_bytes, 0, Path::new(&vpath)),
+        FileFormat::FITS => parse_fits_header_bytes(header_bytes, 0, Path::new(&vpath), rules),
+        FileFormat::XISF => parse_xisf_header_bytes(header_bytes, 0, Path::new(&vpath), rules),
     }?;
     let modified = entry.modified.map(|n| n.and_utc()).unwrap_or(zip_modified);
     let size = entry.size as i64;
@@ -554,11 +538,7 @@ fn insert_entry(conn: &Connection, zip_str: &str, entry: &ZipEntryInfo, parsed: 
         params![zip_str, entry.path, crc, file_id],
     )?;
     frame.file_id = file_id;
-    if unique_camera {
-        if let Some(ref instrume) = frame.instrume {
-            frame.instrume = Some(format!("{instrume} N{root_id}"));
-        }
-    }
+    frame.instrume = instrume_for_scan(frame.instrume.take(), unique_camera, root_id);
     let frame_id = insert_frame(conn, &frame)?;
     insert_fits_header(conn, file_id, &header)?;
     sp.commit()?;
@@ -788,6 +768,19 @@ fn move_zip_identity(conn: &Connection, new_zip_id: i64, new_zip_path: &str, gon
 /// disk file that failed is retried. A zip that cannot be opened is an `Err` and leaves no
 /// `zip_archives` row, so the next scan retries it.
 pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool) -> Result<ZipScanOutcome> {
+    let rules = crate::header_fallbacks::load_for_scan(conn);
+    scan_zip_with(conn, zip, root_id, unique_camera, &rules)
+}
+
+/// [`scan_zip`] under an already-loaded rule set: a scan that walks several zips loads the catalog's
+/// FITS keyword rules once and hands them to each.
+pub(crate) fn scan_zip_with(
+    conn: &Connection,
+    zip: &Path,
+    root_id: i64,
+    unique_camera: bool,
+    rules: &HeaderFallbackConfig,
+) -> Result<ZipScanOutcome> {
     let zip_str = path_to_utf8(zip)?;
     let meta = std::fs::metadata(zip).with_context(|| format!("stat {}", zip.display()))?;
     let size = meta.len() as i64;
@@ -930,7 +923,7 @@ pub fn scan_zip(conn: &Connection, zip: &Path, root_id: i64, unique_camera: bool
         let staged = match header {
             Ok(bytes) => {
                 let preferred = linked_rows.get(entry.path.as_str()).copied();
-                stage_entry(conn, zip, &zip_str, entry, *known_id, preferred, &bytes, zip_modified, root_id, unique_camera)
+                stage_entry(conn, zip, &zip_str, entry, *known_id, preferred, &bytes, zip_modified, root_id, unique_camera, rules)
             }
             Err(e) => Err(e),
         };
@@ -1108,6 +1101,43 @@ mod scan_tests {
     }
 
     #[test]
+    fn zip_scan_reads_the_catalog_rules() {
+        use crate::header_fallbacks::{FieldRule, HeaderField, HeaderFallbackConfig};
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        let mut rules = HeaderFallbackConfig::default();
+        rules.fields.insert(
+            HeaderField::CcdTemp,
+            FieldRule { order: vec!["MY-TEMP".into(), "CCD-TEMP".into(), "DET-TEMP".into()], retired: Vec::new() },
+        );
+        crate::header_fallbacks::store(&conn, &rules).unwrap();
+        let entry = fits_bytes(&[
+            "CCD-TEMP=                -10.0".to_string(),
+            "MY-TEMP =                 -3.0".to_string(),
+        ]);
+        let zip = make_zip(tmp.path(), "n.zip", &[("Lights/L_001.fits", entry)], ArchiveCompression::Store);
+        let outcome = scan_zip(&conn, &zip, 1, false).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let ccd_temp: Option<f64> = conn.query_row("SELECT ccd_temp FROM frames", [], |r| r.get(0)).unwrap();
+        assert_eq!(ccd_temp, Some(-3.0), "the zip entry is read under the catalog's rules");
+    }
+
+    #[test]
+    fn a_header_instrume_that_already_ends_in_the_root_suffix_gets_no_second_one() {
+        let tmp = TempDir::new().unwrap();
+        let conn = db(tmp.path());
+        // The fixture's own INSTRUME card (`'C       '`) swapped for one of the same width.
+        let plain = fits_bytes(&[]);
+        let at = plain.windows(20).position(|w| w == b"INSTRUME= 'C       '").unwrap();
+        let mut entry = plain;
+        entry[at..at + 20].copy_from_slice(b"INSTRUME= 'Cam N1  '");
+        let zip = make_zip(tmp.path(), "n.zip", &[("Lights/L_001.fits", entry)], ArchiveCompression::Store);
+        scan_zip(&conn, &zip, 1, true).unwrap();
+        let instrume: Option<String> = conn.query_row("SELECT instrume FROM frames", [], |r| r.get(0)).unwrap();
+        assert_eq!(instrume.as_deref(), Some("Cam N1"));
+    }
+
+    #[test]
     fn store_and_deflate_zips_catalog_every_frame_with_virtual_paths() {
         for compression in [ArchiveCompression::Store, ArchiveCompression::Deflate] {
             let tmp = TempDir::new().unwrap();
@@ -1155,7 +1185,7 @@ mod scan_tests {
             // The header fingerprint is the one a disk copy of the same bytes gets.
             let disk = tmp.path().join("disk.fits");
             std::fs::write(&disk, &a).unwrap();
-            let (_, disk_header) = parse_fits_with_header(&disk, 0).unwrap();
+            let (_, disk_header) = parse_fits_with_header(&disk, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
             assert_eq!(
                 fingerprint_of(&conn, id_of(&conn, &vpath)),
                 crate::fingerprint::compute_header_fingerprint(&disk_header)
@@ -1458,7 +1488,7 @@ mod scan_tests {
         let bytes = light(7);
         let probe = tmp.path().join("probe.fits");
         std::fs::write(&probe, &bytes).unwrap();
-        let (_, header) = parse_fits_with_header(&probe, 0).unwrap();
+        let (_, header) = parse_fits_with_header(&probe, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         let old = offline.join("L_001.fits");
         conn.execute(
             "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (900, ?1, 'L_001.fits', 1, '2025-01-01T00:00:00Z', 'FITS')",
@@ -1512,7 +1542,7 @@ mod scan_tests {
         // A row as Move and ZIP leaves it: original disk path, zip markers, the operation that archived it.
         let probe = tmp.path().join("probe.fits");
         std::fs::write(&probe, &bytes).unwrap();
-        let (_, header) = parse_fits_with_header(&probe, 0).unwrap();
+        let (_, header) = parse_fits_with_header(&probe, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         conn.execute(
             "INSERT INTO files (id, path, filename, size, modified_at, format, archive_zip_path, archive_path_in_zip)
              VALUES (500, '/data/original/L_001.fits', 'L_001.fits', 1, '2025-01-01T00:00:00Z', 'FITS', ?1, 'Lights/L_001.fits')",
@@ -1796,7 +1826,7 @@ mod scan_tests {
         let zip = make_zip(tmp.path(), "ours.zip", &[("Lights/L_001.fits", bytes.clone())], ArchiveCompression::Store);
         let probe = tmp.path().join("probe.fits");
         std::fs::write(&probe, &bytes).unwrap();
-        let (_, header) = parse_fits_with_header(&probe, 0).unwrap();
+        let (_, header) = parse_fits_with_header(&probe, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         // A row of ours that a newer capture pushed off its original path: files.path is the virtual path.
         let old_virtual = virtual_path(&zip, "Lights/L_001.fits");
         conn.execute(
@@ -2010,7 +2040,7 @@ mod scan_tests {
             let id = 500 + i as i64;
             let probe = tmp.path().join(format!("probe{i}.fits"));
             std::fs::write(&probe, bytes).unwrap();
-            let (_, header) = parse_fits_with_header(&probe, 0).unwrap();
+            let (_, header) = parse_fits_with_header(&probe, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
             conn.execute(
                 "INSERT INTO files (id, path, filename, size, modified_at, format, archived_in_operation, archive_zip_path, archive_path_in_zip)
                  VALUES (?1, ?2, ?3, 1, '2025-01-01T00:00:00Z', 'FITS', ?4, ?5, ?3)",

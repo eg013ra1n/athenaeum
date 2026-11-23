@@ -2837,7 +2837,7 @@ fn build_typed_package(
             .build()
             .unwrap();
         write_fits_f32(&path, 4, 4, 1, &[(i as f32) + 1.0; 16], &cards).unwrap();
-        let mut frame = crate::fits_parser::parse_fits(&path, 0).unwrap();
+        let mut frame = crate::fits_parser::parse_fits(&path, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         frame.uuid = Some(format!("{tag}-{i}"));
         frame.updated_at = Some("2026-01-16T10:00:00.000Z".to_string());
         let byte_size = std::fs::metadata(&path).unwrap().len();

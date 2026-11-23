@@ -90,6 +90,7 @@ pub fn run() {
                     iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
                     // The app data dir is only known once the database is initialized (`initialize_database`).
                     zip_cache: Arc::new(athenaeum_core::zip_store::cache::ZipCache::unbound()),
+                    apply_running: Default::default(),
                 }),
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),
@@ -312,6 +313,13 @@ pub fn run() {
             commands::set_setting,
             commands::delete_setting,
             commands::get_settings_defaults,
+            commands::get_header_fallbacks,
+            commands::set_header_fallbacks,
+            commands::reset_header_fallbacks,
+            commands::preview_header_fallbacks,
+            commands::apply_header_fallbacks,
+            commands::export_header_fallbacks,
+            commands::plan_header_fallbacks_import,
             commands::get_logging_config,
             commands::set_logging_config,
             commands::set_blink_threads,

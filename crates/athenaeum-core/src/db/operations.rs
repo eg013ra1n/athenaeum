@@ -2119,8 +2119,21 @@ pub fn bulk_update_frame_metadata(
     // frame. If the user just reverted everything back to its original
     // file-header values, drop the flag so the row stops looking edited.
     // Errors here aren't fatal — the edits themselves succeeded already.
-    if let Err(e) = recompute_override_flag_for_frames(conn, frame_ids) {
-        tracing::warn!(count = frame_ids.len(), error = %e, "recompute_override_flag_for_frames after bulk_update failed, edits already committed");
+    // The header is read under the catalog's FITS keyword rules; rules that cannot be read leave the
+    // flag on (the safe side: the frame keeps looking edited).
+    match crate::header_fallbacks::load(conn) {
+        Ok(rules) => {
+            if let Err(e) = recompute_override_flag_for_frames(conn, frame_ids, &rules) {
+                tracing::warn!(count = frame_ids.len(), error = %e, "recompute_override_flag_for_frames after bulk_update failed, edits already committed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                key = crate::settings::keys::CATALOG_HEADER_FALLBACKS,
+                error = %format!("{e:#}"),
+                "stored FITS keyword rules could not be read; override flags not recomputed"
+            );
+        }
     }
 
     Ok(count)
@@ -3979,6 +3992,14 @@ pub fn get_frame_memberships_summary(
     Ok(summary)
 }
 
+/// The one choice of a file's stored header: `fits_header.file_id` is not unique, so the newest row
+/// (highest id) is the header. The metadata pane's snapshot, the override recompute and the keyword
+/// rules' preview and Apply all read it through this subquery, so they judge the same text.
+/// `file_id_expr` is the SQL expression of the file id (`fr.file_id`, `files.id`).
+pub(crate) fn latest_header_subquery(file_id_expr: &str) -> String {
+    format!("(SELECT header FROM fits_header WHERE file_id = {file_id_expr} ORDER BY id DESC LIMIT 1)")
+}
+
 /// Re-evaluate the `override` flag for each given frame: if every editable
 /// field on the frame now equals what the original FITS header said, drop
 /// the flag back to 0. Otherwise leave it alone (`bulk_update_frame_metadata`
@@ -3990,8 +4011,13 @@ pub fn get_frame_memberships_summary(
 ///
 /// Only frames currently flagged `override = 1` are inspected; clean rows
 /// are skipped so the cost is proportional to actual edits.
-pub fn recompute_override_flag_for_frames(conn: &Connection, frame_ids: &[i64]) -> Result<usize> {
-    use crate::fits_parser::stored_header::{parse_stored_header_keys, snapshot_from_keys};
+pub fn recompute_override_flag_for_frames(
+    conn: &Connection,
+    frame_ids: &[i64],
+    rules: &crate::header_fallbacks::HeaderFallbackConfig,
+) -> Result<usize> {
+    use crate::fits_parser::header_keys::stored_header_key_map;
+    use crate::fits_parser::stored_header::snapshot_from_keys;
     use crate::models::FileFormat;
 
     if frame_ids.is_empty() {
@@ -4006,12 +4032,11 @@ pub fn recompute_override_flag_for_frames(conn: &Connection, frame_ids: &[i64]) 
     let sql = format!(
         "SELECT fr.id, fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop,
                 fr.focallen, fr.gain, fr.offset, fr.binning, fr.exptime, fr.ccd_temp,
-                fr.date_obs, fr.ra, fr.dec, files.format, fh.header
+                fr.date_obs, fr.ra, fr.dec, files.format, {header}
          FROM frames fr
          JOIN files ON files.id = fr.file_id
-         LEFT JOIN fits_header fh ON fh.file_id = fr.file_id
-         WHERE fr.id IN ({}) AND fr.override = 1",
-        placeholders
+         WHERE fr.id IN ({placeholders}) AND fr.override = 1",
+        header = latest_header_subquery("fr.file_id"),
     );
 
     type FrameRow = (
@@ -4092,8 +4117,8 @@ pub fn recompute_override_flag_for_frames(conn: &Connection, frame_ids: &[i64]) 
             // so leave override = 1.
             _ => continue,
         };
-        let keys = parse_stored_header_keys(format, &header_text);
-        let snap = snapshot_from_keys(frame_id, &keys);
+        let keys = stored_header_key_map(format, &header_text);
+        let snap = snapshot_from_keys(frame_id, &keys, rules);
 
         let all_match = opt_str_eq(&object, &snap.object)
             && opt_str_eq(&filter, &snap.filter)
@@ -4170,10 +4195,10 @@ fn opt_date_eq(a: &Option<String>, b: &Option<String>) -> bool {
 pub fn get_frame_metadata_originals(
     conn: &Connection,
     frame_ids: &[i64],
+    rules: &crate::header_fallbacks::HeaderFallbackConfig,
 ) -> Result<Vec<crate::fits_parser::stored_header::FrameOriginalSnapshot>> {
-    use crate::fits_parser::stored_header::{
-        parse_stored_header_keys, snapshot_from_keys, FrameOriginalSnapshot,
-    };
+    use crate::fits_parser::header_keys::stored_header_key_map;
+    use crate::fits_parser::stored_header::{snapshot_from_keys, FrameOriginalSnapshot};
     use crate::models::FileFormat;
 
     if frame_ids.is_empty() {
@@ -4186,12 +4211,11 @@ pub fn get_frame_metadata_originals(
         .collect();
 
     let sql = format!(
-        "SELECT fr.id, files.format, fh.header
+        "SELECT fr.id, files.format, {header}
          FROM frames fr
          JOIN files ON files.id = fr.file_id
-         LEFT JOIN fits_header fh ON fh.file_id = fr.file_id
-         WHERE fr.id IN ({})",
-        placeholders
+         WHERE fr.id IN ({placeholders})",
+        header = latest_header_subquery("fr.file_id"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(id_params.iter()), |row| {
@@ -4211,8 +4235,8 @@ pub fn get_frame_metadata_originals(
         };
         match header {
             Some(text) if !text.is_empty() => {
-                let keys = parse_stored_header_keys(format, &text);
-                out.push(snapshot_from_keys(frame_id, &keys));
+                let keys = stored_header_key_map(format, &text);
+                out.push(snapshot_from_keys(frame_id, &keys, rules));
             }
             // No stored header (rare — may pre-date the fits_header table or
             // a DB without re-scan after the migration). Emit an empty snapshot
@@ -5219,6 +5243,161 @@ mod bulk_metadata_tests {
             override_flag, 1,
             "FILTER still differs from original ('R' vs 'L'), override must stay"
         );
+    }
+
+    /// `MY-TEMP` first, then the standard keywords.
+    fn my_temp_rules() -> crate::header_fallbacks::HeaderFallbackConfig {
+        use crate::header_fallbacks::{FieldRule, HeaderField, HeaderFallbackConfig};
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.insert(
+            HeaderField::CcdTemp,
+            FieldRule {
+                order: vec!["MY-TEMP".into(), "CCD-TEMP".into(), "DET-TEMP".into()],
+                retired: Vec::new(),
+            },
+        );
+        cfg
+    }
+
+    fn card80(s: &str) -> String {
+        format!("{s:<80}")
+    }
+
+    fn file_id_of(conn: &Connection, frame_id: i64) -> i64 {
+        conn.query_row("SELECT file_id FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn metadata_originals_follow_the_catalog_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
+        let header = format!(
+            "{}\n{}",
+            card80("CCD-TEMP=                -10.0"),
+            card80("MY-TEMP =                 -3.0")
+        );
+        insert_fits_header_for_file(&conn, file_id_of(&conn, frame_id), &header);
+
+        let custom = get_frame_metadata_originals(&conn, &[frame_id], &my_temp_rules()).unwrap();
+        assert_eq!(custom[0].ccd_temp, Some(-3.0));
+        let default =
+            get_frame_metadata_originals(&conn, &[frame_id], &crate::header_fallbacks::HeaderFallbackConfig::default())
+                .unwrap();
+        assert_eq!(default[0].ccd_temp, Some(-10.0));
+    }
+
+    #[test]
+    fn snapshot_override_recompute_and_apply_read_the_same_header_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
+        let file_id = file_id_of(&conn, frame_id);
+        // `file_id` is not unique in fits_header: the older row says -10, the newer one -3.
+        insert_fits_header_for_file(
+            &conn,
+            file_id,
+            &format!("{}\n{}", card80("CCD-TEMP=                -10.0"), card80("IMAGETYP= 'Light'")),
+        );
+        insert_fits_header_for_file(
+            &conn,
+            file_id,
+            &format!("{}\n{}", card80("CCD-TEMP=                 -3.0"), card80("IMAGETYP= 'Light'")),
+        );
+        let rules = crate::header_fallbacks::HeaderFallbackConfig::default();
+
+        let snap = get_frame_metadata_originals(&conn, &[frame_id], &rules).unwrap();
+        assert_eq!(snap[0].ccd_temp, Some(-3.0), "the newest header row is the original");
+
+        // A frame holding the newest row's value is back to its original: the flag clears.
+        conn.execute("UPDATE frames SET override = 1, ccd_temp = -3.0 WHERE id = ?1", [frame_id]).unwrap();
+        assert_eq!(recompute_override_flag_for_frames(&conn, &[frame_id], &rules).unwrap(), 1);
+        // A frame holding the older row's value is not.
+        conn.execute("UPDATE frames SET override = 1, ccd_temp = -10.0 WHERE id = ?1", [frame_id]).unwrap();
+        assert_eq!(recompute_override_flag_for_frames(&conn, &[frame_id], &rules).unwrap(), 0);
+
+        let sql = format!("SELECT {}", latest_header_subquery("?1"));
+        let latest: String = conn.query_row(&sql, [file_id], |r| r.get(0)).unwrap();
+        assert!(latest.contains("-3.0"), "{latest}");
+    }
+
+    #[test]
+    fn override_recompute_reads_under_the_catalog_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
+        let header = format!(
+            "{}\n{}\n{}",
+            card80("CCD-TEMP=                -10.0"),
+            card80("MY-TEMP =                 -3.0"),
+            card80("IMAGETYP= 'Light'")
+        );
+        insert_fits_header_for_file(&conn, file_id_of(&conn, frame_id), &header);
+        // Every field equals what the header says under the custom rules.
+        conn.execute("UPDATE frames SET override = 1, ccd_temp = -3.0 WHERE id = ?1", [frame_id]).unwrap();
+
+        let default = crate::header_fallbacks::HeaderFallbackConfig::default();
+        assert_eq!(recompute_override_flag_for_frames(&conn, &[frame_id], &default).unwrap(), 0);
+        let flag = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT override FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(flag(&conn), 1, "under the standard keywords the frame still differs");
+        assert_eq!(recompute_override_flag_for_frames(&conn, &[frame_id], &my_temp_rules()).unwrap(), 1);
+        assert_eq!(flag(&conn), 0, "under the catalog's rules it matches its header");
+    }
+
+    #[test]
+    fn bulk_update_judges_the_revert_under_the_stored_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::header_fallbacks::store(&conn, &my_temp_rules()).unwrap();
+        let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
+        let header = format!(
+            "{}\n{}\n{}",
+            card80("CCD-TEMP=                -10.0"),
+            card80("MY-TEMP =                 -3.0"),
+            card80("IMAGETYP= 'Light'")
+        );
+        insert_fits_header_for_file(&conn, file_id_of(&conn, frame_id), &header);
+        conn.execute("UPDATE frames SET ccd_temp = -3.0 WHERE id = ?1", [frame_id]).unwrap();
+
+        // Any edit sets the flag; the recompute afterwards sees every field equal to the header
+        // as the stored rules read it.
+        let edits = FrameMetadataEdits { object: Some(None), ..Default::default() };
+        bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
+        let flag: i64 =
+            conn.query_row("SELECT override FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap();
+        assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn bulk_update_keeps_the_override_flag_when_the_stored_rules_cannot_be_read() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
+        conn.execute("UPDATE frames SET object = 'M42' WHERE id = ?1", [frame_id]).unwrap();
+        insert_fits_header_for_file(
+            &conn,
+            file_id_of(&conn, frame_id),
+            &format!("{}\n{}", card80("OBJECT  = 'M42'"), card80("IMAGETYP= 'Light'")),
+        );
+        let edit = |object: &str| FrameMetadataEdits { object: Some(Some(object.into())), ..Default::default() };
+        let flag = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT override FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap()
+        };
+        let object = |conn: &Connection| -> Option<String> {
+            conn.query_row("SELECT object FROM frames WHERE id = ?1", [frame_id], |r| r.get(0)).unwrap()
+        };
+
+        bulk_update_frame_metadata(&conn, &[frame_id], &edit("OTHER")).unwrap();
+        assert_eq!(flag(&conn), 1);
+
+        // The revert would clear the flag, but the stored rules cannot be read: the edit is
+        // committed and the flag stays on (the safe side).
+        crate::db::set_setting(&conn, crate::settings::keys::CATALOG_HEADER_FALLBACKS, "not json").unwrap();
+        bulk_update_frame_metadata(&conn, &[frame_id], &edit("M42")).unwrap();
+        assert_eq!(object(&conn).as_deref(), Some("M42"), "the edit is committed");
+        assert_eq!(flag(&conn), 1, "the flag is not recomputed");
     }
 
     #[test]

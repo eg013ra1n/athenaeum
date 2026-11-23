@@ -7,6 +7,7 @@
 use crate::analysis::config::AnalysisConfig;
 use crate::api::ApiError;
 use crate::calibration::config::CalibrationMatchingConfig;
+use crate::header_fallbacks::HeaderFallbackConfig;
 use crate::logging::config::LoggingConfig;
 use crate::monitor::MonitorService;
 use crate::plate_solve::config::PlateSolveConfig;
@@ -24,6 +25,7 @@ pub struct SettingsDefaults {
     pub calibration_matching: CalibrationMatchingConfig,
     pub logging: LoggingConfig,
     pub stacking: StackingConfig,
+    pub header_fallbacks: HeaderFallbackConfig,
 }
 
 /// Every default a fresh Settings page needs, built without touching the
@@ -39,6 +41,7 @@ pub fn get_settings_defaults(_ctx: &ServiceContext) -> Result<SettingsDefaults, 
         calibration_matching: CalibrationMatchingConfig::default(),
         logging: LoggingConfig::default(),
         stacking: StackingConfig::default(),
+        header_fallbacks: HeaderFallbackConfig::default(),
     })
 }
 
@@ -47,6 +50,10 @@ pub fn get_settings_defaults(_ctx: &ServiceContext) -> Result<SettingsDefaults, 
 /// resize the cache now, and the monitoring keys wake the monitor loop.
 /// `monitor` is passed explicitly because `MonitorService` lives beside (not
 /// inside) `ServiceContext` on both hosts' state.
+///
+/// `catalog.header_fallbacks` is refused too: the rules are written by `api::header_fallbacks` only, which
+/// validates them and keeps the retired keywords; a plain write would skip both and a bad document would make
+/// every scan fall back to the defaults.
 ///
 /// `mcp.enabled` is refused: turning assistant access on or off binds or closes the local channel, which only
 /// `api::mcp::set_mcp_enabled` does; a plain write would store a value nothing acts on.
@@ -59,6 +66,10 @@ pub fn set_setting(
     if key == crate::settings::keys::MCP_ENABLED {
         tracing::warn!(key, "generic setting write refused: the assistant switch has its own command");
         return Err(ApiError::Invalid("use set_mcp_enabled".to_string()));
+    }
+    if key == crate::settings::keys::CATALOG_HEADER_FALLBACKS {
+        tracing::warn!(key, "generic setting write refused: the FITS keyword rules have their own commands");
+        return Err(ApiError::Invalid("use set_header_fallbacks".to_string()));
     }
     let db = crate::api::db(ctx)?;
     let conn = db.conn();
@@ -162,6 +173,15 @@ mod tests {
             serde_json::to_value(StackingConfig::default()).unwrap()
         );
         assert_eq!(
+            serde_json::to_value(&d.header_fallbacks).unwrap(),
+            serde_json::to_value(HeaderFallbackConfig::default()).unwrap()
+        );
+        let reset = crate::api::header_fallbacks::reset_header_fallbacks(&ctx).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reset).unwrap(),
+            serde_json::to_value(&d.header_fallbacks).unwrap()
+        );
+        assert_eq!(
             d.kv.get("calibration.master_format").map(String::as_str),
             Some("fits")
         );
@@ -193,6 +213,17 @@ mod tests {
                 .unwrap(),
             "false"
         );
+    }
+
+    #[test]
+    fn set_setting_refuses_the_header_fallbacks_key() {
+        let (_tmp, ctx) = test_ctx();
+        let monitor = MonitorService::new();
+        let key = crate::settings::keys::CATALOG_HEADER_FALLBACKS;
+        let err = set_setting(&ctx, key, "not json", &monitor).expect_err("refused");
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+        let conn = ctx.db.get().unwrap().conn();
+        assert_eq!(crate::db::get_setting(&conn, key).unwrap(), None, "nothing was stored");
     }
 
     fn stored_blink_threads(ctx: &ServiceContext) -> String {

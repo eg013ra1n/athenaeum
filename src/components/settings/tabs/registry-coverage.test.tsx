@@ -106,6 +106,9 @@ const CALIBRATION_MATCHING_CONFIG_FIXTURE: CalibrationMatchingConfigType = {
   },
 };
 
+// `HeaderKeywordsSection` reads one rule per field; an empty document renders every row with its default chain.
+const HEADER_FALLBACK_FIXTURE = { fields: {} };
+
 routeInvoke({
   // `AnalysisSettingsPanel`/`PlateSolveSettingsPanel` (Task D1) read
   // `defaults.analysis`/`defaults.plateSolve` directly (for the
@@ -118,6 +121,17 @@ routeInvoke({
     analysis: ANALYSIS_CONFIG_FIXTURE,
     plateSolve: PLATE_SOLVE_CONFIG_FIXTURE,
     calibrationMatching: CALIBRATION_MATCHING_CONFIG_FIXTURE,
+    headerFallbacks: HEADER_FALLBACK_FIXTURE,
+  },
+  get_header_fallbacks: HEADER_FALLBACK_FIXTURE,
+  preview_header_fallbacks: {
+    byField: [],
+    framesChanged: 0,
+    valuesKept: 0,
+    setsRegrouped: 0,
+    lightLinksDropped: 0,
+    manualLinksDropped: 0,
+    framesWithoutHeader: 0,
   },
   get_setting: '',
   get_analysis_config: ANALYSIS_CONFIG_FIXTURE,

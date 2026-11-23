@@ -4030,6 +4030,7 @@ mod tests {
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         });
 
         // Pool max_size is 8 — exceed it so, pre-fix, every task grabs one
@@ -4176,6 +4177,7 @@ mod tests {
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         });
 
         // Archive the raw set's originals for real (plan -> commit -> execute) —
@@ -4486,6 +4488,7 @@ mod tests {
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         });
 
         // (a) An in-flight build blocks the delete. `active_master_builds` is
@@ -5014,6 +5017,7 @@ mod tests {
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(crate::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         })
     }
 
@@ -5093,7 +5097,7 @@ mod tests {
                 // consensus reads are exactly what a scan of these files
                 // produces — not values hand-typed to match the assertion.
                 let (parsed, header_text) =
-                    crate::fits_parser::parse_fits_with_header(&p, 0).unwrap();
+                    crate::fits_parser::parse_fits_with_header(&p, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
                 assert_eq!(parsed.xbayroff, Some(1), "fixture sanity: parsed phase");
                 conn.execute(
                     "INSERT INTO files (path, filename, size, modified_at, format)

@@ -2551,5 +2551,29 @@ dockerImage: string | null, };
 
 export type WhatsNew = { version: string, notes: string, blogUrl: string, };
 
-export type SettingsDefaults = { kv: { [key in string]: string }, analysis: AnalysisConfig, plateSolve: PlateSolveConfig, calibrationMatching: CalibrationMatchingConfig, logging: LoggingConfig, stacking: StackingConfig, };
+export type HeaderField = "ccdTemp" | "setTemp" | "gain" | "offset" | "exptime" | "focallen" | "xpixsz" | "ypixsz" | "object" | "filter" | "instrume" | "telescop";
+
+export type FieldRule = { 
+/**
+ * Keywords tried first to last; the first usable value wins.
+ */
+order: Array<string>, 
+/**
+ * Keywords the user took out of the order, newest last. Never read by a scan.
+ */
+retired: Array<string>, };
+
+export type HeaderFallbackConfig = { fields: { [key in HeaderField]?: FieldRule }, };
+
+export type FieldCount = { field: HeaderField, frames: number, };
+
+export type HeaderFallbackCounts = { byField: Array<FieldCount>, framesChanged: number, valuesKept: number, setsRegrouped: number, lightLinksDropped: number, manualLinksDropped: number, framesWithoutHeader: number, };
+
+export type HeaderFallbackProgress = { phase: string, done: number, total: number, };
+
+export type FieldOrderChange = { field: HeaderField, before: Array<string>, after: Array<string>, };
+
+export type HeaderFallbackImportPlan = { config: HeaderFallbackConfig, changes: Array<FieldOrderChange>, };
+
+export type SettingsDefaults = { kv: { [key in string]: string }, analysis: AnalysisConfig, plateSolve: PlateSolveConfig, calibrationMatching: CalibrationMatchingConfig, logging: LoggingConfig, stacking: StackingConfig, headerFallbacks: HeaderFallbackConfig, };
 

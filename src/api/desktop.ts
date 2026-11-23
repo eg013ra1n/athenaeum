@@ -74,3 +74,22 @@ export async function pickFile(options?: {
   }
   return null;
 }
+
+/**
+ * Open a native "save as" dialog and return the chosen path, or null when cancelled.
+ * Only works in Tauri desktop mode — returns null in web mode, where the caller
+ * offers a browser download instead.
+ */
+export async function pickSaveFile(options: {
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}): Promise<string | null> {
+  if (isTauri) {
+    const { save } = await import('@tauri-apps/plugin-dialog');
+    return save({
+      defaultPath: options.defaultPath,
+      filters: options.filters,
+    });
+  }
+  return null;
+}

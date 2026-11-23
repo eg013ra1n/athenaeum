@@ -5128,6 +5128,11 @@ Spec `docs/superpowers/specs/2026-10-07-one-star-measurement-path-design.md`; pl
       proven path), not by `ImageConverter::read_header`'s parsing. Review T1+T2 found inputs on which a numeric-only port could move a number;
       with the port none is known. What still differs is an error becoming a success (an XISF header without `<?xml` / `</xisf>` or of 64-100 MB,
       XISF bytes under another name) and the error text of an unreadable header, which reaches the Analysis tab as `"{path}: {error}"`.
+      *Divergence since FITS keyword fallbacks (2026-11-23; rustafits unchanged, ruled by the review: Analysis numbers must not move):* "verbatim" is true of
+      the 2026-11-05 copy only. Athenaeum's XISF stored-header reader (`fits_parser/header_keys.rs`, `docs/catalog/README.md` "FITS keyword fallbacks") now
+      keeps the LAST duplicate, does no `" / "` cut and drops blank values, where the rustafits copy still keeps the first duplicate and cuts at `" / "`.
+      rustafits still reads BITPIX / BZERO / BSCALE / DATAMAX / EGAIN by its own copy, so no Analysis number moves; the two readers can disagree only on a
+      dump with a duplicate key or a `" / "` value for those keys. A change to either side is made on both or ruled.
     - *Numbers and logs.* `MEASURE_VERSION` stays 8 and `config_hash` is unchanged, so no stored analysis is re-run. The moved events keep their
       fields and carry the targets `astroimage::star_measure::{raw, green}` (`docs/logging/README.md`). No rustafits release (D-8: the additions
       ride with 1.8.0 in phase 5).

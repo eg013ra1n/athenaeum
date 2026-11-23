@@ -441,6 +441,7 @@ mod relink_tests {
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(athenaeum_core::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {
@@ -488,9 +489,8 @@ mod relink_tests {
         )
         .unwrap();
 
-        let (_frame, header_text) = athenaeum_core::fits_parser::parse_fits_with_header(
-            &PathBuf::from(MONO_FIXTURE), 0,
-        ).unwrap();
+        let header_text =
+            athenaeum_core::fits_parser::extract_fits_header(&PathBuf::from(MONO_FIXTURE)).unwrap();
         let old_path = old_root.join("L_001.fits");
         seed_old_file_row(&conn, 900, old_path.to_str().unwrap(), &header_text);
 

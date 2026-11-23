@@ -519,7 +519,7 @@ mod tests {
             read_xisf_keyword(&dest, "FILTER").unwrap().as_deref(),
             Some("R")
         );
-        let frame = crate::fits_parser::parse_xisf(&dest, 1).unwrap();
+        let frame = crate::fits_parser::parse_xisf(&dest, 1, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         assert_eq!(
             frame.filter.as_deref(),
             Some("R"),

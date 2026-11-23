@@ -2,11 +2,14 @@
 //! a keyword map, then map known keys to the canonical fields the catalog
 //! cares about.
 //!
-//! The scanner stores two formats in the same TEXT column:
+//! The scanner stores these formats in the same TEXT column:
 //!   - **FITS**: 80-byte cards joined with `\n` (see `FitsHeader::to_header_text`).
-//!   - **XISF**: the raw `<?xml...</xisf>` block.
+//!   - **XISF**: the `NAME = value` keyword dump of `xisf_header_text` (Athenaeum's own
+//!     output), or, in older catalogs, the raw `<?xml...</xisf>` block.
 //!
-//! Re-parsing here lets the UI show "what the file looked like at the most
+//! The reading itself lives in `header_keys`: one key reader per format, the scanner's own
+//! (HIERARCH names, doubled quotes and CONTINUE cards for FITS; the `FITSKeyword` extraction for
+//! XISF). Re-parsing here lets the UI show "what the file looked like at the most
 //! recent scan" so a user can compare against their custom edits and revert
 //! individual fields if they want to.
 //!
@@ -14,6 +17,8 @@
 //! stored text — which has cards joined by newlines, not contiguous 2880-byte
 //! blocks — round-trips cleanly without padding/realigning.
 
+use super::header_keys::{stored_header_key_map, HeaderKeyMap};
+use crate::header_fallbacks::{resolve_all, HeaderFallbackConfig};
 use crate::models::{FileFormat, ImageType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -67,82 +72,30 @@ pub struct FrameOriginalSnapshot {
     pub rotation: Option<f64>,
 }
 
-/// Format-aware dispatcher: pulls the canonical FITS keys (UPPERCASE) out
-/// of the stored blob into a HashMap.
+/// Format-aware dispatcher: pulls the canonical FITS keys (UPPERCASE, `COMMENT` / `HISTORY`
+/// dropped, values trimmed, blank ones dropped) out of the stored blob into a HashMap. A thin
+/// view of [`stored_header_key_map`], which holds the readers.
 pub fn parse_stored_header_keys(format: FileFormat, header_text: &str) -> HashMap<String, String> {
-    let primary = match format {
-        FileFormat::FITS => parse_fits_card_text(header_text),
-        FileFormat::XISF => parse_xisf_xml_text(header_text),
-    };
-    if !primary.is_empty() {
-        return primary;
-    }
-    // Some capture tools (notably ASIAIR) persist the header as a plain
-    // "KEY = value" text dump rather than 80-col FITS cards or XISF XML, so
-    // the format-specific parser yields nothing. Fall back to a line parser
-    // so "revert to original" / metadata snapshots still work.
-    parse_keyword_eq_text(header_text)
+    stored_header_key_map(format, header_text).into_legacy_map()
 }
 
-/// Parse a plain "KEY = value" header dump (one keyword per line, banner /
-/// separator / COMMENT / HISTORY / blank lines skipped). Quoted strings have
-/// their quotes stripped; an unquoted value's trailing " / comment" is
-/// dropped. Keys are upper-cased to match the other parsers.
-fn parse_keyword_eq_text(text: &str) -> HashMap<String, String> {
-    let mut result: HashMap<String, String> = HashMap::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        let Some((k, v)) = line.split_once('=') else { continue };
-        let key = k.trim().to_uppercase();
-        if key.is_empty()
-            || key.contains(' ')
-            || key == "END"
-            || key == "COMMENT"
-            || key == "HISTORY"
-        {
-            continue;
-        }
-        let v = v.trim();
-        let value = if let Some(s) = v.strip_prefix('\'') {
-            match s.find('\'') {
-                Some(end) => s[..end].trim_end().to_string(),
-                None => continue,
-            }
-        } else {
-            // Drop a FITS-style trailing comment (" / ...") without breaking
-            // space-separated values like "2 41 04.824".
-            v.split(" / ").next().unwrap_or("").trim().to_string()
-        };
-        if value.is_empty() {
-            continue;
-        }
-        result.entry(key).or_insert(value);
-    }
-    result
-}
-
-/// Map a parsed-keyword HashMap onto the canonical snapshot fields.
-pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> FrameOriginalSnapshot {
+/// Map a stored header's key map onto the canonical snapshot fields. The ten fields the rules
+/// govern come from the one resolver under `rules`, so the pane's "original" column agrees with
+/// what a scan under the same rules stored.
+pub fn snapshot_from_keys(
+    frame_id: i64,
+    keys: &HeaderKeyMap,
+    rules: &HeaderFallbackConfig,
+) -> FrameOriginalSnapshot {
     let get = |k: &str| keys.get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let r = resolve_all(rules, keys);
 
-    let object = get("OBJECT");
-    let filter = get("FILTER");
     let raw_imagetyp = get("IMAGETYP");
     let imagetyp = raw_imagetyp.as_ref().map(|s| {
         ImageType::from_str(s)
             .map(|t| format!("{:?}", t))
             .unwrap_or_else(|| s.clone())
     });
-    let instrume = get("INSTRUME");
-    let telescop = get("TELESCOP");
-    let focallen = get("FOCALLEN").and_then(|s| s.parse::<f64>().ok());
-    let xpixsz = get("XPIXSZ").and_then(|s| s.parse::<f64>().ok());
-    // Many cameras store gain under EGAIN and software-set gain under GAIN —
-    // prefer the simpler GAIN keyword first, falling back to EGAIN.
-    let gain = get("GAIN")
-        .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| get("EGAIN").and_then(|s| s.parse::<f64>().ok()));
-    let offset = get("OFFSET").and_then(|s| s.parse::<f64>().ok());
 
     // Binning: prefer XBINNING/YBINNING (numeric pair), fall back to a raw
     // BINNING text keyword if present.
@@ -153,13 +106,6 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
         _ => get("BINNING"),
     };
 
-    let exptime = get("EXPTIME").and_then(|s| s.parse::<f64>().ok());
-    // Must match the scanner's `frames.ccd_temp` (`CCD-TEMP`, else `DET-TEMP`),
-    // or the metadata pane shows a phantom "original differs" diff.
-    let ccd_temp = get("CCD-TEMP")
-        .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| get("CCDTEMP").and_then(|s| s.parse::<f64>().ok()))
-        .or_else(|| get("DET-TEMP").and_then(|s| s.parse::<f64>().ok()));
     let date_obs = get("DATE-OBS").or_else(|| get("DATE_OBS"));
 
     // RA: prefer sexagesimal OBJCTRA (HH:MM:SS); fall back to numeric RA in
@@ -211,18 +157,18 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
 
     FrameOriginalSnapshot {
         frame_id,
-        object,
-        filter,
+        object: r.object,
+        filter: r.filter,
         imagetyp,
-        instrume,
-        telescop,
-        focallen,
-        xpixsz,
-        gain,
-        offset,
+        instrume: r.instrume,
+        telescop: r.telescop,
+        focallen: r.focallen,
+        xpixsz: r.xpixsz,
+        gain: r.gain,
+        offset: r.offset,
         binning,
-        exptime,
-        ccd_temp,
+        exptime: r.exptime,
+        ccd_temp: r.ccd_temp,
         date_obs,
         ra,
         dec,
@@ -293,103 +239,6 @@ pub fn backfill_frame_cfa(
     }
 }
 
-/// Parse FITS header text where each line is one 80-char card (the format
-/// `to_header_text` produces). Skips END/COMMENT/HISTORY/blank cards. Handles
-/// quoted-string and unquoted-numeric value forms; comments after `/` are
-/// stripped from numeric/unquoted values.
-fn parse_fits_card_text(text: &str) -> HashMap<String, String> {
-    let mut result: HashMap<String, String> = HashMap::new();
-    for raw_line in text.lines() {
-        // Cards may have been stripped of trailing spaces during persistence.
-        // Treat the line as the card image, padding to 80 if shorter.
-        let line = raw_line.trim_end_matches('\r');
-        let keyword = line.get(0..line.len().min(8)).unwrap_or("").trim().to_uppercase();
-        if keyword.is_empty() || keyword == "END" || keyword == "COMMENT" || keyword == "HISTORY" {
-            continue;
-        }
-        let indicator = line.get(8..10).unwrap_or("");
-        if indicator != "= " {
-            // HIERARCH and other long-keyword cards aren't typed by users;
-            // skip rather than misparse.
-            continue;
-        }
-        let value_area = line.get(10..).unwrap_or("").trim_start();
-        let value = if let Some(stripped) = value_area.strip_prefix('\'') {
-            // Quoted string: take everything up to the next unescaped quote.
-            // FITS escapes quotes by doubling (''), but the simple path is
-            // good enough for user-facing fields.
-            match stripped.find('\'') {
-                Some(end) => stripped[..end].trim_end().to_string(),
-                None => continue,
-            }
-        } else {
-            // Numeric/boolean — split off comment after '/' and trim.
-            value_area
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        };
-        if value.is_empty() {
-            continue;
-        }
-        result.entry(keyword).or_insert(value);
-    }
-    result
-}
-
-/// Parse XISF XML text — `FITSKeyword name="..." value="..."` elements,
-/// with quotes stripped from values to match how `parse_xisf` already
-/// records them.
-fn parse_xisf_xml_text(text: &str) -> HashMap<String, String> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-
-    let mut result: HashMap<String, String> = HashMap::new();
-    let mut reader = Reader::from_str(text);
-    reader.config_mut().trim_text(true);
-    // Permissive dangling-`&` retained deliberately (0.36-era behavior; XISF
-    // headers are machine-written but a malformed one should still render —
-    // cycle decision 2026-07-29).
-    reader.config_mut().allow_dangling_amp = true;
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
-                if e.name().as_ref() == b"FITSKeyword" =>
-            {
-                let mut name = String::new();
-                let mut value = String::new();
-                for attr in e.attributes().flatten() {
-                    match attr.key.as_ref() {
-                        b"name" => name = String::from_utf8_lossy(&attr.value).to_string(),
-                        b"value" => {
-                            let mut v = String::from_utf8_lossy(&attr.value).to_string();
-                            if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
-                                v = v[1..v.len() - 1].trim().to_string();
-                            }
-                            value = v;
-                        }
-                        _ => {}
-                    }
-                }
-                if !name.is_empty() {
-                    result.entry(name.to_uppercase()).or_insert(value);
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                tracing::warn!(error = %e, "stored XISF header parse aborted");
-                break;
-            }
-            _ => {}
-        }
-        buf.clear();
-    }
-    result
-}
-
 /// `APTDIA` (mm) of a stored header blob — finite and positive, else `None`
 /// (plan 6b-2 C3/C4). `format` is `files.format` (`"FITS"` / `"XISF"`); any
 /// other value reads as no aperture.
@@ -408,6 +257,19 @@ pub fn aperture_mm_from_stored_header(format: &str, header: &str) -> Option<f64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rules() -> HeaderFallbackConfig {
+        HeaderFallbackConfig::default()
+    }
+
+    /// Key map of `(key, value)` pairs (first wins), the shape the readers produce.
+    fn km(pairs: &[(&str, &str)]) -> HeaderKeyMap {
+        HeaderKeyMap::from_first_wins(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+    }
+
+    fn snap(frame_id: i64, pairs: &[(&str, &str)]) -> FrameOriginalSnapshot {
+        snapshot_from_keys(frame_id, &km(pairs), &rules())
+    }
 
     #[test]
     fn aperture_reads_aptdia_finite_and_positive_only() {
@@ -473,13 +335,12 @@ mod tests {
     #[test]
     fn snapshot_falls_back_to_crval_when_objctra_missing() {
         // Header with WCS only — no OBJCTRA / RA / OBJCTDEC / DEC.
-        let mut keys = std::collections::HashMap::new();
-        keys.insert("CRVAL1".to_string(), "234.6002".to_string());
-        keys.insert("CRVAL2".to_string(), "-33.2365".to_string());
-        keys.insert("CD1_2".to_string(), "-1.2e-7".to_string());
-        keys.insert("CD2_2".to_string(), "0.000138".to_string());
-
-        let snap = snapshot_from_keys(42, &keys);
+        let snap = snap(42, &[
+            ("CRVAL1", "234.6002"),
+            ("CRVAL2", "-33.2365"),
+            ("CD1_2", "-1.2e-7"),
+            ("CD2_2", "0.000138"),
+        ]);
         let ra = snap.ra.expect("ra must come from CRVAL1");
         let dec = snap.dec.expect("dec must come from CRVAL2");
         assert!((ra - 234.6002).abs() < 1e-6, "ra={ra}");
@@ -490,10 +351,7 @@ mod tests {
 
         // Sanity: OBJCTRA wins over CRVAL1 when present, so survey frames
         // that DO have OBJCTRA continue to use it.
-        let mut keys2 = std::collections::HashMap::new();
-        keys2.insert("OBJCTRA".to_string(), "15 00 00".to_string());
-        keys2.insert("CRVAL1".to_string(), "999.0".to_string());
-        let snap2 = snapshot_from_keys(43, &keys2);
+        let snap2 = self::snap(43, &[("OBJCTRA", "15 00 00"), ("CRVAL1", "999.0")]);
         let ra2 = snap2.ra.expect("ra");
         assert!((ra2 - 225.0).abs() < 0.01, "OBJCTRA must win over CRVAL1; got {ra2}");
     }
@@ -520,7 +378,7 @@ mod tests {
             card_object, card_exptime, card_ccdtemp, card_xbin, card_ybin
         );
 
-        let keys = parse_fits_card_text(&text);
+        let keys = parse_stored_header_keys(FileFormat::FITS, &text);
         assert_eq!(keys.get("OBJECT"), Some(&"M42".to_string()));
         assert_eq!(keys.get("EXPTIME"), Some(&"120.0".to_string()));
         assert_eq!(keys.get("CCD-TEMP"), Some(&"-10.0".to_string()));
@@ -529,20 +387,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_asiair_xisf_keyword_dump() {
-        // ASIAIR persists the XISF header as a plain "KEY = value" text dump
-        // (not XISF XML, not 80-col FITS cards). parse_xisf_xml_text returns
-        // empty for this; the dispatcher must fall back to the line parser.
+    fn parses_the_xisf_keyword_dump() {
+        // Athenaeum stores an XISF header as the `NAME = value` dump of its own
+        // `xisf_header_text` (banner, then one line per FITSKeyword). The dispatcher
+        // inverts that dump.
         let dump = "XISF FITS Keywords:\n==================\n\nSIMPLE = T\nBITPIX = 16\nNAXIS = 2\nCOMMENT = \nFOCALLEN = 140.616\nXPIXSZ = 2.4\nOBJCTRA = 2 41 04.824\nOBJCTDEC = +62 56 44.95\nCROTA2 = 4.383973760472021\nCREATOR = ZWO ASIAIR\n";
-        // XML parser must yield nothing for this format.
-        assert!(parse_xisf_xml_text(dump).is_empty());
-        // Dispatcher must recover the keys via the fallback.
         let keys = parse_stored_header_keys(FileFormat::XISF, dump);
         assert_eq!(keys.get("FOCALLEN"), Some(&"140.616".to_string()));
         assert_eq!(keys.get("OBJCTRA"), Some(&"2 41 04.824".to_string()));
         assert_eq!(keys.get("OBJCTDEC"), Some(&"+62 56 44.95".to_string()));
         // And the snapshot must materialise the originals.
-        let snap = snapshot_from_keys(7, &keys);
+        let snap = snapshot_from_keys(7, &stored_header_key_map(FileFormat::XISF, dump), &rules());
         assert_eq!(snap.focallen, Some(140.616));
         let ra = snap.ra.expect("ra");
         let dec = snap.dec.expect("dec");
@@ -553,14 +408,13 @@ mod tests {
 
     #[test]
     fn snapshot_normalises_imagetyp_and_binning() {
-        let mut keys = HashMap::new();
-        keys.insert("IMAGETYP".into(), "MASTER DARK".into());
-        keys.insert("XBINNING".into(), "2".into());
-        keys.insert("YBINNING".into(), "2".into());
-        keys.insert("EXPTIME".into(), "60".into());
-        keys.insert("CCD-TEMP".into(), "-9.9".into());
-
-        let snap = snapshot_from_keys(42, &keys);
+        let snap = snap(42, &[
+            ("IMAGETYP", "MASTER DARK"),
+            ("XBINNING", "2"),
+            ("YBINNING", "2"),
+            ("EXPTIME", "60"),
+            ("CCD-TEMP", "-9.9"),
+        ]);
         assert_eq!(snap.imagetyp.as_deref(), Some("MasterDark"));
         assert_eq!(snap.binning.as_deref(), Some("2x2"));
         assert_eq!(snap.exptime, Some(60.0));
@@ -573,11 +427,7 @@ mod tests {
     /// never outranks it.
     #[test]
     fn snapshot_ccd_temp_falls_back_to_det_temp() {
-        let snap_of = |pairs: &[(&str, &str)]| {
-            let keys: HashMap<String, String> =
-                pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            snapshot_from_keys(1, &keys).ccd_temp
-        };
+        let snap_of = |pairs: &[(&str, &str)]| snap(1, pairs).ccd_temp;
         assert_eq!(snap_of(&[("DET-TEMP", "-5.5")]), Some(-5.5), "DET-TEMP alone");
         assert_eq!(
             snap_of(&[("CCD-TEMP", "-10.0"), ("DET-TEMP", "-5.5")]),
@@ -597,15 +447,15 @@ mod tests {
     #[test]
     fn det_temp_reaches_the_snapshot_from_stored_header_text() {
         let fits = format!("{:<80}\n{:<80}", "SIMPLE  =                    T", "DET-TEMP=                 -5.5 / sensor");
-        let keys = parse_stored_header_keys(FileFormat::FITS, &fits);
-        assert_eq!(snapshot_from_keys(1, &keys).ccd_temp, Some(-5.5));
+        let keys = stored_header_key_map(FileFormat::FITS, &fits);
+        assert_eq!(snapshot_from_keys(1, &keys, &rules()).ccd_temp, Some(-5.5));
 
         let xisf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <xisf>
   <FITSKeyword name="DET-TEMP" value="-5.5" />
 </xisf>"#;
-        let keys = parse_stored_header_keys(FileFormat::XISF, xisf);
-        assert_eq!(snapshot_from_keys(1, &keys).ccd_temp, Some(-5.5));
+        let keys = stored_header_key_map(FileFormat::XISF, xisf);
+        assert_eq!(snapshot_from_keys(1, &keys, &rules()).ccd_temp, Some(-5.5));
     }
 
     #[test]
@@ -615,10 +465,7 @@ mod tests {
         // and reflects user intent; ROTATANG is the raw rotator position
         // whose mapping to sky depends on the rotator's zero offset. Sky
         // frame wins.
-        let mut keys = HashMap::new();
-        keys.insert("OBJCTROT".into(), "185.0".into());
-        keys.insert("ROTATANG".into(), "208.089996337891".into());
-        let snap = snapshot_from_keys(42, &keys);
+        let snap = snap(42, &[("OBJCTROT", "185.0"), ("ROTATANG", "208.089996337891")]);
         assert_eq!(
             snap.rotation,
             Some(185.0),
@@ -631,64 +478,64 @@ mod tests {
         // Walk the chain top-down: each keyword wins over everything below it.
         // Order: CROTA2 → CD-matrix → CROTA1 → POSANGLE → PA → OBJCTROT →
         // ROTATANG → APTS_ROT. Sky-frame keys precede mechanical ones.
-        let mut keys = HashMap::new();
-        keys.insert("APTS_ROT".into(), "8.0".into());
-        keys.insert("ROTATANG".into(), "7.0".into());
-        keys.insert("OBJCTROT".into(), "6.0".into());
-        keys.insert("PA".into(), "5.0".into());
-        keys.insert("POSANGLE".into(), "4.0".into());
-        keys.insert("CROTA1".into(), "3.0".into());
-        keys.insert("CROTA2".into(), "1.0".into());
-        let snap = snapshot_from_keys(1, &keys);
+        let mut keys: Vec<(&str, &str)> = Vec::new();
+        keys.push(("APTS_ROT", "8.0"));
+        keys.push(("ROTATANG", "7.0"));
+        keys.push(("OBJCTROT", "6.0"));
+        keys.push(("PA", "5.0"));
+        keys.push(("POSANGLE", "4.0"));
+        keys.push(("CROTA1", "3.0"));
+        keys.push(("CROTA2", "1.0"));
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, Some(1.0), "CROTA2 must win when present");
 
         // Drop CROTA2 → CD matrix wins next (atan2-derived).
-        keys.remove("CROTA2");
-        keys.insert("CD1_2".into(), "0.0".into());
-        keys.insert("CD2_2".into(), "1.0".into());
-        let snap = snapshot_from_keys(1, &keys);
+        keys.retain(|(k, _)| *k != "CROTA2");
+        keys.push(("CD1_2", "0.0"));
+        keys.push(("CD2_2", "1.0"));
+        let snap = self::snap(1, &keys);
         // atan2(-0.0, 1.0) = 0.0 rad = 0°
         assert_eq!(snap.rotation, Some(0.0), "CD matrix must win over CROTA1+");
 
         // Remove CD matrix → CROTA1 wins.
-        keys.remove("CD1_2");
-        keys.remove("CD2_2");
-        let snap = snapshot_from_keys(1, &keys);
+        keys.retain(|(k, _)| *k != "CD1_2");
+        keys.retain(|(k, _)| *k != "CD2_2");
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, Some(3.0));
 
         // ...POSANGLE...
-        keys.remove("CROTA1");
-        let snap = snapshot_from_keys(1, &keys);
+        keys.retain(|(k, _)| *k != "CROTA1");
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, Some(4.0));
 
         // ...PA (now 5th)...
-        keys.remove("POSANGLE");
-        let snap = snapshot_from_keys(1, &keys);
+        keys.retain(|(k, _)| *k != "POSANGLE");
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, Some(5.0));
 
         // ...OBJCTROT (now 6th)...
-        keys.remove("PA");
-        let snap = snapshot_from_keys(1, &keys);
+        keys.retain(|(k, _)| *k != "PA");
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, Some(6.0));
 
         // ...ROTATANG (now 7th, demoted from 5th — sky frame wins over hw)...
-        keys.remove("OBJCTROT");
-        let snap = snapshot_from_keys(1, &keys);
+        keys.retain(|(k, _)| *k != "OBJCTROT");
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, Some(7.0));
 
         // ...APTS_ROT.
-        keys.remove("ROTATANG");
-        let snap = snapshot_from_keys(1, &keys);
+        keys.retain(|(k, _)| *k != "ROTATANG");
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, Some(8.0));
 
         // No rotation keys at all → None.
         keys.clear();
-        let snap = snapshot_from_keys(1, &keys);
+        let snap = self::snap(1, &keys);
         assert_eq!(snap.rotation, None);
     }
 
     #[test]
-    fn parses_xisf_xml_fitskeyword_elements() {
+    fn parses_raw_xisf_xml_fitskeyword_elements() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <xisf>
   <FITSKeyword name="OBJECT" value="'M42'" comment="" />
@@ -697,7 +544,7 @@ mod tests {
   <FITSKeyword name="XBINNING" value="1" />
   <FITSKeyword name="YBINNING" value="1" />
 </xisf>"#;
-        let keys = parse_xisf_xml_text(xml);
+        let keys = parse_stored_header_keys(FileFormat::XISF, xml);
         assert_eq!(keys.get("OBJECT"), Some(&"M42".to_string()));
         assert_eq!(keys.get("EXPTIME"), Some(&"120.0".to_string()));
         assert_eq!(keys.get("CCD-TEMP"), Some(&"-10.0".to_string()));
@@ -717,7 +564,7 @@ mod tests {
   <FITSKeyword name="OBJECT" value="'M42'" comment="" />
   <FITSKeyword name="EXPTIME" value="120.0" />
 </xisf>"#;
-        let keys = parse_xisf_xml_text(xml);
+        let keys = parse_stored_header_keys(FileFormat::XISF, xml);
 
         // Not just "no error": the FITSKeyword elements *after* the dangling
         // `&` must still have been reached and read correctly.
@@ -727,6 +574,88 @@ mod tests {
             "keywords after a dangling `&` must still parse"
         );
         assert_eq!(keys.get("EXPTIME"), Some(&"120.0".to_string()));
+    }
+
+    /// `CCDTEMP` and `EGAIN` were never keywords the scanner read; the snapshot used to
+    /// invent them (a phantom diff against `frames.ccd_temp` / `frames.gain`).
+    #[test]
+    fn snapshot_ignores_ccdtemp_and_egain() {
+        let s = snap(1, &[("CCDTEMP", "-10"), ("EGAIN", "0.24")]);
+        assert_eq!(s.ccd_temp, None);
+        assert_eq!(s.gain, None);
+    }
+
+    #[test]
+    fn snapshot_reads_exposure_and_pixsize1() {
+        let s = snap(1, &[("EXPOSURE", "60"), ("PIXSIZE1", "3.76")]);
+        assert_eq!(s.exptime, Some(60.0));
+        assert_eq!(s.xpixsz, Some(3.76));
+    }
+
+    #[test]
+    fn snapshot_follows_a_custom_order() {
+        let mut custom = HeaderFallbackConfig::default();
+        custom.fields.get_mut(&crate::header_fallbacks::HeaderField::CcdTemp).unwrap().order =
+            vec!["DET-TEMP".to_string(), "CCD-TEMP".to_string()];
+        let s = snapshot_from_keys(1, &km(&[("CCD-TEMP", "-10"), ("DET-TEMP", "-5.5")]), &custom);
+        assert_eq!(s.ccd_temp, Some(-5.5));
+    }
+
+    fn fits_text(cards: &[&str]) -> String {
+        cards.iter().map(|c| format!("{c:<80}")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn legacy_map_reads_hierarch_cards() {
+        let text = fits_text(&["HIERARCH ESO DET TEMP = -7.25 / sensor", "END"]);
+        let keys = parse_stored_header_keys(FileFormat::FITS, &text);
+        assert_eq!(keys.get("ESO DET TEMP").map(String::as_str), Some("-7.25"));
+    }
+
+    #[test]
+    fn legacy_map_joins_continue_cards() {
+        let text = fits_text(&[
+            "FILTER  = 'Long filter &'",
+            "CONTINUE  '  two'",
+            "END",
+        ]);
+        let keys = parse_stored_header_keys(FileFormat::FITS, &text);
+        // FitsHeader's own join: the first part is right-trimmed, the continuation verbatim.
+        assert_eq!(keys.get("FILTER").map(String::as_str), Some("Long filter  two"));
+    }
+
+    #[test]
+    fn legacy_map_keeps_a_doubled_quote() {
+        // Was "O": the old reader stopped at the first quote. Now the scanner's reading.
+        let text = fits_text(&["OBJECT  = 'O''Brien'", "END"]);
+        let keys = parse_stored_header_keys(FileFormat::FITS, &text);
+        assert_eq!(keys.get("OBJECT").map(String::as_str), Some("O'Brien"));
+    }
+
+    #[test]
+    fn legacy_map_keeps_an_xisf_value_with_slash() {
+        // Was "Ha": the dump line was cut at " / ". Now the value as the XISF builder read it.
+        let dump = "XISF FITS Keywords:\n==================\n\nFILTER = Ha / 7nm\n";
+        let keys = parse_stored_header_keys(FileFormat::XISF, dump);
+        assert_eq!(keys.get("FILTER").map(String::as_str), Some("Ha / 7nm"));
+    }
+
+    #[test]
+    fn legacy_map_xisf_last_duplicate_wins() {
+        // Was "100": the XISF builder keeps the last duplicate, now the stored text agrees.
+        let dump = "XISF FITS Keywords:\n==================\n\nGAIN = 100\nGAIN = 120\n";
+        let keys = parse_stored_header_keys(FileFormat::XISF, dump);
+        assert_eq!(keys.get("GAIN").map(String::as_str), Some("120"));
+    }
+
+    #[test]
+    fn legacy_map_drops_comment_history_and_blank_values() {
+        let text = fits_text(&["COMMENT hello", "HISTORY made", "OBJECT  = ''", "GAIN    = 100", "END"]);
+        let keys = parse_stored_header_keys(FileFormat::FITS, &text);
+        assert!(!keys.contains_key("COMMENT"));
+        assert!(!keys.contains_key("HISTORY"));
+        assert!(!keys.contains_key("OBJECT"));
+        assert_eq!(keys.get("GAIN").map(String::as_str), Some("100"));
     }
 }
 

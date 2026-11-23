@@ -148,3 +148,111 @@ pub async fn get_settings_defaults(
 ) -> Result<athenaeum_core::api::settings::SettingsDefaults, String> {
     athenaeum_core::api::settings::get_settings_defaults(&state.ctx).map_err(|e| e.to_string())
 }
+
+/// The user's ordered header keywords per catalog field (expanded document, `retired` included).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_header_fallbacks(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::header_fallbacks::HeaderFallbackConfig, String> {
+    athenaeum_core::api::header_fallbacks::get_header_fallbacks(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Validate and store the keyword rules; keywords dropped from an order are retired.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_header_fallbacks(
+    config: athenaeum_core::header_fallbacks::HeaderFallbackConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    athenaeum_core::api::header_fallbacks::set_header_fallbacks(&state.ctx, config)
+        .map_err(|e| e.to_string())
+}
+
+/// Every field back to its default keyword chain; returns the stored document.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn reset_header_fallbacks(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::header_fallbacks::HeaderFallbackConfig, String> {
+    athenaeum_core::api::header_fallbacks::reset_header_fallbacks(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// What the stored keyword rules would change in the catalog (a read-only count). Runs on a
+/// blocking thread: it reads every frame.
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip_all, err)]
+pub async fn preview_header_fallbacks(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || athenaeum_core::api::header_fallbacks::preview_header_fallbacks(&ctx))
+        .await
+        .map_err(|e| format!("FITS keyword preview task panicked: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// Write what the stored keyword rules change in the catalog (regrouping the raw calibration
+/// frames whose grouping values change). Emits `header-fallbacks-progress`. Runs on a blocking
+/// thread; a second Apply while one runs is refused.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn apply_header_fallbacks(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        let emitter = crate::tauri_events::TauriProgressEmitter(app_handle);
+        athenaeum_core::api::header_fallbacks::apply_header_fallbacks(&ctx, &emitter)
+    })
+    .await
+    .map_err(|e| format!("FITS keyword apply task panicked: {e}"))?
+    .map_err(|e| e.to_string())
+}
+
+/// The stored keyword rules as the JSON file of the spec's §5.7. With `path` the text is also
+/// written there (the desktop reads and writes the user's chosen file in core); the text is
+/// returned either way.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn export_header_fallbacks(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        athenaeum_core::api::header_fallbacks::export_header_fallbacks(
+            &ctx,
+            path,
+            &athenaeum_core::api::PathPolicy::AllowAll,
+        )
+    })
+    .await
+    .map_err(|e| format!("FITS keyword export task panicked: {e}"))?
+    .map_err(|e| e.to_string())
+}
+
+/// What importing a keyword-rules file (its `text`, or a `path`) would change. Stores nothing;
+/// the frontend saves `plan.config` after the user confirms. Runs on a blocking thread: it reads
+/// the file.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn plan_header_fallbacks_import(
+    text: Option<String>,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::header_fallbacks::transfer::HeaderFallbackImportPlan, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        athenaeum_core::api::header_fallbacks::plan_header_fallbacks_import(
+            &ctx,
+            text,
+            path,
+            &athenaeum_core::api::PathPolicy::AllowAll,
+        )
+    })
+    .await
+    .map_err(|e| format!("FITS keyword import task panicked: {e}"))?
+    .map_err(|e| e.to_string())
+}

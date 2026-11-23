@@ -135,7 +135,9 @@ pub fn extract_hints(frame: &Frame, conn: Option<&Connection>) -> SolveHints {
     // make sense.
     if hints.ra.is_none() && hints.dec.is_none() {
         if let (Some(conn), Some(frame_id)) = (conn, frame.id) {
-            if let Ok(snaps) = crate::db::get_frame_metadata_originals(conn, &[frame_id]) {
+            // Only ra/dec are read here; the FITS keyword rules do not govern them.
+            let rules = crate::header_fallbacks::HeaderFallbackConfig::default();
+            if let Ok(snaps) = crate::db::get_frame_metadata_originals(conn, &[frame_id], &rules) {
                 if let Some(snap) = snaps.into_iter().next() {
                     if let (Some(ra), Some(dec)) = (snap.ra, snap.dec) {
                         if !is_sentinel_position(ra, dec) {

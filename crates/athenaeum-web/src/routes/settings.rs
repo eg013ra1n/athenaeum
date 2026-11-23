@@ -264,6 +264,151 @@ pub async fn get_settings_defaults(
         .map_err(api_err)
 }
 
+// ── FITS keyword rules (issue #21) ───────────────────────────────────────────
+
+/// POST /api/get_header_fallbacks
+///
+/// The user's ordered header keywords per catalog field (expanded document).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::HeaderFallbackConfig>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::get_header_fallbacks(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Request body for `set_header_fallbacks`: `api.invoke('set_header_fallbacks', { config })`
+/// sends `{ "config": { ... } }`, per the Tauri named-arg convention.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetHeaderFallbacksArgs {
+    pub config: athenaeum_core::header_fallbacks::HeaderFallbackConfig,
+}
+
+/// POST /api/set_header_fallbacks
+///
+/// Validates and stores the rules; a document that breaks a rule is a 400.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetHeaderFallbacksArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::set_header_fallbacks(&state.ctx, args.config)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/reset_header_fallbacks
+///
+/// Every field back to its default chain; returns the stored document.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn reset_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::HeaderFallbackConfig>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::reset_header_fallbacks(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/preview_header_fallbacks
+///
+/// What the stored rules would change in the catalog (a read-only count). Runs on a blocking
+/// thread: it reads every frame.
+#[tracing::instrument(level = "debug", skip_all, err(Debug))]
+pub async fn preview_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || athenaeum_core::api::header_fallbacks::preview_header_fallbacks(&ctx))
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("FITS keyword preview task panicked: {e}"))
+        })?
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/apply_header_fallbacks
+///
+/// Write what the stored rules change in the catalog, regrouping the raw calibration frames whose
+/// grouping values change. Emits `header-fallbacks-progress` over SSE. Runs on a blocking thread;
+/// a second Apply while one runs answers 409.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn apply_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let event_tx = state.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let emitter = crate::events::SseProgressEmitter::new(event_tx);
+        athenaeum_core::api::header_fallbacks::apply_header_fallbacks(&ctx, &emitter)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("FITS keyword apply task panicked: {e}")))?
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// Request body for `export_header_fallbacks`. A path is refused on the web host (D15): the
+/// browser downloads the returned text.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportHeaderFallbacksArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// POST /api/export_header_fallbacks
+///
+/// The rules as the JSON file of the spec's section 5.7; a `path` answers 403.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn export_header_fallbacks(
+    State(state): State<WebAppState>,
+    Json(args): Json<ExportHeaderFallbacksArgs>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::export_header_fallbacks(
+        &state.ctx,
+        args.path,
+        &athenaeum_core::api::PathPolicy::AllowedRoots(Vec::new()),
+    )
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// Request body for `plan_header_fallbacks_import`: the file's `text` (the browser reads the
+/// file); a `path` answers 403 (D15).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanHeaderFallbacksImportArgs {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// POST /api/plan_header_fallbacks_import
+///
+/// What importing the file would change; stores nothing. A file that breaks a rule is a 400.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn plan_header_fallbacks_import(
+    State(state): State<WebAppState>,
+    Json(args): Json<PlanHeaderFallbacksImportArgs>,
+) -> Result<Json<athenaeum_core::header_fallbacks::transfer::HeaderFallbackImportPlan>, (StatusCode, String)> {
+    athenaeum_core::api::header_fallbacks::plan_header_fallbacks_import(
+        &state.ctx,
+        args.text,
+        args.path,
+        &athenaeum_core::api::PathPolicy::AllowedRoots(Vec::new()),
+    )
+    .map(Json)
+    .map_err(api_err)
+}
+
 #[cfg(test)]
 mod logging_config_tests {
     use super::*;
@@ -282,7 +427,7 @@ mod logging_config_tests {
     /// `routes::tests::test_state` in `routes/mod.rs`, which leaves `ctx.db`
     /// unset to test only the auth layer). Mirrors
     /// `scan_roots::relink_tests::test_state`.
-    fn test_state(db: Database) -> WebAppState {
+    pub(super) fn test_state(db: Database) -> WebAppState {
         let db_cell = OnceLock::new();
         let _ = db_cell.set(db);
         let ctx = Arc::new(ServiceContext {
@@ -307,6 +452,7 @@ mod logging_config_tests {
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             zip_cache: std::sync::Arc::new(athenaeum_core::zip_store::cache::ZipCache::for_tests()),
+            apply_running: Default::default(),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {
@@ -458,5 +604,149 @@ mod logging_config_tests {
             .await
             .expect("in range");
         assert_eq!(state.image_semaphore.read().unwrap().available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod header_fallbacks_tests {
+    use super::logging_config_tests::test_state;
+    use super::*;
+    use athenaeum_core::db::Database;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn set_header_fallbacks_then_get_reflects_change() {
+        use athenaeum_core::header_fallbacks::{HeaderField, HeaderFallbackConfig};
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.get_mut(&HeaderField::Gain).unwrap().order = vec!["G2".into(), "GAIN".into()];
+        let _ = set_header_fallbacks(State(state.clone()), Json(SetHeaderFallbacksArgs { config: cfg }))
+            .await
+            .expect("valid rules must be accepted");
+
+        let got = get_header_fallbacks(State(state.clone()), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(got.order(HeaderField::Gain), ["G2", "GAIN"]);
+
+        let reset = reset_header_fallbacks(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(reset.order(HeaderField::Gain), ["GAIN"]);
+        assert_eq!(reset.retired(HeaderField::Gain), ["G2"]);
+    }
+
+    #[tokio::test]
+    async fn preview_header_fallbacks_counts_an_empty_catalog_as_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let counts = preview_header_fallbacks(State(state), Json(serde_json::json!({}))).await.unwrap().0;
+        assert_eq!(counts, athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts::default());
+    }
+
+    #[tokio::test]
+    async fn apply_header_fallbacks_changes_nothing_in_an_empty_catalog_and_conflicts_when_running() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let counts = apply_header_fallbacks(State(state.clone()), Json(serde_json::json!({}))).await.unwrap().0;
+        assert_eq!(counts, athenaeum_core::header_fallbacks::apply::HeaderFallbackCounts::default());
+        state.ctx.apply_running.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = apply_header_fallbacks(State(state), Json(serde_json::json!({}))).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn set_header_fallbacks_rejects_a_dropped_default_keyword_with_400() {
+        use athenaeum_core::header_fallbacks::{HeaderField, HeaderFallbackConfig};
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.get_mut(&HeaderField::CcdTemp).unwrap().order = vec!["CCD-TEMP".into()];
+        let err = set_header_fallbacks(State(state), Json(SetHeaderFallbacksArgs { config: cfg }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The frontend sends `{ "config": ... }`; a bare document must not deserialize.
+    #[test]
+    fn bare_header_fallbacks_body_fails_to_deserialize_into_wrapped_args() {
+        let bare = serde_json::to_value(athenaeum_core::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
+        assert!(serde_json::from_value::<SetHeaderFallbacksArgs>(bare).is_err());
+    }
+
+    #[tokio::test]
+    async fn export_then_plan_import_round_trips_over_the_routes() {
+        use athenaeum_core::header_fallbacks::{HeaderField, HeaderFallbackConfig};
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let mut cfg = HeaderFallbackConfig::default();
+        cfg.fields.get_mut(&HeaderField::Gain).unwrap().order = vec!["G2".into(), "GAIN".into()];
+        let _ = set_header_fallbacks(State(state.clone()), Json(SetHeaderFallbacksArgs { config: cfg }))
+            .await
+            .unwrap();
+        let text = export_header_fallbacks(State(state.clone()), Json(ExportHeaderFallbacksArgs { path: None }))
+            .await
+            .unwrap()
+            .0;
+        assert!(text.contains("\"gain\""), "{text}");
+        let plan = plan_header_fallbacks_import(
+            State(state),
+            Json(PlanHeaderFallbacksImportArgs { text: Some(text), path: None }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        assert_eq!(plan.config.order(HeaderField::Gain), ["G2", "GAIN"]);
+    }
+
+    #[tokio::test]
+    async fn export_and_import_refuse_a_path_with_403_and_a_bad_file_with_400() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+        let file = tmp.path().join("rules.json");
+        let path = Some(file.to_string_lossy().into_owned());
+        let err = export_header_fallbacks(State(state.clone()), Json(ExportHeaderFallbacksArgs { path: path.clone() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(!file.exists());
+        let err = plan_header_fallbacks_import(
+            State(state.clone()),
+            Json(PlanHeaderFallbacksImportArgs { text: None, path }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let err = plan_header_fallbacks_import(
+            State(state),
+            Json(PlanHeaderFallbacksImportArgs { text: Some("not json".into()), path: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The frontend omits an absent argument; the body `{}` must still deserialize.
+    #[test]
+    fn export_and_import_args_accept_missing_members() {
+        let a: ExportHeaderFallbacksArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(a.path.is_none());
+        let b: PlanHeaderFallbacksImportArgs =
+            serde_json::from_value(serde_json::json!({ "text": "x" })).unwrap();
+        assert_eq!(b.text.as_deref(), Some("x"));
+        assert!(b.path.is_none());
     }
 }

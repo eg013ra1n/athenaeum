@@ -49,7 +49,7 @@ function buildIndex(): IndexedSection[] {
       text: normalize([field.label, field.help, ...(field.keywords ?? [])].filter(Boolean).join(' ')),
     }));
     const haystack = normalize(
-      [section.title, section.description, TAB_LABEL[section.tab], ...fields.map((f) => f.text)]
+      [section.title, section.description, TAB_LABEL[section.tab], ...(section.keywords ?? []), ...fields.map((f) => f.text)]
         .filter(Boolean)
         .join(' '),
     );

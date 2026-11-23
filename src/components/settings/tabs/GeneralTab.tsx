@@ -1,5 +1,5 @@
 // Settings redesign (spec 2026-09-18 §2) — General tab: Updates · Frame set
-// grouping · Session detection · Monitoring · Auto-merge · Content index ·
+// grouping · Session detection · FITS keywords · Monitoring · Auto-merge · Content index ·
 // Archive · Data file locations · Assistant access (MCP) · Logging. (Sky background moved to the
 // Sky Chart tab.)
 //
@@ -12,6 +12,7 @@
 import { UpdatesSection } from '../sections/UpdatesSection';
 import { FrameSetGroupingSection } from '../sections/FrameSetGroupingSection';
 import { SessionDetectionSection } from '../sections/SessionDetectionSection';
+import { HeaderKeywordsSection } from '../sections/HeaderKeywordsSection';
 import { MonitoringSection } from '../sections/MonitoringSection';
 import { AutoMergeSection } from '../sections/AutoMergeSection';
 import { ContentIndexSection } from '../sections/ContentIndexSection';
@@ -26,6 +27,7 @@ export const GENERAL_SECTIONS: TabSectionEntry[] = [
   { sectionId: 'general.updates', element: <UpdatesSection /> },
   { sectionId: 'general.grouping', element: <FrameSetGroupingSection /> },
   { sectionId: 'general.sessions', element: <SessionDetectionSection /> },
+  { sectionId: 'general.headerKeywords', element: <HeaderKeywordsSection /> },
   { sectionId: 'general.monitoring', element: <MonitoringSection /> },
   { sectionId: 'general.autoMerge', element: <AutoMergeSection /> },
   { sectionId: 'general.contentIndex', element: <ContentIndexSection /> },

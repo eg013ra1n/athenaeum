@@ -363,6 +363,11 @@ pub mod keys {
     /// keeps the container its file already has.
     pub const CALIBRATION_MASTER_FORMAT: &str = "calibration.master_format";
 
+    /// The user's ordered header keywords for the twelve catalog fields (typed document,
+    /// `header_fallbacks::HeaderFallbackConfig`, compact form). Absent = every default chain.
+    /// Not in `defaults::all()`: read and written only by `api::header_fallbacks`.
+    pub const CATALOG_HEADER_FALLBACKS: &str = "catalog.header_fallbacks";
+
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "compute.max_concurrent";
 

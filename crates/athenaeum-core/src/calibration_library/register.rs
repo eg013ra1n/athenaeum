@@ -113,8 +113,11 @@ pub fn register_master(
         .extension()
         .map(|e| e.to_string_lossy().eq_ignore_ascii_case("xisf"))
         .unwrap_or(false);
+    // The catalog's FITS keyword rules, read once: a registered master reads its header exactly as
+    // a scan of the same file would.
+    let rules = crate::header_fallbacks::load_for_scan(conn);
     let (mut frame, header_text) = if is_xisf {
-        let frame = parse_xisf(master_path, 0).with_context(|| {
+        let frame = parse_xisf(master_path, 0, &rules).with_context(|| {
             format!("freshly written master failed to parse: {}", master_path.display())
         })?;
         let header = extract_xisf_header(master_path).with_context(|| {
@@ -122,7 +125,7 @@ pub fn register_master(
         })?;
         (frame, header)
     } else {
-        parse_fits_with_header(master_path, 0).with_context(|| {
+        parse_fits_with_header(master_path, 0, &rules).with_context(|| {
             format!("freshly written master failed to parse: {}", master_path.display())
         })?
     };
@@ -552,7 +555,7 @@ mod tests {
         let raw = seed_source_set(&conn, dir.path());
         let master_path = write_master(dir.path());
         let reg = register_master(&conn, raw, &master_path, "{}").unwrap();
-        let parsed = crate::fits_parser::parse_fits(&master_path, 0).unwrap();
+        let parsed = crate::fits_parser::parse_fits(&master_path, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         let g = crate::calibration::geometry::geometry_for_set(&conn, reg.master_set_id).unwrap();
         assert_eq!(g.size, parsed.naxis1.zip(parsed.naxis2));
         assert!(g.size.is_some(), "a registered master must record its size");
@@ -583,6 +586,38 @@ mod tests {
         }
     }
 
+    /// A directly registered master reads its header under the catalog's FITS keyword rules,
+    /// as a scan of the same file does.
+    #[test]
+    fn register_master_reads_the_catalog_rules() {
+        use crate::fits_writer::{Card, CardValue};
+        use crate::header_fallbacks::{FieldRule, HeaderField, HeaderFallbackConfig};
+        for format in [OutputFormat::Fits, OutputFormat::Xisf] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            let raw = seed_source_set(&conn, dir.path());
+            let mut rules = HeaderFallbackConfig::default();
+            rules.fields.insert(
+                HeaderField::Gain,
+                FieldRule { order: vec!["MY-GAIN".into(), "GAIN".into()], retired: Vec::new() },
+            );
+            crate::header_fallbacks::store(&conn, &rules).unwrap();
+            let path = dir.path().join(format!("master_dark.{}", format.extension()));
+            let cards = HeaderBuilder::new(FrameKind::MasterDark)
+                .instrume("TestCam").exptime(300.0).gain(100).offset(50)
+                .binning(1, 1).ccd_temp(-10.0)
+                .custom(Card::new("MY-GAIN", CardValue::Integer(139)).unwrap())
+                .build().unwrap();
+            crate::fits_writer::write_image_f32(&path, 8, 8, 1, &vec![100.0; 64], &cards, format, XisfBounds::Adu16)
+                .unwrap();
+            let reg = register_master(&conn, raw, &path, "{}").unwrap();
+            let gain: Option<f64> = conn
+                .query_row("SELECT gain FROM frames WHERE file_id = ?1", [reg.master_file_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(gain, Some(139.0), "{format:?}");
+        }
+    }
+
     #[test]
     fn matcher_excludes_superseded_sets() {
         let dir = tempfile::tempdir().unwrap();
@@ -598,7 +633,7 @@ mod tests {
             .binning(1, 1).ccd_temp(-10.0)
             .build().unwrap();
         crate::fits_writer::write_fits_f32(&probe, 8, 8, 1, &vec![1.0; 64], &cards).unwrap();
-        let frame = crate::fits_parser::parse_fits(&probe, 0).unwrap();
+        let frame = crate::fits_parser::parse_fits(&probe, 0, &crate::header_fallbacks::HeaderFallbackConfig::default()).unwrap();
         let config = crate::calibration::config::CalibrationMatchingConfig::default();
         let candidates = crate::calibration::configurable_matcher::find_calibration_candidates(
             &conn, &frame, "lights", "dark", &config,

@@ -14,6 +14,13 @@
 
 import type { LucideIcon } from 'lucide-react';
 import {
+  HEADER_FIELDS,
+  HEADER_FIELD_LABELS,
+  HEADER_FIELD_COLUMNS,
+  HEADER_FIELD_SYNONYMS,
+  DEFAULT_HEADER_CHAINS,
+} from './headerFields';
+import {
   Settings as SettingsIcon,
   Eye,
   BarChart3,
@@ -51,6 +58,8 @@ export interface SettingsSectionMeta {
   tab: SettingsTabId;
   title: string;
   description?: string;
+  /** Extra search terms for the whole section (a typed config's settings key, synonyms). */
+  keywords?: string[];
   fields: SettingsFieldMeta[];
 }
 
@@ -117,6 +126,24 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
         keywords: ['session_gap_threshold_hours', 'night', 'imaging night'],
       },
     ],
+  },
+  {
+    id: 'general.headerKeywords',
+    tab: 'general',
+    title: 'FITS keywords',
+    description:
+      'Which header keyword each catalog field is read from, first match wins. Your files are never changed.',
+    keywords: ['fits', 'header', 'keyword', 'fallback', 'xisf', 'catalog.header_fallbacks'],
+    fields: HEADER_FIELDS.map((f) => ({
+      id: f,
+      label: HEADER_FIELD_LABELS[f],
+      help: 'Tried in order; the first keyword with a usable value fills the field.',
+      keywords: [
+        ...DEFAULT_HEADER_CHAINS[f].map((k) => k.toLowerCase()),
+        HEADER_FIELD_COLUMNS[f],
+        ...(HEADER_FIELD_SYNONYMS[f] ?? []),
+      ],
+    })),
   },
   {
     id: 'general.monitoring',

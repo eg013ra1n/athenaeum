@@ -31,3 +31,13 @@ The `mcp-plan` scenario (`HARNESS_SCENARIO=mcp-plan HARNESS_PLAN=black_hole|meta
 `black_hole`) shows the assistant's plan window over any page: the web build asks `get_mcp_plan` on load and the harness answers
 with a waiting plan. The Black Hole plan names the same files as the two groups on http://localhost:1430/files (Duplicates tab).
 An answer is echoed (Apply ends in a report, Cancel in "cancelled"); reload the page to get the plan back. Fixtures: `mcpPlan.mjs`.
+
+The `header-keywords` scenario (`HARNESS_SCENARIO=header-keywords npm run ui:harness`, then
+http://localhost:1430/settings?tab=general&section=general.headerKeywords) shows Settings → General → FITS keywords on the
+default chains, with a preview of 312 frames (290 sensor temperature, 22 exposure, 14 pixel size X), 9 values kept, 3 calibration
+sets regrouped and 2 frames without a header, so the Apply dialog carries every line. `HARNESS_PREVIEW=empty` answers a preview with
+nothing to change (the line is hidden). `set_header_fallbacks` echoes what it received (and logs the changed fields),
+`reset_header_fallbacks` and `apply_header_fallbacks` answer like the real ones; nothing is stored, so a reload brings the
+default chains back and the preview line stays after Apply. The harness has no events, so the `header-fallbacks-progress` line
+(`Applying… 120 of 312 frames`) never shows here; the section's test drives it. Fixtures: `headerKeywords.mjs`.
+Its Export… downloads a fixed JSON text; Import… (any file) answers by `HARNESS_IMPORT=change|same|refuse`: one changed field (Sensor temperature, the confirm lists it), no change (the dialog says the file matches), or a refusal (a warning notification with the server text). Import's Import button feeds the rules to the autosave; the desktop file dialogs cannot be shown here.
