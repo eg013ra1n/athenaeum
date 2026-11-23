@@ -165,8 +165,23 @@ fn literal(platform: &str, c: &Computed, live: &dyn Fn(&str) -> u32) -> String {
     )
 }
 
+/// A table row as it is written in [`GOLDENS`] (the literal a failure message about the row carries).
+fn row_literal(g: &Golden) -> String {
+    let versions: Vec<String> = g.versions.iter().map(|(n, v)| format!("(\"{n}\", {v})")).collect();
+    format!(
+        "Golden {{ stage: \"{}\", platform: \"{}\", versions: &[{}], checksum: {:#018x} }},",
+        g.stage,
+        g.platform,
+        versions.join(", "),
+        g.checksum
+    )
+}
+
 /// Compares the computed stages with the table on `platform`. A float stage on a platform with no rows checks
 /// determinism only (the caller did that) and passes; a `portable` stage is checked against its `"*"` row everywhere.
+/// A row of the table that reads as coverage but covers nothing fails too: a row whose stage is no longer computed
+/// (a renamed or dropped stage) and a second row for the same (stage, platform). That holds for the rows of `platform`
+/// when it has rows and for the `"*"` rows on every platform.
 fn check(
     table: &[Golden],
     platform: &str,
@@ -211,6 +226,31 @@ fn check(
                  commit. New row: {lit}",
                 c.stage,
                 live(own)
+            ));
+        }
+    }
+    for (at, row) in table.iter().enumerate() {
+        let star = row.platform == "*";
+        if !star && !(has_rows && row.platform == platform) {
+            continue;
+        }
+        let key = (row.stage, row.platform);
+        if table[..at].iter().any(|g| (g.stage, g.platform) == key) {
+            failures.push(format!(
+                "{} ({}): a second row for the same stage and platform; the first one is the one checked: remove \
+                 one. Row: {}",
+                row.stage,
+                row.platform,
+                row_literal(row)
+            ));
+        }
+        if !computed.iter().any(|c| c.stage == row.stage && c.portable == star) {
+            failures.push(format!(
+                "{} ({}): the table has a row for a stage that is no longer computed: remove it or restore the \
+                 stage. Row: {}",
+                row.stage,
+                row.platform,
+                row_literal(row)
             ));
         }
     }
@@ -867,4 +907,57 @@ fn a_star_row_is_enforced_on_every_platform() {
     }];
     let err = check(&table, "q", &computed, &|_| 1).unwrap_err();
     assert!(err.contains("bump LN_GRID_VERSION"), "{err}");
+}
+
+#[test]
+fn a_row_for_a_stage_no_longer_computed_fails() {
+    let mut table = one_row_table();
+    table.push(Golden {
+        stage: "dropped_stage",
+        platform: "p",
+        versions: &[("MEASURE_VERSION", 8)],
+        checksum: 3,
+    });
+    let err = check(&table, "p", &measure_computed(1), &|_| 8).unwrap_err();
+    assert!(err.contains("no longer computed"), "{err}");
+    assert!(err.contains("stage: \"dropped_stage\", platform: \"p\""), "{err}");
+    // A star row for a stage that is gone fails on every platform, even one with no rows of its own.
+    let star = [Golden {
+        stage: "dropped_grid_2",
+        platform: "*",
+        versions: &[("LN_GRID_VERSION", 1)],
+        checksum: 4,
+    }];
+    let err = check(&star, "q", &measure_computed(1), &|_| 8).unwrap_err();
+    assert!(err.contains("no longer computed"), "{err}");
+    assert!(err.contains("platform: \"*\""), "{err}");
+}
+
+#[test]
+fn a_second_row_for_one_stage_and_platform_fails() {
+    let mut table = one_row_table();
+    table.push(Golden {
+        stage: "measure",
+        platform: "p",
+        versions: &[("MEASURE_VERSION", 8)],
+        checksum: 5,
+    });
+    let err = check(&table, "p", &measure_computed(1), &|_| 8).unwrap_err();
+    assert!(err.contains("a second row"), "{err}");
+    assert!(err.contains("checksum: 0x0000000000000005"), "{err}");
+    let star = |checksum| Golden {
+        stage: "ln_grid_format",
+        platform: "*",
+        versions: &[("LN_GRID_VERSION", 1)],
+        checksum,
+    };
+    let table = [star(1), star(2)];
+    let computed = [Computed {
+        stage: "ln_grid_format",
+        versions: &["LN_GRID_VERSION"],
+        portable: true,
+        checksum: 1,
+    }];
+    let err = check(&table, "q", &computed, &|_| 1).unwrap_err();
+    assert!(err.contains("a second row"), "{err}");
 }
