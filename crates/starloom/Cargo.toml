@@ -46,6 +46,13 @@ ts = ["dep:ts-rs"]
 # (`PlanePrep::zero_timings`) when the `engine` layer is on.
 test-support = ["rustafits?/test-support"]
 
+# The stage goldens hold for the build profile they were recorded under: Athenaeum's dev profile, opt-level 2 for every
+# package. At opt-level 0 one measured FWHM comes out one ulp apart (measured 2026-11-23, starloom phase 3: the measure
+# and pass-1 rows red, 7/7 at opt-level 2), so a standalone build uses the same level. Inside Athenaeum's workspace
+# this section is ignored (cargo warns that a non-root package's profiles are ignored) and the root's profile applies.
+[profile.dev]
+opt-level = 2
+
 [lints.rust]
 unexpected_cfgs = "deny"
 
