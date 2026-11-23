@@ -454,10 +454,10 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **No "manual block" for calibration auto-links.** | `unlink_calibration_for_frames`, Find Calibration | Owner, 2026-10-31: not needed. An unlinked auto link may come back on the next Find Calibration, while a manual choice sticks. |
 | **Perseus 0.5.1 Library behaviour.** | The Perseus Library | Owner, 2026-10-31. Ratified: selection across directories; the in-flight gate that blocks a divert while a sibling batch is Delivered or Waiting; the chip naming the original batch after a re-send. Not ratified: a file deleted by hand is found only on restart (see Owner rulings, To do). |
 
-## Deferred to starloom phase 1 (2026-11-22)
+## Starloom: left after phase 1 (2026-11-23)
 
-Not smokes: work the phase-0 move left on purpose (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`).
-What phase 1 did is deleted from this list; what is left:
+Not smokes: work the starloom extraction left on purpose (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`).
+Phase 1 merged into main on 2026-11-23; what it did is deleted from this list; what is left:
 
 - **The `ATH_*` names in starloom's `light_cal` debug messages** (`calibration_library/light_cal.rs`, about lines 694,
   761 and 768) lose them together with a log-text change that is accepted on purpose (plan note 8).
@@ -466,8 +466,19 @@ What phase 1 did is deleted from this list; what is left:
 - **x86_64 golden rows (P2-6).** The stage goldens have float rows for `aarch64-macos` only; other platforms check
   determinism and the `"*"` row. Rows for x86_64 Linux and Windows wait for public CI (P2-6); record them by hand from
   the printed literal.
-- **rustafits `PlanePrep` zero-timings test hook** at the next rustafits bump, replacing starloom's postcard tail
-  rewrite in `FramePass1::fix_stamp_and_zero_timings` (phase-1 ruling C4).
+- **rustafits `PlanePrep` zero-timings test hook (phase-1 ruling C4).** The pass-1 artifact (`.athm`) stores rustafits'
+  `star_measure::PlanePrep`, whose private `timings` (`PhaseTimings`, ms per phase) and `verdict_time` (`Duration`)
+  differ on every run, so the `pass1_artifact` golden row is deterministic only because starloom's test hook
+  `FramePass1::fix_stamp_and_zero_timings` serialises each prep, rewrites the postcard tail (those two fields are the
+  last stored ones) with zeros and reads it back; it panics if rustafits changes that layout. Owner 2026-11-23: no
+  rustafits release for this alone; with the next rustafits release for another reason:
+  1. rustafits `Cargo.toml`: a `test-support` feature;
+  2. `PlanePrep::zero_timings(&mut self)` under `#[cfg(any(test, feature = "test-support"))]`, `#[doc(hidden)]`,
+     setting both fields to zero;
+  3. here: starloom's `test-support` forwards `rustafits/test-support`, the hook calls `zero_timings()` and the tail
+     rewrite and its unit test go; the golden rows must stay unedited.
+  Not chosen: dropping the timings from the stored prep (a layout change: `PASS1_ARTIFACT_VERSION` bump and every
+  user's pass-1 cache recomputed, for a test-only need).
 
 ---
 
