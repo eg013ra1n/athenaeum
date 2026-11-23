@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in `starloom`, the stacking kernel crate. The crate is standalone-publishable: keep it free of Athenaeum items (no catalog or Settings; it writes and reads no `ATH_*` card of its own, though a few log strings and doc comments still name Athenaeum cards until phase 1).
+Guidance for Claude Code working in `starloom`, the stacking kernel crate. The crate is standalone-publishable: keep it free of Athenaeum items (no catalog or Settings; it writes and reads no `ATH_*` card of its own; the only Athenaeum card names left are in three `light_cal` debug messages).
 
 ## Layers
 
@@ -9,13 +9,14 @@ Base (no feature), `engine` (needs `rustafits`), `stack` (needs `engine` and `so
 ## Rules
 
 - **Naming.** Never name another code base consulted (solver, stacker or processing program) in code, comments, docs or commit messages; the comparison program is "the ERP". Never name the reference implementation of the debayer.
-- **Versions.** Stage versions are public starloom constants (SL-7): a change to a stage's output bits bumps that stage's version in the same PR, and phase 1 adds the golden guard that enforces it. The versions that enter a hash or a file header are `ALIGN_VERSION`, `LN_MODEL_VERSION`, `SNR_GAIN_VERSION`, `DRIZZLE_KERNEL_VERSION`, `PASS1_ARTIFACT_VERSION`, the `.athln` `VERSION` and `LIGHT_CAL_VERSION`; `MEASURE_VERSION` lives in rustafits. Athenaeum's core test `starloom_versions_are_the_accepted_ones` pins them. Spec section 5 of `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md` in the Athenaeum repository is the list.
+- **Versions.** Stage versions are public starloom constants (SL-7): a change to a stage's output bits bumps that stage's version in the same PR, and `tests/stage_goldens.rs` enforces it (a stage whose bytes move while its version stays is red). `MEASURE_STAGE_VERSION` also enters the measurement, registration and normalization hashes when not 1, and a bump raises `PASS1_ARTIFACT_VERSION` with it. The versions that enter a hash or a file header are `ALIGN_VERSION`, `LN_MODEL_VERSION`, `SNR_GAIN_VERSION`, `DRIZZLE_KERNEL_VERSION`, `PASS1_ARTIFACT_VERSION`, the `.athln` `VERSION` and `LIGHT_CAL_VERSION`; `MEASURE_VERSION` lives in rustafits. Athenaeum's core test `starloom_versions_are_the_accepted_ones` pins them. Spec section 5 of `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md` in the Athenaeum repository is the list.
 - **Measurement doctrine.** A numeric change is judged on a whole group at master level. Measured-out ideas are not re-proposed; the list lives in Athenaeum's `docs/stacking/README.md`.
 - **Calibration rulings.**
   - Raw-master-dark, no dark scaling. Proposals ship off by default and pass the corpus.
   - Hot pixels are mapped from the master dark only, never from the light.
   - A MAD of exactly 0 gives no hot-pixel map; over-flagging is refused.
 - **Contracts.**
+  - Every public item has a doc (`#![deny(missing_docs)]`), and a `#[doc(hidden)]` item carries its reason in a comment.
   - SL-8: starloom writes and reads no `ATH_*` card of its own. The header facts Athenaeum owns arrive as parameters.
   - SL-9: starloom never builds a thread pool outside tests; it runs on the caller's rayon pool.
   - SL-12: `Cargo.toml` is standalone: no `[workspace]` table, no `workspace = true` keys, Apache-2.0. `serde_json` enables only `float_roundtrip`; `rusqlite` is never a dependency.

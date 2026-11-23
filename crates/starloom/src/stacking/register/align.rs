@@ -288,7 +288,7 @@ pub struct Alignment {
     pub rotation_deg: f64,
     /// The translation of the linear map `(x, y)`, in pixels.
     pub translation: (f64, f64),
-    /// Whether the map mirrors the image (negative determinant), as after a meridian flip.
+    /// Whether the map mirrors the image (negative determinant); a 180° rotation, as after a meridian flip, is not a mirror.
     pub flipped: bool,
     /// The RANSAC combined quality score: inlier ratio × overlap × regularity / (1 + RMS in pixels).
     pub quality_score: f64,

@@ -416,26 +416,17 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 ## Deferred to starloom phase 1 (2026-11-22)
 
 Not smokes: work the phase-0 move left on purpose (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`).
+What phase 1 did is deleted from this list; what is left:
 
-- **Renames and hidden items.** `write_xisf_f32_with_with_creator` and `write_image_f32_with_with_creator` get their
-  final names; the `#[doc(hidden)] pub` items made public by the move (`FitsInfo`, `probe_fits`, `fits_info_from_reader`,
-  `release_ln_row_buffers`, `check_pass1_head`, `common_psf_snr`, `included_after_min_weight`, `large_scale_passes`,
-  `positions_in_crop`, `low_inlier_frames`, `PREFIX_LEN`, `median_f64`, `clamp_configured_mb`, `per_job_budget`) are
-  either given a designed API or made private; the `ATH_*` names kept verbatim in starloom's `tracing` message strings
-  (`calibration_library/light_cal.rs`, about lines 667, 734 and 741) lose them together with a log-text change that is
-  accepted on purpose.
-- **Shim globs can expose future fact-less starloom entry points** under `athenaeum_core::` paths
-  (`stacking/measure.rs`, `calibration_library/light_cal.rs`, `stacking/ln/reference.rs`, `fits_writer/mod.rs`). Before
-  phase 2's CLI: explicit re-export lists, or a core test pinning the fact-bearing names.
-- **Duplicate copies.** `sync_best_effort` (starloom `fs_util.rs` vs core `zip_store/fs.rs`), the memory-probe helpers and
-  the two effective-memory rules: one copy in starloom, re-exported by core.
-- **Core `solver` without `render` pulls rustafits** (`crates/athenaeum-core/Cargo.toml`, lines 193-196): a `cargo tree` CI
-  line, or accept it in the spec.
-- **The base layer carries stack-only dependencies** (`postcard`; `serde_json` and `chrono` are non-optional).
+- **The `ATH_*` names in starloom's `light_cal` debug messages** (`calibration_library/light_cal.rs`, about lines 694,
+  761 and 768) lose them together with a log-text change that is accepted on purpose (plan note 8).
 - **Comments pointing into the Athenaeum repo** (for example `integration/combine.rs` lines 3 and 2424, `stats.rs` lines
   56-57): clean at the phase-3 squash.
-- **Optional: direct evidence that no user cache is recomputed.** Run a stacking plan with the branch build on the
-  `tierA-starloom-main` catalog copy and confirm zero stale stages, before the rulers are deleted.
+- **x86_64 golden rows (P2-6).** The stage goldens have float rows for `aarch64-macos` only; other platforms check
+  determinism and the `"*"` row. Rows for x86_64 Linux and Windows wait for public CI (P2-6); record them by hand from
+  the printed literal.
+- **rustafits `PlanePrep` zero-timings test hook** at the next rustafits bump, replacing starloom's postcard tail
+  rewrite in `FramePass1::fix_stamp_and_zero_timings` (phase-1 ruling C4).
 
 ---
 
