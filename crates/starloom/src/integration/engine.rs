@@ -780,7 +780,8 @@ thread_local! {
 /// pool holds pure scratch (see the thread_local's own doc — every element
 /// is fully overwritten before `process_row` reads it back), so dropping it
 /// only changes whether the NEXT `init_row_state` call on that thread has to
-/// reallocate, never what it computes.
+/// reallocate, never what it computes. Compiled with `stack` only: its one caller is in `stacking`.
+#[cfg(feature = "stack")]
 pub(crate) fn release_ln_row_buffers() {
     LN_ROW_BUFFERS.with(|cell| {
         let mut pool = cell.borrow_mut();
