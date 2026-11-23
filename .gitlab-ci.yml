@@ -4,6 +4,8 @@ workflow:
     - if: $CI_COMMIT_BRANCH == "main"
     # A wintest/<name> branch: test:windows alone, the Windows tests before main.
     - if: $CI_COMMIT_BRANCH =~ /^wintest\//
+    # A test/<name> branch: the tests before main on our own runners (Linux VM, EVO-X2).
+    - if: $CI_COMMIT_BRANCH =~ /^test\//
     - when: never
 
 stages:
@@ -182,6 +184,7 @@ check:headless-core:
     - linux
   except:
     - /^wintest\//
+    - /^test\//
   before_script:
     - source "$HOME/.cargo/env"
   # No cache — see the comment in build:windows for why this pipeline has none.
@@ -356,6 +359,25 @@ test:windows:
   timeout: 90m
   script:
     - pwsh -NoProfile -ExecutionPolicy Bypass -File .gitlab/ci/scripts/windows_tests.ps1
+
+# --- TEMPORARY (plan 2026-11-23-ci-own-runners, Task 1): the Linux test runner's facts ---
+# Prints what test:linux will rely on; Task 3 replaces it with test:linux.
+probe:linux-test:
+  stage: build
+  tags: [linux-test]
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^test\//
+  before_script:
+    - source "$HOME/.cargo/env"
+  script:
+    - |
+      set +e
+      echo "cpus $(nproc)"; free -g | head -2; df -h "$CI_PROJECT_DIR" | tail -1; echo "ulimit -u $(ulimit -u)"
+      rustup show active-toolchain; node --version; python3 -c "import yaml; print('pyyaml', yaml.__version__)"
+      for p in libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev build-essential curl wget file; do
+        printf '%s: ' "$p"; dpkg -s "$p" 2>/dev/null | sed -n 's/^Status: //p' | grep . || echo MISSING
+      done
+      du -sh "$CI_PROJECT_DIR/target" 2>/dev/null || echo "target: none yet"
 
 # --- Perseus (headless sync agent) — desktop installers (tags only) ---
 # Perseus ships as its own set of installers alongside Athenaeum. What each job
