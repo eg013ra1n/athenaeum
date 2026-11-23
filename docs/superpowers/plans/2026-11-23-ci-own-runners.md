@@ -13,7 +13,7 @@
 
 **Why** (owner, 2026-11-23): GitHub's free runners take about 32 min for Linux, and Windows runs into its 60-min limit. Of the last 30 runs, 13 were green, 8 red (mostly network flakes) and 8 cancelled (mostly Windows). EVO-X2 ran the same Windows suite in 14 min cold and 5 min warm. The owner will grow the astrodb Linux VM for the Linux suite.
 
-Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 minor). All are folded in below; the two release-critical ones are `check:headless-core` in `deploy`'s needs (Task 4) and `limit = 1` per runner (owner task 2).
+Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 minor). All are folded in below. The two release-critical ones are `check:headless-core` in `deploy`'s needs (Task 4) and the one-job limit on the Linux runner, now held by CI-R4's single runner.
 
 ## Rulings (plan author, 2026-11-23; the owner can overturn any)
 
@@ -22,7 +22,7 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 | CI-R1 | `ci.yml` triggers on `pull_request` only (`paths-ignore` kept). It no longer runs on a `push` to `main` or on a tag. Its two jobs stay, so PRs and the GitLab readers share one command list. The `rust` paths filter gains `'starloom'`, `'rustafits'`, `'solvemyastro'` and `.gitmodules`, so a gitlink-only Dependabot PR runs the Rust jobs. | 2 |
 | CI-R2 | A `test/<name>` branch pipeline is `test:linux` plus `test:windows`, in parallel on our runners, and nothing else (`check:headless-core` gains `except: /^test\//`; `test:linux` runs the same check). `wintest/<name>` stays a Windows-only alias. | 3 |
 | CI-R3 | On a `v*` tag, the pipeline also runs `test:linux` and `test:windows`. `deploy` `needs` both, plus `check:headless-core` (today it gates only through `gate:tests`). `gate:tests`, `github_checks_gate.sh`, its `run_tests.sh` section and fixtures are deleted. The release green-check rule: the tagged commit's `test/<name>` pipeline was green before tagging, and the tag pipeline's own tests gate the deploy. A red test job on a tag is retried, never bypassed: no `allow_failure`, no `optional: true`. The `GATE_REQUIRED_CHECKS` override that v0.7.1 used disappears. Whether a deliberate bypass variable should exist is the owner's call; default: none. | 4, 5 |
-| CI-R4 | `test:linux` runs on a second runner registration on the same VM, tag `linux-test`, so tests never queue behind the release builds. Both registrations carry `limit = 1`. The global `concurrent = 2` would otherwise let the `linux` runner take two release compiles at once (v0.7.1's `build:linux` already OOM'd). Each registration has its own builds dir, separated by its token, with its own warm `target/` (`GIT_CLEAN_FLAGS`). | owner, 3 |
+| CI-R4 | **Owner, 2026-11-23: one runner, two tags.** The VM has 8 vCPU and 12 GB, too little for a test run beside a release compile (v0.7.1's `build:linux` already OOM'd on 3.9 GB). The existing runner (GitLab runner 2, `ubuntu24-linux`) gets the tag `linux-test` beside `linux` and keeps running one job at a time. `test:linux` keeps its own tag, so a later second runner needs no YAML change. A `test/*` pipeline runs the Linux tests alone; on a tag they queue with the release builds, and the release gets longer by their time. | owner, 3 |
 | CI-R5 | The Linux reader runs every `run:` of `ci.yml`'s `build-and-test` job in file order. It skips an explicit list, the apt install and the toolchain-resolve steps (the VM has both). It exits 2 on any multi-line `run:` that is neither a script call nor on that list, so a step added later can never be skipped silently. It sets the job's and the file's `env:` first. | 3 |
 | CI-R6 | Actions move to `actions/checkout@v5` and `actions/setup-node@v5` (the Node 20 deprecation notice). `ci.yml`'s comments about push and tag runs and the GitLab gate are rewritten to the new facts. | 2 |
 | CI-R7 | Starloom's own GitHub CI stays as it is: about 11 min, free for a public repo, the check outside contributors see. | — |
@@ -30,17 +30,8 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 
 ## Owner tasks (before Task 1)
 
-1. **Grow the VM** (astrolinux-runner1 on astrodb). Recommended size, assuming tests and one release build run at the same time (depends on astrodb's host capacity):
-   - **CPU:** 12 vCPU. EVO-X2 has 16 cores and takes 14 min cold; GitHub has 4 vCPU and takes about 32 min.
-   - **RAM:** 32 GB.
-   - **Disk:** 300 GB. Today 62 GB, filled three times by the release `target/`, buildx and rustup; a debug test `target/` is 40-50 GB more, plus a second checkout with submodules.
-   - Then, as a user with sudo (the `gitlab-runner` user has none): `sudo growpart /dev/vda 2 && sudo resize2fs /dev/vda2`.
-2. **A second runner** for project `root/athenaeum`.
-   - **If you see** "New project runner" in GitLab (Settings → CI/CD → Runners): create it there with tag `linux-test`, "Run untagged jobs" off and "Protected" **off** (it serves unprotected `test/*` branches and protected tags, as EVO-X2's does). Then on the VM: `sudo gitlab-runner register --url http://192.168.31.208:9080 --token glrt-…`, executor `shell`.
-   - **If you only see** a registration token (legacy flow): `sudo gitlab-runner register` with `--tag-list linux-test --run-untagged=false --access-level not_protected`, executor `shell`.
-   - **`/etc/gitlab-runner/config.toml`:** the top-level line `concurrent = 2` (there is no `[global]` table), and in BOTH `[[runners]]` blocks `limit = 1`. In the new block also `output_limit = 65536` (EVO-X2 needed it to keep the `test result:` lines). Then `sudo gitlab-runner restart`.
-
-If any of this is not possible (no sudo, a smaller VM), say so. CI-R4 then falls back to the one `linux` runner, and a tag pipeline gets longer by the Linux test time.
+1. **Done 2026-11-23.** The VM (astrolinux-runner1, 192.168.31.173, SSH `astrolinux`) has 8 vCPU, 12 GB RAM and 300 GB disk. `/` is grown to 294 GB with 232 GB free. Checked: `ulimit -u` is 41466 and PyYAML is installed.
+2. **Tag `linux-test` on runner 2** (`ubuntu24-linux`): in GitLab, Admin → CI/CD → Runners → edit → Tags `linux, linux-test`. Or the controller does it through the API on the owner's yes: `PUT /api/v4/runners/2` with `tag_list=linux,linux-test`. Nothing else changes on the VM: `concurrent` stays 1.
 
 ## Global Constraints
 
@@ -54,7 +45,7 @@ If any of this is not possible (no sudo, a smaller VM), say so. CI-R4 then falls
 1. **A tag still deploys only after its tests and the headless check** (Task 4 step 3's lint).
 2. **The Linux run reads the same commands as GitHub's job** (CI-R5; Task 3 step 4 compares the log with `ci.yml`).
 3. **Ceilings on the VM:** `ulimit -u` ≥ 4 096 (the core suite peaks at about 1 650 threads), PyYAML present (Task 1 probe).
-4. **Runner contention:** `test:linux` and a release build run side by side, and the `linux` runner never runs two jobs (Task 3 step 5).
+4. **Runner contention:** the one Linux runner never runs two jobs, so a test run and a release compile never share the 12 GB (Task 3 step 5).
 5. **Dependabot and outside PRs** still get the GitHub checks, gitlink-only ones included (CI-R1, Task 2 step 3).
 
 ## File structure
@@ -81,7 +72,7 @@ If any of this is not possible (no sudo, a smaller VM), say so. CI-R4 then falls
   - `dpkg -s` for every package of `ci.yml`'s apt step.
 
   Add `/^test\//` to `check:headless-core`'s `except`.
-- [ ] **Step 3:** Push the commit to GitLab as `test/probe` (`git push origin <sha>:refs/heads/test/probe`). Expected: the pipeline is `probe:linux-test` alone, on the new runner, printing at least 12 CPUs, 32 GB, 250 GB free, `ulimit -u` ≥ 4 096, PyYAML importable and every package installed. A shortfall goes back to the owner before Task 3. Delete `test/probe` on GitLab.
+- [ ] **Step 3:** Push the commit to GitLab as `test/probe` (`git push origin <sha>:refs/heads/test/probe`). Expected: the pipeline is `probe:linux-test` alone, on runner 2 through its new tag, printing 8 CPUs, about 12 GB, about 230 GB free, `ulimit -u` ≥ 4 096, PyYAML importable and every package installed. A shortfall goes back to the owner before Task 3. Delete `test/probe` on GitLab.
 
 ### Task 2: GitHub runs on pull requests only
 
@@ -106,7 +97,7 @@ If any of this is not possible (no sudo, a smaller VM), say so. CI-R4 then falls
   `test:windows` rules gain `test/*` and tags beside `wintest/*`.
 - [ ] **Step 3: Lint.** `wintest/starloom-p3`: `test:windows` only. `main`: unchanged from the control. `v0.7.1`: the control's jobs plus `test:linux` and `test:windows`.
 - [ ] **Step 4: First run.** Push the branch head as `test/ci-own-runners`. The pipeline has exactly `test:linux` and `test:windows`, both green. Every non-skipped `run:` of the `build-and-test` job appears in the Linux log after `+ `. Record cold durations in the ledger, re-run both jobs and record warm.
-- [ ] **Step 5: Contention.** While `test:linux` re-runs, a one-line job on tag `linux`, pushed on a second `test/*` branch, starts at once. A second job on `linux` waits (`limit = 1`). Delete that branch.
+- [ ] **Step 5: Contention.** While `test:linux` re-runs, a one-line job on tag `linux`, pushed on a second `test/*` branch, waits until it ends: one job at a time. Delete that branch.
 
 ### Task 4: The release gate is native
 
@@ -128,9 +119,9 @@ If any of this is not possible (no sudo, a smaller VM), say so. CI-R4 then falls
   - The `.gitlab-ci.yml` comments of the file table.
   - The `windows_tests.ps1` header.
   - `claude-config/machines/EVO-X2.md`.
-  - Memory `reference_ci.md` (our runners gate; GitHub runs PRs), `reference_linux_ci_runner.md` (the new size, runner `linux-test`, `limit = 1`) and `reference_lab_runners.md`, with the `MEMORY.md` lines.
+  - Memory `reference_ci.md` (our runners gate; GitHub runs PRs), `reference_linux_ci_runner.md` (tag `linux-test` on runner 2) and `reference_lab_runners.md`, with the `MEMORY.md` lines.
 - [ ] **Step 3: Open items.**
   - The runners set `CI=true`, so the `CI`-gated ceilings are logged, not asserted, as on GitHub.
   - A flake that shows only on a runner goes under "Known flaky test" with the runner's name.
-  - At the first release, record the Windows lane time (`test:windows` shares EVO-X2 with the release builds, `concurrent 1`) and the size of `C:\gr\…\target`.
+  - At the first release, record both lanes' times: `test:linux` queues with the Linux release builds on the one runner, `test:windows` with the Windows ones on EVO-X2 (`concurrent 1`). Also record the sizes of both runners' `target/` dirs.
 - [ ] **Step 4:** Merge `ci-own-runners` into `main` (`--no-ff`); push on the owner's word. The first release after this is the first real check of Task 4: watch its tag pipeline to the end.
