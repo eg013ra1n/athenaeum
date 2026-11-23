@@ -14,9 +14,15 @@ that can be released and to read its verdicts.
 - You are in the main checkout on `main`, clean, and `main` == `origin/main` on
   both remotes (`git fetch all && git status -sb`). A worktree session cannot
   release — see memory `reference_worktree_session_release`.
-- The GitHub run of the commit you will tag must be green. The pipeline's
-  `gate:tests` job enforces it; you check first so a red gate never surprises
-  anyone: `gh run list --commit $(git rev-parse HEAD) --json name,conclusion`.
+- The commit you will tag has a green `test/<version>` pipeline on GitLab:
+  `test:linux` on the Linux VM and `test:windows` on EVO-X2, the tests of
+  `.github/workflows/ci.yml` on our own runners (GitHub runs nothing by
+  itself since 2026-11-23). Both test runners are online: GitLab runner
+  `ubuntu24-linux` (tags `linux`, `linux-test`) and EVO-X2 (`windows-test`,
+  `windows-release`). The tag pipeline runs both tests again and `deploy`
+  needs them, with `check:headless-core`. A push to `main` alone is tested by
+  nothing: a change pushed without a `test/*` branch is untested until the
+  next `test/*` run or tag.
 - Keep the dev Mac idle while `build:macos` and `build:perseus:macos` run — the
   macOS runner is this machine and a saturated box times the job out.
 - `root/artfrom-space` `main` must carry the three `download.md` markers
@@ -24,18 +30,16 @@ that can be released and to read its verdicts.
   `<!-- version-history:rows -->`) — `docs:publish` fails naming the missing
   one otherwise.
 - The tag pattern `v*` must be a **Protected tag** in the GitLab project
-  (Settings → Repository → Protected tags, Maintainers). The signing and
-  GitHub variables are Protected, and a Protected variable reaches only a
+  (Settings → Repository → Protected tags, Maintainers). The signing
+  variables are Protected, and a Protected variable reaches only a
   protected ref's pipeline: without the rule every build job dies on
   "is the tag a Protected tag?" (v0.6.4's first attempt). A protected tag
   cannot be deleted by `git push :refs/tags/…` — use the API
   (`DELETE /projects/root%2Fathenaeum/repository/tags/<tag>` with the PAT).
 - Four CI/CD variables the pipeline needs: `DOCS_REPO_TOKEN` (required:
   artfrom-space project access token, Maintainer, write_repository),
-  `GITHUB_API_TOKEN` (recommended — effectively required if a gate ever has
-  to wait or a tag is redone within the hour: the unauthenticated GitHub API
-  limit is 60 calls/hour and the gate polls once a minute for up to 50
-  minutes), `SSH_KNOWN_HOSTS`
+  `GITHUB_API_TOKEN` (unused since 2026-11-23, when the gate that polled
+  GitHub went; the owner removes it when convenient), `SSH_KNOWN_HOSTS`
   (optional, MUST be the `[host]:40022` form that `ssh-keyscan -p 40022 <host>`
   prints, else `StrictHostKeyChecking=yes` refuses the upload), `RELEASE_ALLOW_AMD64_ONLY`
   (only while the arm64 Docker runner is down; unset afterwards).
@@ -51,16 +55,16 @@ that can be released and to read its verdicts.
    files, refreshes `Cargo.lock`, asserts they agree.
 3. **The release commit contains ONLY** `RELEASE_NOTES.md`, the seven version files
    and `Cargo.lock`. A code fix goes in its own commit BEFORE this one and gets
-   its own green GitHub run first. `git status --short` must list exactly those
+   its own green `test/*` pipeline first. `git status --short` must list exactly those
    nine paths. Commit: `chore(release): vX.Y.Z — <tagline without the product name>`.
-4. **Push main, wait for green, tag.**
-   `git push all main` → wait for the GitHub run of that commit
-   (`gh run watch` or poll `gh run list --commit <sha>`) → `git tag vX.Y.Z && git push all vX.Y.Z`.
-   Pushing the tag before the run is green is allowed (the gate waits) but
-   pointless; a red run means fix-then-retag, never force. The tag push
-   starts a second GitHub run for the same commit; the gate reads whichever
-   is the latest, so wait for the main-branch run to be green before tagging
-   rather than relying on the tag's own run.
+4. **Test the commit, push main, tag.**
+   `git push origin <sha>:refs/heads/test/vX.Y.Z` → wait for that pipeline
+   (API `…/pipelines?ref=test/vX.Y.Z`; both jobs green; warm about 10 min
+   Linux, 5 min Windows) → `git push all main` → `git tag vX.Y.Z && git push all vX.Y.Z`.
+   A red test means fix-then-retag, never force. The tag pipeline runs the
+   two tests again on the same commit; on the one Linux runner `test:linux`
+   queues with the Linux release builds. Delete the `test/vX.Y.Z` branch
+   after the release.
 5. **Read the pipeline** (`http://192.168.31.208:9080/root/athenaeum/-/pipelines`, or
    the API with the PAT in `~/.config/athenaeum-ci/gitlab-pat`):
    - `gate` — `check:versions` (the only job in stage `gate`) red: a version file disagrees with the tag → fix,
@@ -73,8 +77,12 @@ that can be released and to read its verdicts.
      `#[cfg]` (every `--workspace` command builds with `default = ["render", "solver"]`, so it
      compiles locally and fails only here and in Perseus jobs; this is exactly what happened to
      v0.5.5) → fix the code on `main`, get green, delete the tag on both remotes, retag; never
-     retry the job. `gate:tests` (stage `build`, polls GitHub up to 50 min) red: GitHub is red →
-     same fix-and-retag.
+     retry the job. `test:linux` / `test:windows` red: read the failing test in the job log (both
+     runners keep 64 MB of log, `output_limit`). A known flake (open-items "Known flaky test") →
+     retry that one job, which re-creates the downstream jobs it held. A real failure → fix on
+     `main`, a green `test/*` run, delete the tag on both remotes, retag. Never `allow_failure`
+     or `optional: true` on the test jobs; there is no bypass variable (`GATE_REQUIRED_CHECKS`
+     went with the GitHub gate).
    - `deploy` red with NO error in the script section, only a
      `…athenaeum.tmp/DEPLOY_SSH_KEY: Permission denied` line in a later
      runner stage: `DEPLOY_SSH_KEY` is a file-type variable the runner

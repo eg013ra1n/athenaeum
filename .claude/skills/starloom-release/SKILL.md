@@ -48,8 +48,10 @@ release. Spec: `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`
    needs a rustafits the submodule no longer satisfies).
 4. Athenaeum's CI never checks starloom's solvemyastro `rev` (the patch hides it); starloom's own CI does. A starloom
    that needs a newer solvemyastro moves both pins: the solvemyastro submodule here and the `rev` there.
-5. Before the owner merges (SL-14): the tripwire `cargo test -p athenaeum-core --test starloom_versions` and the lab
-   checkpoint on real data (the measurement doctrine: a numeric change is judged on a whole group at master level).
+5. Before the owner merges (SL-14): the tripwire `cargo test -p athenaeum-core --test starloom_versions`, a green
+   `test/<name>` pipeline on GitLab (Athenaeum's tests run on our runners; GitHub runs nothing for Athenaeum by itself,
+   so a Dependabot bump PR carries no check), and the lab checkpoint on real data (the measurement doctrine: a numeric
+   change is judged on a whole group at master level). Starloom's own CI on GitHub is unchanged.
 6. Merge a bump PR locally and push to `all` (GitLab and GitHub keep the same SHAs; GitHub closes the PR as merged).
    Commit message: `chore: bump starloom submodule to vX.Y.Z`.
 7. `rust-toolchain.toml` exists in both repositories with the same channel; change them together.
