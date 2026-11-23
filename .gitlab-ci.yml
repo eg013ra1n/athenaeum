@@ -10,7 +10,7 @@ workflow:
 
 stages:
   - gate      # check:versions — refuse a tag that cannot be a release
-  - build     # the seven installers + check:headless-core + gate:tests
+  - build     # the seven installers + check:headless-core + test:linux + test:windows
   - deploy    # rename + upload to artfrom.space/builds/<tag>/
   - publish   # Docker Hub (3 jobs) + the docs site
   - verify    # fetch everything back; Gatekeeper on the real DMGs; BLOCKING
@@ -45,9 +45,9 @@ variables:
 # --- Gate (tags only) ---
 # One refusal before a single build minute is spent: the seven version files
 # must equal the tag (bump.sh's job to make them so). The other half of the
-# gate, gate:tests — the tagged commit's GitHub check-suite, the only place
-# tests actually run — lives down in the `build` stage, not here (see its
-# own comment below for why); the `gate` stage itself holds only this job.
+# gate is the tests: test:linux and test:windows run in the `build` stage of
+# the tag pipeline on our own runners, and deploy needs both, with
+# check:headless-core (see deploy). The `gate` stage itself holds only this job.
 check:versions:
   stage: gate
   tags: [linux]
@@ -554,33 +554,6 @@ build:perseus:linux-arm64:
       - target/debian/*.tar.gz
     expire_in: 30 days
 
-# --- Test gate (tags only) ---
-# Answers "did the tagged commit's tests pass?" by polling the tagged
-# commit's GitHub check-suite — the only place tests actually run (GitHub
-# Actions, .github/workflows/ci.yml). It sits in the `build` stage, not
-# `gate`, on purpose: the linux runner runs one job at a time, so a
-# gate-stage job here — which can poll for up to 50 minutes — would hold
-# the runner and delay every linux build behind it. Anchored on `needs:`
-# instead of the stage boundary, it only starts once build:linux,
-# build:perseus:linux and check:headless-core have cleared the linux
-# runner (~30 min into a normal release, well inside the macOS build's own
-# critical path), so its poll costs no wall clock — deploy (stage `deploy`)
-# still `needs` it before uploading anything.
-gate:tests:
-  stage: build
-  tags: [linux]
-  only: [tags]
-  needs:
-    - job: build:linux
-      artifacts: false
-    - job: build:perseus:linux
-      artifacts: false
-    - job: check:headless-core
-      artifacts: false
-  timeout: 55m
-  script:
-    - .gitlab/ci/scripts/github_checks_gate.sh
-
 # --- Shared SSH deploy setup (hidden template job) ---
 # Single source of truth for the pinned-host-key ssh-agent dance shared by
 # deploy, publish_version and publish:channel-link. before_script starts the
@@ -644,7 +617,13 @@ deploy:
       artifacts: true
     - job: build:perseus:linux-arm64
       artifacts: true
-    - job: gate:tests
+    # The tests and the headless check gate the release: nothing is uploaded until they are green. A red one is
+    # retried, never bypassed (no allow_failure, no optional: true).
+    - job: test:linux
+      artifacts: false
+    - job: test:windows
+      artifacts: false
+    - job: check:headless-core
       artifacts: false
   script:
     - . .gitlab/ci/scripts/artifact_names.sh
