@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in `starloom`, the stacking kernel crate. The crate is standalone-publishable: keep it free of Athenaeum items (no catalog or Settings; it writes and reads no `ATH_*` card of its own; the only Athenaeum card names left are in three `light_cal` debug messages).
+Guidance for Claude Code working in `starloom`, the stacking kernel crate. The crate is standalone-publishable: keep it free of Athenaeum items (no catalog or Settings; it writes and reads no `ATH_*` card of its own; the only Athenaeum card names left, outside test fixtures, are in three `light_cal` debug messages).
 
 ## Layers
 
@@ -21,6 +21,7 @@ Base (no feature), `engine` (needs `rustafits`), `stack` (needs `engine` and `so
   - SL-9: starloom never builds a thread pool outside tests; it runs on the caller's rayon pool.
   - SL-12: `Cargo.toml` is standalone: no `[workspace]` table, no `workspace = true` keys, Apache-2.0. `serde_json` enables only `float_roundtrip`; `rusqlite` is never a dependency.
   - SL-17: test hooks that tests in other crates read exist only under `test-support` (or `cfg(test)`).
+- **Releases** come from `main` only; `CHANGELOG.md` covers every commit since the last tag, the tag `vX.Y.Z` equals the `Cargo.toml` version, and `Cargo.lock` is committed (the goldens are valid for the rustafits it locks).
 - **Environment variables** are `STARLOOM_SCALAR_SELECTION` and `STARLOOM_REQUIRE_VECTOR_KERNEL`. The default XISF creator is `starloom <version>`.
 - **Logging.** `tracing` only; no `println!` or `eprintln!` in production code.
 - **Tests.** Every test passes on macOS, Linux and Windows; test names use letters, digits, `_` and `-` only.

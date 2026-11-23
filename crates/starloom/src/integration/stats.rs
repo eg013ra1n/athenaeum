@@ -63,7 +63,7 @@ pub enum OutputNormalization {
 /// inputs' peak). `Local` normalizes by the star flux pair instead, and costs
 /// the Normalize stage even when local *output* normalization is off. The
 /// stored documents that still carry the old default are rewritten once by
-/// `db::schema::migrate_rejection_normalization_local`; the Fast preview pins
+/// Athenaeum's `db::schema::migrate_rejection_normalization_local`; the Fast preview pins
 /// `ScaleZeroOffset` (no Normalize stage, a preview's promise is speed).
 /// Diagnosis: <https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/research/2026-11-01-project-master-star-cores.md>;
 /// the plan: <https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/plans/2026-11-01-rejection-normalization-star-cores.md>.
