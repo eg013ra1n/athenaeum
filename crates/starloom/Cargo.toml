@@ -6,13 +6,15 @@ edition = "2021"
 license = "Apache-2.0"
 
 # Standalone manifest (SL-12): no [workspace] table and no `workspace = true` keys, so the crate
-# publishes on its own. Versions and features below are copied from athenaeum-core's manifest.
+# publishes on its own. Versions and features below are copied from athenaeum-core's manifest. Dependencies
+# resolve by version (SL-18): rustafits from crates.io, solvemyastro by git revision; Athenaeum's workspace
+# [patch]es both back to its submodules, so it builds one copy of each.
 
 [dependencies]
 # `engine`: the image pipeline. `serde`: the `star_measure` / `stats` types a stacking config stores.
-rustafits = { path = "../../rustafits", default-features = false, features = ["serde"], optional = true }
+rustafits = { version = "1.9.1", default-features = false, features = ["serde"], optional = true }
 # `stack`: the registration quad matcher.
-solvemyastro = { path = "../../solvemyastro", optional = true }
+solvemyastro = { git = "https://github.com/eg013ra1n/solvemyastro.git", rev = "586937fa972e6bfa53c316e49758ed70aa888388", optional = true }
 # no-serde-warnings: ts-rs cannot parse type-irrelevant serde attrs and warns on every build.
 ts-rs = { version = "12", features = ["chrono-impl", "no-serde-warnings"], optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -51,7 +53,7 @@ unexpected_cfgs = "deny"
 # The integration tests read the SL-17 test hooks. A path dev-dependency on the crate itself is allowed (publishing
 # strips it).
 starloom = { path = ".", default-features = false, features = ["test-support"] }
-rustafits = { path = "../../rustafits", default-features = false, features = ["serde", "test-support"] }
+rustafits = { version = "1.9.1", default-features = false, features = ["serde", "test-support"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 walkdir = "2"

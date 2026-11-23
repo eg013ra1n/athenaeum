@@ -17,6 +17,9 @@ members = [
 # submodule's. A patch that no longer satisfies a requirement is silent: CI's lock guard catches it.
 [patch.crates-io]
 rustafits = { path = "rustafits" }
+
+[patch."https://github.com/eg013ra1n/solvemyastro.git"]
+solvemyastro = { path = "solvemyastro" }
 [profile.dev.package."*"]
 opt-level = 2
 
