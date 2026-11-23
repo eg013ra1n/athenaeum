@@ -29,7 +29,7 @@ pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// must not advertise a minimum the backend refuses to honour.
 ///
 /// KEEP IN SYNC with the `budgetNote` clamp window duplicated in
-/// `src/pages/Settings.tsx` (the Calibration tab's "Integration memory
+/// Athenaeum's `src/pages/Settings.tsx` (the Calibration tab's "Integration memory
 /// budget" control) — these constants are private and ts-rs has no way to
 /// hand a plain `usize` across the boundary, so the frontend re-derives its
 /// own copy to explain a clamp without a round trip. A change here with no

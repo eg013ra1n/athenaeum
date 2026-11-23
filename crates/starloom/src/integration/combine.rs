@@ -1356,9 +1356,8 @@ fn medfit_line_with(values: &[f64], warm_start_b: Option<f64>, kernel: Kernel) -
         // (`diag_medfit_new_vs_oracle_cost` in this module's history, run
         // at `n` = 20 and 208 with 50 000 iterations each): I1 alone 1.42–
         // 1.55× the pre-Task-9 cost, I2 alone 1.05–1.09× (both SLOWER, not
-        // faster), combined 1.57–1.72×; the `integrate_probe` end-to-end
-        // measurement in the Task 9 report shows the same direction on the
-        // real 60-frame set. Kept here as the reasoning a future attempt at
+        // faster), combined 1.57–1.72×; an `integrate_probe` end-to-end
+        // measurement showed the same direction on the real 60-frame set. Kept here as the reasoning a future attempt at
         // this item should read before re-trying the same shape.
         //
         // Task 13c 4d: the previous evaluation's slope and the two order

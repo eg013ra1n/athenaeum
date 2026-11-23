@@ -394,8 +394,7 @@ mod tests {
     /// borrow + fused max/ADU-scale pass. The expected values were captured
     /// from this SAME field/seed run through the pre-refactor implementation
     /// (Athenaeum commit `df219c49`, `crates/athenaeum-core/src/stacking/register/
-    /// detect.rs`, before this task's own commit) — see the Task 3 report
-    /// for the exact command. A change to detection, the ADU scale, or the
+    /// detect.rs`, before this task's own commit). A change to detection, the ADU scale, or the
     /// max-fold semantics would move these numbers.
     #[test]
     fn detect_stars_on_one_plane_matches_the_pre_refactor_fixture() {

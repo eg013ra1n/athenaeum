@@ -83,7 +83,7 @@ pub fn erfinv(x: f64) -> f64 {
 
 // ── Regularized incomplete beta ────────────────────────────────────────────
 
-/// `ln Γ(x)` for `x > 0` (Lanczos, Numerical Recipes 6.1 `gammln`; relative
+/// `ln Γ(x)` for `x > 0` (the Lanczos approximation; relative
 /// error ≈ 1e-10). Only ever called with the half-integer shape parameters
 /// the t distribution needs.
 fn ln_gamma(x: f64) -> f64 {
@@ -106,8 +106,7 @@ fn ln_gamma(x: f64) -> f64 {
     -tmp + (2.506_628_274_631_000_5 * ser / x).ln()
 }
 
-/// Lentz's modified continued fraction for the incomplete beta (Numerical
-/// Recipes 6.4 `betacf`). Converges fast for `x < (a+1)/(a+b+2)`; the caller
+/// Lentz's modified continued fraction for the incomplete beta. Converges fast for `x < (a+1)/(a+b+2)`; the caller
 /// applies the symmetry swap outside that range.
 fn beta_continued_fraction(a: f64, b: f64, x: f64) -> f64 {
     const MAX_ITERS: usize = 300;
@@ -159,7 +158,7 @@ fn beta_continued_fraction(a: f64, b: f64, x: f64) -> f64 {
     h
 }
 
-/// Regularized incomplete beta `I_x(a, b)` (Numerical Recipes 6.4 `betai`):
+/// Regularized incomplete beta `I_x(a, b)` (the continued-fraction evaluation):
 /// the continued fraction above, with the `I_x(a, b) = 1 − I_{1−x}(b, a)`
 /// symmetry swap outside the fraction's fast-converging range. `a`, `b` must
 /// be positive; `x` outside `[0, 1]` clamps to the corresponding limit.

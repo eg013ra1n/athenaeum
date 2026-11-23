@@ -12,6 +12,14 @@ Starloom is the astrophotography stacking kernel behind Athenaeum: geometry and 
 
 `default = ["stack", "ts"]`. The crate is standalone: its manifest has no `[workspace]` table. Licence: Apache-2.0.
 
+## Repository
+
+- **CI** (`.github/workflows/ci.yml`): Linux runs `cargo test --locked` for every layer (none, `engine`, `stack`, `ts` and the default `stack` + `ts`); macOS and Windows run the default set. `Cargo.lock` is committed, and the stage goldens are valid for the rustafits it locks.
+- **Releases** come from `main` only: `CHANGELOG.md` gets a section covering every commit since the last tag, `Cargo.toml` the version, and the tag `vX.Y.Z` must equal it. The release workflow checks that and takes the notes from the changelog.
+- **crates.io:** `cargo publish` fails until solvemyastro is published there, because crates.io refuses a git dependency; the CI job that tries it is allowed to fail.
+- **Athenaeum** builds starloom in its own workspace and patches rustafits and solvemyastro back to its own submodules, so it builds one copy of each.
+- **Citations.** Comments cite "spec §N", "math reference §N", ruling IDs (`R-…`), plans and tasks, and modules such as `stacking::run`: those are Athenaeum's design documents, its core and its history, where this crate was written. The two most cited: [the extraction spec](https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/specs/2026-11-22-starloom-extraction-design.md) and [the stacking math reference](https://github.com/eg013ra1n/athenaeum/blob/ff25561c/docs/superpowers/research/2026-09-08-stacking-math-reference.md).
+
 ## Versions
 
 A stage version is a public constant. A change to a stage's output bits bumps that stage's version in the same change. The values below are the ones the dependent application's tripwire test asserts; the ones marked "hash" enter a stage hash or a file header, so a bump invalidates the matching cached results.
@@ -40,7 +48,7 @@ A change that moves a stage's bytes bumps the stage's version in the same change
 - **The platform key** is `<arch>-<os>`, because `exp` and `powf` round one ulp differently from one system math library to the next. Float rows exist for `aarch64-macos` only; the macOS version and the rustafits revision they were recorded with are in the comment above them. A platform with no rows checks determinism only (two runs agree) and prints the rows it would record. The one float-free stage, the `.athln` format, has the platform `"*"` and holds everywhere. A red float row when neither starloom nor rustafits changed points at the system math library first.
 - **The build profile.** The float rows hold for the dev profile at opt-level 2, Athenaeum's (its root `Cargo.toml`) and this crate's own standalone (`[profile.dev]` here). At opt-level 0 one measured FWHM rounds one ulp apart and the measure and pass-1 rows go red; never re-record rows from an opt-level 0 build.
 - **How a row is recorded.** Nothing writes the table. Run `cargo test -p starloom --test stage_goldens -- --nocapture`, copy the literal the failure message prints into the table by hand, and do it in the same change as the version bump. A change that moves no number records its row with the reason in its commit message.
-- **The rustafits note.** A row is valid for the rustafits revision the workspace locks: the measure, pass-1, register, normalization and integrate stages run rustafits' star fit. A red row right after a rustafits bump means rustafits moved numbers; if its `MEASURE_VERSION` rose, record new rows, and if not, stop the bump.
+- **The rustafits note.** A row is valid for the rustafits revision `Cargo.lock` locks (Athenaeum's workspace lock inside Athenaeum): the measure, pass-1, register, normalization and integrate stages run rustafits' star fit. A red row right after a rustafits bump means rustafits moved numbers; if its `MEASURE_VERSION` rose, record new rows, and if not, stop the bump.
 - **The pass-1 hook.** To make a stored first pass byte-identical between runs, the test-only `FramePass1::fix_stamp_and_zero_timings` zeroes every wall-clock field it stores; the two inside each rustafits `PlanePrep` go through rustafits' own test hook `PlanePrep::zero_timings` (rustafits 1.9.1, feature `test-support`, which starloom's `test-support` forwards). Fields the artifact does not store stay as measured.
 
 ## Writers

@@ -11,7 +11,7 @@
 //!
 //! # What a row is valid for
 //!
-//! A row is valid for the rustafits revision the workspace locks (SL-18): the measure, pass-1, register, normalization
+//! A row is valid for the rustafits revision `Cargo.lock` locks (Athenaeum's workspace lock inside Athenaeum; SL-18): the measure, pass-1, register, normalization
 //! and integrate stages run rustafits' star fit. A red row right after a rustafits bump means rustafits moved numbers:
 //! with its `MEASURE_VERSION` raised the rows ask for a new record; without it, stop the bump (the rustafits rule).
 //!
@@ -89,7 +89,7 @@ struct Computed {
 
 /// The recorded rows, upstream first. A row is recorded by hand (see the module doc).
 const GOLDENS: &[Golden] = &[
-    // aarch64-macos, macOS 27.2.1 (sw_vers -productVersion), rustafits 1.9.1 (0edd7d1, the revision the workspace locks); the rows were recorded at 1.9.0 (a8e6b79) and hold unchanged.
+    // aarch64-macos, macOS 27.2.1 (sw_vers -productVersion), rustafits 1.9.1 (0edd7d1, the revision `Cargo.lock` locks); the rows were recorded at 1.9.0 (a8e6b79) and hold unchanged.
     Golden { stage: "measure", platform: "aarch64-macos", versions: &[("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0x15dfd60956642ce3 },
     Golden { stage: "pass1_artifact", platform: "aarch64-macos", versions: &[("MEASURE_STAGE_VERSION", 1), ("PASS1_ARTIFACT_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0x312dae5cab562ff8 },
     Golden { stage: "register", platform: "aarch64-macos", versions: &[("ALIGN_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xb6d64ba321698e0a },
