@@ -28,7 +28,8 @@ COPY rustafits/ rustafits/
 
 # Copy solvemyastro submodule in full for the same reason — it's a workspace
 # member AND a path dep of athenaeum-core (plate solving), with its own [[bin]]
-# target, and it path-deps ../rustafits (layout above matches).
+# target. It names rustafits by version; the root Cargo.toml's [patch] points
+# that at rustafits/ (copied above).
 COPY solvemyastro/ solvemyastro/
 
 # Create dummy lib/main to cache dependency compilation
