@@ -142,6 +142,9 @@ impl LnScaleSeeds<'_> {
     }
 }
 
+/// Counts the frames whose relative scale fell back to full star detection (test and test-support builds
+/// only).
+///
 /// Perf tier C Task 2: how many times [`normalize_frame`] fell back to full
 /// detection (`scale::relative_scale_against`) because a plane had no
 /// usable `fits` artifact or [`scale::relative_scale_from_seeds`] itself
@@ -186,7 +189,7 @@ pub mod fallback_counters {
 /// are a few percent, so this is an order of magnitude of headroom, not a
 /// working limit.
 ///
-/// It lives here, beside [`a_grid`], and not next to the other
+/// It lives here, beside `a_grid`, and not next to the other
 /// local-scale constants in [`scale`] (review m5): the band is a property
 /// of the SAMPLED grid, which is this module's job — `scale` never sees a
 /// grid, only the spline it hands over.
@@ -204,10 +207,16 @@ pub const LN_LOCAL_SCALE_MAX_DEVIATION: f64 = 0.25;
 /// overlap only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LnOverlap {
+    /// The member's pixels are sanitized to the plane median for detection and fitted over the whole frame (a
+    /// frame set's behaviour).
     Legacy,
+    /// The member is fitted on its overlap with the reference only (a project on its grid).
     Masked,
 }
 
+/// Smallest overlap with the LN reference, as a fraction of a member's own footprint, at which the member is
+/// locally normalized; below it the member keeps global normalization.
+///
 /// Spec §5.6: a member whose overlap with the LN reference is under this
 /// fraction of its own footprint keeps global normalization (plan 6b-3 D7).
 pub const LN_MIN_OVERLAP: f64 = 0.25;
@@ -257,6 +266,7 @@ pub enum LnError {
     /// unless its rejection algorithm is not `local`, in which case the frame
     /// keeps global normalization instead and this is logged as a warning.
     TooFewMatches {
+        /// Star pairs that survived matching (fewer than the minimum of 20).
         matches: usize,
     },
     /// The common aperture (spec §4.1) could not measure [`scale::MIN_MATCHES`]
@@ -267,16 +277,24 @@ pub enum LnError {
     /// fall back to detection, the run excludes the frame); only the text
     /// differs, so the cause is named.
     CommonApertureShortfall {
+        /// Pairs with a whole circle and a half-present sky annulus on both frames.
         valid: usize,
+        /// Valid star-flux pairs before the aperture test.
         matched: usize,
+        /// `false` when no finite fitted FWHM could size the aperture at all.
         fwhm_known: bool,
     },
+    /// Reading or writing a sidecar failed.
     Io(std::io::Error),
+    /// Any other failure, with its message.
     Other(String),
+    /// The member overlaps the LN reference on too small a share of its footprint.
+    ///
     /// Plan 6b-3 D7 (spec §5.6): the member overlaps the LN reference on
     /// less than [`LN_MIN_OVERLAP`] of its own footprint (channel 0). The
     /// run keeps it on its global normalization; it is never an exclusion.
     LowOverlap {
+        /// The member's overlap with the reference as a fraction (0 to 1) of its own footprint.
         fraction: f64,
     },
 }
@@ -354,15 +372,22 @@ impl std::error::Error for LnError {
 /// channel's).
 #[derive(Debug, Clone, Default)]
 pub struct LnFrameOutcome {
+    /// Where the frame's local-normalization sidecar was written.
     pub sidecar: std::path::PathBuf,
+    /// The frame's global relative scale, unitless (mean over channels).
     pub scale: f64,
+    /// Matched star pairs the scale rests on (sum over channels).
     pub matches: usize,
     // Background samples of the frame's own final fit, the samples its
     // rejection rounds left out, the samples of the shared refit, and the
     // knot cells under the floor — each summed over channels (spec §10).
+    /// Background samples the frame's own final fit used (sum over channels).
     pub samples: usize,
+    /// Background samples the fit's rejection rounds left out (sum over channels).
     pub samples_rejected: usize,
+    /// Background samples of the shared refit (sum over channels).
     pub samples_shared: usize,
+    /// Knot cells whose support fell under the floor (sum over channels).
     pub cells_unsupported: usize,
     /// Wall time (ms) spent warping into the reference geometry, summed
     /// across every channel (perf tier 1 Task 0).
@@ -389,6 +414,8 @@ pub struct LnFrameOutcome {
     /// Of `scale_ms`, how much was matching + RCR (and, when on, the local
     /// scale spline), summed across every channel.
     pub match_ms: u64,
+    /// Where the frame's relative scales came from: `"seeds"` or `"detected"`.
+    ///
     /// Perf tier C Task 2: `"seeds"` when every channel's relative scale
     /// came from Measure's persisted fits used as seed positions
     /// ([`scale::relative_scale_from_seeds`]); `"detected"` when at least
@@ -411,6 +438,8 @@ pub struct LnFrameOutcome {
     /// compared detection against detection and has nothing to say about
     /// the seeds path's own bias.
     pub channel_from_seeds: Vec<bool>,
+    /// The growth-curve correction factor, unitless, kept for the run summary.
+    ///
     /// Plan B B0 (PB-2), kept on the run summary: F1's growth-curve factor ([`scale::ScaleResult::growth_factor`]),
     /// the MEAN over the channels that report one, like `scale`. `None` unless the growth-curve aperture ran.
     pub growth_factor: Option<f64>,
@@ -574,7 +603,7 @@ fn a_grid(
 /// more than a few percent of the plane; a target frame's own off-canvas
 /// strip gets the identical treatment, per-frame, for the same reason).
 /// `locations[p]` is that channel's median over finite pixels only (fix
-/// round 1, item 7 — see [`median_of_finite`]) — reused directly as
+/// round 1, item 7 — see `median_of_finite`) — reused directly as
 /// [`LnGrid::location_ref`] so it, too, is computed once, not once per
 /// frame.
 ///
@@ -597,15 +626,22 @@ fn a_grid(
 /// before. This is why the struct now carries a lifetime tied to the
 /// `&'a LnReference` [`Self::build`] borrows from.
 pub struct LnReferenceForDetection<'a> {
+    /// Per channel, the reference plane with non-finite pixels replaced by that channel's median (borrowed
+    /// when the plane is all finite).
     pub sanitized_planes: Vec<Cow<'a, [f32]>>,
+    /// Per channel, the median over finite reference pixels, in normalized units.
     pub locations: Vec<f64>,
+    /// Per channel, the reference's detected stars, fits and match tree, built once for the group.
     pub prepared: Vec<scale::PreparedReferenceChannel>,
+    /// Whether members are fitted over the whole frame or on their overlap with the reference.
     pub overlap: LnOverlap,
     /// Per plane, the RAW reference plane's finite pixels (before any
     /// sanitizing) for the common aperture's presence test (P-8). Legacy
     /// only: `build_masked` leaves it empty because the member's overlap is
     /// the reference side's presence there.
     pub present: Vec<FiniteMask>,
+    /// Per plane, the mask of reference pixels that saturate in at least one frame the reference integrates.
+    ///
     /// L-23: per plane, the reference-frames saturation mask (`R >
     /// saturation`, the float map thresholded and dropped by the caller),
     /// read by the reference side of the star selection in both modes.
@@ -689,6 +725,8 @@ impl<'a> LnReferenceForDetection<'a> {
     /// of its coverage edge are dropped before they are fitted. The
     /// reference-frames saturation masks apply here too (their map is NaN,
     /// never set, outside the grid's coverage).
+    ///
+    /// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
     pub fn build_masked(
         reference: &'a LnReference,
         psf: crate::stacking::psf_signal::PsfModel,
@@ -752,7 +790,7 @@ impl<'a> LnReferenceForDetection<'a> {
 ///
 /// With `cfg.local_scale` on (ruling R-M4c-8) `A` is no longer that one
 /// number: [`scale::relative_scale_against`] also fits a thin-plate spline
-/// through the matched stars' scale residuals and [`a_grid`] samples it at
+/// through the matched stars' scale residuals and `a_grid` samples it at
 /// every node, so `A` varies smoothly over the frame. Nothing else about
 /// the sidecar changes — the format has always carried a full `A` grid —
 /// and with the flag off every value written is what M2/M3/M4a wrote.
@@ -817,7 +855,7 @@ impl<'a> LnReferenceForDetection<'a> {
 /// only the seeds path's fitted-signal warp-dependence, ruling C-11). A
 /// channel carrying a fitted local-scale spline is calibrated too, by
 /// scaling the SAMPLED `A` surface rather than its constant term alone
-/// (ruling C-14 item 5 — see [`a_grid`]); fix round 3 skipped such a
+/// (ruling C-14 item 5 — see `a_grid`); fix round 3 skipped such a
 /// channel, which left it a measured fraction of a percent away from every
 /// other channel of the same group. A shorter slice than the reference has
 /// planes, or `None` (the group's calibration was cancelled or could not be
@@ -826,6 +864,8 @@ impl<'a> LnReferenceForDetection<'a> {
 ///
 /// `scale_px` is the RESOLVED LN scale (spec 2026-10-04 P-4, `resolve_scale`);
 /// `cfg.scale` and `cfg.scale_mode` are not read here.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,

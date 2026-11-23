@@ -68,7 +68,7 @@ pub const DISTORTION_ROUNDS: usize = 2;
 /// at all (M4c Task 4, the plan's `4 · MIN_INLIERS`). Below it the spline
 /// would interpolate a handful of stars and say nothing whatsoever about
 /// the rest of the frame, so the linear model is kept instead — the same
-/// stance [`min_pairs_for`] takes for the polynomial arm, at the scale a
+/// stance `min_pairs_for` takes for the polynomial arm, at the scale a
 /// LOCAL model needs.
 pub const TPS_MIN_INLIERS: usize = 4 * MIN_INLIERS;
 
@@ -77,9 +77,12 @@ pub const TPS_MIN_INLIERS: usize = 4 * MIN_INLIERS;
 /// order (ruling R-M4c-6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DistortionFit {
+    /// No distortion layer: the linear model alone.
     #[default]
     None,
+    /// A global polynomial distortion of the given order (2, 3 or 4).
     Polynomial(u8),
+    /// A thin-plate spline distortion over the refit inliers.
     Tps,
 }
 
@@ -104,27 +107,70 @@ impl DistortionFit {
     rename_all_fields = "camelCase",
     tag = "kind"
 )]
+/// Why a frame could not be registered against the reference; stored with the frame's registration result.
 pub enum AlignError {
-    TooFewStars { subject: usize, reference: usize },
+    /// One of the two frames has too few registration stars to align.
+    TooFewStars {
+        /// Registration stars found on the subject frame.
+        subject: usize,
+        /// Registration stars on the reference frame.
+        reference: usize
+    },
+    /// The quad matcher found too few matches to seed a transform.
+    ///
     /// M4b: `after_wcs` marks a quad-seed failure that followed a
     /// plate-solve seed the aligner had already tried and refused — the
     /// frame's stored reason would otherwise lose that fact entirely.
-    NoSeed { matches: usize, after_wcs: bool },
-    TooFewMatches { matches: usize },
-    TooFewInliers { inliers: usize },
+    NoSeed {
+        /// Quad matches the matcher found (too few to seed a transform).
+        matches: usize,
+        /// Whether a plate-solve seed had already been tried and refused.
+        after_wcs: bool
+    },
+    /// Too few star correspondences fell within tolerance of the seeded transform.
+    TooFewMatches {
+        /// Correspondences found.
+        matches: usize
+    },
+    /// The RANSAC fit kept too few inliers.
+    TooFewInliers {
+        /// Inliers kept.
+        inliers: usize
+    },
+    /// A fitted map could not be built: the transform (with its distortion, if any) was not invertible.
     Degenerate,
+    /// The fitted linear scale lies outside the acceptance window.
+    ///
     /// M4b: `expected` is the scale ratio the gate was centred on (1.0 for
     /// a same-scale set, the frame's own `pixel_scale / reference scale`
     /// otherwise — see [`super::scale_gate_for`]). The applied window is
     /// `expected` ± [`SCALE_TOLERANCE`], which is what [`fmt::Display`]
     /// prints, so the message names the gate the frame was actually judged
     /// against rather than a constant that may not have been used.
-    ScaleOutOfRange { scale: f64, expected: f64 },
-    RmsTooHigh { rms_px: f64, max_rms_px: f64 },
+    ScaleOutOfRange {
+        /// The fitted linear scale (subject to reference, unitless).
+        scale: f64,
+        /// The scale ratio the acceptance window was centred on.
+        expected: f64
+    },
+    /// The residual RMS exceeded the configured maximum and the config asks to fail such a frame.
+    RmsTooHigh {
+        /// Residual RMS of the refit inliers through the final map, in pixels.
+        rms_px: f64,
+        /// The configured maximum, in pixels.
+        max_rms_px: f64
+    },
+    /// The map's inliers cover too small a share of the overlap.
+    ///
     /// RQ-10: the map's inliers cover `coverage` of the cells of the 4 x 4
     /// grid over the overlap that hold an eligible star the judged map
     /// pairs, `cells` of them (see [`coverage`]), under [`MIN_COVERAGE`].
-    LowCoverage { coverage: f64, cells: usize },
+    LowCoverage {
+        /// Share (0 to 1) of the eligible grid cells the inliers cover.
+        coverage: f64,
+        /// Grid cells that hold an eligible star the judged map pairs.
+        cells: usize
+    },
 }
 
 impl fmt::Display for AlignError {
@@ -200,10 +246,13 @@ pub enum SeedPolicy {
     WcsFirst,
 }
 
+/// One frame's fitted alignment to the reference: the subject-to-reference map, how it was seeded and fitted,
+/// and the quality figures behind the accept decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alignment {
     /// Subject → reference (with the stored inverse).
     pub map: PixelMap,
+    /// The linear model that was fitted (similarity, affine or homography).
     pub model: LinearKind,
     /// Which distortion layer the frame ended up with (M4c): none, a
     /// polynomial of that order, or a thin-plate spline.
@@ -225,22 +274,34 @@ pub struct Alignment {
     pub repaired: usize,
     /// Refit inliers.
     pub inliers: usize,
+    /// Refit inliers over the final pairing (0 to 1, unitless).
     pub inlier_ratio: f64,
     /// Through the final map, over the refit inliers.
     pub rms_px: f64,
+    /// Standard deviation of the inlier residual distances, in pixels.
     pub sigma_rms_px: f64,
+    /// Largest absolute residual along x and along y over the inliers, in pixels.
     pub peak_px: (f64, f64),
+    /// The linear scale of the fitted map (subject to reference, unitless; 1.0 at the same pixel scale).
     pub scale: f64,
+    /// The rotation of the linear map, in degrees.
     pub rotation_deg: f64,
+    /// The translation of the linear map `(x, y)`, in pixels.
     pub translation: (f64, f64),
+    /// Whether the map mirrors the image (negative determinant), as after a meridian flip.
     pub flipped: bool,
+    /// The RANSAC combined quality score: inlier ratio × overlap × regularity / (1 + RMS in pixels).
     pub quality_score: f64,
+    /// Area of the convex hull of the inliers over that of all pairs (0 to 1, unitless).
     pub overlap: f64,
+    /// Share of the cells of a 4 × 4 grid over the frame that hold at least one inlier (0 to 1, unitless).
     pub regularity: f64,
     /// How much of the paired overlap the refit inliers cover (RQ-10,
     /// [`coverage`]): at least [`MIN_COVERAGE`] for any frame that registered.
     pub coverage: f64,
+    /// RANSAC samples drawn for the final linear fit.
     pub ransac_iterations: usize,
+    /// Sigma-clip rounds inside the weighted refit (at most 5).
     pub refit_rounds: usize,
     /// Rounds of the local distortion loop whose corrector was actually
     /// FITTED (M4c, ruling R-M4c-7; semantics settled by R-T4-1): the
@@ -258,9 +319,12 @@ pub struct Alignment {
     /// [`crate::geometry::refit_weighted`] call (≤ 5) — one number cannot
     /// honestly be both.
     pub local_rounds: usize,
+    /// Non-fatal notes about the registration, for example an RMS above the configured maximum.
     pub warnings: Vec<String>,
 }
 
+/// The linear model a choice resolves to for `n` correspondences: the explicit choice, or for auto homography
+/// from 30 correspondences, affine from 12, similarity below.
 pub fn resolve_model(choice: ModelChoice, n: usize) -> LinearKind {
     match choice {
         ModelChoice::Similarity => LinearKind::Similarity,
@@ -367,9 +431,11 @@ pub enum SeedRoute {
 /// what was kept to arrive at it.
 #[derive(Debug, Clone)]
 pub struct QuadSeed {
+    /// The affine transform fitted from the quad matches.
     pub affine: Affine,
     /// Per match, in `matches` order: true = in the returned fit.
     pub kept: Vec<bool>,
+    /// Which route produced the seed.
     pub route: SeedRoute,
     /// RANSAC samples drawn (0 off the [`SeedRoute::Consensus`] route).
     pub hypotheses: usize,
@@ -1434,7 +1500,7 @@ pub(crate) struct SeedRefusal {
 /// the M1 path, quad seed and error messages alike.
 ///
 /// A seed also fails when its map is not carried by the overlap (RQ-10):
-/// the last check of [`fit_from_seed`] is [`coverage`] against
+/// the last check of `fit_from_seed` is [`coverage`] against
 /// [`MIN_COVERAGE`], and a refusal takes the same one turn each way. A
 /// frame refused both ways fails with [`AlignError::LowCoverage`]; one that
 /// passes keeps the map, warnings and error texts it had before the gate.

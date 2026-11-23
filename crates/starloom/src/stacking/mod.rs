@@ -12,17 +12,14 @@
 pub mod common_set;
 pub mod config;
 pub mod crop;
-#[allow(missing_docs)] // debt: Task 5c
 pub mod drizzle;
 pub mod groups;
 pub mod integrate;
-#[allow(missing_docs)] // debt: Task 5c
 pub mod ln;
 pub mod measure;
 pub mod pass1_artifact;
 pub mod prefilter;
 pub mod psf_signal;
-#[allow(missing_docs)] // debt: Task 5c
 pub mod register;
 pub mod rej;
 // Robust Chauvenet Rejection lives with the star-measurement module; re-exported so

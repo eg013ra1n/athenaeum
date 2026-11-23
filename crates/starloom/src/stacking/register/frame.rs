@@ -19,10 +19,14 @@ use crate::integration::plane_reader::PlaneReader;
 use crate::integration::IntegrationError;
 use crate::stacking::psf_signal::StarFit;
 
+/// The reference frame's registration stars and its size.
 #[derive(Debug, Clone)]
 pub struct ReferenceStars {
+    /// The reference's registration stars, brightest first.
     pub stars: Vec<Star>,
+    /// Reference width in pixels.
     pub width: usize,
+    /// Reference height in pixels.
     pub height: usize,
 }
 
@@ -61,11 +65,17 @@ impl From<&DetectedStars> for ReferenceStars {
 /// scoped worker threads, which have no span context either.
 #[derive(Debug, Clone)]
 pub struct DetectedStars {
+    /// The frame's registration stars, brightest first.
     pub stars: Vec<Star>,
+    /// Frame width in pixels.
     pub width: usize,
+    /// Frame height in pixels.
     pub height: usize,
+    /// Time spent reading the frame's planes, in milliseconds.
     pub read_ms: u64,
+    /// Time spent detecting stars, in milliseconds.
     pub detect_ms: u64,
+    /// The frame's file path (carried for log lines).
     pub path: PathBuf,
 }
 
@@ -95,13 +105,20 @@ pub struct DetectedStars {
 pub static DETECT_FRAME_STARS_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
     std::sync::Mutex::new(Vec::new());
 
+/// One frame's registration verdict against the reference: its size, how many stars were found and either the
+/// fitted alignment or why it failed.
 #[derive(Debug, Clone)]
 pub struct FrameRegistration {
+    /// Frame width in pixels.
     pub width: usize,
+    /// Frame height in pixels.
     pub height: usize,
     /// Registration stars found on the subject.
     pub detections: usize,
+    /// The fitted alignment, or the reason the frame could not be registered.
     pub outcome: Result<Alignment, AlignError>,
+    /// Wall time spent on this frame's registration, in milliseconds (including the read and detection time
+    /// when it was measured).
     pub duration_ms: u64,
 }
 
@@ -130,6 +147,8 @@ fn read_planes(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), Integration
 /// entirely in favour of [`stars_from_fits`]; `None` is today's detection,
 /// unconditionally — an OSC reference (ruling C-6) or any frame the
 /// caller could not, or chose not to, resolve fits for.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn reference_stars(
     path: &Path,
     cfg: &RegistrationConfig,
@@ -205,6 +224,8 @@ pub fn reference_stars(
 /// of reading+detecting; `None` is today's full detection, unconditionally
 /// — an OSC frame (ruling C-6), a stale/missing artifact, or any other
 /// caller that has not resolved fits for this path.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn detect_frame_stars(
     path: &Path,
     cfg: &RegistrationConfig,
@@ -410,6 +431,8 @@ fn log_seed_trail(path: &Path, trail: &SeedTrail) {
 /// the fits-resolution split below for its own caching), only tests and
 /// dev probes, so it carries no `fits` parameter of its own; a caller that
 /// wants Tier C Task 3's mono reuse calls [`detect_frame_stars`] directly.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn register_frame(
     reference: &ReferenceStars,

@@ -69,17 +69,38 @@ export type ModelChoice = "auto" | "similarity" | "affine" | "homography";
 
 export type DistortionChoice = "off" | "polynomial2" | "polynomial3" | "polynomial4" | "tps" | "auto";
 
-export type DetectionConfig = { minSnr: number, maxEccentricity: number, };
+export type DetectionConfig = { 
+/**
+ * Smallest peak signal-to-noise ratio (unitless) a detected star must reach to be kept.
+ */
+minSnr: number, 
+/**
+ * Largest eccentricity a detected star may have to be kept: 0 is round, values toward 1 are elongated
+ * (unitless).
+ */
+maxEccentricity: number, };
 
 export type RegistrationConfig = { 
 /**
+ * Whether the whole set shares one reference geometry (co-registered, the default) or each group gets
+ * its own (native).
+ *
  * M4b (ruling R-M4b-4): co-registered (the default — one reference and
  * one geometry for the whole set) or native (a reference and a
  * geometry per group). `#[serde(default)]` rides the struct-level
  * `default`, so every stored config written before M4b decodes as
  * co-registered and no `STACKING_CONFIG_VERSION` bump is needed.
  */
-geometry: RegistrationGeometry, model: ModelChoice, distortion: DistortionChoice, 
+geometry: RegistrationGeometry, 
+/**
+ * The linear model fitted between a frame and the reference; auto picks it from the number of
+ * correspondences.
+ */
+model: ModelChoice, 
+/**
+ * The non-linear distortion fitted on top of the linear model.
+ */
+distortion: DistortionChoice, 
 /**
  * The thin-plate spline's regularization weight `λ` (M4c, ruling
  * R-M4c-5) — `0.0` is the interpolating spline, which lands on every
@@ -114,7 +135,44 @@ tpsSmoothing: number,
  * refitting the distortion around it. Needs a distortion model to
  * refit, so it is a no-op with `distortion: off`.
  */
-localDistortion: boolean, interpolation: Interpolation, clampingThreshold: number, maxStars: number, ransacTolerancePx: number, ransacMaxIterations: number, maxRmsPx: number, failOnMaxRms: boolean, detection: DetectionConfig, 
+localDistortion: boolean, 
+/**
+ * The resampling kernel used when a frame is warped into the reference geometry.
+ */
+interpolation: Interpolation, 
+/**
+ * Deringing threshold of the sharpening kernels, unitless: when the outer taps' negative contribution
+ * reaches this fraction of the inner taps' contribution, the interpolation falls back to a linear
+ * estimate (default 0.30).
+ */
+clampingThreshold: number, 
+/**
+ * Most registration stars kept per frame, brightest first.
+ */
+maxStars: number, 
+/**
+ * Distance in pixels within which a star pair counts as an inlier of the RANSAC fit (the pairing radii
+ * of the later rounds scale from it).
+ */
+ransacTolerancePx: number, 
+/**
+ * Most RANSAC iterations per fit.
+ */
+ransacMaxIterations: number, 
+/**
+ * Residual RMS in pixels above which a frame's registration is flagged; it fails the frame only when
+ * `fail_on_max_rms` is set.
+ */
+maxRmsPx: number, 
+/**
+ * Whether a frame whose residual RMS exceeds `max_rms_px` fails registration (`true`) or only carries a
+ * warning (`false`).
+ */
+failOnMaxRms: boolean, 
+/**
+ * The star detection cuts.
+ */
+detection: DetectionConfig, 
 /**
  * Vestigial since perf tier A Task 6a: the registered artifact became
  * the run's REQUIRED per-frame output (Normalize/Integrate read it in
@@ -1048,13 +1106,41 @@ lnFrames: number,
  */
 largeScaleRejectedFraction: number | null, };
 
-export type DrizzleStats = { scale: number, outWidth: number, outHeight: number, 
+export type DrizzleStats = { 
+/**
+ * Output pixels per input pixel along each axis.
+ */
+scale: number, 
+/**
+ * Output width in pixels (reference width times `scale`).
+ */
+outWidth: number, 
+/**
+ * Output height in pixels (reference height times `scale`).
+ */
+outHeight: number, 
 /**
  * Included frames this pass drizzled (whether or not every one
  * actually contributed — a frame skipped for zero weight still counts,
  * mirroring `DrizzleInput::frames`'s own length).
  */
-frames: number, kernel: DrizzleKernel, dropShrink: number, usedWeights: boolean, usedRejection: boolean, 
+frames: number, 
+/**
+ * The drop shape used.
+ */
+kernel: DrizzleKernel, 
+/**
+ * The drop's side as a fraction of an input pixel (dimensionless).
+ */
+dropShrink: number, 
+/**
+ * Whether per-frame weights were applied.
+ */
+usedWeights: boolean, 
+/**
+ * Whether `.rej` rejection bitmaps were applied.
+ */
+usedRejection: boolean, 
 /**
  * Of `frames`, how many actually had their LN grids applied (`0` when
  * local normalization was off for the run).
@@ -1063,7 +1149,15 @@ lnFrames: number,
 /**
  * Per plane, measured on the drizzled (output-grid) planes.
  */
-fwhmPx: Array<number>, eccentricity: Array<number>, noise: Array<number>, 
+fwhmPx: Array<number>, 
+/**
+ * Per plane, the eccentricity of the drizzled planes' stars (0 round, toward 1 elongated; unitless).
+ */
+eccentricity: Array<number>, 
+/**
+ * Per plane, the noise sigma of the drizzled plane, in normalized units.
+ */
+noise: Array<number>, 
 /**
  * Per plane, the fraction of output pixels with `W > 0`.
  */
@@ -1074,7 +1168,15 @@ coverage: Array<number>,
  * thread while the current one deposits, so this is the part of the
  * read the overlap did not hide, not the read's full duration.
  */
-readMs: number, depositMs: number, bytesRead: number, };
+readMs: number, 
+/**
+ * Time spent depositing frames into the output grid, in milliseconds.
+ */
+depositMs: number, 
+/**
+ * Source bytes read from disk during the pass.
+ */
+bytesRead: number, };
 
 export type MasterLightKind = "master" | "drizzle" | "weightMap" | "coverage" | "drizzleCoverage";
 

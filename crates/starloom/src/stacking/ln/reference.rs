@@ -5,7 +5,7 @@
 //! `ln/<group>/reference.fits` as an artifact ([`write_reference`] /
 //! [`read_reference`]).
 //!
-//! [`build_reference`] shares [`crate::stacking::integrate::integrate_planes`]
+//! [`build_reference`] shares `crate::stacking::integrate::integrate_planes`
 //! — the ONE `RegisteredSource` per group (ruling R-T4-7: re-pointed at
 //! each plane with `set_plane`) plus `integrate_stack` per plane that
 //! `integrate_group` (Plan 4) also drives — rather than re-implementing it:
@@ -50,7 +50,9 @@ use crate::stacking::integrate::{
 /// [`write_reference`].
 #[derive(Debug)]
 pub struct LnReference {
+    /// Plane width in pixels.
     pub width: usize,
+    /// Plane height in pixels.
     pub height: usize,
     /// One plane per channel, planar (never interleaved), `width × height`
     /// each — the same layout [`crate::fits_writer::write_fits_f32`] wants.
@@ -66,7 +68,7 @@ pub struct LnReference {
 
 /// Builds the group's LN reference (spec §5.2): the best `n` of `included`
 /// by [`crate::stacking::weights::FrameWeight::normalized_mean`], integrated
-/// through [`integrate_planes`] with equal (`1.0`) weights,
+/// through `integrate_planes` with equal (`1.0`) weights,
 /// [`Rejection::LinearFitClip`] `{ sigma_low: 5.0, sigma_high: 3.5 }`,
 /// output normalization [`OutputNormalization::AdditiveWithScaling`] and
 /// rejection normalization [`RejectionNormalization::ScaleZeroOffset`] — the
@@ -99,7 +101,7 @@ pub struct LnReference {
 /// be exactly that top-`n` sky-penalized set before calling in, so the
 /// internal by-weight re-sort only reorders those `n` (a no-op on which
 /// members end up in `frames_used`).
-/// [`validate_group_input`] runs first — the same reference-range and
+/// `validate_group_input` runs first — the same reference-range and
 /// per-frame channel-count checks `integrate_group` performs, shared so a
 /// malformed `GroupInput` is refused here too instead of indexing out of
 /// bounds inside `integrate_planes`.
@@ -120,6 +122,8 @@ pub struct LnReference {
 /// `empty_as_nan` (plan 6b-3 D4/D5): a pixel no member frame covers comes
 /// out NaN instead of 0.0 — set by a project's LN reference on its grid,
 /// `false` for every frame-set caller.
+///
+/// Runs on `pool`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_reference(
     input: &GroupInput<'_>,
@@ -289,7 +293,7 @@ fn stacking_cards(imagetyp: &str, caller_cards: &[Card]) -> Result<Vec<Card>, Fi
 /// height`, atomic tmp+rename — the existing writer's own contract, so a
 /// reader never observes a half-written file) at `path`, creating parent
 /// directories as needed. `cards` is the caller's own provenance; the
-/// mandatory `IMAGETYP` card ([`reference_cards`]) is added
+/// mandatory `IMAGETYP` card (`reference_cards`) is added
 /// here, not by the caller.
 pub fn write_reference(r: &LnReference, path: &Path, cards: &[Card]) -> anyhow::Result<()> {
     let all_cards = reference_cards(cards)?;
@@ -341,6 +345,8 @@ const SATURATION_IMAGETYP: &str = "LN Reference Saturation";
 /// or `<= 0` contributes nothing at all (the caller names it in a
 /// `debug!`). The map starts all NaN, so a pixel no frame contributes to
 /// stays NaN. Returns `M`.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn accumulate_reference_saturation(
     map: &mut [f32],
     plane: &[f32],
@@ -402,14 +408,16 @@ pub fn reference_saturation_mask(
 /// Builds the reference-frames saturation map over `frames_used` (the LN
 /// reference's own members, indices into `input.frames`), one plane per
 /// channel. Each frame is read through the SAME source
-/// [`integrate_planes`] reads it through
-/// ([`crate::stacking::integrate::materialized_frame`] +
+/// `integrate_planes` reads it through
+/// (`crate::stacking::integrate::materialized_frame` +
 /// [`RegisteredSource::open_materialized`], the group's interpolation and
 /// clamping): its materialized registered artifact, or the on-the-fly warp
 /// — so the map and the reference can never disagree about a frame's
 /// pixels. One frame and one channel at a time: peak RAM is one frame
 /// plane (plus the reader's band) on top of the maps. `cancel` is checked
 /// before every frame and channel.
+///
+/// Runs on `pool`.
 pub fn build_reference_saturation(
     input: &GroupInput<'_>,
     frames_used: &[usize],

@@ -129,7 +129,10 @@ pub enum ChannelOutcome {
     TooFewRatios,
     /// The median landed outside [`SEEDS_CALIBRATION_BAND`]; `measured` is
     /// what it was before being refused.
-    OutOfBand { measured: f64 },
+    OutOfBand {
+        /// The refused median ratio, unitless (a ratio of two measured star fluxes).
+        measured: f64
+    },
 }
 
 /// One channel's calibration verdict.
@@ -139,6 +142,7 @@ pub struct ChannelCalibration {
     pub k: f64,
     /// How many usable ratios the median was taken over.
     pub samples: usize,
+    /// Why the factor is what it is: calibrated, too few ratios, or refused as out of band.
     pub outcome: ChannelOutcome,
 }
 
@@ -276,11 +280,15 @@ pub fn calibration_k(ratios: &[Vec<f64>]) -> Vec<ChannelCalibration> {
 /// What [`measure_seeds_calibration`] found, before the caller turns it
 /// into a [`SeedsCalibration`] and logs it.
 pub struct CalibrationMeasurement {
+    /// Catalog ids of the frames the measurement was taken over, reference first.
     pub frame_ids: Vec<i64>,
+    /// One verdict per channel (mono: one entry; colour: R, G, B).
     pub channels: Vec<ChannelCalibration>,
 }
 
 impl CalibrationMeasurement {
+    /// The persistable form of this measurement: the frame ids and one factor `k` per channel (`1.0` where
+    /// the channel was not calibrated).
     pub fn calibration(&self) -> SeedsCalibration {
         SeedsCalibration {
             frame_ids: self.frame_ids.clone(),
@@ -324,6 +332,8 @@ impl CalibrationMeasurement {
 /// the next run does not pay for the measurement again.
 ///
 /// `scale_px` is the RESOLVED LN scale (P-4); `cfg.scale` is not read here.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 #[allow(clippy::too_many_arguments)]
 pub fn measure_seeds_calibration(
     reference: &LnReference,

@@ -20,10 +20,15 @@ pub const SATURATION: f32 = 0.95;
 /// would fail the saturation cut after the `ADU_SCALE` multiply.
 pub const NATIVE_UNITS_MAX: f32 = 1.5;
 
+/// One registration star: a detected, centroid-refined point source on a luminance plane.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Star {
+    /// Centroid column in pixels, as the detector reports it (`x` grows to the right).
     pub x: f64,
+    /// Centroid row in pixels, as the detector reports it (`y` grows downward).
     pub y: f64,
+    /// Star flux in the plane's native normalized units (the detector's flux divided back by `ADU_SCALE`);
+    /// the brightest-first sort key.
     pub flux: f64,
     /// Fitted centroid σ per axis (px) when the detector's refinement
     /// succeeded; `None` keeps the pass-1 centroid unweighted.
@@ -69,6 +74,8 @@ pub fn luminance<'a>(planes: &[&'a [f32]]) -> Cow<'a, [f32]> {
 /// Detect registration stars on one luminance plane in native units. The
 /// detector runs on an ADU-scaled copy (its thresholds are tuned for 16-bit
 /// data); results come back in pixel coordinates and native flux.
+///
+/// Runs on `pool` when given one, otherwise on the caller's current rayon pool.
 pub fn detect_stars(
     lum: &[f32],
     w: usize,
@@ -207,7 +214,7 @@ const FWHM_TO_SIGMA: f64 = 2.354_820_045_030_949_3;
 
 /// Turn one plane's accepted PSF fits (Tier C Task 3, spec §7, ruling C-6)
 /// into a registration star list, in the same shape [`detect_stars`]
-/// itself returns: [`passes_register_cuts`] applied per fit (this
+/// itself returns: `passes_register_cuts` applied per fit (this
 /// detector's own saturation/eccentricity/SNR cuts — Measure's own
 /// acceptance does not reject those the way this module always has),
 /// sorted brightest-first, truncated to `max_stars`. Mono frames only — a
@@ -219,7 +226,7 @@ const FWHM_TO_SIGMA: f64 = 2.354_820_045_030_949_3;
 /// Fix round 1 (ruling C-18, item 2): [`Star::flux`] is `fit.signal /
 /// ADU_SCALE`, NOT the raw `fit.signal` — [`StarFit`]'s fields are
 /// ADU-scaled (`measure::measure_plane_with_seeds` fits at exactly that
-/// scale, the same convention [`passes_register_cuts`]'s own saturation
+/// scale, the same convention `passes_register_cuts`'s own saturation
 /// check above already uses), while [`detect_stars`] stores `s.flux /
 /// ADU_SCALE`, the NATIVE `[0, 1]`-ish domain. A fit-derived star that
 /// skipped the division would carry a flux ~65535× too large — silently

@@ -31,10 +31,12 @@ impl SaturationMask {
         Self::from_fn(width, height, |_| false)
     }
 
+    /// Mask width in pixels.
     pub fn width(&self) -> usize {
         self.0.width()
     }
 
+    /// Mask height in pixels.
     pub fn height(&self) -> usize {
         self.0.height()
     }
@@ -49,23 +51,37 @@ impl SaturationMask {
 /// and its background model's noise and maximum.
 #[derive(Clone, Copy)]
 pub struct SelectionSide<'a> {
+    /// The side's plane, row-major, `width × height`, in normalized units.
     pub plane: &'a [f32],
+    /// Plane width in pixels.
     pub width: usize,
+    /// Plane height in pixels.
     pub height: usize,
+    /// The side's background model noise: local sigma per tile and the plane maximum used by the saturation
+    /// test.
     pub noise: &'a TileNoise,
+    /// The reference-frames saturation mask of the LN reference, on the reference side only.
+    ///
     /// L-23: the reference-frames saturation mask of the LN reference, on
     /// the reference side only. `None` on every target side and wherever
     /// no map exists (a test, a probe without `--ref-saturation`).
     pub frames_saturation: Option<&'a SaturationMask>,
 }
 
+/// Which rule produced the candidate list: stars that pass the peak signal-to-noise cut, or the
+/// bright-quarter fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionRule {
+    /// At least the minimum number of pairs passed the peak signal-to-noise cut; the ranked list is those
+    /// pairs.
     Snr,
+    /// Too few pairs passed the signal-to-noise cut, so the brightest quarter of the unsaturated pairs (at
+    /// least the minimum, at most the cap) is used instead.
     BrightQuarter,
 }
 
 impl SelectionRule {
+    /// The rule's name as written to logs and run summaries: `"snr"` or `"brightQuarter"`.
     pub fn as_str(self) -> &'static str {
         match self {
             SelectionRule::Snr => "snr",
@@ -80,10 +96,18 @@ impl SelectionRule {
 /// quota) — spec §4.1's "pairs that passed steps 1–2 (or the fallback set)".
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidates {
+    /// Candidate pairs as `(reference fit index, target fit index)`, brightest reference star first (ties by
+    /// index).
     pub ranked: Vec<(usize, usize)>,
+    /// How many of the valid pairs the estimator keeps: the configured star cap for the signal-to-noise rule,
+    /// the quarter-size quota for the fallback.
     pub quota: usize,
+    /// The rule that produced `ranked`.
     pub rule: SelectionRule,
+    /// How many of the first `ranked` entries define the common FWHM.
     pub fwhm_set: usize,
+    /// Pairs that passed both planes' own saturation test and failed only the reference-frames mask.
+    ///
     /// L-23: pairs that passed both planes' own relative-saturation test
     /// and failed only the reference-frames mask (`ln_ref_frames_saturated`).
     pub ref_frames_saturated: usize,
@@ -156,6 +180,10 @@ fn snr_passes(side: &SelectionSide<'_>, f: &StarFit, sel: &LnStarSelection) -> b
     signal / sigma >= sel.min_peak_snr
 }
 
+/// Ranks the matched reference/target star pairs for the LN scale: drops pairs saturated on either plane (or
+/// in the reference's frames), keeps those passing the peak signal-to-noise cut ranked by the reference
+/// star's flux, and falls back to the brightest quarter when fewer than the minimum pass. Errors with
+/// `TooFewMatches` when even the unsaturated pairs are fewer than the minimum.
 pub fn rank_candidates(
     pairs: &[(usize, usize)],
     ref_fits: &[StarFit],
