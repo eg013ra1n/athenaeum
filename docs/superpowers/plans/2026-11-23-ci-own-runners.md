@@ -53,7 +53,7 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 | Path | Change | Task |
 | ---- | ---- | ---- |
 | `.gitlab-ci.yml` | `workflow:` rule `test/*`; `probe:linux-test` (Task 1 only); `test:linux`; `test:windows` rules; `check:headless-core` `except`; `gate:tests` deleted; `deploy` needs; comments at about 11, 46-48, 343-349, 533-544 | 1, 3, 4 |
-| `.gitlab/ci/scripts/linux_tests.sh` | new: the Linux reader of `ci.yml` | 3 |
+| `.gitlab/ci/scripts/linux_tests.py` | new: the Linux reader of `ci.yml` | 3 |
 | `.gitlab/ci/scripts/windows_tests.ps1` | header comment only (GitHub runs on PRs) | 5 |
 | `.gitlab/ci/scripts/github_checks_gate.sh`; its section in `.gitlab/ci/scripts/test/run_tests.sh` (about lines 765-815); `fixtures/github_checks_*` (5 files) and its `mock_bin/curl` cases | deleted | 4 |
 | `scripts/ci/lock_guard.sh`, `scripts/ci/headless_check.sh` | new, mode 755 (`git update-index --chmod=+x`) | 2 |
@@ -84,11 +84,11 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 
 ### Task 3: `test:linux` and the `test/*` pipeline
 
-**Files:** `.gitlab-ci.yml`, `.gitlab/ci/scripts/linux_tests.sh`.
+**Files:** `.gitlab-ci.yml`, `.gitlab/ci/scripts/linux_tests.py`.
 
-**Interfaces:** `linux_tests.sh` reads `.github/workflows/ci.yml` with `yaml.safe_load` (PyYAML, proven by the probe) and follows CI-R5. It prints `+ <command>` before each step, runs it with `bash -c`, and exits with the first failing step's code. Exit 2 means `ci.yml` has a step the reader does not know.
+**Interfaces:** `linux_tests.py` reads `.github/workflows/ci.yml` with `yaml.safe_load` (PyYAML, proven by the probe) and follows CI-R5. It prints `+ <command>` before each step, runs it with `bash -c`, and exits with the first failing step's code. Exit 2 means `ci.yml` has a step the reader does not know.
 
-- [ ] **Step 1:** Write `linux_tests.sh`; mode 755.
+- [ ] **Step 1:** Write `linux_tests.py`; mode 755.
 - [ ] **Step 2:** `.gitlab-ci.yml`: replace `probe:linux-test` with `test:linux`:
   - `stage: build`, `tags: [linux-test]`, rules `test/*` and `$CI_COMMIT_TAG =~ /^v/`;
   - `before_script: source "$HOME/.cargo/env"`, `interruptible: true` (harmless on a tag: say so in the comment), `timeout: 90m`;
