@@ -6,9 +6,9 @@
 
 use std::sync::OnceLock;
 
-/// One `Key:   123 kB` line of `/proc/meminfo` or `/proc/self/status`, in bytes.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-pub(crate) fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
+/// One `Key:   123 kB` line of `/proc/meminfo` or `/proc/self/status`, in bytes. `key` includes the colon
+/// (`"MemTotal:"`); `None` when the key is absent or its value is not a number.
+pub fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix(key) {
             let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
@@ -21,8 +21,6 @@ pub(crate) fn parse_kb_field(text: &str, key: &str) -> Option<u64> {
 /// Parse one cgroup memory-limit file. `None` means "no limit here": cgroup v2
 /// writes the literal `max`, and v1 writes a sentinel near `u64::MAX` — a
 /// number that large is not a container limit, it is the absence of one.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-#[doc(hidden)]
 pub fn parse_cgroup_limit(text: &str) -> Option<u64> {
     const UNLIMITED_FLOOR: u64 = 1 << 62;
     let v: u64 = text.trim().parse().ok()?;
@@ -35,9 +33,7 @@ pub fn parse_cgroup_limit(text: &str) -> Option<u64> {
 
 /// Pure computation over `/proc/meminfo`'s content plus the two possible
 /// cgroup limit-file contents: `min(MemTotal, container limit)`. cgroup v2
-/// wins when it names a real limit; `max` (or absent) falls through to v1.
-#[cfg_attr(not(test), allow(dead_code))]
-#[doc(hidden)]
+/// wins when it names a real limit; `max` (or absent) falls through to v1. `None` when `MemTotal:` is absent.
 pub fn linux_total_ram_from(
     meminfo: &str,
     v2: Option<&str>,
@@ -187,15 +183,21 @@ pub fn total_ram_bytes() -> Option<u64> {
     effective_memory(total, limit)
 }
 
-/// The effective-memory rule over a probed pair: a limit counts only when it is below physical memory (or physical
-/// memory is unknown); the result is then the limit when set, else physical memory.
-fn effective_memory(total: Option<u64>, limit: Option<u64>) -> Option<u64> {
-    let limit = match (total, limit) {
+/// The container or job memory limit of a probed pair, kept only when it binds: a limit counts when it is below
+/// physical memory, or when physical memory is unknown. A limit equal to or above physical memory is no limit
+/// (`None`).
+pub fn binding_limit(total: Option<u64>, limit: Option<u64>) -> Option<u64> {
+    match (total, limit) {
         (Some(t), Some(l)) if l < t => Some(l),
         (None, Some(l)) => Some(l),
         _ => None,
-    };
-    match (total, limit) {
+    }
+}
+
+/// The effective-memory rule over a probed pair: the minimum of the physical total and the [`binding_limit`]; the
+/// limit alone when the total is unknown; `None` when neither is known.
+pub fn effective_memory(total: Option<u64>, limit: Option<u64>) -> Option<u64> {
+    match (total, binding_limit(total, limit)) {
         (Some(t), Some(l)) => Some(t.min(l)),
         (Some(t), None) => Some(t),
         (None, l) => l,
@@ -214,6 +216,16 @@ mod tests {
         assert_eq!(effective_memory(Some(16), None), Some(16));
         assert_eq!(effective_memory(None, Some(4)), Some(4));
         assert_eq!(effective_memory(None, None), None);
+    }
+
+    #[test]
+    fn binding_limit_keeps_only_a_limit_below_physical_memory() {
+        assert_eq!(binding_limit(Some(16), Some(4)), Some(4));
+        assert_eq!(binding_limit(Some(16), Some(16)), None);
+        assert_eq!(binding_limit(Some(16), Some(64)), None);
+        assert_eq!(binding_limit(Some(16), None), None);
+        assert_eq!(binding_limit(None, Some(4)), Some(4));
+        assert_eq!(binding_limit(None, None), None);
     }
 
     #[test]
