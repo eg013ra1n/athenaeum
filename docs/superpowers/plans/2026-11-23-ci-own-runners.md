@@ -31,7 +31,8 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 ## Owner tasks (before Task 1)
 
 1. **Done 2026-11-23.** The VM (astrolinux-runner1, 192.168.31.173, SSH `astrolinux`) has 8 vCPU, 12 GB RAM and 300 GB disk. `/` is grown to 294 GB with 232 GB free. Checked: `ulimit -u` is 41466 and PyYAML is installed.
-2. **Tag `linux-test` on runner 2** (`ubuntu24-linux`): in GitLab, Admin → CI/CD → Runners → edit → Tags `linux, linux-test`. Or the controller does it through the API on the owner's yes: `PUT /api/v4/runners/2` with `tag_list=linux,linux-test`. Nothing else changes on the VM: `concurrent` stays 1.
+2. **Tag `linux-test` on runner 2** (`ubuntu24-linux`): in GitLab, Admin → CI/CD → Runners → edit → Tags `linux, linux-test`. Or the controller does it through the API on the owner's yes: `PUT /api/v4/runners/2` with `tag_list=linux,linux-test`. `concurrent` stays 1.
+3. **`output_limit = 65536` in runner 2's `[[runners]]` block** of `/etc/gitlab-runner/config.toml` (the runner reloads the file itself). The first `test:linux` run hit the default 4 MB log cap inside the core suite, as EVO-X2's `test:windows` once did: without it a failing run shows no `test result:` lines. (Dropped by mistake when owner task 2 became one runner; restored 2026-11-23.)
 
 ## Global Constraints
 
