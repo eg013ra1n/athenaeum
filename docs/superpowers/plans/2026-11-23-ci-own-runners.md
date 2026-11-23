@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (the owner runs this natively). The `lean-execution` skill overrides it wherever the two conflict. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Athenaeum's tests run on our own hardware: Linux on the astrodb VM (GitLab runner), Windows on EVO-X2. A `test/<name>` branch runs both before `main`, a release tag runs both again and the release waits for them; GitHub Actions runs only on pull requests.
+**Goal:** Athenaeum's tests run on our own hardware: Linux on the astrodb VM (GitLab runner), Windows on EVO-X2. A `test/<name>` branch runs both before `main`, a release tag runs both again and the release waits for them; GitHub Actions runs only by hand.
 
 **Architecture:**
 - **One source of commands.** `.github/workflows/ci.yml` stays the only place the test commands are written. GitHub runs it on `pull_request` only; the GitLab jobs read their commands from it, as `test:windows` already does (`.gitlab/ci/scripts/windows_tests.ps1`), so the runs cannot drift.
@@ -19,7 +19,7 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 
 | ID | Ruling | Task |
 | ---- | ---- | ---- |
-| CI-R1 | `ci.yml` triggers on `pull_request` only (`paths-ignore` kept). It no longer runs on a `push` to `main` or on a tag. Its two jobs stay, so PRs and the GitLab readers share one command list. The `rust` paths filter gains `'starloom'`, `'rustafits'`, `'solvemyastro'` and `.gitmodules`, so a gitlink-only Dependabot PR runs the Rust jobs. | 2 |
+| CI-R1 | **Owner, 2026-11-23: option A.** `ci.yml` triggers on `workflow_dispatch` only, so GitHub runs nothing by itself, PRs included. Its two jobs stay as the one command list the GitLab readers use. An outside PR is read first, then pushed to GitLab as `test/pr-<number>`: unread code never runs on our runners, which sit on the home network and hold deploy keys on tags. A Dependabot bump PR is a signal; it is tested as a `test/*` branch like any change. The `rust` paths filter additions stay for a PR trigger restored later. | 2, 5 |
 | CI-R2 | A `test/<name>` branch pipeline is `test:linux` plus `test:windows`, in parallel on our runners, and nothing else (`check:headless-core` gains `except: /^test\//`; `test:linux` runs the same check). `wintest/<name>` stays a Windows-only alias. | 3 |
 | CI-R3 | On a `v*` tag, the pipeline also runs `test:linux` and `test:windows`. `deploy` `needs` both, plus `check:headless-core` (today it gates only through `gate:tests`). `gate:tests`, `github_checks_gate.sh`, its `run_tests.sh` section and fixtures are deleted. The release green-check rule: the tagged commit's `test/<name>` pipeline was green before tagging, and the tag pipeline's own tests gate the deploy. A red test job on a tag is retried, never bypassed: no `allow_failure`, no `optional: true`. The `GATE_REQUIRED_CHECKS` override that v0.7.1 used disappears. Whether a deliberate bypass variable should exist is the owner's call; default: none. | 4, 5 |
 | CI-R4 | **Owner, 2026-11-23: one runner, two tags.** The VM has 8 vCPU and 12 GB, too little for a test run beside a release compile (v0.7.1's `build:linux` already OOM'd on 3.9 GB). The existing runner (GitLab runner 2, `ubuntu24-linux`) gets the tag `linux-test` beside `linux` and keeps running one job at a time. `test:linux` keeps its own tag, so a later second runner needs no YAML change. A `test/*` pipeline runs the Linux tests alone; on a tag they queue with the release builds, and the release gets longer by their time. | owner, 3 |
@@ -46,7 +46,7 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 2. **The Linux run reads the same commands as GitHub's job** (CI-R5; Task 3 step 4 compares the log with `ci.yml`).
 3. **Ceilings on the VM:** `ulimit -u` ≥ 4 096 (the core suite peaks at about 1 650 threads), PyYAML present (Task 1 probe).
 4. **Runner contention:** the one Linux runner never runs two jobs, so a test run and a release compile never share the 12 GB (Task 3 step 5).
-5. **Dependabot and outside PRs** still get the GitHub checks, gitlink-only ones included (CI-R1, Task 2 step 3).
+5. **Outside and Dependabot PRs** get no automatic check (CI-R1): the skills say how to test one (`test/pr-<number>` after reading it).
 
 ## File structure
 
@@ -80,7 +80,7 @@ Plan review: fable, 2026-11-23, APPROVE WITH FIXES (2 critical, 10 important, 8 
 
 - [ ] **Step 1:** Move the bodies of the steps "One copy of rustafits and solvemyastro" and "Headless core builds without rustafits or solvemyastro" verbatim into the two scripts (`#!/usr/bin/env bash`, `set -euo pipefail`). The steps become `run: scripts/ci/lock_guard.sh` and `run: scripts/ci/headless_check.sh`. Apply CI-R1 and CI-R6, comments included.
 - [ ] **Step 2: Verify locally.** Both scripts exit 0 on the dev Mac. The lock guard's negative check reproduces non-zero (starloom-p3 plan, Task 1 step 5). `yaml.safe_load` parses `ci.yml`.
-- [ ] **Step 3: GitHub reading (owner's word: a branch and a draft PR on the public repo).** `gh pr create --draft` from a throwaway branch: both jobs start. Cancel the runs (`gh run cancel`), close the PR, delete the branch.
+- [x] **Step 3: GitHub reading.** Done 2026-11-23 under the PR trigger (draft PR #27: both jobs started; cancelled, closed, branch deleted). Option A then replaced the trigger with `workflow_dispatch`; no second PR is needed.
 
 ### Task 3: `test:linux` and the `test/*` pipeline
 
