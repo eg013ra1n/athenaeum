@@ -466,19 +466,6 @@ Phase 1 merged into main on 2026-11-23; what it did is deleted from this list; w
 - **x86_64 golden rows (P2-6).** The stage goldens have float rows for `aarch64-macos` only; other platforms check
   determinism and the `"*"` row. Rows for x86_64 Linux and Windows wait for public CI (P2-6); record them by hand from
   the printed literal.
-- **rustafits `PlanePrep` zero-timings test hook (phase-1 ruling C4).** The pass-1 artifact (`.athm`) stores rustafits'
-  `star_measure::PlanePrep`, whose private `timings` (`PhaseTimings`, ms per phase) and `verdict_time` (`Duration`)
-  differ on every run, so the `pass1_artifact` golden row is deterministic only because starloom's test hook
-  `FramePass1::fix_stamp_and_zero_timings` serialises each prep, rewrites the postcard tail (those two fields are the
-  last stored ones) with zeros and reads it back; it panics if rustafits changes that layout. Owner 2026-11-23: no
-  rustafits release for this alone; with the next rustafits release for another reason:
-  1. rustafits `Cargo.toml`: a `test-support` feature;
-  2. `PlanePrep::zero_timings(&mut self)` under `#[cfg(any(test, feature = "test-support"))]`, `#[doc(hidden)]`,
-     setting both fields to zero;
-  3. here: starloom's `test-support` forwards `rustafits/test-support`, the hook calls `zero_timings()` and the tail
-     rewrite and its unit test go; the golden rows must stay unedited.
-  Not chosen: dropping the timings from the stored prep (a layout change: `PASS1_ARTIFACT_VERSION` bump and every
-  user's pass-1 cache recomputed, for a test-only need).
 
 ---
 

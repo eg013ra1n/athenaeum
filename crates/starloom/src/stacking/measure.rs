@@ -1984,43 +1984,6 @@ pub fn pass1_peak(dir: &Path) -> usize {
         .map_or(0, |(_, _, peak)| *peak)
 }
 
-/// Test-only (ruling C4): zeroes the two wall-clock fields of a rustafits `PlanePrep` that no public setter reaches,
-/// its `PhaseTimings` (four `u64` ms) and its `verdict_time`. They are the LAST two fields postcard stores for a prep
-/// (`population` and `sub` are `serde(skip)`), so the bytes are rewritten at the tail: the prefix stays, the four
-/// varints become zero and the `Duration` becomes zero, and the prep is read back from the new bytes. A rustafits test
-/// hook that zeroes them replaces this at the next rustafits bump.
-///
-/// # Panics
-///
-/// When the stored layout is no longer "timings, then verdict_time, last".
-#[cfg(any(test, feature = "test-support"))]
-fn zero_prep_timings(prep: &mut sm::PlanePrep) {
-    const LAYOUT: &str = "rustafits PlanePrep's stored layout changed (timings and verdict_time are no longer its \
-                          last stored fields): add a rustafits test hook that zeroes them instead (starloom phase 1, \
-                          ruling C4)";
-    let bytes = postcard::to_allocvec(prep).unwrap_or_else(|e| panic!("{LAYOUT}: {e}"));
-    let time_tail = postcard::to_allocvec(&prep.verdict_time()).unwrap_or_else(|e| panic!("{LAYOUT}: {e}"));
-    assert!(bytes.ends_with(&time_tail), "{LAYOUT}");
-    let mut end = bytes.len() - time_tail.len();
-    // Four varints, parsed backward: a varint is bytes with the high bit set and one last byte with it clear, so from
-    // a terminal byte the run of high-bit-set bytes before it is that varint's body.
-    for _ in 0..4 {
-        assert!(end > 0 && bytes[end - 1] & 0x80 == 0, "{LAYOUT}");
-        end -= 1;
-        while end > 0 && bytes[end - 1] & 0x80 != 0 {
-            end -= 1;
-        }
-    }
-    let mut new = bytes[..end].to_vec();
-    new.extend(postcard::to_allocvec(&sm::PhaseTimings::default()).unwrap_or_else(|e| panic!("{LAYOUT}: {e}")));
-    new.extend(postcard::to_allocvec(&Duration::ZERO).unwrap_or_else(|e| panic!("{LAYOUT}: {e}")));
-    *prep = postcard::from_bytes(&new).unwrap_or_else(|e| panic!("{LAYOUT}: {e}"));
-    assert!(
-        prep.verdict_time() == Duration::ZERO && postcard::to_allocvec(prep).is_ok_and(|b| b == new),
-        "{LAYOUT}"
-    );
-}
-
 impl FramePass1 {
     /// Every plane's own β, in plane order.
     pub fn beta_own(&self) -> &[f64] {
@@ -2035,10 +1998,11 @@ impl FramePass1 {
     }
 
     /// Test-only: makes this first pass's stored bytes deterministic. The identity's modification time becomes the Unix
-    /// epoch (its length, the file's own, stays), and every wall-clock field the artifact writes becomes zero.
+    /// epoch (its length, the file's own, stays), and every wall-clock field the artifact writes becomes zero (inside
+    /// each `PlanePrep` through rustafits' `PlanePrep::zero_timings`).
     ///
-    /// The fixed first pass equals one read back from disk: the postcard round trip resets the unstored `population` and
-    /// `sub`, which a stored prep never holds.
+    /// Only the stored bytes are made deterministic: what the artifact does not store (a prep's `population` and its
+    /// sub-step timers) stays as measured, so the fixed value is not equal in memory to one read back from disk.
     #[cfg(any(test, feature = "test-support"))]
     // doc(hidden): an SL-17 test hook (test-support)
     #[doc(hidden)]
@@ -2056,7 +2020,7 @@ impl FramePass1 {
         }
         self.planes.walls.iter_mut().for_each(|w| *w = Duration::ZERO);
         for prep in &mut self.planes.preps {
-            zero_prep_timings(prep);
+            prep.zero_timings();
         }
     }
 
@@ -2496,8 +2460,8 @@ pub(crate) mod tests {
         path
     }
 
-    /// Ruling C4: a first pass measured twice and fixed gives the same stored bytes, so the timings inside every
-    /// `PlanePrep` (which no public setter reaches) are zeroed by the tail rewrite.
+    /// Ruling C4: a first pass measured twice and fixed gives the same stored bytes, so every wall-clock field it stores
+    /// is zeroed, the ones inside each `PlanePrep` by rustafits' `PlanePrep::zero_timings`.
     #[test]
     fn a_fixed_first_pass_stores_the_same_bytes_every_time() {
         let dir = tempfile::tempdir().unwrap();
