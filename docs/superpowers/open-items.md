@@ -321,6 +321,10 @@ contain forward slashes.
 
 ## Known flaky test
 
+- **`sharing::iroh::tests::live_hedge_fires_with_the_default_stream_limit` (2026-11-23, GitHub Linux, once, run of
+  5e1ba6f8, whose changes touch no sharing code).** "bytes fetched twice that no hedge was charged for": 2 129 920 against
+  2 097 152 (one 32 KiB chunk over). A sibling of the skipped `hedge_cancels_the_loser_and_bounds_duplicate_bytes`; not
+  investigated. If it recurs, look at how a hedge's duplicate bytes are charged at the cut, not at the transport.
 - **`services::machine::tests::proc_sample_reads_something` (Windows, 2026-11-22, once; passed on two reruns).** It asserts
   a non-zero `cpu_ns` after a 2 M-iteration busy loop; `GetProcessTimes` ticks at about 15.6 ms, so a loop that finishes inside
   one tick reads 0 (the footprint half of the sample was readable). Not a product fault. Owed: make the test burn CPU until
