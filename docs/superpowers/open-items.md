@@ -321,6 +321,11 @@ contain forward slashes.
 
 ## Known flaky test
 
+- **Core tests and the starloom grid counters (2026-11-23, not probed).** Starloom's own tests now panic when a TPS
+  grid is built outside `grid_counters::exclusive()` (starloom v0.1.2, `cfg(test)` only), which found the last such
+  starloom test. Core's tests read the same counters through `test-support` (`stacking/plan.rs`, `run/crop_tests.rs`)
+  and hold the lock, but no check covers a core test that builds TPS grids without it. If a core grid-count test
+  flakes, run core's suite with that check enabled under `test-support` and `--test-threads=1` before anything else.
 - **`sharing::iroh::tests::live_hedge_fires_with_the_default_stream_limit` (2026-11-23, GitHub Linux, once, run of
   5e1ba6f8, whose changes touch no sharing code).** "bytes fetched twice that no hedge was charged for": 2 129 920 against
   2 097 152 (one 32 KiB chunk over). A sibling of the skipped `hedge_cancels_the_loser_and_bounds_duplicate_bytes`; not
