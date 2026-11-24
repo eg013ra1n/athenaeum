@@ -724,7 +724,7 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
 }
 
 /// Stage 3 (measurement) config subtree: the kernel's [`starloom::stacking::config::measurement_subtree`] (the
-/// measurement settings, the scale estimator, [`MEASURE_VERSION`] and the `.athf` format version).
+/// measurement settings, the scale estimator, `MEASURE_VERSION` and the `.athf` format version).
 pub fn measurement_subtree(cfg: &StackingConfig) -> serde_json::Value {
     starloom::stacking::config::measurement_subtree(&cfg.algorithm())
 }
@@ -753,7 +753,7 @@ fn measurement_subtree_with_measure_version(cfg: &StackingConfig, measure_versio
 }
 
 /// Stage 5 (registration) config subtree: the kernel's [`starloom::stacking::config::registration_subtree`]
-/// (the registration settings, [`MEASURE_VERSION`], `alignVersion`).
+/// (the registration settings, `MEASURE_VERSION`, `alignVersion`).
 pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     starloom::stacking::config::registration_subtree(&cfg.algorithm())
 }
@@ -775,7 +775,7 @@ fn registration_subtree_with_measure_version(cfg: &StackingConfig, measure_versi
 }
 
 /// Stage 6 (local normalization) config subtree: the kernel's [`starloom::stacking::config::normalization_subtree`]
-/// (the whole `normalization` block, `measurement.psfModel` and `maxStars`, [`MEASURE_VERSION`], `lnModelVersion`).
+/// (the whole `normalization` block, `measurement.psfModel` and `maxStars`, `MEASURE_VERSION`, `lnModelVersion`).
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
     starloom::stacking::config::normalization_subtree(&cfg.algorithm())
 }
