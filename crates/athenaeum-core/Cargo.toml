@@ -242,6 +242,10 @@ name = "xisf_convert_probe"
 required-features = ["render"]
 
 [[example]]
+name = "rustafits_header_text"
+required-features = ["render"]
+
+[[example]]
 name = "drizzle_probe"
 required-features = ["render", "solver"]
 
