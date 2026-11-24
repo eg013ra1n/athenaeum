@@ -35,20 +35,18 @@ use crate::calibration_library::light_cal::{
 use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalCardInputs};
 use crate::calibration_library::light_resolve::resolve_frame_inputs;
 use crate::export::models::{calibrated_output_filename, CalibratedLightOptions};
+// Named by the tests below through `use super::*`.
+#[cfg(test)]
 use crate::fits_writer::keywords::Bayer;
 use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
 use crate::integration::banded::probe_bitpix;
 use crate::integration::cfa::CfaGeometry;
 use crate::integration::IntegrationError;
 use crate::models::LightCalParams;
+#[cfg(test)]
 use astroimage::processing::vng::vng_debayer_f32;
+#[cfg(test)]
 use astroimage::BayerPattern;
-
-/// Keywords a debayered output must not carry: they describe a mosaic that no
-/// longer exists in the file. `ROWORDER` deliberately stays — it describes the
-/// row direction of the DATA, which debayering does not change, and a consumer
-/// still needs it to display the frame the right way up.
-const MOSAIC_KEYWORDS: [&str; 3] = ["BAYERPAT", "XBAYROFF", "YBAYROFF"];
 
 /// What one generated artifact turned out to be. Everything a caller needs to
 /// record the file in a manifest or an export result — and nothing that would
@@ -181,96 +179,16 @@ impl GenerationSpec {
     }
 }
 
-/// CALSTAT computed from which masters actually apply — must match the
-/// engine's own construction: a dark subtraction removes bias and dark in one
-/// go (`"BD"`), else a bias subtraction (`"B"`), plus `"F"` when a flat
-/// divides. Predicted here because the header is built before the engine runs.
-fn compute_calstat(dark: bool, bias: bool, flat: bool) -> String {
-    let base = if dark {
-        "BD"
-    } else if bias {
-        "B"
-    } else {
-        ""
-    };
-    if flat {
-        format!("{base}F")
-    } else {
-        base.to_string()
-    }
-}
-
-/// The mosaic as the debayer must see it: a pattern with the frame's
-/// `XBAYROFF`/`YBAYROFF` phase already folded in.
-///
-/// The debayer takes a pattern and nothing else — it reads the tile at
-/// `(x & 1, y & 1)`, i.e. it assumes phase zero. Our geometry carries offsets,
-/// and an ODD offset is not a detail: shifting RGGB one column right lands G
-/// where R was, which is the pattern GRBG. Ignoring the offsets would hand the
-/// debayer a mosaic one step out of phase and swap red with blue.
-///
-/// Both shifts are their own inverse (shifting twice returns the original), so
-/// each is written as a pairing rather than a table of sixteen entries; the
-/// unit test cross-checks all four patterns against
-/// [`crate::integration::cfa::cfa_channel_at`], the codebase's own definition
-/// of where each colour sits.
-/// `pub` since M4d Task 1: the stacking run's Bayer drizzle routes a mosaic
-/// pixel to its colour's plane with the SAME phase-corrected pattern the
-/// debayer was given, and must read it through this one function.
-pub fn bayer_for(geom: CfaGeometry) -> BayerPattern {
-    // A column shift swaps the two columns of the 2x2 tile...
-    let shifted = if geom.xoff.rem_euclid(2) == 1 {
-        match geom.pattern {
-            Bayer::Rggb => Bayer::Grbg,
-            Bayer::Grbg => Bayer::Rggb,
-            Bayer::Bggr => Bayer::Gbrg,
-            Bayer::Gbrg => Bayer::Bggr,
-        }
-    } else {
-        geom.pattern
-    };
-    // ...and a row shift swaps its two rows.
-    let shifted = if geom.yoff.rem_euclid(2) == 1 {
-        match shifted {
-            Bayer::Rggb => Bayer::Gbrg,
-            Bayer::Gbrg => Bayer::Rggb,
-            Bayer::Bggr => Bayer::Grbg,
-            Bayer::Grbg => Bayer::Bggr,
-        }
-    } else {
-        shifted
-    };
-    match shifted {
-        Bayer::Rggb => BayerPattern::Rggb,
-        Bayer::Bggr => BayerPattern::Bggr,
-        Bayer::Gbrg => BayerPattern::Gbrg,
-        Bayer::Grbg => BayerPattern::Grbg,
-    }
-}
-
-/// The VNG debayer of one CFA plane, its `XBAYROFF`/`YBAYROFF` phase folded
-/// in through [`bayer_for`] — the one debayer the generator and the stacking
-/// run's Prepare share (plan 6b-2 C12). Full resolution, three planes,
-/// planar RGB.
-pub fn debayer_plane(
-    data: &[f32],
-    width: usize,
-    height: usize,
-    geom: CfaGeometry,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Vec<f32> {
-    let pattern = bayer_for(geom);
-    match pool {
-        Some(p) => p.install(|| vng_debayer_f32(data, width, height, pattern)),
-        None => vng_debayer_f32(data, width, height, pattern),
-    }
-}
+// The debayer glue lives in `starloom` (`starloom::calibration_library::debayer`): the Bayer phase a debayer must
+// see, the VNG debayer of one CFA plane, the mosaic keywords and the predicted CALSTAT. The old paths stay.
+pub use starloom::calibration_library::debayer::{bayer_for, debayer_plane};
+use starloom::calibration_library::debayer::compute_calstat;
 
 /// A debayered file's header (plan 6b-2 C12): the mosaic keywords removed
 /// (they describe a mosaic that no longer exists in the file) and
 /// `ATH_CDBM = 'VNG'` added.
 pub fn debayered_cards(cards: &mut Vec<Card>) -> Result<(), crate::fits_writer::FitsWriteError> {
-    cards.retain(|c| !MOSAIC_KEYWORDS.contains(&c.keyword.as_str()));
+    starloom::calibration_library::debayer::drop_mosaic_cards(cards);
     cards.push(Card::new("ATH_CDBM", CardValue::Str("VNG".into()))?);
     Ok(())
 }

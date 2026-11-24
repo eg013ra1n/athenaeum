@@ -3,117 +3,14 @@
 //! normalized by the group maximum per channel; the frame-level weight is
 //! the mean over channels.
 
-// The weight modes, formulas, selection and `best_by_weight` live in the kernel; this file keeps the two-pass
-// reference pick, the sky-penalized order and the LN field, which read Athenaeum items.
+// The weight modes, formulas, selection, `best_by_weight`, the sky-penalized order and the reference-coverage
+// estimator live in the kernel; this file keeps the two-pass reference pick and the LN field, which read Athenaeum
+// items.
 pub use starloom::stacking::weights::*;
 
+// Named by the tests below through `use super::*`.
+#[cfg(test)]
 use crate::geometry::PixelMap;
-
-/// The sky-penalized normalization ranking (spec §4.4/§5.2, ruling
-/// R-M3-17 v2): the set's reference frame (manual pin or auto
-/// [`best_by_weight`]) is the REGISTRATION reference only — it no longer
-/// anchors normalization just because it happens to be a group's member.
-/// Instead, every admissible member (the same `included` gate
-/// [`best_by_weight`] applies — the weight-floor/star-count exclusion has
-/// already happened upstream in `select_frames`, `included` just carries
-/// its verdict) scores
-///
-/// ```text
-/// s_i = weight.normalized_mean / sqrt(sky[i])
-/// ```
-///
-/// where `sky[i]` is the frame's mean per-plane background (mean over
-/// `FrameMeasurement.channels[*].median`) — faint-signal SNR scales as
-/// `1 / sqrt(background)`, so this both ranks by weight AND penalizes a
-/// bright sky. A member whose `sky[i]` is non-finite or `<= 0` is not a
-/// candidate at all (dropped from the result, not merely ranked last) —
-/// there is no physical background to take a square root of.
-///
-/// Fix round 1, Important 2: `sky[i]` is floored to
-/// `SKY_BACKGROUND_FLOOR_FRACTION` (1%) of the admissible candidates' own
-/// median background before the square root — an over-subtracted master
-/// dark (a warmer/longer dark, an amp-glow mismatch) can leave a frame's
-/// measured background genuinely near zero without the frame's own
-/// calibration having failed outright (which is what the `<= 0` drop above
-/// already catches); left unfloored, such a frame would win by a landslide
-/// and become the anchor AND the whole LN reference, normalizing the
-/// master to the one frame whose calibration is suspect. The floor is
-/// relative, not absolute, because a real background sits anywhere from
-/// ~1e-3 to ~5e-2 in native units depending on the site/target — no single
-/// absolute constant would both catch a genuinely broken frame and leave a
-/// genuinely dark-sky one alone.
-///
-/// Returns the admissible candidates' ORIGINAL indices, descending by
-/// `s_i`; ties broken by the higher weight, then by star count
-/// ([`best_by_weight`]'s own tie-break), then by the higher original
-/// index — this last tie-break exists ONLY so a FULL tie (equal score,
-/// equal weight, equal star count) matches `best_by_weight`'s own
-/// `Iterator::max_by` semantics, which return the LAST of equally maximum
-/// elements; without it a stable sort's "first survivor wins" would
-/// disagree with `best_by_weight` on that one degenerate case (pinned by
-/// `sky_penalized_order_matches_best_by_weight_on_a_full_tie`). On a group
-/// whose members share one background (the common case on a single-night
-/// set), `s_i` is monotonic in weight, so this order's first element is
-/// exactly what [`best_by_weight`] would return — the two rules coincide
-/// except when sky varies enough across members to move the ranking (a
-/// real single night can drift 20-30% night-to-night with altitude/
-/// moonrise, enough to reorder near-ties even without a second night in
-/// the mix).
-///
-/// The caller takes the first element as the group's NORMALIZATION anchor
-/// (`GroupInput.reference`, `normalization_reference_frame_id`), and the
-/// first `normalization.local.referenceFrames` elements as the LN
-/// reference's member list (`stacking::run::run_group_normalization`, in
-/// place of ranking by raw weight alone — `stacking::ln::reference::
-/// build_reference` itself is unchanged, it still ranks by weight whatever
-/// candidate set it is handed, but the run now hands it this sky-penalized
-/// top-N instead of the whole group). Fix round 1, Important 3: an EMPTY
-/// result (every member dropped for a non-finite/non-positive background)
-/// is the caller's signal to fall back to [`best_by_weight`] — this
-/// function itself never fails, an empty `Vec` is a valid, honest answer.
-pub(crate) fn sky_penalized_order(
-    weights: &[FrameWeight],
-    included: &[bool],
-    star_counts: &[usize],
-    sky: &[f64],
-) -> Vec<usize> {
-    let mut candidates: Vec<usize> = (0..weights.len())
-        .filter(|&i| included.get(i).copied().unwrap_or(false))
-        .filter(|&i| sky.get(i).is_some_and(|&bg| bg.is_finite() && bg > 0.0))
-        .collect();
-    if candidates.is_empty() {
-        return candidates;
-    }
-    let median_bg = {
-        let mut bgs: Vec<f64> = candidates.iter().map(|&i| sky[i]).collect();
-        bgs.sort_by(f64::total_cmp);
-        let n = bgs.len();
-        if n % 2 == 1 {
-            bgs[n / 2]
-        } else {
-            0.5 * (bgs[n / 2 - 1] + bgs[n / 2])
-        }
-    };
-    let floor = SKY_BACKGROUND_FLOOR_FRACTION * median_bg;
-    let score = |i: usize| weights[i].normalized_mean / sky[i].max(floor).sqrt();
-    candidates.sort_by(|&a, &b| {
-        score(b)
-            .total_cmp(&score(a))
-            .then_with(|| {
-                weights[b]
-                    .normalized_mean
-                    .total_cmp(&weights[a].normalized_mean)
-            })
-            .then_with(|| star_counts.get(b).cmp(&star_counts.get(a)))
-            .then_with(|| b.cmp(&a))
-    });
-    candidates
-}
-
-/// Fix round 1, Important 2: the floor [`sky_penalized_order`] clamps a
-/// candidate's background to, as a fraction of the admissible candidates'
-/// own median background — see that function's doc for the rationale.
-const SKY_BACKGROUND_FLOOR_FRACTION: f64 = 0.01;
 
 // ── The two-pass registration reference (spec §4.4, ruling R-M4a-5) ─────────
 
@@ -310,64 +207,6 @@ pub(crate) fn two_pass_pick_among(
     } else {
         None
     }
-}
-
-/// Minimum [`reference_coverage`] fraction for a candidate to be
-/// admissible as the normalization anchor or an LN-reference member (spec
-/// §4.4, ruling R-M3-17 v2 addendum). Fix round 1, Important 6: the
-/// threshold was chosen from the estimator's OWN measured values at
-/// 6224×4168 (reproducible with [`reference_coverage`] as shipped, a pure
-/// rotation about the rectangle's centre) — 1°→1.0, 2°→0.988, 3°→0.980,
-/// **4°→0.969 (the first crossing below 0.97)**, 5°→0.957; a 30-px
-/// translation dither loses far less, ≈0.995. A rotation this small only
-/// clips the four corners' nearest grid cell(s) — the loss is
-/// tangential-to-the-boundary near each corner, not radial, so it grows
-/// slower than a first guess of "a couple of degrees" suggests; 0.97 is
-/// set just past the measured 4° crossing, comfortably below what a real
-/// misregistration this filter exists to catch (a different camera angle,
-/// a badly failed solve) actually produces.
-pub(crate) const MIN_REFERENCE_COVERAGE: f64 = 0.97;
-
-/// The fraction of the reference rectangle `[0, ref_w) x [0, ref_h)` a
-/// registered frame's own footprint covers (spec §4.4, ruling R-M3-17 v2
-/// addendum): a rotated frame, a frame from a session with another camera
-/// angle, or a badly offset one must not become the normalization anchor
-/// nor an LN-reference member — normalizing to it (or modelling the LN
-/// reference's background on it) would carry its uncovered corners/edges
-/// into every other frame.
-///
-/// Estimated by mapping a 32 x 32 grid of reference-pixel CELL CENTRES
-/// (over `[0, ref_w) x [0, ref_h)`) through `map.inverse` (reference pixel
-/// → subject pixel) and counting the fraction that lands inside the
-/// frame's own native extent `[0, src_w) x [0, src_h)`. Pure/deterministic;
-/// the caller compares the result against [`MIN_REFERENCE_COVERAGE`].
-pub(crate) fn reference_coverage(
-    map: &PixelMap,
-    src_w: usize,
-    src_h: usize,
-    ref_w: usize,
-    ref_h: usize,
-) -> f64 {
-    const GRID: usize = 32;
-    if ref_w == 0 || ref_h == 0 {
-        return 0.0;
-    }
-    let mut covered = 0usize;
-    for gy in 0..GRID {
-        let ry = (gy as f64 + 0.5) * ref_h as f64 / GRID as f64;
-        for gx in 0..GRID {
-            let rx = (gx as f64 + 0.5) * ref_w as f64 / GRID as f64;
-            // 1024 probes, and NOT followed by a warp of this frame — a
-            // candidate this ranking rejects is never resampled at all.
-            // The exact path (ruling R-T4-3a) keeps that from building a
-            // half-million-sample displacement grid per candidate.
-            let (sx, sy) = map.inverse_exact(rx, ry);
-            if sx >= 0.0 && sx < src_w as f64 && sy >= 0.0 && sy < src_h as f64 {
-                covered += 1;
-            }
-        }
-    }
-    covered as f64 / (GRID * GRID) as f64
 }
 
 /// Probes per frame side on the LN field's lattice (plan 6b-3 D8, review

@@ -10,38 +10,10 @@ use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::{Card, CardValue, FitsWriteError};
 use anyhow::Result;
 
-/// Header keywords copied verbatim from the source LIGHT frame's own
-/// on-disk cards. Categorized per spec §7 ("WCS cards, optics, DATE-OBS,
-/// session cards, BAYERPAT/XBAYROFF/YBAYROFF"):
-///
-/// - WCS: the plate-solve solution, if the source carries one.
-/// - Optics/acquisition: the equivalent of what `build_master_cards`
-///   (`headers.rs`) derives from its structured `MasterHeaderInputs` —
-///   EXPTIME, GAIN, binning, pixel size, INSTRUME, TELESCOP, FOCALLEN,
-///   FILTER, … — taken here directly from the raw source cards since a
-///   calibrated light has no structured equivalent input.
-/// - Session/target: OBJECT, coordinates, site, observer.
-/// - Bayer/CFA geometry (mosaic preserved un-debayered per §2). ROWORDER
-///   belongs to this group: the CFA pattern is only interpretable together
-///   with the row direction it was declared in, so dropping it flips the
-///   phase (and the colors) of every consumer that debayers the output.
-///
-/// Anything not listed here (IMAGETYP, CALSTAT, ATH_* provenance) is either
-/// replaced or freshly derived by [`build_light_cal_cards`], never copied
-/// blind from the source.
-const COPY_THROUGH_KEYWORDS: &[&str] = &[
-    // WCS solution
-    "CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CDELT1", "CDELT2", "CD1_1",
-    "CD1_2", "CD2_1", "CD2_2", "CROTA1", "CROTA2", "CUNIT1", "CUNIT2", "WCSAXES", "EQUINOX",
-    "RADESYS", "LONPOLE", "LATPOLE", "PLTSOLVD", // Optics / acquisition
-    "EXPTIME", "GAIN", "OFFSET", "EGAIN", "XBINNING", "YBINNING", "XPIXSZ", "YPIXSZ", "CCD-TEMP",
-    "SET-TEMP", "INSTRUME", "TELESCOP", "FOCALLEN", "APTDIA", "FILTER",
-    // Observation timestamp
-    "DATE-OBS", // Session / target
-    "OBJECT", "OBJCTRA", "OBJCTDEC", "RA", "DEC", "SITELAT", "SITELONG", "SITEELEV", "OBSERVER",
-    // Bayer / CFA geometry
-    "BAYERPAT", "XBAYROFF", "YBAYROFF", "ROWORDER",
-];
+// The header keywords copied verbatim from the source LIGHT frame's own cards are the kernel's list (starloom);
+// everything not on it (IMAGETYP, CALSTAT, ATH_* provenance) is replaced or freshly derived by
+// [`build_light_cal_cards`], never copied blind from the source.
+use starloom::calibration_library::COPY_THROUGH_KEYWORDS;
 
 /// Inputs specific to one calibrated-light run, not derivable from the
 /// source header alone. `dark`/`flat`/`bias` are `(uuid, path)` of the

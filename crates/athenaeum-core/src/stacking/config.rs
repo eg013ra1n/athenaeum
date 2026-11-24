@@ -11,19 +11,29 @@
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+// Named by the tests below through `use super::*`.
+#[cfg(test)]
 use crate::resample::Interpolation;
+#[cfg(test)]
 use crate::stacking::fits_artifact::FITS_ARTIFACT_VERSION;
+#[cfg(test)]
 use crate::stacking::integrate::RejectionChoice;
+#[cfg(test)]
 use crate::stacking::register::align::ALIGN_VERSION;
+#[cfg(test)]
 use crate::stacking::register::DistortionChoice;
+#[cfg(test)]
 use crate::star_measure::MEASURE_VERSION;
+#[cfg(test)]
 use starloom::stacking::measure::MEASURE_STAGE_VERSION;
 
-// The measurement and drizzle configs, the seed source and the kernel's bounds are the kernel's; this file keeps the
-// resolution, the presets and every stage hash.
+// The measurement and drizzle configs, the seed source, the algorithm sections with their presets and stage subtrees,
+// and the kernel's bounds are the kernel's; this file keeps the resolution, the app's own presets lines and the
+// stage hash that folds upstream and sources.
 pub use starloom::stacking::config::{
-    DrizzleConfig, DrizzleKernel, MeasurementConfig, SeedSource, DRIZZLE_KERNEL_VERSION, MAX_GROWTH,
-    MAX_PROTECTED_LAYERS, MIN_PROTECTED_LAYERS,
+    algorithm_preset, AlgorithmConfig, DrizzleConfig, DrizzleKernel, MeasurementConfig, SeedSource, StackingPreset,
+    CALIBRATION_HASH_GROUPING_TOLERANCE_SEC, DRIZZLE_KERNEL_VERSION, MAX_GROWTH, MAX_PROTECTED_LAYERS,
+    MIN_PROTECTED_LAYERS,
 };
 
 /// Bumped only when the `StackingConfig` shape changes in a way an old
@@ -65,6 +75,23 @@ impl Default for StackingConfig {
             drizzle: DrizzleConfig::default(),
             output: OutputConfig::default(),
             paths: PathsConfig::default(),
+        }
+    }
+}
+
+impl StackingConfig {
+    /// The seven algorithm sections (calibration, measurement, selection, registration, normalization, integration and
+    /// drizzle), cloned: what the kernel's stage subtrees and presets read. Grouping, reference, output and paths are
+    /// the app's own.
+    pub fn algorithm(&self) -> AlgorithmConfig {
+        AlgorithmConfig {
+            calibration: self.calibration.clone(),
+            measurement: self.measurement.clone(),
+            selection: self.selection.clone(),
+            registration: self.registration.clone(),
+            normalization: self.normalization.clone(),
+            integration: self.integration.clone(),
+            drizzle: self.drizzle.clone(),
         }
     }
 }
@@ -243,17 +270,6 @@ pub struct PathsConfig {
     pub output_dir: Option<String>,
 }
 
-/// spec §9.2: built-in config transforms. Editing any field afterward makes
-/// the effective config "Custom" — that bookkeeping belongs to the caller
-/// (the Stacking tab / run orchestration), not here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
-pub enum StackingPreset {
-    Default,
-    FastPreview,
-    MaximumQuality,
-}
-
 /// Resolves a [`StackingPreset`] to its `StackingConfig`.
 ///
 /// `MaximumQuality` (M3 Task 5, spec §9.2): now turns on everything the spec
@@ -273,32 +289,24 @@ pub enum StackingPreset {
 /// about as much as the integration itself, and a preview has no use for it.
 /// `Default` and `MaximumQuality` inherit `Local`.
 pub fn preset(p: StackingPreset) -> StackingConfig {
-    match p {
-        StackingPreset::Default => StackingConfig::default(),
-        StackingPreset::FastPreview => {
-            let mut c = StackingConfig::default();
-            c.registration.interpolation = Interpolation::Bilinear;
-            c.reference.two_pass = false;
-            c.integration.rejection = RejectionChoice::SigmaClip {
-                sigma_low: 4.0,
-                sigma_high: 3.0,
-            };
-            // OD-3: a preview's promise is speed - no Normalize stage.
-            c.normalization.rejection =
-                crate::integration::stats::RejectionNormalization::ScaleZeroOffset;
-            c.output.cleanup = CleanupPolicy::DeleteIntermediates;
-            c
-        }
-        StackingPreset::MaximumQuality => {
-            let mut c = StackingConfig::default();
-            c.registration.distortion = DistortionChoice::Polynomial3;
-            c.integration.write_rejection_maps = true;
-            c.normalization.local.enabled = true;
-            c.drizzle.enabled = true;
-            c.drizzle.scale = 2;
-            c
-        }
+    // The algorithm sections are the kernel's (`algorithm_preset`); the app's own sections keep their defaults,
+    // except where a preset says otherwise below.
+    let algorithm = algorithm_preset(p);
+    let mut c = StackingConfig {
+        calibration: algorithm.calibration,
+        measurement: algorithm.measurement,
+        selection: algorithm.selection,
+        registration: algorithm.registration,
+        normalization: algorithm.normalization,
+        integration: algorithm.integration,
+        drizzle: algorithm.drizzle,
+        ..StackingConfig::default()
+    };
+    if p == StackingPreset::FastPreview {
+        c.reference.two_pass = false;
+        c.output.cleanup = CleanupPolicy::DeleteIntermediates;
     }
+    c
 }
 
 /// Whole-config precedence (spec §9.2): a stored per-set config, when
@@ -709,210 +717,73 @@ pub fn prepare_subtree(cfg: &StackingConfig) -> serde_json::Value {
     })
 }
 
-/// The `grouping.exposureToleranceSec` value [`calibration_subtree`] writes, whatever the config says (spec
-/// 2026-11-08 §5.2). It holds the hash shape — a set at the shipped default tolerance keeps a byte-identical hash —
-/// and says nothing about the run: the tolerance decides which frames share a group, never what a calibrated frame
-/// contains.
-pub const CALIBRATION_HASH_GROUPING_TOLERANCE_SEC: f64 = 2.0;
-
-/// Stage 1 (calibration) config subtree (spec §9.3): the frame's
-/// calibration options plus the grouping key's shape, written as the
-/// constant [`CALIBRATION_HASH_GROUPING_TOLERANCE_SEC`] (not the config's
-/// tolerance).
+/// Stage 1 (calibration) config subtree (spec §9.3): the kernel's [`starloom::stacking::config::calibration_subtree`]
+/// over this config's algorithm sections.
 pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    // `calibration.format` (the XISF plan, 2026-09-18, ruling R6) is the
-    // container an EXPORT or a SEND writes; the run forces FITS for its own
-    // calibrated frames before the spec is resolved (`stacking::run`), so
-    // the field can never change a cached calibrated artifact and must not
-    // move this hash — otherwise every set would recalibrate once for a
-    // field it ignores. Pinned by `format_moves_the_run_fingerprint_but_no_stage_hash`.
-    let mut calibration =
-        serde_json::to_value(&cfg.calibration).expect("CalibratedLightOptions serializes");
-    if let Some(obj) = calibration.as_object_mut() {
-        obj.remove("format");
-    }
-    // Spec 2026-10-02 §8 (fable C1): the grouping half is written out field
-    // by field, in exactly today's shape. A new `GroupingConfig` field
-    // regroups frames (its group keys change, so group-keyed artifacts are
-    // recomputed under the new keys) but must never move this hash, which
-    // would make every frame set recompute once. Pinned by
-    // `stage_hashes_are_pinned_to_golden_literals`.
-    serde_json::json!({
-        "calibration": calibration,
-        "grouping": { "exposureToleranceSec": CALIBRATION_HASH_GROUPING_TOLERANCE_SEC },
-    })
+    starloom::stacking::config::calibration_subtree(&cfg.algorithm())
 }
 
-/// Stage 3 (measurement) config subtree: the measurement settings, the
-/// scale estimator normalization keeps in lockstep with it (see
-/// [`MeasurementConfig::measure_options`]), and
-/// [`crate::star_measure::MEASURE_VERSION`] — the config alone
-/// cannot express "the fitter itself now accepts different stars", which is
-/// what M4a Task 2 did to every stored measurement (ruling R-M4a-15).
+/// Stage 3 (measurement) config subtree: the kernel's [`starloom::stacking::config::measurement_subtree`] (the
+/// measurement settings, the scale estimator, [`MEASURE_VERSION`] and the `.athf` format version).
 pub fn measurement_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    measurement_subtree_with_fits_artifact_version(cfg, FITS_ARTIFACT_VERSION)
+    starloom::stacking::config::measurement_subtree(&cfg.algorithm())
 }
 
-/// [`measurement_subtree`] with the `.athf` format version supplied (Plan D D2c r1): the version the Measure stage's
-/// `fits.<plane>` files are written at is folded beside [`MEASURE_VERSION`] (`fitsArtifactVersion`), so a row measured at
-/// another format version is keyed on another hash and misses by key. The plan gate then needs no read of the file: a
-/// fresh row is its hash and its stat (`plan::is_fresh`). Nothing else should call this with anything but
-/// [`FITS_ARTIFACT_VERSION`]; the pins of earlier versions go through
-/// [`measurement_subtree_with_measure_version`], which keeps the shape from before the fold.
+/// [`measurement_subtree`] with the `.athf` format version supplied (Plan D D2c r1); nothing else should call this
+/// with anything but [`FITS_ARTIFACT_VERSION`].
+#[cfg(test)]
 pub(crate) fn measurement_subtree_with_fits_artifact_version(
     cfg: &StackingConfig,
     fits_artifact_version: u16,
 ) -> serde_json::Value {
-    let mut subtree = measurement_subtree_with_measure_version(cfg, MEASURE_VERSION);
-    subtree["fitsArtifactVersion"] = serde_json::json!(fits_artifact_version);
-    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
-    subtree
+    starloom::stacking::config::measurement_subtree_with_fits_artifact_version(
+        &cfg.algorithm(),
+        fits_artifact_version,
+    )
 }
 
-/// Folds starloom's [`MEASURE_STAGE_VERSION`] into a subtree that reads the measure stage's numbers, as
-/// `measureStageVersion`, only when it is not 1: at 1 the key is absent, so every hash keeps the bytes it had before
-/// the version existed (starloom phase 1, P1-R1). A bump recomputes the measurement, registration and normalization
-/// artifacts, and is raised together with `PASS1_ARTIFACT_VERSION`.
-pub(crate) fn fold_measure_stage_version(subtree: &mut serde_json::Value, version: u32) {
-    if version != 1 {
-        subtree["measureStageVersion"] = serde_json::json!(version);
-    }
+// Folds starloom's `MEASURE_STAGE_VERSION` into a subtree, only when it is not 1 (starloom phase 1, P1-R1).
+#[cfg(test)]
+pub(crate) use starloom::stacking::config::fold_measure_stage_version;
+
+/// [`measurement_subtree`] with the measure version supplied, so a test can prove the hash actually follows it.
+#[cfg(test)]
+fn measurement_subtree_with_measure_version(cfg: &StackingConfig, measure_version: u32) -> serde_json::Value {
+    starloom::stacking::config::measurement_subtree_with_measure_version(&cfg.algorithm(), measure_version)
 }
 
-/// [`measurement_subtree`] with the measure version supplied, so a test can
-/// prove the hash actually follows it (nothing else should call this with
-/// anything but [`MEASURE_VERSION`]).
-fn measurement_subtree_with_measure_version(
-    cfg: &StackingConfig,
-    measure_version: u32,
-) -> serde_json::Value {
-    // Spec 2026-11-08 §5.4: the weights are computed in every run from the stored measurements (`run/`
-    // `stage_measure_with`, `compute_weights`) and no fit reads `weightMode`, `formula` or `keyword`, so they are
-    // written as the shipped defaults: changing the weighting must not re-measure. A set with default weights keeps
-    // its hash byte for byte.
-    let defaults = MeasurementConfig::default();
-    let mut measurement = cfg.measurement.clone();
-    measurement.weight_mode = defaults.weight_mode;
-    measurement.formula = defaults.formula;
-    measurement.keyword = defaults.keyword;
-    serde_json::json!({
-        "measurement": measurement,
-        "normalization": { "scaleEstimator": cfg.normalization.scale_estimator },
-        "measureVersion": measure_version,
-    })
-}
-
-/// Stage 5 (registration) config subtree, plus
-/// [`crate::star_measure::MEASURE_VERSION`] (Tier C Task 3, ruling
-/// C-6): a mono frame's registration star list can now come straight from
-/// Measure's own accepted PSF fits (`stacking::register::detect::
-/// stars_from_fits`) instead of a fresh detection, so a fitter change —
-/// which changes what those fits SAY — has to re-register every mono set
-/// exactly the way it already re-measures and re-normalizes them (the same
-/// reasoning [`measurement_subtree`]/[`normalization_subtree`] already
-/// follow). The first run after this fold-in re-registers every set once
-/// on purpose, rewriting every `registered` artifact
-/// (perf tier A Task 6a) and re-running every downstream stage that reads
-/// it (Normalize, Integrate).
-///
-/// It also carries [`crate::stacking::register::align::ALIGN_VERSION`]
-/// (`alignVersion`, robust quad seed RQ-5): what `align` returns for an
-/// unchanged star list (the seed, the coverage gate) is no config field
-/// either, so a change in it moves this hash the way a fitter change does —
-/// every set re-registers once, and Calibrate and Measure stay cached.
+/// Stage 5 (registration) config subtree: the kernel's [`starloom::stacking::config::registration_subtree`]
+/// (the registration settings, [`MEASURE_VERSION`], `alignVersion`).
 pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    let mut subtree = registration_subtree_with_versions(cfg, MEASURE_VERSION, ALIGN_VERSION);
-    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
-    subtree
+    starloom::stacking::config::registration_subtree(&cfg.algorithm())
 }
 
-/// [`registration_subtree`] with both versions supplied, so a test can prove
-/// the hash follows each (nothing else should call this with anything but
-/// [`MEASURE_VERSION`] and [`ALIGN_VERSION`]). The measure-version pin
-/// goes through [`registration_subtree_with_measure_version`], which
-/// keeps the shape from before the fold.
+/// [`registration_subtree`] with both versions supplied, so a test can prove the hash follows each.
+#[cfg(test)]
 fn registration_subtree_with_versions(
     cfg: &StackingConfig,
     measure_version: u32,
     align_version: u32,
 ) -> serde_json::Value {
-    let mut subtree = registration_subtree_with_measure_version(cfg, measure_version);
-    subtree["alignVersion"] = serde_json::json!(align_version);
-    subtree
+    starloom::stacking::config::registration_subtree_with_versions(&cfg.algorithm(), measure_version, align_version)
 }
 
-/// [`registration_subtree`] with the measure version supplied and no
-/// `alignVersion` — see [`measurement_subtree_with_measure_version`].
-fn registration_subtree_with_measure_version(
-    cfg: &StackingConfig,
-    measure_version: u32,
-) -> serde_json::Value {
-    serde_json::json!({
-        "registration": cfg.registration,
-        "measureVersion": measure_version,
-    })
+/// [`registration_subtree`] with the measure version supplied and no `alignVersion`.
+#[cfg(test)]
+fn registration_subtree_with_measure_version(cfg: &StackingConfig, measure_version: u32) -> serde_json::Value {
+    starloom::stacking::config::registration_subtree_with_measure_version(&cfg.algorithm(), measure_version)
 }
 
-/// Stage 6 (local normalization, M2) config subtree: the whole
-/// `normalization` block (global output/rejection choice AND the `local`
-/// block — a change to either invalidates a stored `.athln`/reference; this
-/// already covers the PSF model [`crate::stacking::ln::normalize_frame`]
-/// actually hands [`crate::stacking::ln::scale::relative_scale`], which is
-/// `normalization.local.psfModel`, never `measurement.psfModel`) plus
-/// `measurement.maxStars` — the ONE genuinely extra fold-in, since it is the
-/// detection/PSF-fit budget `relative_scale` uses for both planes but lives
-/// under `measurement`, not `normalization`. `measurement.psfModel` rides
-/// along too (harmless — it just widens what invalidates a sidecar — but
-/// plays no role in `relative_scale`'s own model choice; fix round 1, item
-/// 11: an earlier version of this comment claimed otherwise), plus
-/// [`crate::star_measure::MEASURE_VERSION`]: `relative_scale` fits
-/// its matched stars through the same `fit_stars` /
-/// `FitParams::default()` the measurement uses, so a change to what the
-/// fitter accepts silently changes every `.athln` — and no config field
-/// moves when it does (ruling R-M4a-15). It also carries
-/// [`crate::stacking::ln::LN_MODEL_VERSION`] (`lnModelVersion`): a change in
-/// what an existing config's LN model produces moves the hashes the same way.
+/// Stage 6 (local normalization) config subtree: the kernel's [`starloom::stacking::config::normalization_subtree`]
+/// (the whole `normalization` block, `measurement.psfModel` and `maxStars`, [`MEASURE_VERSION`], `lnModelVersion`).
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    let mut subtree = normalization_subtree_with_measure_version(cfg, MEASURE_VERSION);
-    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
-    subtree
+    starloom::stacking::config::normalization_subtree(&cfg.algorithm())
 }
 
-/// [`normalization_subtree`] with the measure version supplied — see
-/// [`measurement_subtree_with_measure_version`].
-fn normalization_subtree_with_measure_version(
-    cfg: &StackingConfig,
-    measure_version: u32,
-) -> serde_json::Value {
-    serde_json::json!({
-        "normalization": canonical_normalization(cfg),
-        "measurement": {
-            "psfModel": cfg.measurement.psf_model,
-            "maxStars": cfg.measurement.max_stars,
-        },
-        "measureVersion": measure_version,
-        "lnModelVersion": crate::stacking::ln::LN_MODEL_VERSION,
-    })
-}
-
-/// The normalization block as the LN hashes see it (L-19): `scale`,
-/// `scaleMode` and `gridSize` leave it - their effect reaches the hashes as
-/// the resolved-scale token - so auto <-> fixed at the same resolved value
-/// invalidates nothing.
-fn canonical_normalization(cfg: &StackingConfig) -> serde_json::Value {
-    let mut v = serde_json::to_value(&cfg.normalization).expect("NormalizationConfig serializes");
-    if let Some(local) = v.get_mut("local").and_then(|l| l.as_object_mut()) {
-        for key in ["scale", "scaleMode", "gridSize"] {
-            local.remove(key);
-        }
-        // The aperture only matters under the common aperture (spec §7).
-        if cfg.normalization.local.flux_estimator
-            != crate::stacking::integrate::LnFluxEstimator::CommonAperture
-        {
-            local.remove("aperture");
-        }
-    }
-    v
+/// [`normalization_subtree`] with the measure version supplied.
+#[cfg(test)]
+fn normalization_subtree_with_measure_version(cfg: &StackingConfig, measure_version: u32) -> serde_json::Value {
+    starloom::stacking::config::normalization_subtree_with_measure_version(&cfg.algorithm(), measure_version)
 }
 
 /// The document a project's first plan stores (spec §9.4): the global
@@ -2596,5 +2467,56 @@ mod tests {
             assert_eq!(subtree_xxh3(&registration_subtree(&cfg)), reg, "{name}: registration subtree moved");
             assert_eq!(subtree_xxh3(&normalization_subtree(&cfg)), nrm, "{name}: normalization subtree moved");
         }
+    }
+
+    /// Starloom phase 2 (Task 7): the algorithm sections of every preset are starloom's `algorithm_preset`, key for
+    /// key: a preset that moved must not drift from the copy the kernel's own tools read.
+    #[test]
+    fn the_algorithm_subtrees_of_every_preset_equal_starloom_s() {
+        const KEYS: [&str; 7] = [
+            "calibration",
+            "measurement",
+            "selection",
+            "registration",
+            "normalization",
+            "integration",
+            "drizzle",
+        ];
+        for (name, p) in every_preset() {
+            let whole = serde_json::to_value(preset(p)).unwrap();
+            let kernel = serde_json::to_value(algorithm_preset(p)).unwrap();
+            for key in KEYS {
+                assert_eq!(whole[key], kernel[key], "{name}: the {key} section differs");
+            }
+            assert_eq!(
+                kernel.as_object().unwrap().len(),
+                KEYS.len(),
+                "{name}: the kernel's algorithm config carries exactly the seven sections"
+            );
+            assert_eq!(preset(p).algorithm(), algorithm_preset(p), "{name}: algorithm() is the same value");
+        }
+    }
+
+    /// Starloom phase 2 (Task 7): the default `StackingConfig`, as a document, is the fixture starloom's own tests
+    /// parse (`starloom/tests/fixtures/stacking-config-default.json`), so a change to a default that the kernel's
+    /// tests do not see is red here.
+    #[test]
+    fn the_starloom_fixture_is_the_default_stacking_config() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("starloom")
+            .join("tests")
+            .join("fixtures")
+            .join("stacking-config-default.json");
+        let text = std::fs::read_to_string(&path).expect("the starloom fixture is readable");
+        let fixture: serde_json::Value = serde_json::from_str(&text).expect("the fixture is JSON");
+        // Both sides come from text: an `f32` field prints with its own shortest digits, which `to_value` would widen.
+        let current: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&StackingConfig::default()).unwrap()).unwrap();
+        assert_eq!(
+            fixture, current,
+            "regenerate starloom/tests/fixtures/stacking-config-default.json from StackingConfig::default()"
+        );
     }
 }

@@ -1332,10 +1332,11 @@ pub(crate) fn fits_artifact_fresh_for_planes(
 /// per frame in both this gate and the run's freshness check, and such a
 /// frame is reported as stale by both and warned about by the run.
 pub(crate) fn wants_cfa_mosaic(cfg: &StackingConfig, group: &IntegrationGroup) -> bool {
-    cfg.drizzle.enabled
-        && cfg.drizzle.bayer
-        && cfg.calibration.debayer_osc
-        && group.color_mode == ColorMode::Osc
+    starloom::stacking::run_helpers::wants_cfa_mosaic(
+        &cfg.drizzle,
+        &cfg.calibration,
+        group.color_mode == ColorMode::Osc,
+    )
 }
 
 /// The plane count every member of `group` has after stage 1, and so the

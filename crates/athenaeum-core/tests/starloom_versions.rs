@@ -14,6 +14,8 @@ use starloom::stacking::measure::MEASURE_STAGE_VERSION;
 #[cfg(feature = "solver")]
 use starloom::stacking::ln::grid::LN_GRID_VERSION;
 #[cfg(feature = "solver")]
+use starloom::stacking::fits_artifact::FITS_ARTIFACT_VERSION;
+#[cfg(feature = "solver")]
 use starloom::stacking::ln::LN_MODEL_VERSION;
 #[cfg(feature = "solver")]
 use starloom::stacking::pass1_artifact::PASS1_ARTIFACT_VERSION;
@@ -30,6 +32,7 @@ fn starloom_versions_are_the_accepted_ones() {
     assert_eq!(DRIZZLE_KERNEL_VERSION, 2, "DRIZZLE_KERNEL_VERSION: {accepted}");
     assert_eq!(PASS1_ARTIFACT_VERSION, 1, "PASS1_ARTIFACT_VERSION: {accepted}");
     assert_eq!(LN_GRID_VERSION, 1, "LN_GRID_VERSION (the .athln version): {accepted}");
+    assert_eq!(FITS_ARTIFACT_VERSION, 3, "FITS_ARTIFACT_VERSION (the .athf version): {accepted}");
 }
 
 /// The two version-less stages' signal versions enter no hash: a bump recomputes nothing, so it is accepted here.
