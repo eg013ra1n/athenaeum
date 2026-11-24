@@ -4,10 +4,10 @@
 
 import { RefreshCw } from 'lucide-react';
 import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
+import { PsfModelSelect } from '../PsfModelSelect';
 import { Checkbox } from '../../settings/Checkbox';
 import { psfModelLabel, seedSourceLabel, weightModeLabel } from '../stageSummary';
 import type {
-  PsfModel,
   SeedSource,
   SeedPrefilter,
   StackingConfig,
@@ -23,8 +23,6 @@ const WEIGHT_MODES: WeightMode[] = [
   'keyword',
   'none',
 ];
-
-const PSF_MODELS: PsfModel[] = ['auto', 'moffat4'];
 
 const SEED_PREFILTERS: SeedPrefilter[] = ['none', 'median3'];
 
@@ -189,29 +187,22 @@ export function MeasurePanel({
         </div>
       )}
 
-      <div>
-        <label className="block text-xs text-content-secondary mb-1">PSF model</label>
-        <select
-          value={m.psfModel}
-          disabled={disabled}
-          onChange={(e) => patchMeasurement({ psfModel: e.target.value as PsfModel })}
-          className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
-        >
-          {PSF_MODELS.map((v) => (
-            <option key={v} value={v}>
-              {psfModelLabel(v)}
-            </option>
-          ))}
-        </select>
-        <p className="mt-1 text-[11px] text-content-muted">
-          default {psfModelLabel(defaults.measurement.psfModel)} — the Moffat β every star is
-          fitted at. Auto first measures each frame's own β (the median free-β fit of its brightest
-          unsaturated stars, between 1.5 and 100 — a Gaussian star reads near 100 — or 4 when fewer
-          than 8 of them fit), then fits every frame of the group at one group β: the lower median
-          of those, the same β local normalization uses. A frame's own β is kept as a diagnostic.
-          Moffat-4 holds β at 4 on every frame.
-        </p>
-      </div>
+      <PsfModelSelect
+        value={m.psfModel}
+        onChange={(psfModel) => patchMeasurement({ psfModel })}
+        label={psfModelLabel}
+        disabled={disabled}
+        help={
+          <>
+            default {psfModelLabel(defaults.measurement.psfModel)} — the Moffat β every star is
+            fitted at. Auto first measures each frame's own β (the median free-β fit of its brightest
+            unsaturated stars, between 1.5 and 100 — a Gaussian star reads near 100 — or 4 when fewer
+            than 8 of them fit), then fits every frame of the group at one group β: the lower median
+            of those, the same β local normalization uses. A frame's own β is kept as a diagnostic.
+            Moffat-4 holds β at 4 on every frame; Moffat, own β holds it at the value you give.
+          </>
+        }
+      />
 
       <NumericField
         label="Max stars"

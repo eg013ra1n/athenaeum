@@ -11,7 +11,7 @@ export type SeedDetector = "peak" | "structure";
 
 export type SeedSource = "matchedFilter" | "peak" | "structure";
 
-export type PsfModel = "auto" | "moffat4";
+export type PsfModel = "auto" | "moffat4" | { "moffat": number };
 
 export type WeightMode = "psfSignalWeight" | "psfSnr" | "noise" | "formula" | "exposure" | "keyword" | "none";
 

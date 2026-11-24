@@ -12,10 +12,11 @@
 
 import { NumericField } from '../NumericField';
 import { LN_SCALES, apertureLabel, effectiveScaleMode, fluxEstimatorLabel, resolvedScaleLines } from './lnScale';
+import { PsfModelSelect } from '../PsfModelSelect';
 import { Checkbox } from '../../settings/Checkbox';
 import { ParamPair } from '../ParamPair';
 import { normalizePsfModelLabel, outputNormLabel, rejectionNormLabel } from '../stageSummary';
-import type { LnAperture, LnFluxEstimator, OutputNormalization, PsfModel, RejectionNormalization, ScaleEstimator, StackingConfig, StackingPlan } from '../../../types/stacking';
+import type { LnAperture, LnFluxEstimator, OutputNormalization, RejectionNormalization, ScaleEstimator, StackingConfig, StackingPlan } from '../../../types/stacking';
 
 const OUTPUT_NORMS: OutputNormalization[] = [
   'none',
@@ -26,7 +27,6 @@ const OUTPUT_NORMS: OutputNormalization[] = [
 ];
 const REJECTION_NORMS: RejectionNormalization[] = ['none', 'scaleZeroOffset', 'equalizeFluxes', 'local'];
 const SCALE_ESTIMATORS: ScaleEstimator[] = ['bwmv', 'mad', 'avgDev'];
-const PSF_MODELS: PsfModel[] = ['auto', 'moffat4'];
 const FLUX_ESTIMATORS: LnFluxEstimator[] = ['psfSignal', 'commonAperture'];
 const APERTURES: LnAperture[] = ['fwhm2', 'fwhm3', 'growthCurve'];
 const SELECT_CLASS =
@@ -249,22 +249,13 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
               help={`Stars with a pixel above this fraction of the brightest pixel in the frame are left out. default ${defaults.normalization.local.starSelection.saturation}`}
             />
 
-            <div>
-              <label className="block text-xs text-content-secondary mb-1">PSF model</label>
-              <select
-                value={n.local.psfModel}
-                disabled={disabled}
-                onChange={(e) => patchLocal({ psfModel: e.target.value as PsfModel })}
-                className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
-              >
-                {PSF_MODELS.map((v) => (
-                  <option key={v} value={v}>{normalizePsfModelLabel(v)}</option>
-                ))}
-              </select>
-              <p className="mt-1 text-[11px] text-content-muted">
-                default {normalizePsfModelLabel(defaults.normalization.local.psfModel)}
-              </p>
-            </div>
+            <PsfModelSelect
+              value={n.local.psfModel}
+              onChange={(psfModel) => patchLocal({ psfModel })}
+              label={normalizePsfModelLabel}
+              disabled={disabled}
+              help={`default ${normalizePsfModelLabel(defaults.normalization.local.psfModel)}`}
+            />
 
             <div>
               <Checkbox

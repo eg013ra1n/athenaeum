@@ -197,6 +197,7 @@ export function seedSourceLabel(v: SeedSource): string {
 }
 
 export function psfModelLabel(v: PsfModel): string {
+  if (typeof v === 'object') return `Moffat β ${v.moffat}`;
   switch (v) {
     case 'auto': return 'Auto (group β: lower median of the frames\' β)';
     case 'moffat4': return 'Moffat-4';
@@ -206,6 +207,7 @@ export function psfModelLabel(v: PsfModel): string {
 /** The Normalize stage's PSF model label: in a run, local normalization's `Auto` fits every frame of a group at the
  *  group's one β (the lower median of its frames' measured β), not at a β of its own. */
 export function normalizePsfModelLabel(v: PsfModel): string {
+  if (typeof v === 'object') return `Moffat β ${v.moffat}`;
   switch (v) {
     case 'auto': return 'Auto (group β: lower median of the frames\' β)';
     case 'moffat4': return 'Moffat-4';
