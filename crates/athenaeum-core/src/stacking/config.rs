@@ -27,14 +27,18 @@ use crate::star_measure::MEASURE_VERSION;
 #[cfg(test)]
 use starloom::stacking::measure::MEASURE_STAGE_VERSION;
 
-// The measurement and drizzle configs, the seed source, the algorithm sections with their presets and stage subtrees,
-// and the kernel's bounds are the kernel's; this file keeps the resolution, the app's own presets lines and the
-// stage hash that folds upstream and sources.
+// The measurement and drizzle configs, the seed source, the algorithm sections with their presets, stage subtrees and
+// resolution (`resolve_algorithm`), and the kernel's bounds are the kernel's; this file keeps the app half of the
+// resolution, the app's own presets lines and the stage hash that folds upstream and sources.
 pub use starloom::stacking::config::{
     algorithm_preset, AlgorithmConfig, DrizzleConfig, DrizzleKernel, MeasurementConfig, SeedSource, StackingPreset,
-    CALIBRATION_HASH_GROUPING_TOLERANCE_SEC, DRIZZLE_KERNEL_VERSION, MAX_GROWTH, MAX_PROTECTED_LAYERS,
-    MIN_PROTECTED_LAYERS,
+    CALIBRATION_HASH_GROUPING_TOLERANCE_SEC, DRIZZLE_KERNEL_VERSION, MAX_DETECTION_SIGMA, MAX_GROWTH,
+    MAX_PROTECTED_LAYERS, MAX_SEED_THRESHOLD, MAX_TPS_SMOOTHING, MIN_DETECTION_SIGMA, MIN_FIT_STARS,
+    MIN_PROTECTED_LAYERS, MIN_SEED_THRESHOLD, MIN_TPS_SMOOTHING,
 };
+// The two clamps the tests below call by name; the resolution itself is the kernel's (`resolve_algorithm`).
+#[cfg(test)]
+use starloom::stacking::config::{clamp_detection_sigma, clamp_tps_smoothing};
 
 /// Bumped only when the `StackingConfig` shape changes in a way an old
 /// stored document can't decode through `#[serde(default)]` alone (spec
@@ -103,24 +107,6 @@ impl StackingConfig {
 /// `stacking_run_groups`'s `UNIQUE(run_id, group_key)`.
 pub const MIN_EXPOSURE_TOLERANCE_SEC: f64 = 0.01;
 
-/// The range [`resolve_config`] clamps [`MeasurementConfig::detection_sigma`]
-/// to — the same numbers `MeasurePanel`'s field offers, enforced on the
-/// backend too because a stored or hand-edited document never went through
-/// that field (M4a Task 2 fix round 3).
-pub const MIN_DETECTION_SIGMA: f64 = 1.0;
-pub const MAX_DETECTION_SIGMA: f64 = 100.0;
-
-/// The range [`resolve_config`] clamps
-/// [`crate::stacking::register::RegistrationConfig::tps_smoothing`] to —
-/// the same 0–10 `RegisterPanel`'s field offers (M4c Task 4 fix round 1,
-/// minor 5). Enforced on the backend for the same reason as
-/// `detectionSigma`: a stored or hand-edited document never went through
-/// that field, and a negative or non-finite λ would otherwise make
-/// `ThinPlateSpline::fit` refuse EVERY frame's spline one at a time, with
-/// a per-frame note instead of one honest warning about the config.
-pub const MIN_TPS_SMOOTHING: f64 = 0.0;
-pub const MAX_TPS_SMOOTHING: f64 = 10.0;
-
 /// spec 2026-10-02 §8 (plan 6b-2 C2/C3): how a group's exposure classes
 /// are formed. `seconds` is today's tolerance clustering — the frame-set
 /// default, so an existing stack regroups nothing; `stops` takes every
@@ -177,11 +163,6 @@ impl Default for GroupingConfig {
         }
     }
 }
-
-/// The smallest `measurement.fitStars` ([`resolve_config`] clamps up to `max(MIN_FIT_STARS, registration.maxStars)`):
-/// mono Register takes Measure's fits whenever they exist and never falls back to detection, so a K under its
-/// budget would starve it (FM-3).
-pub const MIN_FIT_STARS: u32 = 1_000;
 
 /// spec §9.2 `reference:`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -360,236 +341,34 @@ pub fn resolve_config(
         );
         config.grouping.stops_width = MIN_STOPS_WIDTH;
     }
-    config.registration.tps_smoothing = clamp_tps_smoothing(config.registration.tps_smoothing);
-    // M4c Task 3: the same backend guard for the large-scale filter's two
-    // integers. Out of range these are not preferences but a broken filter
-    // — the window doubles with every layer, so a hand-edited
-    // `protectedLayers: 40` would ask for a 2^41-wide window (and shift a
-    // `usize` past its width), and a large `growth` grows every structure
-    // by a disc of that radius. The UI's own fields already offer exactly
-    // these ranges.
-    if !(MIN_PROTECTED_LAYERS..=MAX_PROTECTED_LAYERS)
-        .contains(&config.integration.large_scale.protected_layers)
-    {
-        let clamped = config
-            .integration
-            .large_scale
-            .protected_layers
-            .clamp(MIN_PROTECTED_LAYERS, MAX_PROTECTED_LAYERS);
-        warn!(
-            value = config.integration.large_scale.protected_layers,
-            clamped, "stacking config: protectedLayers out of range; clamped"
-        );
-        config.integration.large_scale.protected_layers = clamped;
-    }
-    if config.integration.large_scale.growth > MAX_GROWTH {
-        warn!(
-            value = config.integration.large_scale.growth,
-            clamped = MAX_GROWTH,
-            "stacking config: growth above the maximum; clamped"
-        );
-        config.integration.large_scale.growth = MAX_GROWTH;
-    }
-    resolve_ln_fields(&mut config);
+    // The algorithm half (the `tpsSmoothing` and large-scale filter clamps, then the LN fields, the seed clamps and
+    // `fitStars`) is the kernel's, so the CLI resolves a config exactly as this does.
+    on_algorithm(&mut config, starloom::stacking::config::resolve_algorithm);
     Ok(config)
 }
 
 /// L-9 and the spec §6 clamps for the LN fields (and the two seed clamps
 /// `detectionSigma` / `seedThreshold`), on any config that came from
 /// storage or from a caller (resolve_config, a plan override, a decoded user
-/// preset), and the `measurement.fitStars` clamp ([`resolve_fit_stars`]). Idempotent.
+/// preset), and the `measurement.fitStars` clamp. Idempotent. The kernel's
+/// [`starloom::stacking::config::resolve_ln_fields`] on the algorithm sections.
 pub(crate) fn resolve_ln_fields(config: &mut StackingConfig) {
-    // The two seed clamps ride the same shared resolver, so a plan override or
-    // a decoded preset cannot carry an out-of-range value past resolve_config.
-    config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
-    config.measurement.seed_threshold = clamp_seed_threshold(config.measurement.seed_threshold);
-    resolve_fit_stars(config);
-    use crate::stacking::integrate::LnScaleMode;
-    use crate::stacking::ln::{effective_scale_mode, snap_ln_scale, MAX_GRID_SIZE, MIN_GRID_SIZE};
-    let local = &mut config.normalization.local;
-    if local.scale_mode.is_none() {
-        let mode = effective_scale_mode(local);
-        tracing::debug!(
-            scale = local.scale,
-            ln_scale_mode = mode.as_str(),
-            "stacking config: legacy LN scale resolved"
-        );
-        local.scale_mode = Some(mode);
-    }
-    if local.scale_mode == Some(LnScaleMode::Fixed) {
-        let snapped = snap_ln_scale(local.scale as f64);
-        if snapped != local.scale {
-            warn!(
-                value = local.scale,
-                clamped = snapped,
-                "stacking config: LN scale is not a supported size; snapped"
-            );
-            local.scale = snapped;
-        }
-    }
-    if !(MIN_GRID_SIZE..=MAX_GRID_SIZE).contains(&local.grid_size) {
-        let clamped = local.grid_size.clamp(MIN_GRID_SIZE, MAX_GRID_SIZE);
-        warn!(
-            value = local.grid_size,
-            clamped, "stacking config: LN gridSize out of range; clamped"
-        );
-        local.grid_size = clamped;
-    }
-    let sel = &mut local.star_selection;
-    // `!(x >= MIN)` so a NaN clamps to the minimum too.
-    if !(sel.min_peak_snr >= 5.0) || sel.min_peak_snr > 200.0 {
-        let clamped = if sel.min_peak_snr > 200.0 { 200.0 } else { 5.0 };
-        warn!(
-            value = sel.min_peak_snr,
-            clamped, "stacking config: LN starSelection.minPeakSnr out of range; clamped"
-        );
-        sel.min_peak_snr = clamped;
-    }
-    if !(20..=5000).contains(&sel.max_stars) {
-        let clamped = sel.max_stars.clamp(20, 5000);
-        warn!(
-            value = sel.max_stars,
-            clamped, "stacking config: LN starSelection.maxStars out of range; clamped"
-        );
-        sel.max_stars = clamped;
-    }
-    if !(sel.saturation >= 0.5) || sel.saturation > 1.0 {
-        let clamped = if sel.saturation > 1.0 { 1.0 } else { 0.5 };
-        warn!(
-            value = sel.saturation,
-            clamped, "stacking config: LN starSelection.saturation out of range; clamped"
-        );
-        sel.saturation = clamped;
-    }
+    on_algorithm(config, starloom::stacking::config::resolve_ln_fields);
 }
 
-/// `measurement.fitStars` (FM-3): a K under the floor `max(`[`MIN_FIT_STARS`]`, registration.maxStars)` is clamped up
-/// to it with a `warn!`; a K at or above `measurement.maxStars` is All and is stored as `None` (equivalent configs
-/// share hashes); a `selection.minStars` above the effective K warns, since selection reads `stars_fitted` and every
-/// frame would be excluded. Idempotent. The probe passes its K straight to the module and never comes through here.
-fn resolve_fit_stars(config: &mut StackingConfig) {
-    let Some(k) = config.measurement.fit_stars else {
-        return;
-    };
-    let floor = MIN_FIT_STARS.max(u32::try_from(config.registration.max_stars).unwrap_or(u32::MAX));
-    let resolves_to_all = |k: u32| k as usize >= config.measurement.max_stars;
-    let k = if k < floor {
-        if resolves_to_all(floor) {
-            warn!(
-                value = k,
-                clamped = floor,
-                "stacking config: fitStars below the floor; resolves to all"
-            );
-        } else {
-            warn!(
-                value = k,
-                clamped = floor,
-                "stacking config: fitStars below the floor; clamped"
-            );
-        }
-        floor
-    } else {
-        k
-    };
-    if resolves_to_all(k) {
-        config.measurement.fit_stars = None;
-        return;
-    }
-    config.measurement.fit_stars = Some(k);
-    if let Some(min) = config.selection.min_stars {
-        if min > k as usize {
-            warn!(
-                value = min,
-                count = k,
-                "stacking config: selection.minStars above fitStars; every frame would be excluded"
-            );
-        }
-    }
-}
-
-/// [`MeasurementConfig::detection_sigma`] into
-/// `[MIN_DETECTION_SIGMA, MAX_DETECTION_SIGMA]`, warning when it moves.
-///
-/// The UI's own field already offers exactly that range; this is the
-/// backend's guard for a value that never went through it — a stored
-/// document, a hand-edited one, or a caller building the struct directly.
-/// Out of range it is not a preference but a broken detector: at `0` or
-/// below, every pixel clears the level, and at an infinity none does.
-///
-/// `!(x >= MIN)` rather than `x < MIN` so a NaN clamps too (every
-/// comparison against NaN is false) — the same shape the exposure-tolerance
-/// floor uses. JSON cannot express NaN or an infinity (`serde_json` rejects
-/// both the literals and out-of-range magnitudes such as `1e309`), so that
-/// arm only ever fires for a programmatic caller; it is cheap and it means
-/// the value handed to the detector is finite by construction.
-fn clamp_detection_sigma(value: f64) -> f64 {
-    if !(value >= MIN_DETECTION_SIGMA) {
-        warn!(
-            detection_sigma = value,
-            min = MIN_DETECTION_SIGMA,
-            "stacking config: detectionSigma below the minimum; clamped"
-        );
-        return MIN_DETECTION_SIGMA;
-    }
-    if value > MAX_DETECTION_SIGMA {
-        warn!(
-            detection_sigma = value,
-            max = MAX_DETECTION_SIGMA,
-            "stacking config: detectionSigma above the maximum; clamped"
-        );
-        return MAX_DETECTION_SIGMA;
-    }
-    value
-}
-
-/// [`MeasurementConfig::seed_threshold`]'s range (ruling R-OSP-2).
-pub const MIN_SEED_THRESHOLD: f64 = crate::star_measure::seeds::MIN_THRESHOLD;
-pub const MAX_SEED_THRESHOLD: f64 = crate::star_measure::seeds::MAX_THRESHOLD;
-
-/// [`MeasurementConfig::seed_threshold`] into [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`], warning when it
-/// moves. `!(x >= MIN)` so a NaN clamps too.
-fn clamp_seed_threshold(value: f64) -> f64 {
-    if !(value >= MIN_SEED_THRESHOLD) {
-        warn!(
-            seed_threshold = value,
-            min = MIN_SEED_THRESHOLD,
-            "stacking config: seedThreshold below the minimum; clamped"
-        );
-        return MIN_SEED_THRESHOLD;
-    }
-    if value > MAX_SEED_THRESHOLD {
-        warn!(
-            seed_threshold = value,
-            max = MAX_SEED_THRESHOLD,
-            "stacking config: seedThreshold above the maximum; clamped"
-        );
-        return MAX_SEED_THRESHOLD;
-    }
-    value
-}
-
-/// [`MIN_TPS_SMOOTHING`]..=[`MAX_TPS_SMOOTHING`], with the one-time
-/// `warn!` the other clamps use. `!(value >= MIN)` rather than
-/// `value < MIN` so a NaN clamps too — every comparison against NaN is
-/// false, and a NaN λ would sink every spline in the run.
-fn clamp_tps_smoothing(value: f64) -> f64 {
-    if !(value >= MIN_TPS_SMOOTHING) {
-        warn!(
-            value,
-            min = MIN_TPS_SMOOTHING,
-            "stacking config: tpsSmoothing below the minimum; clamped"
-        );
-        return MIN_TPS_SMOOTHING;
-    }
-    if value > MAX_TPS_SMOOTHING {
-        warn!(
-            value,
-            max = MAX_TPS_SMOOTHING,
-            "stacking config: tpsSmoothing above the maximum; clamped"
-        );
-        return MAX_TPS_SMOOTHING;
-    }
-    value
+/// Runs `resolve` on the seven algorithm sections of `config` in place.
+fn on_algorithm(config: &mut StackingConfig, resolve: impl FnOnce(&mut AlgorithmConfig)) {
+    let mut algorithm = config.algorithm();
+    resolve(&mut algorithm);
+    let AlgorithmConfig { calibration, measurement, selection, registration, normalization, integration, drizzle } =
+        algorithm;
+    config.calibration = calibration;
+    config.measurement = measurement;
+    config.selection = selection;
+    config.registration = registration;
+    config.normalization = normalization;
+    config.integration = integration;
+    config.drizzle = drizzle;
 }
 
 /// xxh3 of the canonical JSON of the whole resolved config — a run-level
