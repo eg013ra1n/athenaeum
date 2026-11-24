@@ -6855,6 +6855,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "clap",
+ "flate2",
  "glob",
  "libc",
  "postcard",
