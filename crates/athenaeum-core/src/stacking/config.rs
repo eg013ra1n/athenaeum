@@ -2546,4 +2546,55 @@ mod tests {
         let text = serde_json::to_string(&serde_json::json!({"b": 1, "a": 2})).unwrap();
         assert_eq!(text, r#"{"a":2,"b":1}"#, "a crate in the build turned on serde_json preserve_order");
     }
+
+    /// The three presets, with the names the pins print under.
+    fn every_preset() -> [(&'static str, StackingPreset); 3] {
+        [
+            ("Default", StackingPreset::Default),
+            ("FastPreview", StackingPreset::FastPreview),
+            ("MaximumQuality", StackingPreset::MaximumQuality),
+        ]
+    }
+
+    /// xxh3-64 of a subtree's compact JSON, as 16 lowercase hex digits (starloom phase 2, P2-R9: the value a
+    /// manifest entry's stage hash is made of).
+    fn subtree_xxh3(subtree: &serde_json::Value) -> String {
+        let json = serde_json::to_string(subtree).expect("a subtree serializes");
+        format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
+    }
+
+    /// Starloom phase 2 (Task 6): the whole-config fingerprint of every built-in preset, pinned before the preset
+    /// definitions move into starloom. A move that changes one byte of a preset is a red test here.
+    #[test]
+    fn every_preset_config_hash_is_pinned() {
+        let expected = [
+            ("Default", "936429b7aeb6c9c4"),
+            ("FastPreview", "7e61164f16c92c82"),
+            ("MaximumQuality", "84146c93127ef713"),
+        ];
+        for ((name, p), (pinned_name, pinned)) in every_preset().into_iter().zip(expected) {
+            assert_eq!(name, pinned_name);
+            assert_eq!(config_hash(&preset(p)), pinned, "{name}: config_hash moved");
+        }
+    }
+
+    /// Starloom phase 2 (Task 6, P2-R9): xxh3-64 of each stage subtree of every preset, pinned before the subtree
+    /// builders move into starloom. 12 literals, some repeated: a preset differs from the default in only some stages.
+    #[test]
+    fn every_preset_stage_subtree_is_pinned() {
+        // (preset, calibration, measurement, registration, normalization)
+        let expected = [
+            ("Default", "0f3177998fbce0da", "3e6550bbf1c99012", "0a4a72469833a578", "135f0143c278b3e6"),
+            ("FastPreview", "0f3177998fbce0da", "3e6550bbf1c99012", "e8bf9794120c4ab5", "06ab9d4517b16ba5"),
+            ("MaximumQuality", "0f3177998fbce0da", "3e6550bbf1c99012", "dd272ff14698a2da", "eed22cdb5e2a2d25"),
+        ];
+        for ((name, p), (pinned_name, cal, mea, reg, nrm)) in every_preset().into_iter().zip(expected) {
+            assert_eq!(name, pinned_name);
+            let cfg = preset(p);
+            assert_eq!(subtree_xxh3(&calibration_subtree(&cfg)), cal, "{name}: calibration subtree moved");
+            assert_eq!(subtree_xxh3(&measurement_subtree(&cfg)), mea, "{name}: measurement subtree moved");
+            assert_eq!(subtree_xxh3(&registration_subtree(&cfg)), reg, "{name}: registration subtree moved");
+            assert_eq!(subtree_xxh3(&normalization_subtree(&cfg)), nrm, "{name}: normalization subtree moved");
+        }
+    }
 }
