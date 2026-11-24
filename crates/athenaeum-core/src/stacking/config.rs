@@ -2519,4 +2519,80 @@ mod tests {
             "regenerate starloom/tests/fixtures/stacking-config-default.json from StackingConfig::default()"
         );
     }
+
+    /// Starloom phase 2 (Task 8 review I3): xxh3-64 of `serde_json::to_string` of what `resolve_config` makes of
+    /// every preset and of two out-of-range documents, pinned before the algorithm half of the resolution moves into
+    /// starloom. The low document sits under every clamp's floor and takes the fitStars clamp into "all" (`None`) and
+    /// the legacy LN scale (1024, no `scaleMode`) to auto; the high one sits over every clamp's ceiling, takes
+    /// fitStars up to its floor, and reads a 700 px scale with no `scaleMode` as fixed and snaps it.
+    #[test]
+    fn resolve_config_of_every_preset_and_a_clamped_config_is_pinned() {
+        fn resolved_xxh3(doc: &serde_json::Value) -> String {
+            let text = serde_json::to_string(doc).unwrap();
+            let resolved = resolve_config(Some(&text), None).expect("the document decodes");
+            let json = serde_json::to_string(&resolved).unwrap();
+            format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
+        }
+        let expected = [
+            ("Default", "b2251283fd6db5d7"),
+            ("FastPreview", "abb37a38927e5b82"),
+            ("MaximumQuality", "69162191b7c3c934"),
+        ];
+        for ((name, p), (pinned_name, pinned)) in every_preset().into_iter().zip(expected) {
+            assert_eq!(name, pinned_name);
+            let doc = serde_json::to_value(preset(p)).unwrap();
+            assert_eq!(resolved_xxh3(&doc), pinned, "{name}: resolve_config moved");
+        }
+
+        let mut low = serde_json::to_value(StackingConfig::default()).unwrap();
+        low["version"] = serde_json::json!(7);
+        low["grouping"]["exposureToleranceSec"] = serde_json::json!(0.0);
+        low["grouping"]["stopsWidth"] = serde_json::json!(0.0);
+        low["registration"]["tpsSmoothing"] = serde_json::json!(-3.0);
+        low["registration"]["maxStars"] = serde_json::json!(2000);
+        low["integration"]["largeScale"]["protectedLayers"] = serde_json::json!(0);
+        low["measurement"]["detectionSigma"] = serde_json::json!(0.25);
+        low["measurement"]["seedThreshold"] = serde_json::json!(-1.0);
+        low["measurement"]["maxStars"] = serde_json::json!(1500);
+        low["measurement"]["fitStars"] = serde_json::json!(500);
+        low["selection"]["minStars"] = serde_json::json!(3000);
+        let local = low["normalization"]["local"].as_object_mut().unwrap();
+        local.remove("scaleMode");
+        local.insert("scale".to_string(), serde_json::json!(1024));
+        local.insert("gridSize".to_string(), serde_json::json!(0));
+        local["starSelection"]["minPeakSnr"] = serde_json::json!(1.0);
+        local["starSelection"]["maxStars"] = serde_json::json!(10);
+        local["starSelection"]["saturation"] = serde_json::json!(0.1);
+
+        let mut high = serde_json::to_value(StackingConfig::default()).unwrap();
+        high["grouping"]["exposureToleranceSec"] = serde_json::json!(-5.0);
+        high["grouping"]["stopsWidth"] = serde_json::json!(-1.0);
+        high["registration"]["tpsSmoothing"] = serde_json::json!(50.0);
+        high["integration"]["largeScale"]["protectedLayers"] = serde_json::json!(40);
+        high["integration"]["largeScale"]["growth"] = serde_json::json!(9);
+        high["measurement"]["detectionSigma"] = serde_json::json!(500.0);
+        high["measurement"]["seedThreshold"] = serde_json::json!(1.0e6);
+        high["measurement"]["fitStars"] = serde_json::json!(5);
+        let local = high["normalization"]["local"].as_object_mut().unwrap();
+        local.remove("scaleMode");
+        local.insert("scale".to_string(), serde_json::json!(700));
+        local.insert("gridSize".to_string(), serde_json::json!(50));
+        local["starSelection"]["minPeakSnr"] = serde_json::json!(500.0);
+        local["starSelection"]["maxStars"] = serde_json::json!(99_999);
+        local["starSelection"]["saturation"] = serde_json::json!(2.0);
+
+        // The documents reach every rule they are meant to reach.
+        let r_low = resolve_config(Some(&low.to_string()), None).unwrap();
+        assert_eq!(r_low.measurement.fit_stars, None, "a clamp into all canonicalizes to None");
+        assert_eq!(r_low.normalization.local.scale_mode, Some(crate::stacking::integrate::LnScaleMode::Auto));
+        assert_eq!(r_low.normalization.local.grid_size, 2);
+        let r_high = resolve_config(Some(&high.to_string()), None).unwrap();
+        assert_eq!(r_high.measurement.fit_stars, Some(MIN_FIT_STARS.max(r_high.registration.max_stars as u32)));
+        assert_eq!(r_high.normalization.local.scale_mode, Some(crate::stacking::integrate::LnScaleMode::Fixed));
+        assert_eq!(r_high.normalization.local.scale, 768, "700 px snaps to the nearest supported size");
+        assert_eq!(r_high.integration.large_scale.growth, MAX_GROWTH);
+
+        assert_eq!(resolved_xxh3(&low), "0e803d8968dd2151", "the low document: resolve_config moved");
+        assert_eq!(resolved_xxh3(&high), "a769b20c607435ee", "the high document: resolve_config moved");
+    }
 }
