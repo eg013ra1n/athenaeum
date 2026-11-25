@@ -538,11 +538,6 @@ Not smokes unless marked: what the `starloom` command and the `pipeline` layer (
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
-### solvemyastro standalone — the new workflows (2026-11-25)
-
-Branch `solvemyastro-standalone`. `actionlint` was not available, so solvemyastro's new `.github/workflows/ci.yml` and `release.yml` were never checked by a tool.
-- **The first GitHub CI run of those two workflows is the check.** Owed until that run is green; a red run is a workflow fix in solvemyastro, not an Athenaeum one.
-
 ### Starloom phase 0 — the stacking kernel lives in `crates/starloom` (2026-11-22)
 
 Branch `starloom-p0` (spec `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`). Identity on real data was proven

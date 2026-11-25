@@ -858,3 +858,5 @@ Catalog building left Athenaeum: the catalog builder crate and core's Gaia inges
 | The bright cache | `solvemyastro build-cache`, `build-bright-cache` |
 
 The chain with its flags, the "complete cells" rule for a partial Gaia download and the Gaia credit line are in `solvemyastro/README.md` and `solvemyastro/CHANGELOG.md` (0.3.0). A build needs `solvemyastro` with its `catalog` feature (`cargo install solvemyastro --features cli --locked`); Athenaeum enables neither `catalog` nor `cli`.
+
+**Acceptance (2026-11-25).** On the first three Gaia DR3 files the CLI matched the old builder byte for byte: bins (record multisets, 420 of 420), the four tiers, both index packs and both manifests. The installed tiers matched in every interior cell (82 cells differ only in the order of equal-magnitude stars, the new sort key). The crate's first GitHub CI run passed on every feature layer on Linux, on macOS, on Windows and in the publish dry run, and Athenaeum's Windows job passed on EVO-X2.
