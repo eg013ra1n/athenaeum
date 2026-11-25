@@ -501,8 +501,8 @@ Not smokes unless marked: what the `starloom` command and the `pipeline` layer (
 - **The `miniz_oxide` 0.9 / 0.8 duplicate** (0.9 from fitsio-pure, 0.8 from flate2 and png) goes when `png` moves to
   0.9: png 0.18.1 is the latest and still on `^0.8`; 0.17 is pinned by cdshealpix and ico. Accepted by the owner
   2026-11-24.
-- **The `rustafits-release` skill is stale:** it says there is no CHANGELOG (the heading must be `## [X.Y.Z]`) and it
-  pushes `main` after the tag (`main` goes first, then the tag).
+- **The `rustafits-release` skill is stale:** it says there is no `CHANGELOG.md` (there is one, and the release
+  workflow needs a `## [X.Y.Z]` section in it).
 - **Core's `header_text_f64`** (`stacking/measure.rs`, the stacker's XISF gain read) is a looser third header rule
   than the catalog's and rustafits' (quote trim, cut at any `/`, case-sensitive, first card wins). Noted, not
   measured: a gain read there can differ from the catalog's `frames.gain` for an odd XISF header.
