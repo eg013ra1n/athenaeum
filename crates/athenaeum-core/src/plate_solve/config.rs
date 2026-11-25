@@ -299,6 +299,13 @@ mod tests {
         );
     }
 
+    /// The app's default gate settings are solvemyastro's own default gate: a change to either side
+    /// changes the accept/refuse verdicts and must be made on purpose (recipe bump included).
+    #[test]
+    fn the_default_gate_is_solvemyastros() {
+        assert_eq!(acceptance_gate(&PlateSolveConfig::default()), solvemyastro::accept::Gate::default());
+    }
+
     #[test]
     fn legacy_config_json_loads_ignoring_removed_keys() {
         // A config written by an older version carried keys that no longer
