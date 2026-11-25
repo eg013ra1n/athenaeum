@@ -1,47 +1,18 @@
-//! Discover the installed density-tier catalog dirs (or a legacy single cache).
+//! The installed catalog layers: where they live, and their identities.
 //!
 //! The plate-solver consumes an additive stack of disjoint density tiers,
-//! installed as `tier_<density>/stars.smac` under the catalog root. This
-//! module finds those dirs (ascending density = base → deepest) so the caller
-//! can open each as a `StarCache` and pass `Caches::layered(..)` to the solver.
-//! A legacy single `stars.smac` directly under the root is supported as a
-//! 1-layer fallback so old installs keep solving.
+//! installed as `tier_<density>/stars.smac` under the catalog root. Discovery of
+//! those dirs (ascending density = base → deepest, with a legacy single
+//! `stars.smac` as a 1-layer fallback) is `solvemyastro::layout`'s and is
+//! re-exported here. This module keeps Athenaeum's own part: the catalog and
+//! index roots, opening the layers as `StarCache`s for `Caches::layered(..)`,
+//! and the catalog and index identity strings.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-/// Ordered `tier_<density>/` dirs (ascending density) under `catalog_root`.
-///
-/// Falls back to `[catalog_root]` when no tiers exist but a legacy
-/// `stars.smac` is present directly under the root. Returns an empty `Vec`
-/// when neither tiers nor a legacy cache are found (caller surfaces the
-/// "catalog not installed" error).
-pub fn discover_layers(catalog_root: &Path) -> Vec<PathBuf> {
-    let mut tiers: Vec<(u32, PathBuf)> = match std::fs::read_dir(catalog_root) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_str()?.to_string();
-                let density: u32 = name.strip_prefix("tier_")?.parse().ok()?;
-                if e.path().join("stars.smac").is_file() {
-                    Some((density, e.path()))
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    tiers.sort_by_key(|(d, _)| *d);
-    if !tiers.is_empty() {
-        return tiers.into_iter().map(|(_, p)| p).collect();
-    }
-    if catalog_root.join("stars.smac").is_file() {
-        return vec![catalog_root.to_path_buf()];
-    }
-    Vec::new()
-}
+pub use solvemyastro::layout::{discover_index_packs, discover_layers};
 
 /// Why the plate-solve star catalog could not be opened.
 #[derive(Debug)]
@@ -147,27 +118,6 @@ pub fn index_root(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("catalogs").join("smac_index")
 }
 
-/// Pack directories under `root` that hold a `quads.smaq`, sorted by name.
-/// Whether the file opens is for [`open_index_packs`] to find out.
-pub fn discover_index_packs(root: &Path) -> Vec<PathBuf> {
-    let mut packs: Vec<(String, PathBuf)> = match std::fs::read_dir(root) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_str()?.to_string();
-                if e.path().join(solvemyastro::index::INDEX_FILE).is_file() {
-                    Some((name, e.path()))
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    packs.sort_by(|a, b| a.0.cmp(&b.0));
-    packs.into_iter().map(|(_, p)| p).collect()
-}
-
 /// Open every installed quad-index pack under [`index_root`]. A pack that
 /// cannot be opened (a format the solver no longer reads, a damaged file) is
 /// logged and skipped: a missing pack only costs the blind-solve speed-up, so
@@ -225,33 +175,6 @@ pub fn index_identity(app_data_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn discovers_tiers_in_density_order_else_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        for d in ["tier_2000", "tier_500", "tier_8000"] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-            std::fs::write(root.join(d).join("stars.smac"), b"x").unwrap();
-        }
-        // A `tier_*` dir without stars.smac must be ignored.
-        std::fs::create_dir_all(root.join("tier_9999")).unwrap();
-        let got = discover_layers(root);
-        let names: Vec<_> = got
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(names, vec!["tier_500", "tier_2000", "tier_8000"]);
-
-        // Legacy fallback: a bare stars.smac, no tiers.
-        let leg = tempfile::tempdir().unwrap();
-        std::fs::write(leg.path().join("stars.smac"), b"x").unwrap();
-        assert_eq!(discover_layers(leg.path()), vec![leg.path().to_path_buf()]);
-
-        // Neither tiers nor legacy → empty.
-        let empty = tempfile::tempdir().unwrap();
-        assert!(discover_layers(empty.path()).is_empty());
-    }
 
     /// Plan 6b-2 C14: the catalog's identity names every tier with its
     /// `stars.smac` size and mtime, so replacing a tier moves it. With no

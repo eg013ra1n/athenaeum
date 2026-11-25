@@ -439,6 +439,15 @@ Spec `docs/superpowers/specs/2026-11-22-header-fallbacks-design.md`, plan `plans
   (`docs/stacking/README.md` R-P4-C1): last duplicate, no `" / "` cut and blank values dropped here; rustafits unchanged by
   ruling, so no Analysis number moves.
 
+## The in-field count reads 0 — found in the solvemyastro standalone job (2026-11-25)
+
+A defect the job's real-data acceptance found and did not fix (the job moved the code verbatim); its own job, because it changes accept and refuse verdicts.
+`solvemyastro::accept::expected_bright_in_fov` rebuilds the field radius as `scale * sqrt(detected stars) / 3600 / 2 * 1.41`, using the star
+count where the image side in pixels belongs. On a 6252 x 4176 frame at 1.73 arcsec/px with 815 detections it gives 0.0097 degrees against a real
+half-diagonal of 1.807. So the in-field count is 0, and the dense-field check (`expected > 100 && inlier_ratio < 0.04`) never arms. It has been there
+since commit 38f55c5a (2026-05-19). A fix needs `config::SOLVE_RECIPE_VERSION` bumped (cached stacking solves are judged again) and a re-run of the
+accept/refuse set on the corpus; the function's own doc comment says the same. Reference: `docs/platesolving/input-and-acceptance-gates.md`.
+
 ## Standing decisions — do not re-flag these
 
 Each of these has been raised by an audit or a review at least once and answered.

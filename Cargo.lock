@@ -389,13 +389,11 @@ dependencies = [
  "axum",
  "base64 0.23.0",
  "blake3",
- "byteorder",
  "cdshealpix",
  "chrono",
  "crc32fast",
  "ed25519-dalek",
  "fd-lock",
- "flate2",
  "hostname",
  "image",
  "imageproc",
@@ -404,7 +402,6 @@ dependencies = [
  "iroh-tickets",
  "keyring",
  "libc",
- "md-5",
  "n0-future",
  "notify",
  "postcard",
@@ -929,19 +926,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "catalog-builder"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "athenaeum-core",
- "serde_json",
- "sha2 0.11.0",
- "solvemyastro",
- "tempfile",
- "zip 8.6.0",
-]
-
-[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1027,9 +1011,9 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -6732,20 +6716,27 @@ dependencies = [
 
 [[package]]
 name = "solvemyastro"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "byteorder",
  "cdshealpix",
+ "clap",
+ "flate2",
+ "md-5",
  "memmap2",
  "nalgebra",
  "rand",
  "rand_xoshiro",
  "rayon",
  "rustafits",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
+ "zip 8.6.0",
 ]
 
 [[package]]

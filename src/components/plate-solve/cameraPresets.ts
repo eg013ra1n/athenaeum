@@ -13,7 +13,7 @@ export function recommendTier(
 }
 
 /** Canonical density tiers + the smallest FOV (°) each cumulative depth supports.
- *  Mirrors catalog-builder's `min_fov_for`. This mapping is fixed policy — used
+ *  Mirrors solvemyastro's `min_fov_for`. This mapping is fixed policy — used
  *  ONLY as a fallback when the live catalog status (`get_catalog_status`) has
  *  nothing to report (manifest unreachable AND nothing installed on disk yet),
  *  so the FOV recommendation and the tier list still work before the server

@@ -5,7 +5,6 @@ members = [
     "crates/athenaeum-mcp",
     "crates/athenaeum-tauri",
     "crates/athenaeum-web",
-    "crates/catalog-builder",
     "crates/log-mcp",
     "crates/perseus",
     "starloom",

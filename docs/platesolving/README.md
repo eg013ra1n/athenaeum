@@ -31,7 +31,7 @@ The solver is `solvemyastro`, a git submodule (`solvemyastro/` at the repo root,
    |       -> SolveResult (WCS + SIP, inliers, rms, scale, derived focal length)
    |- back on the calling thread, one transaction:
          service::store_result
-           -> acceptance gate (service::acceptance_refusal / blind_gate_ok)
+           -> acceptance gate (service::acceptance_refusal -> solvemyastro::accept::Gate)
            -> plate_solves row  (storage::insert_plate_solve)
            -> frames write-back (storage::update_frame_from_solve)
            -> frames.object label from the nearest DSO, if empty
@@ -45,7 +45,7 @@ The `solver` cargo feature of `athenaeum-core` (on by default) pulls in `solvemy
 
 `solvemyastro` reads memory-mapped `stars.smac` caches organised as an **additive stack of density tiers** (disjoint magnitude bands, base to deepest) under `<app-data>/catalogs/smac_gaia/tier_<density>/`. `plate_solve::layers`:
 
-- `discover_layers(root)` lists the `tier_<density>/` directories that hold a `stars.smac`, ascending by density. With no tiers but a bare `stars.smac` directly under the root, that single cache is a one-layer fallback (old installs keep solving). With neither, it returns nothing.
+- `discover_layers(root)` (`solvemyastro::layout`, re-exported by `plate_solve::layers`) lists the `tier_<density>/` directories that hold a `stars.smac`, ascending by density. With no tiers but a bare `stars.smac` directly under the root, that single cache is a one-layer fallback (old installs keep solving). With neither, it returns nothing.
 - `open_catalog_layers(app_data_dir)` opens each layer as a `solvemyastro::StarCache`. It is the one opener: both hosts and the stacking project path call it. A missing catalog is `CatalogOpenError::NotInstalled`; the hosts turn it into "download the catalog from Settings -> Plate Solving".
 - `catalog_identity(app_data_dir)` is a stat-only fingerprint (tier directory name, `stars.smac` size and mtime) used in the hash of a cached stacking solve.
 
@@ -62,7 +62,7 @@ A **quad index pack** is a precomputed table of catalog quads (`quads.smaq`, for
 
 Packs are optional. With none installed the solver behaves exactly as before. The lower figure is the manifest's `min_fov_deg` (`QuadIndex::min_fov_deg`: four times the pack's smallest quad, 1.296 and 0.648 degrees as published); the solvemyastro spec table quotes the band edges, about 1.1 and 0.55.
 
-**Layout.** Same server directory as the tiers (base URL `catalog_base_url()`, default `https://artfrom.space/catalogs/`, override `ATHENAEUM_CATALOG_BASE_URL`): `index_manifest.json`, `index_base.zip` + `index_base.zip.sha256`, `index_narrow.zip` + `index_narrow.zip.sha256`; each zip holds `<dir>/quads.smaq` (for example `base/quads.smaq`). Locally: `<app-data>/catalogs/smac_index/<dir>/quads.smaq`, with the manifest cached as `<app-data>/catalogs/smac_index/manifest.json` (same cache and short-timeout fetch policy as the tier manifest). The manifest model is `catalog::manifest::IndexManifest { version, format, catalog_epoch, packs: [IndexManifestPack { name, zip, sha256, dir, size_bytes, min_fov_deg }] }`; `format` must equal `solvemyastro::index::FORMAT_VERSION`, otherwise the pack is shown as incompatible and a download is refused with "update Athenaeum".
+**Layout.** Same server directory as the tiers (base URL `catalog_base_url()`, default `https://artfrom.space/catalogs/`, override `ATHENAEUM_CATALOG_BASE_URL`): `index_manifest.json`, `index_base.zip` + `index_base.zip.sha256`, `index_narrow.zip` + `index_narrow.zip.sha256` (the tree `solvemyastro package` writes); each zip holds `<dir>/quads.smaq` (for example `base/quads.smaq`). Locally: `<app-data>/catalogs/smac_index/<dir>/quads.smaq`, with the manifest cached as `<app-data>/catalogs/smac_index/manifest.json` (same cache and short-timeout fetch policy as the tier manifest). The manifest model is `solvemyastro::manifest::IndexManifest { version, format, catalog_epoch, packs: [IndexManifestPack { name, zip, sha256, dir, size_bytes, min_fov_deg }] }`; `format` must equal `solvemyastro::index::FORMAT_VERSION`, otherwise the pack is shown as incompatible and a download is refused with "update Athenaeum".
 
 **Code.** `catalog/index_prebuilt.rs` mirrors `gaia_prebuilt.rs` and shares its helpers (resumable Range download, SHA-256 sidecar, `extract_zip_file` with its zip-slip checks, `is_safe_filename`): `index_status` merges the manifest with what the solver can open (without a manifest it lists the installed directories), and `download_index_packs(app_data, names, ..)` does download, verify, extract, then confirms `QuadIndex::open` succeeds (a pack that does not open is deleted and the download fails). `plate_solve::layers` has `index_root`, `discover_index_packs` (directories holding `quads.smaq`, by name), `open_index_packs` (a pack that fails to open is logged at `warn` and skipped, so it never fails a solve) and `index_identity` (stat only: `name:size:mtime` per pack, comma-joined, empty with none). The hosts open the packs once per batch, next to the catalog layers, and pass them to `service::solve_frame_with_hints`, which calls `solvemyastro::solve_with_index`; the stacking `CatalogSolver` does the same lazily on its first solve. The legacy `solve_frame` and `solve_frame_layered` helpers pass no packs.
 
@@ -81,7 +81,7 @@ A solve found through the index logs `path = "index"` at `info` ("solve succeede
 
 **Recipe and identity.** `SOLVE_RECIPE_VERSION` is 2 (solvemyastro 0.2.0 changed verification and the search), so SOLVED stacking solves cached under recipe 1 are solved again. `stacking::solve::solver_identity` appends `|index:<index_identity>` when any pack is installed (`{config hash}:{catalog identity}|index:{identity}`); with none the form is unchanged. Installing, replacing or removing a pack therefore re-solves the stacking caches, which is intended: the same frame can now take a different path to its solution.
 
-**Publishing.** `catalog-builder publish-index --tiers <dir with tier_500 and tier_2000> --out <dir>` builds `base` (depths 2 to 7, 10 stars and 8 quads per cell) and `narrow` (depth 8, 10 stars and 4 quads per cell) and writes `<out>/publish/{index_base.zip, index_base.zip.sha256, index_narrow.zip, index_narrow.zip.sha256, index_manifest.json}` (the sidecar text is `"<hex>  <zip>\n"`, as for the tiers). `--packs-dir <dir>` skips the build and packages already-built `<dir>/base/quads.smaq` and `<dir>/narrow/quads.smaq`. Upload the files next to the tier files.
+**Publishing.** Not an Athenaeum job any more: `solvemyastro build-index --tiers <dir with tier_500 and tier_2000> --out <pack> --preset base|narrow` builds the two packs (`base`: depths 2 to 7 over `tier_500`; `narrow`: depth 8 over `tier_500` + `tier_2000`) and `solvemyastro package --tiers <tiers> --index base=<pack> --index narrow=<pack> --out <publish>` writes the zips, the `.sha256` sidecars (`"<hex>  <zip>\n"`) and the two manifests. Upload the files next to the tier files. Chain, presets and flags: `solvemyastro/README.md` and `solvemyastro/QUAD_INDEX.md`; moved text: "Detail moved to solvemyastro" at the end of this file.
 
 ### Code organisation
 
@@ -356,16 +356,16 @@ Per frame: `load_frame_with_path`, then the **input gate** `service::input_gate_
 
 The `SolveResult` carries the WCS with its SIP polynomials, `matched_stars`, `total_detected`, the RMS residual in pixels and arcseconds, pixel scale, field rotation, solve time, `catalog_used` and `algorithm_used` (both reported by the solver), `inlier_ratio` (the solver's own), and:
 
-- `expected_catalog_stars_in_fov`, counted by a cone of G <= 12 around the solved centre (the base layer, for a tier stack).
+- `expected_catalog_stars_in_fov`, counted by `solvemyastro::accept::expected_bright_in_fov`: a cone of G <= 12 around the solved centre on the base layer, for a tier stack. Its radius is wrong today (open-items, "The in-field count reads 0").
 - `derived_focallen_mm`, inverted from the solved pixel scale and `XPIXSZ` (or the `camera_defaults` entry for the frame's `INSTRUME`/`TELESCOP` when `XPIXSZ` is missing). `focallen_corrected` is set when the header had no focal length, or when the derived value differs from it by more than 2 %, which means the header scale hint was wrong.
 
 A failure is returned as the solver's own error so `describe_solve_failure` can downcast the structured `SolveFailure`. Each frame is wrapped in `catch_unwind`: a panic becomes a per-frame failure and the batch continues. A cancel flag (`cancel_plate_solve`) is passed to the solver.
 
 ### 4. Acceptance gate and persistence (calling thread, one transaction)
 
-`service::store_result` first runs `acceptance_refusal` (only when `blind_gate_enabled`), which applies `blind_gate_ok`. A solve is refused when any of these holds:
+`service::store_result` first runs `acceptance_refusal` (only when `blind_gate_enabled`), which maps the config onto a `solvemyastro::accept::Gate` (`config::acceptance_gate`) and asks `Gate::accepts`; the thresholds and their order live in `solvemyastro/src/accept.rs` (`docs/platesolving/input-and-acceptance-gates.md`). A solve is refused when any of these holds:
 
-- the RMS residual exceeds `blind_rms_max_px_mult` times the adaptive pixel tolerance, `clamp(base_verification_tolerance_arcsec / pixel_scale_arcsec, 4, 20)` px (`adaptive_tol_px`);
+- the RMS residual exceeds `blind_rms_max_px_mult` times the adaptive pixel tolerance, `clamp(base_verification_tolerance_arcsec / pixel_scale_arcsec, 4, 20)` px (`accept::gate_tol_px`);
 - the inlier count is below `blind_inlier_floor`;
 - the field is dense (`expected_catalog_stars_in_fov > 100`) and `inlier_ratio` is below `blind_min_inlier_ratio` (the primary false-positive discriminator; sparse fields are exempt);
 - the recovered pixel scale is outside `blind_scale_sanity_min`..`blind_scale_sanity_max` arcsec/px;
@@ -644,16 +644,16 @@ The `blind_*` fields and `camera_defaults` have no controls; they live only in t
 
 | Path | Role |
 | ---- | ---- |
-| `solvemyastro/` (submodule) | The solver: `orchestrate.rs` (blind and hinted search), `cache.rs` (`StarCache`, `.smac` format), `select.rs`, `quad.rs`, `verify.rs`, `refine.rs`, `sip.rs`, `wcs.rs`, `diag.rs` (`SolveFailure`, `FailureClass`) |
-| `crates/athenaeum-core/src/plate_solve/service.rs` | `solve_frame`, `solve_frame_tiered`, `solve_frame_layered`, `solve_frame_with_hints`, `store_result`, `acceptance_refusal`, `blind_gate_ok`, `input_gate_reason`, `adaptive_tol_px`, `record_from_result` |
-| `crates/athenaeum-core/src/plate_solve/layers.rs` | `discover_layers`, `open_catalog_layers`, `catalog_root`, `catalog_identity`, `CatalogOpenError` |
+| `solvemyastro/` (submodule) | The solver: `orchestrate.rs` (blind and hinted search), `cache.rs` (`StarCache`, `.smac` format), `select.rs`, `quad.rs`, `verify.rs`, `refine.rs`, `sip.rs`, `wcs.rs`, `diag.rs` (`SolveFailure`, `FailureClass`); the acceptance gate (`accept.rs`); the catalog layout, manifests and HEALPix (`layout.rs`, `manifest.rs`, `healpix.rs`); and, behind its `catalog` feature, catalog building (`gaia/`, `bins.rs`, `tiers.rs`, `package.rs`) with the `solvemyastro` CLI (`src/bin/solvemyastro/`) |
+| `crates/athenaeum-core/src/plate_solve/service.rs` | `solve_frame`, `solve_frame_tiered`, `solve_frame_layered`, `solve_frame_with_hints`, `store_result`, `acceptance_refusal`, `input_gate_reason`, `record_from_result` |
+| `crates/athenaeum-core/src/plate_solve/layers.rs` | `discover_layers` (re-exported from `solvemyastro::layout`), `open_catalog_layers`, `catalog_root`, `catalog_identity`, `CatalogOpenError` |
 | `crates/athenaeum-core/src/plate_solve/hints.rs` | `extract_hints`, `apply_object_name_fallback`, `fov_from_optics`, `frame_fov_summary` |
 | `crates/athenaeum-core/src/plate_solve/config.rs` | `PlateSolveConfig`, `load_config`/`save_config`, `SOLVE_RECIPE_VERSION`, `solver_config_hash` |
 | `crates/athenaeum-core/src/plate_solve/failure.rs` | `describe_solve_failure`: solver failure class to a stable code and a user message |
 | `crates/athenaeum-core/src/plate_solve/storage.rs` | `PlateSolveRecord`, `insert_plate_solve`, `get_plate_solve`, `delete_plate_solve`, `update_frame_from_solve`, `update_frame_object_if_missing` |
 | `crates/athenaeum-core/src/plate_solve/dso_lookup.rs` | Bundled DSO catalog: name resolution and nearest-object lookup |
 | `crates/athenaeum-core/src/plate_solve/object_fill.rs` | The "Autofind object from coordinates" batch |
-| `crates/athenaeum-core/src/catalog/gaia_prebuilt.rs` | Catalog tier download and `tier_status`; `catalog/manifest.rs` the published manifest |
+| `crates/athenaeum-core/src/catalog/gaia_prebuilt.rs` | Catalog tier download and `tier_status`; the published manifest model is `solvemyastro::manifest` |
 | `crates/athenaeum-core/src/stacking/solve.rs` | The stacking project path's solve, sharing the gate and the opener |
 
 ### Tauri/Web
@@ -844,3 +844,19 @@ Verified: 6 unit tests in `service::tests`, 5 integration tests in `blind_index_
 ### Plate solving
 
 `solvemyastro` (submodule) is the sole solver, driven from `crates/athenaeum-core/src/plate_solve/`. Three defences (2026-09-05) against wind-shaken frames being "solved" at a wrong scale: rustafits measures eccentricity on every fast detection, the solver drops streaks before quad selection and refuses a frame the cut emptied (`looks_trailed`), and `plate_solve/service.rs` has an analysis-based input gate (`median_eccentricity` AND `trail_r_squared`, both required) plus an acceptance gate fed the header pixel scale. **Only the input gate has a Settings section** (`plateSolving.inputGate`); the acceptance gate's `blind_*` fields live only in the stored `plate_solve.config` JSON. Known gap, its own cycle: the full analysis under-reports eccentricity on trailed frames. **Object-name fallback** (`plate_solve::hints::apply_object_name_fallback`): a header without usable RA/Dec resolves OBJECT against the bundled DSO catalog; a recorded position always wins; `resolve_object_name` on both hosts. Reference: `docs/platesolving/README.md` (pipeline) and `docs/platesolving/input-and-acceptance-gates.md` (the gates).
+
+## Detail moved to solvemyastro (2026-11-25)
+
+Catalog building left Athenaeum: the catalog builder crate and core's Gaia ingest, bulk download and binary-format code are deleted, and the catalog layout, manifests, HEALPix helpers and the acceptance gate are `solvemyastro` modules (`layout`, `manifest`, `healpix`, `accept`). Athenaeum keeps the app half: `catalog/gaia_prebuilt.rs` and `catalog/index_prebuilt.rs` (the app's download of ready tiers and packs), `plate_solve/` (hints, config, persistence, the gate's config mapping). What the app no longer builds:
+
+| Was | Now |
+| ---- | ---- |
+| Gaia files to bins (the builder crate and core's bulk ingest) | `solvemyastro ingest --gaia <dir> --out <bins>`; G < 21 and RUWE < 1.4 (`solvemyastro::gaia`, `GAIA_RUWE_MAX`) |
+| Bins to the four density tiers | `solvemyastro build-tiers --bins <bins> --out <tiers>` |
+| The builder's index publishing (packs) | `solvemyastro build-index --tiers <tiers> --out <pack> --preset base\|narrow` |
+| The publish tree, zips and manifests | `solvemyastro package --tiers <tiers> --index <name>=<pack> --out <publish>` |
+| The bright cache | `solvemyastro build-cache`, `build-bright-cache` |
+
+The chain with its flags, the "complete cells" rule for a partial Gaia download and the Gaia credit line are in `solvemyastro/README.md` and `solvemyastro/CHANGELOG.md` (0.3.0). A build needs `solvemyastro` with its `catalog` feature (`cargo install solvemyastro --features cli --locked`); Athenaeum enables neither `catalog` nor `cli`.
+
+**Acceptance (2026-11-25).** On the first three Gaia DR3 files the CLI matched the old builder byte for byte: bins (record multisets, 420 of 420), the four tiers, both index packs and both manifests. The installed tiers matched in every interior cell (82 cells differ only in the order of equal-magnitude stars, the new sort key). The crate's first GitHub CI run passed on every feature layer on Linux, on macOS, on Windows and in the publish dry run, and Athenaeum's Windows job passed on EVO-X2.

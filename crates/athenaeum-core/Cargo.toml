@@ -39,10 +39,6 @@ solvemyastro = { path = "../../solvemyastro", optional = true }
 # The stacking kernel. Base layer and `ts` always; `render` / `solver` add its `engine` / `stack` layers.
 starloom = { path = "../../starloom", default-features = false, features = ["ts"] }
 sha2 = "0.11"
-md-5 = "0.11"
-byteorder = "1"
-cdshealpix = "0.9"
-flate2 = "1.0"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 # TLS backend is selected EXPLICITLY. reqwest 0.13 changed `default-tls` to
 # rustls-with-aws-lc-rs, which would drag aws-lc-sys (cmake + nasm) into every
@@ -259,6 +255,8 @@ athenaeum-core = { path = ".", features = ["test-support"] }
 # `test-support`: `StarFit::test_at` and `PlanePrep::for_pin`, the fixtures the tests build fits and pins with.
 rustafits = { path = "../../rustafits", default-features = false, features = ["serde", "test-support"] }
 tempfile = "3"
+# The `hips` golden test checks the HEALPix cell-centre table the sky chart ships against this reference.
+cdshealpix = "0.9"
 # `trace`: the statement counter of `catalog_query` tests (same rusqlite, one more feature in test builds only).
 rusqlite = { version = "0.40", features = ["trace"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
