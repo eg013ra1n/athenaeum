@@ -44,7 +44,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::binary_format::{self, StarRecord};
-use super::healpix;
+use solvemyastro::healpix;
 
 /// ESA Gaia archive TAP async endpoint.
 pub const GAIA_TAP_ASYNC: &str = "https://gea.esac.esa.int/tap-server/tap/async";

@@ -2,9 +2,7 @@ pub mod binary_format;
 pub mod gaia;
 pub mod gaia_bulk;
 pub mod gaia_prebuilt;
-pub mod healpix;
 pub mod index_prebuilt;
-pub mod manifest;
 
 use std::path::Path;
 
@@ -28,7 +26,7 @@ pub fn write_catalog_to_healpix(
     // Bin records by HEALpix pixel
     let mut bins: HashMap<u64, Vec<StarRecord>> = HashMap::new();
     for record in records {
-        let pixel = healpix::sky_to_pixel(record.ra as f64, record.dec as f64);
+        let pixel = solvemyastro::healpix::sky_to_pixel(record.ra as f64, record.dec as f64);
         bins.entry(pixel).or_default().push(record.clone());
     }
 

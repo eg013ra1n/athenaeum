@@ -173,6 +173,20 @@ impl Default for PlateSolveConfig {
 /// `load_config` normalizes it to the current default on read.
 const STALE_BLIND_INLIER_FLOOR: usize = 12;
 
+/// The persist gate's thresholds as solvemyastro's [`Gate`](solvemyastro::accept::Gate). `blind_gate_enabled` is not
+/// part of it: whether the gate runs at all stays the app's own check.
+pub fn acceptance_gate(cfg: &PlateSolveConfig) -> solvemyastro::accept::Gate {
+    solvemyastro::accept::Gate {
+        base_tolerance_arcsec: cfg.base_verification_tolerance_arcsec,
+        rms_max_px_mult: cfg.blind_rms_max_px_mult,
+        min_inlier_ratio: cfg.blind_min_inlier_ratio,
+        inlier_floor: cfg.blind_inlier_floor,
+        scale_sanity_min: cfg.blind_scale_sanity_min,
+        scale_sanity_max: cfg.blind_scale_sanity_max,
+        scale_header_tol: cfg.blind_scale_header_tol,
+    }
+}
+
 /// Load the plate solve config from the database. Returns default if not set.
 pub fn load_config(conn: &Connection) -> PlateSolveConfig {
     let result: Result<String, _> = conn.query_row(
@@ -256,6 +270,34 @@ pub fn solver_config_hash(cfg: &PlateSolveConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `acceptance_gate` maps every gate threshold one-to-one onto solvemyastro's `Gate`: seven distinct
+    /// non-default values land in seven distinct fields.
+    #[test]
+    fn acceptance_gate_maps_every_field() {
+        let cfg = PlateSolveConfig {
+            base_verification_tolerance_arcsec: 11.0,
+            blind_rms_max_px_mult: 3.5,
+            blind_min_inlier_ratio: 0.07,
+            blind_inlier_floor: 9,
+            blind_scale_sanity_min: 0.11,
+            blind_scale_sanity_max: 42.0,
+            blind_scale_header_tol: 5.5,
+            ..PlateSolveConfig::default()
+        };
+        assert_eq!(
+            acceptance_gate(&cfg),
+            solvemyastro::accept::Gate {
+                base_tolerance_arcsec: 11.0,
+                rms_max_px_mult: 3.5,
+                min_inlier_ratio: 0.07,
+                inlier_floor: 9,
+                scale_sanity_min: 0.11,
+                scale_sanity_max: 42.0,
+                scale_header_tol: 5.5,
+            }
+        );
+    }
 
     #[test]
     fn legacy_config_json_loads_ignoring_removed_keys() {

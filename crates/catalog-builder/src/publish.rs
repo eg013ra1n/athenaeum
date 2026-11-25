@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
-use athenaeum_core::catalog::manifest::{Manifest, ManifestTier};
+use solvemyastro::manifest::{Manifest, ManifestTier};
 
 fn min_fov_for(density: u32) -> f64 {
     match density {

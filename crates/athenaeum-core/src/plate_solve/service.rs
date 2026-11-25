@@ -276,47 +276,15 @@ pub fn solve_frame_with_hints(
     // matched_stars / bright-catalog-in-fov; we also expose the raw cone
     // count for the density-aware gate in `store_result`.
     let obs_epoch = observation_epoch(frame);
-    // Changing any of these: bump config::SOLVE_RECIPE_VERSION.
-    let fov_radius_deg = {
-        // If we have a pixel scale and total_detected, reconstruct the FOV.
-        // Fall back to a reasonable default if not available.
-        if solution.pixel_scale_arcsec > 0.0 && solution.total_detected > 0 {
-            // Approximate: assume square-ish image, diagonal ~ sqrt(2) * side
-            // We can't recover exact image dimensions here, so use a generous
-            // half-diagonal approximation that matches solvemyastro's verify cone.
-            // 3 degrees is a safe upper bound for common astrophotography setups.
-            3.0_f64.min(
-                solution.pixel_scale_arcsec * (solution.total_detected as f64).sqrt()
-                    / 3600.0
-                    / 2.0
-                    * 1.41,
-            )
-        } else {
-            1.5
-        }
-    };
-    // Changing any of these: bump config::SOLVE_RECIPE_VERSION.
-    let bright_mag_limit = 12.0_f32; // mirrors VERIFY_MAG_LIMIT in orchestrate.rs
-                                     // Representative catalog for the bright-star FOV count: the legacy deep
-                                     // cache, or — for an additive tier stack — the base layer (all bright stars
-                                     // brighter than `bright_mag_limit` live in the brightest/base tier).
-    let count_bright_in_fov = |c: &StarCache| {
-        c.cone(
-            solution.wcs.crval.0,
-            solution.wcs.crval.1,
-            fov_radius_deg,
-            bright_mag_limit,
-            obs_epoch,
-        )
-        .map(|v| v.len())
-        .unwrap_or(0)
-    };
-    let expected_catalog_stars_in_fov = match *caches {
-        solvemyastro::Caches::Legacy { deep, .. } => count_bright_in_fov(deep),
-        solvemyastro::Caches::Layered { layers } => {
-            layers.first().map(|&c| count_bright_in_fov(c)).unwrap_or(0)
-        }
-    };
+    // The cone radius and the magnitude limit live in `solvemyastro::accept`; a change there needs
+    // `config::SOLVE_RECIPE_VERSION` bumped.
+    let expected_catalog_stars_in_fov = solvemyastro::accept::expected_bright_in_fov(
+        caches,
+        solution.wcs.crval,
+        solution.pixel_scale_arcsec,
+        solution.total_detected,
+        obs_epoch,
+    );
 
     // Use solvemyastro's inlier_ratio directly: it is matched_stars /
     // total_detected (see solvemyastro `Solution::inlier_ratio`) — the
@@ -498,11 +466,11 @@ pub(crate) fn acceptance_refusal(
     if !config.blind_gate_enabled {
         return None;
     }
-    let m = BlindGateMetrics {
+    let m = solvemyastro::accept::GateMetrics {
         inliers: result.matched_stars,
         expected_in_fov: result.expected_catalog_stars_in_fov,
         rms_px: result.rms_residual_px,
-        adaptive_tol_px: adaptive_tol_px(
+        tol_px: solvemyastro::accept::gate_tol_px(
             result.pixel_scale_arcsec,
             config.base_verification_tolerance_arcsec,
         ),
@@ -510,7 +478,7 @@ pub(crate) fn acceptance_refusal(
         recovered_scale_arcsec: result.pixel_scale_arcsec,
         header_scale_arcsec: expected_scale_arcsec,
     };
-    if blind_gate_ok(GateStage::ScaleCleared, &m, config) {
+    if super::config::acceptance_gate(config).accepts(&m) {
         None
     } else {
         Some(format!(
@@ -554,80 +522,6 @@ pub(crate) fn record_from_result(frame_id: i64, result: &SolveResult) -> PlateSo
         expected_catalog_stars_in_fov: Some(result.expected_catalog_stars_in_fov as i32),
         inlier_ratio: Some(result.inlier_ratio),
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GateStage {
-    Hinted,
-    ScaleCleared,
-    // Reserved for stage-aware gate thresholds: a whole-sky solve must stay
-    // strict while a scale-recovered-near-hint solve can tolerate defocused
-    // inlier counts (the 2026-05 defocus fix lowered the floor globally —
-    // the per-stage split is the finer follow-up). Production currently
-    // labels every blind solve ScaleCleared (acceptance_refusal, which
-    // store_result calls), so this is
-    // constructed only by the blind_gate_ok tests until that work lands.
-    #[allow(dead_code)]
-    FullBlind,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BlindGateMetrics {
-    pub inliers: usize,
-    pub expected_in_fov: usize,
-    pub rms_px: f64,
-    pub adaptive_tol_px: f64,
-    pub inlier_ratio: f64,
-    pub recovered_scale_arcsec: f64,
-    pub header_scale_arcsec: Option<f64>,
-}
-
-/// Extra acceptance gate applied ONLY on the blind path (scale cleared
-/// and/or position prior disabled). The hinted stage-1 path is never
-/// affected, so well-working hinted solves do not regress. Calibrated from
-/// a real-library audit: `inlier_ratio` is the primary discriminator
-/// (real solves >= ~0.08, false positives <= ~0.001); rms and absolute
-/// inlier count do not separate, so those are loose backstops.
-pub(crate) fn blind_gate_ok(
-    stage: GateStage,
-    m: &BlindGateMetrics,
-    cfg: &PlateSolveConfig,
-) -> bool {
-    if stage == GateStage::Hinted || !cfg.blind_gate_enabled {
-        return true;
-    }
-    // Geometric fit must be tight (scale-relative ceiling; loose backstop).
-    if !m.rms_px.is_finite() || m.rms_px > cfg.blind_rms_max_px_mult * m.adaptive_tol_px {
-        return false;
-    }
-    // Absolute inlier floor (weak backstop).
-    if m.inliers < cfg.blind_inlier_floor {
-        return false;
-    }
-    // Dense-field confidence ratio — the primary false-positive gate.
-    // Sparse fields (<=100 expected) are exempt: too few stars to trust a
-    // ratio there, and the noise alignments occur in dense regions.
-    if m.expected_in_fov > 100 && m.inlier_ratio < cfg.blind_min_inlier_ratio {
-        return false;
-    }
-    // Recovered scale must be physically plausible.
-    if !(cfg.blind_scale_sanity_min..=cfg.blind_scale_sanity_max)
-        .contains(&m.recovered_scale_arcsec)
-    {
-        return false;
-    }
-    // ...and not wildly off the header scale when the header had one
-    // (generous: a legitimately very-wrong FOCALLEN is the whole point of
-    // the blind fallback, so this is only a coarse backstop).
-    if let Some(hs) = m.header_scale_arcsec {
-        if hs > 0.0 {
-            let r = m.recovered_scale_arcsec / hs;
-            if r < 1.0 / cfg.blind_scale_header_tol || r > cfg.blind_scale_header_tol {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Why this frame should not be sent to the solver at all, or `None`.
@@ -687,17 +581,6 @@ fn header_pixel_scale_arcsec(conn: &Connection, frame_id: i64) -> Option<f64> {
         return None;
     }
     Some((xpixsz / 1000.0 / focallen).atan().to_degrees() * 3600.0)
-}
-
-/// Convert an arcsecond-scale base tolerance to a per-frame pixel tolerance,
-/// clamped to [4, 20] px. Tight FOVs get smaller pixel tolerances (fewer
-/// false matches); wide-field frames get larger ones (slightly defocused
-/// stars still count). Used in place of the old fixed `verification_tolerance_px`.
-pub(crate) fn adaptive_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 {
-    if pixel_scale_arcsec.abs() < 1e-6 {
-        return 10.0;
-    }
-    (base_arcsec / pixel_scale_arcsec).clamp(4.0, 20.0)
 }
 
 #[cfg(test)]
@@ -771,31 +654,20 @@ mod tests {
         }
     }
 
-    /// A blind solve that lands on six matches is noise, and the app must
-    /// refuse it even though the solver returned it. Real numbers, from a
-    /// DSLR frame with no FOCALLEN/XPIXSZ in its header (so the scale check
-    /// has nothing to compare against) that "solved" at Dec −68° — a sky it
-    /// was never pointed at: 6 inliers, ratio 0.037, in a field where the
-    /// catalog expects hundreds of stars (2026-09-05).
+    /// The persist gate keeps its decisions across the move of the gate into solvemyastro: the six-match noise
+    /// alignment (2026-09-05, real numbers: 6 inliers, ratio 0.037 in a field the catalogue expects hundreds of stars
+    /// in) is refused with the app's own text, the same field at a real solve's confidence is accepted, and the gate
+    /// switched off accepts the noise.
     #[test]
-    fn blind_gate_refuses_a_six_match_noise_alignment() {
+    fn acceptance_refusal_keeps_its_decisions() {
         let cfg = PlateSolveConfig::default();
-        let noise = BlindGateMetrics {
-            inliers: 6,
-            expected_in_fov: 480,
-            rms_px: 1.159,
-            adaptive_tol_px: adaptive_tol_px(0.2178, cfg.base_verification_tolerance_arcsec),
-            inlier_ratio: 0.0373,
-            recovered_scale_arcsec: 0.2178,
-            header_scale_arcsec: None,
-        };
-        assert!(
-            !blind_gate_ok(GateStage::ScaleCleared, &noise, &cfg),
-            "six matches at ratio 0.037 is a noise alignment, not a solve"
-        );
-        // The same field with a real solve's confidence still passes.
-        let real = BlindGateMetrics { inliers: 60, inlier_ratio: 0.125, ..noise };
-        assert!(blind_gate_ok(GateStage::ScaleCleared, &real, &cfg));
+        let noise = mk_result(6, 480, 0.0373, 0.2178, 1.159);
+        let refusal = acceptance_refusal(&noise, None, &cfg).expect("noise is refused");
+        assert!(refusal.starts_with("Rejected: low confidence ("), "{refusal}");
+        let real = mk_result(60, 480, 0.125, 0.2178, 1.159);
+        assert_eq!(acceptance_refusal(&real, None, &cfg), None);
+        let off = PlateSolveConfig { blind_gate_enabled: false, ..PlateSolveConfig::default() };
+        assert_eq!(acceptance_refusal(&noise, None, &off), None);
     }
 
     /// The input gate refuses a frame whose own analysis carries the `trailed` verdict — and refuses nothing else,
@@ -1167,154 +1039,6 @@ mod tests {
             matches!(out_old, StoreOutcome::RejectedLowConfidence { .. }),
             "old floor of 12 rejected the same 10-inlier solve — that was the bug"
         );
-    }
-
-    #[test]
-    fn blind_gate_table() {
-        let cfg = PlateSolveConfig {
-            blind_rms_max_px_mult: 2.5,
-            blind_min_inlier_ratio: 0.04,
-            blind_inlier_floor: 12,
-            blind_scale_sanity_min: 0.05,
-            blind_scale_sanity_max: 60.0,
-            blind_scale_header_tol: 8.0,
-            blind_gate_enabled: true,
-            ..PlateSolveConfig::default()
-        };
-        let base = BlindGateMetrics {
-            inliers: 40,
-            expected_in_fov: 800,
-            rms_px: 1.2,
-            adaptive_tol_px: 6.0,
-            inlier_ratio: 0.30,
-            recovered_scale_arcsec: 1.8,
-            header_scale_arcsec: Some(1.9),
-        };
-        // Hinted stage is never gated.
-        assert!(blind_gate_ok(GateStage::Hinted, &base, &cfg));
-        // Good full-blind passes.
-        assert!(blind_gate_ok(GateStage::FullBlind, &base, &cfg));
-        // Loose RMS on blind path rejected.
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                rms_px: 20.0,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Low ratio on a DENSE field rejected (the calibrated primary gate).
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                inlier_ratio: 0.001,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Sparse field (expected<=100) NOT punished by the ratio rule — stage is irrelevant here.
-        assert!(blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                expected_in_fov: 40,
-                inlier_ratio: 0.001,
-                inliers: 14,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Too few inliers rejected.
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                inliers: 8,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Absurd recovered scale rejected.
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                recovered_scale_arcsec: 0.001,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Recovered scale wildly off header scale rejected (ratio ~10 > tol 8).
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                recovered_scale_arcsec: 20.0,
-                header_scale_arcsec: Some(1.9),
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Non-finite RMS is never a real solve (guards the is_finite branch;
-        // degenerate blind solves can produce NaN/inf).
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                rms_px: f64::NAN,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                rms_px: f64::INFINITY,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // No header scale: the header-tol guard is skipped entirely, so a
-        // recovered scale that WOULD fail the ratio-to-header check still
-        // passes when header_scale_arcsec is None.
-        assert!(blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                header_scale_arcsec: None,
-                recovered_scale_arcsec: 20.0,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Scale-sanity MAX bound (the existing table only covered the min side).
-        assert!(!blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                recovered_scale_arcsec: 100.0,
-                ..base.clone()
-            },
-            &cfg
-        ));
-        // Gate can be disabled by config.
-        let off = PlateSolveConfig {
-            blind_gate_enabled: false,
-            ..cfg.clone()
-        };
-        assert!(blind_gate_ok(
-            GateStage::FullBlind,
-            &BlindGateMetrics {
-                rms_px: 99.0,
-                ..base
-            },
-            &off
-        ));
-    }
-
-    #[test]
-    fn adaptive_tol_clamps_to_4_to_20_px() {
-        // Narrow FOV (0.5"/px): 8 / 0.5 = 16, within band.
-        assert!((adaptive_tol_px(0.5, 8.0) - 16.0).abs() < 1e-9);
-        // Wide FOV (5"/px): 8 / 5 = 1.6, clamps UP to 4.
-        assert!((adaptive_tol_px(5.0, 8.0) - 4.0).abs() < 1e-9);
-        // Tiny scale: huge tolerance clamps to 20.
-        assert!((adaptive_tol_px(0.1, 8.0) - 20.0).abs() < 1e-9);
-        // Zero pixel scale (defensive) → safe 10 px default.
-        assert!((adaptive_tol_px(0.0, 8.0) - 10.0).abs() < 1e-9);
     }
 
     // ── Gate 4: SolveSolution → SolveResult SIP mapping ────────────────────

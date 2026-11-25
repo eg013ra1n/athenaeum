@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use solvemyastro::index::{build_index, BuildParams, FORMAT_VERSION, INDEX_FILE};
 use solvemyastro::{QuadIndex, StarCache};
 
-use athenaeum_core::catalog::manifest::{IndexManifest, IndexManifestPack};
+use solvemyastro::manifest::{IndexManifest, IndexManifestPack};
 
 use crate::publish::{write_sha256_sidecar, zip_file};
 

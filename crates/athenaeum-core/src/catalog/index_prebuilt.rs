@@ -24,7 +24,7 @@ use crate::catalog::gaia_prebuilt::{
     catalog_base_url, download_resumable, extract_zip_file, fetch_expected_sha, fetch_small,
     http_client, is_safe_filename, sha256_file, GaiaPrebuiltProgress,
 };
-use crate::catalog::manifest::{IndexManifest, IndexManifestPack};
+use solvemyastro::manifest::{IndexManifest, IndexManifestPack};
 use crate::plate_solve::layers::{discover_index_packs, index_root};
 
 fn manifest_cache_path(app_data: &Path) -> PathBuf {

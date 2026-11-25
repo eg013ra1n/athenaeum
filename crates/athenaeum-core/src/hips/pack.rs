@@ -129,7 +129,7 @@ pub fn pack_tiles(sky_order: u8, max_order: u8, regions: &[PackRegion]) -> Resul
     for region in regions {
         for order in sky_order + 1..=max_order {
             tiles.extend(
-                crate::catalog::healpix::cone_pixels_at(
+                solvemyastro::healpix::cone_pixels_at(
                     order,
                     region.ra_deg.rem_euclid(360.0),
                     region.dec_deg.clamp(-90.0, 90.0),

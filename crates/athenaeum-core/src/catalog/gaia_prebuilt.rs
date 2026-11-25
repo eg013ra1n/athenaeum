@@ -24,7 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::manifest::{Manifest, ManifestTier};
+use solvemyastro::manifest::{Manifest, ManifestTier};
 use crate::plate_solve::layers::discover_layers;
 
 /// Resolve the catalog base URL (always ends in `/`).
@@ -496,8 +496,8 @@ mod tests {
         assert_eq!(m.tiers[0].density, 500);
     }
 
-    fn mtier(density: u32) -> crate::catalog::manifest::ManifestTier {
-        crate::catalog::manifest::ManifestTier {
+    fn mtier(density: u32) -> solvemyastro::manifest::ManifestTier {
+        solvemyastro::manifest::ManifestTier {
             density, zip: format!("tier_{density}.zip"), sha256: format!("tier_{density}.zip.sha256"),
             dir: format!("tier_{density}"), size_bytes: 1, min_fov_deg: 0.5,
         }
