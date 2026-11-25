@@ -32,9 +32,12 @@ COPY rustafits/ rustafits/
 # that at rustafits/ (copied above).
 COPY solvemyastro/ solvemyastro/
 
-# Create dummy lib/main to cache dependency compilation
+# Create dummy lib/main to cache dependency compilation. starloom's explicit [[bin]] and [[test]] targets (its manifest
+# names them) need stub files too: Cargo refuses a manifest whose named target path is missing.
 RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/athenaeum-core/src/lib.rs \
     && mkdir -p starloom/src && echo "pub fn _dummy() {}" > starloom/src/lib.rs \
+    && mkdir -p starloom/src/bin && echo 'fn main() {}' > starloom/src/bin/starloom.rs \
+    && mkdir -p starloom/tests && touch starloom/tests/pipeline_e2e.rs starloom/tests/cli_e2e.rs starloom/tests/pipeline_pool.rs \
     && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs
 
 # Stub every explicit [[example]] target of athenaeum-core. Cargo refuses to
