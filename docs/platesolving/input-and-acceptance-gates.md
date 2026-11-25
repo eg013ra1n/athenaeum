@@ -29,7 +29,7 @@ commits and in this file).
 - **Two gates in the app** (`athenaeum-core/src/plate_solve/service.rs`): the
   input gate (rule below: 2026-09-05 pair, replaced 2026-10-24 by the verdict);
   the acceptance gate finally receives the header's pixel scale, which
-  `blind_gate_ok` has always compared against via `blind_scale_header_tol`
+  the gate has always compared against via `blind_scale_header_tol`
   but was given `None`. **The input gate has a Settings section** (Plate
   Solving → Input Gate, `plateSolving.inputGate` in `src/settings/registry.ts`,
   rendered by `PlateSolveSettingsPanel.tsx`): the on/off switch
@@ -120,3 +120,16 @@ position always wins. The metadata editor confirms a typed name live via
 `resolve_object_name` (both backends), so naming a target is a usable repair
 for coordinate-less frames.
 
+## The acceptance gate lives in solvemyastro (2026-11-25)
+
+The check itself moved out of `plate_solve/service.rs` into `solvemyastro::accept` (`Gate`, `GateMetrics`, `gate_tol_px`, `expected_bright_in_fov`), so the `solvemyastro solve` command and the app judge a solution the same way. The app keeps the config: `config::acceptance_gate` maps the seven `blind_*` fields one-to-one onto `Gate`, and `service::acceptance_refusal` builds the `GateMetrics` and asks `Gate::accepts`. The checks run in this order and the first failure refuses:
+
+| Check | Default |
+| ---- | ---- |
+| RMS residual at most a multiple of the pixel tolerance (`gate_tol_px`: `base / scale`, clamped to 4..20 px, 10 at scale 0) | 2.5 x, base 8 arcsec |
+| Inlier floor | 6 |
+| Dense field (`expected_in_fov` over 100, `DENSE_FIELD_MIN_EXPECTED`): inlier ratio at least | 0.04 |
+| Recovered scale plausible, arcsec/px | 0.05 to 60 |
+| Recovered scale against the header's scale, either way | factor 8 |
+
+A change to a threshold, to `expected_bright_in_fov` or to the verification magnitude limit changes which solves are accepted, so it bumps `config::SOLVE_RECIPE_VERSION`. Known defect: the in-field count reads 0 on real frames, so the dense-field check never arms (`docs/superpowers/open-items.md`, "The in-field count reads 0").
