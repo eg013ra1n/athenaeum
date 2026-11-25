@@ -36,7 +36,7 @@ batch_concurrency: number,
 blind_gate_enabled: boolean, 
 /**
  * RMS-residual ceiling, as a multiple of the per-frame adaptive pixel
- * tolerance. Reject if `rms_residual_px > mult * adaptive_tol_px`. Loose
+ * tolerance. Reject if `rms_residual_px > mult * gate_tol_px`. Loose
  * backstop (rms was non-discriminating in calibration). Default: 2.5.
  */
 blind_rms_max_px_mult: number, 

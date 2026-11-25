@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-
 use solvemyastro::manifest::{Manifest, ManifestTier};
+
 use crate::plate_solve::layers::discover_layers;
 
 /// Resolve the catalog base URL (always ends in `/`).

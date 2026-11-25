@@ -389,13 +389,11 @@ dependencies = [
  "axum",
  "base64 0.23.0",
  "blake3",
- "byteorder",
  "cdshealpix",
  "chrono",
  "crc32fast",
  "ed25519-dalek",
  "fd-lock",
- "flate2",
  "hostname",
  "image",
  "imageproc",
@@ -404,7 +402,6 @@ dependencies = [
  "iroh-tickets",
  "keyring",
  "libc",
- "md-5",
  "n0-future",
  "notify",
  "postcard",
@@ -926,19 +923,6 @@ checksum = "374b7c592d9c00c1f4972ea58390ac6b18cbb6ab79011f3bdc90a0b82ca06b77"
 dependencies = [
  "serde",
  "toml 0.9.12+spec-1.1.0",
-]
-
-[[package]]
-name = "catalog-builder"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "athenaeum-core",
- "serde_json",
- "sha2 0.11.0",
- "solvemyastro",
- "tempfile",
- "zip 8.6.0",
 ]
 
 [[package]]

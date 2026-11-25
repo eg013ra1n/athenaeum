@@ -176,10 +176,9 @@ athenaeum/
 │   ├── athenaeum-tauri/          # Desktop shell — commands/ wraps core
 │   ├── athenaeum-web/            # Axum HTTP/SSE server — routes/ mirrors commands
 │   ├── perseus/                  # Capture-agent CLI for observatory machines
-│   ├── catalog-builder/          # Star-catalog build tool
 │   └── log-mcp/                  # Log query server for development
 ├── rustafits/                    # Submodule — FITS/XISF image rendering
-├── solvemyastro/                 # Submodule — plate solver
+├── solvemyastro/                 # Submodule — plate solver; its own README covers building the star catalog
 ├── src/                          # React frontend
 │   ├── api/                      # The only place Tauri IPC or HTTP is touched
 │   ├── components/               # UI components

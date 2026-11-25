@@ -276,7 +276,8 @@ pub fn solve_frame_with_hints(
     // matched_stars / bright-catalog-in-fov; we also expose the raw cone
     // count for the density-aware gate in `store_result`.
     let obs_epoch = observation_epoch(frame);
-    // The cone radius and the magnitude limit live in `solvemyastro::accept`; a change there needs
+    // The cone radius lives in `solvemyastro::accept` and the magnitude limit is solvemyastro's verify limit
+    // (`orchestrate::VERIFY_MAG_LIMIT`, read by `accept::expected_bright_in_fov`); a change to either needs
     // `config::SOLVE_RECIPE_VERSION` bumped.
     let expected_catalog_stars_in_fov = solvemyastro::accept::expected_bright_in_fov(
         caches,
@@ -398,7 +399,7 @@ pub fn store_result(
     // because a wrong/corrupt header made it look hinted) cannot overwrite
     // frame metadata. inlier_ratio is the rig-independent discriminator
     // (real solves >= ~0.08, noise alignments <= ~0.001); sparse fields are
-    // exempted inside blind_gate_ok exactly as during acceptance.
+    // exempted inside `solvemyastro::accept::Gate::accepts` exactly as during acceptance.
     if config.blind_gate_enabled {
         // The frame's own optics, when it declares them (2026-09-05: on
         // wind-shaken frames the solver walks its autoFOV ladder and returns a
@@ -466,19 +467,17 @@ pub(crate) fn acceptance_refusal(
     if !config.blind_gate_enabled {
         return None;
     }
+    let gate = super::config::acceptance_gate(config);
     let m = solvemyastro::accept::GateMetrics {
         inliers: result.matched_stars,
         expected_in_fov: result.expected_catalog_stars_in_fov,
         rms_px: result.rms_residual_px,
-        tol_px: solvemyastro::accept::gate_tol_px(
-            result.pixel_scale_arcsec,
-            config.base_verification_tolerance_arcsec,
-        ),
+        tol_px: solvemyastro::accept::gate_tol_px(result.pixel_scale_arcsec, gate.base_tolerance_arcsec),
         inlier_ratio: result.inlier_ratio,
         recovered_scale_arcsec: result.pixel_scale_arcsec,
         header_scale_arcsec: expected_scale_arcsec,
     };
-    if super::config::acceptance_gate(config).accepts(&m) {
+    if gate.accepts(&m) {
         None
     } else {
         Some(format!(

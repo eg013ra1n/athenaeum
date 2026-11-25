@@ -44,7 +44,7 @@ pub struct PlateSolveConfig {
     #[serde(default = "default_blind_gate_enabled")]
     pub blind_gate_enabled: bool,
     /// RMS-residual ceiling, as a multiple of the per-frame adaptive pixel
-    /// tolerance. Reject if `rms_residual_px > mult * adaptive_tol_px`. Loose
+    /// tolerance. Reject if `rms_residual_px > mult * gate_tol_px`. Loose
     /// backstop (rms was non-discriminating in calibration). Default: 2.5.
     #[serde(default = "default_blind_rms_max_px_mult")]
     pub blind_rms_max_px_mult: f64,

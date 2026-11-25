@@ -1,11 +1,12 @@
-//! Discover the installed density-tier catalog dirs (or a legacy single cache).
+//! The installed catalog layers: where they live, and their identities.
 //!
 //! The plate-solver consumes an additive stack of disjoint density tiers,
-//! installed as `tier_<density>/stars.smac` under the catalog root. This
-//! module finds those dirs (ascending density = base → deepest) so the caller
-//! can open each as a `StarCache` and pass `Caches::layered(..)` to the solver.
-//! A legacy single `stars.smac` directly under the root is supported as a
-//! 1-layer fallback so old installs keep solving.
+//! installed as `tier_<density>/stars.smac` under the catalog root. Discovery of
+//! those dirs (ascending density = base → deepest, with a legacy single
+//! `stars.smac` as a 1-layer fallback) is `solvemyastro::layout`'s and is
+//! re-exported here. This module keeps Athenaeum's own part: the catalog and
+//! index roots, opening the layers as `StarCache`s for `Caches::layered(..)`,
+//! and the catalog and index identity strings.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
