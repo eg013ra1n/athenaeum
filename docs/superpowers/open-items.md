@@ -478,12 +478,6 @@ Phase 3 (2026-11-23): starloom is its own repository, `github.com/eg013ra1n/star
 
 - **The `ATH_*` names in starloom's `light_cal` debug messages** (`calibration_library/light_cal.rs`, about lines 694,
   761 and 768) lose them together with a log-text change that is accepted on purpose (plan note 8).
-- **x86_64 golden rows (P2-6, P2-R14).** The stage goldens have float rows for `aarch64-macos` only (GitHub's macOS
-  runner matches them, 2026-11-23); other platforms check determinism and the `"*"` rows. Starloom's CI now runs the
-  `Stage golden rows of this platform` step (the Linux `cli` job and the macOS and Windows jobs, `--nocapture`), which
-  prints the `x86_64-linux` and `x86_64-windows` literals, the `pipeline` row included. Owed: copy them by hand into
-  `tests/stage_goldens.rs` from that CI log, with the runner image names in the comment above them (never recorded
-  from another machine), and delete this entry when CI is green with them.
 - **The measured FWHM depends on the optimization level by one ulp** (2026-11-23, phase 3): at opt-level 0 the
   measure and pass-1 rows go red, at opt-level 2 they hold, so starloom's `[profile.dev]` sets 2 for a standalone build
   and Athenaeum's root sets it in the workspace. Release builds (opt-level 3, no debug assertions) were never compared
