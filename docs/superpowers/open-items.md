@@ -328,6 +328,7 @@ contain forward slashes.
   two lanes' times (Linux tests queue with the Linux release builds on the one runner; Windows shares EVO-X2,
   `concurrent 1`) and the size of both runners' `target/`. First readings: Linux cold 2098 s, warm 629 s; Windows
   cold 824 s, warm 326 s.
+- **`sync_e2e::ack_timeout_waiting_then_recovery_clears_error_at_serving_stage`** (`ubuntu24-linux`, 2026-11-25, pipeline 504 on `test/starloom-p2`): `wait_until timed out after 30s` at `sync_e2e.rs:3248`; the retry (job 2232) passed. The branch touched no sync code.
 - **Core tests and the starloom grid counters (2026-11-23, not probed).** Starloom's own tests now panic when a TPS
   grid is built outside `grid_counters::exclusive()` (starloom v0.1.2, `cfg(test)` only), which found the last such
   starloom test. Core's tests read the same counters through `test-support` (`stacking/plan.rs`, `run/crop_tests.rs`)
