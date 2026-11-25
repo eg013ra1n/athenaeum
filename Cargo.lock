@@ -6737,15 +6737,22 @@ dependencies = [
  "anyhow",
  "byteorder",
  "cdshealpix",
+ "clap",
+ "flate2",
+ "md-5",
  "memmap2",
  "nalgebra",
  "rand",
  "rand_xoshiro",
  "rayon",
  "rustafits",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
+ "zip 8.6.0",
 ]
 
 [[package]]
