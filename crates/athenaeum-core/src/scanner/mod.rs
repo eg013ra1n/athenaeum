@@ -681,6 +681,17 @@ fn process_file(
             );
             return Ok(None);
         }
+
+        // The starloom CLI's intermediate products (calibrated lights, registered
+        // files, LN references, maps) are never cataloged; its masters are.
+        if is_starloom_cli_intermediate(&keys) {
+            tracing::debug!(
+                root_id,
+                path = %current_path,
+                "starloom CLI intermediate (SLM_PLV) — never cataloged"
+            );
+            return Ok(None);
+        }
     }
 
     // Check for moved files using the header fingerprint
@@ -1682,6 +1693,18 @@ fn process_file_parallel(
     })
 }
 
+/// Whether a file's header says it is an intermediate product of the `starloom` command line: it carries `SLM_PLV`
+/// (the pipeline-version card on every file the CLI writes) and is none of the CLI's masters. The masters are the
+/// master calibration frames (`SLM_REC`, the recipe card of `master.rs`) and the master light and its drizzled form
+/// (`SLM_MSV`, the first of the five master version cards; the rejection maps and the drizzle weight map copy only
+/// `SLM_VER`, `SLM_CFG`, `SLM_PLV`, `SLM_REF` and the drizzle cards, so neither carries it). Everything else the CLI
+/// writes (a calibrated light, a CFA mosaic, a registered file, the LN reference and its saturation map, the maps) is
+/// skipped like any other intermediate. Card names only: no CLI code is needed. A file without `SLM_PLV` is not judged
+/// here at all.
+pub(crate) fn is_starloom_cli_intermediate(keys: &std::collections::HashMap<String, String>) -> bool {
+    keys.contains_key("SLM_PLV") && !keys.contains_key("SLM_REC") && !keys.contains_key("SLM_MSV")
+}
+
 /// Parallel scan a directory for FITS/XISF files with progress reporting
 ///
 /// This function uses a two-phase approach:
@@ -2189,6 +2212,14 @@ pub(crate) fn scan_files_parallel_to_depth<E: ProgressEmitter>(
                     root_id,
                     path = %file_result.file.path,
                     "stacking artifact (ATH_REG/ATH_STK) — never cataloged"
+                );
+                continue;
+            }
+            if is_starloom_cli_intermediate(&keys) {
+                tracing::debug!(
+                    root_id,
+                    path = %file_result.file.path,
+                    "starloom CLI intermediate (SLM_PLV) — never cataloged"
                 );
                 continue;
             }
@@ -5655,5 +5686,167 @@ mod header_rules_tests {
         assert_eq!(split_unique_camera_suffix("Cam N3x"), ("Cam N3x", None));
         assert_eq!(split_unique_camera_suffix("Cam"), ("Cam", None));
         assert_eq!(split_unique_camera_suffix("ZWO N 12"), ("ZWO N 12", None));
+    }
+}
+
+/// The starloom command line's products under a scan root: its intermediates (everything carrying `SLM_PLV` that is
+/// not a master) are never cataloged, its masters are. The headers are written with the card names the CLI uses
+/// (`starloom/src/pipeline/`), no CLI code.
+#[cfg(test)]
+mod starloom_cli_scan_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use crate::events::NullEmitter;
+    use crate::fits_writer::{write_fits_f32, write_xisf_f32, Card, CardValue};
+    use rusqlite::params;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    fn s(keyword: &str, v: &str) -> Card {
+        Card::new(keyword, CardValue::Str(v.to_string())).unwrap()
+    }
+
+    fn i(keyword: &str, v: i64) -> Card {
+        Card::new(keyword, CardValue::Integer(v)).unwrap()
+    }
+
+    /// `SLM_VER`, `SLM_CFG`, `SLM_PLV`: on every file the CLI writes.
+    fn common() -> Vec<Card> {
+        vec![s("SLM_VER", "0.2.0"), s("SLM_CFG", "0123456789abcdef"), i("SLM_PLV", 1)]
+    }
+
+    fn with(imagetyp: &str, rest: Vec<Card>) -> Vec<Card> {
+        let mut cards = vec![s("IMAGETYP", imagetyp), s("OBJECT", "M42"), s("DATE-OBS", "2026-01-05T21:00:00")];
+        cards.extend(rest);
+        cards
+    }
+
+    fn calibrated_light() -> Vec<Card> {
+        let mut c = common();
+        c.extend([s("SLM_CSRN", "Light_0001.fits"), s("SLM_CDRK", "master_dark.fits"), i("SLM_LCV", 1)]);
+        with("Light Frame", c)
+    }
+
+    fn registered_light() -> Vec<Card> {
+        let mut c = common();
+        c.push(s("SLM_REF", "c_Light_0001.fits"));
+        with("Light Frame", c)
+    }
+
+    fn ln_reference() -> Vec<Card> {
+        with("Light Frame", common())
+    }
+
+    fn weight_map() -> Vec<Card> {
+        let mut c = common();
+        c.extend([s("SLM_REF", "c_Light_0001.fits"), i("SLM_DRZ", 2), i("SLM_DZV", 1)]);
+        with("Drizzle Weight", c)
+    }
+
+    fn rejection_map() -> Vec<Card> {
+        let mut c = common();
+        c.push(s("SLM_REF", "c_Light_0001.fits"));
+        with("Rejection Map Low", c)
+    }
+
+    fn master_dark() -> Vec<Card> {
+        let mut c = common();
+        c.extend([i("SLM_N", 20), s("SLM_REC", "Average | Winsorized sigma (3.0/3.0) n=20")]);
+        with("Master Dark", c)
+    }
+
+    fn master_light() -> Vec<Card> {
+        let mut c = common();
+        c.push(s("SLM_REF", "c_Light_0001.fits"));
+        c.extend(["SLM_MSV", "SLM_MV", "SLM_ALV", "SLM_LNV", "SLM_INV"].map(|k| i(k, 1)));
+        with("Master Light", c)
+    }
+
+    fn drizzled_master_light() -> Vec<Card> {
+        let mut c = master_light();
+        c.extend([i("SLM_DRZ", 2), i("SLM_DZV", 1)]);
+        c
+    }
+
+    /// `SLM_*` cards of a calibrated light but no `SLM_PLV`: not the CLI's file, scanned as before.
+    fn slm_cards_without_plv() -> Vec<Card> {
+        with("Light Frame", vec![s("SLM_VER", "0.2.0"), s("SLM_CSRN", "Light_0001.fits"), i("SLM_LCV", 1)])
+    }
+
+    fn catalog(parallel: bool, name: &str, cards: &[Card], xisf: bool) -> (i64, Vec<String>) {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(if xisf { format!("{name}.xisf") } else { format!("{name}.fits") });
+        let data = vec![0.1f32; 16 * 16];
+        if xisf {
+            write_xisf_f32(&path, 16, 16, 1, &data, cards).unwrap();
+        } else {
+            write_fits_f32(&path, 16, 16, 1, &data, cards).unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)", params![root.path().to_str().unwrap()])
+            .unwrap();
+        let result = if parallel {
+            scan_directory_parallel(root.path(), 1, &conn, &NullEmitter, Arc::new(AtomicBool::new(false)), false)
+        } else {
+            scan_directory(root.path(), &conn, None, false, 1)
+        };
+        let n = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        (n, result.errors)
+    }
+
+    fn check(name: &str, cards: Vec<Card>, cataloged: bool) {
+        for xisf in [false, true] {
+            for parallel in [false, true] {
+                let (n, errors) = catalog(parallel, name, &cards, xisf);
+                assert!(errors.is_empty(), "{name} xisf={xisf} parallel={parallel}: {errors:?}");
+                assert_eq!(n, i64::from(cataloged), "{name} xisf={xisf} parallel={parallel}: files rows");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cli_calibrated_light_is_skipped() {
+        check("c_Light_0001", calibrated_light(), false);
+    }
+
+    #[test]
+    fn a_cli_registered_file_is_skipped() {
+        check("r_Light_0001", registered_light(), false);
+    }
+
+    #[test]
+    fn a_cli_ln_reference_is_skipped() {
+        check("reference", ln_reference(), false);
+    }
+
+    #[test]
+    fn a_cli_weight_map_is_skipped() {
+        check("weight", weight_map(), false);
+    }
+
+    #[test]
+    fn a_cli_rejection_map_is_skipped() {
+        check("rejection-low", rejection_map(), false);
+    }
+
+    #[test]
+    fn a_cli_master_dark_is_cataloged() {
+        check("master_dark", master_dark(), true);
+    }
+
+    #[test]
+    fn a_cli_master_light_is_cataloged() {
+        check("master", master_light(), true);
+    }
+
+    #[test]
+    fn a_cli_drizzled_master_light_is_cataloged() {
+        check("master_drizzled", drizzled_master_light(), true);
+    }
+
+    #[test]
+    fn a_file_with_slm_cards_but_no_slm_plv_is_scanned_as_before() {
+        check("c_Light_0001", slm_cards_without_plv(), true);
     }
 }

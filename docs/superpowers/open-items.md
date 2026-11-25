@@ -510,6 +510,13 @@ Not smokes unless marked: what the `starloom` command and the `pipeline` layer (
   `frames.object`). Look in the dev catalog first; rustafits' reader follows the catalog either way.
 - **Core's XISF Bayer offset `inf`** saturates to `i64::MAX` in `parse_offset` (an odd, folded value). Ported as it
   is into rustafits' reader, so the two agree; fix both together if it ever matters.
+- **starloom's next release (found by the phase-2 final review):** `README.md:165` still says float golden rows exist for
+  aarch64-macos only, and the comment at `tests/stage_goldens.rs:93` still names rustafits 1.9.1 as the locked
+  revision; test files with spaces in their names (`pipeline/inputs.rs:539,540,618,619`, `pipeline/config.rs:339`,
+  `pipeline/formats/manifest.rs:343,387,420,429`) break the portable-names rule. Fix all in the next starloom
+  release, and let its README say that Athenaeum's scanner skips the CLI's intermediates and catalogs its masters.
+- **rustafits `PsfModel` gets `#[non_exhaustive]` at the next major** (1.10.0 added `Moffat(f64)` to a public enum that
+  is not marked, so an exhaustive `match` in a dependent crate broke on a minor).
 - **Later: a `.fits.gz` header read inflates the whole file** (seconds per frame in `preflight`), and a gzip light is
   inflated more than once in `calibrate`. rustafits has no one-read facts-and-pixels call. Athenaeum's catalog still
   does not index `.fz`.
