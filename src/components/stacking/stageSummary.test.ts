@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boardMode, rowState, stageLabel, stageSummary } from './stageSummary';
+import { boardMode, normalizePsfModelLabel, psfModelLabel, rowState, stageLabel, stageSummary } from './stageSummary';
 import type { PlanPrepare, Stage, StackingConfig, StackingPlan } from '../../types/stacking';
 import type { RunOutcome, RunProgress } from '../../hooks/useStackingRuns';
 
@@ -196,4 +196,13 @@ describe('stageSummary output coverage', () => {
     expect(stageSummary('output', { output: { format: 'fits', cleanup: 'keepAll' } } as unknown as StackingConfig)).toBe(
       'FITS · keep all',
     ));
+});
+
+describe('PSF model labels', () => {
+  it('psf_model_label_names_the_beta', () => {
+    expect(psfModelLabel({ moffat: 8 })).toBe('Moffat β 8');
+    expect(normalizePsfModelLabel({ moffat: 8 })).toBe('Moffat β 8');
+    expect(psfModelLabel({ moffat: 2.5 })).toBe('Moffat β 2.5');
+    expect(psfModelLabel('moffat4')).toBe('Moffat-4');
+  });
 });

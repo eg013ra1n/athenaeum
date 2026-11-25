@@ -84,3 +84,34 @@ describe('NormalizePanel rejection normalization', () => {
     expect(screen.queryByText(/reset to/)).toBeNull();
   });
 });
+
+describe('NormalizePanel local PSF model', () => {
+  const withPsf = (psfModel: StackingConfig['normalization']['local']['psfModel']): StackingConfig => {
+    const base = cfg('local', true);
+    return { ...base, normalization: { ...base.normalization, local: { ...base.normalization.local, psfModel } } };
+  };
+  const betaInput = () => screen.getByLabelText('Moffat β') as HTMLInputElement;
+  const patched = (onChange: ReturnType<typeof vi.fn>) =>
+    onChange.mock.calls.map((c) => (c[0] as StackingConfig).normalization.local.psfModel);
+
+  it('normalize_panel_offers_a_moffat_with_its_own_beta', () => {
+    const onChange = vi.fn();
+    const defaults = cfg('local', false);
+    const { rerender } = render(<NormalizePanel config={withPsf('auto')} defaults={defaults} onChange={onChange} />);
+    const select = control('PSF model') as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(['auto', 'moffat4', 'moffat-own']);
+
+    fireEvent.change(select, { target: { value: 'moffat-own' } });
+    expect(patched(onChange)).toEqual([{ moffat: 4 }]);
+
+    rerender(<NormalizePanel config={withPsf({ moffat: 4 })} defaults={defaults} onChange={onChange} />);
+    expect(betaInput().value).toBe('4');
+    fireEvent.change(betaInput(), { target: { value: '8' } });
+    expect(patched(onChange)[patched(onChange).length - 1]).toEqual({ moffat: 8 });
+
+    onChange.mockClear();
+    fireEvent.change(betaInput(), { target: { value: '1.2' } });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByText(/β from 1\.5 to 100 — not saved/)).toBeTruthy();
+  });
+});

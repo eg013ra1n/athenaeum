@@ -56,7 +56,7 @@ use crate::fits_writer::{write_image_f32, OutputFormat, XisfBounds};
 // directly.
 #[cfg(test)]
 use crate::fits_writer::write_fits_f32;
-use crate::integration::combine::{IntegrationRecipe, Rejection};
+use crate::integration::combine::IntegrationRecipe;
 use crate::integration::engine::{
     integrate_bias_like, integrate_flat, EngineProgress, FlatPrecal, IntegrationOutput,
 };
@@ -263,31 +263,8 @@ struct MasterBuildCompleteEvent {
 
 // ── Recipe resolution (pure, unit-tested) ────────────────────────────────────
 
-/// spec §2/§9: bias-like N>=15 Average+Winsorized else Median; flat N>=15
-/// Average+Winsorized else Average+Percentile. Explicit override always wins.
-pub fn resolve_recipe(
-    explicit: Option<IntegrationRecipe>,
-    imagetyp: &str,
-    n: i64,
-) -> IntegrationRecipe {
-    if let Some(recipe) = explicit {
-        return recipe;
-    }
-    let is_flat = imagetyp == "Flat";
-    if n >= 15 {
-        IntegrationRecipe::average(Rejection::WinsorizedSigma {
-            sigma_low: 3.0,
-            sigma_high: 3.0,
-        })
-    } else if is_flat {
-        IntegrationRecipe::average(Rejection::PercentileClip {
-            low: 0.2,
-            high: 0.02,
-        })
-    } else {
-        IntegrationRecipe::median(Rejection::None)
-    }
-}
+// `resolve_recipe` (spec §2/§9: the auto recipe of a master calibration frame) is the kernel's.
+pub use starloom::integration::recipe::resolve_recipe;
 
 /// Dependency-build order for a batch (Task 13, spec: bias/darkflat before
 /// dark before flat — flats resolve pre-cal at RUN time via

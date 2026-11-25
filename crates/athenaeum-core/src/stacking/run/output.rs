@@ -805,21 +805,8 @@ impl From<DrizzleError> for DrizzleFailure {
     }
 }
 
-/// The result of one `pick_reference_idx` call (ruling R-M3-17 v2 + its
-/// coverage addendum, fix round 1 Important 3): `idx` is always a valid
-/// index into the `members` slice the closure was called with — a group
-/// with `>= 3` members always gets an anchor, restoring the pre-this-
-/// ruling guarantee `best_by_weight` used to provide unconditionally.
-/// `coverage_dropped`/`sky_fallback` are `Some(count)` when the closure
-/// had to relax ITS OWN filter to reach that guarantee (fewer than 3
-/// members covered the reference geometry; or every covering member's
-/// background was non-finite/non-positive) — the caller (which alone holds
-/// `&mut rc`) turns either into a `warn!` + a run warning.
-struct AnchorPick {
-    idx: usize,
-    coverage_dropped: Option<usize>,
-    sky_fallback: Option<usize>,
-}
+// `AnchorPick` (the result of one `pick_reference_idx` call) and the pick itself are the kernel's.
+use starloom::stacking::run_helpers::{pick_ln_anchor, AnchorPick};
 
 /// Normalize (stage 6, M2 Task 5 — [`run_group_normalization`]), integrate
 /// and write the master for one group. LN DISABLED keeps the exact pre-M2
@@ -1013,16 +1000,9 @@ fn process_group_output(
             .collect();
 
         let coverage = member_coverages(ln_field.as_ref(), members, ref_width, ref_height);
-        let coverage_mask: Vec<bool> = coverage
-            .iter()
-            .map(|&c| c >= MIN_REFERENCE_COVERAGE)
-            .collect();
-        let admissible_count = coverage_mask.iter().filter(|&&ok| ok).count();
-        let (included_mask, coverage_dropped) = if admissible_count >= 3 {
-            (coverage_mask, None)
-        } else {
-            (vec![true; members.len()], Some(admissible_count))
-        };
+        // The pick itself is the kernel's (`pick_ln_anchor`: the coverage mask, the sky-penalized order and the
+        // weight-alone fallback); it logs nothing, so the two relaxations it made are reported here.
+        let (pick, coverage_dropped) = pick_ln_anchor(&weights, &star_counts, &sky, &coverage);
         if let Some(count) = coverage_dropped {
             tracing::warn!(
                 run_id,
@@ -1033,32 +1013,38 @@ fn process_group_output(
             );
         }
 
-        // Fix round 1, Important 3: `sky_penalized_order` returning empty
-        // (every admissible member's background non-finite/non-positive —
-        // e.g. a narrowband set whose dark slightly over-subtracts every
-        // frame) used to fail the WHOLE GROUP here. A group with `>= 3`
-        // members always got an anchor before this ruling existed
-        // (`best_by_weight` never refuses a non-empty candidate set); this
-        // restores that guarantee by falling back to it over the SAME
-        // `included_mask` (still coverage-filtered) the sky-penalized rank
-        // used, rather than failing the group over a background
-        // measurement problem the anchor pick itself can't fix.
-        let ordered = sky_penalized_order(&weights, &included_mask, &star_counts, &sky);
-        let (idx, sky_fallback) = match ordered.into_iter().next() {
-            Some(idx) => (idx, None),
-            None => {
-                let count = included_mask.iter().filter(|&&ok| ok).count();
-                tracing::warn!(
-                    run_id,
-                    group_key = %group.key,
-                    count,
-                    "no admissible member has a usable measured background; \
-                     anchoring by weight alone"
-                );
-                let idx = best_by_weight(&weights, &included_mask, &star_counts)?;
-                (idx, Some(count))
-            }
+        // Fix round 1, Important 3: `sky_penalized_order` returning empty (every admissible member's background
+        // non-finite/non-positive) falls back to `best_by_weight` over the same coverage-filtered members rather than
+        // failing the whole group. A pick that is `None` here is exactly that fallback finding no member: its count is
+        // the members the (possibly dropped) coverage filter admitted.
+        let Some(pick) = pick else {
+            let count = if coverage_dropped.is_some() {
+                members.len()
+            } else {
+                coverage
+                    .iter()
+                    .filter(|&&c| c >= MIN_REFERENCE_COVERAGE)
+                    .count()
+            };
+            tracing::warn!(
+                run_id,
+                group_key = %group.key,
+                count,
+                "no admissible member has a usable measured background; \
+                 anchoring by weight alone"
+            );
+            return None;
         };
+        if let Some(count) = pick.sky_fallback {
+            tracing::warn!(
+                run_id,
+                group_key = %group.key,
+                count,
+                "no admissible member has a usable measured background; \
+                 anchoring by weight alone"
+            );
+        }
+        let idx = pick.idx;
         tracing::info!(
             run_id,
             group_key = %group.key,
@@ -1067,11 +1053,7 @@ fn process_group_output(
             background = sky[idx],
             "normalization anchor chosen"
         );
-        Some(AnchorPick {
-            idx,
-            coverage_dropped,
-            sky_fallback,
-        })
+        Some(pick)
     };
     // Same shape as `StackFrame`'s own construction from a `GroupMember`
     // list — a closure, not a one-shot `.map()`, because the LN pass can

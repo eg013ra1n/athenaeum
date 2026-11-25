@@ -328,6 +328,7 @@ contain forward slashes.
   two lanes' times (Linux tests queue with the Linux release builds on the one runner; Windows shares EVO-X2,
   `concurrent 1`) and the size of both runners' `target/`. First readings: Linux cold 2098 s, warm 629 s; Windows
   cold 824 s, warm 326 s.
+- **`sync_e2e::ack_timeout_waiting_then_recovery_clears_error_at_serving_stage`** (`ubuntu24-linux`, 2026-11-25, pipeline 504 on `test/starloom-p2`): `wait_until timed out after 30s` at `sync_e2e.rs:3248`; the retry (job 2232) passed. The branch touched no sync code.
 - **Core tests and the starloom grid counters (2026-11-23, not probed).** Starloom's own tests now panic when a TPS
   grid is built outside `grid_counters::exclusive()` (starloom v0.1.2, `cfg(test)` only), which found the last such
   starloom test. Core's tests read the same counters through `test-support` (`stacking/plan.rs`, `run/crop_tests.rs`)
@@ -478,15 +479,48 @@ Phase 3 (2026-11-23): starloom is its own repository, `github.com/eg013ra1n/star
 
 - **The `ATH_*` names in starloom's `light_cal` debug messages** (`calibration_library/light_cal.rs`, about lines 694,
   761 and 768) lose them together with a log-text change that is accepted on purpose (plan note 8).
-- **x86_64 golden rows (P2-6).** The stage goldens have float rows for `aarch64-macos` only (GitHub's macOS runner
-  matches them, 2026-11-23); other platforms check determinism and the `"*"` row. Starloom's own CI prints the rows
-  for x86_64 Linux and Windows (`no golden rows for …`): record them by hand in a starloom release.
 - **The measured FWHM depends on the optimization level by one ulp** (2026-11-23, phase 3): at opt-level 0 the
   measure and pass-1 rows go red, at opt-level 2 they hold, so starloom's `[profile.dev]` sets 2 for a standalone build
   and Athenaeum's root sets it in the workspace. Release builds (opt-level 3, no debug assertions) were never compared
   with the dev rows. Not a defect of the guard; a fact to know before reading a release-build number against a row.
 - **Owed smoke (spec §8 acceptance):** a no-op starloom release (`v0.1.1`) arrives in Athenaeum as a Dependabot bump
   PR with CI green. Possible only once Athenaeum `main` with `.github/dependabot.yml` is on GitHub.
+
+## Starloom: left after phase 2 (2026-11-25)
+
+Not smokes unless marked: what the `starloom` command and the `pipeline` layer (starloom 0.2.0, plan
+`docs/superpowers/plans/2026-11-24-starloom-p2.md`) left on purpose.
+
+- **Owed smoke: `starloom run` by hand on Windows (EVO-X2)** on one set, with the frame paths typed once in another
+  case than the files have (they are compared case-sensitively today, also on Windows). Starloom's CI covers the
+  command on Windows with synthetic frames only.
+- **The mirror's guard (P2-R16).** `pipeline` hand-copies private `run/` logic, so nothing ties it to Athenaeum at
+  compile time. Re-run `p2-chain.sh` (athenaeum-lab, `harness/acceptance/starloom/`) on any starloom release and on any
+  Athenaeum change that touches `run/` or `pipeline/`; the `starloom-release` skill has the step.
+- **Owed smoke: a real `.fz` set through `starloom run`**, once one exists. Compressed input is tested on fpack
+  fixtures and on gzip copies of synthetic frames.
+- **The `miniz_oxide` 0.9 / 0.8 duplicate** (0.9 from fitsio-pure, 0.8 from flate2 and png) goes when `png` moves to
+  0.9: png 0.18.1 is the latest and still on `^0.8`; 0.17 is pinned by cdshealpix and ico. Accepted by the owner
+  2026-11-24.
+- **The `rustafits-release` skill is stale:** it says there is no `CHANGELOG.md` (there is one, and the release
+  workflow needs a `## [X.Y.Z]` section in it).
+- **Core's `header_text_f64`** (`stacking/measure.rs`, the stacker's XISF gain read) is a looser third header rule
+  than the catalog's and rustafits' (quote trim, cut at any `/`, case-sensitive, first card wins). Noted, not
+  measured: a gain read there can differ from the catalog's `frames.gain` for an odd XISF header.
+- **Check, then file or drop:** whether the catalog's XISF text keeps XML entities undecoded (`M81 &amp; M82` in
+  `frames.object`). Look in the dev catalog first; rustafits' reader follows the catalog either way.
+- **Core's XISF Bayer offset `inf`** saturates to `i64::MAX` in `parse_offset` (an odd, folded value). Ported as it
+  is into rustafits' reader, so the two agree; fix both together if it ever matters.
+- **starloom's next release (found by the phase-2 final review):** `README.md:165` still says float golden rows exist for
+  aarch64-macos only, and the comment at `tests/stage_goldens.rs:93` still names rustafits 1.9.1 as the locked
+  revision; test files with spaces in their names (`pipeline/inputs.rs:539,540,618,619`, `pipeline/config.rs:339`,
+  `pipeline/formats/manifest.rs:343,387,420,429`) break the portable-names rule. Fix all in the next starloom
+  release, and let its README say that Athenaeum's scanner skips the CLI's intermediates and catalogs its masters.
+- **rustafits `PsfModel` gets `#[non_exhaustive]` at the next major** (1.10.0 added `Moffat(f64)` to a public enum that
+  is not marked, so an exhaustive `match` in a dependent crate broke on a minor).
+- **Later: a `.fits.gz` header read inflates the whole file** (seconds per frame in `preflight`), and a gzip light is
+  inflated more than once in `calibrate`. rustafits has no one-read facts-and-pixels call. Athenaeum's catalog still
+  does not index `.fz`.
 
 ---
 

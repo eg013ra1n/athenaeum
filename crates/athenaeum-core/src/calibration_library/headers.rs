@@ -8,7 +8,7 @@ use crate::fits_writer::{Card, FitsWriteError};
 // integration engine; the card BUILDER below is ungated (it only ever receives
 // the finished `[R, G, B]` triple), so only the measurement is gated.
 #[cfg(feature = "render")]
-use crate::integration::cfa::{central_third_channel_means, CfaGeometry};
+use crate::integration::cfa::{flat_channel_norms, CfaGeometry};
 use crate::models::FileFormat;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -384,12 +384,15 @@ pub(crate) fn measure_flat_channel_norms(
         xoff: inputs.xbayroff.unwrap_or(0),
         yoff: inputs.ybayroff.unwrap_or(0),
     };
-    let means = central_third_channel_means(data, width, height, geom);
-    if !means.iter().all(|m| m.is_finite() && *m > 0.0) {
-        warn!(set_id, value = ?means, "per-channel flat constants degenerate — omitted");
-        return None;
+    // The pixel half is the kernel's (`flat_channel_norms`): the central-third means, accepted only when finite and
+    // positive. The catalog lookup above and this warning (with the set id) stay here.
+    match flat_channel_norms(data, width, height, geom) {
+        Ok(means) => Some(means),
+        Err(means) => {
+            warn!(set_id, value = ?means, "per-channel flat constants degenerate — omitted");
+            None
+        }
     }
-    Some(means)
 }
 
 pub fn build_master_cards(

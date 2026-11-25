@@ -461,6 +461,10 @@ fn stage_entry(
         tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "stacking artifact (ATH_REG/ATH_STK) — never cataloged");
         return Ok(Staged::Done(EntryOutcome::Skipped));
     }
+    if crate::scanner::is_starloom_cli_intermediate(&keys) {
+        tracing::debug!(root_id, zip_path = %zip.display(), zip_entry = %entry.path, "starloom CLI intermediate (SLM_PLV) — never cataloged");
+        return Ok(Staged::Done(EntryOutcome::Skipped));
+    }
 
     let filename = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
 

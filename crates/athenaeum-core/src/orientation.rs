@@ -59,40 +59,11 @@ pub fn flip_vertical_for_path(path: &Path) -> bool {
     }
 }
 
-/// The canonical `ROWORDER` spellings (defined in `starloom`, which the XISF writer lives in), so a writer that has
-/// to state the order explicitly (the XISF writer — see [`row_order_is_bottom_up`]) spells it the same way this
-/// rule reads it.
-pub use starloom::orientation::{ROW_ORDER_BOTTOM_UP, ROW_ORDER_TOP_DOWN};
-
-/// The row-order rule over an already-read `ROWORDER` value — the ONE
-/// place the table in the module docs is encoded (M4d Task 2 fix round 1,
-/// ruling R-T2-1: the XISF writer and the stacking run both need this
-/// answer over a card they already hold, and a second copy of the rule is
-/// exactly how a 180° flip goes unnoticed).
-///
-/// `TOP-DOWN` → `false`; `BOTTOM-UP`, an unrecognized explicit value, and a
-/// missing card → `true`, the astronomical default. Case-insensitive, and
-/// tolerant of the surrounding quotes some writers leave in the value
-/// despite the FITS card already delimiting it.
-pub fn row_order_is_bottom_up(value: Option<&str>) -> bool {
-    match value {
-        Some(value) => {
-            let normalized = value
-                .trim()
-                .trim_matches('\'')
-                .trim()
-                .to_ascii_uppercase();
-            match normalized.as_str() {
-                s if s == ROW_ORDER_TOP_DOWN => false,
-                s if s == ROW_ORDER_BOTTOM_UP => true,
-                // Unknown explicit value — assume astronomical default.
-                _ => true,
-            }
-        }
-        // Missing ROWORDER → astronomical default = bottom-up = flip.
-        None => true,
-    }
-}
+/// The canonical `ROWORDER` spellings and the row-order rule over an already-read `ROWORDER` value (defined in
+/// `starloom`, which the XISF writer and the `stack` stage live in): the ONE place the table in the module docs is
+/// encoded (M4d Task 2 fix round 1, ruling R-T2-1), so a writer that states the order explicitly spells it the way
+/// the rule reads it.
+pub use starloom::orientation::{row_order_is_bottom_up, ROW_ORDER_BOTTOM_UP, ROW_ORDER_TOP_DOWN};
 
 /// FITS-specific rule: read `ROWORDER`, apply astronomical convention.
 fn fits_flip_vertical(path: &Path) -> bool {

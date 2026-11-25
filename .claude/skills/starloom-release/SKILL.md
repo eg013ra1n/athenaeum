@@ -16,9 +16,10 @@ release. Spec: `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`
 1. In `starloom/`, compare `main` with `origin/main` first (the submodule sits in detached HEAD; a stale local `main`
    silently moves the tree back), then branch from `origin/main`.
 2. A change that moves a stage's output bits bumps that stage's version and records its golden row in the same commit
-   (`tests/stage_goldens.rs`, `cargo test --test stage_goldens -- --nocapture`, copy the printed literal). Rows are
-   recorded at opt-level 2 only (the dev profile; never from an opt-level 0 build). A change that moves no number says
-   so in its commit message.
+   (`tests/stage_goldens.rs`, `cargo test --features cli --test stage_goldens -- --nocapture`, copy the printed
+   literal; the `cli` feature also computes the `pipeline` row). Rows are recorded at opt-level 2 only (the dev
+   profile; never from an opt-level 0 build). A platform's rows come from its own CI log, never from another machine
+   (the `Stage golden rows of this platform` step). A change that moves no number says so in its commit message.
 3. Merge into starloom `main` with a merge commit (`--no-ff`), never a squash: Athenaeum pins `main` commits only, and
    a squash leaves a pinned SHA unreachable.
 
@@ -28,14 +29,21 @@ release. Spec: `docs/superpowers/specs/2026-11-22-starloom-extraction-design.md`
    (`git log vLAST..main --oneline`). The release workflow takes the notes from it and fails without it.
 2. `Cargo.toml` `version = "X.Y.Z"`; `Cargo.lock` follows (`cargo metadata --format-version 1 >/dev/null`, inside a
    standalone clone, not the workspace). Commit `release: vX.Y.Z` on `main`.
-3. Push `main`; wait for CI green (Linux all layers, macOS, Windows; `publish-dry-run` passes on the expected
-   git-dependency failure until solvemyastro is on crates.io).
-4. `git tag vX.Y.Z` on that commit (lightweight, like rustafits), push it. The tag must equal the `Cargo.toml`
+3. **The mirror's guard (P2-R16).** `pipeline` hand-copies private `run/` logic, so nothing ties it to Athenaeum at
+   compile time: on any starloom release, and on any Athenaeum change that touches `run/` or `pipeline/`, re-run
+   `athenaeum-lab/harness/acceptance/starloom/p2-chain.sh` (the chain compare, a mono group and an OSC group; usage in
+   its header and `README.md` there; build the CLI in the workspace with `cargo build --release -p starloom --features
+   cli`) and read its verdict: every stage equal. A difference outside the divergences in starloom's README ("Where it
+   differs from Athenaeum") is a STOP, never a tolerance.
+4. Push `main`; wait for CI green (Linux all layers including `cli`, macOS and Windows with `--features cli`;
+   `publish-dry-run` passes on the expected git-dependency failure until solvemyastro is on crates.io).
+5. `git tag vX.Y.Z` on that commit (lightweight, like rustafits), push it. The tag must equal the `Cargo.toml`
    version (the workflow checks).
-5. Verify by fact: `gh run list -R eg013ra1n/starloom --workflow Release -L 1` green and
-   `gh release view vX.Y.Z -R eg013ra1n/starloom` shows the changelog section. There is no crates.io leg and no binary
-   (spec Q3; the CLI is phase 2).
-6. The owner's word is needed for pushes to starloom `main` and tags, as for rustafits.
+6. Verify by fact: `gh run list -R eg013ra1n/starloom --workflow Release -L 1` green and
+   `gh release view vX.Y.Z -R eg013ra1n/starloom` shows the changelog section. There is no crates.io leg and no prebuilt
+   binary (P2-R4: the CLI installs with `cargo install --git https://github.com/eg013ra1n/starloom --features cli
+   --locked`).
+7. The owner's word is needed for pushes to starloom `main` and tags, as for rustafits.
 
 ## The bump in Athenaeum
 

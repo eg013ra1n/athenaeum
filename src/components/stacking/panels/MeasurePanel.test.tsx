@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { MeasurePanel } from './MeasurePanel';
 import { stageSummary } from '../stageSummary';
 import type { SeedSource, StackingConfig } from '../../../types/stacking';
@@ -71,5 +71,55 @@ describe('stageSummary measure seeds', () => {
   it('keeps the peak and structure wording', () => {
     expect(stageSummary('measure', cfg('peak'))).toMatch(/ · σ 20$/);
     expect(stageSummary('measure', cfg('structure'))).toMatch(/ · structure-map seeds$/);
+  });
+});
+
+describe('MeasurePanel PSF model', () => {
+  const withPsf = (psfModel: StackingConfig['measurement']['psfModel']): StackingConfig => {
+    const base = cfg('matchedFilter');
+    return { ...base, measurement: { ...base.measurement, psfModel } };
+  };
+  const betaInput = () => screen.getByLabelText('Moffat β') as HTMLInputElement;
+  const patched = (onChange: ReturnType<typeof vi.fn>) =>
+    onChange.mock.calls.map((c) => (c[0] as StackingConfig).measurement.psfModel);
+
+  it('measure_panel_offers_a_moffat_with_its_own_beta', () => {
+    const onChange = vi.fn();
+    const { rerender } = render(<MeasurePanel config={withPsf('auto')} defaults={cfg('matchedFilter')} onChange={onChange} />);
+    const select = control('PSF model') as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(['auto', 'moffat4', 'moffat-own']);
+    expect(screen.queryByLabelText('Moffat β')).toBeNull();
+
+    fireEvent.change(select, { target: { value: 'moffat-own' } });
+    expect(patched(onChange)).toEqual([{ moffat: 4 }]);
+
+    rerender(<MeasurePanel config={withPsf({ moffat: 4 })} defaults={cfg('matchedFilter')} onChange={onChange} />);
+    expect((control('PSF model') as HTMLSelectElement).value).toBe('moffat-own');
+    expect(betaInput().value).toBe('4');
+    expect(betaInput().step).toBe('0.1');
+
+    fireEvent.change(betaInput(), { target: { value: '8' } });
+    expect(patched(onChange)[patched(onChange).length - 1]).toEqual({ moffat: 8 });
+
+    onChange.mockClear();
+    fireEvent.change(betaInput(), { target: { value: '1.2' } });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByText(/β from 1\.5 to 100 — not saved/)).toBeTruthy();
+    fireEvent.change(betaInput(), { target: { value: '101' } });
+    expect(onChange).not.toHaveBeenCalled();
+
+    fireEvent.change(select, { target: { value: 'moffat4' } });
+    expect(patched(onChange)).toEqual(['moffat4']);
+  });
+
+  it('keeps the chosen beta when the select is moved off and the own-beta key is picked again from a beta', () => {
+    const onChange = vi.fn();
+    render(<MeasurePanel config={withPsf({ moffat: 8 })} defaults={cfg('matchedFilter')} onChange={onChange} />);
+    fireEvent.change(control('PSF model'), { target: { value: 'moffat-own' } });
+    expect(patched(onChange)).toEqual([{ moffat: 8 }]);
+  });
+
+  it('names the beta in the stage summary', () => {
+    expect(stageSummary('measure', withPsf({ moffat: 8 }))).toContain('Moffat β 8 PSF');
   });
 });

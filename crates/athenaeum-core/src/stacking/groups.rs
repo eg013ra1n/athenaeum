@@ -178,25 +178,8 @@ fn exposure_token(exposure_s: Option<f64>) -> String {
     }
 }
 
-/// Pixel scale from the header's focal length and pixel size (M4b, ruling
-/// R-M4b-1): `206.2648 * xpixsz_um / focallen_mm`, arcsec/px — the standard
-/// plate-scale formula. `xpixsz_um` is trusted as already binned-effective
-/// (an ASI294MM bin-2 light's `XPIXSZ` already reads twice the sensor's
-/// native pixel size, the FITS convention every camera driver in the wild
-/// follows) — there is deliberately NO separate binning factor here.
-/// `None` when either input is missing, non-finite, or non-positive (a
-/// zero/negative `focallen` would divide by zero or invert the sign,
-/// neither a usable optical setup; a non-finite value is reachable from a
-/// real header — the FITS parser passes a literal `1E999` through as `inf`
-/// with no finiteness filter of its own, `fits_parser/fits_header_reader.rs`).
-pub fn header_pixel_scale_arcsec(xpixsz_um: Option<f64>, focallen_mm: Option<f64>) -> Option<f64> {
-    let xpixsz = xpixsz_um?;
-    let focallen = focallen_mm?;
-    if !xpixsz.is_finite() || !focallen.is_finite() || xpixsz <= 0.0 || focallen <= 0.0 {
-        return None;
-    }
-    Some(206.2648 * xpixsz / focallen)
-}
+// `header_pixel_scale_arcsec` (M4b, ruling R-M4b-1) is the kernel's: `206.2648 * xpixsz_um / focallen_mm`.
+pub use starloom::geometry::header_pixel_scale_arcsec;
 
 /// `sanitize_for_filename` a possibly-absent, possibly-blank value, falling
 /// back to `fallback` when the value is `None`, empty/whitespace, or

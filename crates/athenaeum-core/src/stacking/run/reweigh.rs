@@ -5,18 +5,8 @@ use super::*;
 /// `reason` of a fallback names "under 20 common stars"; the count it names is the module's.
 const _: () = assert!(common_set::COMMON_MIN_STARS == 20);
 
-/// A registration map's linear scale at the frame centre: the square root of the Jacobian determinant of
-/// `forward_exact`, by central differences over one pixel. `NaN` for a map that is not finite there.
-fn map_scale(map: &PixelMap, width: usize, height: usize) -> f64 {
-    let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
-    let (xp, yp) = map.forward_exact(cx + 1.0, cy);
-    let (xm, ym) = map.forward_exact(cx - 1.0, cy);
-    let (xq, yq) = map.forward_exact(cx, cy + 1.0);
-    let (xn, yn) = map.forward_exact(cx, cy - 1.0);
-    let (a, c) = ((xp - xm) / 2.0, (yp - ym) / 2.0);
-    let (b, d) = ((xq - xn) / 2.0, (yq - yn) / 2.0);
-    (a * d - b * c).abs().sqrt()
-}
+// `map_scale` (a registration map's linear scale at the frame centre) is the kernel's.
+use starloom::stacking::run_helpers::map_scale;
 
 /// Why one (group, plane) keeps its Measure-time weight inputs (ruling PD-6). Nothing here is per frame.
 #[derive(Debug, Clone, PartialEq)]
