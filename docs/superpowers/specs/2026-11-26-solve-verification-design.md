@@ -1,7 +1,7 @@
 # Solve verification as published: one chance-or-real test — design
 
-Date: 2026-11-26. Status: revised after the builder check and the per-star scan (§5.1); owner calls SV-8, SV-10 and
-SV-11 open (§10). Releases: solvemyastro 0.4.0, then an Athenaeum pointer bump.
+Date: 2026-11-26. Status: owner calls settled (§3), revised after the builder check and the per-star scan (§5.1);
+SV-8 is a contingency (§10). Releases: solvemyastro 0.4.0, then an Athenaeum pointer bump.
 
 ## 1. Problem and intent
 
@@ -49,6 +49,8 @@ Anti-goals (a failure even if it compiles)
 | SV-6 | Show the confidence: "Confidence: odds 10^X to 1" in the metadata pane's plate-solve block and in the refusal texts; the stored in-field count (0 or 1 on every row, the bug) is cleared to unknown. |
 | SV-7 | `SOLVE_RECIPE_VERSION` goes to 3: every stacking-cached solve re-solves once under the new rule. |
 | SV-9 | The owner supplies the lab's own frames (cloudy, narrow-field, DSLR, the recorded false alignments); the release waits for §7's minimum set. |
+| SV-10 | Thin solves: accept on A alone, with the gate's backstop of 6 matched on the final WCS; no minimum count. The narrow-field frames of §7 show whether a thin true solve exists. |
+| SV-11 | The match count is stored and shown on the final WCS (120 for 28940, not the linear 15); the pane, the refusal texts and the gate's floor count the stars the decision counted. Rows stored before keep their old count. |
 
 ## 4. How verification works today
 
@@ -116,7 +118,7 @@ break-even by their stored match count, all 271 rows under 1.5 × that break-eve
 - The stored `matched_stars` is `count_inliers` on the linear refit WCS (`orchestrate.rs:2158`), before the SIP fit.
   Dropping SIP from the stored WCS reproduces it (median ratio 0.97, p10–p90 0.89–1.03), while the final WCS matches
   2.9 × more (median; 28940: 14 against 120). The break-even premise, and every reconstruction here that starts from a
-  stored count, rest on that linear count. SV-11 asks to store the final one.
+  stored count, rest on that linear count. SV-11 stores the final one.
 - Centroid refinement on or off moves A by ≤ 1.3 decades. Stored `crpix` is 0-based (the FITS writer adds 1).
 
 Evidence (local, outside the repo): `~/.athenaeum-acc/gate-measure/scan-report.md` and `scan/rows_scan.csv`.
@@ -323,13 +325,11 @@ library. V-6 above 10⁶: the clause of §6.1 is active there. V-7: profiled. Ea
 
 | Id | Question | Proposal |
 | ---- | ---- | ---- |
-SV-6, SV-7 and SV-9 are decided (§3).
+SV-6, SV-7, SV-9, SV-10 and SV-11 are decided (§3). SV-8 is a contingency: it is asked only if V-3 fails.
 
 | Id | Question | Proposal |
 | ---- | ---- | ---- |
 | SV-8 | If V-3 fails on an owner's cloudy or narrow-field frame for the depth reason of §9: switch the rule to B, or accept the refusal? | Switch to B with ε from the same 1999:1 cost ratio. The library has no such frame (§5.1). |
-| SV-10 | Thin solves: with the hypothesis's own stars set aside, A needs a few matches beyond them (7–9 in all at this library's scales, more at long focal length). Accept on A alone, or also require a minimum count? | A alone, with the gate's backstop of 6 matched on the final WCS. The published method has no fixed minimum, and a count is the kind of hand-set rule this job removes. The narrow-field frames of §7 show whether a thin true solve exists. |
-| SV-11 | Store and show the match count on the final WCS (120 for 28940) instead of the linear count before the distortion fit (15)? | Yes: the pane's "Inliers: m / N", the refusal texts and the gate's floor then count the stars the decision counted. Rows stored before keep their old count. |
 
 ## 11. References
 
