@@ -1418,7 +1418,8 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     project target misses a retry. A cached Failed/Refused from another app
     version is tried once more (review I7); a cached solve stays. Bump
     `plate_solve::config::SOLVE_RECIPE_VERSION` when a solver change should
-    re-solve frames cached as solved. `rerun_from = Measure` does not force a
+    re-solve frames cached as solved (recipe 3, solvemyastro 0.4.0's decision,
+    re-solved every cached SOLVED solve once). `rerun_from = Measure` does not force a
     re-solve.
   - `solve` is not an intermediate: `CleanupWhat::Intermediates` keeps it, and
     only `CleanupWhat::All` (every artifact row) deletes the solve cache.

@@ -73,7 +73,9 @@ FITS/XISF
    │     keep whichever has the lower count_inliers RMS   ⇒ precise ≤ fast
    ▼
 SolveSolution { wcs, pixel_scale_arcsec, field_rotation_deg, matched_stars,
-                rms_residual_px/arcsec, inlier_ratio, psf_fwhm_px, … }
+                rms_residual_px/arcsec, inlier_ratio, log10_odds,
+                reference_stars_in_frame, hypotheses_verified, psf_fwhm_px, … }
+                (matched_stars: final-WCS count; inlier_ratio = matched_stars / reference_stars_in_frame)
 ```
 
 ### [1] Detection + PSF centroid refinement (rustafits)

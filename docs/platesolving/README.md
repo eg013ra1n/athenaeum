@@ -37,7 +37,7 @@ The solver is `solvemyastro`, a git submodule (`solvemyastro/` at the repo root,
            -> frames.object label from the nearest DSO, if empty
 ```
 
-A solve is refused or fails at one of three places, each with its own reason shown in the UI: the **input gate** (trailed stars, before any solver work), the **solver** (a `solvemyastro::SolveFailure`, translated by `plate_solve::failure::describe_solve_failure` into a stable code and a message), and the **acceptance gate** (`REJECTED_LOW_CONFIDENCE`, nothing written).
+A solve is refused or fails at one of three places, each with its own reason shown in the UI: the **input gate** (trailed stars, before any solver work), the **solver** (a `solvemyastro::SolveFailure`, translated by `plate_solve::failure::describe_solve_failure` into a stable code and a message), and the **acceptance gate** (`REJECTED_LOW_CONFIDENCE`, nothing written). The solver's failure codes include `NOT_CONFIDENT` (the best candidate's odds stayed under the bar of 10^9) and `TOO_FEW_MATCHED` (the best candidate cleared the odds but matched fewer stars than the floor of 6); the metadata pane and the batch panel style both as warnings.
 
 The `solver` cargo feature of `athenaeum-core` (on by default) pulls in `solvemyastro`; `cargo check --no-default-features` does not compile plate solving.
 
@@ -79,7 +79,7 @@ A solve found through the index logs `path = "index"` at `info` ("solve succeede
 
 **Acceptance.** 2026-10-25, no human at the screen: the web build's Quad Index block downloaded both packs from the real host (files byte-identical to the build), and a blind solve through `solve_frame_with_hints` with the packs installed matched the solve without them (M82 0.4 s against 3.2 s, an M42 frame 1.5 s against 3.1 s). 2026-10-31: the owner confirmed the packs work in the desktop build.
 
-**Recipe and identity.** `SOLVE_RECIPE_VERSION` is 2 (solvemyastro 0.2.0 changed verification and the search), so SOLVED stacking solves cached under recipe 1 are solved again. `stacking::solve::solver_identity` appends `|index:<index_identity>` when any pack is installed (`{config hash}:{catalog identity}|index:{identity}`); with none the form is unchanged. Installing, replacing or removing a pack therefore re-solves the stacking caches, which is intended: the same frame can now take a different path to its solution.
+**Recipe and identity.** `SOLVE_RECIPE_VERSION` is 3 (solvemyastro 0.4.0 replaced the completeness test and the gate's inlier-ratio rule with the solver's odds, and `blind_min_inlier_ratio` left the config), so SOLVED stacking solves cached under recipe 2 are solved again once; recipe 2 (solvemyastro 0.2.0 changed verification and the search) did the same for recipe 1. `stacking::solve::solver_identity` appends `|index:<index_identity>` when any pack is installed (`{config hash}:{catalog identity}|index:{identity}`); with none the form is unchanged. Installing, replacing or removing a pack therefore re-solves the stacking caches, which is intended: the same frame can now take a different path to its solution.
 
 **Publishing.** Not an Athenaeum job any more: `solvemyastro build-index --tiers <dir with tier_500 and tier_2000> --out <pack> --preset base|narrow` builds the two packs (`base`: depths 2 to 7 over `tier_500`; `narrow`: depth 8 over `tier_500` + `tier_2000`) and `solvemyastro package --tiers <tiers> --index base=<pack> --index narrow=<pack> --out <publish>` writes the zips, the `.sha256` sidecars (`"<hex>  <zip>\n"`) and the two manifests. Upload the files next to the tier files. Chain, presets and flags: `solvemyastro/README.md` and `solvemyastro/QUAD_INDEX.md`; moved text: "Detail moved to solvemyastro" at the end of this file.
 
@@ -352,26 +352,26 @@ Per frame: `load_frame_with_path`, then the **input gate** `service::input_gate_
 
 ### 3. Solve
 
-`solve_frame_with_hints` calls `solvemyastro::solve(file, hints, Caches::layered(..), SolveConfig, cancel)` with a `SolveConfig` whose recipe is fixed in code: `quad_tolerance` 0.007, `catalog_mag_limit` 19.0, `fit_sip` true, `sip_order` from `PlateSolveConfig`. Changing any of those recipe constants, the gate or the catalog layering means bumping `config::SOLVE_RECIPE_VERSION`. The solver (see `solvemyastro/src/orchestrate.rs`) detects stars with `astroimage`'s fast detector, ranks them by SNR and drops streaks (eccentricity above 0.8), refuses a frame whose detections are almost all streaks (`looks_trailed`), then walks an autoFOV ladder (a hinted scale gives a short ladder around it; blind, it runs from 9.5 deg down to 0.38 deg in steps of 1/1.5) and a square-spiral search of sky cells, around the hinted position (default search radius 10 deg) or the whole sky. In each cell it cones the catalog, projects it, builds quads, matches and fits an affine, seeds a WCS, counts inliers, refits and fits SIP. The solver itself never emits a solution below 6 inliers (`MIN_ABSOLUTE_INLIERS`).
+`solve_frame_with_hints` calls `solvemyastro::solve(file, hints, Caches::layered(..), SolveConfig, cancel)` with a `SolveConfig` whose recipe is fixed in code: `quad_tolerance` 0.007, `catalog_mag_limit` 19.0, `fit_sip` true, `sip_order` from `PlateSolveConfig`. Changing any of those recipe constants, the gate or the catalog layering means bumping `config::SOLVE_RECIPE_VERSION`. The solver (see `solvemyastro/src/orchestrate.rs`) detects stars with `astroimage`'s fast detector, ranks them by SNR and drops streaks (eccentricity above 0.8), refuses a frame whose detections are almost all streaks (`looks_trailed`), then walks an autoFOV ladder (a hinted scale gives a short ladder around it; blind, it runs from 9.5 deg down to 0.38 deg in steps of 1/1.5) and a square-spiral search of sky cells, around the hinted position (default search radius 10 deg) or the whole sky. In each cell it cones the catalog, projects it, builds quads, matches and fits an affine, seeds a WCS, counts inliers, refits and fits SIP. The solver itself never emits a solution below 6 inliers (`MIN_ABSOLUTE_INLIERS`) or whose odds of being a real alignment stay under 10^9 (the decision, `docs/platesolving/input-and-acceptance-gates.md`).
 
-The `SolveResult` carries the WCS with its SIP polynomials, `matched_stars`, `total_detected`, the RMS residual in pixels and arcseconds, pixel scale, field rotation, solve time, `catalog_used` and `algorithm_used` (both reported by the solver), `inlier_ratio` (the solver's own), and:
+The `SolveResult` carries the WCS with its SIP polynomials, `matched_stars` (counted on the final WCS), `total_detected`, the RMS residual in pixels and arcseconds, pixel scale, field rotation, solve time, `catalog_used` and `algorithm_used` (both reported by the solver), `inlier_ratio` (the solver's own: `matched_stars / N_R`), `log10_odds` (the decision's number), and:
 
-- `expected_catalog_stars_in_fov`, counted by `solvemyastro::accept::expected_bright_in_fov`: a cone of G <= 12 around the solved centre on the base layer, for a tier stack. Its radius is wrong today (open-items, "The in-field count reads 0").
+- `expected_catalog_stars_in_fov`, the solver's `reference_stars_in_frame`: `N_R`, the verification-set catalog stars inside the frame on the final WCS, the denominator of the pane's "Inliers: m / N".
 - `derived_focallen_mm`, inverted from the solved pixel scale and `XPIXSZ` (or the `camera_defaults` entry for the frame's `INSTRUME`/`TELESCOP` when `XPIXSZ` is missing). `focallen_corrected` is set when the header had no focal length, or when the derived value differs from it by more than 2 %, which means the header scale hint was wrong.
 
 A failure is returned as the solver's own error so `describe_solve_failure` can downcast the structured `SolveFailure`. Each frame is wrapped in `catch_unwind`: a panic becomes a per-frame failure and the batch continues. A cancel flag (`cancel_plate_solve`) is passed to the solver.
 
 ### 4. Acceptance gate and persistence (calling thread, one transaction)
 
-`service::store_result` first runs `acceptance_refusal` (only when `blind_gate_enabled`), which maps the config onto a `solvemyastro::accept::Gate` (`config::acceptance_gate`) and asks `Gate::accepts`; the thresholds and their order live in `solvemyastro/src/accept.rs` (`docs/platesolving/input-and-acceptance-gates.md`). A solve is refused when any of these holds:
+`service::store_result` first runs `acceptance_refusal` (only when `blind_gate_enabled`), which maps the config onto a `solvemyastro::accept::Gate` (`config::acceptance_gate`) and asks `Gate::refusal`; the thresholds and their order live in `solvemyastro/src/accept.rs` (`docs/platesolving/input-and-acceptance-gates.md`). The solver decides chance-or-real by its odds; the gate re-reads them and holds backstops. A solve is refused when any of these holds:
 
 - the RMS residual exceeds `blind_rms_max_px_mult` times the adaptive pixel tolerance, `clamp(base_verification_tolerance_arcsec / pixel_scale_arcsec, 4, 20)` px (`accept::gate_tol_px`);
-- the inlier count is below `blind_inlier_floor`;
-- the field is dense (`expected_catalog_stars_in_fov > 100`) and `inlier_ratio` is below `blind_min_inlier_ratio` (the primary false-positive discriminator; sparse fields are exempt);
+- the matched-star count (final WCS) is below `blind_inlier_floor`;
+- `log10_odds` is below `solvemyastro::verify::ACCEPT_LOG10_ODDS` (9);
 - the recovered pixel scale is outside `blind_scale_sanity_min`..`blind_scale_sanity_max` arcsec/px;
 - the header declares a pixel scale (from `focallen` and `xpixsz`) and the recovered scale differs from it by more than the factor `blind_scale_header_tol`.
 
-A refusal writes nothing and reaches the UI as a failure with code `REJECTED_LOW_CONFIDENCE`. The same pure check, `acceptance_refusal`, judges a frame in the stacking project path (`stacking::solve`), which also calls `solve_frame_with_hints` and `open_catalog_layers`; see `docs/stacking/README.md`. An accepted solve is written to `plate_solves` and the `frames` summary columns (see Database Storage), and, through `plate_solve::dso_lookup::DsoCatalog::find_best`, the nearest named object labels `frames.object` when it is empty.
+A refusal writes nothing and reaches the UI as a failure with code `REJECTED_LOW_CONFIDENCE`, its text naming the check (`Rejected: the match could be a chance alignment (odds 10^6.2 to 1, 10^9 needed; 12 stars matched)`, `Rejected: only 5 stars matched (6 needed)`). The same pure check, `acceptance_refusal`, judges a frame in the stacking project path (`stacking::solve`), which also calls `solve_frame_with_hints` and `open_catalog_layers`; see `docs/stacking/README.md`. An accepted solve is written to `plate_solves` and the `frames` summary columns (see Database Storage), and, through `plate_solve::dso_lookup::DsoCatalog::find_best`, the nearest named object labels `frames.object` when it is empty.
 
 ## Per-Frame Pipeline of the Quad-Index Solver (History)
 
@@ -584,7 +584,7 @@ Defined in `crates/athenaeum-core/src/db/schema.rs`. One row per frame — re-so
 | `sip_order` | `INTEGER` | Order of the fitted SIP polynomial; NULL when no SIP was fitted |
 | `sip_a_coeffs`, `sip_b_coeffs` | `TEXT` | SIP forward polynomials, JSON triangular arrays |
 | `sip_ap_coeffs`, `sip_bp_coeffs` | `TEXT` | SIP reverse polynomials, same encoding |
-| `matched_stars` | `INTEGER NOT NULL` | Inlier count |
+| `matched_stars` | `INTEGER NOT NULL` | Inlier count: on the final WCS from recipe 3 (solvemyastro 0.4.0); before, the count on the linear WCS ahead of the distortion fit, about a third of it |
 | `total_detected` | `INTEGER NOT NULL` | Stars the solver detected |
 | `rms_residual_px`, `rms_residual_arcsec` | `REAL NOT NULL` | RMS of the inlier residuals |
 | `pixel_scale_arcsec` | `REAL NOT NULL` | Solved pixel scale |
@@ -592,8 +592,9 @@ Defined in `crates/athenaeum-core/src/db/schema.rs`. One row per frame — re-so
 | `solve_time_ms` | `INTEGER NOT NULL` | Wall time of `solve_frame_with_hints` |
 | `catalog_used`, `algorithm_used` | `TEXT NOT NULL` | As reported by `solvemyastro` |
 | `solved_at` | `TEXT NOT NULL` | UTC timestamp, `%Y-%m-%d %H:%M:%S` |
-| `expected_catalog_stars_in_fov` | `INTEGER` | Catalog stars (G <= 12) in the solved field. Nullable: rows written before the column was added by the idempotent `ALTER TABLE` migration in `schema.rs` keep NULL |
-| `inlier_ratio` | `REAL` | The solver's inlier ratio; nullable for the same reason |
+| `expected_catalog_stars_in_fov` | `INTEGER` | `N_R`: the verification-set catalog stars inside the solved frame. Nullable: rows written before the column was added by the idempotent `ALTER TABLE` migration in `schema.rs` keep NULL, and the guarded step of recipe 3 cleared the old in-field count (all 0 or 1, the bug) to NULL, which the pane shows as unknown |
+| `inlier_ratio` | `REAL` | The solver's inlier ratio, `matched_stars / N_R` on new rows; stored for review, never judged; nullable for the same reason |
+| `log10_odds` | `REAL` | The decision's odds of a real alignment, in decades (10^N to 1); NULL on rows stored before recipe 3 (the pane shows a dash) |
 
 ### `frames` table (summary coordinates)
 
@@ -612,7 +613,7 @@ Defined in `crates/athenaeum-core/src/db/schema.rs`. One row per frame — re-so
 
 ## Configuration
 
-`PlateSolveConfig` lives in `crates/athenaeum-core/src/plate_solve/config.rs` and is persisted as JSON in the `settings` table under the key `plate_solve.config`. Every field is `#[serde(default)]` and unknown keys are ignored, so configs written by older versions (which carried `max_image_stars`, `min_matched_stars`, `verification_tolerance_px`, `index_mag_limit`, `hash_tolerance`, `use_fast_detection`, `retry_passes`, `min_inlier_ratio` and others) still load. `load_config` also normalises a stored `blind_inlier_floor` of 12, the pre-2026-05 default, to the current default.
+`PlateSolveConfig` lives in `crates/athenaeum-core/src/plate_solve/config.rs` and is persisted as JSON in the `settings` table under the key `plate_solve.config`. Every field is `#[serde(default)]` and unknown keys are ignored, so configs written by older versions (which carried `max_image_stars`, `min_matched_stars`, `verification_tolerance_px`, `index_mag_limit`, `hash_tolerance`, `use_fast_detection`, `retry_passes`, `min_inlier_ratio`, `blind_min_inlier_ratio` and others) still load; `blind_min_inlier_ratio` left the config with recipe 3 and a stored value is ignored. `load_config` also normalises a stored `blind_inlier_floor` of 12, the pre-2026-05 default, to the current default.
 
 | Field | Default | Meaning |
 | ---- | ---- | ---- |
@@ -622,8 +623,7 @@ Defined in `crates/athenaeum-core/src/db/schema.rs`. One row per frame — re-so
 | `batch_concurrency` | 0 | Batch workers; 0 = auto, `(cores / 3).clamp(2, 8)` |
 | `blind_gate_enabled` | `true` | Master switch of the acceptance gate (`store_result` and the stacking solve) |
 | `blind_rms_max_px_mult` | 2.5 | Refuse when `rms_residual_px` exceeds this multiple of the adaptive pixel tolerance |
-| `blind_min_inlier_ratio` | 0.04 | Minimum `inlier_ratio`, applied to dense fields only (more than 100 catalog stars in the field) |
-| `blind_inlier_floor` | 6 | Absolute inlier floor, equal to the solver's own minimum; a backstop, not a discriminator |
+| `blind_inlier_floor` | 6 | Absolute matched-star floor (final WCS), equal to the solver's own minimum; a backstop, not a discriminator |
 | `blind_scale_sanity_min`, `blind_scale_sanity_max` | 0.05, 60.0 | Recovered pixel scale must lie in this arcsec/px range |
 | `blind_scale_header_tol` | 8.0 | When the header implies a scale, the recovered scale must be within this factor of it |
 | `input_gate_enabled` | `true` | Refuse trailed frames before solving |
@@ -773,6 +773,12 @@ _History: the retired Tycho-2 quad-index solver (replaced by `solvemyastro` + Ga
 SIP distortion fitting and the Gaia catalog, listed here as planned while the quad-index solver was current, are implemented: the solver fits SIP and the `plate_solves` SIP columns are filled.
 
 ## Changelog
+
+### 2026-11 — Solve verification (solvemyastro 0.4.0)
+
+- The solver decides chance-or-real by the odds of its final fit (a Bayes factor, 10^9); the completeness test and the gate's `blind_min_inlier_ratio` rule are gone, the gate re-reads the odds and holds backstops. New failure codes `NOT_CONFIDENT` and `TOO_FEW_MATCHED`; refusal texts name the failed check.
+- `matched_stars` is counted on the final WCS; `inlier_ratio` is `matched_stars / N_R`; `plate_solves.log10_odds` added, the old in-field count cleared to NULL; the pane shows the odds and the true denominator.
+- `SOLVE_RECIPE_VERSION` 2 -> 3.
 
 ### 2026-10 — Quad index packs
 

@@ -439,15 +439,6 @@ Spec `docs/superpowers/specs/2026-11-22-header-fallbacks-design.md`, plan `plans
   (`docs/stacking/README.md` R-P4-C1): last duplicate, no `" / "` cut and blank values dropped here; rustafits unchanged by
   ruling, so no Analysis number moves.
 
-## The in-field count reads 0 — found in the solvemyastro standalone job (2026-11-25)
-
-A defect the job's real-data acceptance found and did not fix (the job moved the code verbatim); its own job, because it changes accept and refuse verdicts.
-`solvemyastro::accept::expected_bright_in_fov` rebuilds the field radius as `scale * sqrt(detected stars) / 3600 / 2 * 1.41`, using the star
-count where the image side in pixels belongs. On a 6252 x 4176 frame at 1.73 arcsec/px with 815 detections it gives 0.0097 degrees against a real
-half-diagonal of 1.807. So the in-field count is 0, and the dense-field check (`expected > 100 && inlier_ratio < 0.04`) never arms. It has been there
-since commit 38f55c5a (2026-05-19). A fix needs `config::SOLVE_RECIPE_VERSION` bumped (cached stacking solves are judged again) and a re-run of the
-accept/refuse set on the corpus; the function's own doc comment says the same. Reference: `docs/platesolving/input-and-acceptance-gates.md`.
-
 ## Standing decisions — do not re-flag these
 
 Each of these has been raised by an audit or a review at least once and answered.
@@ -537,6 +528,17 @@ Not smokes unless marked: what the `starloom` command and the `pipeline` layer (
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Solve verification — the solver's odds decide (solvemyastro 0.4.0, recipe 3, 2026-11-27)
+
+Branch `solve-verification`. The lab acceptance ran (`docs/platesolving/input-and-acceptance-gates.md`); what no test or lab run did:
+
+- **The pane's number on a fresh solve** (plan task A3, Step 5 was not run). In `npm run tauri dev` on the dev catalog,
+  solve one frame: the metadata pane's plate-solve block reads `Confidence: odds 10^N to 1` and `Inliers: m / N_R` with a
+  real denominator (not `m / 0`); a frame stored before the change shows a dash for the odds. Refuse one on purpose (a wrong
+  scale hint) and read the batch panel: `NOT_CONFIDENT` and `TOO_FEW_MATCHED` show as warnings, the text names the check.
+- **One stacking set re-solving once under recipe 3.** Run a set whose solves are cached as SOLVED: the first run solves
+  its frames again (the solver identity moved), the second run reads the cache. Every frame that solved before still solves.
 
 ### Starloom phase 0 — the stacking kernel lives in `crates/starloom` (2026-11-22)
 
@@ -2486,6 +2488,16 @@ A measured mismatch with a known fix, deferred to its own cycle; not a smoke.
 ### Measure working set on mono frames (Plan A Task 14b, 2026-10-19)
 
 - **`MEASURE_PLANES_RESIDENT = 8` (`stacking/run.rs`) is about 10 % low for mono frames.** The constant was fitted on an OSC frame; on a 6224 x 4168 mono plane (25.94 Mpx, set 204 `0058`) `measure_probe auto` peaks at 922.8 MB minus a 6.4 MB baseline = 8.83 planes, and the 69b4710b build peaks at 8.82, so Task 14b's median pass adds +0.00 (direct interleaved check). Cost if ignored: the Measure fan-out is sized about 10 % too wide on a tight machine (a 16 GB Mac) - slightly more memory pressure, no wrong numbers. Fix is its own memory cycle: re-measure per channel count and per plane size, then re-state the constant (and `NORMALIZE`'s, which cites it). Evidence: `athenaeum-lab` `star-lab/results/plan-a/t14b/e4-cost.txt`, ruling STOP C in the Task 14b sdd folder.
+
+### solvemyastro 0.4.1: the final fit's overfit on a band of matched stars (2026-11-27)
+
+- **A cubic refit over stars matched in a band across the frame can run 180 to 360 px off at the far edge**, and the odds
+  then read very high (10^85 on a lowered run over an NGC 7023 frame with a wrong scale hint). It is a real-sky overfit, not
+  a chance alignment; 0.3.0's test accepts it too, and no production solve reached one, so the owner excepted it for 0.4.0
+  (2026-11-27). The fix: limit the distortion order by how the matches cover the frame, and re-match over the whole frame
+  after the fit. The owner's condition: it is dropped if it slows the solver. Its lab check is the arm-2 lowered runs of
+  `release:63902` and `release:28940` (athenaeum-lab `harness/acceptance/solve-verify/`): the overfit candidate must score
+  low and no good frame may lose its solve.
 
 ### Analysis follow-ups (Plan C C9, 2026-10-24)
 
