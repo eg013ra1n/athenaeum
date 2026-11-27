@@ -418,7 +418,9 @@ export interface PlateSolveProgressEvent {
   rms_arcsec?: number;
   error?: string;
   /** Machine code for a failure (solvemyastro FailureClass, e.g. "VERIFY_GAP",
-   * or "REJECTED_LOW_CONFIDENCE" / "PANIC"). Lets the UI group/style reasons. */
+   * "NOT_CONFIDENT" (no candidate cleared the odds), "TOO_FEW_MATCHED" (one cleared
+   * them, too few stars matched), or "REJECTED_LOW_CONFIDENCE" / "PANIC").
+   * Lets the UI group/style reasons. */
   failure_code?: string;
   /** Frame filename, for labelling per-frame rows without a separate lookup. */
   filename?: string;

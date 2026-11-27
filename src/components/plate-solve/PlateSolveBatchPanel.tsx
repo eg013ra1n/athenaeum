@@ -3,6 +3,11 @@ import { AlertCircle, CheckCircle, Loader2, ScanSearch, XCircle } from 'lucide-r
 import { usePlateSolveProgressContext } from '../../contexts/PlateSolveProgressContext';
 import { ZipExtractionLine } from '../zip/ZipExtractionLine';
 
+/** A solve the solver or the gate declined for want of confidence is a warning, not an error. */
+const WARNING_FAILURE_CODES = new Set(['REJECTED_LOW_CONFIDENCE', 'NOT_CONFIDENT', 'TOO_FEW_MATCHED']);
+const isWarningFailure = (code: string | undefined): boolean =>
+  code != null && WARNING_FAILURE_CODES.has(code);
+
 export interface PlateSolveBatchPanelProps {
   /** All frame IDs shown in the current coordinates-missing list. Optional when the panel is driven imperatively. */
   frameIds?: number[];
@@ -92,7 +97,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
   ).length;
 
   // Per-frame failure reasons, surfaced as a list on completion. `code` lets
-  // us style a gate-rejected solve ("REJECTED_LOW_CONFIDENCE") differently from
+  // us style a gate-rejected or not-confident solve (`isWarningFailure`) differently from
   // a genuine no-solution failure.
   const failedFrames: Array<{
     frameId: number;
@@ -303,7 +308,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
           </summary>
           <ul className="max-h-56 divide-y divide-border/60 overflow-y-auto px-3 pb-2">
             {failedFrames.map(({ frameId, error, code, filename }) => {
-              const rejected = code === 'REJECTED_LOW_CONFIDENCE';
+              const rejected = isWarningFailure(code);
               return (
                 <li key={frameId} className="flex items-start gap-2 py-2">
                   {rejected ? (

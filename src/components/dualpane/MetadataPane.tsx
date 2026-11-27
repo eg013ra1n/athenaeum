@@ -27,6 +27,7 @@ import type { PlateSolveRecord } from '../../types/plate-solve';
 import type { PlateSolveCompleteEvent } from '../../types/helpers';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { ZipEntriesMetadata } from './ZipEntryView';
+import { formatInliers, formatSolveOdds } from './plateSolveText';
 import { zipEntryRows, type ZipLocation } from './zipView';
 
 interface Props {
@@ -1297,10 +1298,13 @@ function FileMetadataEditor({ otherListing, otherSelection, onSaved }: Omit<Prop
                   <div>
                     <span className="text-content-muted">Inliers: </span>
                     <span className="font-mono text-content">
-                      {plateSolve.matched_stars}
-                      {plateSolve.expected_catalog_stars_in_fov != null
-                        ? ` / ${plateSolve.expected_catalog_stars_in_fov}`
-                        : ''}
+                      {formatInliers(plateSolve.matched_stars, plateSolve.expected_catalog_stars_in_fov)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-content-muted">Confidence: </span>
+                    <span className="font-mono text-content">
+                      {formatSolveOdds(plateSolve.log10_odds)}
                     </span>
                   </div>
                   <div className="col-span-2">
