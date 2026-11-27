@@ -502,6 +502,7 @@ pub(crate) fn record_from_result(frame_id: i64, result: &SolveResult) -> PlateSo
         solved_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         expected_catalog_stars_in_fov: Some(result.expected_catalog_stars_in_fov as i32),
         inlier_ratio: Some(result.inlier_ratio),
+        log10_odds: Some(result.log10_odds),
     }
 }
 
@@ -1384,14 +1385,14 @@ mod tests {
     /// and for a stacking run's cached solve.
     #[test]
     fn record_from_result_is_the_stored_row() {
-        let r = record_from_result(7, &mk_result(120, 800, 0.15, 1.9, 1.0, 300.0));
+        let r = record_from_result(7, &mk_result(120, 476, 0.25, 1.9, 1.0, 300.0));
         assert_eq!((r.id, r.frame_id), (None, 7));
         assert_eq!((r.crval1, r.crval2), (123.45, 67.89));
         assert_eq!((r.cd1_1, r.cd1_2, r.cd2_1, r.cd2_2), (1e-4, 0.0, 0.0, 1e-4));
         assert_eq!((r.matched_stars, r.total_detected), (120, 600));
         assert_eq!(
-            (r.expected_catalog_stars_in_fov, r.inlier_ratio),
-            (Some(800), Some(0.15))
+            (r.expected_catalog_stars_in_fov, r.inlier_ratio, r.log10_odds),
+            (Some(476), Some(0.25), Some(300.0))
         );
         assert_eq!(
             (r.catalog_used.as_str(), r.algorithm_used.as_str()),

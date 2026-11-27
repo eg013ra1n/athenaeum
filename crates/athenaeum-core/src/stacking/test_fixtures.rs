@@ -1462,6 +1462,7 @@ pub(crate) fn sky_frame_record(f: &SkyFrame<'_>) -> crate::plate_solve::storage:
         solved_at: "2026-10-03T00:00:00Z".into(),
         expected_catalog_stars_in_fov: None,
         inlier_ratio: None,
+        log10_odds: None,
     }
 }
 

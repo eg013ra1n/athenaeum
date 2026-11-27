@@ -435,6 +435,7 @@ pub fn grid_plate_solve(grid: &CanonicalGrid, solved_at: &str) -> PlateSolveReco
         solved_at: solved_at.to_string(),
         expected_catalog_stars_in_fov: None,
         inlier_ratio: None,
+        log10_odds: None,
     }
 }
 
@@ -518,6 +519,7 @@ mod tests {
             solved_at: "2026-10-03T00:00:00Z".into(),
             expected_catalog_stars_in_fov: None,
             inlier_ratio: None,
+            log10_odds: None,
         }
     }
 

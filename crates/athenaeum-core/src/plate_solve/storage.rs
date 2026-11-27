@@ -34,14 +34,18 @@ pub struct PlateSolveRecord {
     pub catalog_used: String,
     pub algorithm_used: String,
     pub solved_at: String,
-    /// Number of catalog stars that fell within the solved field of view.
-    /// Used by the density-aware acceptance gate. None for pre-density-aware
-    /// solves stored before the migration.
+    /// Number of reference-catalog stars the solution places inside the frame (the solver's N_R, recipe 3). The
+    /// denominator of `matched_stars`. `None` for a solve stored before recipe 3: the older count was a different
+    /// quantity (a share of the catalog's bright stars) and the migration cleared it.
     pub expected_catalog_stars_in_fov: Option<i32>,
-    /// matched_stars / expected_catalog_stars_in_fov — solve confidence
-    /// signal independent of absolute star count. Closer to 1.0 = stronger
-    /// match. None for pre-density-aware solves.
+    /// `matched_stars / expected_catalog_stars_in_fov` as the solver computed it. Stored and shown, never judged
+    /// from the stored row: the decision is `log10_odds`. `None` for pre-density-aware solves.
     pub inlier_ratio: Option<f64>,
+    /// The solver's Bayes factor for "this solution is real, not chance", in decades (a value of 314 reads
+    /// "10^314 to 1"). Recorded from recipe 3 on; `None` for a solve stored before it. A display value: no gate
+    /// reads it back, the solver decided on it at solve time.
+    #[serde(default)]
+    pub log10_odds: Option<f64>,
 }
 
 impl PlateSolveRecord {
@@ -124,7 +128,7 @@ pub fn insert_plate_solve(conn: &Connection, record: &PlateSolveRecord) -> Resul
             rms_residual_px, rms_residual_arcsec,
             pixel_scale_arcsec, field_rotation_deg,
             solve_time_ms, catalog_used, algorithm_used, solved_at,
-            expected_catalog_stars_in_fov, inlier_ratio
+            expected_catalog_stars_in_fov, inlier_ratio, log10_odds
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
@@ -133,7 +137,7 @@ pub fn insert_plate_solve(conn: &Connection, record: &PlateSolveRecord) -> Resul
             ?17, ?18,
             ?19, ?20,
             ?21, ?22, ?23, ?24,
-            ?25, ?26
+            ?25, ?26, ?27
         )",
         rusqlite::params![
             record.frame_id,
@@ -162,6 +166,7 @@ pub fn insert_plate_solve(conn: &Connection, record: &PlateSolveRecord) -> Resul
             record.solved_at,
             record.expected_catalog_stars_in_fov,
             record.inlier_ratio,
+            record.log10_odds,
         ],
     )
     .context("Failed to insert plate solve record")?;
@@ -181,7 +186,7 @@ const PLATE_SOLVE_COLUMNS: &str = "id, frame_id, crpix1, crpix2, crval1, crval2,
                     rms_residual_px, rms_residual_arcsec,
                     pixel_scale_arcsec, field_rotation_deg,
                     solve_time_ms, catalog_used, algorithm_used, solved_at,
-                    expected_catalog_stars_in_fov, inlier_ratio";
+                    expected_catalog_stars_in_fov, inlier_ratio, log10_odds";
 
 fn row_to_plate_solve(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlateSolveRecord> {
     Ok(PlateSolveRecord {
@@ -212,6 +217,7 @@ fn row_to_plate_solve(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlateSolveRec
         solved_at: row.get(24)?,
         expected_catalog_stars_in_fov: row.get(25)?,
         inlier_ratio: row.get(26)?,
+        log10_odds: row.get(27)?,
     })
 }
 
@@ -386,6 +392,7 @@ mod tests {
             solved_at: "2025-01-01T00:00:00Z".to_string(),
             expected_catalog_stars_in_fov: None,
             inlier_ratio: None,
+            log10_odds: None,
         }
     }
 
@@ -461,5 +468,38 @@ mod tests {
             .to_solution()
             .expect("forward-only converts");
         assert!(w.sip_forward.is_some() && w.sip_reverse.is_none());
+    }
+
+    /// A catalog connection without foreign keys, so a row needs no frame behind it.
+    fn catalog() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_record_round_trips_its_odds() {
+        let conn = catalog();
+        let mut r = record(None, None, None);
+        r.log10_odds = Some(314.4);
+        insert_plate_solve(&conn, &r).unwrap();
+        let back = get_plate_solve(&conn, 77).unwrap().expect("the row is stored");
+        assert_eq!(back.log10_odds, Some(314.4));
+    }
+
+    #[test]
+    fn a_row_without_odds_reads_none() {
+        let conn = catalog();
+        conn.execute(
+            "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2,
+                matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec,
+                field_rotation_deg, solve_time_ms, catalog_used, algorithm_used, solved_at)
+             VALUES (78, 0, 0, 10, 20, 1e-4, 0, 0, 1e-4, 15, 100, 0.5, 0.5, 1.0, 0, 1, 'c', 'a', 't')",
+            [],
+        )
+        .unwrap();
+        let back = get_plate_solve(&conn, 78).unwrap().expect("the row is stored");
+        assert_eq!(back.log10_odds, None);
     }
 }

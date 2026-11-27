@@ -315,6 +315,7 @@ mod tests {
             solved_at: "2026-09-09T00:00:00Z".into(),
             expected_catalog_stars_in_fov: None,
             inlier_ratio: None,
+            log10_odds: None,
         }
     }
 
@@ -463,6 +464,7 @@ mod tests {
             solved_at: "2026-09-10T00:00:00Z".into(),
             expected_catalog_stars_in_fov: Some(60),
             inlier_ratio: Some(0.8),
+            log10_odds: None,
         }
     }
 

@@ -822,6 +822,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// A cached solve written before `log10_odds` existed still decodes; the odds read unknown.
+    #[test]
+    fn a_cached_solve_without_odds_decodes() {
+        let mut record = serde_json::to_value(FakeSolver::fixture_record()).unwrap();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("log10_odds")
+            .expect("the record serializes its odds");
+        let json = serde_json::json!({
+            "blake3": "bb",
+            "app_version": "1.2.3",
+            "outcome": { "solved": record },
+        });
+        let back: SolveArtifact = serde_json::from_value(json).unwrap();
+        match back.outcome {
+            SolveOutcome::Solved(r) => assert_eq!(r.log10_odds, None),
+            other => panic!("expected a solved outcome, got {}", other.label()),
+        }
+    }
+
     /// Spec §5.2: a project frame's request carries its handle (it names the
     /// solve's span, review M12), the project's target as the position hint,
     /// and the manifest's scale as both the scale hint and the gate's expected

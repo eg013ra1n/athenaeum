@@ -1343,6 +1343,7 @@ mod tests {
             solved_at: "2026-09-09T00:00:00Z".into(),
             expected_catalog_stars_in_fov: None,
             inlier_ratio: None,
+            log10_odds: None,
         }
     }
 
