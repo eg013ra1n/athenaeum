@@ -815,6 +815,33 @@ fn backfill_identity(conn: &Connection) -> rusqlite::Result<()> {
 /// trigger-evolution DROP+CREATE DDL. Held for the whole `init_db` body.
 static INIT_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The `plate_solves.log10_odds` step: the in-field count cleared and the column added in one transaction. The
+/// column is probed again after the write lock is taken (another process of the new build may have migrated between
+/// the caller's probe and the lock): then nothing is cleared and the transaction commits empty. Any error rolls
+/// back (the transaction's drop) and is logged and returned.
+fn add_log10_odds_column(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let step = (|| -> rusqlite::Result<()> {
+        let present: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plate_solves') WHERE name='log10_odds'",
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            tx.execute("UPDATE plate_solves SET expected_catalog_stars_in_fov = NULL", [])?;
+            tx.execute("ALTER TABLE plate_solves ADD COLUMN log10_odds REAL", [])?;
+        }
+        Ok(())
+    })();
+    match step.and_then(|()| tx.commit()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::error!(error = %e, "plate_solves.log10_odds migration failed");
+            Err(e)
+        }
+    }
+}
+
 /// Initialize the database schema.
 ///
 /// **Idempotent** — safe to call repeatedly on the same catalog; every table /
@@ -2300,22 +2327,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     if has_log10_odds == 0 {
-        let step = conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             UPDATE plate_solves SET expected_catalog_stars_in_fov = NULL;
-             ALTER TABLE plate_solves ADD COLUMN log10_odds REAL;
-             COMMIT;",
-        );
-        if let Err(e) = &step {
-            tracing::error!(error = %e, "plate_solves.log10_odds migration failed");
-            // A failed statement inside the batch leaves its explicit BEGIN open.
-            if !conn.is_autocommit() {
-                if let Err(e) = conn.execute("ROLLBACK", []) {
-                    tracing::error!(error = %e, "migration batch rollback failed");
-                }
-            }
-        }
-        step?;
+        add_log10_odds_column(conn)?;
     }
 
     // Add archived_at to frames_set table (ZIP archive feature)
@@ -8208,5 +8220,33 @@ mod plate_solves_odds_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         assert!(has_odds_column(&conn));
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2,
+                matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec,
+                field_rotation_deg, solve_time_ms, catalog_used, algorithm_used, solved_at,
+                expected_catalog_stars_in_fov, inlier_ratio, log10_odds)
+             VALUES (1, 0, 0, 10, 20, 1e-4, 0, 0, 1e-4, 120, 100, 0.5, 0.5, 1.0, 0, 1, 'c', 'a', 't',
+                476, 0.25, 314.4)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(row(&conn, 1), (Some(476), Some(0.25), 120, Some(314.4)), "no clearing on a catalog that has the column");
+    }
+
+    /// Another process may add the column between the probe and the write lock: the step, run against a table
+    /// that already has the column, commits without clearing and without an error.
+    #[test]
+    fn the_step_run_after_another_process_added_the_column_clears_nothing() {
+        let conn = old_catalog();
+        put_old_row(&conn, 1, Some(300), 0.2, 15);
+        conn.execute("ALTER TABLE plate_solves ADD COLUMN log10_odds REAL", []).unwrap();
+        conn.execute("UPDATE plate_solves SET log10_odds = 12.5", []).unwrap();
+
+        add_log10_odds_column(&conn).unwrap();
+
+        assert!(conn.is_autocommit(), "the transaction is closed");
+        assert_eq!(row(&conn, 1), (Some(300), Some(0.2), 15, Some(12.5)));
     }
 }

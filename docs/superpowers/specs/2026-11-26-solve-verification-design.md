@@ -214,7 +214,7 @@ judges fresh solves.
 - `acceptance_gate` maps six fields. The refusal text names the check (code stays `REJECTED_LOW_CONFIDENCE`), e.g.
   "the match could be a chance alignment (odds 10^6.2 to 1, 10^9 needed; 12 stars matched)" or "only 5 stars matched
   (6 needed)". `describe_solve_failure` for `NOT_CONFIDENT`: "A candidate position was found, but its star match could
-  be chance (best odds 10^6.2 to 1; 10^9 needed)."
+  be chance (best odds 10^6.2 to 1; at least 10^9 needed)."
 - Decided (SV-6): "Confidence: odds 10^X to 1" in the pane's plate-solve block (X rounded down; a dash for rows stored
   before the change). With SV-11 the pane's "Inliers: m / N" shows the final count over N_R on new rows; a row stored
   before keeps its old, linear count over an unknown denominator. No Settings change, no Tauri command change.

@@ -50,7 +50,7 @@ pub fn describe_solve_failure(err: &anyhow::Error) -> SolveFailureInfo {
             }
             FailureClass::NotConfident { best_log10_odds } => format!(
                 "A candidate position was found, but its star match could be chance \
-                 (best odds 10^{best_log10_odds:.1} to 1; 10^{} needed).",
+                 (best odds 10^{best_log10_odds:.1} to 1; at least 10^{} needed).",
                 solvemyastro::verify::ACCEPT_LOG10_ODDS
             ),
             FailureClass::TooFewMatched { best_matched, floor } => format!(
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(info.code.as_deref(), Some("NOT_CONFIDENT"));
         assert_eq!(
             info.message,
-            "A candidate position was found, but its star match could be chance (best odds 10^6.2 to 1; 10^9 needed)."
+            "A candidate position was found, but its star match could be chance (best odds 10^6.2 to 1; at least 10^9 needed)."
         );
     }
 

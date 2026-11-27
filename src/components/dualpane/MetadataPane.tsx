@@ -1298,7 +1298,7 @@ function FileMetadataEditor({ otherListing, otherSelection, onSaved }: Omit<Prop
                   <div>
                     <span className="text-content-muted">Inliers: </span>
                     <span className="font-mono text-content">
-                      {formatInliers(plateSolve.matched_stars, plateSolve.expected_catalog_stars_in_fov)}
+                      {formatInliers(plateSolve.matched_stars, plateSolve.expected_catalog_stars_in_fov, plateSolve.log10_odds)}
                     </span>
                   </div>
                   <div>

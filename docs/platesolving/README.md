@@ -37,7 +37,7 @@ The solver is `solvemyastro`, a git submodule (`solvemyastro/` at the repo root,
            -> frames.object label from the nearest DSO, if empty
 ```
 
-A solve is refused or fails at one of three places, each with its own reason shown in the UI: the **input gate** (trailed stars, before any solver work), the **solver** (a `solvemyastro::SolveFailure`, translated by `plate_solve::failure::describe_solve_failure` into a stable code and a message), and the **acceptance gate** (`REJECTED_LOW_CONFIDENCE`, nothing written). The solver's failure codes include `NOT_CONFIDENT` (the best candidate's odds stayed under the bar of 10^9) and `TOO_FEW_MATCHED` (the best candidate cleared the odds but matched fewer stars than the floor of 6); the metadata pane and the batch panel style both as warnings.
+A solve is refused or fails at one of three places, each with its own reason shown in the UI: the **input gate** (trailed stars, before any solver work), the **solver** (a `solvemyastro::SolveFailure`, translated by `plate_solve::failure::describe_solve_failure` into a stable code and a message), and the **acceptance gate** (`REJECTED_LOW_CONFIDENCE`, nothing written). The solver's failure codes include `NOT_CONFIDENT` (the best candidate's odds stayed under the bar of 10^9) and `TOO_FEW_MATCHED` (the best candidate cleared the odds but matched fewer stars than the floor of 6); only the batch panel styles both as warnings (the metadata pane shows no failure).
 
 The `solver` cargo feature of `athenaeum-core` (on by default) pulls in `solvemyastro`; `cargo check --no-default-features` does not compile plate solving.
 

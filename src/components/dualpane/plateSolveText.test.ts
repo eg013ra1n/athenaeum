@@ -15,12 +15,18 @@ describe('formatSolveOdds', () => {
 });
 
 describe('formatInliers', () => {
-  it('inliers show the in-frame reference count when known', () => {
-    expect(formatInliers(120, 476)).toBe('120 / 476');
-    expect(formatInliers(15, null)).toBe('15');
+  it('inliers show the in-frame reference count of a recipe-3 row', () => {
+    expect(formatInliers(120, 476, 314.4)).toBe('120 / 476');
   });
 
-  it('never prints a zero denominator', () => {
-    expect(formatInliers(15, 0)).toBe('15');
+  it('a row an older build wrote after the step shows the matched count alone', () => {
+    expect(formatInliers(15, 1, null)).toBe('15');
+    expect(formatInliers(15, 1, undefined)).toBe('15');
+    expect(formatInliers(15, 1, NaN)).toBe('15');
+  });
+
+  it('never prints a missing or zero denominator', () => {
+    expect(formatInliers(15, null, 12.5)).toBe('15');
+    expect(formatInliers(15, 0, 12.5)).toBe('15');
   });
 });

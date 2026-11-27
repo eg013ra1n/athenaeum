@@ -12,9 +12,16 @@ export function formatSolveOdds(log10Odds: number | null | undefined): string {
 
 /**
  * Matched stars over the reference stars the solved WCS puts in the frame.
- * A solve without that count (older recipe) or with a zero one shows the
- * matched count alone, never a zero denominator.
+ * Only a recipe-3 row (one that carries the solver's odds) has that count: an
+ * older build can store a different number in the same column after the
+ * catalog's migration, so a row without finite odds, or with a zero count,
+ * shows the matched count alone, never a denominator.
  */
-export function formatInliers(matched: number, inField: number | null | undefined): string {
-  return inField != null && inField > 0 ? `${matched} / ${inField}` : `${matched}`;
+export function formatInliers(
+  matched: number,
+  inField: number | null | undefined,
+  log10Odds: number | null | undefined,
+): string {
+  const recipe3 = log10Odds != null && Number.isFinite(log10Odds);
+  return recipe3 && inField != null && inField > 0 ? `${matched} / ${inField}` : `${matched}`;
 }

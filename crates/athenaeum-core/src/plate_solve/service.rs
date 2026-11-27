@@ -405,6 +405,7 @@ pub fn store_result(
                 inliers = result.matched_stars,
                 log10_odds = result.log10_odds,
                 scale_arcsec_px = result.pixel_scale_arcsec,
+                reason = %reason,
                 "refusing to persist low-confidence solve, WCS/focal length not written back"
             );
             return Ok(StoreOutcome::RejectedLowConfidence { reason });
