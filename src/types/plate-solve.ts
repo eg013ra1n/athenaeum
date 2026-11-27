@@ -41,16 +41,9 @@ blind_gate_enabled: boolean,
  */
 blind_rms_max_px_mult: number, 
 /**
- * Minimum inlier_ratio, applied only to dense fields (expected_in_fov >
- * 100); sparse fields keep the absolute floor. This is the primary
- * false-positive discriminator. Default: 0.04.
- */
-blind_min_inlier_ratio: number, 
-/**
  * Absolute minimum inliers — a TRUE hard floor, not a discriminator.
- * The real-library calibration found inlier COUNT does not separate real
- * solves from false positives (`inlier_ratio` does — see
- * `blind_min_inlier_ratio`), so this is only a backstop. Set to 6 to match
+ * Chance-or-real is decided by the solver's odds (`verify::ACCEPT_LOG10_ODDS`,
+ * re-read by the gate), so this is only a backstop. Set to 6 to match
  * solvemyastro's own `MIN_ABSOLUTE_INLIERS` acceptance floor: the solver
  * never emits a solution below 6 inliers, so athenaeum never
  * count-rejects a solve the solver itself already accepted. Raising it

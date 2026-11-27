@@ -48,6 +48,14 @@ pub fn describe_solve_failure(err: &anyhow::Error) -> SolveFailureInfo {
                 "A candidate was rejected before verification (implausible pixel scale)."
                     .to_string()
             }
+            FailureClass::NotConfident { best_log10_odds } => format!(
+                "A candidate position was found, but its star match could be chance \
+                 (best odds 10^{best_log10_odds:.1} to 1; 10^{} needed).",
+                solvemyastro::verify::ACCEPT_LOG10_ODDS
+            ),
+            FailureClass::TooFewMatched { best_matched, floor } => format!(
+                "A candidate position was found, but only {best_matched} stars matched ({floor} needed)."
+            ),
             // Solved shouldn't appear on the error path; Unclassified has no
             // better text than the raw message.
             FailureClass::Solved | FailureClass::Unclassified => f.message.clone(),
@@ -61,5 +69,38 @@ pub fn describe_solve_failure(err: &anyhow::Error) -> SolveFailureInfo {
             code: None,
             message: err.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(class: FailureClass) -> anyhow::Error {
+        anyhow::Error::new(SolveFailure {
+            class,
+            best_attempt: None,
+            message: "raw".to_string(),
+            hypotheses_verified: 0,
+            prefilter_passed: 0,
+            verifies: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn not_confident_reads_as_a_chance_match() {
+        let info = describe_solve_failure(&failure(FailureClass::NotConfident { best_log10_odds: 6.2 }));
+        assert_eq!(info.code.as_deref(), Some("NOT_CONFIDENT"));
+        assert_eq!(
+            info.message,
+            "A candidate position was found, but its star match could be chance (best odds 10^6.2 to 1; 10^9 needed)."
+        );
+    }
+
+    #[test]
+    fn too_few_matched_reads_as_a_floor_refusal() {
+        let info = describe_solve_failure(&failure(FailureClass::TooFewMatched { best_matched: 5, floor: 6 }));
+        assert_eq!(info.code.as_deref(), Some("TOO_FEW_MATCHED"));
+        assert_eq!(info.message, "A candidate position was found, but only 5 stars matched (6 needed).");
     }
 }

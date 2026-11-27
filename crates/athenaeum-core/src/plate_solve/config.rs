@@ -48,15 +48,9 @@ pub struct PlateSolveConfig {
     /// backstop (rms was non-discriminating in calibration). Default: 2.5.
     #[serde(default = "default_blind_rms_max_px_mult")]
     pub blind_rms_max_px_mult: f64,
-    /// Minimum inlier_ratio, applied only to dense fields (expected_in_fov >
-    /// 100); sparse fields keep the absolute floor. This is the primary
-    /// false-positive discriminator. Default: 0.04.
-    #[serde(default = "default_blind_min_inlier_ratio")]
-    pub blind_min_inlier_ratio: f64,
     /// Absolute minimum inliers — a TRUE hard floor, not a discriminator.
-    /// The real-library calibration found inlier COUNT does not separate real
-    /// solves from false positives (`inlier_ratio` does — see
-    /// `blind_min_inlier_ratio`), so this is only a backstop. Set to 6 to match
+    /// Chance-or-real is decided by the solver's odds (`verify::ACCEPT_LOG10_ODDS`,
+    /// re-read by the gate), so this is only a backstop. Set to 6 to match
     /// solvemyastro's own `MIN_ABSOLUTE_INLIERS` acceptance floor: the solver
     /// never emits a solution below 6 inliers, so athenaeum never
     /// count-rejects a solve the solver itself already accepted. Raising it
@@ -122,13 +116,10 @@ fn default_blind_gate_enabled() -> bool {
 fn default_blind_rms_max_px_mult() -> f64 {
     2.5
 }
-fn default_blind_min_inlier_ratio() -> f64 {
-    0.04
-}
 fn default_blind_inlier_floor() -> usize {
-    // = solvemyastro MIN_ABSOLUTE_INLIERS. Not a discriminator (the calibration
-    // showed count does not separate real/false — inlier_ratio does); only a
-    // floor matching the solver's own acceptance minimum. See the field doc.
+    // = solvemyastro MIN_ABSOLUTE_INLIERS. Not a discriminator (the solver's
+    // odds are); only a floor matching the solver's own acceptance minimum.
+    // See the field doc.
     6
 }
 fn default_blind_scale_sanity_min() -> f64 {
@@ -153,7 +144,6 @@ impl Default for PlateSolveConfig {
             batch_concurrency: default_batch_concurrency(),
             blind_gate_enabled: default_blind_gate_enabled(),
             blind_rms_max_px_mult: default_blind_rms_max_px_mult(),
-            blind_min_inlier_ratio: default_blind_min_inlier_ratio(),
             blind_inlier_floor: default_blind_inlier_floor(),
             blind_scale_sanity_min: default_blind_scale_sanity_min(),
             blind_scale_sanity_max: default_blind_scale_sanity_max(),
@@ -179,7 +169,6 @@ pub fn acceptance_gate(cfg: &PlateSolveConfig) -> solvemyastro::accept::Gate {
     solvemyastro::accept::Gate {
         base_tolerance_arcsec: cfg.base_verification_tolerance_arcsec,
         rms_max_px_mult: cfg.blind_rms_max_px_mult,
-        min_inlier_ratio: cfg.blind_min_inlier_ratio,
         inlier_floor: cfg.blind_inlier_floor,
         scale_sanity_min: cfg.blind_scale_sanity_min,
         scale_sanity_max: cfg.blind_scale_sanity_max,
@@ -236,7 +225,9 @@ pub fn save_config(conn: &Connection, config: &PlateSolveConfig) -> Result<()> {
 /// 2: solvemyastro 0.2.0 changed the verification and the search (the quad
 /// index, the bright-star completeness gate), so a SOLVED solve cached under
 /// version 1 is solved again.
-pub const SOLVE_RECIPE_VERSION: u32 = 2;
+///
+/// 3: solvemyastro 0.4.0 decides chance-or-real by a Bayes factor; the completeness test and the 4 % rule are gone.
+pub const SOLVE_RECIPE_VERSION: u32 = 3;
 
 /// What a cached solve depends on (plan 6b-2 C14): the recipe, the SIP
 /// order, and every acceptance-gate field. Not the batch concurrency, the
@@ -249,7 +240,6 @@ pub fn solver_config_value(cfg: &PlateSolveConfig) -> serde_json::Value {
         "baseVerificationToleranceArcsec": cfg.base_verification_tolerance_arcsec,
         "blindGateEnabled": cfg.blind_gate_enabled,
         "blindRmsMaxPxMult": cfg.blind_rms_max_px_mult,
-        "blindMinInlierRatio": cfg.blind_min_inlier_ratio,
         "blindInlierFloor": cfg.blind_inlier_floor,
         "blindScaleSanityMin": cfg.blind_scale_sanity_min,
         "blindScaleSanityMax": cfg.blind_scale_sanity_max,
@@ -271,14 +261,13 @@ pub fn solver_config_hash(cfg: &PlateSolveConfig) -> String {
 mod tests {
     use super::*;
 
-    /// `acceptance_gate` maps every gate threshold one-to-one onto solvemyastro's `Gate`: seven distinct
-    /// non-default values land in seven distinct fields.
+    /// `acceptance_gate` maps every gate threshold one-to-one onto solvemyastro's `Gate`: six distinct
+    /// non-default values land in six distinct fields.
     #[test]
     fn acceptance_gate_maps_every_field() {
         let cfg = PlateSolveConfig {
             base_verification_tolerance_arcsec: 11.0,
             blind_rms_max_px_mult: 3.5,
-            blind_min_inlier_ratio: 0.07,
             blind_inlier_floor: 9,
             blind_scale_sanity_min: 0.11,
             blind_scale_sanity_max: 42.0,
@@ -290,7 +279,6 @@ mod tests {
             solvemyastro::accept::Gate {
                 base_tolerance_arcsec: 11.0,
                 rms_max_px_mult: 3.5,
-                min_inlier_ratio: 0.07,
                 inlier_floor: 9,
                 scale_sanity_min: 0.11,
                 scale_sanity_max: 42.0,
@@ -315,7 +303,6 @@ mod tests {
         let old = r#"{"max_image_stars":300,"min_matched_stars":6,"solver_backend":"legacy"}"#;
         let cfg: PlateSolveConfig = serde_json::from_str(old).unwrap();
         assert!(cfg.blind_gate_enabled);
-        assert_eq!(cfg.blind_min_inlier_ratio, 0.04);
         assert!(cfg.blind_inlier_floor >= 6);
         assert_eq!(cfg.blind_scale_header_tol, 8.0);
         assert_eq!(cfg.sip_order, 3);
@@ -357,6 +344,33 @@ mod tests {
         );
     }
 
+    /// solvemyastro 0.4.0 decides chance-or-real by odds, so the ratio threshold is gone: a config stored with the
+    /// key still decodes (the key is ignored, the other values kept) and saves without it.
+    #[test]
+    fn a_stored_config_with_the_ratio_key_decodes_and_saves_without_it() {
+        use crate::db::schema::init_db;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('plate_solve.config', ?1)",
+            [r#"{"blind_min_inlier_ratio":0.04,"blind_inlier_floor":20}"#],
+        )
+        .unwrap();
+        let cfg = load_config(&conn);
+        assert_eq!(cfg.blind_inlier_floor, 20, "the document decoded as a whole, not to defaults");
+        save_config(&conn, &cfg).unwrap();
+        let json: String = conn
+            .query_row("SELECT value FROM settings WHERE key = 'plate_solve.config'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!json.contains("blind_min_inlier_ratio"), "{json}");
+    }
+
+    /// Recipe 3 is solvemyastro 0.4.0's decision; a cached SOLVED solve of recipe 2 is solved again.
+    #[test]
+    fn the_recipe_is_three() {
+        assert_eq!(SOLVE_RECIPE_VERSION, 3);
+    }
+
     /// Plan C C7 (PC-12, REMOVE): a config stored while the eccentricity / trail-R² pair existed still decodes; the two
     /// keys are ignored and every other value, the switch included, is kept.
     #[test]
@@ -388,11 +402,11 @@ mod tests {
         let cfg = PlateSolveConfig::default();
         assert_eq!(
             serde_json::to_string(&solver_config_value(&cfg)).unwrap(),
-            r#"{"baseVerificationToleranceArcsec":8.0,"blindGateEnabled":true,"blindInlierFloor":6,"blindMinInlierRatio":0.04,"blindRmsMaxPxMult":2.5,"blindScaleHeaderTol":8.0,"blindScaleSanityMax":60.0,"blindScaleSanityMin":0.05,"recipe":2,"sipOrder":3}"#
+            r#"{"baseVerificationToleranceArcsec":8.0,"blindGateEnabled":true,"blindInlierFloor":6,"blindRmsMaxPxMult":2.5,"blindScaleHeaderTol":8.0,"blindScaleSanityMax":60.0,"blindScaleSanityMin":0.05,"recipe":3,"sipOrder":3}"#
         );
         let h = solver_config_hash(&cfg);
         assert_eq!(h.len(), 16);
-        assert_eq!(h, "91087005893f31a2");
+        assert_eq!(h, "e39aaed95773de95");
         let mut same = cfg.clone();
         same.batch_concurrency = 4;
         same.autofind_tolerance_deg = 2.0;

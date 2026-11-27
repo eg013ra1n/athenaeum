@@ -450,7 +450,7 @@ struct PlateSolveProgressEvent {
     matched_stars: Option<usize>,
     rms_arcsec: Option<f64>,
     error: Option<String>,
-    /// Machine code for a failure (solvemyastro `FailureClass` or
+    /// Machine code for a failure (solvemyastro `FailureClass`, e.g. `NOT_CONFIDENT` or `TOO_FEW_MATCHED`, or
     /// `REJECTED_LOW_CONFIDENCE` / `PANIC`); lets the UI group/style reasons.
     failure_code: Option<String>,
     /// Frame filename, so the UI can label per-frame rows without a lookup.
