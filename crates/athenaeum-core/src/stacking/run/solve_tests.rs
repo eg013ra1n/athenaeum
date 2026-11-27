@@ -120,7 +120,8 @@ fn a_failed_or_refused_solve_is_cached_and_the_frame_stays() {
             .with(
                 "c_r2.fits",
                 SolveOutcome::Refused(
-                    "Rejected: low confidence (6 inliers, ratio 0.01, 1.50\"/px)".into(),
+                    "Rejected: the match could be a chance alignment (odds 10^4.8 to 1, 10^9 needed; 6 stars matched)"
+                        .into(),
                 ),
             ),
     );

@@ -55,3 +55,57 @@ describe('PlateSolveBatchPanel, a run this page did not start', () => {
     expect(screen.queryByText(/started from the assistant/)).toBeNull();
   });
 });
+
+describe('PlateSolveBatchPanel, failed frames', () => {
+  const renderWithFailure = (code: string) => {
+    ctx.current = {
+      enqueuePlateSolve: vi.fn(() => 1),
+      cancelBatch: vi.fn(),
+      dismissCompleted: vi.fn(),
+      cancelForeignRun: vi.fn(),
+      foreignRun: null,
+      activeBatches: new Map([
+        [
+          1,
+          {
+            isComplete: true,
+            isCancelling: false,
+            progress: null,
+            currentFilename: null,
+            errorMessage: null,
+            summary: { solved: 0, failed: 1, total: 1, total_time_ms: 1000 },
+            frameStatuses: new Map([
+              [7, { kind: 'failed', error: 'refused', code, filename: 'a.fits' }],
+            ]),
+          },
+        ],
+      ]),
+    };
+    const view = render(<PlateSolveBatchPanel frameIds={[7]} />);
+    fireEvent.click(screen.getByRole('button', { name: /Plate Solve All/ }));
+    return view;
+  };
+
+  const rowIconClass = (container: HTMLElement) =>
+    container.querySelector('li svg')?.getAttribute('class') ?? '';
+
+  it('a NOT_CONFIDENT failure is styled as a warning', () => {
+    const { container } = renderWithFailure('NOT_CONFIDENT');
+    expect(rowIconClass(container)).toContain('text-warning');
+  });
+
+  it('a TOO_FEW_MATCHED failure is styled as a warning', () => {
+    const { container } = renderWithFailure('TOO_FEW_MATCHED');
+    expect(rowIconClass(container)).toContain('text-warning');
+  });
+
+  it('a REJECTED_LOW_CONFIDENCE failure is styled as a warning', () => {
+    const { container } = renderWithFailure('REJECTED_LOW_CONFIDENCE');
+    expect(rowIconClass(container)).toContain('text-warning');
+  });
+
+  it('a VERIFY_GAP failure stays an error', () => {
+    const { container } = renderWithFailure('VERIFY_GAP');
+    expect(rowIconClass(container)).toContain('text-error');
+  });
+});

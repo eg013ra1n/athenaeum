@@ -41,16 +41,9 @@ blind_gate_enabled: boolean,
  */
 blind_rms_max_px_mult: number, 
 /**
- * Minimum inlier_ratio, applied only to dense fields (expected_in_fov >
- * 100); sparse fields keep the absolute floor. This is the primary
- * false-positive discriminator. Default: 0.04.
- */
-blind_min_inlier_ratio: number, 
-/**
  * Absolute minimum inliers — a TRUE hard floor, not a discriminator.
- * The real-library calibration found inlier COUNT does not separate real
- * solves from false positives (`inlier_ratio` does — see
- * `blind_min_inlier_ratio`), so this is only a backstop. Set to 6 to match
+ * Chance-or-real is decided by the solver's odds (`verify::ACCEPT_LOG10_ODDS`,
+ * re-read by the gate), so this is only a backstop. Set to 6 to match
  * solvemyastro's own `MIN_ABSOLUTE_INLIERS` acceptance floor: the solver
  * never emits a solution below 6 inliers, so athenaeum never
  * count-rejects a solve the solver itself already accepted. Raising it
@@ -102,17 +95,22 @@ bright_cache_path: string | null, };
 
 export type PlateSolveRecord = { id: number | null, frame_id: number, crpix1: number, crpix2: number, crval1: number, crval2: number, cd1_1: number, cd1_2: number, cd2_1: number, cd2_2: number, sip_order: number | null, sip_a_coeffs: string | null, sip_b_coeffs: string | null, sip_ap_coeffs: string | null, sip_bp_coeffs: string | null, matched_stars: number, total_detected: number, rms_residual_px: number, rms_residual_arcsec: number, pixel_scale_arcsec: number, field_rotation_deg: number, solve_time_ms: number, catalog_used: string, algorithm_used: string, solved_at: string, 
 /**
- * Number of catalog stars that fell within the solved field of view.
- * Used by the density-aware acceptance gate. None for pre-density-aware
- * solves stored before the migration.
+ * Number of reference-catalog stars the solution places inside the frame (the solver's N_R, recipe 3). The
+ * denominator of `matched_stars`. `None` for a solve stored before recipe 3: the older count was a different
+ * quantity (a share of the catalog's bright stars) and the migration cleared it.
  */
 expected_catalog_stars_in_fov: number | null, 
 /**
- * matched_stars / expected_catalog_stars_in_fov — solve confidence
- * signal independent of absolute star count. Closer to 1.0 = stronger
- * match. None for pre-density-aware solves.
+ * `matched_stars / expected_catalog_stars_in_fov` as the solver computed it. Stored and shown, never judged
+ * from the stored row: the decision is `log10_odds`. `None` for pre-density-aware solves.
  */
-inlier_ratio: number | null, };
+inlier_ratio: number | null, 
+/**
+ * The solver's Bayes factor for "this solution is real, not chance", in decades (a value of 314 reads
+ * "10^314 to 1"). Recorded from recipe 3 on; `None` for a solve stored before it. A display value: no gate
+ * reads it back, the solver decided on it at solve time.
+ */
+log10_odds: number | null, };
 
 export type FovSummary = { light_count: number, computable_count: number, min_fov_deg: number | null, narrowest_instrume: string | null, };
 

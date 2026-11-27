@@ -120,16 +120,40 @@ position always wins. The metadata editor confirms a typed name live via
 `resolve_object_name` (both backends), so naming a target is a usable repair
 for coordinate-less frames.
 
-## The acceptance gate lives in solvemyastro (2026-11-25)
+## The decision and the acceptance gate (solvemyastro 0.4.0, recipe 3)
 
-The check itself moved out of `plate_solve/service.rs` into `solvemyastro::accept` (`Gate`, `GateMetrics`, `gate_tol_px`, `expected_bright_in_fov`), so the `solvemyastro solve` command and the app judge a solution the same way. The app keeps the config: `config::acceptance_gate` maps the seven `blind_*` fields one-to-one onto `Gate`, and `service::acceptance_refusal` builds the `GateMetrics` and asks `Gate::accepts`. The checks run in this order and the first failure refuses:
+**The decision is the solver's.** A candidate is accepted when its odds of being a real alignment, against a chance one, reach 10^9 (`solvemyastro::verify::ACCEPT_LOG10_ODDS`, 9). The odds are a Bayes factor on the final distortion-fitted WCS, the verification of the published blind-calibration method. The reference stars are the catalog stars that fall inside the frame (`N_R`); the test stars are the image stars in SNR order, minus the hypothesis's own stars, which chose or fitted it and so are no independent evidence. Each test star adds a term that depends on whether a reference star lies within the matching tolerance of it (matched stars count for the hypothesis, unmatched ones cost a little, a catalog star without a detection costs nothing), and the decision reads the largest running sum. The bar rises above 9 only when more than 10^6 hypotheses were tried in one solve. A frame that fails it is a `NOT_CONFIDENT` failure (the best candidate's odds stayed under the bar); a candidate that clears the odds but matches fewer stars than the floor of 6 is a `TOO_FEW_MATCHED` failure. The solve's `log10_odds`, `N_R` (`reference_stars_in_frame`) and the number of hypotheses tried (`hypotheses_verified`) travel with the solution; `matched_stars` is counted on the final WCS and `inlier_ratio` is `matched_stars / N_R`.
+
+**The gate re-reads the decision and keeps backstops.** The check lives in `solvemyastro::accept` (`Gate`, `GateMetrics`, `gate_tol_px`), so the `solvemyastro solve` command and the app judge a solution the same way. The app keeps the config: `config::acceptance_gate` maps six `blind_*` fields one-to-one onto `Gate`, and `service::acceptance_refusal` builds the `GateMetrics` and asks `Gate::refusal`, which names the check that failed (the text reads `Rejected: <reason>`, the code stays `REJECTED_LOW_CONFIDENCE`). The checks run in this order and the first failure refuses:
 
 | Check | Default |
 | ---- | ---- |
 | RMS residual at most a multiple of the pixel tolerance (`gate_tol_px`: `base / scale`, clamped to 4..20 px, 10 at scale 0) | 2.5 x, base 8 arcsec |
-| Inlier floor | 6 |
-| Dense field (`expected_in_fov` over 100, `DENSE_FIELD_MIN_EXPECTED`): inlier ratio at least | 0.04 |
+| Matched stars (on the final WCS) at least | 6 |
+| `log10_odds` at least (the solver's own constant, so a lowered lab threshold and `--no-gate` line up) | 9 |
 | Recovered scale plausible, arcsec/px | 0.05 to 60 |
 | Recovered scale against the header's scale, either way | factor 8 |
 
-A change to a threshold, to `expected_bright_in_fov` or to the verification magnitude limit changes which solves are accepted, so it bumps `config::SOLVE_RECIPE_VERSION`. Known defect: the in-field count reads 0 on real frames, so the dense-field check never arms (`docs/superpowers/open-items.md`, "The in-field count reads 0").
+The gate only judges fresh solves; a stored row is never re-judged. A change to a threshold, to the decision or to the verification magnitude limit changes which solves are accepted, so it bumps `config::SOLVE_RECIPE_VERSION` (3 today).
+
+**What it replaced, and why (2026-11-26).** The gate used to carry a fifth check: on a dense field (more than 100 catalog stars in it) an `inlier_ratio` of at least 0.04, and the solver a bright-star completeness test. Measured on the library:
+
+- The 4 % rule never armed. Its in-field count read 0 on real frames (the field radius was built from the detection count instead of the image size). Fixed, it would have refused 220 of 4 231 good solves (212 of them from the Milky Way set 217), because the ratio falls with star density, and it catches no bad solve in this library.
+- The completeness test counted every bright catalog star without a detection against the solution, so a thin-cloud frame (28940, LDN 1272) would have been refused on a re-solve.
+- The stored `matched_stars` was counted on the linear WCS before the distortion fit (14 for 28940 where its final WCS matches 120).
+- The per-star scan on the final WCS cleared 291 of 291 stored rows (the weakest, 28940, at 314 decades with four stars set aside, 238 with 28).
+
+`blind_min_inlier_ratio` is gone from the config (a stored key is ignored); recipe 3 re-solves every cached stacking SOLVED solve once.
+
+**Acceptance before release (2026-11-27).** The lab run of athenaeum-lab `harness/acceptance/solve-verify/results/r1/` (commit 811dda3, solvemyastro 0b72e75):
+
+| Bar | Result |
+| ---- | ---- |
+| False accepts | 0 in 922 provoked attempts |
+| Chance alignments | 39 223 distinct scored false candidates; the best chance alignment at 10^4.8 |
+| Good frames refused | 0 (arm 5: 10 cloudy and dawn frames, and the 3 207-frame library); the weakest good solve at 10^72.8 |
+| Library re-solve | the same 3 207 of 3 207 |
+| Speed | median solve time +0.5 % against 0.3.0 |
+| Best false candidate | 10^85: failed, excepted by the owner for 0.4.0 (below) |
+
+The one bar that failed: the best false candidate, 10^85, is a lowered run (acceptance threshold lowered for the lab) on an NGC 7023 frame with a wrong scale hint. It is a real-sky overfit, not a chance alignment: the matched stars sit in a band across the frame, and the cubic refit is 180 to 360 px off at the top edge. 0.3.0's test accepts the same candidate, and no production solve reached one. The owner excepted it for 0.4.0 (2026-11-27); the fix is deferred to solvemyastro 0.4.1 (`docs/superpowers/open-items.md`).

@@ -120,6 +120,7 @@ mod tests {
             solved_at: "2025-01-01T00:00:00Z".to_string(),
             expected_catalog_stars_in_fov: None,
             inlier_ratio: None,
+            log10_odds: None,
         }
     }
 

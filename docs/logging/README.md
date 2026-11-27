@@ -109,7 +109,11 @@ Manual use without MCP: it's a stdio JSON-RPC binary —
   should read).
 - **Solver internals** — `solvemyastro=debug` gives per-stage timings
   (`stage` + `duration_ms`); `=trace` adds per-candidate detail. Solve outcome
-  events carry `outcome`, `inliers`, `rms_px`, `scale_arcsec_px`.
+  events carry `outcome`, `inliers`, `rms_px`, `scale_arcsec_px`. The solver's
+  `solve decision` debug event (a candidate's verification) carries `log10_odds`,
+  `reference_stars`, `test_stars`, `peak_rank`, `scan_matched`, `hypotheses` and
+  `required_log10_odds`, and `store_result`'s refusal warn carries `log10_odds`
+  beside `inliers`; six of these names are new dictionary extensions in the logging spec (`reference_stars` already existed).
 - **A user's support bundle** — it's the same JSONL: point log-mcp at the
   unzipped folder (`cargo run -q -p log-mcp -- /path/to/their/logs`).
 

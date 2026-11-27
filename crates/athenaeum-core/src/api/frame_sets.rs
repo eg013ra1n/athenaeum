@@ -2164,6 +2164,7 @@ mod tests {
                 solved_at: "2026-03-01T23:00:00Z".into(),
                 expected_catalog_stars_in_fov: None,
                 inlier_ratio: None,
+                log10_odds: None,
             },
         )
         .unwrap();

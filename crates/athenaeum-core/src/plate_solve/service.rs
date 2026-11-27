@@ -41,13 +41,17 @@ pub struct SolveResult {
     /// (the solve only succeeded after the scale hint was cleared). Drives
     /// the unconditional focal-length write-back in `store_result`.
     pub focallen_corrected: bool,
-    /// Number of catalog stars inside the solved FOV (from the verification
-    /// cone search). Drives the density-aware acceptance gate.
+    /// The reference stars inside the solved frame (`N_R`, solvemyastro's
+    /// `reference_stars_in_frame`): the denominator of `inlier_ratio`. Shown,
+    /// never judged.
     pub expected_catalog_stars_in_fov: usize,
-    /// matched_stars / expected_catalog_stars_in_fov. Confidence signal
-    /// independent of absolute inlier count — a 8-of-10 match in a sparse
-    /// field can be stronger than 25-of-500 in a dense field.
+    /// `matched_stars / expected_catalog_stars_in_fov` (solvemyastro's
+    /// `inlier_ratio`). Stored for display; nothing gates on it.
     pub inlier_ratio: f64,
+    /// `log10` of the solver's odds that the match is real (solvemyastro's
+    /// `log10_odds`): the measure of confidence the persist gate re-reads at
+    /// `verify::ACCEPT_LOG10_ODDS`.
+    pub log10_odds: f64,
     // ── SIP distortion coefficients (populated by solvemyastro) ──────────
     /// SIP polynomial order (None → no SIP fitted).
     pub sip_order: Option<u8>,
@@ -269,29 +273,14 @@ pub fn solve_frame_with_hints(
             (None, None, None, None, None)
         };
 
-    // Verification cone: query the cache around the solved centre to get
-    // `expected_catalog_stars_in_fov` and `inlier_ratio`. We use the same
-    // FOV radius as the legacy solver (half the diagonal of the image).
-    // `solution.inlier_ratio` already comes from solvemyastro and reflects
-    // matched_stars / bright-catalog-in-fov; we also expose the raw cone
-    // count for the density-aware gate in `store_result`.
-    let obs_epoch = observation_epoch(frame);
-    // The cone radius lives in `solvemyastro::accept` and the magnitude limit is solvemyastro's verify limit
-    // (`orchestrate::VERIFY_MAG_LIMIT`, read by `accept::expected_bright_in_fov`); a change to either needs
+    // The solver reports its own confidence: the in-frame reference stars
+    // (`N_R`), the share of them matched, and the odds that the match is real.
+    // A change to the verification magnitude limit
+    // (`orchestrate::VERIFY_MAG_LIMIT`) or to the solver's bar needs
     // `config::SOLVE_RECIPE_VERSION` bumped.
-    let expected_catalog_stars_in_fov = solvemyastro::accept::expected_bright_in_fov(
-        caches,
-        solution.wcs.crval,
-        solution.pixel_scale_arcsec,
-        solution.total_detected,
-        obs_epoch,
-    );
-
-    // Use solvemyastro's inlier_ratio directly: it is matched_stars /
-    // total_detected (see solvemyastro `Solution::inlier_ratio`) — the
-    // discriminator the persist gate keys on. Real solves sit well above the
-    // ~0.04 floor; noise/false-positive alignments are ~0.001.
+    let expected_catalog_stars_in_fov = solution.reference_stars_in_frame;
     let inlier_ratio = solution.inlier_ratio;
+    let log10_odds = solution.log10_odds;
 
     // Derive focal length from the solved pixel scale + the frame's pixel
     // size, ALWAYS when computable (not only when header was missing). This
@@ -357,6 +346,7 @@ pub fn solve_frame_with_hints(
         focallen_corrected,
         expected_catalog_stars_in_fov,
         inlier_ratio,
+        log10_odds,
         sip_order,
         sip_a_coeffs: sip_a,
         sip_b_coeffs: sip_b,
@@ -397,9 +387,9 @@ pub fn store_result(
     // confidence bar — applied here REGARDLESS of acceptance stage, so a
     // false positive that slipped through the gate-exempt hinted path (e.g.
     // because a wrong/corrupt header made it look hinted) cannot overwrite
-    // frame metadata. inlier_ratio is the rig-independent discriminator
-    // (real solves >= ~0.08, noise alignments <= ~0.001); sparse fields are
-    // exempted inside `solvemyastro::accept::Gate::accepts` exactly as during acceptance.
+    // frame metadata. The solver's odds are the discriminator (`log10_odds`
+    // against `verify::ACCEPT_LOG10_ODDS`); the gate re-reads them and holds the
+    // RMS, matched-star and scale backstops, exactly as during acceptance.
     if config.blind_gate_enabled {
         // The frame's own optics, when it declares them (2026-09-05: on
         // wind-shaken frames the solver walks its autoFOV ladder and returns a
@@ -413,8 +403,9 @@ pub fn store_result(
                 stage = "store",
                 outcome = "rejected_low_confidence",
                 inliers = result.matched_stars,
-                inlier_ratio = result.inlier_ratio,
+                log10_odds = result.log10_odds,
                 scale_arcsec_px = result.pixel_scale_arcsec,
+                reason = %reason,
                 "refusing to persist low-confidence solve, WCS/focal length not written back"
             );
             return Ok(StoreOutcome::RejectedLowConfidence { reason });
@@ -470,21 +461,13 @@ pub(crate) fn acceptance_refusal(
     let gate = super::config::acceptance_gate(config);
     let m = solvemyastro::accept::GateMetrics {
         inliers: result.matched_stars,
-        expected_in_fov: result.expected_catalog_stars_in_fov,
         rms_px: result.rms_residual_px,
         tol_px: solvemyastro::accept::gate_tol_px(result.pixel_scale_arcsec, gate.base_tolerance_arcsec),
-        inlier_ratio: result.inlier_ratio,
+        log10_odds: result.log10_odds,
         recovered_scale_arcsec: result.pixel_scale_arcsec,
         header_scale_arcsec: expected_scale_arcsec,
     };
-    if gate.accepts(&m) {
-        None
-    } else {
-        Some(format!(
-            "Rejected: low confidence ({} inliers, ratio {:.2}, {:.2}\"/px)",
-            result.matched_stars, result.inlier_ratio, result.pixel_scale_arcsec
-        ))
-    }
+    gate.refusal(&m).map(|refusal| format!("Rejected: {refusal}"))
 }
 
 /// The `plate_solves` row a solve becomes (pure; `solved_at` is now).
@@ -520,6 +503,7 @@ pub(crate) fn record_from_result(frame_id: i64, result: &SolveResult) -> PlateSo
         solved_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         expected_catalog_stars_in_fov: Some(result.expected_catalog_stars_in_fov as i32),
         inlier_ratio: Some(result.inlier_ratio),
+        log10_odds: Some(result.log10_odds),
     }
 }
 
@@ -623,7 +607,8 @@ mod tests {
         assert!(err.contains("gone.zip") && err.contains("not reachable"), "{err}");
     }
 
-    fn mk_result(matched: usize, expected: usize, ratio: f64, scale: f64, rms: f64) -> SolveResult {
+    /// `in_field` is `N_R`, the in-frame reference stars; `odds` is `log10_odds`.
+    fn mk_result(matched: usize, in_field: usize, ratio: f64, scale: f64, rms: f64, odds: f64) -> SolveResult {
         SolveResult {
             wcs: WcsSolution {
                 crpix: (0.0, 0.0),
@@ -643,8 +628,9 @@ mod tests {
             algorithm_used: "blind_index".into(),
             derived_focallen_mm: None,
             focallen_corrected: false,
-            expected_catalog_stars_in_fov: expected,
+            expected_catalog_stars_in_fov: in_field,
             inlier_ratio: ratio,
+            log10_odds: odds,
             sip_order: None,
             sip_a_coeffs: None,
             sip_b_coeffs: None,
@@ -653,20 +639,47 @@ mod tests {
         }
     }
 
-    /// The persist gate keeps its decisions across the move of the gate into solvemyastro: the six-match noise
-    /// alignment (2026-09-05, real numbers: 6 inliers, ratio 0.037 in a field the catalogue expects hundreds of stars
-    /// in) is refused with the app's own text, the same field at a real solve's confidence is accepted, and the gate
-    /// switched off accepts the noise.
+    /// The persist gate's decisions under solvemyastro 0.4.0: the six-match noise alignment (2026-09-05: 6 inliers
+    /// in a field with hundreds of reference stars) has odds far below the solver's bar and is refused in the
+    /// solver's own words, the same field at a real solve's odds is accepted, and the gate switched off accepts the
+    /// noise.
     #[test]
     fn acceptance_refusal_keeps_its_decisions() {
         let cfg = PlateSolveConfig::default();
-        let noise = mk_result(6, 480, 0.0373, 0.2178, 1.159);
+        let noise = mk_result(6, 480, 0.0125, 0.2178, 1.159, 4.8);
         let refusal = acceptance_refusal(&noise, None, &cfg).expect("noise is refused");
-        assert!(refusal.starts_with("Rejected: low confidence ("), "{refusal}");
-        let real = mk_result(60, 480, 0.125, 0.2178, 1.159);
+        assert!(refusal.starts_with("Rejected: the match could be a chance alignment"), "{refusal}");
+        let real = mk_result(60, 61, 0.98, 0.2178, 1.159, 120.0);
         assert_eq!(acceptance_refusal(&real, None, &cfg), None);
         let off = PlateSolveConfig { blind_gate_enabled: false, ..PlateSolveConfig::default() };
         assert_eq!(acceptance_refusal(&noise, None, &off), None);
+    }
+
+    /// Every refusal the gate can make reads as `Rejected: {GateRefusal}`, in solvemyastro's one wording.
+    #[test]
+    fn acceptance_refusal_names_the_failed_check() {
+        let cfg = PlateSolveConfig::default();
+        let text = |r: &SolveResult, header: Option<f64>| acceptance_refusal(r, header, &cfg).expect("refused");
+        assert_eq!(
+            text(&mk_result(6, 61, 0.098, 0.2178, 1.159, 4.8), None),
+            "Rejected: the match could be a chance alignment (odds 10^4.8 to 1, 10^9 needed; 6 stars matched)"
+        );
+        assert_eq!(
+            text(&mk_result(5, 400, 0.0125, 1.9, 1.0, 50.0), None),
+            "Rejected: only 5 stars matched (6 needed)"
+        );
+        assert_eq!(
+            text(&mk_result(120, 476, 0.25, 1.9, 20.0, 300.0), None),
+            "Rejected: the stars fit too loosely (20.00 px RMS, 10.53 px allowed)"
+        );
+        assert_eq!(
+            text(&mk_result(120, 476, 0.25, 100.0, 1.0, 300.0), None),
+            "Rejected: the solved scale 100.00\"/px is outside 0.05..60\"/px"
+        );
+        assert_eq!(
+            text(&mk_result(120, 476, 0.25, 29.6, 1.0, 300.0), Some(1.873)),
+            "Rejected: the solved scale 29.60\"/px is more than 8x off the header's 1.87\"/px"
+        );
     }
 
     /// The input gate refuses a frame whose own analysis carries the `trailed` verdict — and refuses nothing else,
@@ -889,7 +902,7 @@ mod tests {
 
         // 29.6 "/px against the header's 1.873 — the real shape of the false
         // solutions, confident-looking in every other respect.
-        let out = store_result(&conn, 1, &mk_result(120, 800, 0.15, 29.6, 1.0), None, &cfg).unwrap();
+        let out = store_result(&conn, 1, &mk_result(120, 800, 0.15, 29.6, 1.0, 300.0), None, &cfg).unwrap();
         assert!(
             !matches!(out, StoreOutcome::Persisted),
             "a solve 16x off the header's scale must not be stored, got {out:?}"
@@ -901,7 +914,7 @@ mod tests {
 
         // The same confidence at the header's own scale still persists — the
         // tolerance is deliberately generous, this is not a scale gate.
-        let ok = store_result(&conn, 2, &mk_result(120, 800, 0.15, 1.9, 1.0), None, &cfg).unwrap();
+        let ok = store_result(&conn, 2, &mk_result(120, 800, 0.15, 1.9, 1.0, 300.0), None, &cfg).unwrap();
         assert!(matches!(ok, StoreOutcome::Persisted), "a scale that agrees is stored");
     }
 
@@ -928,7 +941,7 @@ mod tests {
 
         // High-confidence (real-solve shape) — must persist.
         let out1 =
-            store_result(&conn, 1, &mk_result(120, 800, 0.15, 1.5, 1.0), None, &cfg).unwrap();
+            store_result(&conn, 1, &mk_result(120, 800, 0.15, 1.5, 1.0, 300.0), None, &cfg).unwrap();
         assert!(
             matches!(out1, StoreOutcome::Persisted),
             "high-confidence solve must report Persisted"
@@ -952,7 +965,7 @@ mod tests {
         let out2 = store_result(
             &conn,
             2,
-            &mk_result(90, 150_000, 0.0006, 22.0, 2.8),
+            &mk_result(90, 150_000, 0.0006, 22.0, 2.8, 2.0),
             None,
             &cfg,
         )
@@ -1009,7 +1022,7 @@ mod tests {
 
         // _0060 shape: 10 inliers, dense field (expected 800 so the ratio gate
         // is active), ratio 0.070, scale 0.48"/px, rms 2.35px.
-        let defocused = mk_result(10, 800, 0.070, 0.48, 2.35);
+        let defocused = mk_result(10, 800, 0.070, 0.48, 2.35, 40.0);
 
         // Default gate (floor now 6): the correct-but-sparse solve PERSISTS.
         let out = store_result(&conn, 1, &defocused, None, &PlateSolveConfig::default()).unwrap();
@@ -1352,13 +1365,13 @@ mod tests {
     #[test]
     fn acceptance_refusal_is_store_results_gate() {
         let cfg = PlateSolveConfig::default();
-        let wrong = mk_result(120, 800, 0.15, 29.6, 1.0);
+        let wrong = mk_result(120, 800, 0.15, 29.6, 1.0, 300.0);
         assert_eq!(
             acceptance_refusal(&wrong, Some(1.873), &cfg).as_deref(),
-            Some("Rejected: low confidence (120 inliers, ratio 0.15, 29.60\"/px)")
+            Some("Rejected: the solved scale 29.60\"/px is more than 8x off the header's 1.87\"/px")
         );
         assert_eq!(
-            acceptance_refusal(&mk_result(120, 800, 0.15, 1.9, 1.0), Some(1.873), &cfg),
+            acceptance_refusal(&mk_result(120, 800, 0.15, 1.9, 1.0, 300.0), Some(1.873), &cfg),
             None
         );
         assert_eq!(acceptance_refusal(&wrong, None, &cfg), None);
@@ -1373,14 +1386,14 @@ mod tests {
     /// and for a stacking run's cached solve.
     #[test]
     fn record_from_result_is_the_stored_row() {
-        let r = record_from_result(7, &mk_result(120, 800, 0.15, 1.9, 1.0));
+        let r = record_from_result(7, &mk_result(120, 476, 0.25, 1.9, 1.0, 300.0));
         assert_eq!((r.id, r.frame_id), (None, 7));
         assert_eq!((r.crval1, r.crval2), (123.45, 67.89));
         assert_eq!((r.cd1_1, r.cd1_2, r.cd2_1, r.cd2_2), (1e-4, 0.0, 0.0, 1e-4));
         assert_eq!((r.matched_stars, r.total_detected), (120, 600));
         assert_eq!(
-            (r.expected_catalog_stars_in_fov, r.inlier_ratio),
-            (Some(800), Some(0.15))
+            (r.expected_catalog_stars_in_fov, r.inlier_ratio, r.log10_odds),
+            (Some(476), Some(0.25), Some(300.0))
         );
         assert_eq!(
             (r.catalog_used.as_str(), r.algorithm_used.as_str()),

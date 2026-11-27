@@ -815,6 +815,33 @@ fn backfill_identity(conn: &Connection) -> rusqlite::Result<()> {
 /// trigger-evolution DROP+CREATE DDL. Held for the whole `init_db` body.
 static INIT_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The `plate_solves.log10_odds` step: the in-field count cleared and the column added in one transaction. The
+/// column is probed again after the write lock is taken (another process of the new build may have migrated between
+/// the caller's probe and the lock): then nothing is cleared and the transaction commits empty. Any error rolls
+/// back (the transaction's drop) and is logged and returned.
+fn add_log10_odds_column(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let step = (|| -> rusqlite::Result<()> {
+        let present: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plate_solves') WHERE name='log10_odds'",
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            tx.execute("UPDATE plate_solves SET expected_catalog_stars_in_fov = NULL", [])?;
+            tx.execute("ALTER TABLE plate_solves ADD COLUMN log10_odds REAL", [])?;
+        }
+        Ok(())
+    })();
+    match step.and_then(|()| tx.commit()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::error!(error = %e, "plate_solves.log10_odds migration failed");
+            Err(e)
+        }
+    }
+}
+
 /// Initialize the database schema.
 ///
 /// **Idempotent** — safe to call repeatedly on the same catalog; every table /
@@ -2262,6 +2289,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             solved_at TEXT NOT NULL,
             expected_catalog_stars_in_fov INTEGER,
             inlier_ratio REAL,
+            log10_odds REAL,
             FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
         )",
         [],
@@ -2285,6 +2313,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             [],
         )?;
         conn.execute("ALTER TABLE plate_solves ADD COLUMN inlier_ratio REAL", [])?;
+    }
+
+    // Migration: `plate_solves.log10_odds` (solvemyastro 0.4.0, recipe 3). The in-field count stored before it was a
+    // different quantity (a share of the catalog's bright stars; the in-frame reference count replaces it), so the
+    // same step clears it to unknown. Clearing and adding the column are one transaction: a stop between them can
+    // never leave the column present with the old count uncleared. The guard is the column's absence, so a re-run
+    // after a stop repeats the clearing and nothing that was stored under recipe 3 is touched. `matched_stars` and
+    // `inlier_ratio` stay as stored.
+    let has_log10_odds: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('plate_solves') WHERE name='log10_odds'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_log10_odds == 0 {
+        add_log10_odds_column(conn)?;
     }
 
     // Add archived_at to frames_set table (ZIP archive feature)
@@ -8038,5 +8081,172 @@ mod stacking_subject_schema_tests {
         assert_eq!(violations, 0);
         init_db(&conn).unwrap();
         assert_eq!(stacking_row_counts(&conn), before);
+    }
+}
+
+#[cfg(test)]
+mod plate_solves_odds_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// The `plate_solves` table as the 0.3.x builds created it: the density-aware columns, no `log10_odds`.
+    const OLD_DDL: &str = "CREATE TABLE plate_solves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id INTEGER NOT NULL UNIQUE,
+            crpix1 REAL NOT NULL,
+            crpix2 REAL NOT NULL,
+            crval1 REAL NOT NULL,
+            crval2 REAL NOT NULL,
+            cd1_1 REAL NOT NULL,
+            cd1_2 REAL NOT NULL,
+            cd2_1 REAL NOT NULL,
+            cd2_2 REAL NOT NULL,
+            sip_order INTEGER,
+            sip_a_coeffs TEXT,
+            sip_b_coeffs TEXT,
+            sip_ap_coeffs TEXT,
+            sip_bp_coeffs TEXT,
+            matched_stars INTEGER NOT NULL,
+            total_detected INTEGER NOT NULL,
+            rms_residual_px REAL NOT NULL,
+            rms_residual_arcsec REAL NOT NULL,
+            pixel_scale_arcsec REAL NOT NULL,
+            field_rotation_deg REAL NOT NULL,
+            solve_time_ms INTEGER NOT NULL,
+            catalog_used TEXT NOT NULL,
+            algorithm_used TEXT NOT NULL,
+            solved_at TEXT NOT NULL,
+            expected_catalog_stars_in_fov INTEGER,
+            inlier_ratio REAL,
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        )";
+
+    /// A catalog as a 0.3.x user has it: every table exists, `plate_solves` has the old shape.
+    fn old_catalog() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(&format!("DROP TABLE plate_solves; {OLD_DDL};"))
+            .unwrap();
+        conn
+    }
+
+    fn put_old_row(conn: &Connection, frame_id: i64, in_field: Option<i64>, ratio: f64, matched: i64) {
+        conn.execute(
+            "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2,
+                matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec,
+                field_rotation_deg, solve_time_ms, catalog_used, algorithm_used, solved_at,
+                expected_catalog_stars_in_fov, inlier_ratio)
+             VALUES (?1, 0, 0, 10, 20, 1e-4, 0, 0, 1e-4, ?2, 100, 0.5, 0.5, 1.0, 0, 1, 'c', 'a', 't', ?3, ?4)",
+            rusqlite::params![frame_id, matched, in_field, ratio],
+        )
+        .unwrap();
+    }
+
+    fn has_odds_column(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plate_solves') WHERE name='log10_odds'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    fn row(conn: &Connection, frame_id: i64) -> (Option<i64>, Option<f64>, i64, Option<f64>) {
+        conn.query_row(
+            "SELECT expected_catalog_stars_in_fov, inlier_ratio, matched_stars, log10_odds
+             FROM plate_solves WHERE frame_id = ?1",
+            [frame_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_guarded_step_adds_log10_odds_and_clears_the_old_in_field_count() {
+        let conn = old_catalog();
+        put_old_row(&conn, 1, Some(1), 0.2, 15);
+        assert!(!has_odds_column(&conn));
+
+        init_db(&conn).unwrap();
+
+        assert!(has_odds_column(&conn));
+        assert_eq!(
+            row(&conn, 1),
+            (None, Some(0.2), 15, None),
+            "the in-field count is unknown now; the ratio and the match count stay"
+        );
+
+        // A solve stored under the new recipe survives a second `init_db`.
+        conn.execute(
+            "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2,
+                matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec,
+                field_rotation_deg, solve_time_ms, catalog_used, algorithm_used, solved_at,
+                expected_catalog_stars_in_fov, inlier_ratio, log10_odds)
+             VALUES (2, 0, 0, 10, 20, 1e-4, 0, 0, 1e-4, 120, 100, 0.5, 0.5, 1.0, 0, 1, 'c', 'a', 't',
+                476, 0.25, 314.4)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(row(&conn, 2), (Some(476), Some(0.25), 120, Some(314.4)));
+        assert_eq!(row(&conn, 1), (None, Some(0.2), 15, None));
+    }
+
+    /// A stop between the clearing and the column can never leave the column present with the count uncleared, and a
+    /// re-run after a clearing that already happened still adds the column.
+    #[test]
+    fn a_catalog_where_only_the_clearing_ran_gets_the_column() {
+        let conn = old_catalog();
+        put_old_row(&conn, 1, None, 0.2, 15);
+        put_old_row(&conn, 2, Some(300), 0.3, 40);
+        // Only the clearing happened (the other row still carries a count); the column is absent.
+        conn.execute(
+            "UPDATE plate_solves SET expected_catalog_stars_in_fov = NULL WHERE frame_id = 1",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        assert!(has_odds_column(&conn));
+        assert_eq!(row(&conn, 1), (None, Some(0.2), 15, None));
+        assert_eq!(row(&conn, 2), (None, Some(0.3), 40, None));
+    }
+
+    #[test]
+    fn a_fresh_catalog_has_the_column_and_no_clearing_happens() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert!(has_odds_column(&conn));
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO plate_solves (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2,
+                matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, pixel_scale_arcsec,
+                field_rotation_deg, solve_time_ms, catalog_used, algorithm_used, solved_at,
+                expected_catalog_stars_in_fov, inlier_ratio, log10_odds)
+             VALUES (1, 0, 0, 10, 20, 1e-4, 0, 0, 1e-4, 120, 100, 0.5, 0.5, 1.0, 0, 1, 'c', 'a', 't',
+                476, 0.25, 314.4)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(row(&conn, 1), (Some(476), Some(0.25), 120, Some(314.4)), "no clearing on a catalog that has the column");
+    }
+
+    /// Another process may add the column between the probe and the write lock: the step, run against a table
+    /// that already has the column, commits without clearing and without an error.
+    #[test]
+    fn the_step_run_after_another_process_added_the_column_clears_nothing() {
+        let conn = old_catalog();
+        put_old_row(&conn, 1, Some(300), 0.2, 15);
+        conn.execute("ALTER TABLE plate_solves ADD COLUMN log10_odds REAL", []).unwrap();
+        conn.execute("UPDATE plate_solves SET log10_odds = 12.5", []).unwrap();
+
+        add_log10_odds_column(&conn).unwrap();
+
+        assert!(conn.is_autocommit(), "the transaction is closed");
+        assert_eq!(row(&conn, 1), (Some(300), Some(0.2), 15, Some(12.5)));
     }
 }

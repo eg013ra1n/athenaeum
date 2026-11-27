@@ -336,6 +336,7 @@ impl ManifestWcs {
             solved_at: String::new(),
             expected_catalog_stars_in_fov: None,
             inlier_ratio: None,
+            log10_odds: None,
         };
         if pixel_scale_arcsec.is_none() {
             if let Some(solution) = record.to_solution() {
@@ -496,6 +497,7 @@ mod tests {
                 solved_at: "2026-09-24T02:10:00Z".into(),
                 expected_catalog_stars_in_fov: Some(500),
                 inlier_ratio: Some(0.9),
+                log10_odds: None,
             },
         )
         .unwrap();

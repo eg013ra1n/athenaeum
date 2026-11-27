@@ -53,7 +53,6 @@ const PLATE_SOLVE_CONFIG_FIXTURE: PlateSolveConfig = {
   batch_concurrency: 0,
   blind_gate_enabled: true,
   blind_rms_max_px_mult: 2.5,
-  blind_min_inlier_ratio: 0.04,
   blind_inlier_floor: 6,
   blind_scale_sanity_min: 0.05,
   blind_scale_sanity_max: 60.0,
